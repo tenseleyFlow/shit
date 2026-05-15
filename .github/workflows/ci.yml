@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  native:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - macos-13
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: license-check
+        run: cargo run --quiet --package xtask -- license-check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: build (release)
+        run: cargo build --workspace --release
+
+  freebsd:
+    name: freebsd-14
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: build + test on FreeBSD 14
+        uses: cross-platform-actions/action@v0.25.0
+        with:
+          operating_system: freebsd
+          version: '14.2'
+          shell: sh
+          run: |
+            sudo pkg install -y rust gmake
+            cargo fmt --all -- --check
+            cargo clippy --workspace --all-targets --all-features -- -D warnings
+            cargo test --workspace
+            cargo build --workspace --release
