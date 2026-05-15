@@ -6,7 +6,7 @@ use shit_shell::{
     InstallParams, MARKER_BEGIN, plan_install, remove_marker_block, render_template,
     upsert_marker_block,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{config_home, home_dir, paths};
 
@@ -33,7 +33,10 @@ pub fn install(shell: Option<ShellKind>) -> Result<()> {
         // Fish autoloads everything in conf.d/, so we don't touch config.fish.
         println!("installed fish hook at {}", plan.hook_file.display());
         println!("fish autoloads conf.d/ — no further action required");
-        println!("source the file in any existing fish sessions: source {}", plan.hook_file.display());
+        println!(
+            "source the file in any existing fish sessions: source {}",
+            plan.hook_file.display()
+        );
         return Ok(());
     }
 
@@ -45,7 +48,10 @@ pub fn install(shell: Option<ShellKind>) -> Result<()> {
     println!("installed {} hook", shell.as_str());
     println!("  hook script: {}", plan.hook_file.display());
     println!("  rc file:     {}", rc_path.display());
-    println!("open a new shell (or `source {}`) to activate", rc_path.display());
+    println!(
+        "open a new shell (or `source {}`) to activate",
+        rc_path.display()
+    );
     Ok(())
 }
 
@@ -70,7 +76,10 @@ pub fn uninstall(shell: Option<ShellKind>) -> Result<()> {
     let existing = match std::fs::read_to_string(&rc_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("rc file {} does not exist; nothing to uninstall", rc_path.display());
+            println!(
+                "rc file {} does not exist; nothing to uninstall",
+                rc_path.display()
+            );
             return Ok(());
         }
         Err(e) => bail!("read {}: {e}", rc_path.display()),
@@ -84,7 +93,10 @@ pub fn uninstall(shell: Option<ShellKind>) -> Result<()> {
     println!("removed shit marker block from {}", rc_path.display());
     if plan.hook_file.exists() {
         println!("hook script left in place at {}", plan.hook_file.display());
-        println!("remove it manually if desired: rm {}", plan.hook_file.display());
+        println!(
+            "remove it manually if desired: rm {}",
+            plan.hook_file.display()
+        );
     }
     Ok(())
 }
@@ -140,9 +152,4 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn _unused() -> PathBuf {
-    PathBuf::new()
 }
