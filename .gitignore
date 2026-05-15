@@ -1,0 +1,42 @@
+# internal — intentionally gitignored
+.docs/
+.refs/
+.fackr/
+
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+*.profraw
+
+# coverage
+/coverage
+*.gcov
+*.gcda
+*.gcno
+
+# logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.fleet/
+.zed/
+
+# secrets / local
+.env
+.env.local
+
+# build artifacts
+/bin/
+/dist/
+/out/
