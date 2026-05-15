@@ -36,6 +36,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 uuid = { version = "1.11", features = ["v7", "serde"] }
 bytes = "1.8"
+vergen-gitcl = { version = "1.0", features = ["build", "cargo", "rustc"] }
 
 shit-proto = { path = "crates/shit-proto" }
 shit-store = { path = "crates/shit-store" }

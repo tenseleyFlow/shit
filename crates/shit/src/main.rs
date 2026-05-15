@@ -2,13 +2,26 @@
 
 use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "shit", about = "magic undo for the command line", version = build_version())]
-struct Cli {}
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit: ",
+    env!("VERGEN_GIT_SHA"),
+    "\nbuilt:  ",
+    env!("VERGEN_BUILD_TIMESTAMP"),
+    "\nrustc:  ",
+    env!("VERGEN_RUSTC_SEMVER"),
+    "\ntarget: ",
+    env!("VERGEN_CARGO_TARGET_TRIPLE"),
+);
 
-fn build_version() -> &'static str {
-    concat!(env!("CARGO_PKG_VERSION"), " (", env!("CARGO_PKG_NAME"), ")")
-}
+#[derive(Parser)]
+#[command(
+    name = "shit",
+    about = "magic undo for the command line",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = LONG_VERSION,
+)]
+struct Cli {}
 
 fn main() -> anyhow::Result<()> {
     let _ = Cli::parse();

@@ -11,6 +11,9 @@ authors.workspace = true
 name = "shit-helper"
 path = "src/main.rs"
 
+[build-dependencies]
+vergen-gitcl = { workspace = true }
+
 [dependencies]
 shit-proto = { workspace = true }
 shit-capture = { workspace = true }
