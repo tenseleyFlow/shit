@@ -3,11 +3,115 @@
 //! IPC protocol types and wire framing for `shit`.
 //!
 //! Wire format and message catalog are specified in `.docs/sprints/S01-shell-integration.md`.
+//!
+//! # Wire format
+//!
+//! Every frame on the wire is:
+//!
+//! ```text
+//! | u32 BE total_payload_len | u8 wire_version | postcard(HookMessage) |
+//! ```
+//!
+//! `total_payload_len` covers `wire_version` plus the postcard payload. For
+//! SOCK_DGRAM transports the length prefix is technically redundant with the
+//! datagram boundary, but we include it for parity with the FIFO/stream
+//! fallback path and for cheap framing-level validation under fuzzing.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_wires_up() {
-        assert_eq!(2 + 2, 4);
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub mod frame;
+
+pub use frame::{DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame};
+
+/// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookMessage {
+    /// Emitted once when a shell session starts.
+    SessionOpen {
+        session: Uuid,
+        shell_kind: ShellKind,
+        parent_pid: u32,
+        tty: String,
+        ts_unix_nanos: u64,
+    },
+    /// Emitted before each interactive command runs.
+    PreExec {
+        session: Uuid,
+        seq: u64,
+        pid: u32,
+        cwd_inode: u64,
+        cwd_dev: u64,
+        ts_unix_nanos: u64,
+        shell_kind: ShellKind,
+        depth: u8,
+    },
+    /// Emitted after each interactive command exits.
+    PostExec {
+        session: Uuid,
+        seq: u64,
+        exit_code: i32,
+        ts_unix_nanos: u64,
+    },
+    /// Emitted when the shell exits.
+    SessionClose {
+        session: Uuid,
+        ts_unix_nanos: u64,
+    },
+}
+
+impl HookMessage {
+    pub fn session(&self) -> Uuid {
+        match self {
+            Self::SessionOpen { session, .. }
+            | Self::PreExec { session, .. }
+            | Self::PostExec { session, .. }
+            | Self::SessionClose { session, .. } => *session,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SessionOpen { .. } => "session-open",
+            Self::PreExec { .. } => "pre-exec",
+            Self::PostExec { .. } => "post-exec",
+            Self::SessionClose { .. } => "session-close",
+        }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellKind {
+    Bash,
+    Zsh,
+    Fish,
+    Unknown,
+}
+
+impl ShellKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::str::FromStr for ShellKind {
+    type Err = ShellKindParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bash" => Ok(Self::Bash),
+            "zsh" => Ok(Self::Zsh),
+            "fish" => Ok(Self::Fish),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(ShellKindParseError(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown shell kind: {0}")]
+pub struct ShellKindParseError(pub String);
