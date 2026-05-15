@@ -1,0 +1,22 @@
+[package]
+name = "shitd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "shitd"
+path = "src/main.rs"
+
+[dependencies]
+shit-proto = { workspace = true }
+shit-store = { workspace = true }
+shit-planner = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

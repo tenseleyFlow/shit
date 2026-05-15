@@ -1,0 +1,17 @@
+[package]
+name = "shit-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+shit-proto = { workspace = true }
+rusqlite = { workspace = true }
+blake3 = { workspace = true }
+zstd = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

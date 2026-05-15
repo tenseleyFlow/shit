@@ -1,0 +1,15 @@
+[package]
+name = "shit-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+shit-proto = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

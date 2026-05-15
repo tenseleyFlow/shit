@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/shit",
+    "crates/shitd",
+    "crates/shit-helper",
+    "crates/shit-proto",
+    "crates/shit-store",
+    "crates/shit-capture",
+    "crates/shit-planner",
+    "crates/shit-shell",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/tenseleyFlow/shit"
+authors = ["mfwolffe <mfwolffe@outlook.com>"]
+
+[workspace.dependencies]
+tokio = { version = "1.42", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+blake3 = "1.5"
+zstd = "0.13"
+nix = { version = "0.29", features = ["fs", "process", "user", "signal"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2.0"
+anyhow = "1.0"
+uuid = { version = "1.11", features = ["v7", "serde"] }
+bytes = "1.8"
+
+shit-proto = { path = "crates/shit-proto" }
+shit-store = { path = "crates/shit-store" }
+shit-capture = { path = "crates/shit-capture" }
+shit-planner = { path = "crates/shit-planner" }
+shit-shell = { path = "crates/shit-shell" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
