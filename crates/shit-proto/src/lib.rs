@@ -22,7 +22,9 @@ use uuid::Uuid;
 
 pub mod frame;
 
-pub use frame::{DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame};
+pub use frame::{
+    DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
+};
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,10 +56,7 @@ pub enum HookMessage {
         ts_unix_nanos: u64,
     },
     /// Emitted when the shell exits.
-    SessionClose {
-        session: Uuid,
-        ts_unix_nanos: u64,
-    },
+    SessionClose { session: Uuid, ts_unix_nanos: u64 },
 }
 
 impl HookMessage {

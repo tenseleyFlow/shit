@@ -39,7 +39,11 @@ pub fn encode_frame(msg: &HookMessage) -> Result<Vec<u8>, EncodeError> {
         return Err(EncodeError::TooLarge { got: total_len });
     }
     let mut frame = Vec::with_capacity(total_len);
-    frame.extend_from_slice(&u32::try_from(body_len).expect("checked above").to_be_bytes());
+    frame.extend_from_slice(
+        &u32::try_from(body_len)
+            .expect("checked above")
+            .to_be_bytes(),
+    );
     frame.push(WIRE_VERSION);
     frame.extend_from_slice(&payload);
     Ok(frame)

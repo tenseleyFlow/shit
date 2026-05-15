@@ -54,7 +54,9 @@ pub fn render_template(shell: ShellKind, params: &InstallParams) -> Result<Strin
     };
     let bin = path_to_str(&params.shit_bin)?;
     let sock = path_to_str(&params.socket_path)?;
-    Ok(template.replace("@@SHIT_BIN@@", bin).replace("@@SHIT_SOCK@@", sock))
+    Ok(template
+        .replace("@@SHIT_BIN@@", bin)
+        .replace("@@SHIT_SOCK@@", sock))
 }
 
 /// Compute the install plan (paths, source line, ...) for `shell` and the
@@ -139,7 +141,8 @@ pub fn remove_marker_block(rc_content: &str) -> String {
 }
 
 fn path_to_str(p: &Path) -> Result<&str, InstallError> {
-    p.to_str().ok_or_else(|| InstallError::NonUtf8Path(p.to_path_buf()))
+    p.to_str()
+        .ok_or_else(|| InstallError::NonUtf8Path(p.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -220,6 +223,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.rc_file, PathBuf::from("/home/u/.bashrc"));
-        assert_eq!(plan.hook_file, PathBuf::from("/home/u/.config/shit/hook.bash"));
+        assert_eq!(
+            plan.hook_file,
+            PathBuf::from("/home/u/.config/shit/hook.bash")
+        );
     }
 }

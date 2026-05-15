@@ -120,7 +120,12 @@ fn random_garbage_does_not_panic() {
 #[test]
 fn shell_kind_str_roundtrip() {
     use std::str::FromStr;
-    for k in [ShellKind::Bash, ShellKind::Zsh, ShellKind::Fish, ShellKind::Unknown] {
+    for k in [
+        ShellKind::Bash,
+        ShellKind::Zsh,
+        ShellKind::Fish,
+        ShellKind::Unknown,
+    ] {
         let s = k.as_str();
         let back = ShellKind::from_str(s).unwrap();
         assert_eq!(k, back);
