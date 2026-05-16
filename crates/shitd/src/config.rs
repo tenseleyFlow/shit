@@ -37,7 +37,6 @@ pub struct ResolvedConfig {
     pub hook_socket_path: PathBuf,
     #[allow(dead_code, reason = "consumed by S02.4 ctl-socket listener")]
     pub ctl_socket_path: PathBuf,
-    #[allow(dead_code, reason = "consumed by S02.2 single-instance flock")]
     pub lock_path: PathBuf,
     pub state_dir: PathBuf,
     pub log_level: String,

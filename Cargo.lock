@@ -992,6 +992,8 @@ dependencies = [
  "shit-planner",
  "shit-proto",
  "shit-store",
+ "tempfile",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",

@@ -4,6 +4,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 mod config;
+mod lock;
 mod server;
 
 const LONG_VERSION: &str = concat!(
@@ -58,6 +59,9 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("daemon disabled via config; exiting");
         return Ok(());
     }
+
+    // Single-instance enforcement. Held for the lifetime of `_lock_guard`.
+    let _lock_guard = lock::DaemonLock::acquire(&resolved.lock_path)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
