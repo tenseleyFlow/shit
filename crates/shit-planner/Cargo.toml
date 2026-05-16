@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 shit-proto = { workspace = true }
 serde = { workspace = true }
+postcard = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
