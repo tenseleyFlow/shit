@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use clap::Parser;
+use std::path::PathBuf;
 
-mod paths;
+mod config;
 mod server;
 
 const LONG_VERSION: &str = concat!(
@@ -25,27 +26,41 @@ const LONG_VERSION: &str = concat!(
     long_version = LONG_VERSION,
 )]
 struct Cli {
-    /// Run in the foreground (don't daemonize). The only mode supported in S01.
+    /// Run in the foreground. Only mode supported pre-S22.
     #[arg(long, default_value_t = true)]
     foreground: bool,
 
-    /// Override the socket path. Default: paths::default_socket_path().
+    /// Override config file location. Default: $XDG_CONFIG_HOME/shit/config.toml.
     #[arg(long)]
-    sock: Option<std::path::PathBuf>,
+    config: Option<PathBuf>,
+
+    /// Override the hook socket path (overrides config and defaults).
+    #[arg(long)]
+    sock: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    let mut resolved = config::Config::load(cli.config.as_deref())?.resolve()?;
+    if let Some(s) = cli.sock {
+        resolved.hook_socket_path = s;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&resolved.log_level)),
         )
         .init();
 
-    let sock = cli.sock.unwrap_or_else(paths::default_socket_path);
+    if resolved.disable {
+        tracing::warn!("daemon disabled via config; exiting");
+        return Ok(());
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(server::serve(sock))
+    rt.block_on(server::serve(resolved))
 }

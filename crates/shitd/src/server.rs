@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use crate::config::ResolvedConfig;
 use shit_proto::{HookMessage, MAX_FRAME_SIZE, decode_frame};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::net::UnixDatagram;
 use tracing::{debug, info, warn};
 
-pub async fn serve(sock_path: PathBuf) -> anyhow::Result<()> {
-    // Best-effort: remove a stale socket file from a prior daemon.
-    if Path::new(&sock_path).exists() {
-        let _ = std::fs::remove_file(&sock_path);
-    }
-    if let Some(parent) = sock_path.parent() {
+pub async fn serve(cfg: ResolvedConfig) -> anyhow::Result<()> {
+    if let Some(parent) = cfg.hook_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let sock = UnixDatagram::bind(&sock_path)?;
-    // 0700 — owner-only. Defense in depth; the parent dir's perms already cover the common case.
+    std::fs::create_dir_all(&cfg.state_dir)?;
+
+    if Path::new(&cfg.hook_socket_path).exists() {
+        let _ = std::fs::remove_file(&cfg.hook_socket_path);
+    }
+    let sock = UnixDatagram::bind(&cfg.hook_socket_path)?;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
-    info!(path = %sock_path.display(), "listening");
+    std::fs::set_permissions(
+        &cfg.hook_socket_path,
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    info!(path = %cfg.hook_socket_path.display(), idle_timeout_secs = cfg.idle_timeout_secs, "listening");
 
     let mut buf = vec![0u8; MAX_FRAME_SIZE];
     loop {
