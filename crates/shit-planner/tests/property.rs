@@ -77,18 +77,25 @@ fn arb_path() -> impl Strategy<Value = PathBuf> {
 /// Generate a "file pre-image" event with random fields. ts comes from outside
 /// so we can preserve ordering across an event vec.
 fn arb_pre_image(id: u64, ts: u64) -> impl Strategy<Value = CaptureEvent> {
-    (arb_inode(), arb_path(), arb_blob()).prop_map(move |(inode, path, blob)| CaptureEvent {
-        id: EventId(id),
-        command: cmd(1),
-        ts: TimePoint::new(ts, 0),
-        partial: false,
-        kind: CaptureEventKind::FilePreImage {
-            inode,
-            path,
-            blob,
-            meta: empty_meta(),
-        },
-    })
+    (
+        arb_inode(),
+        arb_path(),
+        arb_blob(),
+        proptest::option::of(arb_blob()),
+    )
+        .prop_map(move |(inode, path, blob, post)| CaptureEvent {
+            id: EventId(id),
+            command: cmd(1),
+            ts: TimePoint::new(ts, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path,
+                blob,
+                meta: empty_meta(),
+                post_content_hash: post,
+            },
+        })
 }
 
 /// Generate `TreeOp::Unlink` event.
@@ -227,6 +234,47 @@ proptest! {
         rec.ended_at = None;
         let p = plan(rec, &events, &probe, &store);
         prop_assert!(p.warnings.iter().any(|w| matches!(w, PlanWarning::UnclosedCommand)));
+    }
+
+    #[test]
+    fn post_hash_mismatch_always_yields_hard_conflict(
+        path in arb_path(),
+        inode in arb_inode(),
+        blob in arb_blob(),
+        post_a in arb_blob(),
+        post_b in arb_blob(),
+    ) {
+        // Pre-condition for the property: the two hashes must differ.
+        prop_assume!(post_a != post_b);
+
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat { inode, meta: empty_meta() },
+            Some(post_b), // current content
+        );
+        store.put_blob(blob, 1);
+
+        let ev = CaptureEvent {
+            id: EventId(0),
+            command: cmd(1),
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path,
+                blob,
+                meta: empty_meta(),
+                post_content_hash: Some(post_a), // expected
+            },
+        };
+        let p = plan(closed_record(), &[ev], &probe, &store);
+        prop_assert!(
+            matches!(p.nodes[0].conflict, Some(Conflict::Hard { .. })),
+            "expected Hard conflict, got {:?}", p.nodes[0].conflict
+        );
+        prop_assert!(p.has_blocking_conflicts());
     }
 }
 

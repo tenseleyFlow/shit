@@ -62,11 +62,24 @@ pub struct CaptureEvent {
 pub enum CaptureEventKind {
     /// Captured pre-mutation content + metadata of a file. The file existed
     /// before the syscall; we recorded its bytes (`blob`) and stat fields.
+    ///
+    /// `post_content_hash` records the content hash immediately after the
+    /// kernel allowed the mutating syscall to complete. The planner uses it
+    /// to detect post-capture modifications: if the current file content
+    /// differs from `post_content_hash` at undo time, the file has been
+    /// edited since our command and a `Conflict::Hard` is emitted so we
+    /// don't silently overwrite the user's later edits.
+    ///
+    /// `None` means the capture tier didn't (or couldn't) compute the
+    /// post-state — e.g. degraded macOS FSEvents-only mode. The planner
+    /// proceeds without post-modification conflict detection in that case,
+    /// and documentation warns the user.
     FilePreImage {
         inode: InodeRef,
         path: PathBuf,
         blob: BlobHash,
         meta: FileMetadata,
+        post_content_hash: Option<BlobHash>,
     },
     /// File metadata changed (chmod/chown/setxattr/setacl/utimes) without a
     /// content change. Stored separately from `FilePreImage` to avoid blob
@@ -270,6 +283,7 @@ mod tests {
                 path: PathBuf::from("/tmp/x"),
                 blob: BlobHash::from_bytes([0x11; 32]),
                 meta: sample_meta(),
+                post_content_hash: Some(BlobHash::from_bytes([0x22; 32])),
             },
         };
         let bytes = postcard::to_allocvec(&ev).unwrap();

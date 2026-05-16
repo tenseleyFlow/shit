@@ -14,8 +14,10 @@
 //! - Events emitted in **reverse-chronological** order so tree-recreate ops
 //!   come before content-restore ops naturally (file is created before bytes
 //!   land in it).
-//! - Conflict detection is path/inode-only — we don't yet correlate against a
-//!   post-image (we don't capture one yet).
+//! - Conflict detection is path/inode + post-image-hash. When the capture
+//!   tier recorded `post_content_hash` and the current file content differs,
+//!   we emit `Conflict::Hard` rather than silently overwrite the user's
+//!   later edits.
 //! - Partial events are dropped with a warning; the rest of the plan still
 //!   produces actionable output.
 
@@ -74,11 +76,29 @@ fn emit_for_event(
             path,
             blob,
             meta,
+            post_content_hash,
         } => {
             let mut conflict = file_path_conflict(path, *inode, probe);
             if conflict.is_none() && store.blob_size_hint(*blob).is_none() {
                 conflict = Some(Conflict::Missing {
                     detail: format!("blob {blob} no longer in store (GC'd or evicted)"),
+                });
+            }
+            // Post-image check: if the capture tier recorded the post-mutation
+            // content hash and the current content doesn't match, the user has
+            // edited the file since our command — applying the restore would
+            // clobber those edits. Surface as Hard so the user must opt in.
+            if conflict.is_none()
+                && let Some(expected_post) = post_content_hash
+                && let Some(current) = probe.content_hash(path)
+                && &current != expected_post
+            {
+                conflict = Some(Conflict::Hard {
+                    detail: format!(
+                        "{} has been modified since the original command; \
+                         restore would overwrite the later edits",
+                        path.display()
+                    ),
                 });
             }
             nodes.push(PlanNode {
@@ -399,6 +419,7 @@ mod tests {
                 path: PathBuf::from("/tmp/x"),
                 blob: BlobHash::from_bytes([1; 32]),
                 meta: meta(0),
+                post_content_hash: None,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -439,6 +460,7 @@ mod tests {
                 path: path.clone(),
                 blob,
                 meta: meta(50),
+                post_content_hash: None,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -477,6 +499,7 @@ mod tests {
                 path,
                 blob: BlobHash::from_bytes([0xFF; 32]),
                 meta: meta(50),
+                post_content_hash: None,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -505,6 +528,7 @@ mod tests {
                 path: PathBuf::from("/tmp/gone"),
                 blob,
                 meta: meta(10),
+                post_content_hash: None,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -544,6 +568,7 @@ mod tests {
                 path,
                 blob,
                 meta: meta(50),
+                post_content_hash: None,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -578,6 +603,7 @@ mod tests {
                 path: path.clone(),
                 blob,
                 meta: meta(50),
+                post_content_hash: None,
             },
         };
         let unlink = CaptureEvent {
@@ -641,5 +667,124 @@ mod tests {
             name: "CHANGED".to_string(),
             value: "pre".to_string(),
         }));
+    }
+
+    #[test]
+    fn post_image_match_no_conflict() {
+        // Captured post_hash matches current content → undo is safe; the
+        // file is still in the post-mutation state.
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 5);
+        let blob = BlobHash::from_bytes([0xAA; 32]); // pre-image content
+        let post = BlobHash::from_bytes([0xBB; 32]); // post-mutation content
+        let path = PathBuf::from("/tmp/foo");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(50),
+            },
+            Some(post), // current content matches expected post
+        );
+        store.put_blob(blob, 50);
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path,
+                blob,
+                meta: meta(100),
+                post_content_hash: Some(post),
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert!(p.nodes[0].conflict.is_none(), "{:?}", p.nodes[0].conflict);
+    }
+
+    #[test]
+    fn post_image_mismatch_yields_hard_conflict() {
+        // Captured post_hash differs from current content → user has edited
+        // the file since the original command. Hard conflict.
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 5);
+        let blob = BlobHash::from_bytes([0xAA; 32]);
+        let expected_post = BlobHash::from_bytes([0xBB; 32]);
+        let current = BlobHash::from_bytes([0xCC; 32]); // != expected_post
+        let path = PathBuf::from("/tmp/foo");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(50),
+            },
+            Some(current),
+        );
+        store.put_blob(blob, 50);
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path,
+                blob,
+                meta: meta(100),
+                post_content_hash: Some(expected_post),
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert!(matches!(p.nodes[0].conflict, Some(Conflict::Hard { .. })));
+        assert!(p.has_blocking_conflicts());
+    }
+
+    #[test]
+    fn post_image_none_disables_check() {
+        // Degraded tier: no post_content_hash recorded. Even if current
+        // content is "wrong", we can't detect it; plan proceeds without
+        // Hard conflict.
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 5);
+        let blob = BlobHash::from_bytes([0xAA; 32]);
+        let path = PathBuf::from("/tmp/foo");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(50),
+            },
+            Some(BlobHash::from_bytes([0xFF; 32])),
+        );
+        store.put_blob(blob, 50);
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path,
+                blob,
+                meta: meta(100),
+                post_content_hash: None,
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert!(p.nodes[0].conflict.is_none());
     }
 }

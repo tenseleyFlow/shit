@@ -231,6 +231,7 @@ mod tests {
                     path: PathBuf::from(format!("/f{seq}")),
                     blob: BlobHash::from_bytes([seq as u8; 32]),
                     meta: empty_meta(),
+                    post_content_hash: None,
                 },
             });
         }
@@ -260,6 +261,7 @@ mod tests {
                     path: PathBuf::from("/some/path"),
                     blob: BlobHash::from_bytes([0; 32]),
                     meta: empty_meta(),
+                    post_content_hash: None,
                 },
             });
         }
