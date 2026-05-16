@@ -14,6 +14,8 @@ pub mod events;
 pub mod inode;
 pub mod inverse;
 pub mod metadata;
+pub mod probe;
+pub mod store;
 pub mod time;
 
 pub use events::{
@@ -23,6 +25,8 @@ pub use events::{
 pub use inode::{BlobHash, InodeRef};
 pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
 pub use metadata::{FileKind, FileMetadata};
+pub use probe::{ProbeStat, StateProbe};
+pub use store::PlannerStore;
 pub use time::{SeqRange, TimePoint, TimeRange};
 
 #[cfg(test)]

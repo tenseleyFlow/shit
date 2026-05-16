@@ -31,7 +31,7 @@ impl std::fmt::Display for InodeRef {
 /// Content-addressed blob handle. Hashing is blake3 throughout the project;
 /// the byte array is the raw 256-bit digest. Hex rendering is provided by
 /// `Display`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BlobHash(pub [u8; 32]);
 
 impl BlobHash {
