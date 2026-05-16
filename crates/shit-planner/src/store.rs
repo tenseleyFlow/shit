@@ -102,11 +102,7 @@ pub mod mock {
             out
         }
 
-        fn events_touching_inode(
-            &self,
-            inode: InodeRef,
-            since: TimePoint,
-        ) -> Vec<CaptureEvent> {
+        fn events_touching_inode(&self, inode: InodeRef, since: TimePoint) -> Vec<CaptureEvent> {
             let mut out: Vec<_> = self
                 .events
                 .iter()

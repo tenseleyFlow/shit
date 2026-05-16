@@ -100,7 +100,11 @@ mod tests {
         let mut p = InMemoryProbe::new();
         let path = PathBuf::from("/tmp/x");
         let stat = sample_stat();
-        p.insert(path.clone(), stat.clone(), Some(BlobHash::from_bytes([1; 32])));
+        p.insert(
+            path.clone(),
+            stat.clone(),
+            Some(BlobHash::from_bytes([1; 32])),
+        );
         assert_eq!(p.stat(&path), Some(stat));
         assert!(p.exists(&path));
         assert_eq!(p.content_hash(&path), Some(BlobHash::from_bytes([1; 32])));
