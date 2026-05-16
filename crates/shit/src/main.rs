@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod hooks;
 mod paths;
 mod send;
+mod status;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -38,6 +39,12 @@ enum Cmd {
     Hooks {
         #[command(subcommand)]
         action: HooksCmd,
+    },
+    /// Show daemon status.
+    Status {
+        /// Override the ctl socket path.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
     },
     /// Send one hook event to the daemon. Invoked by shell hooks.
     #[command(name = "hook-send", hide = true)]
@@ -120,6 +127,7 @@ fn main() -> anyhow::Result<()> {
             HooksCmd::Uninstall { shell } => hooks::uninstall(shell.resolve()),
             HooksCmd::Status => hooks::status(),
         },
+        Cmd::Status { ctl_sock } => status::run(ctl_sock),
         Cmd::HookSend { kind } => send::run(kind),
         Cmd::Internal { action } => match action {
             InternalCmd::NewUuid => {
