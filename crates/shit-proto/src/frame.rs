@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use crate::HookMessage;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub const WIRE_VERSION: u8 = 1;
 
@@ -31,7 +32,12 @@ pub enum DecodeError {
     TooLarge(usize),
 }
 
-pub fn encode_frame(msg: &HookMessage) -> Result<Vec<u8>, EncodeError> {
+/// Encode any postcard-serializable message into the on-wire framing:
+///
+/// ```text
+/// | u32 BE body_len | u8 wire_version | postcard payload |
+/// ```
+pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> {
     let payload = postcard::to_allocvec(msg)?;
     let body_len = 1 + payload.len();
     let total_len = 4 + body_len;
@@ -49,7 +55,8 @@ pub fn encode_frame(msg: &HookMessage) -> Result<Vec<u8>, EncodeError> {
     Ok(frame)
 }
 
-pub fn decode_frame(buf: &[u8]) -> Result<HookMessage, DecodeError> {
+/// Decode any postcard-deserializable message from a complete frame.
+pub fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeError> {
     if buf.len() < 5 {
         return Err(DecodeError::Truncated(buf.len()));
     }

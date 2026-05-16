@@ -46,7 +46,7 @@ fn sample_session_close() -> HookMessage {
 fn roundtrip_session_open() {
     let msg = sample_session_open();
     let frame = encode_frame(&msg).expect("encode");
-    let decoded = decode_frame(&frame).expect("decode");
+    let decoded: HookMessage = decode_frame(&frame).expect("decode");
     assert_eq!(msg, decoded);
 }
 
@@ -54,7 +54,7 @@ fn roundtrip_session_open() {
 fn roundtrip_preexec() {
     let msg = sample_preexec();
     let frame = encode_frame(&msg).expect("encode");
-    let decoded = decode_frame(&frame).expect("decode");
+    let decoded: HookMessage = decode_frame(&frame).expect("decode");
     assert_eq!(msg, decoded);
 }
 
@@ -62,7 +62,7 @@ fn roundtrip_preexec() {
 fn roundtrip_postexec() {
     let msg = sample_postexec();
     let frame = encode_frame(&msg).expect("encode");
-    let decoded = decode_frame(&frame).expect("decode");
+    let decoded: HookMessage = decode_frame(&frame).expect("decode");
     assert_eq!(msg, decoded);
 }
 
@@ -70,14 +70,14 @@ fn roundtrip_postexec() {
 fn roundtrip_session_close() {
     let msg = sample_session_close();
     let frame = encode_frame(&msg).expect("encode");
-    let decoded = decode_frame(&frame).expect("decode");
+    let decoded: HookMessage = decode_frame(&frame).expect("decode");
     assert_eq!(msg, decoded);
 }
 
 #[test]
 fn detect_truncated_frame() {
     let frame = encode_frame(&sample_preexec()).unwrap();
-    let err = decode_frame(&frame[..3]).expect_err("should fail");
+    let err = decode_frame::<HookMessage>(&frame[..3]).expect_err("should fail");
     assert!(matches!(err, DecodeError::Truncated(_)));
 }
 
@@ -85,7 +85,7 @@ fn detect_truncated_frame() {
 fn detect_length_mismatch() {
     let mut frame = encode_frame(&sample_preexec()).unwrap();
     frame.pop();
-    let err = decode_frame(&frame).expect_err("should fail");
+    let err = decode_frame::<HookMessage>(&frame).expect_err("should fail");
     assert!(matches!(err, DecodeError::LengthMismatch { .. }));
 }
 
@@ -93,13 +93,13 @@ fn detect_length_mismatch() {
 fn detect_bad_wire_version() {
     let mut frame = encode_frame(&sample_preexec()).unwrap();
     frame[4] = 99;
-    let err = decode_frame(&frame).expect_err("should fail");
+    let err = decode_frame::<HookMessage>(&frame).expect_err("should fail");
     assert!(matches!(err, DecodeError::UnsupportedVersion(99)));
 }
 
 #[test]
 fn empty_buffer_is_truncated() {
-    let err = decode_frame(&[]).expect_err("should fail");
+    let err = decode_frame::<HookMessage>(&[]).expect_err("should fail");
     assert!(matches!(err, DecodeError::Truncated(0)));
 }
 
@@ -113,7 +113,7 @@ fn random_garbage_does_not_panic() {
         &[0, 0, 0, 0],
     ];
     for case in cases {
-        let _ = decode_frame(case);
+        let _ = decode_frame::<HookMessage>(case);
     }
 }
 

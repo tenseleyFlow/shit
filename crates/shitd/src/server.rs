@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use crate::config::ResolvedConfig;
+use crate::stats::Stats;
 use shit_proto::{HookMessage, MAX_FRAME_SIZE, decode_frame};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixDatagram;
 use tracing::{debug, info, warn};
 
@@ -17,7 +19,7 @@ fn idle_tick(idle_timeout: Duration) -> Duration {
     (idle_timeout / 4).clamp(IDLE_TICK_MIN, IDLE_TICK_MAX)
 }
 
-pub async fn serve(cfg: ResolvedConfig) -> anyhow::Result<()> {
+pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()> {
     if let Some(parent) = cfg.hook_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -40,7 +42,6 @@ pub async fn serve(cfg: ResolvedConfig) -> anyhow::Result<()> {
 
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let tick = idle_tick(idle_timeout);
-    let mut last_activity = Instant::now();
     let mut buf = vec![0u8; MAX_FRAME_SIZE];
 
     loop {
@@ -48,19 +49,25 @@ pub async fn serve(cfg: ResolvedConfig) -> anyhow::Result<()> {
             res = sock.recv_from(&mut buf) => {
                 match res {
                     Ok((n, _peer)) => {
-                        last_activity = Instant::now();
-                        match decode_frame(&buf[..n]) {
-                            Ok(msg) => handle(msg),
-                            Err(e) => warn!(err = %e, len = n, "decode failed"),
+                        match decode_frame::<HookMessage>(&buf[..n]) {
+                            Ok(msg) => {
+                                stats.note_hook_msg();
+                                handle(msg);
+                            }
+                            Err(e) => {
+                                stats.note_decode_error();
+                                warn!(err = %e, len = n, "decode failed");
+                            }
                         }
                     }
                     Err(e) => warn!(err = %e, "recv_from failed"),
                 }
             }
             _ = tokio::time::sleep(tick) => {
-                if last_activity.elapsed() >= idle_timeout {
+                let idle = stats.idle_for();
+                if idle >= idle_timeout {
                     info!(
-                        idle_for_secs = last_activity.elapsed().as_secs(),
+                        idle_for_secs = idle.as_secs(),
                         timeout_secs = idle_timeout.as_secs(),
                         "idle timeout; exiting"
                     );

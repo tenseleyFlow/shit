@@ -2,10 +2,14 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 mod config;
+mod ctl;
 mod lock;
 mod server;
+mod stats;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -60,11 +64,39 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Single-instance enforcement. Held for the lifetime of `_lock_guard`.
     let _lock_guard = lock::DaemonLock::acquire(&resolved.lock_path)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(server::serve(resolved))
+    rt.block_on(run(resolved))
+}
+
+async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
+    let stats = stats::Stats::new();
+    let shutdown = Arc::new(Notify::new());
+
+    let ctl_handle = {
+        let cfg = cfg.clone();
+        let stats = Arc::clone(&stats);
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            if let Err(e) = ctl::serve(&cfg, stats, shutdown).await {
+                tracing::error!(err = %e, "ctl listener exited");
+            }
+        })
+    };
+
+    let stats_for_server = Arc::clone(&stats);
+    let shutdown_for_server = Arc::clone(&shutdown);
+    let result = tokio::select! {
+        r = server::serve(cfg, stats_for_server) => r,
+        _ = shutdown_for_server.notified() => {
+            tracing::info!("shutdown requested via ctl");
+            Ok(())
+        }
+    };
+
+    ctl_handle.abort();
+    result
 }

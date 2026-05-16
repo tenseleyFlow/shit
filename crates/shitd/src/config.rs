@@ -27,14 +27,11 @@ pub struct Config {
     pub disable: bool,
 }
 
-/// Fully-resolved config — what the daemon actually runs on. Some fields are
-/// only consumed by later S02 sub-steps; the `expect` annotations get removed
-/// as each step lands.
+/// Fully-resolved config — what the daemon actually runs on.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub idle_timeout_secs: u64,
     pub hook_socket_path: PathBuf,
-    #[allow(dead_code, reason = "consumed by S02.4 ctl-socket listener")]
     pub ctl_socket_path: PathBuf,
     pub lock_path: PathBuf,
     pub state_dir: PathBuf,
