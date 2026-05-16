@@ -107,15 +107,18 @@ fn arb_event(id: u64, ts: u64) -> impl Strategy<Value = CaptureEvent> {
 }
 
 fn arb_events(n: usize) -> impl Strategy<Value = Vec<CaptureEvent>> {
-    proptest::collection::vec((0u64..1000).prop_flat_map(|ts| (Just(ts), arb_event(0, ts))), 0..n)
-        .prop_map(|pairs| {
-            let mut out = Vec::with_capacity(pairs.len());
-            for (i, (_ts, mut ev)) in pairs.into_iter().enumerate() {
-                ev.id = EventId(i as u64);
-                out.push(ev);
-            }
-            out
-        })
+    proptest::collection::vec(
+        (0u64..1000).prop_flat_map(|ts| (Just(ts), arb_event(0, ts))),
+        0..n,
+    )
+    .prop_map(|pairs| {
+        let mut out = Vec::with_capacity(pairs.len());
+        for (i, (_ts, mut ev)) in pairs.into_iter().enumerate() {
+            ev.id = EventId(i as u64);
+            out.push(ev);
+        }
+        out
+    })
 }
 
 fn populate_probe_and_store(events: &[CaptureEvent]) -> (InMemoryProbe, InMemoryStore) {
