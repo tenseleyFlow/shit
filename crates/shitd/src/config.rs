@@ -32,7 +32,6 @@ pub struct Config {
 /// as each step lands.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
-    #[allow(dead_code, reason = "consumed by S02.3 idle-down timer")]
     pub idle_timeout_secs: u64,
     pub hook_socket_path: PathBuf,
     #[allow(dead_code, reason = "consumed by S02.4 ctl-socket listener")]

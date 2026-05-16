@@ -3,8 +3,19 @@
 use crate::config::ResolvedConfig;
 use shit_proto::{HookMessage, MAX_FRAME_SIZE, decode_frame};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tokio::net::UnixDatagram;
 use tracing::{debug, info, warn};
+
+/// Upper bound on the idle-check interval. We tick more often than this when
+/// the configured timeout is small so short-timeout configs (and tests) don't
+/// wait an entire ceiling-tick before noticing.
+const IDLE_TICK_MAX: Duration = Duration::from_secs(60);
+const IDLE_TICK_MIN: Duration = Duration::from_millis(100);
+
+fn idle_tick(idle_timeout: Duration) -> Duration {
+    (idle_timeout / 4).clamp(IDLE_TICK_MIN, IDLE_TICK_MAX)
+}
 
 pub async fn serve(cfg: ResolvedConfig) -> anyhow::Result<()> {
     if let Some(parent) = cfg.hook_socket_path.parent() {
@@ -21,20 +32,41 @@ pub async fn serve(cfg: ResolvedConfig) -> anyhow::Result<()> {
         &cfg.hook_socket_path,
         std::fs::Permissions::from_mode(0o600),
     )?;
-    info!(path = %cfg.hook_socket_path.display(), idle_timeout_secs = cfg.idle_timeout_secs, "listening");
+    info!(
+        path = %cfg.hook_socket_path.display(),
+        idle_timeout_secs = cfg.idle_timeout_secs,
+        "listening"
+    );
 
+    let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
+    let tick = idle_tick(idle_timeout);
+    let mut last_activity = Instant::now();
     let mut buf = vec![0u8; MAX_FRAME_SIZE];
+
     loop {
-        let (n, _peer) = match sock.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(err = %e, "recv_from failed");
-                continue;
+        tokio::select! {
+            res = sock.recv_from(&mut buf) => {
+                match res {
+                    Ok((n, _peer)) => {
+                        last_activity = Instant::now();
+                        match decode_frame(&buf[..n]) {
+                            Ok(msg) => handle(msg),
+                            Err(e) => warn!(err = %e, len = n, "decode failed"),
+                        }
+                    }
+                    Err(e) => warn!(err = %e, "recv_from failed"),
+                }
             }
-        };
-        match decode_frame(&buf[..n]) {
-            Ok(msg) => handle(msg),
-            Err(e) => warn!(err = %e, len = n, "decode failed"),
+            _ = tokio::time::sleep(tick) => {
+                if last_activity.elapsed() >= idle_timeout {
+                    info!(
+                        idle_for_secs = last_activity.elapsed().as_secs(),
+                        timeout_secs = idle_timeout.as_secs(),
+                        "idle timeout; exiting"
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
 }
