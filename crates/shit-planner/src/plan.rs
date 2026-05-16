@@ -247,9 +247,7 @@ fn emit_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec<PlanNod
                 conflict,
             });
         }
-        TreeOp::Unlink {
-            path, ..
-        } => {
+        TreeOp::Unlink { path, .. } => {
             // The user's command deleted this path; we want to recreate it.
             // We don't know mode/kind from the unlink alone — those come from
             // a paired FilePreImage / FileMetadata. Recreate with conservative
@@ -448,14 +446,8 @@ mod tests {
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
         assert_eq!(p.nodes.len(), 2);
-        assert!(matches!(
-            p.nodes[0].op,
-            InverseOp::RestoreContent { .. }
-        ));
-        assert!(matches!(
-            p.nodes[1].op,
-            InverseOp::RestoreMetadata { .. }
-        ));
+        assert!(matches!(p.nodes[0].op, InverseOp::RestoreContent { .. }));
+        assert!(matches!(p.nodes[1].op, InverseOp::RestoreMetadata { .. }));
         assert!(p.nodes[0].conflict.is_none(), "{:?}", p.nodes[0].conflict);
         assert!(!p.has_blocking_conflicts());
         assert_eq!(p.content_restore_count(), 1);
@@ -491,7 +483,10 @@ mod tests {
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
-        assert!(matches!(p.nodes[0].conflict, Some(Conflict::Missing { .. })));
+        assert!(matches!(
+            p.nodes[0].conflict,
+            Some(Conflict::Missing { .. })
+        ));
     }
 
     #[test]
@@ -516,7 +511,10 @@ mod tests {
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
-        assert!(matches!(p.nodes[0].conflict, Some(Conflict::Missing { .. })));
+        assert!(matches!(
+            p.nodes[0].conflict,
+            Some(Conflict::Missing { .. })
+        ));
     }
 
     #[test]
@@ -552,7 +550,10 @@ mod tests {
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
-        assert!(matches!(p.nodes[0].conflict, Some(Conflict::Phantom { .. })));
+        assert!(matches!(
+            p.nodes[0].conflict,
+            Some(Conflict::Phantom { .. })
+        ));
         assert!(p.has_blocking_conflicts());
     }
 

@@ -83,8 +83,8 @@ pub enum CaptureEventKind {
     /// All maps carry old (pre-command) values where applicable so undo can
     /// restore without re-querying the shell.
     EnvDiff {
-        added: BTreeMap<String, String>,        // name -> value (post)
-        removed: BTreeMap<String, String>,      // name -> value (pre)
+        added: BTreeMap<String, String>,              // name -> value (post)
+        removed: BTreeMap<String, String>,            // name -> value (pre)
         modified: BTreeMap<String, (String, String)>, // name -> (pre, post)
     },
     /// Package-manager operation (apt/dpkg/pacman/dnf/brew/pkg).
