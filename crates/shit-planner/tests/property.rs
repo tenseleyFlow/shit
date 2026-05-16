@@ -214,9 +214,10 @@ proptest! {
 
     #[test]
     fn no_panic_on_empty_or_single_event(ev in arb_event(0, 1)) {
-        let (probe, store) = populate_probe_and_store(&[ev.clone()]);
+        let single = std::slice::from_ref(&ev);
+        let (probe, store) = populate_probe_and_store(single);
         let _ = plan(closed_record(), &[], &probe, &store);
-        let _ = plan(closed_record(), &[ev], &probe, &store);
+        let _ = plan(closed_record(), single, &probe, &store);
     }
 
     #[test]

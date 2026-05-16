@@ -252,12 +252,9 @@ fn emit_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec<PlanNod
             // We don't know mode/kind from the unlink alone — those come from
             // a paired FilePreImage / FileMetadata. Recreate with conservative
             // defaults; the FilePreImage's RestoreMetadata will overwrite.
-            let conflict = match probe.stat(path) {
-                Some(_) => Some(Conflict::Phantom {
-                    detail: format!("{} exists now but didn't expect it to", path.display()),
-                }),
-                None => None,
-            };
+            let conflict = probe.stat(path).map(|_| Conflict::Phantom {
+                detail: format!("{} exists now but didn't expect it to", path.display()),
+            });
             nodes.push(PlanNode {
                 op: InverseOp::RecreatePath {
                     path: path.clone(),
