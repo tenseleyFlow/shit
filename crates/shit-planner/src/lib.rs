@@ -2,8 +2,21 @@
 
 //! Undo planner and inverse-op DAG for `shit`.
 //!
-//! Spec lives in `.docs/sprints/S03-undo-planner-spec.md`. The executor and
-//! per-tier executors land in S11.
+//! This crate is **pure**: no I/O, no syscalls. Inputs are `CaptureEvent`s
+//! fetched from a `PlannerStore` plus a `StateProbe` over the live
+//! filesystem. Output is an `UndoPlan` — a topologically-ordered DAG of
+//! `InverseOp`s with conflict annotations.
+//!
+//! See `.docs/sprints/S03-undo-planner-spec.md` for the design and
+//! `.docs/audits/planner-spec.md` for the longer rationale.
+
+pub mod inode;
+pub mod metadata;
+pub mod time;
+
+pub use inode::{BlobHash, InodeRef};
+pub use metadata::{FileKind, FileMetadata};
+pub use time::{SeqRange, TimePoint, TimeRange};
 
 #[cfg(test)]
 mod tests {

@@ -38,6 +38,7 @@ uuid = { version = "1.11", features = ["v7", "serde"] }
 bytes = "1.8"
 vergen-gitcl = { version = "1.0", features = ["build", "cargo", "rustc"] }
 toml = "0.9"
+proptest = "1.6"
 
 shit-proto = { path = "crates/shit-proto" }
 shit-store = { path = "crates/shit-store" }
