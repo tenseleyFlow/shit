@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod hooks;
 mod paths;
 mod send;
+mod service;
 mod status;
 
 const LONG_VERSION: &str = concat!(
@@ -46,6 +47,11 @@ enum Cmd {
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
+    /// Install / manage the daemon under launchd, systemd --user, runit, or manual mode.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
     /// Send one hook event to the daemon. Invoked by shell hooks.
     #[command(name = "hook-send", hide = true)]
     HookSend {
@@ -58,6 +64,20 @@ enum Cmd {
         #[command(subcommand)]
         action: InternalCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Render the right template, write it, and register with the service manager.
+    Install,
+    /// Deregister from the service manager and remove the template file.
+    Uninstall,
+    /// Ask the service manager to start the daemon.
+    Start,
+    /// Ask the service manager to stop the daemon.
+    Stop,
+    /// Print service-manager-side status for the daemon.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -128,6 +148,13 @@ fn main() -> anyhow::Result<()> {
             HooksCmd::Status => hooks::status(),
         },
         Cmd::Status { ctl_sock } => status::run(ctl_sock),
+        Cmd::Service { action } => match action {
+            ServiceCmd::Install => service::install(),
+            ServiceCmd::Uninstall => service::uninstall(),
+            ServiceCmd::Start => service::start(),
+            ServiceCmd::Stop => service::stop(),
+            ServiceCmd::Status => service::status(),
+        },
         Cmd::HookSend { kind } => send::run(kind),
         Cmd::Internal { action } => match action {
             InternalCmd::NewUuid => {
