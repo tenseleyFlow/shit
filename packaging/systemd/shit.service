@@ -1,0 +1,34 @@
+# shit daemon systemd user unit template.
+# Substituted at install time:
+#   @@SHITD_BIN@@    — absolute path to the shitd binary
+#   @@CONFIG_PATH@@  — absolute path to the shitd config file
+#
+# Install: ~/.config/systemd/user/shit.service
+# Enable:  systemctl --user enable --now shit.service
+
+[Unit]
+Description=shit daemon — magic undo for the command line
+Documentation=https://github.com/tenseleyFlow/shit
+After=default.target
+
+[Service]
+Type=exec
+ExecStart=@@SHITD_BIN@@ --foreground --config @@CONFIG_PATH@@
+
+Restart=on-failure
+RestartSec=10
+
+# Hardening (relaxed; shitd is per-user, not privileged)
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=full
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+#!/bin/sh
+# shit daemon runit service template.
+# Substituted at install time:
+#   @@SHITD_BIN@@    — absolute path to the shitd binary
+#   @@CONFIG_PATH@@  — absolute path to the shitd config file
+#
+# Install: ~/.config/service/shit/run (or system /etc/sv/shit/run + symlink)
+
+exec 2>&1
+exec @@SHITD_BIN@@ --foreground --config @@CONFIG_PATH@@

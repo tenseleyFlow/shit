@@ -40,8 +40,16 @@ pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()>
         "listening"
     );
 
+    let idle_disabled = cfg.idle_timeout_secs == 0;
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
-    let tick = idle_tick(idle_timeout);
+    let tick = if idle_disabled {
+        Duration::from_secs(3600) // dummy: we never check the condition
+    } else {
+        idle_tick(idle_timeout)
+    };
+    if idle_disabled {
+        info!("idle-down disabled (idle_timeout_secs = 0)");
+    }
     let mut buf = vec![0u8; MAX_FRAME_SIZE];
 
     loop {
@@ -64,6 +72,7 @@ pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()>
                 }
             }
             _ = tokio::time::sleep(tick) => {
+                if idle_disabled { continue; }
                 let idle = stats.idle_for();
                 if idle >= idle_timeout {
                     info!(
