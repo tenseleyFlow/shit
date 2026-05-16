@@ -12,6 +12,7 @@
 
 pub mod events;
 pub mod inode;
+pub mod inverse;
 pub mod metadata;
 pub mod time;
 
@@ -20,6 +21,7 @@ pub use events::{
     PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
 };
 pub use inode::{BlobHash, InodeRef};
+pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
 pub use metadata::{FileKind, FileMetadata};
 pub use time::{SeqRange, TimePoint, TimeRange};
 
