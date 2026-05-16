@@ -80,10 +80,12 @@ pub enum CaptureEventKind {
     /// Filesystem tree operations.
     TreeOp(TreeOp),
     /// Environment variable diff observed across a command (shell-side capture).
+    /// All maps carry old (pre-command) values where applicable so undo can
+    /// restore without re-querying the shell.
     EnvDiff {
-        added: BTreeMap<String, String>,
-        removed: Vec<String>,
-        modified: BTreeMap<String, (String, String)>, // name -> (before, after)
+        added: BTreeMap<String, String>,        // name -> value (post)
+        removed: BTreeMap<String, String>,      // name -> value (pre)
+        modified: BTreeMap<String, (String, String)>, // name -> (pre, post)
     },
     /// Package-manager operation (apt/dpkg/pacman/dnf/brew/pkg).
     PackageOp {
@@ -315,7 +317,11 @@ mod tests {
             partial: false,
             kind: CaptureEventKind::EnvDiff {
                 added,
-                removed: vec!["BAZ".to_string()],
+                removed: {
+                    let mut m = BTreeMap::new();
+                    m.insert("BAZ".to_string(), "old".to_string());
+                    m
+                },
                 modified: BTreeMap::new(),
             },
         };

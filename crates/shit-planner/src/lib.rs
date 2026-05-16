@@ -14,9 +14,12 @@ pub mod events;
 pub mod inode;
 pub mod inverse;
 pub mod metadata;
+pub mod plan;
 pub mod probe;
 pub mod store;
 pub mod time;
+
+pub use plan::plan;
 
 pub use events::{
     CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, NetworkTool, PackageManager,
