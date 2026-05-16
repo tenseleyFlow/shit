@@ -9,9 +9,16 @@ authors.workspace = true
 
 [dependencies]
 shit-proto = { workspace = true }
+shit-planner = { workspace = true }
 rusqlite = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

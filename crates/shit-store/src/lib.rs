@@ -4,10 +4,6 @@
 //!
 //! Spec lives in `.docs/sprints/S04-blob-and-index-store.md`.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_wires_up() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod blob;
+
+pub use blob::{BlobError, BlobStat, BlobStore};

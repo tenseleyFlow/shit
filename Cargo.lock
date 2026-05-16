@@ -1089,10 +1089,15 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytes",
+ "postcard",
  "rusqlite",
+ "serde",
+ "shit-planner",
  "shit-proto",
+ "tempfile",
  "thiserror",
  "tracing",
+ "uuid",
  "zstd",
 ]
 

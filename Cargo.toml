@@ -40,10 +40,10 @@ vergen-gitcl = { version = "1.0", features = ["build", "cargo", "rustc"] }
 toml = "0.9"
 proptest = "1.6"
 
+shit-planner = { path = "crates/shit-planner" }
 shit-proto = { path = "crates/shit-proto" }
 shit-store = { path = "crates/shit-store" }
 shit-capture = { path = "crates/shit-capture" }
-shit-planner = { path = "crates/shit-planner" }
 shit-shell = { path = "crates/shit-shell" }
 
 [profile.release]
