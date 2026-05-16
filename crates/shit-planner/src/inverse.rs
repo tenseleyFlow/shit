@@ -305,12 +305,7 @@ mod tests {
         assert!(Conflict::Hard { detail: "x".into() }.is_blocking());
         assert!(Conflict::Phantom { detail: "x".into() }.is_blocking());
         assert!(!Conflict::Soft { detail: "x".into() }.is_blocking());
-        assert!(
-            !Conflict::Missing {
-                detail: "x".into()
-            }
-            .is_blocking()
-        );
+        assert!(!Conflict::Missing { detail: "x".into() }.is_blocking());
     }
 
     #[test]
