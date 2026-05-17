@@ -1,0 +1,134 @@
+name: perf
+
+# S21.9 — perf regression gates.
+#
+# Runs the bench harness on every PR and on every push to trunk.
+# Compares against per-OS baseline JSON files committed under
+# benches/regression/baselines/. If a baseline doesn't exist yet
+# (first run on a new OS, or after a deliberate plan-perf-budget
+# update), the comparison degrades to absolute-budget checks only and
+# the workflow still passes — the operator commits the produced
+# `<workload>.json` artifact as the seed baseline.
+#
+# On regression the workflow uploads:
+#   - the bench JSON artifacts (always)
+#   - a cargo-flamegraph SVG of the failing workload (Linux only;
+#     macOS sampling needs an entitlement we don't have in CI)
+#
+# Deliberate scope (this chunk):
+#   - baseline workload (no hooks): valid on day one.
+#   - tight-loop workload (no hooks installed in this CI; runs the
+#     same /bin/sh -c ':' as baseline). When DR-69 lands the
+#     "live daemon + hooks" matrix, this step gets the hooked-shell
+#     environment and becomes a real perf gate. Until then it's a
+#     duplicate of baseline — useful as a workflow shape check, not
+#     as a regression detector.
+#   - cargo-build / find-workload / git-clone: skipped pending
+#     fixture provisioning. They're deferred to DR-69 alongside the
+#     hook-install step.
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Perf workflow doesn't add -D warnings — we want it to succeed even
+  # on small clippy churn. The `ci` workflow is the place for warnings.
+
+jobs:
+  bench:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key from `ci` so a perf-only rebuild
+          # doesn't churn the main CI cache.
+          shared-key: perf
+
+      - name: build benches (release)
+        run: cargo build --release -p shit-regression-bench
+
+      - name: prepare bench output dir
+        run: mkdir -p target/bench
+
+      - name: run baseline workload
+        run: |
+          ./target/release/baseline \
+            --n 500 \
+            --out target/bench/baseline.json
+          cat target/bench/baseline.json
+
+      - name: run tight-loop workload
+        run: |
+          ./target/release/tight-loop \
+            --n 500 \
+            --out target/bench/tight-loop.json
+          cat target/bench/tight-loop.json
+
+      - name: derive baseline path
+        id: baseline
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-24.04) bp=ubuntu-24.04-x86_64 ;;
+            macos-14)     bp=macos-14-aarch64 ;;
+            *)            bp=unknown ;;
+          esac
+          echo "tight_loop=benches/regression/baselines/$bp-tight-loop.json" >> "$GITHUB_OUTPUT"
+
+      # Note: the `baseline` workload is the no-hook floor (raw
+      # /bin/sh spawn cost). We do NOT gate it against SHELL_HOOK —
+      # that budget is for the shell-hook overhead, not the OS-level
+      # spawn floor. The baseline JSON is for human inspection and
+      # for the eventual "subtract floor from hooked" math when DR-69
+      # lights up the live-daemon matrix.
+      #
+      # Tight-loop also runs unhooked in this workflow today, so
+      # --no-budget skips the absolute SHELL_HOOK gate (which only
+      # makes sense once hooks are installed) and relies on relative
+      # regression vs the per-OS baseline.
+      - name: compare tight-loop vs baseline (relative-only)
+        id: tight_loop_compare
+        run: |
+          ./target/release/compare \
+            --current target/bench/tight-loop.json \
+            --baseline ${{ steps.baseline.outputs.tight_loop }} \
+            --gate shell-hook \
+            --no-budget
+
+      - name: upload bench JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: target/bench/*.json
+          retention-days: 14
+
+      # Flamegraph capture on regression (Linux only).
+      - name: install cargo-flamegraph
+        if: failure() && matrix.os == 'ubuntu-24.04'
+        run: cargo install flamegraph --locked || true
+      - name: capture flamegraph (tight-loop)
+        if: failure() && matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+          cargo flamegraph -p shit-regression-bench --bin tight-loop \
+            -o target/bench/tight-loop.svg -- --n 200 || true
+      - name: upload flamegraph
+        if: failure() && matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flamegraph-${{ matrix.os }}
+          path: target/bench/*.svg
+          retention-days: 14
