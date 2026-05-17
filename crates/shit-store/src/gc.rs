@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::blob::BlobStore;
 use crate::index::{Index, IndexError};
-use crate::refcount::{ReapBatch, reap_commands};
+use crate::refcount::reap_commands;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {

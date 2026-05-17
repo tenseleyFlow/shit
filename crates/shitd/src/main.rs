@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 
 mod config;
 mod ctl;
+mod gc;
 mod helper_link;
 mod lock;
 mod server;
@@ -82,6 +83,38 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let index = Arc::new(shit_store::Index::open(&index_path)?);
     tracing::info!(path = %index_path.display(), "index opened");
 
+    let blobs_path = cfg.state_dir.join("blobs");
+    let blob_store = Arc::new(shit_store::BlobStore::open(&blobs_path)?);
+    tracing::info!(path = %blobs_path.display(), "blob store opened");
+
+    let gc_signal = Arc::new(gc::GcSignal::new());
+    let gc_handle = {
+        let index = Arc::clone(&index);
+        let blob_store = Arc::clone(&blob_store);
+        let signal = Arc::clone(&gc_signal);
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            // Stage-1 logical clock: a monotonic counter incrementing
+            // once per pass. Replaced by the daemon's real logical
+            // clock once the capture-runtime pipeline lights up.
+            let counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            let now_logical_fn = {
+                let counter = Arc::clone(&counter);
+                Arc::new(move || counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    as Arc<dyn Fn() -> u64 + Send + Sync>
+            };
+            gc::run_loop(
+                index,
+                blob_store,
+                gc::GcTaskConfig::default(),
+                signal,
+                shutdown,
+                now_logical_fn,
+            )
+            .await;
+        })
+    };
+
     let ctl_handle = {
         let cfg = cfg.clone();
         let stats = Arc::clone(&stats);
@@ -104,5 +137,6 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     };
 
     ctl_handle.abort();
+    gc_handle.abort();
     result
 }
