@@ -1066,6 +1066,7 @@ name = "shit-helper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags",
  "clap",
  "libc",
  "nix",
