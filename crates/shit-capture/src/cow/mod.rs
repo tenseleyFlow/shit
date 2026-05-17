@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 pub mod clonefile_macos;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod copy_file_range;
+pub mod engine;
 mod error;
 #[cfg(target_os = "linux")]
 pub mod ficlone_linux;
@@ -23,6 +24,7 @@ pub mod hardlink;
 pub mod streaming;
 pub mod verify;
 
+pub use engine::{DefaultEngine, would_pick};
 pub use error::CowError;
 
 /// Which strategy actually produced the captured blob.
