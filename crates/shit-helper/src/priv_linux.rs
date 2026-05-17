@@ -44,9 +44,12 @@ pub fn drop_to_minimum() -> Result<(), PrivError> {
     // CAP_LAST_CAP varies by kernel; we probe by trying CAP_DROP up to
     // a known-safe ceiling. Capabilities above the real CAP_LAST_CAP
     // return EINVAL which we ignore.
+    // Numeric values from <linux/capability.h> — libc on stable doesn't
+    // expose CAP_SYS_ADMIN / CAP_BPF / CAP_PERFMON as constants. Pinning
+    // the numbers explicitly here is the standard portable pattern and
+    // is what `man capabilities` documents.
     const KEEP: &[u32] = &[
-        libc::CAP_SYS_ADMIN as u32,
-        // libc on stable doesn't expose CAP_BPF/CAP_PERFMON yet; use raw values.
+        21, // CAP_SYS_ADMIN
         39, // CAP_BPF
         38, // CAP_PERFMON
     ];
