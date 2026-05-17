@@ -436,6 +436,23 @@ impl Index {
         })?;
         Ok(n as u64)
     }
+
+    /// Count of distinct blobs recorded in the index. Surfaced via
+    /// `shit metrics` (S21.4) as `store_blob_count`.
+    pub fn blob_count(&self) -> Result<u64, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// Count of recorded commands. Surfaced via `shit metrics` as
+    /// `store_command_count`. Does not double-count commands across
+    /// sessions; each row is one (session, seq) pair.
+    pub fn command_count(&self) -> Result<u64, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))?;
+        Ok(n.max(0) as u64)
+    }
 }
 
 /// Apply path-history maintenance using a borrowed Connection (so the same
