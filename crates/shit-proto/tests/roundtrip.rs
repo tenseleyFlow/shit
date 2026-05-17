@@ -139,3 +139,63 @@ fn frame_size_is_bounded() {
     assert!(frame.len() <= shit_proto::MAX_FRAME_SIZE);
     assert!(frame.len() >= 5);
 }
+
+#[test]
+fn db_engine_wire_str_roundtrip() {
+    use shit_proto::DbEngineWire;
+    use std::str::FromStr;
+    for e in [
+        DbEngineWire::Postgres,
+        DbEngineWire::Mysql,
+        DbEngineWire::Sqlite3,
+    ] {
+        let back = DbEngineWire::from_str(e.as_str()).unwrap();
+        assert_eq!(e, back);
+    }
+    // Aliases.
+    assert_eq!(
+        DbEngineWire::from_str("postgres").unwrap(),
+        DbEngineWire::Postgres
+    );
+    assert_eq!(
+        DbEngineWire::from_str("mariadb").unwrap(),
+        DbEngineWire::Mysql
+    );
+    assert_eq!(
+        DbEngineWire::from_str("sqlite").unwrap(),
+        DbEngineWire::Sqlite3
+    );
+    assert!(DbEngineWire::from_str("oracle").is_err());
+}
+
+#[test]
+fn db_event_req_postcard_roundtrip() {
+    use shit_proto::{CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase};
+    use std::collections::BTreeMap;
+    let req = DbEventReq {
+        engine: DbEngineWire::Postgres,
+        phase: PkgPhase::Pre,
+        conn: DbConnInfo {
+            host: "db.example.com".into(),
+            port: Some(5432),
+            user: "alice".into(),
+            target: "production".into(),
+        },
+        statements: vec!["INSERT INTO t VALUES (1)".into()],
+        transaction_state: DbTxStateWire::Unknown,
+        pid: 9999,
+        uid: 1000,
+        extras: BTreeMap::from([("xact_commit_pre".into(), "42".into())]),
+    };
+    let frame = encode_frame(&CtlRequest::DbEvent(req.clone())).unwrap();
+    let back: CtlRequest = decode_frame(&frame).unwrap();
+    match back {
+        CtlRequest::DbEvent(r) => {
+            assert_eq!(r.engine, req.engine);
+            assert_eq!(r.conn.host, req.conn.host);
+            assert_eq!(r.statements, req.statements);
+            assert_eq!(r.extras, req.extras);
+        }
+        other => panic!("expected DbEvent, got {other:?}"),
+    }
+}
