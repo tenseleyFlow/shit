@@ -15,6 +15,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+#[cfg(target_os = "freebsd")]
+mod capsicum_bsd;
 mod crash;
 #[cfg(target_os = "linux")]
 mod ebpf;
@@ -32,8 +34,6 @@ mod ipc;
     target_os = "dragonfly",
 ))]
 mod kqueue;
-#[cfg(target_os = "freebsd")]
-mod capsicum_bsd;
 #[cfg(target_os = "linux")]
 mod priv_linux;
 mod sandbox;

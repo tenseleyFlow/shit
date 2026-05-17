@@ -160,10 +160,7 @@ impl BsdProbe {
     /// Render a one-line diagnosis for `shit doctor`.
     pub fn diagnose(&self) -> String {
         let zfs_bit = if self.zfs.usable() {
-            format!(
-                "zfs (pools={})",
-                self.zfs.pool_count.unwrap_or(0)
-            )
+            format!("zfs (pools={})", self.zfs.pool_count.unwrap_or(0))
         } else if self.zfs.binary_present {
             "zfs binary present, no pools".to_string()
         } else {
@@ -217,7 +214,10 @@ fn which_zfs() -> Option<std::path::PathBuf> {
 }
 
 fn count_pools() -> Option<u32> {
-    let out = Command::new("zpool").args(["list", "-H", "-o", "name"]).output().ok()?;
+    let out = Command::new("zpool")
+        .args(["list", "-H", "-o", "name"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return Some(0);
     }
@@ -254,9 +254,7 @@ pub fn dataset_for_path(path: &Path) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let name = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .to_string();
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if name.is_empty() { None } else { Some(name) }
 }
 

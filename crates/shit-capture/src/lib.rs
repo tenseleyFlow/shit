@@ -6,10 +6,6 @@
 //! land in S07 (macOS EndpointSecurity), S08 (Linux fanotify), S09 (Linux eBPF-LSM),
 //! and S10 (BSD kqueue).
 
-pub mod cow;
-pub mod fs_matrix;
-#[cfg(target_os = "linux")]
-pub mod linux_kernel;
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
@@ -17,6 +13,10 @@ pub mod linux_kernel;
     target_os = "dragonfly",
 ))]
 pub mod bsd_probe;
+pub mod cow;
+pub mod fs_matrix;
+#[cfg(target_os = "linux")]
+pub mod linux_kernel;
 
 pub use cow::{
     CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier, DefaultEngine, would_pick,
