@@ -57,7 +57,7 @@ Tests are first-class. Write tests as you go for the sprint's targets. The CI ma
 
 ### Architectural decisions already locked
 
-- **Rust 2024 edition**, MSRV 1.85.
+- **Rust 2024 edition**, MSRV 1.88 (bumped from 1.85 in S20.13: helper.rs uses `let` chains stabilized in 1.88).
 - **No `notify` crate.** Watcher abstractions are per-platform from day one. Don't introduce a portable wrapper "for convenience" — it'll lose the OS-specific events we need.
 - **`thiserror` at library boundaries, `anyhow` only in `main`.**
 - **`postcard` for IPC, `serde` JSON only for human-facing config.**
