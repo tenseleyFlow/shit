@@ -166,9 +166,18 @@ mod tests {
                 body.starts_with("#!/usr/bin/env bash"),
                 "{name} wrapper missing bash shebang"
             );
-            assert!(body.contains("SPDX-License-Identifier"), "{name} missing SPDX");
-            assert!(body.contains("proc-event"), "{name} doesn't call proc-event");
-            assert!(body.contains("target-argv"), "{name} doesn't pass target-argv");
+            assert!(
+                body.contains("SPDX-License-Identifier"),
+                "{name} missing SPDX"
+            );
+            assert!(
+                body.contains("proc-event"),
+                "{name} doesn't call proc-event"
+            );
+            assert!(
+                body.contains("target-argv"),
+                "{name} doesn't pass target-argv"
+            );
         }
     }
 

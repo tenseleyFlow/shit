@@ -238,10 +238,7 @@ mod tests {
         let s = sug(
             &["app"],
             "/",
-            &[
-                ("GITHUB_TOKEN", "<redacted:deadbeef>"),
-                ("WORKERS", "4"),
-            ],
+            &[("GITHUB_TOKEN", "<redacted:deadbeef>"), ("WORKERS", "4")],
             RestartHint::RawArgv,
         );
         let out = render(&[s], RedactionDisplay::HideEntirely);
@@ -320,4 +317,3 @@ mod tests {
         assert!(out.contains(r"killed: echo 'it'\''s'"));
     }
 }
-
