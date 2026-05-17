@@ -125,15 +125,17 @@ unsafe fn cfr(
 ) -> isize {
     // Linux: SYS_copy_file_range = 326 on x86_64; libc::copy_file_range
     // is gated by version, so we call the syscall directly.
-    libc::syscall(
-        libc::SYS_copy_file_range,
-        src_fd,
-        src_off,
-        dst_fd,
-        dst_off,
-        len,
-        flags,
-    ) as isize
+    unsafe {
+        libc::syscall(
+            libc::SYS_copy_file_range,
+            src_fd,
+            src_off,
+            dst_fd,
+            dst_off,
+            len,
+            flags,
+        ) as isize
+    }
 }
 
 #[cfg(target_os = "freebsd")]
@@ -146,7 +148,7 @@ unsafe fn cfr(
     flags: u32,
 ) -> isize {
     // FreeBSD 13+ exposes copy_file_range as a libc function.
-    libc::copy_file_range(src_fd, src_off, dst_fd, dst_off, len, flags) as isize
+    unsafe { libc::copy_file_range(src_fd, src_off, dst_fd, dst_off, len, flags) as isize }
 }
 
 fn hash_file(path: &Path) -> Result<BlobHash, CowError> {
