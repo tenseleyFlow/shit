@@ -45,13 +45,13 @@ pub fn capture_clonefile(
     fs::create_dir_all(&tmp_dir)?;
     let tmp_path = unique_tmp(&tmp_dir);
 
-    let c_src = CString::new(src_path.as_os_str().as_bytes())
-        .map_err(|_| CowError::TierUnsupported {
+    let c_src =
+        CString::new(src_path.as_os_str().as_bytes()).map_err(|_| CowError::TierUnsupported {
             tier: "clonefile",
             detail: "src path contains NUL".into(),
         })?;
-    let c_dst = CString::new(tmp_path.as_os_str().as_bytes())
-        .map_err(|_| CowError::TierUnsupported {
+    let c_dst =
+        CString::new(tmp_path.as_os_str().as_bytes()).map_err(|_| CowError::TierUnsupported {
             tier: "clonefile",
             detail: "dst path contains NUL".into(),
         })?;

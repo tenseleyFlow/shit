@@ -15,10 +15,7 @@ use std::os::fd::AsRawFd;
 fn blob_root_with_no_write_perms_surfaces_io_error() {
     let tmp = tempfile::tempdir().unwrap();
     let src_path = tmp.path().join("source.txt");
-    File::create(&src_path)
-        .unwrap()
-        .write_all(b"x")
-        .unwrap();
+    File::create(&src_path).unwrap().write_all(b"x").unwrap();
 
     let blob_root = tmp.path().join("readonly");
     std::fs::create_dir_all(&blob_root).unwrap();
@@ -32,15 +29,9 @@ fn blob_root_with_no_write_perms_surfaces_io_error() {
 
     let engine = DefaultEngine::new();
     let f = File::open(&src_path).unwrap();
-    let res = engine.capture(
-        f.as_raw_fd(),
-        &src_path,
-        &blob_root,
-        CaptureOpts::default(),
-    );
+    let res = engine.capture(f.as_raw_fd(), &src_path, &blob_root, CaptureOpts::default());
 
     // Restore perms so tempdir cleanup works on drop.
-    use std::os::unix::fs::PermissionsExt as _;
     let mut perms = std::fs::metadata(&blob_root).unwrap().permissions();
     perms.set_mode(0o700);
     let _ = std::fs::set_permissions(&blob_root, perms);

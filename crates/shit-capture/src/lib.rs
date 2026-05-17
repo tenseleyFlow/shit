@@ -9,5 +9,7 @@
 pub mod cow;
 pub mod fs_matrix;
 
-pub use cow::{CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier, DefaultEngine, would_pick};
+pub use cow::{
+    CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier, DefaultEngine, would_pick,
+};
 pub use fs_matrix::{FsKind, detect_fs, pick_tier, supported_tiers};

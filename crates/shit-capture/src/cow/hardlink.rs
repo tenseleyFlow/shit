@@ -161,13 +161,16 @@ mod tests {
     fn hardlink_refuses_when_source_not_doomed() {
         let tmp = tempfile::tempdir().unwrap();
         let src_path = tmp.path().join("source.txt");
-        File::create(&src_path)
-            .unwrap()
-            .write_all(b"x")
-            .unwrap();
+        File::create(&src_path).unwrap().write_all(b"x").unwrap();
         let f = File::open(&src_path).unwrap();
         let err = capture_hardlink(f.as_raw_fd(), &src_path, tmp.path(), false).unwrap_err();
-        assert!(matches!(err, CowError::TierUnsupported { tier: "hardlink", .. }));
+        assert!(matches!(
+            err,
+            CowError::TierUnsupported {
+                tier: "hardlink",
+                ..
+            }
+        ));
     }
 
     #[test]

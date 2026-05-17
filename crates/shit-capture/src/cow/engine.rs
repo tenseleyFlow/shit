@@ -189,21 +189,13 @@ mod tests {
         let engine = DefaultEngine::new();
         let f = std::fs::File::open(&src_path).unwrap();
         let outcome = engine
-            .capture(
-                f.as_raw_fd(),
-                &src_path,
-                tmp.path(),
-                CaptureOpts::default(),
-            )
+            .capture(f.as_raw_fd(), &src_path, tmp.path(), CaptureOpts::default())
             .unwrap();
         // Highest tier we can guarantee on any test runner is Streaming;
         // on the dev mac it'll be Clonefile. Either is fine.
         assert!(matches!(
             outcome.tier,
-            CowTier::Clonefile
-                | CowTier::Reflink
-                | CowTier::CopyFileRange
-                | CowTier::StreamingCopy
+            CowTier::Clonefile | CowTier::Reflink | CowTier::CopyFileRange | CowTier::StreamingCopy
         ));
     }
 
@@ -219,12 +211,7 @@ mod tests {
         let engine = DefaultEngine::new();
         let f = std::fs::File::open(&src_path).unwrap();
         let outcome = engine
-            .capture(
-                f.as_raw_fd(),
-                &src_path,
-                tmp.path(),
-                CaptureOpts::default(),
-            )
+            .capture(f.as_raw_fd(), &src_path, tmp.path(), CaptureOpts::default())
             .unwrap();
         let store = shit_store::BlobStore::open(tmp.path()).unwrap();
         // Either path produces a queryable blob.

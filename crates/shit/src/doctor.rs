@@ -6,14 +6,7 @@
 use shit_capture::{CaptureOpts, CowTier, FsKind, detect_fs, supported_tiers, would_pick};
 use std::path::{Path, PathBuf};
 
-const CANDIDATE_PATHS: &[&str] = &[
-    "$HOME",
-    "/etc",
-    "/usr/local",
-    "/opt",
-    "/tmp",
-    "/var/tmp",
-];
+const CANDIDATE_PATHS: &[&str] = &["$HOME", "/etc", "/usr/local", "/opt", "/tmp", "/var/tmp"];
 
 #[derive(Debug)]
 struct Row {
@@ -85,16 +78,10 @@ fn caveats_for(fs: &FsKind, picked: Option<&CowTier>) -> Vec<String> {
 }
 
 fn print_table(rows: &[Row]) {
-    println!(
-        "{:<22}  {:<10}  {:<16}  caveats",
-        "path", "fs", "tier"
-    );
+    println!("{:<22}  {:<10}  {:<16}  caveats", "path", "fs", "tier");
     println!("{}", "-".repeat(72));
     for r in rows {
-        let tier = r
-            .picked
-            .map(|t| t.as_str())
-            .unwrap_or("<none>");
+        let tier = r.picked.map(|t| t.as_str()).unwrap_or("<none>");
         println!(
             "{:<22}  {:<10}  {:<16}  {}",
             truncate(&r.path.display().to_string(), 22),

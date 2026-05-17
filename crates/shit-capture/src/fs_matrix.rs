@@ -81,7 +81,11 @@ impl FsKind {
 /// for non-synthetic filesystems.
 pub fn supported_tiers(fs: &FsKind) -> Vec<CowTier> {
     match fs {
-        FsKind::Apfs => vec![CowTier::Clonefile, CowTier::Hardlink, CowTier::StreamingCopy],
+        FsKind::Apfs => vec![
+            CowTier::Clonefile,
+            CowTier::Hardlink,
+            CowTier::StreamingCopy,
+        ],
         FsKind::Btrfs => vec![
             CowTier::Reflink,
             CowTier::CopyFileRange,

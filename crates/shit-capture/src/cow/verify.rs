@@ -56,10 +56,7 @@ impl SourceFingerprint {
 
 /// Compare two fingerprints, returning `Err(SourceMutated)` if they
 /// differ. Used pre- and post-capture for non-atomic tiers.
-pub fn assert_stable(
-    before: SourceFingerprint,
-    after: SourceFingerprint,
-) -> Result<(), CowError> {
+pub fn assert_stable(before: SourceFingerprint, after: SourceFingerprint) -> Result<(), CowError> {
     if before == after {
         Ok(())
     } else {

@@ -49,16 +49,7 @@ pub fn capture_copy_file_range(
 
     while remaining > 0 {
         let want = remaining.min(COPY_CHUNK as isize) as usize;
-        let n = unsafe {
-            cfr(
-                src_fd,
-                &mut src_off,
-                dst.as_raw_fd(),
-                &mut dst_off,
-                want,
-                0,
-            )
-        };
+        let n = unsafe { cfr(src_fd, &mut src_off, dst.as_raw_fd(), &mut dst_off, want, 0) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             drop(dst);
