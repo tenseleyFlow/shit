@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 #[cfg(target_os = "freebsd")]
 mod capsicum_bsd;
 mod crash;
+mod db;
 #[cfg(target_os = "linux")]
 mod ebpf;
 #[cfg(target_os = "linux")]
@@ -204,6 +205,33 @@ enum Mode {
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
+    /// Single-shot DB CLI shim invocation (S19, stretch). Sent by the
+    /// opt-in `psql`/`mysql`/`sqlite3` wrappers. The wrapper passes
+    /// the user's argv (post-tool-name) newline-separated so we can
+    /// recover the connection target, and pipes the statement text on
+    /// `--statement-blob` (also newline-separated for `-f` multi-stmt
+    /// scripts).
+    ///
+    /// Same hook-friendly error policy as `pkg-event` etc.: shit-side
+    /// failure never breaks the user's DB invocation.
+    #[command(name = "db-event")]
+    DbEvent {
+        /// DB engine identifier (psql|mysql|sqlite3).
+        engine: String,
+        /// Phase of the operation (pre|post).
+        phase: String,
+        /// User's argv after the tool name, newline-separated.
+        #[arg(long, default_value = "")]
+        target_argv: String,
+        /// SQL text — for `-c "<stmt>"` it's the literal -c value;
+        /// for `-f <file>` the wrapper reads the file and pipes its
+        /// contents. Multi-statement scripts are split planner-side.
+        #[arg(long, default_value = "")]
+        statement_blob: String,
+        /// Override the daemon ctl-socket path.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -330,6 +358,22 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             target_argv,
             ctl_sock,
         } => proc::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
+        Mode::DbEvent {
+            engine,
+            phase,
+            target_argv,
+            statement_blob,
+            ctl_sock,
+        } => {
+            db::run_event(
+                &engine,
+                &phase,
+                &target_argv,
+                &statement_blob,
+                ctl_sock.as_deref(),
+            )
+            .await
+        }
     }
 }
 
