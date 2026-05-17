@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 mod config;
+mod crash;
 mod ctl;
 mod db_track;
 mod env_track;
@@ -61,6 +62,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(s) = cli.sock {
         resolved.hook_socket_path = s;
     }
+
+    // S21.8 — install panic hook before the log layer so a panic
+    // during log_setup or any later wiring still drops a
+    // canonical-format crash file under state_dir/crashes/.
+    crash::install_panic_hook(&resolved.state_dir);
 
     // S21.3 — JSON layer to $XDG_STATE_HOME/shit/log/daemon.jsonl.*
     // (daily rotation) + a stderr fallback for warn+ events. The
