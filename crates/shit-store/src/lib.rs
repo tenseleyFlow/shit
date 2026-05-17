@@ -6,8 +6,10 @@
 
 pub mod blob;
 pub mod index;
+pub mod refcount;
 pub mod schema;
 
 pub use blob::{BlobError, BlobStat, BlobStore};
 pub use index::{Index, IndexError};
+pub use refcount::{ReapBatch, reap_commands};
 pub use schema::SchemaError;

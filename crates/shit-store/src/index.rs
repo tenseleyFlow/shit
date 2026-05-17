@@ -54,6 +54,13 @@ impl Index {
         })
     }
 
+    /// Access to the inner connection mutex. `pub(crate)` so sibling
+    /// modules (refcount, gc) can compose multi-statement transactions
+    /// without re-implementing every primitive Index already has.
+    pub(crate) fn conn(&self) -> &Mutex<Connection> {
+        &self.conn
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
