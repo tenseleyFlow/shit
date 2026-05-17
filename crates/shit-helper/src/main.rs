@@ -10,7 +10,7 @@
 //! completes a handshake, then sits ready to handle watch / auth /
 //! shutdown requests. Per-OS kernel hooks land in S07/S08/S09.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -34,6 +34,7 @@ mod ipc;
     target_os = "dragonfly",
 ))]
 mod kqueue;
+mod pkg;
 #[cfg(target_os = "linux")]
 mod priv_linux;
 mod sandbox;
@@ -68,33 +69,67 @@ const LONG_VERSION: &str = concat!(
 )]
 struct Cli {
     /// Path to the SEQPACKET UDS the daemon set up for us to connect back to.
+    /// Required when running as the daemon's sidecar (no subcommand). Ignored
+    /// by transient subcommands like `pkg-event`.
     #[arg(long)]
-    daemon_sock: PathBuf,
+    daemon_sock: Option<PathBuf>,
 
     /// Expected daemon PID. Helper refuses to handshake unless the
     /// peer-PID we read off the socket matches.
     #[arg(long)]
-    daemon_pid: u32,
+    daemon_pid: Option<u32>,
 
     /// Expected daemon UID. Same: refuse on mismatch.
     #[arg(long)]
-    daemon_uid: u32,
+    daemon_uid: Option<u32>,
 
     /// State dir for crash logs and per-helper bookkeeping.
     #[arg(long)]
-    state_dir: PathBuf,
+    state_dir: Option<PathBuf>,
 
     /// Run in foreground (currently the only mode). Reserved for future
     /// daemonize switch.
     #[arg(long, default_value_t = true)]
     foreground: bool,
+
+    /// Transient operation mode. With no subcommand, the helper runs
+    /// as the daemon's privileged sidecar (the original behavior;
+    /// requires `--daemon-sock`, `--daemon-pid`, `--daemon-uid`,
+    /// `--state-dir`).
+    #[command(subcommand)]
+    mode: Option<Mode>,
+}
+
+#[derive(Subcommand)]
+enum Mode {
+    /// Single-shot package-manager hook invocation (S14). Reads
+    /// package-state via the requested manager's CLI tools and ships
+    /// it to the daemon over the ctl socket. Returns immediately;
+    /// does not enter the privileged-sidecar runtime.
+    ///
+    /// Invoked by per-manager hook configs (apt's `DPkg::Pre-Invoke`,
+    /// pacman's PreTransaction hook, dnf plugin, brew wrapper, FreeBSD
+    /// pkg event pipe). The hook script provides `<manager> <phase>`.
+    #[command(name = "pkg-event")]
+    PkgEvent {
+        /// Package manager identifier (apt/dpkg/pacman/dnf/brew/pkg).
+        manager: String,
+        /// Phase of the package transaction (pre|post).
+        phase: String,
+        /// Override the daemon ctl-socket path. By default we use the
+        /// per-user default location.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     // S06.3: drop LD_PRELOAD before anything else. TA-3 mitigation.
     // If anything injected itself into this process via LD_PRELOAD,
     // it's already too late for *this* binary; but we make sure no
-    // child or thread inherits the variable.
+    // child or thread inherits the variable. The pkg-event path
+    // still enforces this — a poisoned hook script is exactly the
+    // attack surface this exists for.
     refuse_if_ld_preloaded()?;
 
     let cli = Cli::parse();
@@ -107,15 +142,31 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Transient modes short-circuit before any privileged setup. They
+    // need their own modest runtime; the sidecar's `current_thread`
+    // runtime is overkill for a one-shot UDS write, but it's already
+    // available and avoids a second build path.
+    if let Some(mode) = cli.mode {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(run_mode(mode));
+    }
+
+    // Legacy sidecar invocation: the daemon spawns the helper with
+    // these four flags. Validate them; emit a clear error if any are
+    // missing so a misconfigured init doesn't fail with a clap panic.
+    let sidecar = SidecarConfig::from_cli(&cli)?;
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         commit = env!("VERGEN_GIT_SHA"),
-        daemon_pid = cli.daemon_pid,
+        daemon_pid = sidecar.daemon_pid,
         "shit-helper starting"
     );
 
     // Crash hook: panics in worker tasks get a one-line summary on disk.
-    crash::install_panic_hook(&cli.state_dir);
+    crash::install_panic_hook(&sidecar.state_dir);
 
     // ---- privileged phase ----
     // Open any fd that requires `CAP_SYS_ADMIN` while we still have it,
@@ -132,7 +183,50 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(cli, setup))
+    rt.block_on(run(sidecar, setup))
+}
+
+/// The four daemon-supplied flags pulled out as a struct so the
+/// downstream `run` doesn't have to thread `Option` through every
+/// field. Validation happens once at startup; everything after this
+/// can assume the fields are populated.
+pub struct SidecarConfig {
+    pub daemon_sock: PathBuf,
+    pub daemon_pid: u32,
+    pub daemon_uid: u32,
+    pub state_dir: PathBuf,
+}
+
+impl SidecarConfig {
+    fn from_cli(cli: &Cli) -> anyhow::Result<Self> {
+        Ok(Self {
+            daemon_sock: cli.daemon_sock.clone().ok_or_else(|| {
+                anyhow::anyhow!("missing --daemon-sock (required in sidecar mode)")
+            })?,
+            daemon_pid: cli.daemon_pid.ok_or_else(|| {
+                anyhow::anyhow!("missing --daemon-pid (required in sidecar mode)")
+            })?,
+            daemon_uid: cli.daemon_uid.ok_or_else(|| {
+                anyhow::anyhow!("missing --daemon-uid (required in sidecar mode)")
+            })?,
+            state_dir: cli
+                .state_dir
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("missing --state-dir (required in sidecar mode)"))?,
+        })
+    }
+}
+
+/// Dispatch a transient subcommand. These never enter the sidecar
+/// runtime; they run, do one IPC round-trip, and exit.
+async fn run_mode(mode: Mode) -> anyhow::Result<()> {
+    match mode {
+        Mode::PkgEvent {
+            manager,
+            phase,
+            ctl_sock,
+        } => pkg::run_event(&manager, &phase, ctl_sock.as_deref()).await,
+    }
 }
 
 /// Outcome of the privileged setup phase. The fanotify fd (if present)
@@ -312,7 +406,7 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
     }
 }
 
-async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
+async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let shutdown = Arc::new(Notify::new());
 
     install_signal_handlers(Arc::clone(&shutdown));
