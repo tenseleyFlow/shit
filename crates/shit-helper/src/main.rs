@@ -41,9 +41,9 @@ mod pkg;
 mod priv_linux;
 mod proc;
 mod sandbox;
-mod self_verify;
 #[cfg(target_os = "linux")]
 mod seccomp_linux;
+mod self_verify;
 mod svc;
 #[cfg(any(
     target_os = "freebsd",

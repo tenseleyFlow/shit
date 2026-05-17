@@ -255,9 +255,7 @@ fn net_event_req_with_large_state_raw_encodes() {
 #[test]
 fn db_event_req_with_large_statement_blob_encodes() {
     // Real-world driver: a migrations.sql with ~150 statements.
-    use shit_proto::{
-        CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase,
-    };
+    use shit_proto::{CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase};
     let statements: Vec<String> = (0..150)
         .map(|i| format!("INSERT INTO t (id) VALUES ({i})"))
         .collect();

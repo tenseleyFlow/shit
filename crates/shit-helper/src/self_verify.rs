@@ -44,10 +44,7 @@ pub enum VerifyOutcome {
     /// caller is expected to write the current hash to the baseline.
     BaselineMissing { computed: String },
     /// Baseline present but did not match. Helper refuses handshake.
-    Mismatch {
-        computed: String,
-        baseline: String,
-    },
+    Mismatch { computed: String, baseline: String },
     /// Platform doesn't support self-verification (dev builds, or
     /// `/proc/self/exe` unavailable). Helper proceeds with a warning.
     Skipped { reason: String },
@@ -211,7 +208,7 @@ mod tests {
         // In debug builds we get Skipped; in release we'd get
         // BaselineMissing on a fresh state-dir.
         match outcome {
-            VerifyOutcome::Skipped { .. } => {} // debug-build branch
+            VerifyOutcome::Skipped { .. } => {}         // debug-build branch
             VerifyOutcome::BaselineMissing { .. } => {} // release-build branch
             other => panic!("unexpected outcome: {other:?}"),
         }

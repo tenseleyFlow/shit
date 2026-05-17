@@ -210,8 +210,14 @@ mod redaction_uniformity_tests {
             }],
             RedactionDisplay::NamesVisible,
         );
-        assert!(env_out.contains("<redacted>"), "env: missing label: {env_out}");
-        assert!(proc_out.contains("<redacted>"), "proc: missing label: {proc_out}");
+        assert!(
+            env_out.contains("<redacted>"),
+            "env: missing label: {env_out}"
+        );
+        assert!(
+            proc_out.contains("<redacted>"),
+            "proc: missing label: {proc_out}"
+        );
         assert!(db_out.contains("<redacted>"), "db: missing label: {db_out}");
     }
 
