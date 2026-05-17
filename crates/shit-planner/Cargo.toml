@@ -19,6 +19,7 @@ tracing = { workspace = true }
 # enough on Windows that we'd want a separate impl, not a port).
 nix = { workspace = true }
 libc = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

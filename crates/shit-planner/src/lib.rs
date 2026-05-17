@@ -18,6 +18,7 @@ pub mod inverse;
 pub mod metadata;
 pub mod plan;
 pub mod probe;
+pub mod probe_live;
 pub mod store;
 pub mod time;
 
@@ -36,6 +37,7 @@ pub use inode::{BlobHash, InodeRef};
 pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
 pub use metadata::{FileKind, FileMetadata};
 pub use probe::{ProbeStat, StateProbe};
+pub use probe_live::{LiveStateProbe, hash_file};
 pub use store::PlannerStore;
 pub use time::{SeqRange, TimePoint, TimeRange};
 
