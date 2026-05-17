@@ -264,10 +264,19 @@ pub fn render_snippet(s: &RestartSuggestion) -> String {
 }
 
 fn render_raw_argv(s: &RestartSuggestion) -> String {
+    const REDACTED_PREFIX: &str = "<redacted:";
     let mut out = String::new();
     out.push_str("cd ");
     out.push_str(&posix_single_quote(&s.cwd.to_string_lossy()));
     for (k, v) in &s.env_summary {
+        // Redacted values are unrecoverable — exporting the literal
+        // `<redacted:...>` marker would restore a useless string and
+        // leak the capture-time hash. The "env:" line in the render
+        // layer already tells the user *which* vars were redacted;
+        // we silently omit them here.
+        if v.starts_with(REDACTED_PREFIX) {
+            continue;
+        }
         out.push_str(" && export ");
         out.push_str(k);
         out.push('=');
@@ -459,6 +468,24 @@ mod tests {
         // && between sections, not ;
         assert!(out.contains(" && "));
         assert!(!out.contains(';'));
+    }
+
+    #[test]
+    fn render_raw_argv_omits_redacted_env_exports() {
+        let s = synthesize(
+            &DaemonCrossRef::new(),
+            &["app".into()],
+            &PathBuf::from("/"),
+            &BTreeMap::from([
+                ("GITHUB_TOKEN".into(), "<redacted:deadbeef>".into()),
+                ("WORKERS".into(), "4".into()),
+            ]),
+            "",
+        );
+        let out = render_snippet(&s);
+        assert!(!out.contains("GITHUB_TOKEN"));
+        assert!(!out.contains("deadbeef"));
+        assert!(out.contains("export WORKERS='4'"));
     }
 
     #[test]
