@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 
 mod config;
 mod ctl;
+mod env_track;
 mod gc;
 mod helper_link;
 mod lock;
@@ -117,20 +118,29 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     };
 
     let pkg_stash = Arc::new(pkg::PkgPreStash::new());
+    let env_stash = Arc::new(env_track::EnvPreStash::new());
     let pkg_janitor = {
-        let stash = Arc::clone(&pkg_stash);
+        let pkg_stash = Arc::clone(&pkg_stash);
+        let env_stash = Arc::clone(&env_stash);
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
-            // Sweep orphan Pre stashes every minute. The 5-minute TTL
-            // lives on the stash itself; this just wakes it up.
+            // Sweep orphan Pre stashes every minute. The 5-minute
+            // TTL lives on each stash; this task just wakes them up.
+            // pkg + env share the same TTL, so a single janitor is
+            // cheaper than two timers.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        let evicted = stash.sweep_expired();
-                        if evicted > 0 {
-                            tracing::info!(evicted, "pkg-event: swept orphan Pre stashes");
+                        let pkg_evicted = pkg_stash.sweep_expired();
+                        let env_evicted = env_stash.sweep_expired();
+                        if pkg_evicted > 0 || env_evicted > 0 {
+                            tracing::info!(
+                                pkg_evicted,
+                                env_evicted,
+                                "stash janitor: swept orphan Pre entries"
+                            );
                         }
                     }
                     _ = shutdown.notified() => return,
@@ -155,8 +165,9 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
 
     let stats_for_server = Arc::clone(&stats);
     let shutdown_for_server = Arc::clone(&shutdown);
+    let env_stash_for_server = Arc::clone(&env_stash);
     let result = tokio::select! {
-        r = server::serve(cfg, stats_for_server, index) => r,
+        r = server::serve(cfg, stats_for_server, index, env_stash_for_server) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
             Ok(())
