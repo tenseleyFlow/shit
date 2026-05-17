@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use crate::config::ResolvedConfig;
+use crate::env_track::{self, EnvPreStash};
 use crate::stats::Stats;
 use shit_planner::{CommandId, CommandRecord, TimePoint};
 use shit_proto::{HookMessage, MAX_FRAME_SIZE, decode_frame};
@@ -38,6 +39,7 @@ pub async fn serve(
     cfg: ResolvedConfig,
     stats: Arc<Stats>,
     index: Arc<Index>,
+    env_stash: Arc<EnvPreStash>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = cfg.hook_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -79,7 +81,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index);
+                                handle(msg, &index, &env_stash);
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -106,7 +108,7 @@ pub async fn serve(
     }
 }
 
-fn handle(msg: HookMessage, index: &Index) {
+fn handle(msg: HookMessage, index: &Index, env_stash: &EnvPreStash) {
     let session = msg.session();
     let kind = msg.kind();
     let ts = next_ts();
@@ -186,13 +188,14 @@ fn handle(msg: HookMessage, index: &Index) {
             }
         }
         HookMessage::PreExecEnv { seq, env_hash, .. } => {
-            // S15.4 wires this to env_track. For S15.1 we just log
-            // so the wire path is exercised end-to-end before the
-            // diffing engine lands.
             debug!(%session, kind, seq, hash = %hex8(env_hash), "pre-exec-env");
+            env_track::handle_pre(env_stash, CommandId { session, seq: *seq }, *env_hash);
         }
         HookMessage::PostExecEnv { seq, env_block, .. } => {
             debug!(%session, kind, seq, bytes = env_block.len(), "post-exec-env");
+            let _ = env_track::handle_post(env_stash, CommandId { session, seq: *seq }, env_block);
+            // The PostOutcome is logged inside handle_post; the
+            // journal-write integration is DR-32.
         }
         HookMessage::SessionClose { .. } => {
             info!(%session, kind, "session close");
