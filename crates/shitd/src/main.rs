@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+mod ancestry;
 mod config;
 mod crash;
 mod ctl;
