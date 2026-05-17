@@ -107,6 +107,12 @@ async fn handle_client(
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
+        CtlRequest::SvcEvent(_) => {
+            // S16.6 wires this to a real handler. Stub-ack so a
+            // helper that ships ahead of the daemon doesn't deadlock
+            // the user's `systemctl` invocation.
+            CtlResponse::SvcEventAck
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
