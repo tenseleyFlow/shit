@@ -28,6 +28,13 @@ pub enum CtlRequest {
     /// package operation. The daemon binds the event to the most
     /// recent open command window for the helper's process tree.
     PkgEvent(PkgEventReq),
+    /// systemctl/launchctl wrapper invocation (S16). Sent by
+    /// `shit-helper svc-event ...` once per Pre and once per Post
+    /// phase of a service operation. The daemon pairs by
+    /// (pid, unit) — pid because a single shell may run multiple
+    /// unrelated `systemctl` invocations, and unit because the same
+    /// command can touch multiple units in sequence (rare but legal).
+    SvcEvent(SvcEventReq),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +133,80 @@ impl std::str::FromStr for PkgManagerWire {
 #[error("unknown package manager: {0}")]
 pub struct PkgManagerParseError(pub String);
 
+/// Which service-manager CLI the wrapper is fronting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SvcToolWire {
+    Systemctl,
+    Launchctl,
+}
+
+impl SvcToolWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Systemctl => "systemctl",
+            Self::Launchctl => "launchctl",
+        }
+    }
+}
+
+impl std::str::FromStr for SvcToolWire {
+    type Err = SvcToolParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "systemctl" => Ok(Self::Systemctl),
+            "launchctl" => Ok(Self::Launchctl),
+            other => Err(SvcToolParseError(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown service tool: {0}")]
+pub struct SvcToolParseError(pub String);
+
+/// Service-manager scope hint. Mirrors `shit_planner::SystemdScope`
+/// without depending on that crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SvcScopeWire {
+    User,
+    System,
+    LaunchdGui,
+    LaunchdSystem,
+}
+
+impl SvcScopeWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::System => "system",
+            Self::LaunchdGui => "launchd-gui",
+            Self::LaunchdSystem => "launchd-system",
+        }
+    }
+}
+
+/// One service-manager wrapper invocation as it crosses the wire.
+///
+/// The wrapper invokes `shit-helper svc-event ...` once per phase
+/// with the verb (e.g. `start`, `enable`) and the affected unit.
+/// `state_raw` is the captured snapshot from the manager's own
+/// query interface (`systemctl show -p ...` for systemd,
+/// `launchctl print` for launchd); the planner parses it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SvcEventReq {
+    pub tool: SvcToolWire,
+    pub phase: PkgPhase,
+    pub scope: SvcScopeWire,
+    pub unit: String,
+    /// The shell-issued verb (`start`/`enable`/`bootstrap`/...).
+    pub verb: String,
+    pub pid: u32,
+    pub uid: u32,
+    /// Raw output of the manager's state-query command. May be
+    /// empty if the query failed; the daemon tolerates that.
+    pub state_raw: String,
+}
+
 /// One package-manager hook invocation as it crosses the wire from
 /// `shit-helper pkg-event` to the daemon.
 ///
@@ -167,6 +248,8 @@ pub enum CtlResponse {
     /// hook only cares that the event was recorded so it can return
     /// cleanly to its package-manager caller.
     PkgEventAck,
+    /// Reply to `SvcEvent` — same shape as `PkgEventAck`.
+    SvcEventAck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
