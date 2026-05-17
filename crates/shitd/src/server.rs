@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use crate::active_commands::ActiveCommands;
 use crate::config::ResolvedConfig;
 use crate::env_track::{self, EnvPreStash};
 use crate::stats::Stats;
@@ -26,7 +27,7 @@ fn idle_tick(idle_timeout: Duration) -> Duration {
 /// session anyway.
 static LOGICAL_CLOCK: AtomicU64 = AtomicU64::new(1);
 
-fn next_ts() -> TimePoint {
+pub(crate) fn next_ts() -> TimePoint {
     let logical = LOGICAL_CLOCK.fetch_add(1, Ordering::Relaxed);
     let wall = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -40,6 +41,7 @@ pub async fn serve(
     stats: Arc<Stats>,
     index: Arc<Index>,
     env_stash: Arc<EnvPreStash>,
+    active: Arc<ActiveCommands>,
 ) -> anyhow::Result<()> {
     let env_filter = cfg.env.filter();
     if let Some(parent) = cfg.hook_socket_path.parent() {
@@ -86,7 +88,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index, &env_stash, &env_filter);
+                                handle(msg, &index, &env_stash, &env_filter, &active);
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -119,6 +121,7 @@ fn handle(
     index: &Index,
     env_stash: &EnvPreStash,
     env_filter: &shit_planner::EnvFilter,
+    active: &ActiveCommands,
 ) {
     let session = msg.session();
     let kind = msg.kind();
@@ -167,8 +170,15 @@ fn handle(
                 shell = shell_kind.as_str(),
                 "pre-exec"
             );
+            let command = CommandId { session, seq: *seq };
+            // DR-25: register the active command so tier-event
+            // handlers can attribute pkg/env/svc/net/proc/db events
+            // to it. The shell-pid (`pid`) is the lookup key; tier
+            // events arrive with the helper or wrapper pid and walk
+            // ancestors to find this one.
+            active.insert(*pid, command);
             let cmd = CommandRecord {
-                command: CommandId { session, seq: *seq },
+                command,
                 cmd_string: None,
                 cwd: PathBuf::from("/"),
                 pid: *pid,
@@ -184,13 +194,17 @@ fn handle(
         }
         HookMessage::PostExec { seq, exit_code, .. } => {
             info!(%session, kind, seq, exit_code, "post-exec");
+            let command = CommandId { session, seq: *seq };
             // Update via re-put: ON CONFLICT replaces ended_at + exit_code.
             // We don't know the original started_at from this side of the
             // ledger; fetch the existing command to preserve it.
-            if let Some(mut existing) = <Index as shit_planner::PlannerStore>::command_by_id(
-                index,
-                CommandId { session, seq: *seq },
-            ) {
+            if let Some(mut existing) =
+                <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+            {
+                // DR-25: drain the active map entry now that the
+                // command is closed. `existing.pid` is the shell pid
+                // from the matching PreExec.
+                active.remove(existing.pid, command);
                 existing.ended_at = Some(ts);
                 existing.exit_code = Some(*exit_code);
                 if let Err(e) = index.put_command(&existing) {
