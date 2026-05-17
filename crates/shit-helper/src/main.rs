@@ -19,6 +19,8 @@ mod crash;
 mod handshake;
 mod health;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod priv_linux;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod seccomp_linux;
@@ -89,6 +91,12 @@ fn main() -> anyhow::Result<()> {
         daemon_pid = cli.daemon_pid,
         "shit-helper starting"
     );
+
+    // Drop privileges to the minimum keep-list *before* any tokio rt
+    // bring-up so the runtime never holds extra caps.
+    #[cfg(target_os = "linux")]
+    priv_linux::drop_to_minimum()
+        .map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
 
     // Crash hook: panics in worker tasks get a one-line summary on disk.
     crash::install_panic_hook(&cli.state_dir);
