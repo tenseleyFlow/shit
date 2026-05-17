@@ -1,19 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Crash log writer. Captures panics into
-//! `<state_dir>/crashes/helper-<unix_secs>-<pid>.txt` so a postmortem
-//! can find them without parsing journald / launchd logs.
+//! Crash log writer for `shit-helper`. The format is defined in
+//! [`shit_proto::crash`]; this module owns the panic-hook install
+//! and the tracing ring buffer wiring.
 //!
 //! Best-effort: a panic hook that itself panics aborts the process, so
 //! every fs call here is wrapped in `let _ = ...`. The default panic
 //! handler still runs after ours (the stderr message + backtrace).
 
-use std::fmt::Write;
+use std::backtrace::Backtrace;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use shit_proto::crash::{CrashFacts, CrashPanic, TracingRing, crash_filename, format_crash_record};
+
+/// Capacity of the in-process ring buffer (per the schema doc: "last
+/// 100 tracing events"). 100 is the schema commitment; bumping
+/// requires a schema change.
+const RING_CAPACITY: usize = 100;
+
 static CRASH_DIR: OnceLock<PathBuf> = OnceLock::new();
+static RING: OnceLock<Arc<TracingRing>> = OnceLock::new();
+
+const HELPER_FACTS: CrashFacts = CrashFacts {
+    component: "shit-helper",
+    version: env!("CARGO_PKG_VERSION"),
+    commit: env!("VERGEN_GIT_SHA"),
+    built: env!("VERGEN_BUILD_TIMESTAMP"),
+    rustc: env!("VERGEN_RUSTC_SEMVER"),
+    target: env!("VERGEN_CARGO_TARGET_TRIPLE"),
+};
 
 /// Install the panic hook. Idempotent; calling twice replaces the
 /// stored crash dir but leaves the hook in place.
@@ -21,6 +38,7 @@ pub fn install_panic_hook(state_dir: &Path) {
     let dir = state_dir.join("crashes");
     let _ = std::fs::create_dir_all(&dir);
     let _ = CRASH_DIR.set(dir);
+    let _ = RING.set(Arc::new(TracingRing::new(RING_CAPACITY)));
     static INSTALLED: OnceLock<()> = OnceLock::new();
     if INSTALLED.set(()).is_err() {
         return;
@@ -32,6 +50,18 @@ pub fn install_panic_hook(state_dir: &Path) {
     }));
 }
 
+/// Handle to the in-process ring buffer. The tracing-Layer wiring
+/// that pushes events into it is tracked as DR-67-adjacent (a single
+/// `tracing_subscriber::Layer` impl that calls `ring().map(|r|
+/// r.push(...))` for each event). The helper currently runs without
+/// the layer wired — the ring stays empty and the crash log just
+/// renders "last 0 tracing events"; the format is identical, which
+/// keeps the schema commitment stable.
+#[allow(dead_code)]
+pub fn ring() -> Option<Arc<TracingRing>> {
+    RING.get().cloned()
+}
+
 fn write_record(info: &std::panic::PanicHookInfo<'_>) {
     let Some(dir) = CRASH_DIR.get() else {
         return;
@@ -41,43 +71,34 @@ fn write_record(info: &std::panic::PanicHookInfo<'_>) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let pid = std::process::id();
-    let path = dir.join(format!("helper-{ts}-{pid}.txt"));
+    let path = dir.join(crash_filename(HELPER_FACTS.component, ts, pid));
 
-    let payload = format_record(info);
+    let panic = panic_from_info(info);
+    let events = RING.get().map(|r| r.snapshot()).unwrap_or_default();
+    let payload = format_crash_record(&HELPER_FACTS, &panic, pid, ts, &events);
     let _ = std::fs::write(&path, payload);
 }
 
-fn format_record(info: &std::panic::PanicHookInfo<'_>) -> String {
-    let mut buf = String::new();
-    let _ = writeln!(
-        buf,
-        "shit-helper crash @ {}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
-    let _ = writeln!(buf, "version: {}", env!("CARGO_PKG_VERSION"));
-    let _ = writeln!(buf, "commit:  {}", env!("VERGEN_GIT_SHA"));
-    let _ = writeln!(buf, "pid:     {}", std::process::id());
-    if let Some(loc) = info.location() {
-        let _ = writeln!(
-            buf,
-            "at:      {}:{}:{}",
-            loc.file(),
-            loc.line(),
-            loc.column()
-        );
-    }
-    let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+fn panic_from_info(info: &std::panic::PanicHookInfo<'_>) -> CrashPanic {
+    let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
         s.clone()
     } else {
         "<non-string panic payload>".to_string()
     };
-    let _ = writeln!(buf, "message: {msg}");
-    buf
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_default();
+    // Force capture so the record has a backtrace even when
+    // RUST_BACKTRACE isn't set in the binary's environment.
+    let backtrace = Backtrace::force_capture().to_string();
+    CrashPanic {
+        message,
+        location,
+        backtrace,
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +120,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         install_panic_hook(tmp.path());
         install_panic_hook(tmp.path());
+    }
+
+    #[test]
+    fn ring_is_available_after_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_panic_hook(tmp.path());
+        let r = ring().expect("ring should be wired after install");
+        assert_eq!(r.capacity(), RING_CAPACITY);
     }
 
     // Note: we deliberately don't exercise the panic-hook path inside
