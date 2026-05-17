@@ -81,7 +81,12 @@ impl BlobStore {
         }
         let tmp_path = self.tmp_path();
         let compressed = bytes.len() >= COMPRESS_MIN_BYTES;
+        // S20.9 fault-injection point: panic between tmp-write and
+        // rename to exercise the recovery path. The tmp file will
+        // remain on disk; the next GC sweep cleans it up.
+        shit_proto::fault_inject::maybe_inject("blob_store.put.before_atomic_write");
         let stored_bytes = self.write_atomic(&tmp_path, &final_path, bytes, compressed)?;
+        shit_proto::fault_inject::maybe_inject("blob_store.put.after_atomic_write");
         Ok((
             hash,
             BlobStat {
