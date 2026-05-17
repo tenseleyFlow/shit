@@ -60,10 +60,17 @@ pub fn resolve_color(pref: ColorPref) -> bool {
 mod tests {
     use super::*;
 
+    /// Process-global lock serializing env mutation across the
+    /// parallel test runner. Without it the NO_COLOR/CLICOLOR tests
+    /// race against each other — one thread sets `CLICOLOR=0` while
+    /// another is in the middle of asserting it's unset.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Helper: run a closure with `NO_COLOR` and `CLICOLOR` cleared,
-    /// then restore. Tests within this module rely on those env vars
-    /// being absent unless explicitly set inside the test.
+    /// then restore. Holds `ENV_LOCK` for the closure's duration so
+    /// other tests can't observe our temporary state.
     fn with_clean_env<F: FnOnce() -> R, R>(f: F) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let no_color = std::env::var_os("NO_COLOR");
         let clicolor = std::env::var_os("CLICOLOR");
         unsafe {
