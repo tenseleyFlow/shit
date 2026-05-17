@@ -99,6 +99,12 @@ async fn handle_client(
         CtlRequest::Pin(req) => handle_pin(req, index),
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
+        CtlRequest::PkgEvent(_) => {
+            // S14.9 wires this to a real handler. For now we ack so
+            // a helper that ships ahead of the daemon-side handler
+            // doesn't deadlock the package manager waiting on us.
+            CtlResponse::PkgEventAck
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;

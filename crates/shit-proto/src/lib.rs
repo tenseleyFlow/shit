@@ -24,7 +24,10 @@ pub mod ctl;
 pub mod frame;
 pub mod helper;
 
-pub use ctl::{CtlRequest, CtlResponse, DaemonStatus, GcReport, GcRequest, PinRequest, PinSummary};
+pub use ctl::{
+    CtlRequest, CtlResponse, DaemonStatus, GcReport, GcRequest, PinRequest, PinSummary,
+    PkgEventReq, PkgManagerParseError, PkgManagerWire, PkgPhase,
+};
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
 };
