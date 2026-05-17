@@ -16,6 +16,8 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 mod crash;
+#[cfg(target_os = "linux")]
+mod fanotify;
 mod handshake;
 mod health;
 mod ipc;
