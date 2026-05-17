@@ -32,6 +32,8 @@ mod ipc;
     target_os = "dragonfly",
 ))]
 mod kqueue;
+#[cfg(target_os = "freebsd")]
+mod capsicum_bsd;
 #[cfg(target_os = "linux")]
 mod priv_linux;
 mod sandbox;
