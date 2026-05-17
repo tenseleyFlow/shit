@@ -332,7 +332,8 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             | InverseOp::PackageRollback { .. }
             | InverseOp::NetworkRollback { .. }
             | InverseOp::SystemdRollback { .. }
-            | InverseOp::ProcessNote { .. } => None,
+            | InverseOp::ProcessNote { .. }
+            | InverseOp::DbNote { .. } => None,
         }
     }
 }

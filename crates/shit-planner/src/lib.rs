@@ -47,7 +47,9 @@ pub use executor::{
 };
 pub use executors::FileExecutor;
 pub use inode::{BlobHash, InodeRef};
-pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
+pub use inverse::{
+    Conflict, DbEngine, InverseOp, InverseTier, PlanNode, PlanWarning, RollbackHint, UndoPlan,
+};
 pub use metadata::{FileKind, FileMetadata};
 pub use network::{
     IP_MUTATING, IPTABLES_MUTATING, NFT_MUTATING, PFCTL_MUTATING, RestoreMethod, UFW_MUTATING,

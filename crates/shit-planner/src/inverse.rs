@@ -94,6 +94,70 @@ pub enum InverseOp {
         env_summary: BTreeMap<String, String>,
         message: String,
     },
+    /// Informational (S19): record what statements crossed the DB shim.
+    /// For sqlite3 the file is captured via the file tier and the
+    /// `rollback_hint` carries the blob; for postgres/mysql we emit a
+    /// human-readable rollback plan the user runs themselves.
+    DbNote {
+        engine: DbEngine,
+        /// Connection target — DB name for psql/mysql; file path for sqlite3.
+        target: String,
+        statements: Vec<String>,
+        rollback_hint: RollbackHint,
+    },
+}
+
+/// Which DB engine the captured statements belong to. Mirrors
+/// [`shit_proto::DbEngineWire`] but lives planner-side so the inverse
+/// op can be serialized without the wire dep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DbEngine {
+    Postgres,
+    Mysql,
+    Sqlite3,
+}
+
+impl DbEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "psql",
+            Self::Mysql => "mysql",
+            Self::Sqlite3 => "sqlite3",
+        }
+    }
+}
+
+/// Engine-specific rollback advice. Only [`RollbackHint::Sqlite`] is
+/// actionable mechanically (via the file-tier blob restore); the
+/// other two are *informational* — the executor renders them, never
+/// invokes them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RollbackHint {
+    /// SQLite is a regular file. The capture pipeline already
+    /// snapshotted it; restoring is the file-tier inverse op
+    /// against `path` and `file_blob`.
+    Sqlite {
+        path: PathBuf,
+        file_blob: Option<BlobHash>,
+    },
+    /// Postgres: render a PITR + statements-for-review block.
+    /// `binlog_position` is empty when the engine didn't expose
+    /// one (typical for a SELECT-heavy session).
+    Postgres {
+        pitr_recommended: bool,
+        wal_position: Option<String>,
+        statements_for_review: Vec<String>,
+    },
+    /// MySQL: render a binlog-position rewind block. Same
+    /// caveat — never auto-applied.
+    Mysql {
+        binlog_position: Option<String>,
+        statements_for_review: Vec<String>,
+    },
+    /// Engine had no actionable advice (e.g., DDL on a database
+    /// without binlog/PITR). Renderer surfaces "no rollback hint
+    /// available; review statements manually."
+    None,
 }
 
 impl InverseOp {
@@ -112,7 +176,8 @@ impl InverseOp {
             | Self::PackageRollback { .. }
             | Self::NetworkRollback { .. }
             | Self::SystemdRollback { .. }
-            | Self::ProcessNote { .. } => None,
+            | Self::ProcessNote { .. }
+            | Self::DbNote { .. } => None,
         }
     }
 
@@ -140,6 +205,7 @@ impl InverseOp {
             Self::NetworkRollback { .. } => InverseTier::Network,
             Self::SystemdRollback { .. } => InverseTier::Services,
             Self::ProcessNote { .. } => InverseTier::Processes,
+            Self::DbNote { .. } => InverseTier::Database,
         }
     }
 }
@@ -152,6 +218,7 @@ pub enum InverseTier {
     Network,
     Services,
     Processes,
+    Database,
 }
 
 /// One step in the plan, with conflict/cohort decoration.
@@ -318,5 +385,55 @@ mod tests {
         let bytes = postcard::to_allocvec(&op).unwrap();
         let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(op, back);
+    }
+
+    #[test]
+    fn db_note_classifies_as_database_tier() {
+        let op = InverseOp::DbNote {
+            engine: DbEngine::Postgres,
+            target: "prod".into(),
+            statements: vec!["INSERT INTO t VALUES (1)".into()],
+            rollback_hint: RollbackHint::Postgres {
+                pitr_recommended: true,
+                wal_position: None,
+                statements_for_review: vec!["INSERT INTO t VALUES (1)".into()],
+            },
+        };
+        assert_eq!(op.tier(), InverseTier::Database);
+        assert!(op.primary_path().is_none());
+        assert!(op.primary_inode().is_none());
+    }
+
+    #[test]
+    fn db_note_roundtrips_through_postcard() {
+        let op = InverseOp::DbNote {
+            engine: DbEngine::Sqlite3,
+            target: "/tmp/test.db".into(),
+            statements: vec!["CREATE TABLE t (id INT)".into()],
+            rollback_hint: RollbackHint::Sqlite {
+                path: PathBuf::from("/tmp/test.db"),
+                file_blob: Some(BlobHash::from_bytes([5; 32])),
+            },
+        };
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    #[test]
+    fn rollback_hint_none_for_unhinted_engines() {
+        // Useful when the engine probe returned nothing — render
+        // layer treats this as "no actionable advice."
+        let h = RollbackHint::None;
+        let bytes = postcard::to_allocvec(&h).unwrap();
+        let back: RollbackHint = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(h, back);
+    }
+
+    #[test]
+    fn db_engine_as_str_matches_wire_form() {
+        assert_eq!(DbEngine::Postgres.as_str(), "psql");
+        assert_eq!(DbEngine::Mysql.as_str(), "mysql");
+        assert_eq!(DbEngine::Sqlite3.as_str(), "sqlite3");
     }
 }
