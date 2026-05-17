@@ -1099,6 +1099,7 @@ name = "shit-proto"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "proptest",
  "serde",
  "thiserror",
  "uuid",
