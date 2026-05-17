@@ -38,6 +38,7 @@ mod net;
 mod pkg;
 #[cfg(target_os = "linux")]
 mod priv_linux;
+mod proc;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod seccomp_linux;
@@ -124,6 +125,31 @@ enum Mode {
         phase: String,
         /// Override the daemon ctl-socket path. By default we use the
         /// per-user default location.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
+    /// Single-shot process-lifecycle hook invocation (S18). Sent
+    /// by the kill/pkill/killall wrappers. Pre-phase enumerates
+    /// the target pids and snapshots their state (argv, cwd, env,
+    /// parent_pid, tty); Post re-enumerates to see which targets
+    /// went away.
+    ///
+    /// `target_argv` is everything the user passed *after* the
+    /// tool name (so `kill -9 1234` → `["-9", "1234"]`). The
+    /// shell wrapper SHOULD shell-quote-and-join the argv into a
+    /// single newline-separated string in `--target-argv`; we
+    /// split on newlines here.
+    #[command(name = "proc-event")]
+    ProcEvent {
+        /// Process tool identifier (kill|pkill|killall).
+        tool: String,
+        /// Phase of the operation (pre|post).
+        phase: String,
+        /// User's argv after the tool, newline-separated. Each
+        /// line is one argv token. (Avoids quoting headaches.)
+        #[arg(long, default_value = "")]
+        target_argv: String,
+        /// Override the daemon ctl-socket path.
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
@@ -298,6 +324,12 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             scope_hint,
             ctl_sock,
         } => net::run_event(&tool, &phase, &verb, &scope_hint, ctl_sock.as_deref()).await,
+        Mode::ProcEvent {
+            tool,
+            phase,
+            target_argv,
+            ctl_sock,
+        } => proc::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
     }
 }
 
