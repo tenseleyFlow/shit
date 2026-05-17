@@ -96,21 +96,26 @@ impl FanotifyFeatures {
         }
     }
 
-    /// Highest tier label, for `shit doctor` output.
+    /// Highest tier label, for `shit doctor` output. Tiers are
+    /// cumulative — a kernel that has report_pidfd also has every
+    /// lower-tier flag — so we walk top-to-bottom and pick the first
+    /// hit. Any oddball combination (a custom kernel that surfaces a
+    /// higher flag without a lower one) falls through to the most
+    /// specific label that still describes it.
     pub fn tier_label(&self) -> &'static str {
-        match (
-            self.perm_events,
-            self.filesystem_mark,
-            self.report_fid,
-            self.report_dir_fid,
-            self.report_pidfd,
-        ) {
-            (true, true, true, true, true) => "fanotify-perm + pidfd (5.15+)",
-            (true, true, true, true, false) => "fanotify-perm + dir-fid (5.9+)",
-            (true, true, true, false, false) => "fanotify-perm + fid (5.4+)",
-            (true, true, false, false, false) => "fanotify-perm + fs-scope (5.1+)",
-            (true, false, false, false, false) => "fanotify-perm (4.20+)",
-            (false, _, _, _, _) => "no fanotify-perm (pre-4.20 or compiled-out)",
+        if !self.perm_events {
+            return "no fanotify-perm (pre-4.20 or compiled-out)";
+        }
+        if self.report_pidfd {
+            "fanotify-perm + pidfd (5.15+)"
+        } else if self.report_dir_fid {
+            "fanotify-perm + dir-fid (5.9+)"
+        } else if self.report_fid {
+            "fanotify-perm + fid (5.4+)"
+        } else if self.filesystem_mark {
+            "fanotify-perm + fs-scope (5.1+)"
+        } else {
+            "fanotify-perm (4.20+)"
         }
     }
 }
