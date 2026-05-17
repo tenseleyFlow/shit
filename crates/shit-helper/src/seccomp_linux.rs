@@ -9,9 +9,7 @@
 
 #![cfg(target_os = "linux")]
 
-use seccompiler::{
-    BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
-};
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -110,9 +108,7 @@ mod tests {
     #[test]
     fn filter_compiles_clean() {
         let filter = build_filter().unwrap();
-        let _: BpfProgram = filter
-            .try_into()
-            .expect("filter compiles to BPF program");
+        let _: BpfProgram = filter.try_into().expect("filter compiles to BPF program");
     }
 
     #[test]

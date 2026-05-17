@@ -58,7 +58,11 @@ impl Conn {
         let frame = encode_frame(msg)?;
         let mut sent = 0;
         while sent < frame.len() {
-            let n = send(self.fd.as_raw_fd(), &frame[sent..], nix::sys::socket::MsgFlags::empty())?;
+            let n = send(
+                self.fd.as_raw_fd(),
+                &frame[sent..],
+                nix::sys::socket::MsgFlags::empty(),
+            )?;
             if n == 0 {
                 return Err(ConnError::PeerClosed);
             }
@@ -73,7 +77,11 @@ impl Conn {
         let frame = encode_frame(msg)?;
         let mut sent = 0;
         while sent < frame.len() {
-            let n = send(self.fd.as_raw_fd(), &frame[sent..], nix::sys::socket::MsgFlags::empty())?;
+            let n = send(
+                self.fd.as_raw_fd(),
+                &frame[sent..],
+                nix::sys::socket::MsgFlags::empty(),
+            )?;
             if n == 0 {
                 return Err(ConnError::PeerClosed);
             }
@@ -193,7 +201,7 @@ pub fn socketpair() -> Result<(Conn, Conn), ConnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shit_proto::{HelperCaps, HELPER_PROTOCOL_VERSION};
+    use shit_proto::{HELPER_PROTOCOL_VERSION, HelperCaps};
 
     #[test]
     fn socketpair_round_trip_request() {

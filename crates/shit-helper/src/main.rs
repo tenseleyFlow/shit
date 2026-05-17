@@ -95,8 +95,7 @@ fn main() -> anyhow::Result<()> {
     // Drop privileges to the minimum keep-list *before* any tokio rt
     // bring-up so the runtime never holds extra caps.
     #[cfg(target_os = "linux")]
-    priv_linux::drop_to_minimum()
-        .map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
+    priv_linux::drop_to_minimum().map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
 
     // Crash hook: panics in worker tasks get a one-line summary on disk.
     crash::install_panic_hook(&cli.state_dir);
@@ -128,18 +127,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     // reflects what the helper can actually do given current privileges.
     let local_caps = current_capabilities();
 
-    let outcome = match handshake::perform_helper_side(
-        &conn,
-        cli.daemon_pid,
-        cli.daemon_uid,
-        local_caps,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::error!(err = %e, "handshake failed; exiting");
-            return Err(anyhow::anyhow!("handshake failed: {e}"));
-        }
-    };
+    let outcome =
+        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, local_caps) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(err = %e, "handshake failed; exiting");
+                return Err(anyhow::anyhow!("handshake failed: {e}"));
+            }
+        };
     tracing::info!(
         daemon_pid = outcome.daemon_pid,
         daemon_uid = outcome.daemon_uid,
@@ -169,14 +164,16 @@ fn install_signal_handlers(shutdown: Arc<Notify>) {
     let shutdown_term = Arc::clone(&shutdown);
     let shutdown_int = shutdown;
     tokio::spawn(async move {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             s.recv().await;
             tracing::info!("SIGTERM received");
             shutdown_term.notify_waiters();
         }
     });
     tokio::spawn(async move {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        {
             s.recv().await;
             tracing::info!("SIGINT received");
             shutdown_int.notify_waiters();
@@ -208,4 +205,3 @@ fn refuse_if_ld_preloaded() -> anyhow::Result<()> {
     }
     Ok(())
 }
-

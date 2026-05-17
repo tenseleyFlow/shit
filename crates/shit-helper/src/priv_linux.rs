@@ -60,10 +60,7 @@ pub fn drop_to_minimum() -> Result<(), PrivError> {
         let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
         if rc != 0 {
             let e = io::Error::last_os_error();
-            if matches!(
-                e.raw_os_error(),
-                Some(libc::EINVAL) | Some(libc::EPERM)
-            ) {
+            if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::EPERM)) {
                 continue;
             }
             return Err(PrivError::Capset(format!("PR_CAPBSET_DROP cap={cap}: {e}")));
@@ -72,8 +69,7 @@ pub fn drop_to_minimum() -> Result<(), PrivError> {
 
     // Set NO_NEW_PRIVS — required for the unprivileged seccomp install
     // later, and prevents any future setuid binary from regaining caps.
-    let rc =
-        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) };
+    let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64) };
     if rc != 0 {
         return Err(PrivError::Capset(format!(
             "PR_SET_NO_NEW_PRIVS: {}",

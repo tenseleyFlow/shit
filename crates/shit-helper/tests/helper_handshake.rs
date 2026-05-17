@@ -180,7 +180,10 @@ fn helper_refuses_wrong_daemon_pid() {
     // we even try to handshake. Give it a moment.
     let status = wait_with_timeout(&mut child, Duration::from_secs(10));
     let status = status.expect("helper should exit on pid mismatch");
-    assert!(!status.success(), "helper exited 0 despite wrong daemon-pid");
+    assert!(
+        !status.success(),
+        "helper exited 0 despite wrong daemon-pid"
+    );
 }
 
 #[test]

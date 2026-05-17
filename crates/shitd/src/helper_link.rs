@@ -17,8 +17,7 @@ use nix::sys::socket::{
     AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
 };
 use shit_proto::{
-    HELPER_PROTOCOL_VERSION, HelperCaps, HelperRequest, HelperResponse, decode_frame,
-    encode_frame,
+    HELPER_PROTOCOL_VERSION, HelperCaps, HelperRequest, HelperResponse, decode_frame, encode_frame,
 };
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -245,9 +244,9 @@ fn recv_frame_blocking(fd: std::os::fd::RawFd) -> Result<Vec<u8>, HelperLinkErro
     recv_exact(fd, &mut header)?;
     let body_len = u32::from_be_bytes(header) as usize;
     if body_len > shit_proto::MAX_HELPER_FRAME_SIZE - 4 {
-        return Err(HelperLinkError::Decode(
-            shit_proto::DecodeError::TooLarge(body_len + 4),
-        ));
+        return Err(HelperLinkError::Decode(shit_proto::DecodeError::TooLarge(
+            body_len + 4,
+        )));
     }
     let mut out = Vec::with_capacity(4 + body_len);
     out.extend_from_slice(&header);
@@ -263,11 +262,7 @@ fn recv_frame_blocking_owned(fd: &OwnedFd) -> Result<Vec<u8>, HelperLinkError> {
 fn recv_exact(fd: std::os::fd::RawFd, buf: &mut [u8]) -> Result<(), HelperLinkError> {
     let mut got = 0;
     while got < buf.len() {
-        let n = nix::sys::socket::recv(
-            fd,
-            &mut buf[got..],
-            nix::sys::socket::MsgFlags::empty(),
-        )?;
+        let n = nix::sys::socket::recv(fd, &mut buf[got..], nix::sys::socket::MsgFlags::empty())?;
         if n == 0 {
             return Err(HelperLinkError::HelperExited);
         }

@@ -226,16 +226,10 @@ mod tests {
         let expected_uid = current_uid();
 
         let server_thread = thread::spawn(move || {
-            perform_helper_side(
-                &server,
-                expected_pid,
-                expected_uid,
-                HelperCaps::full(),
-            )
+            perform_helper_side(&server, expected_pid, expected_uid, HelperCaps::full())
         });
 
-        let outcome_daemon =
-            perform_daemon_side(&client, HelperCaps::full()).unwrap();
+        let outcome_daemon = perform_daemon_side(&client, HelperCaps::full()).unwrap();
         let outcome_helper = server_thread.join().unwrap().unwrap();
         assert_eq!(outcome_helper.daemon_pid, expected_pid);
         assert_eq!(outcome_helper.daemon_uid, expected_uid);
@@ -267,12 +261,7 @@ mod tests {
     fn handshake_refuses_wrong_pid() {
         let (_client, server) = socketpair().unwrap();
         let wrong_pid = std::process::id().wrapping_add(1);
-        let res = perform_helper_side(
-            &server,
-            wrong_pid,
-            current_uid(),
-            HelperCaps::full(),
-        );
+        let res = perform_helper_side(&server, wrong_pid, current_uid(), HelperCaps::full());
         assert!(matches!(res, Err(HandshakeError::PidMismatch { .. })));
     }
 }

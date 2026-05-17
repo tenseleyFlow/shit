@@ -11,12 +11,12 @@
 
 use std::path::Path;
 
+#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+mod bsd;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-mod bsd;
 
 /// Enter the platform sandbox.
 pub fn enter(state_dir: &Path) -> anyhow::Result<()> {
