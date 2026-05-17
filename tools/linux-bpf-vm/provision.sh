@@ -97,7 +97,7 @@ instance-id: shit-linux-bpf-vm-$(date +%s)
 local-hostname: shit-linux-bpf
 EOF
 
-cat > "${TMP_USER_DATA}" <<EOF
+cat > "${TMP_USER_DATA}" <<USERDATA_EOF
 #cloud-config
 users:
   - name: ubuntu
@@ -124,34 +124,29 @@ packages:
   - bpftool
   - linux-tools-common
 runcmd:
-  # Add 'bpf' to the kernel lsm= command line. The default Ubuntu
-  # noble cmdline is GRUB_CMDLINE_LINUX_DEFAULT="" with lsm= deferred
-  # to the kernel built-in default. We append explicitly here so
-  # /sys/kernel/security/lsm includes bpf after reboot.
   - |
-    if ! grep -q 'lsm=.*\bbpf\b' /etc/default/grub; then
+    if ! grep -q 'lsm=.*bpf' /etc/default/grub; then
       sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"|GRUB_CMDLINE_LINUX_DEFAULT="\1 lsm=lockdown,yama,integrity,apparmor,bpf"|' /etc/default/grub
       update-grub
     fi
-  # Mark cloud-init as done; reboot once so the LSM stack change
-  # takes effect. cloud-init's `power_state` would also work, but
-  # `shutdown -r` is more transparent in the serial log.
   - touch /var/lib/cloud/instance/shit-vm-provisioned
-  - shutdown -r +1 "shit-linux-bpf-vm: rebooting to pick up lsm=bpf"
-EOF
+  - shutdown -r +1 shit-linux-bpf-vm-reboot-for-lsm
+USERDATA_EOF
 
 log "building cidata.iso"
+STAGE_DIR="$(mktemp -d -t linux-cidata)"
+cp "${TMP_USER_DATA}" "${STAGE_DIR}/user-data"
+cp "${TMP_META_DATA}" "${STAGE_DIR}/meta-data"
 if command -v mkisofs >/dev/null 2>&1; then
+  # cdrtools mkisofs: build from a staged directory (its argv-rename
+  # syntax isn't compatible with the genisoimage `src=dest` form).
   mkisofs -quiet -output "${SEED_ISO}" -volid cidata -joliet -rock \
-    "${TMP_USER_DATA}=user-data" "${TMP_META_DATA}=meta-data"
+    "${STAGE_DIR}"
 else
-  STAGE_DIR="$(mktemp -d -t linux-cidata)"
-  cp "${TMP_USER_DATA}" "${STAGE_DIR}/user-data"
-  cp "${TMP_META_DATA}" "${STAGE_DIR}/meta-data"
   hdiutil makehybrid -quiet -o "${SEED_ISO}" -hfs -joliet -iso \
     -default-volume-name cidata "${STAGE_DIR}"
-  rm -rf "${STAGE_DIR}"
 fi
+rm -rf "${STAGE_DIR}"
 
 # 5. EFI firmware (same as the FreeBSD VM).
 EFI_FIRMWARE=""
