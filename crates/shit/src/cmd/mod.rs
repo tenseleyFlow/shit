@@ -11,6 +11,7 @@ pub mod forget;
 pub mod gc;
 pub mod list;
 pub mod manpages;
+pub mod net_hooks;
 pub mod no_protect;
 pub mod pin;
 pub mod pkg_hooks;
