@@ -82,6 +82,10 @@ enum Cmd {
     /// killall). See `shit proc-hooks --help`.
     #[command(name = "proc-hooks")]
     ProcHooks(cmd::proc_hooks::ProcHooksArgs),
+    /// Install/remove/status the DB CLI wrappers (psql, mysql,
+    /// sqlite3). Opt-in stretch UX. See `shit db-hooks --help`.
+    #[command(name = "db-hooks")]
+    DbHooks(cmd::db_hooks::DbHooksArgs),
     /// Drop a captured command's savepoint.
     Forget(cmd::forget::ForgetArgs),
     /// Manual blob-store garbage collection.
@@ -256,6 +260,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::SvcHooks(args) => Ok(cmd::svc_hooks::run(args)?),
         Cmd::NetHooks(args) => Ok(cmd::net_hooks::run(args)?),
         Cmd::ProcHooks(args) => Ok(cmd::proc_hooks::run(args)?),
+        Cmd::DbHooks(args) => Ok(cmd::db_hooks::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
         Cmd::Config(args) => Ok(cmd::config::run(args)?),
