@@ -21,6 +21,7 @@ pub mod init;
 pub mod kernel_probe;
 pub mod mark;
 pub mod parse;
+pub mod queue;
 pub mod tree;
 
 pub use init::{FanotifyFd, InitError, init, init_pre_content};
