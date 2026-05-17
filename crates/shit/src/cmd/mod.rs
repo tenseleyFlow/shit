@@ -13,6 +13,7 @@ pub mod list;
 pub mod manpages;
 pub mod no_protect;
 pub mod pin;
+pub mod pkg_hooks;
 pub mod redo;
 pub mod show;
 pub mod undo;
