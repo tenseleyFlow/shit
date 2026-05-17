@@ -34,6 +34,7 @@ mod ipc;
     target_os = "dragonfly",
 ))]
 mod kqueue;
+mod net;
 mod pkg;
 #[cfg(target_os = "linux")]
 mod priv_linux;
@@ -102,6 +103,10 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// The `*Event` postfix is shared by design — each subcommand
+// represents one hook event kind. Renaming for clippy's taste would
+// uncouple the variant from its subcommand name.
+#[allow(clippy::enum_variant_names)]
 enum Mode {
     /// Single-shot package-manager hook invocation (S14). Reads
     /// package-state via the requested manager's CLI tools and ships
@@ -119,6 +124,29 @@ enum Mode {
         phase: String,
         /// Override the daemon ctl-socket path. By default we use the
         /// per-user default location.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
+    /// Single-shot network-tool wrapper invocation (S17). Same
+    /// hook-friendly error policy as `pkg-event` / `svc-event`. The
+    /// wrapper script has already classified the verb as mutating;
+    /// we just snapshot state via the tool's native dump command
+    /// and ship the bytes.
+    #[command(name = "net-event")]
+    NetEvent {
+        /// Network tool identifier (iptables|ip6tables|nft|ufw|pfctl|ip-route|...).
+        tool: String,
+        /// Phase of the operation (pre|post).
+        phase: String,
+        /// Verb the user issued (informational; the wrapper has
+        /// already decided this is a mutating op).
+        #[arg(long)]
+        verb: String,
+        /// Tool-specific scope hint (iptables family, nft table,
+        /// pfctl anchor, ip object). Empty when not applicable.
+        #[arg(long, default_value = "")]
+        scope_hint: String,
+        /// Override the daemon ctl-socket path.
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
@@ -263,6 +291,13 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             verb,
             ctl_sock,
         } => svc::run_event(&tool, &phase, &scope, &unit, &verb, ctl_sock.as_deref()).await,
+        Mode::NetEvent {
+            tool,
+            phase,
+            verb,
+            scope_hint,
+            ctl_sock,
+        } => net::run_event(&tool, &phase, &verb, &scope_hint, ctl_sock.as_deref()).await,
     }
 }
 
