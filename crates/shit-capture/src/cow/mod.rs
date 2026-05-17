@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 pub mod clonefile_macos;
 mod error;
+#[cfg(target_os = "linux")]
+pub mod ficlone_linux;
 pub mod hardlink;
 pub mod streaming;
 pub mod verify;
