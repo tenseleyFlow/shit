@@ -105,25 +105,48 @@ impl Conn {
     }
 
     fn recv_frame(&self) -> Result<Vec<u8>, ConnError> {
-        // Read the 4-byte BE length prefix, then read exactly that many
-        // payload bytes. SEQPACKET would let us read one packet at a
-        // time, but the framing handles either case so we use the same
-        // path everywhere.
-        let mut header = [0u8; 4];
-        self.recv_exact(&mut header)?;
-        let body_len = u32::from_be_bytes(header) as usize;
-        if body_len > MAX_HELPER_FRAME_SIZE - 4 {
-            return Err(ConnError::Decode(shit_proto::DecodeError::TooLarge(
-                body_len + 4,
-            )));
+        // Transport-aware:
+        //   - SEQPACKET (Linux): one `recv()` returns the full packet
+        //     atomically. Issuing a short recv would TRUNCATE the rest
+        //     of the kernel packet, so we must read into a full-size
+        //     buffer up-front.
+        //   - STREAM (macOS/BSD): byte stream; we read the 4-byte
+        //     length header first, then the declared body. Partial
+        //     reads OK.
+        #[cfg(target_os = "linux")]
+        {
+            let mut buf = vec![0u8; MAX_HELPER_FRAME_SIZE];
+            let n = recv(
+                self.fd.as_raw_fd(),
+                &mut buf,
+                nix::sys::socket::MsgFlags::empty(),
+            )?;
+            if n == 0 {
+                return Err(ConnError::PeerClosed);
+            }
+            buf.truncate(n);
+            return Ok(buf);
         }
-        let mut out = Vec::with_capacity(4 + body_len);
-        out.extend_from_slice(&header);
-        out.resize(4 + body_len, 0);
-        self.recv_exact(&mut out[4..])?;
-        Ok(out)
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut header = [0u8; 4];
+            self.recv_exact(&mut header)?;
+            let body_len = u32::from_be_bytes(header) as usize;
+            if body_len > MAX_HELPER_FRAME_SIZE - 4 {
+                return Err(ConnError::Decode(shit_proto::DecodeError::TooLarge(
+                    body_len + 4,
+                )));
+            }
+            let mut out = Vec::with_capacity(4 + body_len);
+            out.extend_from_slice(&header);
+            out.resize(4 + body_len, 0);
+            self.recv_exact(&mut out[4..])?;
+            Ok(out)
+        }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn recv_exact(&self, buf: &mut [u8]) -> Result<(), ConnError> {
         let mut got = 0;
         while got < buf.len() {

@@ -283,15 +283,37 @@ fn send_frame(fd: &std::os::fd::OwnedFd, frame: &[u8]) {
 }
 
 fn recv_frame(fd: &std::os::fd::OwnedFd) -> Vec<u8> {
-    let mut header = [0u8; 4];
-    recv_exact(fd, &mut header);
-    let body_len = u32::from_be_bytes(header) as usize;
-    let mut out = vec![0u8; 4 + body_len];
-    out[..4].copy_from_slice(&header);
-    recv_exact(fd, &mut out[4..]);
-    out
+    // SEQPACKET (Linux) requires a single full-size recv to avoid
+    // truncating the packet. STREAM (macOS/BSD) allows incremental
+    // reads via the length-prefix header.
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf = vec![0u8; shit_proto::MAX_HELPER_FRAME_SIZE];
+        let n = nix::sys::socket::recv(
+            fd.as_raw_fd(),
+            &mut buf,
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .expect("recv");
+        if n == 0 {
+            panic!("peer closed");
+        }
+        buf.truncate(n);
+        buf
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut header = [0u8; 4];
+        recv_exact(fd, &mut header);
+        let body_len = u32::from_be_bytes(header) as usize;
+        let mut out = vec![0u8; 4 + body_len];
+        out[..4].copy_from_slice(&header);
+        recv_exact(fd, &mut out[4..]);
+        out
+    }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn recv_exact(fd: &std::os::fd::OwnedFd, buf: &mut [u8]) {
     let mut got = 0;
     while got < buf.len() {
