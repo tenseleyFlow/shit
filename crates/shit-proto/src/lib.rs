@@ -25,9 +25,9 @@ pub mod frame;
 pub mod helper;
 
 pub use ctl::{
-    CtlRequest, CtlResponse, DaemonStatus, GcReport, GcRequest, PinRequest, PinSummary,
-    PkgEventReq, PkgManagerParseError, PkgManagerWire, PkgPhase, SvcEventReq, SvcScopeWire,
-    SvcToolParseError, SvcToolWire,
+    CtlRequest, CtlResponse, DaemonStatus, GcReport, GcRequest, NetEventReq, NetToolParseError,
+    NetToolWire, PinRequest, PinSummary, PkgEventReq, PkgManagerParseError, PkgManagerWire,
+    PkgPhase, SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire,
 };
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,

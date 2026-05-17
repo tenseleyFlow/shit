@@ -35,6 +35,11 @@ pub enum CtlRequest {
     /// unrelated `systemctl` invocations, and unit because the same
     /// command can touch multiple units in sequence (rare but legal).
     SvcEvent(SvcEventReq),
+    /// Network-tool wrapper invocation (S17). Sent by `shit-helper
+    /// net-event ...` once per Pre and once per Post phase of an
+    /// iptables/nft/ufw/pfctl/ip/route invocation. The daemon
+    /// pairs by (tool, pid, scope_hint).
+    NetEvent(NetEventReq),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +190,86 @@ impl SvcScopeWire {
     }
 }
 
+/// Which network-tool CLI the wrapper is fronting. Mirrors
+/// `shit_planner::NetworkTool` without dragging in that crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NetToolWire {
+    Iptables,
+    Ip6tables,
+    Nft,
+    Ufw,
+    Pfctl,
+    IpRoute,
+    IpAddr,
+    IpLink,
+    Route,
+    Ifconfig,
+    Networksetup,
+}
+
+impl NetToolWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Iptables => "iptables",
+            Self::Ip6tables => "ip6tables",
+            Self::Nft => "nft",
+            Self::Ufw => "ufw",
+            Self::Pfctl => "pfctl",
+            Self::IpRoute => "ip-route",
+            Self::IpAddr => "ip-addr",
+            Self::IpLink => "ip-link",
+            Self::Route => "route",
+            Self::Ifconfig => "ifconfig",
+            Self::Networksetup => "networksetup",
+        }
+    }
+}
+
+impl std::str::FromStr for NetToolWire {
+    type Err = NetToolParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "iptables" => Ok(Self::Iptables),
+            "ip6tables" => Ok(Self::Ip6tables),
+            "nft" => Ok(Self::Nft),
+            "ufw" => Ok(Self::Ufw),
+            "pfctl" => Ok(Self::Pfctl),
+            "ip-route" | "iproute" => Ok(Self::IpRoute),
+            "ip-addr" | "ipaddr" => Ok(Self::IpAddr),
+            "ip-link" | "iplink" => Ok(Self::IpLink),
+            "route" => Ok(Self::Route),
+            "ifconfig" => Ok(Self::Ifconfig),
+            "networksetup" => Ok(Self::Networksetup),
+            other => Err(NetToolParseError(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown network tool: {0}")]
+pub struct NetToolParseError(pub String);
+
+/// One network-tool wrapper invocation as it crosses the wire.
+///
+/// `scope_hint` carries tool-specific context the daemon uses to
+/// disambiguate (iptables family, nft table, ufw is global so empty,
+/// pfctl anchor path). The daemon doesn't interpret it; the planner
+/// does on the inverse side.
+///
+/// `state_raw` is the raw tool-native dump (`iptables-save -c`,
+/// `nft list ruleset -a`, `pfctl -s rules`, `ip -j route show`,
+/// etc.). The wrapper script knows what to invoke per tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetEventReq {
+    pub tool: NetToolWire,
+    pub phase: PkgPhase,
+    pub verb: String,
+    pub scope_hint: String,
+    pub pid: u32,
+    pub uid: u32,
+    pub state_raw: Vec<u8>,
+}
+
 /// One service-manager wrapper invocation as it crosses the wire.
 ///
 /// The wrapper invokes `shit-helper svc-event ...` once per phase
@@ -250,6 +335,8 @@ pub enum CtlResponse {
     PkgEventAck,
     /// Reply to `SvcEvent` — same shape as `PkgEventAck`.
     SvcEventAck,
+    /// Reply to `NetEvent` — same shape.
+    NetEventAck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
