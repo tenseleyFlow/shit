@@ -17,6 +17,8 @@ use tokio::sync::Notify;
 
 mod crash;
 #[cfg(target_os = "linux")]
+mod ebpf;
+#[cfg(target_os = "linux")]
 mod fanotify;
 mod handshake;
 mod health;
@@ -188,26 +190,29 @@ fn privileged_setup() -> PrivilegedSetup {
 }
 
 /// Decide which kernel-tier the helper *should* use based on the
-/// runtime probe. Stage-1 (this commit) returns `Fanotify` even when
-/// BPF-LSM is fully supported; the eBPF-LSM loader lands in a later
-/// S09 stage that requires explicit user buy-in.
+/// runtime probe.
+///
+/// Stage 2 of S09: the `EbpfLoader::probe` runs (read-only); when
+/// prerequisites are met we record `EbpfLsmAvailableButDeferred` so
+/// operators see the upgrade path. The actual `load()` always returns
+/// `NotImplemented`, so fanotify remains the only working tier.
 #[cfg(target_os = "linux")]
 fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
-    let bpf = shit_capture::linux_kernel::probe_bpf_lsm();
-    let caps = priv_linux::probe_bpf_caps();
-    if bpf.fully_supported() && caps.can_load_lsm() {
+    let loader = ebpf::EbpfLoader::new();
+    let outcome = loader.probe();
+    if outcome.should_attempt_load() {
         tracing::info!(
-            diagnosis = bpf.diagnose(),
-            cap_bpf = caps.cap_bpf,
-            cap_perfmon = caps.cap_perfmon,
-            "ebpf-lsm is available but loader is not shipped yet — falling back to fanotify"
+            kernel = outcome.kernel.diagnose(),
+            cap_bpf = outcome.caps.cap_bpf,
+            cap_perfmon = outcome.caps.cap_perfmon,
+            "ebpf-lsm prerequisites met; loader is stage-2 NotImplemented → fanotify"
         );
         if have_fanotify_fd {
             return CaptureTier::EbpfLsmAvailableButDeferred;
         }
     } else {
         tracing::info!(
-            diagnosis = bpf.diagnose(),
+            diagnosis = outcome.diagnose(),
             "ebpf-lsm not available; using fanotify if possible"
         );
     }
