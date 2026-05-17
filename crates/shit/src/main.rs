@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod cmd;
 mod doctor;
+mod exitcode;
 mod hooks;
 mod paths;
 mod send;
