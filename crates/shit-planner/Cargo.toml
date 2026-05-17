@@ -20,6 +20,7 @@ tracing = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 blake3 = { workspace = true }
+globset = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

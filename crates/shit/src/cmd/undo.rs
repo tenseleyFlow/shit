@@ -61,6 +61,13 @@ pub struct UndoArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     pub raw: bool,
 
+    /// Restrict the undo to paths matching one of these glob patterns.
+    /// May be passed multiple times: `--paths '/etc/**' --paths '/var/log/**'`.
+    /// Ops with no path (env, package, etc.) are not affected by this
+    /// filter — they always pass.
+    #[arg(long = "paths", action = ArgAction::Append)]
+    pub paths: Vec<String>,
+
     /// Override the daemon ctl socket. Diagnostic; not for normal use.
     #[arg(long)]
     pub ctl_sock: Option<PathBuf>,
@@ -74,6 +81,7 @@ impl Default for UndoArgs {
             on_conflict: ConflictPolicyArg::Abort,
             yes: false,
             raw: false,
+            paths: Vec::new(),
             ctl_sock: None,
         }
     }
@@ -119,6 +127,7 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
     println!("  dry-run:     {}", args.dry_run);
     println!("  on-conflict: {policy:?}");
     println!("  raw:         {}", args.raw);
+    println!("  paths:       {:?}", args.paths);
     println!();
     println!(
         "The S11 executor pipeline is in place: \

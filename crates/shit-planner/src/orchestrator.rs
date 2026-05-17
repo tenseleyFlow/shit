@@ -29,14 +29,45 @@ use crate::probe::StateProbe;
 ///
 /// Borrows the executor + probe; the orchestrator holds no state of
 /// its own across calls. Re-entrant by design.
+///
+/// **Path filter (DR-17 — partial undo):** when set, ops whose
+/// `primary_path()` doesn't match any of the patterns are recorded
+/// as `Skipped { reason: "filtered out" }`. Ops without a path
+/// (env, network, etc.) are not affected — they pass the filter
+/// unconditionally so a `--paths '/etc/**'` doesn't accidentally
+/// silence environment changes.
 pub struct Orchestrator<'a, E: InverseOpExecutor, P: StateProbe> {
     executor: &'a E,
     probe: &'a P,
+    paths_filter: Option<globset::GlobSet>,
 }
 
 impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
     pub fn new(executor: &'a E, probe: &'a P) -> Self {
-        Self { executor, probe }
+        Self {
+            executor,
+            probe,
+            paths_filter: None,
+        }
+    }
+
+    /// Restrict execution to ops whose path matches at least one
+    /// pattern. Pass `None` to clear.
+    pub fn with_paths_filter(mut self, set: Option<globset::GlobSet>) -> Self {
+        self.paths_filter = set;
+        self
+    }
+
+    /// True when this op should be skipped because its path doesn't
+    /// match the filter. Ops without a path bypass the filter.
+    fn filtered_out(&self, op: &InverseOp) -> bool {
+        let Some(set) = &self.paths_filter else {
+            return false;
+        };
+        match op.primary_path() {
+            Some(p) => !set.is_match(p),
+            None => false,
+        }
     }
 
     /// Walk the plan, applying each op. The returned report mirrors
@@ -47,6 +78,27 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
 
         for (op_index, node) in plan.nodes.iter().enumerate() {
             let op = &node.op;
+
+            // Path-filter short-circuit: filtered-out ops are Skipped
+            // without consulting the executor or the conflict probe.
+            // This preserves "filtered" as a distinct outcome — users
+            // reviewing the report can tell "I excluded it" from
+            // "it conflicted."
+            if self.filtered_out(op) {
+                records.push(ExecutionRecord {
+                    op_index,
+                    op: op.clone(),
+                    tier: op.tier(),
+                    outcome_kind: OutcomeKind::Skipped,
+                    detail: Some(format!(
+                        "filtered out: {} not matched by --paths",
+                        op.primary_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<no-path>".into())
+                    )),
+                });
+                continue;
+            }
 
             // Live-state precondition check. Returns Some(Conflict) when
             // the FS is in a state we can't reconcile with the op's
@@ -335,6 +387,76 @@ mod tests {
         assert_eq!(r.records[0].outcome_kind, OutcomeKind::WouldApply);
         // The file is still there — dry-run didn't mutate.
         assert!(target.exists());
+    }
+
+    #[test]
+    fn paths_filter_skips_non_matching_paths() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let inside = tmpdir.path().join("inside.txt");
+        let outside = tmpdir.path().join("outside.txt");
+        std::fs::write(&inside, b"a").unwrap();
+        std::fs::write(&outside, b"b").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            inside.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        probe.insert(
+            outside.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 2),
+                meta: sample_meta(),
+            },
+            None,
+        );
+
+        // Filter: only `inside.txt` (literal match).
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new(inside.to_str().unwrap()).unwrap());
+        let set = builder.build().unwrap();
+
+        let orc = Orchestrator::new(&exec, &probe).with_paths_filter(Some(set));
+
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: inside.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: outside.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+
+        let r = orc.run(&plan, false, ConflictPolicy::default());
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.records[0].outcome_kind, OutcomeKind::Applied);
+        assert_eq!(r.records[1].outcome_kind, OutcomeKind::Skipped);
+        assert!(
+            r.records[1]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("filtered out"),
+            "{:?}",
+            r.records[1].detail
+        );
+        // Inside was applied; outside still exists.
+        assert!(!inside.exists());
+        assert!(outside.exists());
     }
 
     #[test]
