@@ -43,10 +43,10 @@ pub fn resolve_color_with<F: FnOnce() -> bool>(pref: ColorPref, is_tty: F) -> bo
     {
         return false;
     }
-    if let Some(v) = std::env::var_os("CLICOLOR") {
-        if v == "0" {
-            return false;
-        }
+    if let Some(v) = std::env::var_os("CLICOLOR")
+        && v == "0"
+    {
+        return false;
     }
     is_tty()
 }

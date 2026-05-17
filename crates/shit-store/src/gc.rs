@@ -123,11 +123,12 @@ pub fn run_pass(
 
     // Pre-emptive trigger: 90% of cap also pulls aggressive mode in
     // even though we haven't hit the wall yet.
-    if let Some(cap) = config.size_cap_bytes {
-        if !aggressive && size_now * 10 >= cap * 9 {
-            effective_age_cutoff = u64::MAX;
-            report.aggressive_mode_used = true;
-        }
+    if let Some(cap) = config.size_cap_bytes
+        && !aggressive
+        && size_now * 10 >= cap * 9
+    {
+        effective_age_cutoff = u64::MAX;
+        report.aggressive_mode_used = true;
     }
 
     // 1+2. Mark-expired loop. We process in `batch_size` chunks so the

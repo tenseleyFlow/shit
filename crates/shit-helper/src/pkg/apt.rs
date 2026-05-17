@@ -88,10 +88,10 @@ fn read_holds() -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut held = Vec::new();
     for line in text.lines() {
-        if let Some((name, kind)) = line.split_once(char::is_whitespace) {
-            if kind.trim() == "hold" {
-                held.push(name.to_string());
-            }
+        if let Some((name, kind)) = line.split_once(char::is_whitespace)
+            && kind.trim() == "hold"
+        {
+            held.push(name.to_string());
         }
     }
     if held.is_empty() {

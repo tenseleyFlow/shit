@@ -101,16 +101,16 @@ pub fn plan_install(
 /// Idempotent: re-running with the same `inner_line` yields identical output.
 pub fn upsert_marker_block(rc_content: &str, inner_line: &str) -> String {
     let block = format!("{MARKER_BEGIN}\n{inner_line}\n{MARKER_END}\n");
-    if let Some((before, rest)) = rc_content.split_once(MARKER_BEGIN) {
-        if let Some((_, after)) = rest.split_once(MARKER_END) {
-            // Strip the existing block (and the trailing newline if present).
-            let after = after.strip_prefix('\n').unwrap_or(after);
-            let mut out = String::with_capacity(rc_content.len() + block.len());
-            out.push_str(before);
-            out.push_str(&block);
-            out.push_str(after);
-            return out;
-        }
+    if let Some((before, rest)) = rc_content.split_once(MARKER_BEGIN)
+        && let Some((_, after)) = rest.split_once(MARKER_END)
+    {
+        // Strip the existing block (and the trailing newline if present).
+        let after = after.strip_prefix('\n').unwrap_or(after);
+        let mut out = String::with_capacity(rc_content.len() + block.len());
+        out.push_str(before);
+        out.push_str(&block);
+        out.push_str(after);
+        return out;
     }
     // No existing block; append.
     let mut out = String::with_capacity(rc_content.len() + block.len() + 1);
@@ -125,17 +125,17 @@ pub fn upsert_marker_block(rc_content: &str, inner_line: &str) -> String {
 /// Remove the `# >>> shit hooks >>>` marker block from `rc_content`. Returns
 /// the content unchanged if no block is present.
 pub fn remove_marker_block(rc_content: &str) -> String {
-    if let Some((before, rest)) = rc_content.split_once(MARKER_BEGIN) {
-        if let Some((_, after)) = rest.split_once(MARKER_END) {
-            let after = after.strip_prefix('\n').unwrap_or(after);
-            let mut out = String::with_capacity(before.len() + after.len());
-            out.push_str(before.trim_end_matches('\n'));
-            if !before.is_empty() && !after.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(after);
-            return out;
+    if let Some((before, rest)) = rc_content.split_once(MARKER_BEGIN)
+        && let Some((_, after)) = rest.split_once(MARKER_END)
+    {
+        let after = after.strip_prefix('\n').unwrap_or(after);
+        let mut out = String::with_capacity(before.len() + after.len());
+        out.push_str(before.trim_end_matches('\n'));
+        if !before.is_empty() && !after.is_empty() {
+            out.push('\n');
         }
+        out.push_str(after);
+        return out;
     }
     rc_content.to_string()
 }

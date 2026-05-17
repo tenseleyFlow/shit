@@ -397,10 +397,10 @@ mod tests {
         fn run(&self, argv: &[String]) -> Result<(), String> {
             let mut v = self.invocations.borrow_mut();
             v.push(argv.to_vec());
-            if let Some(n) = self.fail_on {
-                if v.len() - 1 == n {
-                    return Err(format!("fail on idx {n}"));
-                }
+            if let Some(n) = self.fail_on
+                && v.len() - 1 == n
+            {
+                return Err(format!("fail on idx {n}"));
             }
             Ok(())
         }

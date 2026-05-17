@@ -322,11 +322,11 @@ fn install_runit(s: &Subs) -> Result<()> {
 
 fn uninstall_runit() -> Result<()> {
     let run = runit_service_path()?;
-    if let Some(dir) = run.parent() {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)?;
-            println!("removed {}", dir.display());
-        }
+    if let Some(dir) = run.parent()
+        && dir.exists()
+    {
+        std::fs::remove_dir_all(dir)?;
+        println!("removed {}", dir.display());
     }
     Ok(())
 }

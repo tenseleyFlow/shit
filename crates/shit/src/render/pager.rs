@@ -49,10 +49,10 @@ pub fn page_if_tty(content: &str, over_threshold: bool) -> std::io::Result<()> {
     };
     if let Some(stdin) = child.stdin.as_mut() {
         // Pager may quit early (user pressed q); ignore EPIPE.
-        if let Err(e) = stdin.write_all(content.as_bytes()) {
-            if e.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(e);
-            }
+        if let Err(e) = stdin.write_all(content.as_bytes())
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(e);
         }
     }
     let _ = child.wait();

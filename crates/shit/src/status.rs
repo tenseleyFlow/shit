@@ -18,14 +18,14 @@ pub fn run(ctl_sock: Option<PathBuf>) -> Result<()> {
         }
         Err(e) => {
             // Distinguish "no daemon" from other failures.
-            if let Some(io) = e.downcast_ref::<std::io::Error>() {
-                if matches!(
+            if let Some(io) = e.downcast_ref::<std::io::Error>()
+                && matches!(
                     io.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) {
-                    println!("daemon: not running (no ctl socket at {})", path.display());
-                    return Ok(());
-                }
+                )
+            {
+                println!("daemon: not running (no ctl socket at {})", path.display());
+                return Ok(());
             }
             Err(e)
         }
