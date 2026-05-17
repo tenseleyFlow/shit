@@ -22,10 +22,16 @@ use uuid::Uuid;
 
 pub mod ctl;
 pub mod frame;
+pub mod helper;
 
 pub use ctl::{CtlRequest, CtlResponse, DaemonStatus};
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
+};
+pub use helper::{
+    AuthDecision, AuthEventKind, HELPER_PATH_HINT_MAX, HELPER_PROTOCOL_VERSION,
+    HelperCaps, HelperProtoError, HelperRequest, HelperResponse, MAX_HELPER_FRAME_SIZE,
+    validate_outgoing,
 };
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.
