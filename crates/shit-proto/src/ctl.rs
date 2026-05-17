@@ -134,7 +134,7 @@ impl std::str::FromStr for PkgManagerWire {
 pub struct PkgManagerParseError(pub String);
 
 /// Which service-manager CLI the wrapper is fronting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SvcToolWire {
     Systemctl,
     Launchctl,
