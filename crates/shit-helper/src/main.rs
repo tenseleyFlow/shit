@@ -96,21 +96,58 @@ fn main() -> anyhow::Result<()> {
         "shit-helper starting"
     );
 
-    // Drop privileges to the minimum keep-list *before* any tokio rt
-    // bring-up so the runtime never holds extra caps.
-    #[cfg(target_os = "linux")]
-    priv_linux::drop_to_minimum().map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
-
     // Crash hook: panics in worker tasks get a one-line summary on disk.
     crash::install_panic_hook(&cli.state_dir);
+
+    // ---- privileged phase ----
+    // Open any fd that requires `CAP_SYS_ADMIN` while we still have it,
+    // *then* drop caps. The order is load-bearing: dropping first
+    // EPERMs the fanotify_init below.
+    let setup = privileged_setup();
+
+    // Drop privileges to the minimum keep-list *after* the fanotify fd
+    // is in hand. On systems where we never had CAP_SYS_ADMIN this is
+    // a no-op safety net.
+    #[cfg(target_os = "linux")]
+    priv_linux::drop_to_minimum().map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(cli))
+    rt.block_on(run(cli, setup))
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Outcome of the privileged setup phase. The fanotify fd (if present)
+/// is owned here and handed to the runtime; we never re-init from the
+/// async side because we no longer hold `CAP_SYS_ADMIN`.
+struct PrivilegedSetup {
+    caps: shit_proto::HelperCaps,
+    #[cfg(target_os = "linux")]
+    fanotify_fd: Option<fanotify::FanotifyFd>,
+}
+
+fn privileged_setup() -> PrivilegedSetup {
+    #[cfg(target_os = "linux")]
+    {
+        let (caps, fanotify_fd) = linux_privileged_setup();
+        return PrivilegedSetup { caps, fanotify_fd };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS path lands in S07; BSD in S10. Helper still claims
+        // `watch_tree` since that primitive is best-effort even with
+        // no kernel hooks.
+        PrivilegedSetup {
+            caps: shit_proto::HelperCaps {
+                watch_tree: true,
+                auth_subscribe: false,
+                package_hook: false,
+            },
+        }
+    }
+}
+
+async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let shutdown = Arc::new(Notify::new());
 
     install_signal_handlers(Arc::clone(&shutdown));
@@ -127,12 +164,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         "connected to daemon ipc socket"
     );
 
-    // Per-platform helper capabilities. Once S07/S08/S09 land, this
-    // reflects what the helper can actually do given current privileges.
-    let local_caps = current_capabilities();
-
     let outcome =
-        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, local_caps) {
+        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, setup.caps) {
             Ok(o) => o,
             Err(e) => {
                 tracing::error!(err = %e, "handshake failed; exiting");
@@ -145,6 +178,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         granted = ?outcome.granted,
         "handshake complete"
     );
+
+    // S08.13 will spawn the fanotify event loop here using
+    // `setup.fanotify_fd`. For now we just stash it so the fd lives
+    // long enough; drop on shutdown closes it.
+    #[cfg(target_os = "linux")]
+    let _fanotify_fd = setup.fanotify_fd;
 
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
@@ -185,47 +224,22 @@ fn install_signal_handlers(shutdown: Arc<Notify>) {
     });
 }
 
-/// Compute what the helper can advertise on this platform / privilege
-/// level. The probe is destructive on Linux (it opens the real
-/// fanotify fd) — we keep the fd around in the returned outcome so we
-/// don't have to re-init after the cap drop.
-fn current_capabilities() -> shit_proto::HelperCaps {
-    #[cfg(target_os = "linux")]
-    {
-        return linux_probe_caps();
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // macOS path lands in S07; BSD in S10. Helper still claims
-        // `watch_tree` since that primitive is best-effort even with
-        // no kernel hooks.
-        shit_proto::HelperCaps {
-            watch_tree: true,
-            auth_subscribe: false,
-            package_hook: false,
-        }
-    }
-}
-
-/// Probe the Linux kernel features + privilege level. Opens a real
-/// `fanotify_init(2)`; on success, advertises `auth_subscribe = true`
-/// and the caller drops `CAP_SYS_ADMIN` immediately (the fd works
-/// without the cap once init has returned).
+/// Linux privileged setup. Runs while we still hold `CAP_SYS_ADMIN`
+/// (if we ever did). Opens the fanotify fd; the fd works without the
+/// cap once init returns, so the caller drops caps immediately after.
 ///
-/// On EPERM (no CAP_SYS_ADMIN) or ENOSYS (older kernel without
-/// fanotify-perm) we fall through to inotify-only degraded mode —
-/// `auth_subscribe = false` to be honest about what we can deliver.
+/// Returns the advertised cap set and the owned fanotify fd. The fd
+/// is `None` when:
+///   - we don't have `CAP_SYS_ADMIN` (EPERM) → degraded mode,
+///   - kernel is pre-4.20 (no perm events) → degraded mode,
+///   - any other `fanotify_init` failure.
 #[cfg(target_os = "linux")]
-fn linux_probe_caps() -> shit_proto::HelperCaps {
+fn linux_privileged_setup() -> (shit_proto::HelperCaps, Option<fanotify::FanotifyFd>) {
     let (version, features) = match fanotify::probe() {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(err = %e, "kernel feature probe failed; assuming no fanotify");
-            return shit_proto::HelperCaps {
-                watch_tree: true,
-                auth_subscribe: false,
-                package_hook: false,
-            };
+            return (degraded_caps(), None);
         }
     };
     tracing::info!(
@@ -236,41 +250,34 @@ fn linux_probe_caps() -> shit_proto::HelperCaps {
 
     if !features.perm_events {
         tracing::warn!("kernel pre-4.20 — fanotify-perm unavailable, degraded mode");
-        return shit_proto::HelperCaps {
-            watch_tree: true,
-            auth_subscribe: false,
-            package_hook: false,
-        };
+        return (degraded_caps(), None);
     }
 
     match fanotify::init_pre_content() {
         Ok(fd) => {
-            tracing::info!("fanotify pre-content client opened; dropping CAP_SYS_ADMIN");
-            // Cap drop right after init — fd still works (S08 design
-            // note: cap is needed only by fanotify_init + fanotify_mark;
-            // we accept losing mark for now, S08+S09 wire mark into a
-            // privileged setup phase before this drop).
-            //
-            // For S08.8 the cap-drop happens via priv_linux on entry;
-            // this branch documents the design intent — the actual
-            // mark calls (S08.4 wiring) must run *before* we reach
-            // here. Today we hold the fd and let it close on the
-            // function return.
-            drop(fd);
-            shit_proto::HelperCaps {
-                watch_tree: true,
-                auth_subscribe: true,
-                package_hook: false,
-            }
+            tracing::info!("fanotify pre-content client opened");
+            (
+                shit_proto::HelperCaps {
+                    watch_tree: true,
+                    auth_subscribe: true,
+                    package_hook: false,
+                },
+                Some(fd),
+            )
         }
         Err(e) => {
             tracing::warn!(err = %e, "fanotify_init failed; degraded mode");
-            shit_proto::HelperCaps {
-                watch_tree: true,
-                auth_subscribe: false,
-                package_hook: false,
-            }
+            (degraded_caps(), None)
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn degraded_caps() -> shit_proto::HelperCaps {
+    shit_proto::HelperCaps {
+        watch_tree: true,
+        auth_subscribe: false,
+        package_hook: false,
     }
 }
 
