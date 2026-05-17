@@ -18,6 +18,7 @@ pub mod executors;
 pub mod inode;
 pub mod inverse;
 pub mod metadata;
+pub mod network;
 pub mod orchestrator;
 pub mod plan;
 pub mod probe;
@@ -46,6 +47,11 @@ pub use executors::FileExecutor;
 pub use inode::{BlobHash, InodeRef};
 pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
 pub use metadata::{FileKind, FileMetadata};
+pub use network::{
+    IP_MUTATING, IPTABLES_MUTATING, NFT_MUTATING, PFCTL_MUTATING, RestoreMethod, UFW_MUTATING,
+    is_ip_mutating, is_iptables_mutating, is_nft_mutating, is_pfctl_mutating, is_ufw_mutating,
+    restore_method,
+};
 pub use orchestrator::Orchestrator;
 pub use probe::{ProbeStat, StateProbe};
 pub use probe_live::{LiveStateProbe, hash_file};
