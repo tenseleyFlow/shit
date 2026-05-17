@@ -1,0 +1,19 @@
+[package]
+name = "shit-preload-shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LD_PRELOAD/DYLD_INSERT_LIBRARIES libc-interposition shim for shit-helper (S10 BSD tier)"
+
+[lib]
+# cdylib produces libshit_preload.{so,dylib} suitable for LD_PRELOAD.
+# We deliberately keep this a no_main, no-Rust-runtime cdylib so the
+# shim adds negligible load-time overhead to every process the user
+# runs with LD_PRELOAD set.
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = { workspace = true }

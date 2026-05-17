@@ -4,6 +4,7 @@ members = [
     "crates/shit",
     "crates/shitd",
     "crates/shit-helper",
+    "crates/shit-preload-shim",
     "crates/shit-proto",
     "crates/shit-store",
     "crates/shit-capture",
