@@ -5,6 +5,7 @@
 
 # Rust
 /target
+/vendor
 **/*.rs.bk
 *.pdb
 *.profraw
