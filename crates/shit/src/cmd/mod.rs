@@ -12,6 +12,7 @@ pub mod forget;
 pub mod gc;
 pub mod list;
 pub mod manpages;
+pub mod metrics;
 pub mod net_hooks;
 pub mod no_protect;
 pub mod pin;

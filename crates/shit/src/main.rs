@@ -86,6 +86,9 @@ enum Cmd {
     /// sqlite3). Opt-in stretch UX. See `shit db-hooks --help`.
     #[command(name = "db-hooks")]
     DbHooks(cmd::db_hooks::DbHooksArgs),
+    /// Query the daemon's perf-counter snapshot. `--format prometheus`
+    /// for scraping; `--watch 1s` for live updates.
+    Metrics(cmd::metrics::MetricsArgs),
     /// Drop a captured command's savepoint.
     Forget(cmd::forget::ForgetArgs),
     /// Manual blob-store garbage collection.
@@ -273,6 +276,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::NetHooks(args) => Ok(cmd::net_hooks::run(args)?),
         Cmd::ProcHooks(args) => Ok(cmd::proc_hooks::run(args)?),
         Cmd::DbHooks(args) => Ok(cmd::db_hooks::run(args)?),
+        Cmd::Metrics(args) => Ok(cmd::metrics::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
         Cmd::Config(args) => Ok(cmd::config::run(args)?),
