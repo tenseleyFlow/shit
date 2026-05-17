@@ -114,9 +114,106 @@ fn full_capset() -> bool {
     false
 }
 
+/// Numeric capability constants we need but libc on stable doesn't
+/// export. Values are pinned by the kernel ABI; see
+/// `include/uapi/linux/capability.h`.
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_PERFMON: u32 = 38;
+pub const CAP_BPF: u32 = 39;
+
+/// Which capabilities the current process holds in its effective set.
+/// Reads `/proc/self/status:CapEff` and tests bit `(1 << cap)`.
+///
+/// Returns `None` if the status file is unreadable (synthetic procfs
+/// builds, restrictive sandboxes).
+pub fn effective_caps_contain(cap: u32) -> Option<bool> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("CapEff:") {
+            let hex = rest.trim();
+            let mask = u64::from_str_radix(hex, 16).ok()?;
+            return Some((mask & (1u64 << cap)) != 0);
+        }
+    }
+    None
+}
+
+/// Snapshot of the BPF-LSM-relevant capabilities. Used by the helper
+/// during startup probe + `shit doctor` reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BpfCapState {
+    pub cap_bpf: bool,
+    pub cap_perfmon: bool,
+    pub cap_sys_admin: bool,
+}
+
+impl BpfCapState {
+    /// True when we have what `aya::Bpf::load` would need to load an
+    /// LSM program on a modern kernel: either `CAP_BPF + CAP_PERFMON`
+    /// (preferred, 5.8+) or `CAP_SYS_ADMIN` (legacy fallback).
+    pub fn can_load_lsm(&self) -> bool {
+        (self.cap_bpf && self.cap_perfmon) || self.cap_sys_admin
+    }
+}
+
+pub fn probe_bpf_caps() -> BpfCapState {
+    BpfCapState {
+        cap_bpf: effective_caps_contain(CAP_BPF).unwrap_or(false),
+        cap_perfmon: effective_caps_contain(CAP_PERFMON).unwrap_or(false),
+        cap_sys_admin: effective_caps_contain(CAP_SYS_ADMIN).unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_bpf_caps_returns_a_state() {
+        // Tests don't run privileged. All three should be false. If
+        // the test runner DOES have any of these, that's outside our
+        // control — we just sanity-check the call doesn't panic.
+        let c = probe_bpf_caps();
+        let _ = c.can_load_lsm();
+    }
+
+    #[test]
+    fn empty_cap_state_cannot_load() {
+        let c = BpfCapState::default();
+        assert!(!c.can_load_lsm());
+    }
+
+    #[test]
+    fn cap_bpf_plus_perfmon_can_load() {
+        let c = BpfCapState {
+            cap_bpf: true,
+            cap_perfmon: true,
+            cap_sys_admin: false,
+        };
+        assert!(c.can_load_lsm());
+    }
+
+    #[test]
+    fn cap_sys_admin_alone_can_load_legacy() {
+        let c = BpfCapState {
+            cap_bpf: false,
+            cap_perfmon: false,
+            cap_sys_admin: true,
+        };
+        assert!(c.can_load_lsm());
+    }
+
+    #[test]
+    fn cap_bpf_alone_cannot_load_on_modern() {
+        // 5.8+ split CAP_BPF from CAP_PERFMON; both required for
+        // perf-attached LSM programs.
+        let c = BpfCapState {
+            cap_bpf: true,
+            cap_perfmon: false,
+            cap_sys_admin: false,
+        };
+        assert!(!c.can_load_lsm());
+    }
 
     #[test]
     fn full_capset_is_false_in_normal_test_run() {
