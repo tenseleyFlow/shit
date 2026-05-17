@@ -117,6 +117,12 @@ async fn handle_client(
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
+        CtlRequest::ProcEvent(_) => {
+            // S18.6 wires this to a real handler. Stub-ack so a
+            // helper that ships ahead of the daemon doesn't deadlock
+            // the user's `kill` invocation.
+            CtlResponse::ProcEventAck
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
