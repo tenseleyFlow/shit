@@ -17,7 +17,9 @@
 #![cfg(target_os = "linux")]
 
 pub mod init;
+pub mod kernel_probe;
 pub mod mark;
 
 pub use init::{FanotifyFd, InitError, init, init_pre_content};
+pub use kernel_probe::{FanotifyFeatures, KernelVersion, probe, read_kernel_version};
 pub use mark::{MarkError, MarkFlags, mark_filesystem, mark_mount, unmark_filesystem};
