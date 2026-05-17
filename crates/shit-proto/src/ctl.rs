@@ -40,6 +40,12 @@ pub enum CtlRequest {
     /// iptables/nft/ufw/pfctl/ip/route invocation. The daemon
     /// pairs by (tool, pid, scope_hint).
     NetEvent(NetEventReq),
+    /// Process-lifecycle hook invocation (S18). Sent by
+    /// `shit-helper proc-event` once per Pre and once per Post
+    /// phase of a `kill`/`pkill`/`killall` invocation. Pre carries
+    /// the captured argv/cwd/env_summary snapshot for each target
+    /// process; Post reports which targets survived vs. went away.
+    ProcEvent(ProcEventReq),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +255,79 @@ impl std::str::FromStr for NetToolWire {
 #[error("unknown network tool: {0}")]
 pub struct NetToolParseError(pub String);
 
+/// Which kill-family tool the wrapper is fronting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProcToolWire {
+    Kill,
+    Pkill,
+    Killall,
+}
+
+impl ProcToolWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kill => "kill",
+            Self::Pkill => "pkill",
+            Self::Killall => "killall",
+        }
+    }
+}
+
+impl std::str::FromStr for ProcToolWire {
+    type Err = ProcToolParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "kill" => Ok(Self::Kill),
+            "pkill" => Ok(Self::Pkill),
+            "killall" => Ok(Self::Killall),
+            other => Err(ProcToolParseError(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown process tool: {0}")]
+pub struct ProcToolParseError(pub String);
+
+/// One process snapshot captured at Pre time. Used to render a
+/// restart suggestion if the kill succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcSnapshot {
+    pub pid: u32,
+    /// `comm` (15-char kernel-stored short name) — useful when
+    /// argv has been overwritten (postgres et al.).
+    pub comm: String,
+    /// Full argv from `/proc/<pid>/cmdline` (NUL-separated; the
+    /// helper splits before sending).
+    pub argv: Vec<String>,
+    pub cwd: String,
+    /// Whitelisted env vars only. The whitelist matches S15's
+    /// redaction story: TOKEN/SECRET/PASSWORD/API_KEY values are
+    /// already redacted before they cross the wire.
+    pub env_summary: std::collections::BTreeMap<String, String>,
+    pub parent_pid: u32,
+    /// Monotonic-clock start time in seconds since boot. Used for
+    /// PID-reuse sanity checking on Post.
+    pub start_time_secs: u64,
+    /// Controlling tty if any (e.g. `/dev/pts/3`).
+    pub tty: Option<String>,
+}
+
+/// One process-lifecycle hook invocation as it crosses the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcEventReq {
+    pub tool: ProcToolWire,
+    pub phase: PkgPhase,
+    /// The user's argv (minus the tool name). For `kill -9 1234`
+    /// this is `["-9", "1234"]`.
+    pub target_argv: Vec<String>,
+    /// Pre-state snapshots of each target. On Post this is the
+    /// *current* state (or absent entries mean the pid is gone).
+    pub targets: Vec<ProcSnapshot>,
+    pub pid: u32,
+    pub uid: u32,
+}
+
 /// One network-tool wrapper invocation as it crosses the wire.
 ///
 /// `scope_hint` carries tool-specific context the daemon uses to
@@ -337,6 +416,8 @@ pub enum CtlResponse {
     SvcEventAck,
     /// Reply to `NetEvent` — same shape.
     NetEventAck,
+    /// Reply to `ProcEvent` — same shape.
+    ProcEventAck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
