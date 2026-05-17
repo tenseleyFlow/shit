@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shit_planner::CommandId;
+use shit_planner::{CommandId, EnvFilter};
 
 /// TTL for stashed Pre events. Same logic as the pkg-event stash:
 /// orphan entries (no matching Post within this window) get evicted
@@ -125,7 +125,18 @@ pub fn handle_pre(stash: &EnvPreStash, key: CommandId, env_hash: [u8; 32]) {
 /// what we decided. The actual journal write happens in a follow-up
 /// (DR-32) when the (session, seq) → CaptureEvent::EnvDiff binding
 /// is in place.
-pub fn handle_post(stash: &EnvPreStash, key: CommandId, env_block: &[u8]) -> PostOutcome {
+///
+/// `filter` is consulted at the per-var redaction/ignore level when
+/// the diff is non-empty. Stage 1 doesn't retain the pre-block (only
+/// its hash), so we can't compute a per-key diff yet; the filter is
+/// threaded through anyway so the wiring is exercised end-to-end
+/// before DR-32 lands.
+pub fn handle_post(
+    stash: &EnvPreStash,
+    key: CommandId,
+    env_block: &[u8],
+    filter: &EnvFilter,
+) -> PostOutcome {
     let pre = match stash.take(key) {
         Some(p) => p,
         None => {
@@ -143,6 +154,21 @@ pub fn handle_post(stash: &EnvPreStash, key: CommandId, env_block: &[u8]) -> Pos
             session = %key.session,
             seq = key.seq,
             "env-post unchanged; dropping"
+        );
+        return PostOutcome::Unchanged;
+    }
+    // Filter doesn't gate the Changed outcome (the daemon's response
+    // is "we noticed a change"). The renderer applies the filter
+    // again at display time, but consulting it here lets us drop
+    // post entries that consist *entirely* of ignored vars — those
+    // shouldn't surface as "changed" to the user.
+    let post = shit_planner::env_parse_block(env_block);
+    let surfaces_to_user = post.keys().any(|k| !filter.is_ignored(k));
+    if !surfaces_to_user {
+        tracing::debug!(
+            session = %key.session,
+            seq = key.seq,
+            "env-post changed but all post vars are filter-ignored; dropping"
         );
         return PostOutcome::Unchanged;
     }
@@ -175,7 +201,7 @@ mod tests {
         let block = b"FOO=bar\0BAZ=qux".as_slice();
         let h = shit_planner::hash_env_block(block);
         handle_pre(&stash, cid(), h);
-        let outcome = handle_post(&stash, cid(), block);
+        let outcome = handle_post(&stash, cid(), block, &EnvFilter::default());
         assert_eq!(outcome, PostOutcome::Unchanged);
         assert_eq!(stash.len(), 0, "Post drains the stash");
     }
@@ -185,7 +211,7 @@ mod tests {
         let stash = EnvPreStash::new();
         let pre_h = shit_planner::hash_env_block(b"FOO=bar");
         handle_pre(&stash, cid(), pre_h);
-        let outcome = handle_post(&stash, cid(), b"FOO=NEW");
+        let outcome = handle_post(&stash, cid(), b"FOO=NEW", &EnvFilter::default());
         match outcome {
             PostOutcome::Changed {
                 pre_hash,
@@ -201,8 +227,19 @@ mod tests {
     #[test]
     fn orphan_post_is_dropped() {
         let stash = EnvPreStash::new();
-        let outcome = handle_post(&stash, cid(), b"FOO=bar");
+        let outcome = handle_post(&stash, cid(), b"FOO=bar", &EnvFilter::default());
         assert_eq!(outcome, PostOutcome::Orphan);
+    }
+
+    #[test]
+    fn filtered_only_post_is_treated_as_unchanged() {
+        let stash = EnvPreStash::new();
+        // Pre is empty; Post contains only an ignored var → user
+        // shouldn't see "changed."
+        let pre_h = shit_planner::hash_env_block(b"");
+        handle_pre(&stash, cid(), pre_h);
+        let outcome = handle_post(&stash, cid(), b"OLDPWD=/tmp", &EnvFilter::default());
+        assert_eq!(outcome, PostOutcome::Unchanged);
     }
 
     #[test]
