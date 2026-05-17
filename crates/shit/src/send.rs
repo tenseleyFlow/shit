@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use shit_proto::{HookMessage, ShellKind, encode_frame};
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -53,6 +54,38 @@ pub enum HookSendKind {
     SessionClose {
         #[arg(long)]
         session: Uuid,
+        #[arg(long)]
+        sock: PathBuf,
+    },
+    /// S15 — env tracking. The shell hook pipes the env block on
+    /// stdin as `KEY=VALUE\0KEY=VALUE\0...` (the output of
+    /// `env -0 | sort -z` on Linux/macOS). We hash it via the
+    /// planner's canonicalizer and emit `HookMessage::PreExecEnv`.
+    ///
+    /// Cheap on the hot path: only the 32-byte hash crosses the
+    /// wire here; the full block is sent in [`PostExecEnv`] only
+    /// when the hash changes (Stage 1 always sends — the "only on
+    /// change" optimization is gated on the daemon's pre-stash, see
+    /// S15.4).
+    #[command(name = "pre-exec-env")]
+    PreExecEnv {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        seq: u64,
+        #[arg(long)]
+        sock: PathBuf,
+    },
+    /// Companion to `PreExecEnv`. Same stdin format. The full
+    /// block crosses the wire; the daemon diffs against the pre-hash
+    /// it cached and emits a `CaptureEvent::EnvDiff` only when
+    /// non-empty.
+    #[command(name = "post-exec-env")]
+    PostExecEnv {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        seq: u64,
         #[arg(long)]
         sock: PathBuf,
     },
@@ -132,8 +165,51 @@ pub fn run(kind: HookSendKind) -> Result<()> {
             },
             sock,
         ),
+        HookSendKind::PreExecEnv { session, seq, sock } => {
+            let block = read_env_block_from_stdin()?;
+            let env_hash = shit_planner::hash_env_block(&block);
+            (
+                HookMessage::PreExecEnv {
+                    session,
+                    seq,
+                    env_hash,
+                    ts_unix_nanos: ts_now(),
+                },
+                sock,
+            )
+        }
+        HookSendKind::PostExecEnv { session, seq, sock } => {
+            let env_block = read_env_block_from_stdin()?;
+            (
+                HookMessage::PostExecEnv {
+                    session,
+                    seq,
+                    env_block,
+                    ts_unix_nanos: ts_now(),
+                },
+                sock,
+            )
+        }
     };
     send_message(&sock, &msg)
+}
+
+/// Read the shell's env block from stdin. Capped at 1 MiB — way over
+/// even the noisiest systems but cheap to enforce.
+const MAX_ENV_BLOCK: usize = 1 << 20;
+
+fn read_env_block_from_stdin() -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(8192);
+    std::io::stdin()
+        .take(MAX_ENV_BLOCK as u64 + 1)
+        .read_to_end(&mut buf)
+        .context("read env block from stdin")?;
+    if buf.len() > MAX_ENV_BLOCK {
+        anyhow::bail!(
+            "env block exceeds {MAX_ENV_BLOCK} bytes; refusing to send (raise the cap if this is genuine)"
+        );
+    }
+    Ok(buf)
 }
 
 fn stat_cwd(cwd: &std::path::Path) -> Option<(u64, u64)> {
