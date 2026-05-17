@@ -1,0 +1,45 @@
+[package]
+name = "shit-regression-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Perf-regression suite (S21.7). The library half is the measurement
+# harness — pure-logic stats with full unit-test coverage. The bin
+# half is per-workload runners that the CI workflow drives (S21.9).
+#
+# Lives in `benches/` rather than `crates/` so it's clearly out of
+# the shipping product. Not depended on by any crate that ships.
+
+[lib]
+name = "shit_regression_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tight-loop"
+path = "src/bin/tight_loop.rs"
+
+[[bin]]
+name = "find-workload"
+path = "src/bin/find_workload.rs"
+
+[[bin]]
+name = "cargo-build"
+path = "src/bin/cargo_build.rs"
+
+[[bin]]
+name = "git-clone"
+path = "src/bin/git_clone.rs"
+
+[[bin]]
+name = "baseline"
+path = "src/bin/baseline.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
