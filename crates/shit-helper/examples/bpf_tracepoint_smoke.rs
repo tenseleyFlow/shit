@@ -79,15 +79,29 @@ fn main() {
     println!("[bpf-smoke] elf magic ok: {:x?}", &NOOP_OBJ[..4]);
     println!("[bpf-smoke] elf size = {} bytes", NOOP_OBJ.len());
 
+    // `include_bytes!` produces a `[u8; N]` whose alignment is 1.
+    // The `object` crate's ELF header cast requires the buffer to be
+    // aligned to `align_of::<FileHeader64>()` (8 bytes). Copy through
+    // a Vec, which is 8-byte aligned by the allocator.
+    let aligned: Vec<u8> = NOOP_OBJ.to_vec();
+
     let load_started = Instant::now();
-    let mut bpf = match Ebpf::load(NOOP_OBJ) {
+    let mut bpf = match Ebpf::load(&aligned) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[bpf-smoke] aya::Ebpf::load failed: {e}");
-            eprintln!(
-                "[bpf-smoke] (need CAP_BPF+CAP_PERFMON or CAP_SYS_ADMIN; \
-                 check getcap on this binary)"
-            );
+            eprintln!("[bpf-smoke] debug: {e:?}");
+            // Walk the source chain so we see the underlying object::read::Error.
+            let mut cur: Option<&dyn std::error::Error> = Some(&e);
+            let mut depth = 0;
+            while let Some(c) = cur {
+                eprintln!("[bpf-smoke] source[{depth}]: {c}");
+                cur = c.source();
+                depth += 1;
+                if depth > 8 {
+                    break;
+                }
+            }
             std::process::exit(2);
         }
     };
