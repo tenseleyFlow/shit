@@ -121,6 +121,7 @@ async fn handle_client(
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
+        CtlRequest::DbEvent(req) => handle_db_event(req),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -305,4 +306,18 @@ fn handle_net_event(req: NetEventReq, net_stash: &NetPreStash) -> CtlResponse {
 fn handle_proc_event(req: ProcEventReq, proc_stash: &ProcPreStash) -> CtlResponse {
     let _ = crate::proc_track::handle(proc_stash, req);
     CtlResponse::ProcEventAck
+}
+
+/// Stub-ack DB shim events (S19.1). The Pre/Post correlator + journal
+/// wiring lands in S19.5; for now we acknowledge so the helper can
+/// return cleanly to the user's `psql`/`mysql`/`sqlite3` caller.
+fn handle_db_event(req: shit_proto::DbEventReq) -> CtlResponse {
+    tracing::debug!(
+        engine = req.engine.as_str(),
+        phase = ?req.phase,
+        statements = req.statements.len(),
+        target = %req.conn.target,
+        "db-event received (stub-acked; S19.5 wires the stash)"
+    );
+    CtlResponse::DbEventAck
 }
