@@ -22,11 +22,17 @@ BUILD_DIR = build
 
 # clang flags for BPF compilation:
 #   -O2            -- verifier rejects unoptimized code on most kernels
-#   -g             -- BTF generation
 #   -target bpf    -- emit bpfel-unknown-none
 #   -Wall          -- catch obvious mistakes
 #   -fno-stack-protector -- BPF has no stack canary support
-CFLAGS = -O2 -g -Wall -fno-stack-protector -target bpf
+#
+# We deliberately omit `-g`. `-g` emits BTF debug info plus
+# `.rel.BTF` / `.rel.BTF.ext` relocation sections that aya 0.13's
+# parser rejects on minimal programs (because the BTF refers to
+# symbols our trivial program doesn't actually use). For real LSM
+# hooks that need CO-RE relocations against vmlinux BTF, `-g` will
+# come back along with the necessary header includes.
+CFLAGS = -O2 -Wall -fno-stack-protector -target bpf
 
 # All sources are .bpf.c; outputs are .bpf.o.
 SOURCES = $(wildcard $(SRC_DIR)/*.bpf.c)
