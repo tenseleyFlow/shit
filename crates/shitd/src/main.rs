@@ -10,6 +10,7 @@ mod ctl;
 mod gc;
 mod helper_link;
 mod lock;
+mod pkg;
 mod server;
 mod stats;
 
@@ -115,14 +116,38 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         })
     };
 
+    let pkg_stash = Arc::new(pkg::PkgPreStash::new());
+    let pkg_janitor = {
+        let stash = Arc::clone(&pkg_stash);
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            // Sweep orphan Pre stashes every minute. The 5-minute TTL
+            // lives on the stash itself; this just wakes it up.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let evicted = stash.sweep_expired();
+                        if evicted > 0 {
+                            tracing::info!(evicted, "pkg-event: swept orphan Pre stashes");
+                        }
+                    }
+                    _ = shutdown.notified() => return,
+                }
+            }
+        })
+    };
+
     let ctl_handle = {
         let cfg = cfg.clone();
         let stats = Arc::clone(&stats);
         let shutdown = Arc::clone(&shutdown);
         let index = Arc::clone(&index);
         let blob_store = Arc::clone(&blob_store);
+        let pkg_stash = Arc::clone(&pkg_stash);
         tokio::spawn(async move {
-            if let Err(e) = ctl::serve(&cfg, stats, shutdown, index, blob_store).await {
+            if let Err(e) = ctl::serve(&cfg, stats, shutdown, index, blob_store, pkg_stash).await {
                 tracing::error!(err = %e, "ctl listener exited");
             }
         })
@@ -140,5 +165,6 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
 
     ctl_handle.abort();
     gc_handle.abort();
+    pkg_janitor.abort();
     result
 }
