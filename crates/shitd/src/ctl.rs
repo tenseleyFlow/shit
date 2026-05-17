@@ -113,6 +113,12 @@ async fn handle_client(
         CtlRequest::PinList => handle_pin_list(index),
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
+        CtlRequest::NetEvent(_) => {
+            // S17.9 wires this to a real handler. Stub-ack so a
+            // helper that ships ahead of the daemon doesn't deadlock
+            // the user's `iptables`/`nft` invocation.
+            CtlResponse::NetEventAck
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
