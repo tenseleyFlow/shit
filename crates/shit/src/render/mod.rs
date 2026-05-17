@@ -17,11 +17,14 @@
 //! bare-`shit` semantics.
 
 pub mod color;
+pub mod git;
 pub mod json;
 pub mod pager;
 
 #[allow(unused_imports)]
 pub use color::{ColorPref, resolve_color};
+#[allow(unused_imports)]
+pub use git::{GitRestoreGroup, detect_git_restores};
 #[allow(unused_imports)]
 pub use json::{JsonError, write_json};
 #[allow(unused_imports)]
