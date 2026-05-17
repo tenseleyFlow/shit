@@ -13,6 +13,7 @@ mod helper_link;
 mod lock;
 mod net_track;
 mod pkg;
+mod proc_track;
 mod server;
 mod stats;
 mod svc_track;
@@ -123,17 +124,17 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let env_stash = Arc::new(env_track::EnvPreStash::new());
     let svc_stash = Arc::new(svc_track::SvcPreStash::new());
     let net_stash = Arc::new(net_track::NetPreStash::new());
+    let proc_stash = Arc::new(proc_track::ProcPreStash::new());
     let pkg_janitor = {
         let pkg_stash = Arc::clone(&pkg_stash);
         let env_stash = Arc::clone(&env_stash);
         let svc_stash = Arc::clone(&svc_stash);
         let net_stash = Arc::clone(&net_stash);
+        let proc_stash = Arc::clone(&proc_stash);
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             // Sweep orphan Pre stashes every minute. The 5-minute
             // TTL lives on each stash; this task just wakes them up.
-            // pkg + env + svc + net share the same TTL, so a single
-            // janitor is cheaper than four timers.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -143,12 +144,14 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let env_evicted = env_stash.sweep_expired();
                         let svc_evicted = svc_stash.sweep_expired();
                         let net_evicted = net_stash.sweep_expired();
-                        if pkg_evicted > 0 || env_evicted > 0 || svc_evicted > 0 || net_evicted > 0 {
+                        let proc_evicted = proc_stash.sweep_expired();
+                        if pkg_evicted + env_evicted + svc_evicted + net_evicted + proc_evicted > 0 {
                             tracing::info!(
                                 pkg_evicted,
                                 env_evicted,
                                 svc_evicted,
                                 net_evicted,
+                                proc_evicted,
                                 "stash janitor: swept orphan Pre entries"
                             );
                         }
@@ -169,6 +172,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             pkg_stash: Arc::clone(&pkg_stash),
             svc_stash: Arc::clone(&svc_stash),
             net_stash: Arc::clone(&net_stash),
+            proc_stash: Arc::clone(&proc_stash),
         };
         tokio::spawn(async move {
             if let Err(e) = ctl::serve(&cfg, ctl_state).await {
