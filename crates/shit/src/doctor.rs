@@ -17,6 +17,9 @@ struct Row {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    print_linux_kernel_tier();
+
     let mut rows: Vec<Row> = Vec::new();
     for raw in CANDIDATE_PATHS {
         let resolved = resolve_path(raw);
@@ -101,6 +104,20 @@ fn truncate(s: &str, max: usize) -> String {
         t.push_str(&s[..cut]);
         t.push('…');
         t
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn print_linux_kernel_tier() {
+    match shit_capture::linux_kernel::probe() {
+        Ok((version, features)) => {
+            println!("kernel: {version}  ({})", features.tier_label());
+            println!();
+        }
+        Err(e) => {
+            println!("kernel: probe failed ({e})");
+            println!();
+        }
     }
 }
 
