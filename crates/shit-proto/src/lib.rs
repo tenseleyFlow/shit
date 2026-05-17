@@ -65,6 +65,32 @@ pub enum HookMessage {
         exit_code: i32,
         ts_unix_nanos: u64,
     },
+    /// Optional companion to [`PreExec`] (S15). Carries only the
+    /// blake3 hash of the shell's env block — small enough to send
+    /// unconditionally on every command. The full block is sent
+    /// post-command via [`PostExecEnv`] *only when the hash changed*.
+    /// Hash is over sorted `KEY=VALUE` bytes joined by NUL.
+    PreExecEnv {
+        session: Uuid,
+        seq: u64,
+        env_hash: [u8; 32],
+        ts_unix_nanos: u64,
+    },
+    /// Companion to [`PostExec`] (S15). Sent **only** when the env
+    /// hash at postexec differs from the preexec one — in the common
+    /// case (env unchanged across the command) this message is
+    /// omitted entirely.
+    ///
+    /// `env_block` is the raw post-command env: sorted by key, joined
+    /// by NUL as `KEY=VALUE\0KEY=VALUE\0...`. The daemon pairs this
+    /// with the cached pre-block (reconstructed or re-requested per
+    /// session) and emits a `CaptureEvent::EnvDiff`.
+    PostExecEnv {
+        session: Uuid,
+        seq: u64,
+        env_block: Vec<u8>,
+        ts_unix_nanos: u64,
+    },
     /// Emitted when the shell exits.
     SessionClose { session: Uuid, ts_unix_nanos: u64 },
 }
@@ -75,6 +101,8 @@ impl HookMessage {
             Self::SessionOpen { session, .. }
             | Self::PreExec { session, .. }
             | Self::PostExec { session, .. }
+            | Self::PreExecEnv { session, .. }
+            | Self::PostExecEnv { session, .. }
             | Self::SessionClose { session, .. } => *session,
         }
     }
@@ -84,6 +112,8 @@ impl HookMessage {
             Self::SessionOpen { .. } => "session-open",
             Self::PreExec { .. } => "pre-exec",
             Self::PostExec { .. } => "post-exec",
+            Self::PreExecEnv { .. } => "pre-exec-env",
+            Self::PostExecEnv { .. } => "post-exec-env",
             Self::SessionClose { .. } => "session-close",
         }
     }
