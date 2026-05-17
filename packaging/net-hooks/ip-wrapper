@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# shit ip wrapper (Linux iproute2). Routes to the per-object inspector
+# (ip-route / ip-addr / ip-link). Mutating-verb classifier matches
+# shit_planner::network::IP_MUTATING.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+real=""
+for cand in /usr/sbin/ip /sbin/ip /usr/bin/ip /bin/ip; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then real="$cand"; break; fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-ip-wrapper: real ip not found" >&2; exit 127; }
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# Parse: ip [-FLAGS] OBJ VERB ...
+obj=""
+verb=""
+state=opts
+for tok in "$@"; do
+    if [[ "$state" == "opts" ]]; then
+        case "$tok" in
+            -*) continue ;;
+            *) obj="$tok"; state=verb; continue ;;
+        esac
+    elif [[ "$state" == "verb" ]]; then
+        verb="$tok"; break
+    fi
+done
+
+mutating=0
+case "$verb" in
+    add|del|delete|change|replace|flush|set|up|down) mutating=1 ;;
+esac
+
+tool_id=""
+case "$obj" in
+    route) tool_id="ip-route" ;;
+    addr|address) tool_id="ip-addr" ;;
+    link) tool_id="ip-link" ;;
+esac
+
+if [[ "$mutating" -eq 1 && -n "$tool_id" ]]; then
+    "$HELPER" net-event "$tool_id" pre "--verb=$verb" "--scope-hint=$obj" 2>/dev/null || true
+    "$real" "$@"
+    rc=$?
+    "$HELPER" net-event "$tool_id" post "--verb=$verb" "--scope-hint=$obj" 2>/dev/null || true
+    exit "$rc"
+else
+    exec "$real" "$@"
+fi

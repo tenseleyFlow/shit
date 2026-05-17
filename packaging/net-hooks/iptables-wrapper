@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# shit iptables wrapper — installed as $XDG_CONFIG_HOME/shit/bin/iptables
+# (or ip6tables). Brackets mutating invocations with
+# `shit-helper net-event iptables {pre,post}`.
+#
+# Verb classifier mirrors shit_planner::network::IPTABLES_MUTATING.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+basename="$(basename "$0")"
+real=""
+for cand in "/sbin/$basename" "/usr/sbin/$basename" "/usr/bin/$basename" "/bin/$basename"; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
+
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# Classify: mutating if any argv token is in the mutating set.
+mutating=0
+for tok in "$@"; do
+    case "$tok" in
+        -A|--append|-I|--insert|-D|--delete|-R|--replace|-F|--flush|-X|--delete-chain|-N|--new-chain|-E|--rename-chain|-P|--policy|-Z|--zero)
+            mutating=1; break ;;
+    esac
+done
+
+tool_id="iptables"
+[[ "$basename" == "ip6tables" ]] && tool_id="ip6tables"
+
+# Scope hint: table flag (-t <name>) defaults to "filter".
+scope="filter"
+prev=""
+for tok in "$@"; do
+    if [[ "$prev" == "-t" || "$prev" == "--table" ]]; then scope="$tok"; break; fi
+    prev="$tok"
+done
+
+# Verb hint: first mutating flag we saw above is the cheapest tag.
+verb=""
+for tok in "$@"; do
+    case "$tok" in
+        -A|--append) verb="-A"; break ;;
+        -I|--insert) verb="-I"; break ;;
+        -D|--delete) verb="-D"; break ;;
+        -F|--flush) verb="-F"; break ;;
+        -*) ;;
+    esac
+done
+
+if [[ "$mutating" -eq 1 ]]; then
+    "$HELPER" net-event "$tool_id" pre "--verb=$verb" "--scope-hint=$scope" 2>/dev/null || true
+    "$real" "$@"
+    rc=$?
+    "$HELPER" net-event "$tool_id" post "--verb=$verb" "--scope-hint=$scope" 2>/dev/null || true
+    exit "$rc"
+else
+    exec "$real" "$@"
+fi

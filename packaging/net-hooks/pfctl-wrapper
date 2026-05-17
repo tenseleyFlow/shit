@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# shit pfctl wrapper (macOS/BSD). Mutating-flag classifier matches
+# shit_planner::network::PFCTL_MUTATING.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+real=""
+for cand in /sbin/pfctl /usr/sbin/pfctl; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then real="$cand"; break; fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-pfctl-wrapper: real pfctl not found" >&2; exit 127; }
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# Scope hint: pfctl anchor path (-a <anchor>) defaults to empty (root).
+scope=""
+prev=""
+for tok in "$@"; do
+    if [[ "$prev" == "-a" ]]; then scope="$tok"; break; fi
+    prev="$tok"
+done
+
+mutating=0
+verb=""
+for tok in "$@"; do
+    case "$tok" in
+        -f|-F|-d|-e|-O|-R|-T) mutating=1; [[ -z "$verb" ]] && verb="$tok" ;;
+    esac
+done
+
+if [[ "$mutating" -eq 1 ]]; then
+    "$HELPER" net-event pfctl pre "--verb=$verb" "--scope-hint=$scope" 2>/dev/null || true
+    "$real" "$@"
+    rc=$?
+    "$HELPER" net-event pfctl post "--verb=$verb" "--scope-hint=$scope" 2>/dev/null || true
+    exit "$rc"
+else
+    exec "$real" "$@"
+fi

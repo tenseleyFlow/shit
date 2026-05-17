@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# shit ufw wrapper.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+real=""
+for cand in /usr/sbin/ufw /usr/bin/ufw /sbin/ufw; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then real="$cand"; break; fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-ufw-wrapper: real ufw not found" >&2; exit 127; }
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+verb="${1:-}"
+mutating=0
+case "$verb" in
+    enable|disable|reset|default|allow|deny|limit|reject|insert|delete|logging|reload) mutating=1 ;;
+esac
+
+if [[ "$mutating" -eq 1 ]]; then
+    "$HELPER" net-event ufw pre "--verb=$verb" 2>/dev/null || true
+    "$real" "$@"
+    rc=$?
+    "$HELPER" net-event ufw post "--verb=$verb" 2>/dev/null || true
+    exit "$rc"
+else
+    exec "$real" "$@"
+fi
