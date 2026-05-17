@@ -2,16 +2,16 @@
 
 use crate::config::ResolvedConfig;
 use crate::stats::Stats;
+use shit_planner::{CommandId, CommandRecord, TimePoint};
 use shit_proto::{HookMessage, MAX_FRAME_SIZE, decode_frame};
-use std::path::Path;
+use shit_store::Index;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::UnixDatagram;
 use tracing::{debug, info, warn};
 
-/// Upper bound on the idle-check interval. We tick more often than this when
-/// the configured timeout is small so short-timeout configs (and tests) don't
-/// wait an entire ceiling-tick before noticing.
 const IDLE_TICK_MAX: Duration = Duration::from_secs(60);
 const IDLE_TICK_MIN: Duration = Duration::from_millis(100);
 
@@ -19,7 +19,26 @@ fn idle_tick(idle_timeout: Duration) -> Duration {
     (idle_timeout / 4).clamp(IDLE_TICK_MIN, IDLE_TICK_MAX)
 }
 
-pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()> {
+/// Process-wide monotonic logical clock. Incremented for every event
+/// ingested. Resets to 0 on daemon restart, which is fine: each restart
+/// starts a fresh event sequence and the planner only orders within a
+/// session anyway.
+static LOGICAL_CLOCK: AtomicU64 = AtomicU64::new(1);
+
+fn next_ts() -> TimePoint {
+    let logical = LOGICAL_CLOCK.fetch_add(1, Ordering::Relaxed);
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    TimePoint::new(logical, wall)
+}
+
+pub async fn serve(
+    cfg: ResolvedConfig,
+    stats: Arc<Stats>,
+    index: Arc<Index>,
+) -> anyhow::Result<()> {
     if let Some(parent) = cfg.hook_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -43,7 +62,7 @@ pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()>
     let idle_disabled = cfg.idle_timeout_secs == 0;
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let tick = if idle_disabled {
-        Duration::from_secs(3600) // dummy: we never check the condition
+        Duration::from_secs(3600)
     } else {
         idle_tick(idle_timeout)
     };
@@ -60,7 +79,7 @@ pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()>
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg);
+                                handle(msg, &index);
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -87,23 +106,36 @@ pub async fn serve(cfg: ResolvedConfig, stats: Arc<Stats>) -> anyhow::Result<()>
     }
 }
 
-fn handle(msg: HookMessage) {
-    let kind = msg.kind();
+fn handle(msg: HookMessage, index: &Index) {
     let session = msg.session();
+    let kind = msg.kind();
+    let ts = next_ts();
+
     match &msg {
         HookMessage::SessionOpen {
             shell_kind,
             parent_pid,
             tty,
             ..
-        } => info!(
-            %session,
-            kind,
-            shell = shell_kind.as_str(),
-            pid = parent_pid,
-            tty,
-            "session open"
-        ),
+        } => {
+            info!(
+                %session,
+                kind,
+                shell = shell_kind.as_str(),
+                pid = parent_pid,
+                tty,
+                "session open"
+            );
+            if let Err(e) = index.put_session(
+                session,
+                shell_kind.as_str(),
+                *parent_pid,
+                Some(tty.as_str()),
+                ts,
+            ) {
+                warn!(err = %e, "put_session failed");
+            }
+        }
         HookMessage::PreExec {
             seq,
             pid,
@@ -111,20 +143,54 @@ fn handle(msg: HookMessage) {
             cwd_dev,
             shell_kind,
             ..
-        } => info!(
-            %session,
-            kind,
-            seq,
-            pid,
-            cwd_dev,
-            cwd_inode,
-            shell = shell_kind.as_str(),
-            "pre-exec"
-        ),
-        HookMessage::PostExec { seq, exit_code, .. } => {
-            info!(%session, kind, seq, exit_code, "post-exec")
+        } => {
+            info!(
+                %session,
+                kind,
+                seq,
+                pid,
+                cwd_dev,
+                cwd_inode,
+                shell = shell_kind.as_str(),
+                "pre-exec"
+            );
+            let cmd = CommandRecord {
+                command: CommandId { session, seq: *seq },
+                cmd_string: None,
+                cwd: PathBuf::from("/"),
+                pid: *pid,
+                shell_kind: *shell_kind,
+                started_at: ts,
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            };
+            if let Err(e) = index.put_command(&cmd) {
+                warn!(err = %e, "put_command failed");
+            }
         }
-        HookMessage::SessionClose { .. } => info!(%session, kind, "session close"),
+        HookMessage::PostExec { seq, exit_code, .. } => {
+            info!(%session, kind, seq, exit_code, "post-exec");
+            // Update via re-put: ON CONFLICT replaces ended_at + exit_code.
+            // We don't know the original started_at from this side of the
+            // ledger; fetch the existing command to preserve it.
+            if let Some(mut existing) = <Index as shit_planner::PlannerStore>::command_by_id(
+                index,
+                CommandId { session, seq: *seq },
+            ) {
+                existing.ended_at = Some(ts);
+                existing.exit_code = Some(*exit_code);
+                if let Err(e) = index.put_command(&existing) {
+                    warn!(err = %e, "put_command (post) failed");
+                }
+            }
+        }
+        HookMessage::SessionClose { .. } => {
+            info!(%session, kind, "session close");
+            if let Err(e) = index.close_session(session, ts) {
+                warn!(err = %e, "close_session failed");
+            }
+        }
     }
     debug!(?msg, "decoded frame");
 }
