@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# shit mysql wrapper — installed as $XDG_CONFIG_HOME/shit/bin/mysql.
+# Same shape as psql-wrapper. Captures `-e "..."` (mysql's analogue
+# of psql `-c`) and `< script.sql` redirection-on-stdin is NOT
+# captured (DR-58).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+basename="$(basename "$0")"
+real=""
+for cand in "/usr/bin/$basename" "/usr/local/bin/$basename" "/opt/homebrew/bin/$basename" "/bin/$basename"; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
+
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+stmt_blob=""
+prev=""
+saw_capture=0
+for tok in "$@"; do
+    case "$prev" in
+        -e|--execute)
+            stmt_blob+="$tok"$'\n'
+            saw_capture=1
+            ;;
+    esac
+    case "$tok" in
+        --execute=*)
+            stmt_blob+="${tok#--execute=}"$'\n'; saw_capture=1 ;;
+        # `-e<stmt>` glued form.
+        -e*)
+            if [[ "$tok" != "-e" && "$tok" != "--execute" ]]; then
+                stmt_blob+="${tok#-e}"$'\n'; saw_capture=1
+            fi
+            ;;
+    esac
+    prev="$tok"
+done
+
+if [[ "$saw_capture" -eq 0 ]]; then
+    exec "$real" "$@"
+fi
+
+argv_blob=""
+for tok in "$@"; do
+    if [[ -z "$argv_blob" ]]; then
+        argv_blob="$tok"
+    else
+        argv_blob="$argv_blob"$'\n'"$tok"
+    fi
+done
+
+"$HELPER" db-event mysql pre "--target-argv=$argv_blob" "--statement-blob=$stmt_blob" 2>/dev/null || true
+"$real" "$@"
+rc=$?
+"$HELPER" db-event mysql post "--target-argv=$argv_blob" "--statement-blob=$stmt_blob" 2>/dev/null || true
+exit "$rc"

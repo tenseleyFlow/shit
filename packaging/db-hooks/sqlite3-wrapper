@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# shit sqlite3 wrapper — installed as $XDG_CONFIG_HOME/shit/bin/sqlite3.
+# Captures statements passed via `-cmd "..."` or as the second-or-later
+# positional after the DB file path. Interactive REPL passes through.
+#
+# Note: sqlite3 is a regular-file DB; the file-tier capture already
+# handles undo. The shim adds the SQL-level UX (`shit show` displays
+# what statements ran).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+basename="$(basename "$0")"
+real=""
+for cand in "/usr/bin/$basename" "/usr/local/bin/$basename" "/opt/homebrew/bin/$basename" "/bin/$basename"; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
+
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# Walk argv. -cmd values are command-line SQL; positionals are
+# [DB_FILE [STATEMENT...]]. We skip flag values per sqlite3's grammar.
+stmt_blob=""
+saw_db=0
+saw_capture=0
+skip_next=0
+skip_next2=0
+prev=""
+for tok in "$@"; do
+    if [[ "$skip_next" -eq 1 ]]; then skip_next=0; prev="$tok"; continue; fi
+    if [[ "$skip_next2" -eq 1 ]]; then skip_next2=0; skip_next=1; prev="$tok"; continue; fi
+    case "$prev" in
+        -cmd|--cmd)
+            stmt_blob+="$tok"$'\n'
+            saw_capture=1
+            ;;
+    esac
+    case "$tok" in
+        -cmd|--cmd|-init|--init|-mmap|-newline|-nullvalue|-separator)
+            skip_next=1 ;;
+        -lookaside|-pagecache)
+            skip_next2=1 ;;
+        -*)
+            ;;
+        *)
+            if [[ "$saw_db" -eq 0 ]]; then
+                saw_db=1
+            else
+                stmt_blob+="$tok"$'\n'
+                saw_capture=1
+            fi
+            ;;
+    esac
+    prev="$tok"
+done
+
+if [[ "$saw_capture" -eq 0 ]]; then
+    exec "$real" "$@"
+fi
+
+argv_blob=""
+for tok in "$@"; do
+    if [[ -z "$argv_blob" ]]; then
+        argv_blob="$tok"
+    else
+        argv_blob="$argv_blob"$'\n'"$tok"
+    fi
+done
+
+"$HELPER" db-event sqlite3 pre "--target-argv=$argv_blob" "--statement-blob=$stmt_blob" 2>/dev/null || true
+"$real" "$@"
+rc=$?
+"$HELPER" db-event sqlite3 post "--target-argv=$argv_blob" "--statement-blob=$stmt_blob" 2>/dev/null || true
+exit "$rc"

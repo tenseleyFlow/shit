@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# shit psql wrapper — installed as $XDG_CONFIG_HOME/shit/bin/psql.
+# Captures statements passed via `-c "..."` or `-f script.sql` and
+# brackets the invocation with `shit-helper db-event psql {pre,post}`.
+#
+# Interactive sessions (no -c / -f) pass through untouched — the
+# statement capture for REPL psql is deferred to DR-58. The wrapper
+# is intentionally a no-op in that case so the user's prompt feels
+# native.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+basename="$(basename "$0")"
+real=""
+for cand in "/usr/bin/$basename" "/usr/local/bin/$basename" "/opt/homebrew/bin/$basename" "/bin/$basename"; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
+
+# Pass through during undo execution.
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# Walk argv: gather -c values and -f file contents into a single
+# statement blob. Interactive (no -c, no -f) passes through.
+stmt_blob=""
+prev=""
+saw_capture=0
+for tok in "$@"; do
+    case "$prev" in
+        -c|--command)
+            stmt_blob+="$tok"$'\n'
+            saw_capture=1
+            ;;
+        -f|--file)
+            if [[ -r "$tok" ]]; then
+                stmt_blob+="$(cat "$tok")"$'\n'
+                saw_capture=1
+            fi
+            ;;
+    esac
+    case "$tok" in
+        --command=*)
+            stmt_blob+="${tok#--command=}"$'\n'; saw_capture=1 ;;
+        --file=*)
+            f="${tok#--file=}"
+            if [[ -r "$f" ]]; then
+                stmt_blob+="$(cat "$f")"$'\n'; saw_capture=1
+            fi ;;
+    esac
+    prev="$tok"
+done
+
+if [[ "$saw_capture" -eq 0 ]]; then
+    exec "$real" "$@"
+fi
+
+# Newline-join argv for the helper.
+argv_blob=""
+for tok in "$@"; do
+    if [[ -z "$argv_blob" ]]; then
+        argv_blob="$tok"
+    else
+        argv_blob="$argv_blob"$'\n'"$tok"
+    fi
+done
+
+"$HELPER" db-event psql pre "--target-argv=$argv_blob" "--statement-blob=$stmt_blob" 2>/dev/null || true
+"$real" "$@"
+rc=$?
+"$HELPER" db-event psql post "--target-argv=$argv_blob" "--statement-blob=$stmt_blob" 2>/dev/null || true
+exit "$rc"
