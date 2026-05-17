@@ -6,10 +6,6 @@
 //! land in S07 (macOS EndpointSecurity), S08 (Linux fanotify), S09 (Linux eBPF-LSM),
 //! and S10 (BSD kqueue).
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_wires_up() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod cow;
+
+pub use cow::{CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier};
