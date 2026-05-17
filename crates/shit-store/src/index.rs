@@ -199,11 +199,9 @@ impl Index {
     /// `shit status` and GC accounting.
     pub fn total_blob_size(&self) -> Result<u64, IndexError> {
         let conn = self.conn.lock().unwrap();
-        let n: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM blobs",
-            [],
-            |row| row.get(0),
-        )?;
+        let n: i64 = conn.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+            row.get(0)
+        })?;
         Ok(n as u64)
     }
 }
@@ -269,9 +267,12 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
                     Some(target.to_string_lossy().into_owned()),
                     "TreeOpLink",
                 ),
-                T::Symlink { path, .. } => {
-                    (None, None, Some(path.to_string_lossy().into_owned()), "TreeOpSymlink")
-                }
+                T::Symlink { path, .. } => (
+                    None,
+                    None,
+                    Some(path.to_string_lossy().into_owned()),
+                    "TreeOpSymlink",
+                ),
             };
             Denormalized {
                 discriminant: disc,
@@ -459,13 +460,8 @@ impl PlannerStore for Index {
                     cmd_string,
                     cwd: PathBuf::from(cwd),
                     pid: pid as u32,
-                    shell_kind: shell_kind
-                        .parse()
-                        .unwrap_or(shit_proto::ShellKind::Unknown),
-                    started_at: TimePoint::new(
-                        started_logical as u64,
-                        started_wall as u64,
-                    ),
+                    shell_kind: shell_kind.parse().unwrap_or(shit_proto::ShellKind::Unknown),
+                    started_at: TimePoint::new(started_logical as u64, started_wall as u64),
                     ended_at: match (ended_logical, ended_wall) {
                         (Some(l), Some(w)) => Some(TimePoint::new(l as u64, w as u64)),
                         _ => None,
@@ -573,8 +569,14 @@ mod tests {
     fn command_round_trip() {
         let (_dir, idx) = open_index();
         let session = Uuid::nil();
-        idx.put_session(session, "bash", 999, Some("/dev/ttys0"), TimePoint::new(0, 0))
-            .unwrap();
+        idx.put_session(
+            session,
+            "bash",
+            999,
+            Some("/dev/ttys0"),
+            TimePoint::new(0, 0),
+        )
+        .unwrap();
         let cmd = sample_command(session, 1);
         idx.put_command(&cmd).unwrap();
         let got = idx.command_by_id(cmd.command).unwrap();
