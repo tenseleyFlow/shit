@@ -40,6 +40,7 @@ mod priv_linux;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod seccomp_linux;
+mod svc;
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
@@ -118,6 +119,34 @@ enum Mode {
         phase: String,
         /// Override the daemon ctl-socket path. By default we use the
         /// per-user default location.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
+    /// Single-shot service-manager (systemctl/launchctl) hook
+    /// invocation (S16). Same hook-friendly error policy as
+    /// `pkg-event`: shit-side failures never break the user's
+    /// `systemctl`/`launchctl` invocation.
+    ///
+    /// Invoked by the PATH-prepended wrapper scripts in
+    /// `packaging/svc-hooks/`. The wrapper has already parsed the
+    /// verb and unit out of the user's argv; we capture pre/post
+    /// state via the manager's own query interface.
+    #[command(name = "svc-event")]
+    SvcEvent {
+        /// Service-manager identifier (systemctl|launchctl).
+        tool: String,
+        /// Phase of the operation (pre|post).
+        phase: String,
+        /// Scope hint (user|system|launchd-gui|launchd-system).
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Unit name (e.g. `nginx.service`, `com.example.foo`).
+        #[arg(long)]
+        unit: String,
+        /// Verb the user issued (`start`/`enable`/`bootstrap`/...).
+        #[arg(long)]
+        verb: String,
+        /// Override the daemon ctl-socket path.
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
@@ -226,6 +255,14 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             phase,
             ctl_sock,
         } => pkg::run_event(&manager, &phase, ctl_sock.as_deref()).await,
+        Mode::SvcEvent {
+            tool,
+            phase,
+            scope,
+            unit,
+            verb,
+            ctl_sock,
+        } => svc::run_event(&tool, &phase, &scope, &unit, &verb, ctl_sock.as_deref()).await,
     }
 }
 
