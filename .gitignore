@@ -42,3 +42,4 @@ Thumbs.db
 /dist/
 /out/
 tools/freebsd-vm/work/
+tools/linux-bpf-vm/work/
