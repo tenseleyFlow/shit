@@ -12,6 +12,7 @@
 
 pub mod events;
 pub mod executor;
+pub mod executors;
 pub mod inode;
 pub mod inverse;
 pub mod metadata;
@@ -30,6 +31,7 @@ pub use executor::{
     BlobReadError, BlobReader, ConflictPolicy, ExecutionOutcome, ExecutionRecord, ExecutionReport,
     InMemoryBlobReader, InverseOpExecutor, OutcomeKind, PlanSummary,
 };
+pub use executors::FileExecutor;
 pub use inode::{BlobHash, InodeRef};
 pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
 pub use metadata::{FileKind, FileMetadata};
