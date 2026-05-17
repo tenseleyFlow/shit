@@ -17,6 +17,7 @@
 //! bare-`shit` semantics.
 
 pub mod color;
+pub mod db;
 pub mod env_diff;
 pub mod git;
 pub mod json;
@@ -35,3 +36,5 @@ pub use json::{JsonError, write_json};
 pub use pager::page_if_tty;
 #[allow(unused_imports)]
 pub use process::render as render_process;
+#[allow(unused_imports)]
+pub use db::render as render_db;
