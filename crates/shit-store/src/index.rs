@@ -360,11 +360,7 @@ fn update_path_history_with_conn(
 
 /// Resolve a path to the (dev, inode) it referred to at `at`. Returns
 /// `None` if no path-history row covers that point.
-fn resolve_path_at(
-    conn: &Connection,
-    path: &Path,
-    at: TimePoint,
-) -> Option<InodeRef> {
+fn resolve_path_at(conn: &Connection, path: &Path, at: TimePoint) -> Option<InodeRef> {
     conn.query_row(
         "SELECT dev, inode FROM paths
          WHERE path = ?1
@@ -605,12 +601,7 @@ impl PlannerStore for Index {
                 "SELECT payload FROM events
                  WHERE ts_logical <= ?1 AND (path = ?2 OR (dev = ?3 AND inode = ?4))
                  ORDER BY ts_logical, id",
-                params![
-                    at.logical as i64,
-                    path_str,
-                    i.dev as i64,
-                    i.inode as i64,
-                ],
+                params![at.logical as i64, path_str, i.dev as i64, i.inode as i64,],
             ),
             None => collect_events(
                 &conn,
@@ -1014,7 +1005,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.kind, CaptureEventKind::FilePreImage { .. }))
             .count();
-        assert_eq!(pre_images, 2, "expected 2 pre-image events, got {pre_images}");
+        assert_eq!(
+            pre_images, 2,
+            "expected 2 pre-image events, got {pre_images}"
+        );
     }
 
     #[test]
