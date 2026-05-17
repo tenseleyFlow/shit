@@ -169,6 +169,118 @@ fn db_engine_wire_str_roundtrip() {
 }
 
 #[test]
+fn encode_rejects_payload_over_max_frame_size() {
+    // S20.4 audit: encode_frame must refuse anything that would
+    // produce a frame larger than MAX_FRAME_SIZE. Build a HookMessage
+    // variant whose tty field is just long enough to push the
+    // serialized payload past the cap.
+    let big_tty = "x".repeat(shit_proto::MAX_FRAME_SIZE + 1024);
+    let msg = HookMessage::SessionOpen {
+        session: Uuid::nil(),
+        shell_kind: ShellKind::Bash,
+        parent_pid: 1,
+        tty: big_tty,
+        ts_unix_nanos: 0,
+    };
+    let err = encode_frame(&msg).unwrap_err();
+    match err {
+        shit_proto::EncodeError::TooLarge { got } => {
+            assert!(got > shit_proto::MAX_FRAME_SIZE);
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_rejects_buffer_over_max_frame_size() {
+    // S20.4 audit: decode_frame must refuse oversized buffers
+    // before attempting any postcard work. Hand it a buffer
+    // larger than the cap and assert TooLarge.
+    let buf = vec![0u8; shit_proto::MAX_FRAME_SIZE + 1];
+    let err = decode_frame::<HookMessage>(&buf).unwrap_err();
+    assert!(matches!(err, DecodeError::TooLarge(_)));
+}
+
+#[test]
+fn decode_at_exactly_max_frame_size_does_not_overflow() {
+    // Defensive: a buffer exactly MAX_FRAME_SIZE bytes long should
+    // proceed to postcard parsing (which will fail on garbage but
+    // not on size). Verifies the off-by-one is correctly handled.
+    let buf = vec![0u8; shit_proto::MAX_FRAME_SIZE];
+    let _ = decode_frame::<HookMessage>(&buf);
+    // No panic, no TooLarge — proceeded past the size gate.
+}
+
+#[test]
+fn max_frame_size_is_at_least_256kib() {
+    // Regression guard: F-NEW-1 fix raised MAX_FRAME_SIZE to 256 KiB
+    // to accommodate tier-event state-dump payloads. If a future PR
+    // lowers it back below that, NetEvent/ProcEvent/DbEvent will
+    // silently start failing to ship. Catch that here. We read the
+    // constant into a local so clippy's `assertions_on_constants`
+    // sees a runtime value (it isn't, but the const-vs-runtime
+    // distinction matters to the lint).
+    let cap = shit_proto::MAX_FRAME_SIZE;
+    assert!(
+        cap >= 256 * 1024,
+        "MAX_FRAME_SIZE regressed below 256 KiB ({cap}); would break tier-event capture (see S20.4)"
+    );
+}
+
+#[test]
+fn net_event_req_with_large_state_raw_encodes() {
+    // Real-world driver: an iptables-save dump of ~10 KiB. The
+    // pre-S20 4 KiB cap would have rejected this; the post-fix cap
+    // accepts it.
+    use shit_proto::{CtlRequest, NetEventReq, NetToolWire, PkgPhase};
+    let state_raw = vec![b'#'; 16 * 1024];
+    let req = NetEventReq {
+        tool: NetToolWire::Iptables,
+        phase: PkgPhase::Pre,
+        verb: "-A".into(),
+        scope_hint: "filter".into(),
+        pid: 1234,
+        uid: 1000,
+        state_raw,
+    };
+    let frame = encode_frame(&CtlRequest::NetEvent(req)).unwrap();
+    let frame_len = frame.len();
+    assert!(
+        frame_len > 4 * 1024,
+        "this test exists *because* 4 KiB was the old cap; got {frame_len}"
+    );
+    let _back: CtlRequest = decode_frame(&frame).unwrap();
+}
+
+#[test]
+fn db_event_req_with_large_statement_blob_encodes() {
+    // Real-world driver: a migrations.sql with ~150 statements.
+    use shit_proto::{
+        CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase,
+    };
+    let statements: Vec<String> = (0..150)
+        .map(|i| format!("INSERT INTO t (id) VALUES ({i})"))
+        .collect();
+    let req = DbEventReq {
+        engine: DbEngineWire::Postgres,
+        phase: PkgPhase::Pre,
+        conn: DbConnInfo {
+            host: "db".into(),
+            port: Some(5432),
+            user: "alice".into(),
+            target: "prod".into(),
+        },
+        statements,
+        transaction_state: DbTxStateWire::Unknown,
+        pid: 1234,
+        uid: 1000,
+        extras: std::collections::BTreeMap::new(),
+    };
+    let frame = encode_frame(&CtlRequest::DbEvent(req)).unwrap();
+    let _back: CtlRequest = decode_frame(&frame).unwrap();
+}
+
+#[test]
 fn db_event_req_postcard_roundtrip() {
     use shit_proto::{CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase};
     use std::collections::BTreeMap;
