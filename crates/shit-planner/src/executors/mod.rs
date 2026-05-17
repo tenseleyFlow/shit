@@ -14,10 +14,15 @@ pub mod env;
 pub mod file;
 pub mod network;
 pub mod package;
+pub mod process;
 pub mod services;
 
 pub use env::{EnvExecutor, SnippetSink, StringSnippetSink};
 pub use file::FileExecutor;
 pub use network::{NetRunner, NetworkExecutor, SystemNetRunner};
 pub use package::{PackageExecutor, PkgRunner, SystemPkgRunner};
+pub use process::{
+    DaemonCrossRef, ProcessExecutor, RestartHint, RestartSuggestion, SuggestionSink, UnitRef,
+    VecSuggestionSink, render_snippet as render_process_snippet,
+};
 pub use services::{ServiceExecutor, SvcRunner, SystemSvcRunner};
