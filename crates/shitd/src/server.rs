@@ -185,6 +185,15 @@ fn handle(msg: HookMessage, index: &Index) {
                 }
             }
         }
+        HookMessage::PreExecEnv { seq, env_hash, .. } => {
+            // S15.4 wires this to env_track. For S15.1 we just log
+            // so the wire path is exercised end-to-end before the
+            // diffing engine lands.
+            debug!(%session, kind, seq, hash = %hex8(env_hash), "pre-exec-env");
+        }
+        HookMessage::PostExecEnv { seq, env_block, .. } => {
+            debug!(%session, kind, seq, bytes = env_block.len(), "post-exec-env");
+        }
         HookMessage::SessionClose { .. } => {
             info!(%session, kind, "session close");
             if let Err(e) = index.close_session(session, ts) {
@@ -193,4 +202,16 @@ fn handle(msg: HookMessage, index: &Index) {
         }
     }
     debug!(?msg, "decoded frame");
+}
+
+/// Stable short hash rendering for log lines — first 8 hex chars of
+/// a 32-byte blake3 digest. The full digest is preserved by the
+/// daemon; logs just need a glance-friendly identifier.
+fn hex8(h: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    for b in &h[..4] {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
