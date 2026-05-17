@@ -41,6 +41,7 @@ pub async fn serve(
     index: Arc<Index>,
     env_stash: Arc<EnvPreStash>,
 ) -> anyhow::Result<()> {
+    let env_filter = cfg.env.filter();
     if let Some(parent) = cfg.hook_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -81,7 +82,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index, &env_stash);
+                                handle(msg, &index, &env_stash, &env_filter);
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -108,7 +109,12 @@ pub async fn serve(
     }
 }
 
-fn handle(msg: HookMessage, index: &Index, env_stash: &EnvPreStash) {
+fn handle(
+    msg: HookMessage,
+    index: &Index,
+    env_stash: &EnvPreStash,
+    env_filter: &shit_planner::EnvFilter,
+) {
     let session = msg.session();
     let kind = msg.kind();
     let ts = next_ts();
@@ -193,7 +199,12 @@ fn handle(msg: HookMessage, index: &Index, env_stash: &EnvPreStash) {
         }
         HookMessage::PostExecEnv { seq, env_block, .. } => {
             debug!(%session, kind, seq, bytes = env_block.len(), "post-exec-env");
-            let _ = env_track::handle_post(env_stash, CommandId { session, seq: *seq }, env_block);
+            let _ = env_track::handle_post(
+                env_stash,
+                CommandId { session, seq: *seq },
+                env_block,
+                env_filter,
+            );
             // The PostOutcome is logged inside handle_post; the
             // journal-write integration is DR-32.
         }
