@@ -9,6 +9,7 @@ mod doctor;
 mod exitcode;
 mod hooks;
 mod paths;
+mod render;
 mod send;
 mod service;
 mod status;
