@@ -12,8 +12,8 @@
 
 #![cfg(target_os = "linux")]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use uuid::Uuid;

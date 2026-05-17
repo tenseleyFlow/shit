@@ -8,6 +8,8 @@
 
 pub mod cow;
 pub mod fs_matrix;
+#[cfg(target_os = "linux")]
+pub mod linux_kernel;
 
 pub use cow::{
     CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier, DefaultEngine, would_pick,

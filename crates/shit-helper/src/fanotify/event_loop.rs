@@ -122,7 +122,8 @@ pub fn write_responses(
         .iter()
         .map(|r| {
             let p = (r as *const libc::fanotify_response).cast::<u8>();
-            let bytes = unsafe { std::slice::from_raw_parts(p, size_of::<libc::fanotify_response>()) };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(p, size_of::<libc::fanotify_response>()) };
             IoSlice::new(bytes)
         })
         .collect();
@@ -173,8 +174,7 @@ pub fn read_step<'a>(fd: &FanotifyFd, buf: &'a mut [u8]) -> Result<&'a [u8], Loo
         let err = io::Error::last_os_error();
         // EAGAIN on a non-blocking fd means "no events right now" —
         // return empty slice. Other errors surface.
-        if err.raw_os_error() == Some(libc::EAGAIN)
-            || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+        if err.raw_os_error() == Some(libc::EAGAIN) || err.raw_os_error() == Some(libc::EWOULDBLOCK)
         {
             return Ok(&buf[..0]);
         }

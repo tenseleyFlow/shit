@@ -18,13 +18,15 @@
 
 pub mod event_loop;
 pub mod init;
-pub mod kernel_probe;
 pub mod mark;
 pub mod parse;
 pub mod queue;
 pub mod tree;
 
+// kernel_probe lives in `shit-capture::linux_kernel` so the `shit doctor`
+// CLI can use it without depending on the helper binary crate.
+pub use shit_capture::linux_kernel::{FanotifyFeatures, KernelVersion, probe, read_kernel_version};
+
 pub use init::{FanotifyFd, InitError, init, init_pre_content};
-pub use kernel_probe::{FanotifyFeatures, KernelVersion, probe, read_kernel_version};
 pub use mark::{MarkError, MarkFlags, mark_filesystem, mark_mount, unmark_filesystem};
 pub use parse::{Event, EventIter, ParseError};

@@ -39,9 +39,7 @@ impl Event {
 
     /// True when the event needs a permission decision.
     pub fn needs_permission(&self) -> bool {
-        (self.mask
-            & (libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_OPEN_EXEC_PERM))
-            != 0
+        (self.mask & (libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_OPEN_EXEC_PERM)) != 0
     }
 }
 
@@ -111,9 +109,7 @@ impl Iterator for EventIter<'_> {
         let vers = h[4];
         // h[5] = reserved
         // h[6..8] = metadata_len (we don't need it directly; event_len drives advance)
-        let mask = u64::from_ne_bytes([
-            h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
-        ]);
+        let mask = u64::from_ne_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
         let fd = i32::from_ne_bytes([h[16], h[17], h[18], h[19]]);
         let pid = i32::from_ne_bytes([h[20], h[21], h[22], h[23]]);
 
@@ -199,7 +195,10 @@ mod tests {
     fn truncated_buffer_errors() {
         let buf = [0u8; 8];
         let mut iter = EventIter::new(&buf);
-        assert!(matches!(iter.next(), Some(Err(ParseError::Truncated { .. }))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(ParseError::Truncated { .. }))
+        ));
         // Poisoned: subsequent .next() yields None.
         assert!(iter.next().is_none());
     }
@@ -221,7 +220,10 @@ mod tests {
         // Claim 999 bytes when only 24 are present.
         buf[0..4].copy_from_slice(&999u32.to_ne_bytes());
         let mut iter = EventIter::new(&buf);
-        assert!(matches!(iter.next(), Some(Err(ParseError::Overflow { .. }))));
+        assert!(matches!(
+            iter.next(),
+            Some(Err(ParseError::Overflow { .. }))
+        ));
     }
 
     #[test]
