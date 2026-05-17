@@ -40,7 +40,12 @@ fn license_check() -> Result<()> {
         if path.components().any(|c| {
             matches!(
                 c.as_os_str().to_str(),
-                Some("target") | Some(".git") | Some(".docs") | Some(".refs") | Some(".fackr")
+                Some("target")
+                    | Some("vendor")
+                    | Some(".git")
+                    | Some(".docs")
+                    | Some(".refs")
+                    | Some(".fackr")
             )
         }) {
             continue;
