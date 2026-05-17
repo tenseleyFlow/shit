@@ -5,8 +5,11 @@
 //! served on their own tokio task.
 
 use crate::config::ResolvedConfig;
+use crate::pkg::PkgPreStash;
 use crate::stats::Stats;
-use shit_proto::{CtlRequest, CtlResponse, DaemonStatus, GcRequest, decode_frame, encode_frame};
+use shit_proto::{
+    CtlRequest, CtlResponse, DaemonStatus, GcRequest, PkgEventReq, decode_frame, encode_frame,
+};
 use shit_store::{BlobStore, Index};
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +30,7 @@ pub async fn serve(
     shutdown: Arc<Notify>,
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
+    pkg_stash: Arc<PkgPreStash>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = cfg.ctl_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -51,9 +55,11 @@ pub async fn serve(
                 let cfg = cfg.clone();
                 let index = Arc::clone(&index);
                 let blob_store = Arc::clone(&blob_store);
+                let pkg_stash = Arc::clone(&pkg_stash);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_client(stream, &cfg, stats, shutdown, index, blob_store).await
+                        handle_client(stream, &cfg, stats, shutdown, index, blob_store, pkg_stash)
+                            .await
                     {
                         debug!(err = %e, "ctl client errored");
                     }
@@ -73,6 +79,7 @@ async fn handle_client(
     shutdown: Arc<Notify>,
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
+    pkg_stash: Arc<PkgPreStash>,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -99,12 +106,7 @@ async fn handle_client(
         CtlRequest::Pin(req) => handle_pin(req, index),
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
-        CtlRequest::PkgEvent(_) => {
-            // S14.9 wires this to a real handler. For now we ack so
-            // a helper that ships ahead of the daemon-side handler
-            // doesn't deadlock the package manager waiting on us.
-            CtlResponse::PkgEventAck
-        }
+        CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -251,4 +253,14 @@ fn snapshot(cfg: &ResolvedConfig, stats: &Stats) -> DaemonStatus {
             .hook_decode_errors
             .load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// Handle one package-manager hook event (S14.9). Pre events are
+/// stashed; Post events pair, diff, and (stage 1) tracing-log. The
+/// journal-write to `events` table under (session, seq) is DR-25 —
+/// it requires the open-command-window lookup that lands together
+/// with the capture-runtime pipeline.
+fn handle_pkg_event(req: PkgEventReq, pkg_stash: &PkgPreStash) -> CtlResponse {
+    let _ = crate::pkg::handle(pkg_stash, req);
+    CtlResponse::PkgEventAck
 }
