@@ -37,6 +37,13 @@ mod priv_linux;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod seccomp_linux;
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+mod zfs;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
