@@ -55,6 +55,11 @@ enum Cmd {
     /// type `shit undo` explicitly — the top-level `shit` does not
     /// accept undo's flags.
     Undo(cmd::undo::UndoArgs),
+    /// Re-apply the most recently-undone command.
+    Redo(cmd::redo::RedoArgs),
+    /// Cathartic alias for `shit undo`. Same args.
+    #[command(name = "fuck")]
+    Fuck(cmd::undo::UndoArgs),
     /// List captured commands (most recent first).
     List(cmd::list::ListArgs),
     /// Show details for one captured command.
@@ -63,6 +68,17 @@ enum Cmd {
     Pin(cmd::pin::PinArgs),
     /// Drop a captured command's savepoint.
     Forget(cmd::forget::ForgetArgs),
+    /// Manual blob-store garbage collection.
+    Gc(cmd::gc::GcArgs),
+    /// Read or write the user's config file.
+    Config(cmd::config::ConfigArgs),
+    /// Temporarily disable capture (this session or this shell).
+    Disable(cmd::disable::DisableArgs),
+    /// Re-enable capture after `shit disable`.
+    Enable(cmd::disable::EnableArgs),
+    /// Run a command WITHOUT capture protection (bypass hard-fail).
+    #[command(name = "no-protect")]
+    NoProtect(cmd::no_protect::NoProtectArgs),
     /// Manage shell hook integration.
     Hooks {
         #[command(subcommand)]
@@ -175,11 +191,17 @@ fn main() -> anyhow::Result<()> {
     // the `Cli` struct for why.
     let cmd = cli.cmd.unwrap_or(Cmd::Undo(cmd::undo::UndoArgs::default()));
     match cmd {
-        Cmd::Undo(args) => cmd::undo::run(args),
+        Cmd::Undo(args) | Cmd::Fuck(args) => cmd::undo::run(args),
+        Cmd::Redo(args) => cmd::redo::run(args).map_err(|e| e.into()),
         Cmd::List(args) => cmd::list::run(args).map_err(|e| e.into()),
         Cmd::Show(args) => cmd::show::run(args).map_err(|e| e.into()),
         Cmd::Pin(args) => cmd::pin::run(args).map_err(|e| e.into()),
         Cmd::Forget(args) => cmd::forget::run(args).map_err(|e| e.into()),
+        Cmd::Gc(args) => cmd::gc::run(args).map_err(|e| e.into()),
+        Cmd::Config(args) => cmd::config::run(args).map_err(|e| e.into()),
+        Cmd::Disable(args) => cmd::disable::run(args).map_err(|e| e.into()),
+        Cmd::Enable(args) => cmd::disable::enable(args).map_err(|e| e.into()),
+        Cmd::NoProtect(args) => cmd::no_protect::run(args).map_err(|e| e.into()),
         Cmd::Hooks { action } => match action {
             HooksCmd::Install { shell } => hooks::install(shell.resolve()),
             HooksCmd::Uninstall { shell } => hooks::uninstall(shell.resolve()),
