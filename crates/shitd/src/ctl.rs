@@ -7,10 +7,25 @@
 use crate::config::ResolvedConfig;
 use crate::pkg::PkgPreStash;
 use crate::stats::Stats;
+use crate::svc_track::SvcPreStash;
 use shit_proto::{
-    CtlRequest, CtlResponse, DaemonStatus, GcRequest, PkgEventReq, decode_frame, encode_frame,
+    CtlRequest, CtlResponse, DaemonStatus, GcRequest, PkgEventReq, SvcEventReq, decode_frame,
+    encode_frame,
 };
 use shit_store::{BlobStore, Index};
+
+/// Daemon-side state bundle threaded through the ctl handlers. Keeps
+/// the `handle_client` signature manageable as more Pre-stash kinds
+/// land.
+#[derive(Clone)]
+pub struct CtlState {
+    pub stats: Arc<Stats>,
+    pub shutdown: Arc<Notify>,
+    pub index: Arc<Index>,
+    pub blob_store: Arc<BlobStore>,
+    pub pkg_stash: Arc<PkgPreStash>,
+    pub svc_stash: Arc<SvcPreStash>,
+}
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -24,14 +39,7 @@ const CTL_BUF: usize = 4096;
 /// Listen on `cfg.ctl_socket_path`, serving each connection on a task.
 /// `shutdown` is notified to ask the main runtime to exit; the listener
 /// itself does not exit until cancelled by the runtime stopping.
-pub async fn serve(
-    cfg: &ResolvedConfig,
-    stats: Arc<Stats>,
-    shutdown: Arc<Notify>,
-    index: Arc<Index>,
-    blob_store: Arc<BlobStore>,
-    pkg_stash: Arc<PkgPreStash>,
-) -> anyhow::Result<()> {
+pub async fn serve(cfg: &ResolvedConfig, state: CtlState) -> anyhow::Result<()> {
     if let Some(parent) = cfg.ctl_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -50,17 +58,10 @@ pub async fn serve(
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                let stats = Arc::clone(&stats);
-                let shutdown = Arc::clone(&shutdown);
                 let cfg = cfg.clone();
-                let index = Arc::clone(&index);
-                let blob_store = Arc::clone(&blob_store);
-                let pkg_stash = Arc::clone(&pkg_stash);
+                let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_client(stream, &cfg, stats, shutdown, index, blob_store, pkg_stash)
-                            .await
-                    {
+                    if let Err(e) = handle_client(stream, &cfg, state).await {
                         debug!(err = %e, "ctl client errored");
                     }
                 });
@@ -75,12 +76,16 @@ pub async fn serve(
 async fn handle_client(
     mut stream: UnixStream,
     cfg: &ResolvedConfig,
-    stats: Arc<Stats>,
-    shutdown: Arc<Notify>,
-    index: Arc<Index>,
-    blob_store: Arc<BlobStore>,
-    pkg_stash: Arc<PkgPreStash>,
+    state: CtlState,
 ) -> anyhow::Result<()> {
+    let CtlState {
+        stats,
+        shutdown,
+        index,
+        blob_store,
+        pkg_stash,
+        svc_stash,
+    } = state;
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
@@ -107,12 +112,7 @@ async fn handle_client(
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
-        CtlRequest::SvcEvent(_) => {
-            // S16.6 wires this to a real handler. Stub-ack so a
-            // helper that ships ahead of the daemon doesn't deadlock
-            // the user's `systemctl` invocation.
-            CtlResponse::SvcEventAck
-        }
+        CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -269,4 +269,14 @@ fn snapshot(cfg: &ResolvedConfig, stats: &Stats) -> DaemonStatus {
 fn handle_pkg_event(req: PkgEventReq, pkg_stash: &PkgPreStash) -> CtlResponse {
     let _ = crate::pkg::handle(pkg_stash, req);
     CtlResponse::PkgEventAck
+}
+
+/// Handle one service-manager hook event (S16.6). Pre stashes a
+/// parsed `ServiceState`; Post pairs by `(tool, pid, unit)` and
+/// returns the before/after diff to the caller. The journal-write
+/// under `(session, seq)` is DR-36 — gated on the same
+/// command-window binding that DR-25 / DR-32 wait on.
+fn handle_svc_event(req: SvcEventReq, svc_stash: &SvcPreStash) -> CtlResponse {
+    let _ = crate::svc_track::handle(svc_stash, req);
+    CtlResponse::SvcEventAck
 }
