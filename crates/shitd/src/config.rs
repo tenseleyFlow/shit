@@ -25,6 +25,58 @@ pub struct Config {
     pub log_level: Option<String>,
     #[serde(default)]
     pub disable: bool,
+    /// S15: env tracking. The `[env]` table in `config.toml`.
+    #[serde(default)]
+    pub env: EnvConfig,
+}
+
+/// S15 env-tracking knobs. Defaults match `shit_planner::env::EnvFilter::default()`.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct EnvConfig {
+    /// Additional variable names to ignore on top of the built-in
+    /// noise list. Merged with the defaults; user names extend, not
+    /// replace.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    /// Additional prefixes to ignore (e.g. `STARSHIP_` is already in
+    /// the default list).
+    #[serde(default)]
+    pub ignore_prefixes: Vec<String>,
+    /// Override the redaction substrings entirely. When `None`, the
+    /// built-in default list is used. Set to `[]` to disable
+    /// redaction (NOT recommended).
+    #[serde(default)]
+    pub redact_substrings: Option<Vec<String>>,
+    /// When true, the ignore lists are bypassed. Redaction still
+    /// applies — turning it off requires `redact_substrings = []`
+    /// explicitly.
+    #[serde(default)]
+    pub track_all: bool,
+}
+
+impl EnvConfig {
+    /// Materialise an `EnvFilter` that the daemon and renderer can
+    /// consume. Folds user-provided lists into the defaults; user
+    /// `ignore` / `ignore_prefixes` extend the built-ins,
+    /// `redact_substrings` replaces them if set.
+    pub fn filter(&self) -> shit_planner::EnvFilter {
+        let mut f = shit_planner::EnvFilter::default();
+        for n in &self.ignore {
+            if !f.ignore.iter().any(|e| e == n) {
+                f.ignore.push(n.clone());
+            }
+        }
+        for p in &self.ignore_prefixes {
+            if !f.ignore_prefixes.iter().any(|e| e == p) {
+                f.ignore_prefixes.push(p.clone());
+            }
+        }
+        if let Some(rs) = &self.redact_substrings {
+            f.redact_substrings = rs.clone();
+        }
+        f.track_all = self.track_all;
+        f
+    }
 }
 
 /// Fully-resolved config — what the daemon actually runs on.
@@ -37,6 +89,7 @@ pub struct ResolvedConfig {
     pub state_dir: PathBuf,
     pub log_level: String,
     pub disable: bool,
+    pub env: EnvConfig,
 }
 
 impl Config {
@@ -68,6 +121,7 @@ impl Config {
                 .log_level
                 .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string()),
             disable: self.disable,
+            env: self.env,
         })
     }
 }
@@ -164,5 +218,57 @@ mod tests {
         let r = Config::default().resolve().unwrap();
         assert!(r.lock_path.starts_with(&r.state_dir));
         assert_eq!(r.lock_path.file_name().unwrap(), "daemon.lock");
+    }
+
+    #[test]
+    fn env_config_defaults_empty_extensions() {
+        let r = Config::default().resolve().unwrap();
+        assert!(r.env.ignore.is_empty());
+        assert!(r.env.ignore_prefixes.is_empty());
+        assert!(r.env.redact_substrings.is_none());
+        assert!(!r.env.track_all);
+    }
+
+    #[test]
+    fn env_config_extends_defaults() {
+        let toml = r#"
+            [env]
+            ignore = ["MY_LOCAL_NOISE"]
+            ignore_prefixes = ["VCPKG_"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let r = cfg.resolve().unwrap();
+        let f = r.env.filter();
+        assert!(f.ignore.iter().any(|n| n == "MY_LOCAL_NOISE"));
+        assert!(f.ignore.iter().any(|n| n == "OLDPWD"), "default kept");
+        assert!(f.ignore_prefixes.iter().any(|n| n == "VCPKG_"));
+        assert!(
+            f.ignore_prefixes.iter().any(|n| n == "STARSHIP_"),
+            "default prefix kept"
+        );
+    }
+
+    #[test]
+    fn env_config_redact_replaces_defaults_when_set() {
+        let toml = r#"
+            [env]
+            redact_substrings = ["CREDENTIAL"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = cfg.resolve().unwrap().env.filter();
+        assert!(f.is_redacted("MY_CREDENTIAL"));
+        // Default `TOKEN` no longer in the list because user replaced.
+        assert!(!f.is_redacted("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn env_config_track_all_propagates() {
+        let toml = r#"
+            [env]
+            track_all = true
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let f = cfg.resolve().unwrap().env.filter();
+        assert!(!f.is_ignored("OLDPWD"));
     }
 }
