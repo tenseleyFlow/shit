@@ -202,7 +202,10 @@ mod tests {
     fn mysql_wrapper_handles_dash_e_glued_and_split() {
         let (_, body) = TOOLS[1];
         assert!(body.contains("-e|--execute"));
-        assert!(body.contains("-e*"), "mysql wrapper missing glued -e support");
+        assert!(
+            body.contains("-e*"),
+            "mysql wrapper missing glued -e support"
+        );
     }
 
     #[test]

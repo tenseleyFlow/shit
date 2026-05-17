@@ -55,7 +55,10 @@ fn render_one(out: &mut String, s: &DbSuggestion, display: RedactionDisplay) {
     let _ = writeln!(out, "  engine: {} target: {}", s.engine.as_str(), s.target);
     let filtered = filter_statements(&s.statements, display);
     if filtered.is_empty() {
-        let _ = writeln!(out, "    (no statements; engine redaction may have dropped them)");
+        let _ = writeln!(
+            out,
+            "    (no statements; engine redaction may have dropped them)"
+        );
     } else {
         let truncated = filtered.len() > MAX_STATEMENTS_PRINTED;
         let n = filtered.len().min(MAX_STATEMENTS_PRINTED);
@@ -200,7 +203,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn sug(engine: DbEngine, target: &str, statements: &[&str], hint: RollbackHint) -> DbSuggestion {
+    fn sug(
+        engine: DbEngine,
+        target: &str,
+        statements: &[&str],
+        hint: RollbackHint,
+    ) -> DbSuggestion {
         DbSuggestion {
             engine,
             target: target.into(),
@@ -346,7 +354,10 @@ mod tests {
         let out = render(&[s], RedactionDisplay::default());
         assert!(out.contains("+ 5 more"));
         // Verify it stopped at the cap.
-        let bullet_count = out.lines().filter(|l| l.trim_start().starts_with("- ")).count();
+        let bullet_count = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .count();
         assert_eq!(bullet_count, MAX_STATEMENTS_PRINTED);
     }
 
@@ -364,15 +375,30 @@ mod tests {
 
     #[test]
     fn rollback_hint_none_says_no_actionable() {
-        let s = sug(DbEngine::Postgres, "prod", &["INSERT INTO t VALUES (1)"], RollbackHint::None);
+        let s = sug(
+            DbEngine::Postgres,
+            "prod",
+            &["INSERT INTO t VALUES (1)"],
+            RollbackHint::None,
+        );
         let out = render(&[s], RedactionDisplay::default());
         assert!(out.contains("no actionable hint"));
     }
 
     #[test]
     fn multiple_suggestions_each_get_a_block() {
-        let a = sug(DbEngine::Postgres, "prod", &["INSERT INTO t VALUES (1)"], RollbackHint::None);
-        let b = sug(DbEngine::Mysql, "stage", &["UPDATE t SET x = 1"], RollbackHint::None);
+        let a = sug(
+            DbEngine::Postgres,
+            "prod",
+            &["INSERT INTO t VALUES (1)"],
+            RollbackHint::None,
+        );
+        let b = sug(
+            DbEngine::Mysql,
+            "stage",
+            &["UPDATE t SET x = 1"],
+            RollbackHint::None,
+        );
         let out = render(&[a, b], RedactionDisplay::default());
         let engine_lines = out.lines().filter(|l| l.contains("engine:")).count();
         assert_eq!(engine_lines, 2);

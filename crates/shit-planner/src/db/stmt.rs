@@ -117,7 +117,10 @@ fn classify_with_body(rest: &str) -> StatementKind {
             while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            let word: String = chars[start..i].iter().collect::<String>().to_ascii_uppercase();
+            let word: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .to_ascii_uppercase();
             match word.as_str() {
                 "SELECT" => return StatementKind::ReadOnly,
                 "INSERT" | "UPDATE" | "DELETE" | "MERGE" => return StatementKind::Mutating,
@@ -273,7 +276,10 @@ mod tests {
 
     #[test]
     fn select_is_readonly() {
-        assert_eq!(classify_statement("SELECT * FROM t"), StatementKind::ReadOnly);
+        assert_eq!(
+            classify_statement("SELECT * FROM t"),
+            StatementKind::ReadOnly
+        );
         assert_eq!(classify_statement("select 1"), StatementKind::ReadOnly);
     }
 
@@ -340,7 +346,13 @@ mod tests {
 
     #[test]
     fn transaction_control_is_mutating() {
-        for s in ["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT sp1", "RELEASE sp1"] {
+        for s in [
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT sp1",
+            "RELEASE sp1",
+        ] {
             assert_eq!(classify_statement(s), StatementKind::Mutating, "{s}");
         }
     }
@@ -362,15 +374,11 @@ mod tests {
             StatementKind::ReadOnly
         );
         assert_eq!(
-            classify_statement(
-                "WITH cte AS (SELECT * FROM old) INSERT INTO new SELECT * FROM cte"
-            ),
+            classify_statement("WITH cte AS (SELECT * FROM old) INSERT INTO new SELECT * FROM cte"),
             StatementKind::Mutating
         );
         assert_eq!(
-            classify_statement(
-                "WITH RECURSIVE cte AS (SELECT 1) UPDATE t SET x = 1 FROM cte"
-            ),
+            classify_statement("WITH RECURSIVE cte AS (SELECT 1) UPDATE t SET x = 1 FROM cte"),
             StatementKind::Mutating
         );
     }
@@ -378,8 +386,14 @@ mod tests {
     #[test]
     fn empty_and_only_comments_are_unknown() {
         assert_eq!(classify_statement(""), StatementKind::Unknown);
-        assert_eq!(classify_statement("-- only a comment"), StatementKind::Unknown);
-        assert_eq!(classify_statement("/* only block */"), StatementKind::Unknown);
+        assert_eq!(
+            classify_statement("-- only a comment"),
+            StatementKind::Unknown
+        );
+        assert_eq!(
+            classify_statement("/* only block */"),
+            StatementKind::Unknown
+        );
     }
 
     #[test]
@@ -443,8 +457,14 @@ mod tests {
 
     #[test]
     fn classifier_handles_lower_and_mixed_case() {
-        assert_eq!(classify_statement("insert into t values (1)"), StatementKind::Mutating);
-        assert_eq!(classify_statement("Update t SET x = 1"), StatementKind::Mutating);
+        assert_eq!(
+            classify_statement("insert into t values (1)"),
+            StatementKind::Mutating
+        );
+        assert_eq!(
+            classify_statement("Update t SET x = 1"),
+            StatementKind::Mutating
+        );
         assert_eq!(classify_statement("select 1"), StatementKind::ReadOnly);
     }
 }

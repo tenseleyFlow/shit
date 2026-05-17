@@ -195,9 +195,7 @@ mod tests {
     #[test]
     fn filter_drops_select_into_distinction() {
         // SELECT FOR UPDATE is still read-only by our classifier; SELECT INTO is mutating.
-        let kept = filter_statements(
-            "SELECT * FROM t FOR UPDATE; SELECT * INTO new FROM old",
-        );
+        let kept = filter_statements("SELECT * FROM t FOR UPDATE; SELECT * INTO new FROM old");
         assert_eq!(kept.len(), 1);
         assert!(kept[0].contains("INTO new"));
     }

@@ -151,8 +151,13 @@ pub fn decide(
     statements: &[String],
     hint: &RollbackHint,
 ) -> DbExecOutcome {
-    if let (DbEngine::Sqlite3, RollbackHint::Sqlite { path, file_blob: Some(blob) }) =
-        (engine, hint)
+    if let (
+        DbEngine::Sqlite3,
+        RollbackHint::Sqlite {
+            path,
+            file_blob: Some(blob),
+        },
+    ) = (engine, hint)
     {
         return DbExecOutcome::DelegateFileRestore {
             path: path.clone(),
@@ -244,11 +249,7 @@ mod tests {
     #[test]
     fn dry_run_does_not_push_suggestion() {
         let exec = DbExecutor::with_vec_sink();
-        let op = note(
-            DbEngine::Postgres,
-            "prod",
-            RollbackHint::None,
-        );
+        let op = note(DbEngine::Postgres, "prod", RollbackHint::None);
         let out = exec.execute(&op, true, ConflictPolicy::Abort);
         assert_eq!(out, ExecutionOutcome::WouldApply);
         assert!(exec.sink().is_empty());

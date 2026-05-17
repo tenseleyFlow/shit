@@ -224,9 +224,9 @@ pub fn parse_sqlite3_argv(args: &[String]) -> Result<ConnInfo, ConnParseError> {
 }
 
 fn parse_pg_uri(uri: &str, out: &mut ConnInfo) -> Result<(), ConnParseError> {
-    let scheme_end = uri.find("://").ok_or_else(|| {
-        ConnParseError::InvalidUri(format!("missing scheme separator in {uri}"))
-    })?;
+    let scheme_end = uri
+        .find("://")
+        .ok_or_else(|| ConnParseError::InvalidUri(format!("missing scheme separator in {uri}")))?;
     let after = &uri[scheme_end + 3..];
     // Split path (db) and query.
     let (authority_and_path, _query) = match after.find('?') {
@@ -326,8 +326,7 @@ mod tests {
 
     #[test]
     fn psql_uri_password_stripped() {
-        let info =
-            parse_psql_argv(&v(&["postgres://alice:hunter2@host/prod"])).unwrap();
+        let info = parse_psql_argv(&v(&["postgres://alice:hunter2@host/prod"])).unwrap();
         assert!(info.password_present);
         // Sanity: no field carries the password.
         assert!(!info.host.contains("hunter2"));
@@ -348,7 +347,14 @@ mod tests {
     #[test]
     fn psql_flag_form() {
         let info = parse_psql_argv(&v(&[
-            "-h", "db.example.com", "-p", "5432", "-U", "alice", "-d", "prod",
+            "-h",
+            "db.example.com",
+            "-p",
+            "5432",
+            "-U",
+            "alice",
+            "-d",
+            "prod",
         ]))
         .unwrap();
         assert_eq!(info.host, "db.example.com");
@@ -427,10 +433,8 @@ mod tests {
         // documented split form here. The glued forms are caller's
         // responsibility (the wrapper should send normalized argv).
         // Verify the canonical form works:
-        let info = parse_mysql_argv(&v(&[
-            "-h", "db", "-P", "3306", "-u", "alice", "-p", "prod",
-        ]))
-        .unwrap();
+        let info =
+            parse_mysql_argv(&v(&["-h", "db", "-P", "3306", "-u", "alice", "-p", "prod"])).unwrap();
         assert_eq!(info.host, "db");
         assert_eq!(info.port, Some(3306));
         assert_eq!(info.user, "alice");
@@ -455,8 +459,7 @@ mod tests {
 
     #[test]
     fn sqlite3_consumes_dash_init_value() {
-        let info =
-            parse_sqlite3_argv(&v(&["-init", "/etc/init.sql", "/tmp/test.db"])).unwrap();
+        let info = parse_sqlite3_argv(&v(&["-init", "/etc/init.sql", "/tmp/test.db"])).unwrap();
         assert_eq!(info.target, "/tmp/test.db");
     }
 
