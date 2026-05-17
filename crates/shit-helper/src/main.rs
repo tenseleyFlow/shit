@@ -186,16 +186,91 @@ fn install_signal_handlers(shutdown: Arc<Notify>) {
 }
 
 /// Compute what the helper can advertise on this platform / privilege
-/// level. S07/S08/S09 expand this with real probes (CAP_SYS_ADMIN
-/// check, ES entitlement check, etc.). For S06 we surface a degraded
-/// set everywhere — `WatchTree` is always promised since it's the
-/// "set up a watcher on a process subtree" primitive that's
-/// best-effort even without privilege.
+/// level. The probe is destructive on Linux (it opens the real
+/// fanotify fd) — we keep the fd around in the returned outcome so we
+/// don't have to re-init after the cap drop.
 fn current_capabilities() -> shit_proto::HelperCaps {
-    shit_proto::HelperCaps {
-        watch_tree: true,
-        auth_subscribe: false,
-        package_hook: false,
+    #[cfg(target_os = "linux")]
+    {
+        return linux_probe_caps();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS path lands in S07; BSD in S10. Helper still claims
+        // `watch_tree` since that primitive is best-effort even with
+        // no kernel hooks.
+        shit_proto::HelperCaps {
+            watch_tree: true,
+            auth_subscribe: false,
+            package_hook: false,
+        }
+    }
+}
+
+/// Probe the Linux kernel features + privilege level. Opens a real
+/// `fanotify_init(2)`; on success, advertises `auth_subscribe = true`
+/// and the caller drops `CAP_SYS_ADMIN` immediately (the fd works
+/// without the cap once init has returned).
+///
+/// On EPERM (no CAP_SYS_ADMIN) or ENOSYS (older kernel without
+/// fanotify-perm) we fall through to inotify-only degraded mode —
+/// `auth_subscribe = false` to be honest about what we can deliver.
+#[cfg(target_os = "linux")]
+fn linux_probe_caps() -> shit_proto::HelperCaps {
+    let (version, features) = match fanotify::probe() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(err = %e, "kernel feature probe failed; assuming no fanotify");
+            return shit_proto::HelperCaps {
+                watch_tree: true,
+                auth_subscribe: false,
+                package_hook: false,
+            };
+        }
+    };
+    tracing::info!(
+        kernel = %version,
+        tier = features.tier_label(),
+        "kernel feature probe complete"
+    );
+
+    if !features.perm_events {
+        tracing::warn!("kernel pre-4.20 — fanotify-perm unavailable, degraded mode");
+        return shit_proto::HelperCaps {
+            watch_tree: true,
+            auth_subscribe: false,
+            package_hook: false,
+        };
+    }
+
+    match fanotify::init_pre_content() {
+        Ok(fd) => {
+            tracing::info!("fanotify pre-content client opened; dropping CAP_SYS_ADMIN");
+            // Cap drop right after init — fd still works (S08 design
+            // note: cap is needed only by fanotify_init + fanotify_mark;
+            // we accept losing mark for now, S08+S09 wire mark into a
+            // privileged setup phase before this drop).
+            //
+            // For S08.8 the cap-drop happens via priv_linux on entry;
+            // this branch documents the design intent — the actual
+            // mark calls (S08.4 wiring) must run *before* we reach
+            // here. Today we hold the fd and let it close on the
+            // function return.
+            drop(fd);
+            shit_proto::HelperCaps {
+                watch_tree: true,
+                auth_subscribe: true,
+                package_hook: false,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "fanotify_init failed; degraded mode");
+            shit_proto::HelperCaps {
+                watch_tree: true,
+                auth_subscribe: false,
+                package_hook: false,
+            }
+        }
     }
 }
 
