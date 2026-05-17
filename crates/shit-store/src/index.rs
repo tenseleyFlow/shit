@@ -61,6 +61,15 @@ impl Index {
         &self.conn
     }
 
+    /// Test-only accessor for the inner connection mutex. Integration
+    /// tests (which live outside the crate, so `pub(crate)` is invisible)
+    /// need raw SQL access to set up fixtures without re-implementing
+    /// every insert primitive. Not part of the production API.
+    #[doc(hidden)]
+    pub fn conn_for_test(&self) -> &Mutex<Connection> {
+        &self.conn
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
