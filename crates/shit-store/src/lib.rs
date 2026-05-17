@@ -6,12 +6,14 @@
 
 pub mod blob;
 pub mod gc;
+pub mod importance;
 pub mod index;
 pub mod refcount;
 pub mod schema;
 
 pub use blob::{BlobError, BlobStat, BlobStore};
 pub use gc::{GcConfig, GcError, GcReport, run_pass};
+pub use importance::{ImportanceConfig, ScoreInputs, bump_for_undo, score_command, set_importance};
 pub use index::{Index, IndexError};
 pub use refcount::{ReapBatch, reap_commands};
 pub use schema::SchemaError;
