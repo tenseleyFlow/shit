@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 
 mod config;
 mod ctl;
+mod db_track;
 mod env_track;
 mod gc;
 mod helper_link;
@@ -125,12 +126,14 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let svc_stash = Arc::new(svc_track::SvcPreStash::new());
     let net_stash = Arc::new(net_track::NetPreStash::new());
     let proc_stash = Arc::new(proc_track::ProcPreStash::new());
+    let db_stash = Arc::new(db_track::DbPreStash::new());
     let pkg_janitor = {
         let pkg_stash = Arc::clone(&pkg_stash);
         let env_stash = Arc::clone(&env_stash);
         let svc_stash = Arc::clone(&svc_stash);
         let net_stash = Arc::clone(&net_stash);
         let proc_stash = Arc::clone(&proc_stash);
+        let db_stash = Arc::clone(&db_stash);
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             // Sweep orphan Pre stashes every minute. The 5-minute
@@ -145,13 +148,15 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let svc_evicted = svc_stash.sweep_expired();
                         let net_evicted = net_stash.sweep_expired();
                         let proc_evicted = proc_stash.sweep_expired();
-                        if pkg_evicted + env_evicted + svc_evicted + net_evicted + proc_evicted > 0 {
+                        let db_evicted = db_stash.sweep_expired();
+                        if pkg_evicted + env_evicted + svc_evicted + net_evicted + proc_evicted + db_evicted > 0 {
                             tracing::info!(
                                 pkg_evicted,
                                 env_evicted,
                                 svc_evicted,
                                 net_evicted,
                                 proc_evicted,
+                                db_evicted,
                                 "stash janitor: swept orphan Pre entries"
                             );
                         }
@@ -173,6 +178,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             svc_stash: Arc::clone(&svc_stash),
             net_stash: Arc::clone(&net_stash),
             proc_stash: Arc::clone(&proc_stash),
+            db_stash: Arc::clone(&db_stash),
         };
         tokio::spawn(async move {
             if let Err(e) = ctl::serve(&cfg, ctl_state).await {
