@@ -26,6 +26,9 @@ ssh \
   -o "IdentitiesOnly=yes" \
   ubuntu@127.0.0.1 <<'REMOTE_SCRIPT'
 set -euo pipefail
+# rustup installs cargo at ~/.cargo/bin/cargo for the ubuntu user;
+# add it to PATH for this session.
+export PATH="$HOME/.cargo/bin:$PATH"
 cd ~/shit
 if ! command -v cargo >/dev/null; then
   echo "[linux-vm-remote] rust not installed — cloud-init should have done this" >&2

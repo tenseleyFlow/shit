@@ -111,8 +111,6 @@ disable_root: false
 package_update: true
 package_upgrade: false
 packages:
-  - rustc
-  - cargo
   - rsync
   - build-essential
   - pkg-config
@@ -123,12 +121,21 @@ packages:
   - libssl-dev
   - bpftool
   - linux-tools-common
+  - curl
+  - ca-certificates
 runcmd:
+  # Drop a grub.d override that sorts after Ubuntu's cloud-image
+  # 50-cloudimg-settings.cfg (which clobbers GRUB_CMDLINE_LINUX_DEFAULT).
+  # Without this the lsm= argument doesn't reach /proc/cmdline.
   - |
-    if ! grep -q 'lsm=.*bpf' /etc/default/grub; then
-      sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"|GRUB_CMDLINE_LINUX_DEFAULT="\1 lsm=lockdown,yama,integrity,apparmor,bpf"|' /etc/default/grub
-      update-grub
-    fi
+    cat > /etc/default/grub.d/99-shit-vm-lsm-bpf.cfg <<'GRUBCFG'
+    GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=lockdown,yama,integrity,apparmor,bpf"
+    GRUBCFG
+    update-grub
+  # Install rustup as the ubuntu user so MSRV >= 1.85 is satisfied
+  # (the apt 'rustc' package on noble is 1.75, below our MSRV).
+  - |
+    su - ubuntu -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal'
   - touch /var/lib/cloud/instance/shit-vm-provisioned
   - shutdown -r +1 shit-linux-bpf-vm-reboot-for-lsm
 USERDATA_EOF
