@@ -13,6 +13,7 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 mod error;
+pub mod hardlink;
 pub mod streaming;
 pub mod verify;
 
@@ -96,7 +97,6 @@ pub trait CowEngine {
 
 /// Path inside the blob store for a given hash. Mirrors `shit_store::BlobStore`
 /// layout: `blobs/<aa>/<bb>/<aabbcc...>`.
-#[allow(dead_code)]
 pub(crate) fn blob_path(root: &Path, hash: &BlobHash) -> PathBuf {
     let hex = hash.to_hex();
     let (aa, rest) = hex.split_at(2);
