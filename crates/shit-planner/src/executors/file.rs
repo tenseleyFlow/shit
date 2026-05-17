@@ -144,27 +144,63 @@ impl<R: BlobReader> FileExecutor<'_, R> {
         }
     }
 
-    fn apply_unlink(&self, _op: &InverseOp) -> ExecutionOutcome {
-        ExecutionOutcome::Failed {
-            err: "S11.5: Unlink not yet implemented".into(),
+    fn apply_unlink(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::Unlink { path } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_unlink: wrong variant".into(),
+            };
+        };
+        match unlink_inner(path) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed { err: e },
         }
     }
 
-    fn apply_recreate_path(&self, _op: &InverseOp) -> ExecutionOutcome {
-        ExecutionOutcome::Failed {
-            err: "S11.5: RecreatePath not yet implemented".into(),
+    fn apply_recreate_path(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::RecreatePath { path, kind, mode } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_recreate_path: wrong variant".into(),
+            };
+        };
+        match recreate_path_inner(path, *kind, *mode) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed { err: e },
         }
     }
 
-    fn apply_rename(&self, _op: &InverseOp) -> ExecutionOutcome {
-        ExecutionOutcome::Failed {
-            err: "S11.5: Rename not yet implemented".into(),
+    fn apply_rename(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::Rename { from, to } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_rename: wrong variant".into(),
+            };
+        };
+        // std::fs::rename is atomic on same-fs; cross-fs returns EXDEV
+        // (mapped to io::Error). Cross-fs renames are stage-2 work —
+        // they need the copy+unlink fallback noted in the sprint plan.
+        match fs::rename(from, to) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed {
+                err: format!("rename {from:?} -> {to:?}: {e}"),
+            },
         }
     }
 
-    fn apply_create_symlink(&self, _op: &InverseOp) -> ExecutionOutcome {
-        ExecutionOutcome::Failed {
-            err: "S11.5: CreateSymlink not yet implemented".into(),
+    fn apply_create_symlink(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::CreateSymlink {
+            target: link_target,
+            path,
+        } = op
+        else {
+            return ExecutionOutcome::Failed {
+                err: "apply_create_symlink: wrong variant".into(),
+            };
+        };
+        use std::os::unix::fs::symlink;
+        match symlink(link_target, path) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed {
+                err: format!("symlink {path:?} -> {link_target:?}: {e}"),
+            },
         }
     }
 }
@@ -236,6 +272,69 @@ fn restore_metadata_inner(
     Ok(())
 }
 
+/// Remove `path`. Auto-detects file-vs-directory via lstat so the
+/// caller doesn't need to pass `FileKind`.
+///
+/// For symlinks: removes the symlink itself, not the target — matches
+/// the `unlink(2)` semantic.
+///
+/// For directories: only succeeds when the directory is empty. The
+/// planner emits one `Unlink` per directory entry plus one per parent,
+/// in post-order; if the planner emits an `Unlink` for a non-empty
+/// dir, that's a planner bug surfaced here as a clear ENOTEMPTY.
+fn unlink_inner(path: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("lstat {path:?}: {e}"))?;
+    if meta.file_type().is_dir() {
+        fs::remove_dir(path).map_err(|e| format!("rmdir {path:?}: {e}"))
+    } else {
+        fs::remove_file(path).map_err(|e| format!("unlink {path:?}: {e}"))
+    }
+}
+
+/// Recreate a path the original command unlinked. Handles regular
+/// files and directories; other kinds (fifo/socket/device) need
+/// `mknod(2)` and are deferred — return a clear "needs DR-15 for
+/// mknod helper routing" message.
+fn recreate_path_inner(
+    path: &Path,
+    kind: crate::metadata::FileKind,
+    mode: u32,
+) -> Result<(), String> {
+    use crate::metadata::FileKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let perm_bits = mode & 0o7777;
+    match kind {
+        FileKind::Regular => {
+            // Create empty file; `RestoreContent` (if present in the
+            // plan) fills it. Setting perms after create so umask
+            // doesn't shave bits off.
+            fs::File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(perm_bits))
+                .map_err(|e| format!("chmod {path:?} -> {perm_bits:o}: {e}"))?;
+            Ok(())
+        }
+        FileKind::Directory => {
+            fs::create_dir(path).map_err(|e| format!("mkdir {path:?}: {e}"))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(perm_bits))
+                .map_err(|e| format!("chmod {path:?} -> {perm_bits:o}: {e}"))?;
+            Ok(())
+        }
+        FileKind::Symlink => Err(format!(
+            "RecreatePath for symlink at {path:?} is a planner bug — \
+             use InverseOp::CreateSymlink which carries the target"
+        )),
+        // Fifo/Socket/BlockDevice/CharDevice need mknod(2). For named
+        // pipes and sockets the helper has CAP_MKNOD by default;
+        // for block/char devices it requires CAP_SYS_ADMIN even with
+        // the right owner. Route through the helper once DR-15 lands.
+        other => Err(format!(
+            "RecreatePath for kind {other:?} at {path:?}: needs mknod(2) \
+             via helper-IPC privileged-op routing (DR-15)"
+        )),
+    }
+}
+
 /// Monotonic-ish suffix for tmpfile names. We use nanoseconds since
 /// the Unix epoch — uniqueness in tight loops is helped by the pid
 /// prefix the caller adds, and worst-case a collision just causes a
@@ -300,20 +399,164 @@ mod tests {
     }
 
     #[test]
-    fn other_variants_still_not_implemented() {
-        // RestoreMetadata / Unlink / RecreatePath / Rename / CreateSymlink
-        // remain stubbed until S11.4 + S11.5.
+    fn unlink_removes_regular_file() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("f");
+        std::fs::write(&target, b"x").unwrap();
+
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::Unlink {
-            path: PathBuf::from("/tmp/never"),
+            path: target.clone(),
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn unlink_removes_empty_directory() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("d");
+        std::fs::create_dir(&target).unwrap();
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Unlink {
+            path: target.clone(),
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn unlink_on_missing_path_returns_failed() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("nope");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Unlink { path: target };
+        assert!(matches!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn recreate_path_makes_directory_with_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("newdir");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RecreatePath {
+            path: target.clone(),
+            kind: crate::metadata::FileKind::Directory,
+            mode: 0o040711,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(target.is_dir());
+        let m = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m, 0o711);
+    }
+
+    #[test]
+    fn recreate_path_makes_empty_regular_file_with_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("empty.bin");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RecreatePath {
+            path: target.clone(),
+            kind: crate::metadata::FileKind::Regular,
+            mode: 0o100640,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(target.is_file());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+        let m = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m, 0o640);
+    }
+
+    #[test]
+    fn recreate_path_symlink_kind_is_planner_bug() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RecreatePath {
+            path: tmpdir.path().join("link"),
+            kind: crate::metadata::FileKind::Symlink,
+            mode: 0o120777,
         };
         match e.execute(&op, false, ConflictPolicy::default()) {
             ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("not yet implemented"), "got: {err}");
+                assert!(err.contains("CreateSymlink"), "got: {err}");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rename_round_trips() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let from = tmpdir.path().join("a");
+        let to = tmpdir.path().join("b");
+        std::fs::write(&from, b"hi").unwrap();
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn create_symlink_creates_link() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let link = tmpdir.path().join("alink");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::CreateSymlink {
+            target: "/tmp/nonexistent-target".into(),
+            path: link.clone(),
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("/tmp/nonexistent-target")
+        );
     }
 
     #[test]
