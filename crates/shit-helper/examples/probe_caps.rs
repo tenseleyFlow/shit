@@ -20,26 +20,11 @@ fn main() {
         Ok((v, features)) => {
             println!("kernel: {v}");
             println!("feature tier: {}", features.tier_label());
-            println!(
-                "  perm_events:     {}",
-                features.perm_events
-            );
-            println!(
-                "  filesystem_mark: {}",
-                features.filesystem_mark
-            );
-            println!(
-                "  report_fid:      {}",
-                features.report_fid
-            );
-            println!(
-                "  report_dir_fid:  {}",
-                features.report_dir_fid
-            );
-            println!(
-                "  report_pidfd:    {}",
-                features.report_pidfd
-            );
+            println!("  perm_events:     {}", features.perm_events);
+            println!("  filesystem_mark: {}", features.filesystem_mark);
+            println!("  report_fid:      {}", features.report_fid);
+            println!("  report_dir_fid:  {}", features.report_dir_fid);
+            println!("  report_pidfd:    {}", features.report_pidfd);
         }
         Err(e) => {
             println!("kernel probe error: {e}");

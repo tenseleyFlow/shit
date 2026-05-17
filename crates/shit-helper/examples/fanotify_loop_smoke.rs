@@ -31,8 +31,8 @@
 fn main() {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     const HARD_DEADLINE: Duration = Duration::from_secs(2);
@@ -119,17 +119,10 @@ fn main() {
         if !poll_readable(fd, 100) {
             continue;
         }
-        let n = unsafe {
-            libc::read(
-                fd,
-                buf.as_mut_ptr().cast::<libc::c_void>(),
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EAGAIN)
-                || e.raw_os_error() == Some(libc::EWOULDBLOCK)
+            if e.raw_os_error() == Some(libc::EAGAIN) || e.raw_os_error() == Some(libc::EWOULDBLOCK)
             {
                 continue;
             }
@@ -142,15 +135,11 @@ fn main() {
         while offset + header_len <= bytes.len() {
             let h = &bytes[offset..];
             let event_len = u32::from_ne_bytes([h[0], h[1], h[2], h[3]]) as usize;
-            let mask = u64::from_ne_bytes([
-                h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
-            ]);
+            let mask = u64::from_ne_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
             let ev_fd = i32::from_ne_bytes([h[16], h[17], h[18], h[19]]);
             events_seen += 1;
             let needs_perm = (mask
-                & (libc::FAN_OPEN_PERM
-                    | libc::FAN_ACCESS_PERM
-                    | libc::FAN_OPEN_EXEC_PERM))
+                & (libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_OPEN_EXEC_PERM))
                 != 0;
             if needs_perm {
                 let resp = libc::fanotify_response {

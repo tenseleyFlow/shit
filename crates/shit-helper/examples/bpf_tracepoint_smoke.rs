@@ -31,8 +31,8 @@
 
 #[cfg(target_os = "linux")]
 fn main() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     const HARD_DEADLINE: Duration = Duration::from_secs(3);
@@ -51,8 +51,7 @@ fn main() {
     // .o is the same artifact the helper would load.
     use aya::{Ebpf, programs::TracePoint};
 
-    const NOOP_OBJ: &[u8] =
-        include_bytes!("../bpf/build/noop_tracepoint.bpf.o");
+    const NOOP_OBJ: &[u8] = include_bytes!("../bpf/build/noop_tracepoint.bpf.o");
 
     let heartbeat = Arc::new(AtomicU64::new(now_ms()));
     let watchdog_alive = Arc::new(AtomicBool::new(true));
@@ -105,7 +104,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    println!("[bpf-smoke] Ebpf::load ok ({} ms)", load_started.elapsed().as_millis());
+    println!(
+        "[bpf-smoke] Ebpf::load ok ({} ms)",
+        load_started.elapsed().as_millis()
+    );
 
     let prog: &mut TracePoint = match bpf
         .program_mut("noop_tracepoint")
@@ -113,9 +115,7 @@ fn main() {
     {
         Some(p) => p,
         None => {
-            eprintln!(
-                "[bpf-smoke] program `noop_tracepoint` not found or not a TracePoint"
-            );
+            eprintln!("[bpf-smoke] program `noop_tracepoint` not found or not a TracePoint");
             std::process::exit(3);
         }
     };

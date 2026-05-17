@@ -261,16 +261,15 @@ async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // when `state.shutdown()` is called (we trigger that below on the
     // signal-handler shutdown path).
     #[cfg(target_os = "linux")]
-    let fanotify_state: Option<fanotify::runtime::FanotifyState> =
-        setup.fanotify_fd.map(|fd| {
-            let state = fanotify::runtime::FanotifyState::new(fd);
-            let reader_state = state.clone();
-            std::thread::Builder::new()
-                .name("fanotify-reader".into())
-                .spawn(move || fanotify::runtime::reader_thread(reader_state))
-                .expect("spawn fanotify reader");
-            state
-        });
+    let fanotify_state: Option<fanotify::runtime::FanotifyState> = setup.fanotify_fd.map(|fd| {
+        let state = fanotify::runtime::FanotifyState::new(fd);
+        let reader_state = state.clone();
+        std::thread::Builder::new()
+            .name("fanotify-reader".into())
+            .spawn(move || fanotify::runtime::reader_thread(reader_state))
+            .expect("spawn fanotify reader");
+        state
+    });
 
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
@@ -351,7 +350,11 @@ fn request_loop(
             } => {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
-                    state.tree.lock().unwrap().watch(session, command_seq, root_pid as i32);
+                    state
+                        .tree
+                        .lock()
+                        .unwrap()
+                        .watch(session, command_seq, root_pid as i32);
                     tracing::info!(
                         %session,
                         command_seq,
@@ -376,11 +379,7 @@ fn request_loop(
             } => {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
-                    state
-                        .tree
-                        .lock()
-                        .unwrap()
-                        .unwatch(session, command_seq);
+                    state.tree.lock().unwrap().unwatch(session, command_seq);
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 }
                 #[cfg(not(target_os = "linux"))]

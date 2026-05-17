@@ -28,8 +28,7 @@ use super::error::EbpfError;
 /// The BPF program bytes shipped in tree. Compiled from
 /// `crates/shit-helper/bpf/src/noop_tracepoint.bpf.c` per the
 /// Makefile next to it. Two instructions: `w0 = 0; exit`.
-const NOOP_TRACEPOINT_OBJ: &[u8] =
-    include_bytes!("../../bpf/build/noop_tracepoint.bpf.o");
+const NOOP_TRACEPOINT_OBJ: &[u8] = include_bytes!("../../bpf/build/noop_tracepoint.bpf.o");
 
 /// Section name inside the .o that aya looks up to find the program.
 /// Matches the `__attribute__((section(...)))` in the .c source.
@@ -134,8 +133,8 @@ impl EbpfLoader {
         // `object` crate's ELF header cast requires 8-byte alignment.
         // Copy through a `Vec` (heap-aligned) before handing to aya.
         let aligned: Vec<u8> = NOOP_TRACEPOINT_OBJ.to_vec();
-        let mut bpf = aya::Ebpf::load(&aligned)
-            .map_err(|e| EbpfError::Aya(format!("load: {e}")))?;
+        let mut bpf =
+            aya::Ebpf::load(&aligned).map_err(|e| EbpfError::Aya(format!("load: {e}")))?;
 
         let prog: &mut aya::programs::TracePoint = bpf
             .program_mut(NOOP_TRACEPOINT_SECTION)
