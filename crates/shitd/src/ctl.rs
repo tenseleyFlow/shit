@@ -29,6 +29,7 @@ pub struct CtlState {
     pub svc_stash: Arc<SvcPreStash>,
     pub net_stash: Arc<NetPreStash>,
     pub proc_stash: Arc<ProcPreStash>,
+    pub db_stash: Arc<crate::db_track::DbPreStash>,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -91,6 +92,7 @@ async fn handle_client(
         svc_stash,
         net_stash,
         proc_stash,
+        db_stash,
     } = state;
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -121,7 +123,7 @@ async fn handle_client(
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
-        CtlRequest::DbEvent(req) => handle_db_event(req),
+        CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -308,16 +310,14 @@ fn handle_proc_event(req: ProcEventReq, proc_stash: &ProcPreStash) -> CtlRespons
     CtlResponse::ProcEventAck
 }
 
-/// Stub-ack DB shim events (S19.1). The Pre/Post correlator + journal
-/// wiring lands in S19.5; for now we acknowledge so the helper can
-/// return cleanly to the user's `psql`/`mysql`/`sqlite3` caller.
-fn handle_db_event(req: shit_proto::DbEventReq) -> CtlResponse {
-    tracing::debug!(
-        engine = req.engine.as_str(),
-        phase = ?req.phase,
-        statements = req.statements.len(),
-        target = %req.conn.target,
-        "db-event received (stub-acked; S19.5 wires the stash)"
-    );
+/// Handle one DB CLI shim event (S19.5). Pre stashes the parsed
+/// connection + filtered statements; Post correlates by
+/// `(engine, pid, target)` and folds in the transaction-state hint.
+/// Journal-write under `(session, seq)` is DR-58.
+fn handle_db_event(
+    req: shit_proto::DbEventReq,
+    db_stash: &crate::db_track::DbPreStash,
+) -> CtlResponse {
+    let _ = crate::db_track::handle(db_stash, req);
     CtlResponse::DbEventAck
 }
