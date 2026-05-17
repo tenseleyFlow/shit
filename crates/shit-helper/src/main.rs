@@ -102,8 +102,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     install_signal_handlers(Arc::clone(&shutdown));
 
-    // S06.4 will fill in the handshake. For now, S06.3 wires the scaffold:
-    // connect to the daemon socket, log success, idle until shutdown.
     let conn = match ipc::connect(&cli.daemon_sock).await {
         Ok(c) => c,
         Err(e) => {
@@ -114,6 +112,29 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::info!(
         path = %cli.daemon_sock.display(),
         "connected to daemon ipc socket"
+    );
+
+    // Per-platform helper capabilities. Once S07/S08/S09 land, this
+    // reflects what the helper can actually do given current privileges.
+    let local_caps = current_capabilities();
+
+    let outcome = match handshake::perform_helper_side(
+        &conn,
+        cli.daemon_pid,
+        cli.daemon_uid,
+        local_caps,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(err = %e, "handshake failed; exiting");
+            return Err(anyhow::anyhow!("handshake failed: {e}"));
+        }
+    };
+    tracing::info!(
+        daemon_pid = outcome.daemon_pid,
+        daemon_uid = outcome.daemon_uid,
+        granted = ?outcome.granted,
+        "handshake complete"
     );
 
     // Sandbox entry — per-OS module decides what to do.
@@ -151,6 +172,20 @@ fn install_signal_handlers(shutdown: Arc<Notify>) {
             shutdown_int.notify_waiters();
         }
     });
+}
+
+/// Compute what the helper can advertise on this platform / privilege
+/// level. S07/S08/S09 expand this with real probes (CAP_SYS_ADMIN
+/// check, ES entitlement check, etc.). For S06 we surface a degraded
+/// set everywhere — `WatchTree` is always promised since it's the
+/// "set up a watcher on a process subtree" primitive that's
+/// best-effort even without privilege.
+fn current_capabilities() -> shit_proto::HelperCaps {
+    shit_proto::HelperCaps {
+        watch_tree: true,
+        auth_subscribe: false,
+        package_hook: false,
+    }
 }
 
 fn refuse_if_ld_preloaded() -> anyhow::Result<()> {

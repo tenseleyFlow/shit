@@ -68,6 +68,7 @@ impl Conn {
     }
 
     /// Send a `HelperRequest` (used by tests + the daemon-side stub).
+    #[allow(dead_code)]
     pub fn send_request(&self, msg: &HelperRequest) -> Result<(), ConnError> {
         let frame = encode_frame(msg)?;
         let mut sent = 0;
@@ -89,6 +90,7 @@ impl Conn {
     }
 
     /// Receive one `HelperResponse` frame.
+    #[allow(dead_code)]
     pub fn recv_response(&self) -> Result<HelperResponse, ConnError> {
         let buf = self.recv_frame()?;
         Ok(decode_frame(&buf)?)
@@ -133,18 +135,21 @@ impl Conn {
     /// Close the IPC half of the connection (write end). Useful when
     /// the helper is shutting down after sending its final
     /// `HelperResponse::ShutdownAck`.
+    #[allow(dead_code)]
     pub fn shutdown_write(&self) -> Result<(), ConnError> {
         shutdown(self.fd.as_raw_fd(), Shutdown::Write)?;
         Ok(())
     }
 
     /// Take ownership of the fd. Caller is then responsible for closing.
+    #[allow(dead_code)]
     pub fn into_fd(self) -> OwnedFd {
         self.fd
     }
 
     /// Wrap an existing fd. Used by tests and by the daemon side that
     /// already has an accepted SEQPACKET fd from `accept(2)`.
+    #[allow(dead_code)]
     pub fn from_fd(fd: OwnedFd) -> Self {
         Self { fd }
     }
@@ -174,6 +179,7 @@ pub async fn connect(path: &Path) -> Result<Conn, ConnError> {
 /// Helper for tests: create a connected SEQPACKET pair. Returns
 /// `(client, server)` fds wrapped as `Conn`. Useful for round-tripping
 /// without involving the filesystem.
+#[allow(dead_code)]
 pub fn socketpair() -> Result<(Conn, Conn), ConnError> {
     let (a, b) = nix::sys::socket::socketpair(
         AddressFamily::Unix,

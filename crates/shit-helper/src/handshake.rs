@@ -114,6 +114,7 @@ pub fn perform_helper_side(
 
 /// Drive the daemon side of the handshake. Used by tests and by
 /// `shitd::helper_link`. Sends Handshake then waits for HandshakeAck.
+#[allow(dead_code)]
 pub fn perform_daemon_side(
     conn: &Conn,
     capability_request: HelperCaps,
