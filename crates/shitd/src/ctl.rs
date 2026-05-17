@@ -39,7 +39,11 @@ use tokio::net::UnixStream;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-const CTL_BUF: usize = 4096;
+// S20 audit (F-NEW-1): aligned with the wire-side cap so tier-event
+// messages (NetEvent, ProcEvent, DbEvent) with raw state-dump bytes
+// — iptables-save output, /proc snapshots, SQL statement blobs —
+// can round-trip without being silently dropped at the encoder.
+const CTL_BUF: usize = shit_proto::MAX_FRAME_SIZE;
 
 /// Listen on `cfg.ctl_socket_path`, serving each connection on a task.
 /// `shutdown` is notified to ask the main runtime to exit; the listener
