@@ -1017,6 +1017,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "shit-capture",
  "shit-proto",
  "shit-shell",
  "tempfile",
@@ -1030,9 +1031,13 @@ dependencies = [
 name = "shit-capture"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "libc",
  "nix",
+ "shit-planner",
  "shit-proto",
+ "shit-store",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
