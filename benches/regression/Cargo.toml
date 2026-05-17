@@ -38,6 +38,10 @@ path = "src/bin/git_clone.rs"
 name = "baseline"
 path = "src/bin/baseline.rs"
 
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
