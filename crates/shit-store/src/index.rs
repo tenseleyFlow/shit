@@ -352,6 +352,72 @@ impl Index {
         Ok(removed > 0)
     }
 
+    /// S13.7: pin a command. Pinned commands are protected from GC.
+    /// Idempotent — re-pinning the same id updates `name`/`expires_logical`.
+    pub fn pin_command(
+        &self,
+        id: CommandId,
+        name: Option<&str>,
+        pinned_logical: u64,
+        expires_logical: Option<u64>,
+    ) -> Result<(), IndexError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO pins (session, seq, name, pinned_logical, expires_logical)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.session.as_bytes().as_slice(),
+                id.seq as i64,
+                name,
+                pinned_logical as i64,
+                expires_logical.map(|v| v as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// S13.7: list all pinned commands. Returns
+    /// `(session, seq, name, pinned_logical, expires_logical)`.
+    #[allow(clippy::type_complexity)]
+    pub fn list_pins(
+        &self,
+    ) -> Result<Vec<(Uuid, u64, Option<String>, u64, Option<u64>)>, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session, seq, name, pinned_logical, expires_logical
+             FROM pins ORDER BY pinned_logical DESC",
+        )?;
+        let rows: Vec<_> = stmt
+            .query_map([], |row| {
+                let session_bytes: Vec<u8> = row.get(0)?;
+                let seq: i64 = row.get(1)?;
+                let name: Option<String> = row.get(2)?;
+                let pinned: i64 = row.get(3)?;
+                let expires: Option<i64> = row.get(4)?;
+                let mut bytes = [0u8; 16];
+                if session_bytes.len() == 16 {
+                    bytes.copy_from_slice(&session_bytes);
+                }
+                Ok((
+                    Uuid::from_bytes(bytes),
+                    seq.max(0) as u64,
+                    name,
+                    pinned.max(0) as u64,
+                    expires.map(|v| v.max(0) as u64),
+                ))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    /// S13.7: total count of pins. Useful for status displays.
+    pub fn pin_count(&self) -> Result<u64, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM pins", [], |row| row.get(0))?;
+        Ok(n.max(0) as u64)
+    }
+
     /// Total disk size of all stored blobs (compressed). Convenience for
     /// `shit status` and GC accounting.
     pub fn total_blob_size(&self) -> Result<u64, IndexError> {

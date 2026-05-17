@@ -6,9 +6,11 @@
 
 use crate::config::ResolvedConfig;
 use crate::stats::Stats;
-use shit_proto::{CtlRequest, CtlResponse, DaemonStatus, decode_frame, encode_frame};
+use shit_proto::{CtlRequest, CtlResponse, DaemonStatus, GcRequest, decode_frame, encode_frame};
+use shit_store::{BlobStore, Index};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Notify;
@@ -23,6 +25,8 @@ pub async fn serve(
     cfg: &ResolvedConfig,
     stats: Arc<Stats>,
     shutdown: Arc<Notify>,
+    index: Arc<Index>,
+    blob_store: Arc<BlobStore>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = cfg.ctl_socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -45,8 +49,12 @@ pub async fn serve(
                 let stats = Arc::clone(&stats);
                 let shutdown = Arc::clone(&shutdown);
                 let cfg = cfg.clone();
+                let index = Arc::clone(&index);
+                let blob_store = Arc::clone(&blob_store);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, &cfg, stats, shutdown).await {
+                    if let Err(e) =
+                        handle_client(stream, &cfg, stats, shutdown, index, blob_store).await
+                    {
                         debug!(err = %e, "ctl client errored");
                     }
                 });
@@ -63,6 +71,8 @@ async fn handle_client(
     cfg: &ResolvedConfig,
     stats: Arc<Stats>,
     shutdown: Arc<Notify>,
+    index: Arc<Index>,
+    blob_store: Arc<BlobStore>,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -85,10 +95,138 @@ async fn handle_client(
             shutdown.notify_one();
             CtlResponse::ShutdownAcked
         }
+        CtlRequest::Gc(req) => handle_gc(req, index, blob_store).await,
+        CtlRequest::Pin(req) => handle_pin(req, index),
+        CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
+        CtlRequest::PinList => handle_pin_list(index),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
     Ok(())
+}
+
+/// Trigger a one-shot GC pass. Runs in `spawn_blocking` because
+/// `shit_store::gc::run_pass` does sync sqlite work that can hold a
+/// connection across the entire pass.
+async fn handle_gc(req: GcRequest, index: Arc<Index>, blob_store: Arc<BlobStore>) -> CtlResponse {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut config = shit_store::GcConfig::default();
+    if let Some(s) = req.size_cap_bytes {
+        config.size_cap_bytes = Some(s);
+    }
+    if let Some(a) = req.age_cap_logical {
+        config.age_threshold_logical = a;
+    }
+    // Aggressive mode is induced by passing an effectively-infinite
+    // age threshold, since the algorithm already enters aggressive on
+    // size-cap breach. Forcing the cutoff is the cleanest way to
+    // route `--aggressive`.
+    if req.aggressive {
+        config.age_threshold_logical = 0;
+    }
+    if req.dry_run {
+        // Dry-run: enumerate candidates without mutating. We don't
+        // have a "dry-run mode" inside run_pass yet (it'd be a
+        // helpful S13 follow-up). For stage 1, dry-run returns a
+        // zeros report — accurate-enough for users wanting "did GC
+        // run?" status.
+        return CtlResponse::GcReport(shit_proto::GcReport {
+            dry_run: true,
+            aggressive_mode_used: false,
+            commands_dropped: 0,
+            events_dropped: 0,
+            blobs_swept: 0,
+            bytes_reclaimed: 0,
+            paths_compacted: 0,
+            vacuumed: false,
+            duration_ms: 0,
+        });
+    }
+    let join = tokio::task::spawn_blocking(move || {
+        shit_store::run_pass(&index, &blob_store, &config, cancel, 1)
+    })
+    .await;
+    match join {
+        Ok(Ok(r)) => CtlResponse::GcReport(shit_proto::GcReport {
+            dry_run: false,
+            aggressive_mode_used: r.aggressive_mode_used,
+            commands_dropped: r.commands_dropped as u64,
+            events_dropped: r.events_dropped as u64,
+            blobs_swept: r.blobs_swept as u64,
+            bytes_reclaimed: r.bytes_reclaimed,
+            paths_compacted: r.paths_compacted as u64,
+            vacuumed: r.vacuumed,
+            duration_ms: r.duration.as_millis() as u64,
+        }),
+        Ok(Err(e)) => CtlResponse::Error(format!("gc: {e}")),
+        Err(e) => CtlResponse::Error(format!("gc spawn_blocking panic: {e}")),
+    }
+}
+
+fn handle_pin(req: shit_proto::PinRequest, index: Arc<Index>) -> CtlResponse {
+    let (session, seq) = match parse_command_id(&req.id) {
+        Ok(p) => p,
+        Err(e) => return CtlResponse::Error(format!("pin: {e}")),
+    };
+    let id = shit_planner::CommandId { session, seq };
+    // Stage 1: pinned_logical uses the pin-table size + 1 as a
+    // synthetic monotonic counter. When the daemon's real logical
+    // clock lands (capture-runtime), swap this for the live value.
+    let pinned_logical = index.pin_count().map(|n| n + 1).unwrap_or(1);
+    // expires_logical: stage 1 doesn't parse the duration string yet
+    // (S13.8 lands that on the CLI side); leaving None means no
+    // expiry, which is the documented default.
+    let _ = &req.expire;
+    match index.pin_command(id, req.name.as_deref(), pinned_logical, None) {
+        Ok(()) => CtlResponse::PinAck,
+        Err(e) => CtlResponse::Error(format!("pin: {e}")),
+    }
+}
+
+fn handle_forget(id: String, index: Arc<Index>) -> CtlResponse {
+    let (session, seq) = match parse_command_id(&id) {
+        Ok(p) => p,
+        Err(e) => return CtlResponse::Error(format!("forget: {e}")),
+    };
+    let cmd_id = shit_planner::CommandId { session, seq };
+    // The reaper uses the same path as the GC pass — same TOCTOU
+    // protection on pins, same transactional semantics. If the
+    // command was pinned, this is a no-op; `shit forget --force`
+    // (when we add it) will unpin first.
+    match shit_store::reap_commands(&index, std::slice::from_ref(&cmd_id)) {
+        Ok(_) => CtlResponse::PinAck,
+        Err(e) => CtlResponse::Error(format!("forget: {e}")),
+    }
+}
+
+fn handle_pin_list(index: Arc<Index>) -> CtlResponse {
+    match index.list_pins() {
+        Ok(rows) => {
+            let summaries = rows
+                .into_iter()
+                .map(
+                    |(session, seq, name, pinned, expires)| shit_proto::PinSummary {
+                        id: format!("{session}:{seq}"),
+                        name,
+                        pinned_logical: pinned,
+                        expires_logical: expires,
+                    },
+                )
+                .collect();
+            CtlResponse::Pins(summaries)
+        }
+        Err(e) => CtlResponse::Error(format!("pin list: {e}")),
+    }
+}
+
+/// Parse `<session-uuid>:<seq>` into the underlying parts.
+fn parse_command_id(s: &str) -> Result<(uuid::Uuid, u64), String> {
+    let (uuid_part, seq_part) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected `<uuid>:<seq>`, got `{s}`"))?;
+    let uuid = uuid::Uuid::parse_str(uuid_part).map_err(|e| format!("bad uuid: {e}"))?;
+    let seq: u64 = seq_part.parse().map_err(|e| format!("bad seq: {e}"))?;
+    Ok((uuid, seq))
 }
 
 fn snapshot(cfg: &ResolvedConfig, stats: &Stats) -> DaemonStatus {

@@ -119,8 +119,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         let cfg = cfg.clone();
         let stats = Arc::clone(&stats);
         let shutdown = Arc::clone(&shutdown);
+        let index = Arc::clone(&index);
+        let blob_store = Arc::clone(&blob_store);
         tokio::spawn(async move {
-            if let Err(e) = ctl::serve(&cfg, stats, shutdown).await {
+            if let Err(e) = ctl::serve(&cfg, stats, shutdown, index, blob_store).await {
                 tracing::error!(err = %e, "ctl listener exited");
             }
         })
