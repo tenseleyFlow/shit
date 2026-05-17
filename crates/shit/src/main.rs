@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use shit_proto::ShellKind;
 use std::path::PathBuf;
 
+mod doctor;
 mod hooks;
 mod paths;
 mod send;
@@ -64,6 +65,8 @@ enum Cmd {
         #[command(subcommand)]
         action: InternalCmd,
     },
+    /// Inspect filesystem support and capture-tier choices for your mounts.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -162,6 +165,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        Cmd::Doctor => doctor::run(),
     }
 }
 
