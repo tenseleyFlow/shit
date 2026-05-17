@@ -16,6 +16,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod event_loop;
 pub mod init;
 pub mod kernel_probe;
 pub mod mark;
