@@ -184,12 +184,25 @@ pub struct BpfLsmFeatures {
 }
 
 impl BpfLsmFeatures {
-    /// True iff every check passes — we can load BPF-LSM programs.
+    /// True when we have everything needed to load BPF-LSM programs.
+    ///
+    /// `bpf_in_active_lsm` is the **authoritative runtime signal**:
+    /// the kernel cannot list `bpf` in `/sys/kernel/security/lsm`
+    /// unless `CONFIG_BPF_LSM=y` AND the kernel was booted with
+    /// `lsm=...,bpf,...`. So when that's true, the config check is
+    /// redundant — we accept `config_bpf_lsm == None` as fine.
+    ///
+    /// `config_bpf_lsm == Some(false)` *does* override active-lsm, but
+    /// only because the kernel could in principle lie (it doesn't) or
+    /// we could be reading an old saved config (we could).
     pub fn fully_supported(&self) -> bool {
-        self.btf_available
-            && self.bpf_in_active_lsm
-            && self.kernel_recent_enough
-            && matches!(self.config_bpf_lsm, Some(true))
+        if !self.btf_available || !self.kernel_recent_enough {
+            return false;
+        }
+        if matches!(self.config_bpf_lsm, Some(false)) {
+            return false;
+        }
+        self.bpf_in_active_lsm
     }
 
     /// Short, doctor-friendly diagnostic. Names the specific check
@@ -205,9 +218,15 @@ impl BpfLsmFeatures {
         } else if !self.btf_available {
             "/sys/kernel/btf/vmlinux missing — distro doesn't ship BTF"
         } else if self.fully_supported() {
-            "BPF-LSM available"
+            // If we got here with config_bpf_lsm == None but everything
+            // else is good, the runtime signal is authoritative.
+            match self.config_bpf_lsm {
+                Some(true) => "BPF-LSM available",
+                None => "BPF-LSM available (config file not found; lsm= confirms it)",
+                Some(false) => unreachable!(),
+            }
         } else {
-            "BPF-LSM partial — see field details"
+            "BPF-LSM unsupported — see field details"
         }
     }
 
@@ -465,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn fully_supported_only_when_all_four_pass() {
+    fn fully_supported_treats_active_lsm_as_authoritative() {
         let mut f = BpfLsmFeatures {
             btf_available: true,
             bpf_in_active_lsm: true,
@@ -473,10 +492,28 @@ mod tests {
             kernel_recent_enough: true,
         };
         assert!(f.fully_supported());
+
+        // Missing BTF → no support regardless.
         f.btf_available = false;
         assert!(!f.fully_supported());
         f.btf_available = true;
+
+        // Unknown config but active-lsm includes bpf → supported.
+        // (NixOS hits this: /proc/config.gz exists but we can't inflate
+        // it without flate2, while /sys/kernel/security/lsm correctly
+        // lists "bpf".)
         f.config_bpf_lsm = None;
+        assert!(f.fully_supported());
+
+        // Config explicitly off → not supported, overrides active-lsm
+        // (defense against a kernel quirk we haven't seen).
+        f.config_bpf_lsm = Some(false);
+        assert!(!f.fully_supported());
+
+        // active-lsm doesn't include bpf → not supported even if every
+        // other check passes.
+        f.config_bpf_lsm = Some(true);
+        f.bpf_in_active_lsm = false;
         assert!(!f.fully_supported());
     }
 
