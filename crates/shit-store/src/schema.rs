@@ -14,9 +14,12 @@ pub enum SchemaError {
     AhheadOfBuild { disk: u32, build: u32 },
 }
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/0001-init.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/0001-init.sql")),
+    (2, include_str!("../migrations/0002-importance.sql")),
+];
 
-const TARGET_VERSION: u32 = 1;
+const TARGET_VERSION: u32 = 2;
 
 pub fn apply(conn: &Connection) -> Result<(), SchemaError> {
     // Pragmas first: durable but not paranoid.
@@ -95,6 +98,39 @@ mod tests {
                 .unwrap_or(false);
             assert!(exists, "table {table} missing after migrations");
         }
+    }
+
+    #[test]
+    fn migration_v2_adds_importance_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        // pragma_table_info returns one row per column; assert importance present.
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('commands')")
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "importance"),
+            "missing `importance` column: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn migration_v2_adds_age_importance_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_commands_age_importance'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(exists);
     }
 
     #[test]
