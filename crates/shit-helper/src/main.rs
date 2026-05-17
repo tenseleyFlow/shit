@@ -20,6 +20,8 @@ mod crash;
 mod fanotify;
 mod handshake;
 mod health;
+#[cfg(target_os = "linux")]
+mod inotify_supplement;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod priv_linux;
