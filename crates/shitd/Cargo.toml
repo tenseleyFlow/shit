@@ -11,6 +11,19 @@ authors.workspace = true
 name = "shitd"
 path = "src/main.rs"
 
+[features]
+# Opt-in OTLP export. Gated because the opentelemetry-otlp + tonic
+# transitive graph adds ~40 crates and noticeable cold-build time —
+# minimal builds (the default for distro packagers) shouldn't pay
+# for a perf-debugging-only feature.
+default = []
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [build-dependencies]
 vergen-gitcl = { workspace = true }
 
@@ -31,6 +44,10 @@ nix = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
