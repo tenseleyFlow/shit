@@ -46,6 +46,14 @@ __shit_pre() {
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # S15: opt-in env tracking. Off by default; SHIT_TRACK_ENV=1 enables.
+    if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
+        env -0 2>/dev/null | "$_SHIT_BIN" hook-send pre-exec-env \
+            --session "$_SHIT_SESSION" \
+            --seq "$_SHIT_SEQ" \
+            --sock "$_SHIT_SOCK" \
+            >/dev/null 2>&1 || true
+    fi
 }
 
 __shit_post() {
@@ -57,6 +65,13 @@ __shit_post() {
         --exit-code "$rc" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
+        env -0 2>/dev/null | "$_SHIT_BIN" hook-send post-exec-env \
+            --session "$_SHIT_SESSION" \
+            --seq "$_SHIT_SEQ" \
+            --sock "$_SHIT_SOCK" \
+            >/dev/null 2>&1 || true
+    fi
     return $rc
 }
 
