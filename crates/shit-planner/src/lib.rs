@@ -22,6 +22,7 @@ pub mod orchestrator;
 pub mod plan;
 pub mod probe;
 pub mod probe_live;
+pub mod services;
 pub mod store;
 pub mod time;
 
@@ -48,6 +49,10 @@ pub use metadata::{FileKind, FileMetadata};
 pub use orchestrator::Orchestrator;
 pub use probe::{ProbeStat, StateProbe};
 pub use probe_live::{LiveStateProbe, hash_file};
+pub use services::{
+    LAUNCHCTL_MUTATING_VERBS, SYSTEMCTL_MUTATING_VERBS, is_launchctl_mutating,
+    is_systemctl_mutating, parse_launchctl_print, parse_systemctl_show,
+};
 pub use store::PlannerStore;
 pub use time::{SeqRange, TimePoint, TimeRange};
 
