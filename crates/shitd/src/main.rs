@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+mod active_commands;
 mod ancestry;
 mod config;
 mod crash;
@@ -171,6 +172,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let net_stash = Arc::new(net_track::NetPreStash::new());
     let proc_stash = Arc::new(proc_track::ProcPreStash::new());
     let db_stash = Arc::new(db_track::DbPreStash::new());
+    // DR-25 prereq: the in-memory active-command map. Owns the
+    // shell_pid → (session, seq) lookup tier-event handlers use to
+    // attribute pkg/env/svc/net/proc/db events to a live command.
+    let active = Arc::new(active_commands::ActiveCommands::new());
     let pkg_janitor = {
         let pkg_stash = Arc::clone(&pkg_stash);
         let env_stash = Arc::clone(&env_stash);
@@ -241,6 +246,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             net_stash: Arc::clone(&net_stash),
             proc_stash: Arc::clone(&proc_stash),
             db_stash: Arc::clone(&db_stash),
+            active: Arc::clone(&active),
         };
         tokio::spawn(async move {
             if let Err(e) = ctl::serve(&cfg, ctl_state).await {
@@ -252,8 +258,9 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let stats_for_server = Arc::clone(&stats);
     let shutdown_for_server = Arc::clone(&shutdown);
     let env_stash_for_server = Arc::clone(&env_stash);
+    let active_for_server = Arc::clone(&active);
     let result = tokio::select! {
-        r = server::serve(cfg, stats_for_server, index, env_stash_for_server) => r,
+        r = server::serve(cfg, stats_for_server, index, env_stash_for_server, active_for_server) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
             Ok(())
