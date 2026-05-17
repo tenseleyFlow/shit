@@ -267,6 +267,84 @@ impl Index {
         update_path_history_with_conn(&conn, kind, ts)
     }
 
+    /// Drop a command (and its events) from the index. Decrements blob
+    /// refcounts for every FilePreImage event the command owned. The blob
+    /// files themselves are not deleted here — that's the GC sweep (S13);
+    /// this just makes the refcount drop to zero so a sweeper can find them.
+    /// Returns the number of events dropped.
+    pub fn drop_command(&self, id: CommandId) -> Result<usize, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        // First decrement refcounts for every blob this command referenced.
+        let blobs_dropped = {
+            let mut stmt = tx.prepare(
+                "SELECT blob_hash FROM events
+                 WHERE session = ?1 AND seq = ?2 AND blob_hash IS NOT NULL",
+            )?;
+            let hashes: Vec<Vec<u8>> = stmt
+                .query_map(
+                    params![id.session.as_bytes().as_slice(), id.seq as i64],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?
+                .filter_map(Result::ok)
+                .collect();
+            for h in &hashes {
+                tx.execute(
+                    "UPDATE blobs SET refcount = MAX(refcount - 1, 0) WHERE hash = ?1",
+                    params![h.as_slice()],
+                )?;
+            }
+            hashes.len()
+        };
+        let removed = tx.execute(
+            "DELETE FROM events WHERE session = ?1 AND seq = ?2",
+            params![id.session.as_bytes().as_slice(), id.seq as i64],
+        )? + tx.execute(
+            "DELETE FROM commands WHERE session = ?1 AND seq = ?2",
+            params![id.session.as_bytes().as_slice(), id.seq as i64],
+        )?;
+        let _ = blobs_dropped;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// List blob hashes whose refcount is zero. The GC sweeper (S13) uses
+    /// this to identify deletable blob files.
+    pub fn unreferenced_blobs(&self) -> Result<Vec<BlobHash>, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hash FROM blobs WHERE refcount = 0")?;
+        let rows = stmt.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            let mut h = [0u8; 32];
+            if bytes.len() != 32 {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "blob hash row has wrong length: {}",
+                        bytes.len()
+                    )),
+                ));
+            }
+            h.copy_from_slice(&bytes);
+            Ok(BlobHash::from_bytes(h))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Remove a blob's index row. Caller is responsible for having already
+    /// removed the on-disk file. Refuses to drop blobs with refcount > 0
+    /// (defense in depth — the sweeper should only target zero-refcount
+    /// rows).
+    pub fn drop_blob_record(&self, hash: BlobHash) -> Result<bool, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM blobs WHERE hash = ?1 AND refcount = 0",
+            params![hash.as_bytes().as_slice()],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Total disk size of all stored blobs (compressed). Convenience for
     /// `shit status` and GC accounting.
     pub fn total_blob_size(&self) -> Result<u64, IndexError> {
@@ -1009,6 +1087,114 @@ mod tests {
             pre_images, 2,
             "expected 2 pre-image events, got {pre_images}"
         );
+    }
+
+    #[test]
+    fn drop_command_decrements_refcount_and_removes_events() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        let blob = BlobHash::from_bytes([0x55; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        for i in 0..5 {
+            idx.put_event(&CaptureEvent {
+                id: EventId(0),
+                command: CommandId { session, seq: 1 },
+                ts: TimePoint::new(i + 1, 0),
+                partial: false,
+                kind: CaptureEventKind::FilePreImage {
+                    inode: InodeRef::new(1, i),
+                    path: PathBuf::from(format!("/p{i}")),
+                    blob,
+                    meta: meta(),
+                    post_content_hash: None,
+                },
+            })
+            .unwrap();
+        }
+        // Pre-drop: refcount 5, command exists.
+        assert_eq!(idx.blob_size_hint(blob), Some(1));
+        let dropped = idx.drop_command(CommandId { session, seq: 1 }).unwrap();
+        assert!(dropped >= 5, "expected >=5 rows dropped, got {dropped}");
+
+        // Post-drop: refcount should be 0, command + events gone.
+        let conn = idx.conn.lock().unwrap();
+        let rc: i64 = conn
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![blob.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rc, 0);
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn unreferenced_blobs_lists_zero_refcount() {
+        let (_dir, idx) = open_index();
+        let referenced = BlobHash::from_bytes([0xA1; 32]);
+        let orphan = BlobHash::from_bytes([0xA2; 32]);
+        idx.put_blob_record(referenced, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_blob_record(orphan, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        // Reference `referenced` via an event.
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/x"),
+                blob: referenced,
+                meta: meta(),
+                post_content_hash: None,
+            },
+        })
+        .unwrap();
+        let unref = idx.unreferenced_blobs().unwrap();
+        assert!(unref.contains(&orphan));
+        assert!(!unref.contains(&referenced));
+    }
+
+    #[test]
+    fn drop_blob_record_refuses_referenced() {
+        let (_dir, idx) = open_index();
+        let blob = BlobHash::from_bytes([0xBB; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/x"),
+                blob,
+                meta: meta(),
+                post_content_hash: None,
+            },
+        })
+        .unwrap();
+        let removed = idx.drop_blob_record(blob).unwrap();
+        assert!(!removed, "referenced blob must not be droppable");
     }
 
     #[test]
