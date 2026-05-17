@@ -7,5 +7,7 @@
 //! and S10 (BSD kqueue).
 
 pub mod cow;
+pub mod fs_matrix;
 
 pub use cow::{CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier};
+pub use fs_matrix::{FsKind, detect_fs, pick_tier, supported_tiers};
