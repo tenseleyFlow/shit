@@ -41,7 +41,7 @@ const LONG_VERSION: &str = concat!(
     // be rejected — those belong to `shit undo`. The `Option<Cmd>`
     // + no top-level args achieves that.
 )]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -79,6 +79,12 @@ enum Cmd {
     /// Run a command WITHOUT capture protection (bypass hard-fail).
     #[command(name = "no-protect")]
     NoProtect(cmd::no_protect::NoProtectArgs),
+    /// Emit a shell-completion script for the given shell.
+    Completions(cmd::completions::CompletionsArgs),
+    /// Write roff man pages for `shit` and each subcommand to a directory.
+    /// (Packaging helper; users should use `shit help` instead.)
+    #[command(hide = true)]
+    Manpages(cmd::manpages::ManpagesArgs),
     /// Manage shell hook integration.
     Hooks {
         #[command(subcommand)]
@@ -202,6 +208,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Disable(args) => cmd::disable::run(args).map_err(|e| e.into()),
         Cmd::Enable(args) => cmd::disable::enable(args).map_err(|e| e.into()),
         Cmd::NoProtect(args) => cmd::no_protect::run(args).map_err(|e| e.into()),
+        Cmd::Completions(args) => cmd::completions::run(args).map_err(|e| e.into()),
+        Cmd::Manpages(args) => cmd::manpages::run(args).map_err(|e| e.into()),
         Cmd::Hooks { action } => match action {
             HooksCmd::Install { shell } => hooks::install(shell.resolve()),
             HooksCmd::Uninstall { shell } => hooks::uninstall(shell.resolve()),
