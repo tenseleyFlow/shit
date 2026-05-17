@@ -111,6 +111,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         let blob_store = Arc::clone(&blob_store);
         let signal = Arc::clone(&gc_signal);
         let shutdown = Arc::clone(&shutdown);
+        let stats = Arc::clone(&stats);
         tokio::spawn(async move {
             // Stage-1 logical clock: a monotonic counter incrementing
             // once per pass. Replaced by the daemon's real logical
@@ -128,6 +129,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                 signal,
                 shutdown,
                 now_logical_fn,
+                stats,
             )
             .await;
         })

@@ -79,6 +79,10 @@ pub async fn serve(
             res = sock.recv_from(&mut buf) => {
                 match res {
                     Ok((n, _peer)) => {
+                        // S21.4 — record hook-handling latency so
+                        // `shit metrics` can surface p50/p99. The
+                        // timer brackets decode + handle.
+                        let started = std::time::Instant::now();
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
@@ -89,6 +93,7 @@ pub async fn serve(
                                 warn!(err = %e, len = n, "decode failed");
                             }
                         }
+                        stats.note_hook_latency_us(started.elapsed().as_micros() as u64);
                     }
                     Err(e) => warn!(err = %e, "recv_from failed"),
                 }

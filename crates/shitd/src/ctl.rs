@@ -128,6 +128,7 @@ async fn handle_client(
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash),
+        CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -274,6 +275,24 @@ fn snapshot(cfg: &ResolvedConfig, stats: &Stats) -> DaemonStatus {
             .hook_decode_errors
             .load(std::sync::atomic::Ordering::Relaxed),
     }
+}
+
+/// Build a [`MetricsSnapshot`] (S21.4) by combining the in-memory
+/// `Stats` with point-in-time store gauges. The store queries are
+/// cheap (sqlite count/sum) but we tolerate failure: a gauge that
+/// can't be read renders as 0 rather than failing the snapshot.
+fn metrics_snapshot(stats: &Stats, index: &Arc<Index>) -> shit_proto::MetricsSnapshot {
+    // SAFETY: getpid always succeeds.
+    let pid = unsafe { libc::getpid() } as u32;
+    let store_size_bytes = index.total_blob_size().unwrap_or(0);
+    let store_blob_count = index.blob_count().unwrap_or(0);
+    let store_command_count = index.command_count().unwrap_or(0);
+    stats.snapshot(
+        pid,
+        store_size_bytes,
+        store_blob_count,
+        store_command_count,
+    )
 }
 
 /// Handle one package-manager hook event (S14.9). Pre events are

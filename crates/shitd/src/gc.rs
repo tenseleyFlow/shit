@@ -115,6 +115,7 @@ pub async fn run_loop(
     signal: Arc<GcSignal>,
     shutdown: Arc<Notify>,
     now_logical_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    stats: Arc<crate::stats::Stats>,
 ) {
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -161,6 +162,8 @@ pub async fn run_loop(
                     vacuumed = r.vacuumed,
                     "gc pass complete"
                 );
+                // S21.4 — surface the summary via `shit metrics`.
+                stats.note_gc(r.duration.as_millis() as u64, r.bytes_reclaimed);
             }
             Ok(Err(GcError::Cancelled)) => {
                 tracing::info!("gc pass cancelled mid-pass (shutdown)");
