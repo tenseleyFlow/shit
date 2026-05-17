@@ -46,6 +46,13 @@ pub enum CtlRequest {
     /// the captured argv/cwd/env_summary snapshot for each target
     /// process; Post reports which targets survived vs. went away.
     ProcEvent(ProcEventReq),
+    /// Database CLI shim invocation (S19, stretch). Sent by
+    /// `shit-helper db-event` once per Pre and once per Post phase of
+    /// an opt-in `psql` / `mysql` / `sqlite3` invocation. Pre carries
+    /// the parsed connection target and the statements about to run;
+    /// Post carries the engine-specific commit/binlog/size delta so
+    /// the planner can render a transaction_state hint.
+    DbEvent(DbEventReq),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +335,92 @@ pub struct ProcEventReq {
     pub uid: u32,
 }
 
+/// Which DB CLI the wrapper is fronting (S19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DbEngineWire {
+    Postgres,
+    Mysql,
+    Sqlite3,
+}
+
+impl DbEngineWire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "psql",
+            Self::Mysql => "mysql",
+            Self::Sqlite3 => "sqlite3",
+        }
+    }
+}
+
+impl std::str::FromStr for DbEngineWire {
+    type Err = DbEngineParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "psql" | "postgres" | "postgresql" => Ok(Self::Postgres),
+            "mysql" | "mariadb" => Ok(Self::Mysql),
+            "sqlite3" | "sqlite" => Ok(Self::Sqlite3),
+            other => Err(DbEngineParseError(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown db engine: {0}")]
+pub struct DbEngineParseError(pub String);
+
+/// Transaction-state hint computed at Post time. Coarse on purpose:
+/// the planner uses it for UX ("this committed" / "this rolled back")
+/// rather than for behavioral branching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DbTxStateWire {
+    /// autocommit-on session; each statement is its own tx.
+    AutoCommit,
+    /// `BEGIN; ... COMMIT;` observed via engine probe.
+    Committed,
+    /// `BEGIN; ... ROLLBACK;` observed via engine probe.
+    RolledBack,
+    /// Tx opened but not closed by the captured invocation (psql `-c BEGIN`
+    /// without a matching `COMMIT`, or interactive session abandoned).
+    Unfinished,
+    /// Engine didn't tell us. The DB shim falls back to `Unknown` on
+    /// probe failure rather than guessing.
+    Unknown,
+}
+
+/// Connection-target hint, password ALREADY redacted at the helper.
+/// `target` is the human-friendly identifier (db name for psql/mysql;
+/// filename for sqlite3). `host` is empty for sqlite3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbConnInfo {
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: String,
+    pub target: String,
+}
+
+/// One DB CLI shim invocation as it crosses the wire.
+///
+/// `statements` is the post-filtering list — read-only statements
+/// (SELECT/SHOW/EXPLAIN-without-INTO) are dropped at the helper.
+/// `transaction_state` is `Unknown` on the Pre side; on Post the
+/// helper fills it in from the engine's own observability (binlog
+/// position delta, `xact_commit` delta, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbEventReq {
+    pub engine: DbEngineWire,
+    pub phase: PkgPhase,
+    pub conn: DbConnInfo,
+    pub statements: Vec<String>,
+    pub transaction_state: DbTxStateWire,
+    pub pid: u32,
+    pub uid: u32,
+    /// Engine-specific extras: psql `xact_commit_delta`, mysql
+    /// `binlog_position`, sqlite3 `file_path`. Free-form so the
+    /// planner can grow new keys without bumping the wire.
+    pub extras: BTreeMap<String, String>,
+}
+
 /// One network-tool wrapper invocation as it crosses the wire.
 ///
 /// `scope_hint` carries tool-specific context the daemon uses to
@@ -418,6 +511,8 @@ pub enum CtlResponse {
     NetEventAck,
     /// Reply to `ProcEvent` — same shape.
     ProcEventAck,
+    /// Reply to `DbEvent` — same shape.
+    DbEventAck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
