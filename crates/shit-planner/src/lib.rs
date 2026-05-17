@@ -11,6 +11,7 @@
 //! `.docs/audits/planner-spec.md` for the longer rationale.
 
 pub mod events;
+pub mod executor;
 pub mod inode;
 pub mod inverse;
 pub mod metadata;
@@ -24,6 +25,10 @@ pub use plan::plan;
 pub use events::{
     CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, NetworkTool, PackageManager,
     PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
+};
+pub use executor::{
+    BlobReadError, BlobReader, ConflictPolicy, ExecutionOutcome, ExecutionRecord, ExecutionReport,
+    InMemoryBlobReader, InverseOpExecutor, OutcomeKind, PlanSummary,
 };
 pub use inode::{BlobHash, InodeRef};
 pub use inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
