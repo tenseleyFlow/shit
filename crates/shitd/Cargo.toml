@@ -18,6 +18,7 @@ vergen-gitcl = { workspace = true }
 shit-proto = { workspace = true }
 shit-store = { workspace = true }
 shit-planner = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

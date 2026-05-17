@@ -1119,6 +1119,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vergen-gitcl",
 ]
 
