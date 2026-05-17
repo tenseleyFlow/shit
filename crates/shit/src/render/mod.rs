@@ -21,6 +21,7 @@ pub mod env_diff;
 pub mod git;
 pub mod json;
 pub mod pager;
+pub mod process;
 
 #[allow(unused_imports)]
 pub use color::{ColorPref, resolve_color};
@@ -32,3 +33,5 @@ pub use git::{GitRestoreGroup, detect_git_restores};
 pub use json::{JsonError, write_json};
 #[allow(unused_imports)]
 pub use pager::page_if_tty;
+#[allow(unused_imports)]
+pub use process::render as render_process;
