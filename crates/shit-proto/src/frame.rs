@@ -5,10 +5,25 @@ use serde::de::DeserializeOwned;
 
 pub const WIRE_VERSION: u8 = 1;
 
-/// Maximum frame size (including length prefix). Frames over this are rejected
-/// on the decode side and never produced on the encode side. Chosen to fit
-/// comfortably inside the default Linux/macOS UDS datagram size.
-pub const MAX_FRAME_SIZE: usize = 4096;
+/// Maximum frame size (including length prefix). Frames over this are
+/// rejected on the decode side and never produced on the encode side.
+///
+/// **S20 audit (F-NEW-1):** the original 4 KiB cap was sized for the
+/// shell-hook UDS datagram surface (small `HookMessage` payloads).
+/// Tier-event messages added in S14–S19 (`CtlRequest::PkgEvent`,
+/// `SvcEvent`, `NetEvent`, `ProcEvent`, `DbEvent`) carry raw
+/// state-dump bytes — `iptables-save -c` output, `/proc` snapshots,
+/// SQL statement blobs — that routinely exceed 4 KiB. The helper's
+/// own read buffers are 256 KiB; the encode-side cap was the choke
+/// point. Raising it to match keeps both sides honest.
+///
+/// The `HookMessage` (shell-hook) payload remains small by design;
+/// the daemon's `server::serve` validates its own bounds against
+/// the same constant. A malicious same-UID attacker can now send up
+/// to 256 KiB per request — that's bounded, and the per-connection
+/// reader is one-shot (no streaming), so total memory cost is one
+/// buffer per concurrent connection.
+pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
