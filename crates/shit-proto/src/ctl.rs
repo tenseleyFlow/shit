@@ -53,6 +53,8 @@ pub enum CtlRequest {
     /// Post carries the engine-specific commit/binlog/size delta so
     /// the planner can render a transaction_state hint.
     DbEvent(DbEventReq),
+    /// One-shot perf-counter snapshot for `shit metrics` (S21.4).
+    Metrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +515,8 @@ pub enum CtlResponse {
     ProcEventAck,
     /// Reply to `DbEvent` — same shape.
     DbEventAck,
+    /// Reply to `Metrics` (S21.4).
+    Metrics(MetricsSnapshot),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,4 +531,39 @@ pub struct DaemonStatus {
     pub ctl_socket_path: String,
     pub hook_messages_received: u64,
     pub hook_decode_errors: u64,
+}
+
+/// One-shot perf-counter snapshot for `shit metrics` (S21.4).
+///
+/// All values are point-in-time. The daemon recomputes on every
+/// request rather than streaming continuously — the CLI is the
+/// pacer (`--watch 1s` polls; `--format prometheus` is one-shot).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    /// Daemon liveness counters.
+    pub uptime_secs: u64,
+    pub pid: u32,
+    /// Hook-frame counters.
+    pub hook_messages_received: u64,
+    pub hook_decode_errors: u64,
+    /// Hook-handling latency percentiles in microseconds.
+    /// Recorded per [`crate::ctl::CtlRequest::HookFrame`] handling
+    /// (S21.4 instruments `shitd::server::handle`). Empty when no
+    /// samples have arrived yet.
+    pub hook_latency_us_p50: u64,
+    pub hook_latency_us_p99: u64,
+    pub hook_latency_samples: u64,
+    /// Store-side gauges, queried at snapshot time from sqlite.
+    pub store_size_bytes: u64,
+    pub store_blob_count: u64,
+    pub store_command_count: u64,
+    /// GC summary from the last completed pass; zeroed before the
+    /// first pass.
+    pub last_gc_duration_ms: u64,
+    pub last_gc_bytes_reclaimed: u64,
+    pub last_gc_at_unix_secs: u64,
+    /// Kernel-tier classifier (Linux: "fanotify"/"bpf-lsm"; macOS:
+    /// "endpoint-security"; FreeBSD: "kqueue"). Empty when capture
+    /// tier not yet initialized.
+    pub kernel_tier: String,
 }
