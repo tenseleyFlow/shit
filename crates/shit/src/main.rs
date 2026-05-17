@@ -183,7 +183,7 @@ fn detect_shell() -> Option<ShellKind> {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -196,41 +196,75 @@ fn main() -> anyhow::Result<()> {
     // Do NOT parse further argv tokens here — see the doc-comment on
     // the `Cli` struct for why.
     let cmd = cli.cmd.unwrap_or(Cmd::Undo(cmd::undo::UndoArgs::default()));
+    let result = run_cmd(cmd);
+    match result {
+        Ok(()) => exitcode::exit(exitcode::SUCCESS),
+        Err(CliMainErr::Cli(e)) => {
+            eprintln!("shit: {e}");
+            exitcode::exit(e.code())
+        }
+        Err(CliMainErr::Anyhow(e)) => {
+            eprintln!("shit: {e}");
+            exitcode::exit(exitcode::GENERIC_FAILURE)
+        }
+    }
+}
+
+/// Marshals the two possible error types subcommands return into
+/// something `main` can pattern-match. New subcommands should return
+/// `CliError` directly — `anyhow::Result` is the legacy shape.
+enum CliMainErr {
+    Cli(exitcode::CliError),
+    Anyhow(anyhow::Error),
+}
+
+impl From<exitcode::CliError> for CliMainErr {
+    fn from(e: exitcode::CliError) -> Self {
+        Self::Cli(e)
+    }
+}
+impl From<anyhow::Error> for CliMainErr {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Anyhow(e)
+    }
+}
+
+fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
     match cmd {
-        Cmd::Undo(args) | Cmd::Fuck(args) => cmd::undo::run(args),
-        Cmd::Redo(args) => cmd::redo::run(args).map_err(|e| e.into()),
-        Cmd::List(args) => cmd::list::run(args).map_err(|e| e.into()),
-        Cmd::Show(args) => cmd::show::run(args).map_err(|e| e.into()),
-        Cmd::Pin(args) => cmd::pin::run(args).map_err(|e| e.into()),
-        Cmd::Forget(args) => cmd::forget::run(args).map_err(|e| e.into()),
-        Cmd::Gc(args) => cmd::gc::run(args).map_err(|e| e.into()),
-        Cmd::Config(args) => cmd::config::run(args).map_err(|e| e.into()),
-        Cmd::Disable(args) => cmd::disable::run(args).map_err(|e| e.into()),
-        Cmd::Enable(args) => cmd::disable::enable(args).map_err(|e| e.into()),
-        Cmd::NoProtect(args) => cmd::no_protect::run(args).map_err(|e| e.into()),
-        Cmd::Completions(args) => cmd::completions::run(args).map_err(|e| e.into()),
-        Cmd::Manpages(args) => cmd::manpages::run(args).map_err(|e| e.into()),
+        Cmd::Undo(args) | Cmd::Fuck(args) => Ok(cmd::undo::run(args)?),
+        Cmd::Redo(args) => Ok(cmd::redo::run(args)?),
+        Cmd::List(args) => Ok(cmd::list::run(args)?),
+        Cmd::Show(args) => Ok(cmd::show::run(args)?),
+        Cmd::Pin(args) => Ok(cmd::pin::run(args)?),
+        Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
+        Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
+        Cmd::Config(args) => Ok(cmd::config::run(args)?),
+        Cmd::Disable(args) => Ok(cmd::disable::run(args)?),
+        Cmd::Enable(args) => Ok(cmd::disable::enable(args)?),
+        Cmd::NoProtect(args) => Ok(cmd::no_protect::run(args)?),
+        Cmd::Completions(args) => Ok(cmd::completions::run(args)?),
+        Cmd::Manpages(args) => Ok(cmd::manpages::run(args)?),
         Cmd::Hooks { action } => match action {
-            HooksCmd::Install { shell } => hooks::install(shell.resolve()),
-            HooksCmd::Uninstall { shell } => hooks::uninstall(shell.resolve()),
-            HooksCmd::Status => hooks::status(),
+            HooksCmd::Install { shell } => Ok(hooks::install(shell.resolve())?),
+            HooksCmd::Uninstall { shell } => Ok(hooks::uninstall(shell.resolve())?),
+            HooksCmd::Status => Ok(hooks::status()?),
         },
-        Cmd::Status { ctl_sock } => status::run(ctl_sock),
+        Cmd::Status { ctl_sock } => Ok(status::run(ctl_sock)?),
         Cmd::Service { action } => match action {
-            ServiceCmd::Install => service::install(),
-            ServiceCmd::Uninstall => service::uninstall(),
-            ServiceCmd::Start => service::start(),
-            ServiceCmd::Stop => service::stop(),
-            ServiceCmd::Status => service::status(),
+            ServiceCmd::Install => Ok(service::install()?),
+            ServiceCmd::Uninstall => Ok(service::uninstall()?),
+            ServiceCmd::Start => Ok(service::start()?),
+            ServiceCmd::Stop => Ok(service::stop()?),
+            ServiceCmd::Status => Ok(service::status()?),
         },
-        Cmd::HookSend { kind } => send::run(kind),
+        Cmd::HookSend { kind } => Ok(send::run(kind)?),
         Cmd::Internal { action } => match action {
             InternalCmd::NewUuid => {
                 println!("{}", uuid::Uuid::now_v7());
                 Ok(())
             }
         },
-        Cmd::Doctor => doctor::run(),
+        Cmd::Doctor => Ok(doctor::run()?),
     }
 }
 

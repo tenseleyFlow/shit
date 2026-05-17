@@ -5,6 +5,7 @@
 
 pub mod completions;
 pub mod config;
+pub mod ctl_client;
 pub mod disable;
 pub mod forget;
 pub mod gc;
