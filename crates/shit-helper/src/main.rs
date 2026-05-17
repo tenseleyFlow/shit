@@ -153,7 +153,7 @@ async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
     install_signal_handlers(Arc::clone(&shutdown));
 
     let conn = match ipc::connect(&cli.daemon_sock).await {
-        Ok(c) => c,
+        Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(err = %e, "failed to connect to daemon socket; exiting");
             return Err(e.into());
@@ -199,12 +199,28 @@ async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
+    let request_conn = Arc::clone(&conn);
+    #[cfg(target_os = "linux")]
+    let request_state = fanotify_state.clone();
+    let request_handle = tokio::task::spawn_blocking(move || {
+        request_loop(
+            request_conn,
+            #[cfg(target_os = "linux")]
+            request_state,
+        )
+    });
+
     tokio::select! {
         _ = shutdown.notified() => {
             tracing::info!("shutdown signal received; exiting");
         }
-        // Placeholder: real daemon-request loop arrives in S08.14.
-        _ = idle(&conn) => {}
+        res = request_handle => {
+            match res {
+                Ok(Ok(())) => tracing::info!("request loop exited cleanly"),
+                Ok(Err(e)) => tracing::warn!(err = %e, "request loop returned error"),
+                Err(e) => tracing::warn!(err = %e, "request loop join failed"),
+            }
+        }
     }
 
     // Signal the reader thread (if any) to wind down before we drop
@@ -219,9 +235,98 @@ async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn idle(_conn: &ipc::Conn) {
-    // S06.4 swaps this out for the real receive loop.
-    std::future::pending::<()>().await
+/// Synchronous daemon-request loop. Lives in `spawn_blocking` so it
+/// can use the blocking `Conn::recv_request`. Exits when the daemon
+/// disconnects or sends `Shutdown`.
+fn request_loop(
+    conn: Arc<ipc::Conn>,
+    #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
+) -> anyhow::Result<()> {
+    use shit_proto::{HelperRequest, HelperResponse};
+
+    loop {
+        let req = match conn.recv_request() {
+            Ok(r) => r,
+            Err(ipc::ConnError::PeerClosed) => {
+                tracing::info!("daemon disconnected; request loop exiting");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "recv_request failed; request loop exiting");
+                return Err(anyhow::anyhow!("recv_request: {e}"));
+            }
+        };
+
+        match req {
+            HelperRequest::Ping { nonce } => {
+                let _ = conn.send_response(&HelperResponse::Pong { nonce });
+            }
+            HelperRequest::Shutdown { reason } => {
+                tracing::info!(reason, "daemon requested shutdown");
+                let _ = conn.send_response(&HelperResponse::ShutdownAck { reason });
+                return Ok(());
+            }
+            HelperRequest::WatchTree {
+                root_pid,
+                descendants_too: _,
+                session,
+                command_seq,
+                shell_kind: _,
+            } => {
+                #[cfg(target_os = "linux")]
+                if let Some(state) = &fanotify_state {
+                    state.tree.lock().unwrap().watch(session, command_seq, root_pid as i32);
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        "watch_tree registered"
+                    );
+                } else {
+                    tracing::debug!(
+                        %session,
+                        command_seq,
+                        "watch_tree ignored — no fanotify (degraded)"
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (root_pid, session, command_seq);
+                }
+            }
+            HelperRequest::UnwatchTree {
+                session,
+                command_seq,
+            } => {
+                #[cfg(target_os = "linux")]
+                if let Some(state) = &fanotify_state {
+                    state
+                        .tree
+                        .lock()
+                        .unwrap()
+                        .unwatch(session, command_seq);
+                    tracing::info!(%session, command_seq, "unwatch_tree");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (session, command_seq);
+                }
+            }
+            HelperRequest::AuthDecision { session, seq, .. } => {
+                // S08 helper doesn't yet emit AuthEvents that need a
+                // decision (always ALLOWs at the kernel boundary), so
+                // an incoming AuthDecision is a protocol violation.
+                tracing::warn!(
+                    %session,
+                    seq,
+                    "unexpected AuthDecision in S08 mode; ignoring"
+                );
+            }
+            HelperRequest::Handshake { .. } => {
+                tracing::warn!("unexpected duplicate Handshake; ignoring");
+            }
+        }
+    }
 }
 
 fn install_signal_handlers(shutdown: Arc<Notify>) {

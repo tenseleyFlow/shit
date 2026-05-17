@@ -30,8 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::event_loop::{
-    Decision, LoopError, RESPONSE_BATCH_MAX, READ_BUF_BYTES, process_batch, read_step,
-    wait_readable, write_responses,
+    Decision, LoopError, READ_BUF_BYTES, process_batch, read_step, wait_readable, write_responses,
 };
 use super::init::FanotifyFd;
 use super::tree::TreeMap;
@@ -164,11 +163,6 @@ pub fn reader_thread(state: FanotifyState) {
         "fanotify reader thread exiting"
     );
 }
-
-// Re-export so callers don't have to reach into event_loop::.
-pub use super::event_loop::READ_BUF_BYTES as BUFFER_BYTES;
-#[allow(dead_code)]
-pub use super::event_loop::RESPONSE_BATCH_MAX as RESPONSE_BATCH;
 
 #[cfg(test)]
 mod tests {
