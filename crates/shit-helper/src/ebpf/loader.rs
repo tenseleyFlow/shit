@@ -130,7 +130,11 @@ impl EbpfLoader {
             return Ok(());
         }
 
-        let mut bpf = aya::Ebpf::load(NOOP_TRACEPOINT_OBJ)
+        // `include_bytes!` returns a `[u8; N]` with alignment 1; the
+        // `object` crate's ELF header cast requires 8-byte alignment.
+        // Copy through a `Vec` (heap-aligned) before handing to aya.
+        let aligned: Vec<u8> = NOOP_TRACEPOINT_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
             .map_err(|e| EbpfError::Aya(format!("load: {e}")))?;
 
         let prog: &mut aya::programs::TracePoint = bpf
