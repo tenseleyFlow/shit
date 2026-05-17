@@ -204,10 +204,8 @@ impl CacheMap {
 
 #[cfg(target_os = "linux")]
 fn detect_fs_uncached(path: &Path) -> io::Result<FsKind> {
-    use nix::sys::statfs::{self, FsType};
-    let s = statfs::statfs(path).map_err(io::Error::from)?;
-    let t = s.filesystem_type();
-    Ok(map_linux_fs_type(t))
+    let s = nix::sys::statfs::statfs(path).map_err(io::Error::from)?;
+    Ok(map_linux_fs_type(s.filesystem_type()))
 }
 
 #[cfg(target_os = "linux")]
