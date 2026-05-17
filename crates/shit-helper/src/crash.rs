@@ -61,7 +61,13 @@ fn format_record(info: &std::panic::PanicHookInfo<'_>) -> String {
     let _ = writeln!(buf, "commit:  {}", env!("VERGEN_GIT_SHA"));
     let _ = writeln!(buf, "pid:     {}", std::process::id());
     if let Some(loc) = info.location() {
-        let _ = writeln!(buf, "at:      {}:{}:{}", loc.file(), loc.line(), loc.column());
+        let _ = writeln!(
+            buf,
+            "at:      {}:{}:{}",
+            loc.file(),
+            loc.line(),
+            loc.column()
+        );
     }
     let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
         (*s).to_string()
@@ -86,22 +92,20 @@ mod tests {
     }
 
     #[test]
-    fn format_record_includes_pid_and_version() {
-        // We can't directly construct a PanicHookInfo, so just exercise
-        // the version-line builder path via the public install + a
-        // controlled panic. Use catch_unwind so the test process
-        // survives.
+    fn install_panic_hook_is_idempotent() {
+        // OnceLock guards the hook install — repeated calls update the
+        // crash-dir target but don't double-register. Calling twice
+        // must not panic.
         let tmp = tempfile::tempdir().unwrap();
         install_panic_hook(tmp.path());
-        let result = std::panic::catch_unwind(|| panic!("test panic for crash log"));
-        assert!(result.is_err());
-        let entries: Vec<_> = std::fs::read_dir(tmp.path().join("crashes"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(!entries.is_empty(), "crash log should have been written");
-        let body = std::fs::read_to_string(entries[0].path()).unwrap();
-        assert!(body.contains("shit-helper crash"));
-        assert!(body.contains("test panic for crash log"));
+        install_panic_hook(tmp.path());
     }
+
+    // Note: we deliberately don't exercise the panic-hook path inside
+    // unit tests. The hook is a process-global resource (`OnceLock`),
+    // so the *first* test to install it wins, and any later test
+    // expecting its own crash dir to receive the record will flake
+    // under parallel execution. The hook is exercised end-to-end by
+    // the integration tests in `tests/helper_handshake.rs` which
+    // spawn fresh helper processes.
 }
