@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 mod crash;
+mod handshake;
 mod health;
 mod ipc;
 mod sandbox;
