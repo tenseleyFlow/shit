@@ -194,6 +194,49 @@ fn size_threshold_breached(size_now: u64, cap: Option<u64>) -> bool {
     cap.is_some_and(|c| size_now > c)
 }
 
+/// Capture-path status check. The daemon calls this before accepting
+/// a new capture event so we can refuse-closed when the store is
+/// full and even aggressive GC can't reclaim more space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeCapStatus {
+    /// Under cap (or no cap configured). Accept captures normally.
+    Ok,
+    /// Above the 90% pre-emptive trigger but below the hard wall.
+    /// Capture accepted; GC should run aggressively soon. The daemon
+    /// surfaces this in `shit status`.
+    Approaching,
+    /// At or above the cap, and aggressive GC most recently ran
+    /// without freeing enough. The capture path must hard-fail this
+    /// command (exit code 5, `CAPTURE_DENIED`).
+    HardFail,
+}
+
+/// Check the current store size against the configured cap. Pass
+/// `last_aggressive_freed_to` as the size value observed right after
+/// the most recent aggressive pass; if we're back above cap, that's
+/// the trigger for `HardFail`.
+pub fn check_size_cap(
+    current_size: u64,
+    cap_bytes: Option<u64>,
+    last_aggressive_freed_to: Option<u64>,
+) -> SizeCapStatus {
+    let Some(cap) = cap_bytes else {
+        return SizeCapStatus::Ok;
+    };
+    if current_size <= cap * 9 / 10 {
+        return SizeCapStatus::Ok;
+    }
+    if current_size > cap {
+        // If aggressive GC ran recently and couldn't bring us below
+        // cap, hard-fail. Otherwise just signal "approaching" and let
+        // the next scheduled aggressive pass try.
+        if matches!(last_aggressive_freed_to, Some(after) if after > cap) {
+            return SizeCapStatus::HardFail;
+        }
+    }
+    SizeCapStatus::Approaching
+}
+
 /// Query the next batch of expired commands. Pinned commands are
 /// filtered out at the SQL level (LEFT JOIN pins ... IS NULL).
 /// Ordering: `(importance ASC, started_logical ASC)` so low-importance
@@ -403,6 +446,43 @@ mod tests {
             Err(GcError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_size_cap_ok_below_threshold() {
+        assert_eq!(check_size_cap(50, Some(100), None), SizeCapStatus::Ok);
+    }
+
+    #[test]
+    fn check_size_cap_approaching_at_90pct() {
+        assert_eq!(
+            check_size_cap(91, Some(100), None),
+            SizeCapStatus::Approaching
+        );
+        assert_eq!(
+            check_size_cap(101, Some(100), None),
+            SizeCapStatus::Approaching
+        );
+    }
+
+    #[test]
+    fn check_size_cap_hard_fail_only_after_aggressive_couldnt_help() {
+        // We're over cap AND aggressive ran and ended up still over cap.
+        assert_eq!(
+            check_size_cap(150, Some(100), Some(120)),
+            SizeCapStatus::HardFail
+        );
+        // Over cap but aggressive freed below cap (so we accept; the
+        // current overage is from new captures we want to keep).
+        assert_eq!(
+            check_size_cap(150, Some(100), Some(80)),
+            SizeCapStatus::Approaching
+        );
+    }
+
+    #[test]
+    fn check_size_cap_no_cap_always_ok() {
+        assert_eq!(check_size_cap(u64::MAX, None, None), SizeCapStatus::Ok);
     }
 
     #[test]
