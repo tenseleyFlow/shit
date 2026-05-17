@@ -11,5 +11,7 @@
 //! - S18 — process tier (note-only)
 
 pub mod file;
+pub mod package;
 
 pub use file::FileExecutor;
+pub use package::{PackageExecutor, PkgRunner, SystemPkgRunner};
