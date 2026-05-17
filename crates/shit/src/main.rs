@@ -78,6 +78,10 @@ enum Cmd {
     /// nft, ufw, pfctl, ip). See `shit net-hooks --help`.
     #[command(name = "net-hooks")]
     NetHooks(cmd::net_hooks::NetHooksArgs),
+    /// Install/remove/status the process-tool wrappers (kill, pkill,
+    /// killall). See `shit proc-hooks --help`.
+    #[command(name = "proc-hooks")]
+    ProcHooks(cmd::proc_hooks::ProcHooksArgs),
     /// Drop a captured command's savepoint.
     Forget(cmd::forget::ForgetArgs),
     /// Manual blob-store garbage collection.
@@ -251,6 +255,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::PkgHooks(args) => Ok(cmd::pkg_hooks::run(args)?),
         Cmd::SvcHooks(args) => Ok(cmd::svc_hooks::run(args)?),
         Cmd::NetHooks(args) => Ok(cmd::net_hooks::run(args)?),
+        Cmd::ProcHooks(args) => Ok(cmd::proc_hooks::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
         Cmd::Config(args) => Ok(cmd::config::run(args)?),

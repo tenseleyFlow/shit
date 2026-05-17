@@ -15,6 +15,7 @@ pub mod net_hooks;
 pub mod no_protect;
 pub mod pin;
 pub mod pkg_hooks;
+pub mod proc_hooks;
 pub mod redo;
 pub mod show;
 pub mod svc_hooks;
