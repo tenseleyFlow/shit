@@ -182,10 +182,11 @@ impl PlanSummary {
 }
 
 /// How the orchestrator handles a per-op conflict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConflictPolicy {
     /// Stop at the first hard conflict; report what was applied + what
     /// remains. **Default.** Safest.
+    #[default]
     Abort,
     /// Skip conflicting ops (record as `Skipped`), continue with the rest.
     /// Use when you want maximum partial-undo coverage.
@@ -193,12 +194,6 @@ pub enum ConflictPolicy {
     /// Apply over conflicts. The CLI requires `--yes` for this; the
     /// orchestrator itself trusts the caller.
     Force,
-}
-
-impl Default for ConflictPolicy {
-    fn default() -> Self {
-        Self::Abort
-    }
 }
 
 /// Abstract content-by-hash reader. The CLI/daemon wires this up against
