@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# shit systemctl wrapper — installed as $XDG_CONFIG_HOME/shit/bin/systemctl
+# and PATH-prepended by the shell hook.
+#
+# For mutating verbs (start/stop/enable/disable/etc.), this wrapper:
+#   1. Bracket-fires `shit-helper svc-event systemctl pre` with the
+#      parsed unit/verb/scope so the daemon snapshots state.
+#   2. Calls through to the real systemctl.
+#   3. Bracket-fires `shit-helper svc-event systemctl post`.
+#
+# For read-only verbs (status/show/cat/list-*) we pass through with
+# no capture overhead.
+#
+# Loop guard: SHIT_WRAPPER_DEPTH increments on every nested call. We
+# bail out at depth ≥ 2.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+
+# Loop guard.
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then
+    echo "shit-systemctl-wrapper: loop detected (depth=$depth); refusing" >&2
+    exit 127
+fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+# Find the real systemctl, skipping ourselves.
+real_systemctl=""
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+for cand in /usr/bin/systemctl /bin/systemctl /run/current-system/sw/bin/systemctl; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real_systemctl="$cand"
+            break
+        fi
+    fi
+done
+
+if [[ -z "$real_systemctl" ]]; then
+    echo "shit-systemctl-wrapper: real systemctl not found" >&2
+    exit 127
+fi
+
+# Inside `shit undo`, the planner sets SHIT_DURING_UNDO=1 so we
+# short-circuit (no double-capture). The helper itself also
+# respects this; the wrapper-level check saves the helper round-trip.
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then
+    exec "$real_systemctl" "$@"
+fi
+
+# Parse argv: skip flags, find the verb + unit. systemctl's CLI is
+#   systemctl [OPTIONS] VERB [UNIT...]
+# Common option flags carry no values; --user is the one that affects
+# scope. The rest we don't need to interpret.
+scope="system"
+verb=""
+unit=""
+declare -a passthrough
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user)
+            scope="user"
+            passthrough+=("$1")
+            shift
+            ;;
+        --system)
+            scope="system"
+            passthrough+=("$1")
+            shift
+            ;;
+        --) shift; while [[ $# -gt 0 ]]; do passthrough+=("$1"); shift; done; break ;;
+        -*) passthrough+=("$1"); shift ;;
+        *)
+            if [[ -z "$verb" ]]; then
+                verb="$1"
+            elif [[ -z "$unit" ]]; then
+                unit="$1"
+            fi
+            passthrough+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Verb classifier: list mirrors crates/shit-planner/src/services.rs
+# SYSTEMCTL_MUTATING_VERBS. If new mutating verbs land in the
+# planner, sync them here. Read-only verbs pass through unchanged.
+mutating=0
+case "$verb" in
+    start|stop|restart|reload|try-restart|reload-or-restart|enable|disable|mask|unmask|kill|preset|set-property|edit|link|revert|isolate|daemon-reload)
+        mutating=1
+        ;;
+esac
+
+if [[ "$mutating" -eq 1 && -n "$unit" ]]; then
+    "$HELPER" svc-event systemctl pre --scope "$scope" --unit "$unit" --verb "$verb" 2>/dev/null || true
+    "$real_systemctl" "${passthrough[@]}"
+    rc=$?
+    "$HELPER" svc-event systemctl post --scope "$scope" --unit "$unit" --verb "$verb" 2>/dev/null || true
+    exit "$rc"
+else
+    exec "$real_systemctl" "${passthrough[@]}"
+fi
