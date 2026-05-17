@@ -174,10 +174,7 @@ impl Index {
     /// Insert N events in a single transaction. Returns the assigned EventIds
     /// in input order. ~10× faster than calling [`Self::put_event`] in a loop
     /// for batches >100 — one fsync per batch instead of one per event.
-    pub fn put_event_batch(
-        &self,
-        events: &[CaptureEvent],
-    ) -> Result<Vec<EventId>, IndexError> {
+    pub fn put_event_batch(&self, events: &[CaptureEvent]) -> Result<Vec<EventId>, IndexError> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,9 +188,8 @@ impl Index {
                                      post_content_hash, payload)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
-            let mut bump = tx.prepare(
-                "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-            )?;
+            let mut bump =
+                tx.prepare("UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1")?;
             for ev in events {
                 let payload = postcard::to_allocvec(ev)?;
                 let denorm = denormalize(&ev.kind);
