@@ -124,13 +124,52 @@ struct PrivilegedSetup {
     caps: shit_proto::HelperCaps,
     #[cfg(target_os = "linux")]
     fanotify_fd: Option<fanotify::FanotifyFd>,
+    /// The kernel-tier we'd ideally use vs. the one we'll actually
+    /// run with. They can differ: a kernel that *supports* BPF-LSM
+    /// may still be backed by fanotify until S09 ships the loader.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    tier: CaptureTier,
+}
+
+/// Which kernel-tier capture path is in effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTier {
+    /// Linux fanotify-perm (S08). The shipped tier on Linux today.
+    Fanotify,
+    /// Linux BPF-LSM (S09). Detected but not yet loaded — stage-1
+    /// builds advertise `Fanotify` even when this would be preferred.
+    /// Logged at startup so operators can see what we'd upgrade to.
+    EbpfLsmAvailableButDeferred,
+    /// macOS EndpointSecurity (S07). Reserved.
+    EndpointSecurity,
+    /// Degraded — no kernel-tier capture available; helper logs only.
+    Degraded,
+}
+
+impl CaptureTier {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CaptureTier::Fanotify => "fanotify-perm (S08)",
+            CaptureTier::EbpfLsmAvailableButDeferred => {
+                "ebpf-lsm-available (S09 loader deferred; running fanotify)"
+            }
+            CaptureTier::EndpointSecurity => "endpoint-security (S07)",
+            CaptureTier::Degraded => "degraded (log-only)",
+        }
+    }
 }
 
 fn privileged_setup() -> PrivilegedSetup {
     #[cfg(target_os = "linux")]
     {
         let (caps, fanotify_fd) = linux_privileged_setup();
-        return PrivilegedSetup { caps, fanotify_fd };
+        let tier = pick_linux_tier(fanotify_fd.is_some());
+        tracing::info!(tier = tier.label(), "kernel capture tier picked");
+        return PrivilegedSetup {
+            caps,
+            fanotify_fd,
+            tier,
+        };
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -143,7 +182,39 @@ fn privileged_setup() -> PrivilegedSetup {
                 auth_subscribe: false,
                 package_hook: false,
             },
+            tier: CaptureTier::Degraded,
         }
+    }
+}
+
+/// Decide which kernel-tier the helper *should* use based on the
+/// runtime probe. Stage-1 (this commit) returns `Fanotify` even when
+/// BPF-LSM is fully supported; the eBPF-LSM loader lands in a later
+/// S09 stage that requires explicit user buy-in.
+#[cfg(target_os = "linux")]
+fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
+    let bpf = shit_capture::linux_kernel::probe_bpf_lsm();
+    let caps = priv_linux::probe_bpf_caps();
+    if bpf.fully_supported() && caps.can_load_lsm() {
+        tracing::info!(
+            diagnosis = bpf.diagnose(),
+            cap_bpf = caps.cap_bpf,
+            cap_perfmon = caps.cap_perfmon,
+            "ebpf-lsm is available but loader is not shipped yet — falling back to fanotify"
+        );
+        if have_fanotify_fd {
+            return CaptureTier::EbpfLsmAvailableButDeferred;
+        }
+    } else {
+        tracing::info!(
+            diagnosis = bpf.diagnose(),
+            "ebpf-lsm not available; using fanotify if possible"
+        );
+    }
+    if have_fanotify_fd {
+        CaptureTier::Fanotify
+    } else {
+        CaptureTier::Degraded
     }
 }
 
