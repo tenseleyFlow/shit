@@ -167,6 +167,7 @@ impl Index {
                 params![blob.as_bytes().as_slice()],
             )?;
         }
+        update_path_history_with_conn(&tx, &event.kind, event.ts)?;
         tx.commit()?;
         Ok(EventId(id as u64))
     }
@@ -215,6 +216,7 @@ impl Index {
                 if let Some(blob) = denorm.blob_hash.as_ref() {
                     bump.execute(params![blob.as_bytes().as_slice()])?;
                 }
+                update_path_history_with_conn(&tx, &ev.kind, ev.ts)?;
             }
         }
         tx.commit()?;
@@ -245,6 +247,26 @@ impl Index {
         Ok(())
     }
 
+    /// Update the path-history table for a TreeOp event. Called by
+    /// [`Self::put_event`] / [`Self::put_event_batch`] internally — exposed
+    /// so the daemon can also rebuild history if it ever needs to.
+    ///
+    /// Semantics:
+    /// - `Create`: open a new (path, dev, inode, valid_from=ts, valid_to=NULL).
+    /// - `Unlink`: close the active row for `path` (set `valid_to=ts`).
+    /// - `Rename { from, to, inode }`: close the active row for `from`, open
+    ///   a new row for `to` with the same `inode`.
+    /// - `Link { target, .. }`: open a new row for `target`.
+    /// - `Symlink { path, .. }`: open a new row for `path`.
+    pub fn update_path_history(
+        &self,
+        kind: &CaptureEventKind,
+        ts: TimePoint,
+    ) -> Result<(), IndexError> {
+        let conn = self.conn.lock().unwrap();
+        update_path_history_with_conn(&conn, kind, ts)
+    }
+
     /// Total disk size of all stored blobs (compressed). Convenience for
     /// `shit status` and GC accounting.
     pub fn total_blob_size(&self) -> Result<u64, IndexError> {
@@ -254,6 +276,112 @@ impl Index {
         })?;
         Ok(n as u64)
     }
+}
+
+/// Apply path-history maintenance using a borrowed Connection (so the same
+/// transaction batches event-insert + path-history update). The connection
+/// must already hold the index's write lock.
+fn update_path_history_with_conn(
+    conn: &Connection,
+    kind: &CaptureEventKind,
+    ts: TimePoint,
+) -> Result<(), IndexError> {
+    use shit_planner::TreeOp as T;
+    let CaptureEventKind::TreeOp(t) = kind else {
+        return Ok(());
+    };
+    match t {
+        T::Create { inode, path, .. } => {
+            conn.execute(
+                "INSERT INTO paths (path, dev, inode, valid_from_logical, valid_to_logical)
+                 VALUES (?1, ?2, ?3, ?4, NULL)
+                 ON CONFLICT(path, valid_from_logical) DO NOTHING",
+                params![
+                    path.to_string_lossy(),
+                    inode.dev as i64,
+                    inode.inode as i64,
+                    ts.logical as i64,
+                ],
+            )?;
+        }
+        T::Unlink { path, .. } => {
+            // Close the most recent active row for this path.
+            conn.execute(
+                "UPDATE paths SET valid_to_logical = ?2
+                 WHERE path = ?1 AND valid_to_logical IS NULL",
+                params![path.to_string_lossy(), ts.logical as i64],
+            )?;
+        }
+        T::Rename { from, to, inode } => {
+            conn.execute(
+                "UPDATE paths SET valid_to_logical = ?2
+                 WHERE path = ?1 AND valid_to_logical IS NULL",
+                params![from.to_string_lossy(), ts.logical as i64],
+            )?;
+            conn.execute(
+                "INSERT INTO paths (path, dev, inode, valid_from_logical, valid_to_logical)
+                 VALUES (?1, ?2, ?3, ?4, NULL)
+                 ON CONFLICT(path, valid_from_logical) DO NOTHING",
+                params![
+                    to.to_string_lossy(),
+                    inode.dev as i64,
+                    inode.inode as i64,
+                    ts.logical as i64,
+                ],
+            )?;
+        }
+        T::Link { source, target } => {
+            conn.execute(
+                "INSERT INTO paths (path, dev, inode, valid_from_logical, valid_to_logical)
+                 VALUES (?1, ?2, ?3, ?4, NULL)
+                 ON CONFLICT(path, valid_from_logical) DO NOTHING",
+                params![
+                    target.to_string_lossy(),
+                    source.dev as i64,
+                    source.inode as i64,
+                    ts.logical as i64,
+                ],
+            )?;
+        }
+        T::Symlink { path, .. } => {
+            // Symlinks: we don't know the inode of the link itself from this
+            // event variant; record with sentinel inode 0/0 so the path-history
+            // entry exists. Sufficient for rename-resolution to skip it.
+            conn.execute(
+                "INSERT INTO paths (path, dev, inode, valid_from_logical, valid_to_logical)
+                 VALUES (?1, 0, 0, ?2, NULL)
+                 ON CONFLICT(path, valid_from_logical) DO NOTHING",
+                params![path.to_string_lossy(), ts.logical as i64],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a path to the (dev, inode) it referred to at `at`. Returns
+/// `None` if no path-history row covers that point.
+fn resolve_path_at(
+    conn: &Connection,
+    path: &Path,
+    at: TimePoint,
+) -> Option<InodeRef> {
+    conn.query_row(
+        "SELECT dev, inode FROM paths
+         WHERE path = ?1
+           AND valid_from_logical <= ?2
+           AND (valid_to_logical IS NULL OR valid_to_logical > ?2)
+         ORDER BY valid_from_logical DESC
+         LIMIT 1",
+        params![path.to_string_lossy(), at.logical as i64],
+        |row| {
+            let dev: i64 = row.get(0)?;
+            let inode: i64 = row.get(1)?;
+            Ok(InodeRef::new(dev as u64, inode as u64))
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
 }
 
 struct Denormalized<'a> {
@@ -376,6 +504,21 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
     }
 }
 
+fn collect_events(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Vec<CaptureEvent> {
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    match stmt.query_map(params, decode_event_row) {
+        Ok(it) => it.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<CaptureEvent> {
     let payload: Vec<u8> = row.get("payload")?;
     postcard::from_bytes(&payload).map_err(|e| {
@@ -450,22 +593,32 @@ impl PlannerStore for Index {
 
     fn events_touching_path(&self, path: &Path, at: TimePoint) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
-        // v1: literal path match. Path-history resolution lands in S04.5.
-        let mut stmt = match conn.prepare(
-            "SELECT payload FROM events
-             WHERE path = ?1 AND ts_logical <= ?2
-             ORDER BY ts_logical, id",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt.query_map(
-            params![path.to_string_lossy(), at.logical as i64],
-            decode_event_row,
-        );
-        match rows {
-            Ok(it) => it.filter_map(Result::ok).collect(),
-            Err(_) => Vec::new(),
+        // Resolve via the paths table: find what (dev, inode) `path`
+        // referred to at `at`. If found, query unifies literal-path and
+        // inode-resolved events; otherwise we fall back to literal-only.
+        let inode_at = resolve_path_at(&conn, path, at);
+        let path_str = path.to_string_lossy();
+
+        match inode_at {
+            Some(i) => collect_events(
+                &conn,
+                "SELECT payload FROM events
+                 WHERE ts_logical <= ?1 AND (path = ?2 OR (dev = ?3 AND inode = ?4))
+                 ORDER BY ts_logical, id",
+                params![
+                    at.logical as i64,
+                    path_str,
+                    i.dev as i64,
+                    i.inode as i64,
+                ],
+            ),
+            None => collect_events(
+                &conn,
+                "SELECT payload FROM events
+                 WHERE ts_logical <= ?1 AND path = ?2
+                 ORDER BY ts_logical, id",
+                params![at.logical as i64, path_str],
+            ),
         }
     }
 
@@ -773,6 +926,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rc, 50);
+    }
+
+    #[test]
+    fn path_history_resolves_through_rename() {
+        // Sequence:
+        //   T1: create /foo (inode=10)
+        //   T2: write /foo (FilePreImage on inode 10)
+        //   T3: rename /foo -> /bar
+        //   T4: write /bar (FilePreImage on inode 10)
+        // Query: events_touching_path("/bar", T4) should return both writes.
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+
+        let inode = InodeRef::new(1, 10);
+        let blob = BlobHash::from_bytes([0x10; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+
+        // T1: create
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 1000),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(shit_planner::TreeOp::Create {
+                inode,
+                path: PathBuf::from("/foo"),
+                kind: shit_planner::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        })
+        .unwrap();
+
+        // T2: write at /foo
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(2, 2000),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: PathBuf::from("/foo"),
+                blob,
+                meta: meta(),
+                post_content_hash: None,
+            },
+        })
+        .unwrap();
+
+        // T3: rename /foo -> /bar
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(3, 3000),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(shit_planner::TreeOp::Rename {
+                from: PathBuf::from("/foo"),
+                to: PathBuf::from("/bar"),
+                inode,
+            }),
+        })
+        .unwrap();
+
+        // T4: write at /bar
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(4, 4000),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: PathBuf::from("/bar"),
+                blob,
+                meta: meta(),
+                post_content_hash: None,
+            },
+        })
+        .unwrap();
+
+        // Query /bar at T4 should pick up BOTH writes via inode resolution.
+        let hits = idx.events_touching_path(Path::new("/bar"), TimePoint::new(4, 0));
+        let pre_images = hits
+            .iter()
+            .filter(|e| matches!(e.kind, CaptureEventKind::FilePreImage { .. }))
+            .count();
+        assert_eq!(pre_images, 2, "expected 2 pre-image events, got {pre_images}");
     }
 
     #[test]
