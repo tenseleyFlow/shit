@@ -1209,6 +1209,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "shit-preload-shim"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "shit-proto"
 version = "0.1.0"
 dependencies = [
