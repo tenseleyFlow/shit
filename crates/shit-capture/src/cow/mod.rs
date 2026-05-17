@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 pub mod clonefile_macos;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub mod copy_file_range;
 mod error;
 #[cfg(target_os = "linux")]
 pub mod ficlone_linux;
