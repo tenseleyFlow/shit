@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# shit killall wrapper — installed as $XDG_CONFIG_HOME/shit/bin/killall.
+# Brackets the invocation with `shit-helper proc-event killall {pre,post}`.
+#
+# Note: GNU killall and BSD/macOS killall have different argv syntaxes
+# (GNU: name-based regex; BSD: name+signal). The helper's parser
+# handles both via shit_planner::parse_pattern_kill.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+basename="$(basename "$0")"
+real=""
+for cand in "/usr/bin/$basename" "/bin/$basename" "/usr/sbin/$basename"; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
+
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# Read-only / list-only flags. -l prints signals on GNU killall; --version etc.
+for tok in "$@"; do
+    case "$tok" in
+        --help|--version|-l) exec "$real" "$@" ;;
+    esac
+done
+
+argv_blob=""
+for tok in "$@"; do
+    if [[ -z "$argv_blob" ]]; then
+        argv_blob="$tok"
+    else
+        argv_blob="$argv_blob"$'\n'"$tok"
+    fi
+done
+
+"$HELPER" proc-event "$basename" pre "--target-argv=$argv_blob" 2>/dev/null || true
+"$real" "$@"
+rc=$?
+"$HELPER" proc-event "$basename" post "--target-argv=$argv_blob" 2>/dev/null || true
+exit "$rc"

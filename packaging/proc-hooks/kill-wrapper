@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# shit kill wrapper — installed as $XDG_CONFIG_HOME/shit/bin/kill.
+# Brackets the invocation with `shit-helper proc-event kill {pre,post}`
+# so the daemon snapshots target state BEFORE the kill takes effect
+# (after-kill, /proc/<pid>/* is gone).
+#
+# Note: `kill` is a shell builtin in bash/zsh. The wrapper is reached
+# only when the user types `command kill`, `\kill`, or invokes the
+# tool from a script with $PATH. Shell builtins are observed via the
+# preexec hook's SHIT_JOB_TABLE publication (resolves %1 etc.).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then exit 127; fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+basename="$(basename "$0")"
+real=""
+for cand in "/bin/$basename" "/usr/bin/$basename" "/sbin/$basename" "/usr/sbin/$basename"; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+[[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
+
+# Pass through unchanged during undo execution to avoid recursion.
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi
+
+# -l (list signals) and -L are read-only.
+for tok in "$@"; do
+    case "$tok" in
+        -l|-L|--list|--table) exec "$real" "$@" ;;
+    esac
+done
+
+# Newline-join argv for the helper. Using printf+IFS avoids `tr`'s
+# argv-length limits and is safe for tokens with embedded spaces.
+argv_blob=""
+for tok in "$@"; do
+    if [[ -z "$argv_blob" ]]; then
+        argv_blob="$tok"
+    else
+        argv_blob="$argv_blob"$'\n'"$tok"
+    fi
+done
+
+"$HELPER" proc-event "$basename" pre "--target-argv=$argv_blob" 2>/dev/null || true
+"$real" "$@"
+rc=$?
+"$HELPER" proc-event "$basename" post "--target-argv=$argv_blob" 2>/dev/null || true
+exit "$rc"
