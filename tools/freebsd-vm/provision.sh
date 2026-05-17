@@ -183,7 +183,7 @@ qemu-system-aarch64 \
   -drive if=virtio,format=raw,file="${SEED_ISO}",readonly=on \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2225-:22 \
   -device virtio-net-pci,netdev=net0 \
-  -nographic \
+  -display none \
   -serial file:"${QEMU_LOG}" \
   -pidfile "${QEMU_PIDFILE}" \
   -monitor none \
