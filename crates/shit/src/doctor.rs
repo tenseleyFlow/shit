@@ -19,6 +19,13 @@ struct Row {
 pub fn run() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     print_linux_kernel_tier();
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    print_bsd_tier();
 
     let mut rows: Vec<Row> = Vec::new();
     for raw in CANDIDATE_PATHS {
@@ -138,6 +145,72 @@ fn print_linux_kernel_tier() {
         }
     }
     println!();
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn print_bsd_tier() {
+    let probe = shit_capture::bsd_probe::probe_bsd();
+    println!(
+        "os:       {} ({})",
+        probe.family.label(),
+        if probe.family.is_primary() {
+            "primary"
+        } else {
+            "best-effort"
+        }
+    );
+    println!("kqueue:   {}", kqueue_features_line(&probe.kqueue));
+    print!("zfs:      ");
+    if probe.zfs.usable() {
+        let v = probe.zfs.version.as_deref().unwrap_or("unknown");
+        println!(
+            "available — {} pool(s), {}",
+            probe.zfs.pool_count.unwrap_or(0),
+            v
+        );
+    } else if probe.zfs.binary_present {
+        println!("binary present, no pools imported");
+    } else {
+        println!("not installed");
+    }
+    let shim = std::path::Path::new("/usr/local/lib/shit/libshit_preload.so");
+    println!(
+        "preload:  {}",
+        if shim.is_file() {
+            "installed at /usr/local/lib/shit/libshit_preload.so"
+        } else {
+            "not installed — kqueue-only coverage; see `shit hooks install`"
+        }
+    );
+    println!();
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn kqueue_features_line(k: &shit_capture::bsd_probe::KqueueFeatures) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if k.evfilt_vnode {
+        parts.push("vnode");
+    }
+    if k.evfilt_proc {
+        parts.push("proc");
+    }
+    if k.note_exec {
+        parts.push("note_exec");
+    }
+    if k.note_truncate {
+        parts.push("note_truncate");
+    }
+    parts.join(" + ")
 }
 
 /// Walk a path and print the doctor row for it. Useful from tests.
