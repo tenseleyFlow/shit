@@ -11,6 +11,7 @@
 //! `.docs/audits/planner-spec.md` for the longer rationale.
 
 pub mod events;
+pub mod exec_log;
 pub mod executor;
 pub mod executors;
 pub mod inode;
@@ -29,6 +30,7 @@ pub use events::{
     CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, NetworkTool, PackageManager,
     PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
 };
+pub use exec_log::{ExecLog, ExecLogError, default_dir as exec_log_default_dir, read_all};
 pub use executor::{
     BlobReadError, BlobReader, ConflictPolicy, ExecutionOutcome, ExecutionRecord, ExecutionReport,
     InMemoryBlobReader, InverseOpExecutor, OutcomeKind, PlanSummary,
