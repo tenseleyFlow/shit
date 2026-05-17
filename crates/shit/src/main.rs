@@ -70,6 +70,10 @@ enum Cmd {
     /// dnf, brew, FreeBSD pkg). See `shit pkg-hooks --help`.
     #[command(name = "pkg-hooks")]
     PkgHooks(cmd::pkg_hooks::PkgHooksArgs),
+    /// Install/remove/status the service-manager wrappers (systemctl,
+    /// launchctl). See `shit svc-hooks --help`.
+    #[command(name = "svc-hooks")]
+    SvcHooks(cmd::svc_hooks::SvcHooksArgs),
     /// Drop a captured command's savepoint.
     Forget(cmd::forget::ForgetArgs),
     /// Manual blob-store garbage collection.
@@ -241,6 +245,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::Show(args) => Ok(cmd::show::run(args)?),
         Cmd::Pin(args) => Ok(cmd::pin::run(args)?),
         Cmd::PkgHooks(args) => Ok(cmd::pkg_hooks::run(args)?),
+        Cmd::SvcHooks(args) => Ok(cmd::svc_hooks::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
         Cmd::Config(args) => Ok(cmd::config::run(args)?),

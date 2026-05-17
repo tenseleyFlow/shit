@@ -16,4 +16,5 @@ pub mod pin;
 pub mod pkg_hooks;
 pub mod redo;
 pub mod show;
+pub mod svc_hooks;
 pub mod undo;
