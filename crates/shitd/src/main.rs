@@ -12,6 +12,7 @@ mod env_track;
 mod gc;
 mod helper_link;
 mod lock;
+mod log_setup;
 mod net_track;
 mod pkg;
 mod proc_track;
@@ -60,13 +61,11 @@ fn main() -> anyhow::Result<()> {
         resolved.hook_socket_path = s;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&resolved.log_level)),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // S21.3 — JSON layer to $XDG_STATE_HOME/shit/log/daemon.jsonl.*
+    // (daily rotation) + a stderr fallback for warn+ events. The
+    // returned guard MUST live until shutdown — dropping it stops
+    // the appender's worker thread.
+    let _log_guard = log_setup::init(&resolved.state_dir, &resolved.log_level);
 
     if resolved.disable {
         tracing::warn!("daemon disabled via config; exiting");
@@ -148,11 +147,17 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         let proc_stash = Arc::clone(&proc_stash);
         let db_stash = Arc::clone(&db_stash);
         let shutdown = Arc::clone(&shutdown);
+        let state_dir = cfg.state_dir.clone();
         tokio::spawn(async move {
             // Sweep orphan Pre stashes every minute. The 5-minute
             // TTL lives on each stash; this task just wakes them up.
+            //
+            // S21.3 also folds the log-retention sweep here: the
+            // appender rotates daily but doesn't prune, so we sweep
+            // files older than RETENTION_DAYS on the same cadence.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut log_sweep_counter = 0u64;
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
@@ -172,6 +177,18 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                                 db_evicted,
                                 "stash janitor: swept orphan Pre entries"
                             );
+                        }
+                        // Run log retention sweep once per hour
+                        // (every 60 ticks at 60s cadence).
+                        log_sweep_counter += 1;
+                        if log_sweep_counter.is_multiple_of(60) {
+                            let log_evicted = log_setup::sweep_old_logs(&state_dir);
+                            if log_evicted > 0 {
+                                tracing::info!(
+                                    log_evicted,
+                                    "log retention sweep: dropped files older than 7d"
+                                );
+                            }
                         }
                     }
                     _ = shutdown.notified() => return,
