@@ -13,7 +13,9 @@
 pub mod env;
 pub mod file;
 pub mod package;
+pub mod services;
 
 pub use env::{EnvExecutor, SnippetSink, StringSnippetSink};
 pub use file::FileExecutor;
 pub use package::{PackageExecutor, PkgRunner, SystemPkgRunner};
+pub use services::{ServiceExecutor, SvcRunner, SystemSvcRunner};
