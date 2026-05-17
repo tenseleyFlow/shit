@@ -56,6 +56,17 @@ __shit_pre() {
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # S15: opt-in env tracking. Off by default until daemon ingestion
+    # lands. `env -0` is GNU coreutils + BSD `env` ≥2024; on legacy
+    # systems users get a fallback via `printenv` (not -0-safe for
+    # values with newlines, but rare enough for v1).
+    if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
+        env -0 2>/dev/null | "$_SHIT_BIN" hook-send pre-exec-env \
+            --session "$_SHIT_SESSION" \
+            --seq "$_SHIT_SEQ" \
+            --sock "$_SHIT_SOCK" \
+            >/dev/null 2>&1 || true
+    fi
 }
 
 __shit_post() {
@@ -67,6 +78,13 @@ __shit_post() {
         --exit-code "$rc" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
+        env -0 2>/dev/null | "$_SHIT_BIN" hook-send post-exec-env \
+            --session "$_SHIT_SESSION" \
+            --seq "$_SHIT_SEQ" \
+            --sock "$_SHIT_SOCK" \
+            >/dev/null 2>&1 || true
+    fi
     return $rc
 }
 
