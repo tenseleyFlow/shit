@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#![allow(dead_code)]
 
 //! Interactive confirmation prompts (S12.3).
 //!

@@ -55,6 +55,14 @@ enum Cmd {
     /// type `shit undo` explicitly — the top-level `shit` does not
     /// accept undo's flags.
     Undo(cmd::undo::UndoArgs),
+    /// List captured commands (most recent first).
+    List(cmd::list::ListArgs),
+    /// Show details for one captured command.
+    Show(cmd::show::ShowArgs),
+    /// Pin a command's savepoint to protect it from GC.
+    Pin(cmd::pin::PinArgs),
+    /// Drop a captured command's savepoint.
+    Forget(cmd::forget::ForgetArgs),
     /// Manage shell hook integration.
     Hooks {
         #[command(subcommand)]
@@ -168,6 +176,10 @@ fn main() -> anyhow::Result<()> {
     let cmd = cli.cmd.unwrap_or(Cmd::Undo(cmd::undo::UndoArgs::default()));
     match cmd {
         Cmd::Undo(args) => cmd::undo::run(args),
+        Cmd::List(args) => cmd::list::run(args).map_err(|e| e.into()),
+        Cmd::Show(args) => cmd::show::run(args).map_err(|e| e.into()),
+        Cmd::Pin(args) => cmd::pin::run(args).map_err(|e| e.into()),
+        Cmd::Forget(args) => cmd::forget::run(args).map_err(|e| e.into()),
         Cmd::Hooks { action } => match action {
             HooksCmd::Install { shell } => hooks::install(shell.resolve()),
             HooksCmd::Uninstall { shell } => hooks::uninstall(shell.resolve()),

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#![allow(dead_code)]
 
 //! Output formatting infrastructure (S12.2).
 //!
@@ -19,6 +20,9 @@ pub mod color;
 pub mod json;
 pub mod pager;
 
+#[allow(unused_imports)]
 pub use color::{ColorPref, resolve_color};
+#[allow(unused_imports)]
 pub use json::{JsonError, write_json};
+#[allow(unused_imports)]
 pub use pager::page_if_tty;

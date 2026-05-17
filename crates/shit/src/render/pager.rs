@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#![allow(dead_code)]
 
 //! Pager wiring. `shit list` and `shit show` over N rows pipe through
 //! `$PAGER` when stdout is a TTY.

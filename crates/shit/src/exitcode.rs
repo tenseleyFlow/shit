@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#![allow(dead_code)]
 
 //! Stable CLI exit codes. **API-shaped** — scripts depend on these.
 //!
