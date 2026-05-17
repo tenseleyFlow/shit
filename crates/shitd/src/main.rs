@@ -14,6 +14,7 @@ mod lock;
 mod pkg;
 mod server;
 mod stats;
+mod svc_track;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -119,15 +120,17 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
 
     let pkg_stash = Arc::new(pkg::PkgPreStash::new());
     let env_stash = Arc::new(env_track::EnvPreStash::new());
+    let svc_stash = Arc::new(svc_track::SvcPreStash::new());
     let pkg_janitor = {
         let pkg_stash = Arc::clone(&pkg_stash);
         let env_stash = Arc::clone(&env_stash);
+        let svc_stash = Arc::clone(&svc_stash);
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             // Sweep orphan Pre stashes every minute. The 5-minute
             // TTL lives on each stash; this task just wakes them up.
-            // pkg + env share the same TTL, so a single janitor is
-            // cheaper than two timers.
+            // pkg + env + svc share the same TTL, so a single
+            // janitor is cheaper than three timers.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -135,10 +138,12 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                     _ = tick.tick() => {
                         let pkg_evicted = pkg_stash.sweep_expired();
                         let env_evicted = env_stash.sweep_expired();
-                        if pkg_evicted > 0 || env_evicted > 0 {
+                        let svc_evicted = svc_stash.sweep_expired();
+                        if pkg_evicted > 0 || env_evicted > 0 || svc_evicted > 0 {
                             tracing::info!(
                                 pkg_evicted,
                                 env_evicted,
+                                svc_evicted,
                                 "stash janitor: swept orphan Pre entries"
                             );
                         }
@@ -151,13 +156,16 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
 
     let ctl_handle = {
         let cfg = cfg.clone();
-        let stats = Arc::clone(&stats);
-        let shutdown = Arc::clone(&shutdown);
-        let index = Arc::clone(&index);
-        let blob_store = Arc::clone(&blob_store);
-        let pkg_stash = Arc::clone(&pkg_stash);
+        let ctl_state = ctl::CtlState {
+            stats: Arc::clone(&stats),
+            shutdown: Arc::clone(&shutdown),
+            index: Arc::clone(&index),
+            blob_store: Arc::clone(&blob_store),
+            pkg_stash: Arc::clone(&pkg_stash),
+            svc_stash: Arc::clone(&svc_stash),
+        };
         tokio::spawn(async move {
-            if let Err(e) = ctl::serve(&cfg, stats, shutdown, index, blob_store, pkg_stash).await {
+            if let Err(e) = ctl::serve(&cfg, ctl_state).await {
                 tracing::error!(err = %e, "ctl listener exited");
             }
         })
