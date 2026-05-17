@@ -39,6 +39,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 hdrhistogram = { version = "7.5", default-features = false }
+# OTel stack — gated behind the `otel` feature in consumer crates so
+# the ~40 transitive crates aren't pulled in for minimal builds.
+opentelemetry = "0.27"
+opentelemetry_sdk = "0.27"
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.28"
 thiserror = "2.0"
 anyhow = "1.0"
 uuid = { version = "1.11", features = ["v7", "serde"] }
