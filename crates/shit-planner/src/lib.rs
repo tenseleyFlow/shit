@@ -10,6 +10,7 @@
 //! See `.docs/sprints/S03-undo-planner-spec.md` for the design and
 //! `.docs/audits/planner-spec.md` for the longer rationale.
 
+pub mod env;
 pub mod events;
 pub mod exec_log;
 pub mod executor;
@@ -26,6 +27,11 @@ pub mod time;
 
 pub use plan::plan;
 
+pub use env::{
+    DEFAULT_IGNORE, DEFAULT_IGNORE_PREFIXES, DEFAULT_REDACT_SUBSTRINGS, EnvDiff, EnvFilter,
+    canonicalize as env_canonicalize, diff_env_blocks, diff_env_maps, hash_env, hash_env_block,
+    parse_block as env_parse_block, redact_value,
+};
 pub use events::{
     CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, NetworkTool, PackageManager,
     PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
