@@ -19,6 +19,7 @@ mod proc_track;
 mod server;
 mod stats;
 mod svc_track;
+mod telemetry;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -66,6 +67,28 @@ fn main() -> anyhow::Result<()> {
     // returned guard MUST live until shutdown — dropping it stops
     // the appender's worker thread.
     let _log_guard = log_setup::init(&resolved.state_dir, &resolved.log_level);
+
+    // S21.6 — surface OTLP feature/config drift loudly. If the
+    // operator set `[telemetry] otlp_endpoint` but the daemon wasn't
+    // built with --features otel, the export silently does nothing —
+    // which is exactly the kind of "thought I had observability,
+    // didn't" failure mode we want to refuse to ship. Warn at startup
+    // so the journal shows it.
+    if let Some(endpoint) = &resolved.telemetry.otlp_endpoint {
+        if cfg!(feature = "otel") {
+            tracing::info!(
+                endpoint = %endpoint,
+                service_name = %resolved.telemetry.service_name,
+                "OTLP export configured",
+            );
+        } else {
+            tracing::warn!(
+                endpoint = %endpoint,
+                "OTLP endpoint set but daemon was built without --features otel; \
+                 export disabled",
+            );
+        }
+    }
 
     if resolved.disable {
         tracing::warn!("daemon disabled via config; exiting");
