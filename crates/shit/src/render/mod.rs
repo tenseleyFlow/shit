@@ -17,12 +17,15 @@
 //! bare-`shit` semantics.
 
 pub mod color;
+pub mod env_diff;
 pub mod git;
 pub mod json;
 pub mod pager;
 
 #[allow(unused_imports)]
 pub use color::{ColorPref, resolve_color};
+#[allow(unused_imports)]
+pub use env_diff::{RedactionDisplay, render as render_env_diff};
 #[allow(unused_imports)]
 pub use git::{GitRestoreGroup, detect_git_restores};
 #[allow(unused_imports)]
