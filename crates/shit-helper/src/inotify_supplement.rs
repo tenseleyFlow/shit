@@ -48,10 +48,8 @@ impl InotifySupplement {
     /// `IN_ATTRIB` (chmod/chown/setxattr), `IN_MOVE_SELF` /
     /// `IN_DELETE_SELF` (the watched path itself moves/disappears).
     pub fn watch(&mut self, path: &Path) -> Result<WatchDescriptor, InotifyError> {
-        let mask = WatchMask::ATTRIB
-            | WatchMask::MOVE_SELF
-            | WatchMask::DELETE_SELF
-            | WatchMask::MODIFY;
+        let mask =
+            WatchMask::ATTRIB | WatchMask::MOVE_SELF | WatchMask::DELETE_SELF | WatchMask::MODIFY;
         Ok(self.inner.watches().add(path, mask)?)
     }
 
