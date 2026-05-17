@@ -18,12 +18,34 @@
 //! - **Single tier (Files).** A real tier-router lands once the
 //!   package / env / network executors exist (S14+).
 
+use std::sync::Mutex;
+
 use crate::executor::{
     ConflictPolicy, ExecutionOutcome, ExecutionRecord, ExecutionReport, InverseOpExecutor,
     OutcomeKind, PlanSummary,
 };
-use crate::inverse::{Conflict, InverseOp, UndoPlan};
+use crate::inverse::{Conflict, InverseOp, PlanNode, UndoPlan};
 use crate::probe::StateProbe;
+
+/// Default cap on cohort-parallel concurrency per the S11/S12 sprint
+/// plans. Operators tune via the orchestrator constructor (S12 CLI:
+/// `--parallel N` once we wire it through; for now this is the only
+/// knob).
+pub const DEFAULT_COHORT_PARALLELISM: usize = 4;
+
+/// Group plan-node indices by cohort, preserving cohort order. The
+/// planner emits cohorts in non-decreasing order, so the result here
+/// is the natural traversal sequence for `run_parallel`.
+fn group_by_cohort(nodes: &[PlanNode]) -> Vec<(u32, Vec<usize>)> {
+    let mut groups: Vec<(u32, Vec<usize>)> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        match groups.last_mut() {
+            Some((c, idx)) if *c == node.cohort => idx.push(i),
+            _ => groups.push((node.cohort, vec![i])),
+        }
+    }
+    groups
+}
 
 /// The thing that walks an [`UndoPlan`] and applies it.
 ///
@@ -70,6 +92,162 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         }
     }
 
+    /// Run the plan with cohort-level parallelism (DR-14 / S12.12).
+    ///
+    /// Within each `cohort` (as labeled on `PlanNode.cohort`) the
+    /// orchestrator spawns up to `max_parallel` threads, executes
+    /// sibling ops concurrently, and joins all before advancing to
+    /// the next cohort. The planner's invariant is that sibling ops
+    /// commute (different inodes, no path conflict), so concurrent
+    /// execution is safe without re-checking.
+    ///
+    /// **Concurrency model:** `std::thread::scope` so we don't pull
+    /// in tokio at the planner-crate level. The CLI binary chooses
+    /// the runtime; we just need workers. The blocking nature of
+    /// the per-op syscalls makes spawn_blocking-style async an
+    /// over-engineering for this case.
+    ///
+    /// Requires `Sync` bounds on the executor and probe since both
+    /// are shared across worker threads via `&`.
+    pub fn run_parallel(
+        &self,
+        plan: &UndoPlan,
+        dry_run: bool,
+        policy: ConflictPolicy,
+        max_parallel: usize,
+    ) -> ExecutionReport
+    where
+        E: Sync,
+        P: Sync,
+    {
+        let plan_summary = PlanSummary::from_plan(plan);
+        let mut records: Vec<Option<ExecutionRecord>> = vec![None; plan.nodes.len()];
+        let mut aborted = false;
+
+        // Group node indices by cohort. We rely on the planner's
+        // topological order: cohorts appear in non-decreasing order
+        // and never interleave.
+        let cohorts = group_by_cohort(&plan.nodes);
+        for (_cohort_id, cohort_indices) in cohorts {
+            // Collect parallel results in a thread-safe slot.
+            let records_slot: Mutex<&mut Vec<Option<ExecutionRecord>>> = Mutex::new(&mut records);
+            let abort_flag = Mutex::new(false);
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(cohort_indices.len());
+                let semaphore = std::sync::Arc::new(Mutex::new(0usize));
+                let cap = max_parallel.max(1);
+
+                for op_index in cohort_indices.iter().copied() {
+                    let node = &plan.nodes[op_index];
+                    let op = &node.op;
+                    let sem = std::sync::Arc::clone(&semaphore);
+                    let records_slot = &records_slot;
+                    let abort_flag = &abort_flag;
+                    let handle = s.spawn(move || {
+                        // Crude semaphore: spin until the in-flight
+                        // count is below cap. Cohorts are small enough
+                        // (~tens of nodes) that this is fine; a real
+                        // semaphore would only matter at thousands.
+                        loop {
+                            let mut g = sem.lock().unwrap();
+                            if *g < cap {
+                                *g += 1;
+                                break;
+                            }
+                            drop(g);
+                            std::thread::yield_now();
+                        }
+                        let record = self.execute_one(op_index, op, dry_run, policy);
+                        // Track whether this record triggers abort.
+                        if matches!(policy, ConflictPolicy::Abort)
+                            && matches!(
+                                record.outcome_kind,
+                                OutcomeKind::Failed
+                                    | OutcomeKind::ConflictHard
+                                    | OutcomeKind::ConflictPhantom
+                            )
+                        {
+                            *abort_flag.lock().unwrap() = true;
+                        }
+                        records_slot.lock().unwrap()[op_index] = Some(record);
+                        *sem.lock().unwrap() -= 1;
+                    });
+                    handles.push(handle);
+                }
+                for h in handles {
+                    let _ = h.join();
+                }
+            });
+
+            if *abort_flag.lock().unwrap() {
+                aborted = true;
+                break;
+            }
+        }
+
+        // Drop trailing `None`s (the post-abort tail) so the report
+        // length reflects what was actually attempted.
+        let records: Vec<ExecutionRecord> = records.into_iter().flatten().collect();
+        if aborted {
+            tracing::warn!("orchestrator (parallel): abort policy halted plan");
+        }
+
+        ExecutionReport {
+            plan_summary,
+            records,
+            dry_run,
+            policy,
+        }
+    }
+
+    /// Per-op evaluator extracted so it's shareable between the
+    /// sequential `run` and the parallel `run_parallel`.
+    fn execute_one(
+        &self,
+        op_index: usize,
+        op: &InverseOp,
+        dry_run: bool,
+        policy: ConflictPolicy,
+    ) -> ExecutionRecord {
+        if self.filtered_out(op) {
+            return ExecutionRecord {
+                op_index,
+                op: op.clone(),
+                tier: op.tier(),
+                outcome_kind: OutcomeKind::Skipped,
+                detail: Some(format!(
+                    "filtered out: {} not matched by --paths",
+                    op.primary_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<no-path>".into())
+                )),
+            };
+        }
+        let conflict = self.precondition_conflict(op);
+        let outcome = match (conflict, policy) {
+            (None, _) => self.executor.execute(op, dry_run, policy),
+            (Some(_), ConflictPolicy::Force) => self.executor.execute(op, dry_run, policy),
+            (Some(c), ConflictPolicy::Skip) => ExecutionOutcome::Skipped {
+                reason: format!("conflict: {c:?}"),
+            },
+            (Some(c), ConflictPolicy::Abort) => ExecutionOutcome::Conflict { kind: c.clone() },
+        };
+        let outcome_kind = OutcomeKind::from_outcome(&outcome);
+        let detail = match &outcome {
+            ExecutionOutcome::Skipped { reason } => Some(reason.clone()),
+            ExecutionOutcome::Conflict { kind } => Some(format!("{kind:?}")),
+            ExecutionOutcome::Failed { err } => Some(err.clone()),
+            _ => None,
+        };
+        ExecutionRecord {
+            op_index,
+            op: op.clone(),
+            tier: op.tier(),
+            outcome_kind,
+            detail,
+        }
+    }
+
     /// Walk the plan, applying each op. The returned report mirrors
     /// the plan's node order one-for-one.
     pub fn run(&self, plan: &UndoPlan, dry_run: bool, policy: ConflictPolicy) -> ExecutionReport {
@@ -78,66 +256,9 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
 
         for (op_index, node) in plan.nodes.iter().enumerate() {
             let op = &node.op;
-
-            // Path-filter short-circuit: filtered-out ops are Skipped
-            // without consulting the executor or the conflict probe.
-            // This preserves "filtered" as a distinct outcome — users
-            // reviewing the report can tell "I excluded it" from
-            // "it conflicted."
-            if self.filtered_out(op) {
-                records.push(ExecutionRecord {
-                    op_index,
-                    op: op.clone(),
-                    tier: op.tier(),
-                    outcome_kind: OutcomeKind::Skipped,
-                    detail: Some(format!(
-                        "filtered out: {} not matched by --paths",
-                        op.primary_path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<no-path>".into())
-                    )),
-                });
-                continue;
-            }
-
-            // Live-state precondition check. Returns Some(Conflict) when
-            // the FS is in a state we can't reconcile with the op's
-            // assumptions.
-            let conflict = self.precondition_conflict(op);
-
-            let outcome = match (conflict, policy) {
-                // No conflict — execute.
-                (None, _) => self.executor.execute(op, dry_run, policy),
-                // Force ignores any conflict and attempts the op.
-                (Some(_), ConflictPolicy::Force) => self.executor.execute(op, dry_run, policy),
-                // Skip policy: every conflict short-circuits to Skipped.
-                (Some(c), ConflictPolicy::Skip) => ExecutionOutcome::Skipped {
-                    reason: format!("conflict: {c:?}"),
-                },
-                // Abort + any conflict: record it. The post-loop check
-                // halts the remainder only if the conflict is blocking
-                // (Hard / Phantom). Missing under Abort is recorded but
-                // not halting — it's typically informational ("path
-                // already gone, op is a no-op").
-                (Some(c), ConflictPolicy::Abort) => ExecutionOutcome::Conflict { kind: c.clone() },
-            };
-
-            let outcome_kind = OutcomeKind::from_outcome(&outcome);
-            let detail = match &outcome {
-                ExecutionOutcome::Skipped { reason } => Some(reason.clone()),
-                ExecutionOutcome::Conflict { kind } => Some(format!("{kind:?}")),
-                ExecutionOutcome::Failed { err } => Some(err.clone()),
-                _ => None,
-            };
-            records.push(ExecutionRecord {
-                op_index,
-                op: op.clone(),
-                tier: op.tier(),
-                outcome_kind,
-                detail,
-            });
-
-            // Abort policy: stop after a blocking conflict OR a hard failure.
+            let record = self.execute_one(op_index, op, dry_run, policy);
+            let outcome_kind = record.outcome_kind;
+            records.push(record);
             if matches!(policy, ConflictPolicy::Abort)
                 && matches!(
                     outcome_kind,
@@ -457,6 +578,100 @@ mod tests {
         // Inside was applied; outside still exists.
         assert!(!inside.exists());
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn run_parallel_applies_independent_cohort_siblings() {
+        // Three files in cohort 0 (independent inodes). All three
+        // should land Applied; the orchestrator must not serialize
+        // them artificially under run_parallel.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let paths: Vec<std::path::PathBuf> = (0..3)
+            .map(|i| tmpdir.path().join(format!("f{i}")))
+            .collect();
+        for p in &paths {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+
+        let mut probe = InMemoryProbe::new();
+        for (i, p) in paths.iter().enumerate() {
+            probe.insert(
+                p.clone(),
+                ProbeStat {
+                    inode: InodeRef::new(1, (i + 1) as u64),
+                    meta: sample_meta(),
+                },
+                None,
+            );
+        }
+        let orc = Orchestrator::new(&exec, &probe);
+
+        let mut plan = empty_plan();
+        for p in &paths {
+            plan.nodes.push(PlanNode {
+                op: InverseOp::Unlink { path: p.clone() },
+                cohort: 0,
+                conflict: None,
+            });
+        }
+        let r = orc.run_parallel(&plan, false, ConflictPolicy::Skip, 4);
+        assert_eq!(r.records.len(), 3);
+        for rec in &r.records {
+            assert_eq!(rec.outcome_kind, OutcomeKind::Applied, "{rec:?}");
+        }
+        for p in &paths {
+            assert!(!p.exists());
+        }
+    }
+
+    #[test]
+    fn run_parallel_preserves_per_op_order_in_records() {
+        // Even when ops run concurrently, the returned `records` are
+        // indexed by op_index — they appear in the original plan order.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let p0 = tmpdir.path().join("a");
+        let p1 = tmpdir.path().join("b");
+        std::fs::write(&p0, b"x").unwrap();
+        std::fs::write(&p1, b"y").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            p0.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        probe.insert(
+            p1.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 2),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let orc = Orchestrator::new(&exec, &probe);
+
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink { path: p0.clone() },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink { path: p1.clone() },
+            cohort: 0,
+            conflict: None,
+        });
+        let r = orc.run_parallel(&plan, false, ConflictPolicy::Skip, 2);
+        assert_eq!(r.records[0].op_index, 0);
+        assert_eq!(r.records[1].op_index, 1);
     }
 
     #[test]
