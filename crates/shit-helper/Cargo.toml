@@ -16,6 +16,7 @@ vergen-gitcl = { workspace = true }
 
 [dependencies]
 shit-proto = { workspace = true }
+shit-planner = { workspace = true }
 shit-capture = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
