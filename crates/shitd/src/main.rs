@@ -77,6 +77,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let stats = stats::Stats::new();
     let shutdown = Arc::new(Notify::new());
 
+    let index_path = cfg.state_dir.join("index.sqlite");
+    let index = Arc::new(shit_store::Index::open(&index_path)?);
+    tracing::info!(path = %index_path.display(), "index opened");
+
     let ctl_handle = {
         let cfg = cfg.clone();
         let stats = Arc::clone(&stats);
@@ -91,7 +95,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let stats_for_server = Arc::clone(&stats);
     let shutdown_for_server = Arc::clone(&shutdown);
     let result = tokio::select! {
-        r = server::serve(cfg, stats_for_server) => r,
+        r = server::serve(cfg, stats_for_server, index) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
             Ok(())
