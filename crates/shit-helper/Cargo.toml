@@ -32,6 +32,11 @@ seccompiler = "0.5"
 bitflags = { workspace = true }
 crossbeam-channel = "0.5"
 inotify = { version = "0.11", default-features = false }
+# aya 0.13 = userspace BPF loader. Linux-only. No program code yet —
+# the `ebpf` module is a skeleton whose `load()` returns NotImplemented.
+# Stage 3 of S09 adds the program crate + bpf-linker; until then this
+# crate is dead-code-imported only.
+aya = "0.13"
 
 [dev-dependencies]
 tempfile = "3.10"
