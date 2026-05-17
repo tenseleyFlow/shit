@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod ctl;
+pub mod fault_inject;
 pub mod frame;
 pub mod helper;
 
