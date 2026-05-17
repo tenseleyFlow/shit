@@ -291,7 +291,7 @@ pub struct ProcToolParseError(pub String);
 
 /// One process snapshot captured at Pre time. Used to render a
 /// restart suggestion if the kill succeeds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcSnapshot {
     pub pid: u32,
     /// `comm` (15-char kernel-stored short name) — useful when
