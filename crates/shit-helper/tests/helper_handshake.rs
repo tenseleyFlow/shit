@@ -183,6 +183,86 @@ fn helper_refuses_wrong_daemon_pid() {
     assert!(!status.success(), "helper exited 0 despite wrong daemon-pid");
 }
 
+#[test]
+fn daemon_sees_eof_when_helper_is_killed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock_path = tmp.path().join("helper.sock");
+    let state_dir = tmp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let listener = socket(
+        AddressFamily::Unix,
+        HELPER_SOCK_TYPE,
+        SockFlag::empty(),
+        None,
+    )
+    .unwrap();
+    let addr = UnixAddr::new(&sock_path).unwrap();
+    bind(listener.as_raw_fd(), &addr).unwrap();
+    listen(&listener, Backlog::new(1).unwrap()).unwrap();
+
+    let daemon_pid = std::process::id();
+    let daemon_uid = unsafe { libc::getuid() };
+
+    let mut child = Command::new(helper_bin())
+        .arg("--daemon-sock")
+        .arg(&sock_path)
+        .arg("--daemon-pid")
+        .arg(daemon_pid.to_string())
+        .arg("--daemon-uid")
+        .arg(daemon_uid.to_string())
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("LD_PRELOAD")
+        .spawn()
+        .expect("spawn helper");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let conn_fd = loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("helper did not connect");
+        }
+        match nix::sys::socket::accept(listener.as_raw_fd()) {
+            Ok(raw) => {
+                use std::os::fd::FromRawFd;
+                break unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            }
+            Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => continue,
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+
+    // Complete the handshake so we know the helper is past startup.
+    let req = HelperRequest::Handshake {
+        daemon_pid,
+        daemon_uid,
+        protocol_version: HELPER_PROTOCOL_VERSION,
+        capability_request: HelperCaps::full(),
+    };
+    send_frame(&conn_fd, &encode_frame(&req).unwrap());
+    let _ack: HelperResponse = decode_frame(&recv_frame(&conn_fd)).unwrap();
+
+    // Kill -9. Helper has no chance to send a ShutdownAck.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // A subsequent recv must return 0 bytes (EOF) within a reasonable
+    // window. We deliberately don't set SO_RCVTIMEO; SEQPACKET/STREAM
+    // both report EOF as a 0-byte recv once the peer fd is closed.
+    let mut buf = [0u8; 8];
+    let n = nix::sys::socket::recv(
+        conn_fd.as_raw_fd(),
+        &mut buf,
+        nix::sys::socket::MsgFlags::empty(),
+    )
+    .expect("recv after kill");
+    assert_eq!(n, 0, "expected EOF after SIGKILL; got {n} bytes");
+}
+
 fn send_frame(fd: &std::os::fd::OwnedFd, frame: &[u8]) {
     let mut sent = 0;
     while sent < frame.len() {
