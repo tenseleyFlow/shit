@@ -30,6 +30,7 @@ pub struct CtlState {
     pub net_stash: Arc<NetPreStash>,
     pub proc_stash: Arc<ProcPreStash>,
     pub db_stash: Arc<crate::db_track::DbPreStash>,
+    pub active: Arc<crate::active_commands::ActiveCommands>,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -97,6 +98,7 @@ async fn handle_client(
         net_stash,
         proc_stash,
         db_stash,
+        active,
     } = state;
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -123,7 +125,7 @@ async fn handle_client(
         CtlRequest::Pin(req) => handle_pin(req, index),
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
-        CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
+        CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash, &active, &index),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
@@ -295,8 +297,13 @@ fn metrics_snapshot(stats: &Stats, index: &Arc<Index>) -> shit_proto::MetricsSna
 /// journal-write to `events` table under (session, seq) is DR-25 —
 /// it requires the open-command-window lookup that lands together
 /// with the capture-runtime pipeline.
-fn handle_pkg_event(req: PkgEventReq, pkg_stash: &PkgPreStash) -> CtlResponse {
-    let _ = crate::pkg::handle(pkg_stash, req);
+fn handle_pkg_event(
+    req: PkgEventReq,
+    pkg_stash: &PkgPreStash,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+) -> CtlResponse {
+    let _ = crate::pkg::handle(pkg_stash, req, active, index);
     CtlResponse::PkgEventAck
 }
 
