@@ -10,8 +10,10 @@
 //! - S17 — network/firewall tier
 //! - S18 — process tier (note-only)
 
+pub mod env;
 pub mod file;
 pub mod package;
 
+pub use env::{EnvExecutor, SnippetSink, StringSnippetSink};
 pub use file::FileExecutor;
 pub use package::{PackageExecutor, PkgRunner, SystemPkgRunner};
