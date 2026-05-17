@@ -12,6 +12,8 @@ use shit_planner::BlobHash;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+pub mod clonefile_macos;
 mod error;
 pub mod hardlink;
 pub mod streaming;
