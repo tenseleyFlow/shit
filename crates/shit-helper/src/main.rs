@@ -144,6 +144,16 @@ pub enum CaptureTier {
     EbpfLsmAvailableButDeferred,
     /// macOS EndpointSecurity (S07). Reserved.
     EndpointSecurity,
+    /// BSD kqueue-only (S10). Post-hoc events; no pre-mutation
+    /// blocking. Used when no LD_PRELOAD shim is installed and the
+    /// storage substrate isn't ZFS.
+    KqueueOnly,
+    /// BSD kqueue + LD_PRELOAD shim (S10). Pre-mutation events via
+    /// the userspace shim, kqueue for verification.
+    KqueuePreloadShim,
+    /// BSD ZFS snapshot-based capture (S10). Coarse but cheap —
+    /// preferred tier when `$HOME` is on ZFS.
+    ZfsSnapshot,
     /// Degraded — no kernel-tier capture available; helper logs only.
     Degraded,
 }
@@ -156,6 +166,9 @@ impl CaptureTier {
                 "ebpf-lsm-available (S09 loader deferred; running fanotify)"
             }
             CaptureTier::EndpointSecurity => "endpoint-security (S07)",
+            CaptureTier::KqueueOnly => "kqueue-only (S10 post-hoc)",
+            CaptureTier::KqueuePreloadShim => "kqueue + LD_PRELOAD shim (S10)",
+            CaptureTier::ZfsSnapshot => "zfs-snapshot (S10 coarse pre-mutation)",
             CaptureTier::Degraded => "degraded (log-only)",
         }
     }
@@ -173,11 +186,40 @@ fn privileged_setup() -> PrivilegedSetup {
             tier,
         };
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
     {
-        // macOS path lands in S07; BSD in S10. Helper still claims
-        // `watch_tree` since that primitive is best-effort even with
-        // no kernel hooks.
+        let tier = pick_bsd_tier();
+        tracing::info!(tier = tier.label(), "kernel capture tier picked");
+        return PrivilegedSetup {
+            caps: shit_proto::HelperCaps {
+                watch_tree: true,
+                // BSD tier doesn't have a kernel-blocking primitive on
+                // par with fanotify-perm / ES. ZFS-snapshot and the
+                // LD_PRELOAD shim both capture pre-mutation state but
+                // don't *block* the syscall on the helper. Advertise
+                // the capability honestly.
+                auth_subscribe: false,
+                package_hook: false,
+            },
+            tier,
+        };
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )))]
+    {
+        // macOS path lands in S07. Helper still claims `watch_tree`
+        // since that primitive is best-effort even with no kernel
+        // hooks.
         PrivilegedSetup {
             caps: shit_proto::HelperCaps {
                 watch_tree: true,
@@ -187,6 +229,37 @@ fn privileged_setup() -> PrivilegedSetup {
             tier: CaptureTier::Degraded,
         }
     }
+}
+
+/// Decide which BSD capture tier to use. ZFS wins when available
+/// because it's dramatically cheaper than per-file capture. Otherwise
+/// the kqueue floor; we advertise the LD_PRELOAD upgrade when the
+/// shim is installed (path probe), but the actual interposition
+/// activation belongs to the shell hook installer.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn pick_bsd_tier() -> CaptureTier {
+    let probe = shit_capture::bsd_probe::probe_bsd();
+    tracing::info!(
+        diagnosis = probe.diagnose(),
+        is_primary = probe.family.is_primary(),
+        "bsd-probe"
+    );
+    if probe.zfs.usable() {
+        return CaptureTier::ZfsSnapshot;
+    }
+    // Shim install path is platform-conventional: /usr/local/lib/shit/
+    // on FreeBSD, same elsewhere. The shim file existing here is the
+    // signal that the user opted into the LD_PRELOAD path.
+    let shim = std::path::Path::new("/usr/local/lib/shit/libshit_preload.so");
+    if shim.is_file() {
+        return CaptureTier::KqueuePreloadShim;
+    }
+    CaptureTier::KqueueOnly
 }
 
 /// Decide which kernel-tier the helper *should* use based on the
