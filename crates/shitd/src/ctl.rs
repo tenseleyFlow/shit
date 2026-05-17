@@ -5,12 +5,13 @@
 //! served on their own tokio task.
 
 use crate::config::ResolvedConfig;
+use crate::net_track::NetPreStash;
 use crate::pkg::PkgPreStash;
 use crate::stats::Stats;
 use crate::svc_track::SvcPreStash;
 use shit_proto::{
-    CtlRequest, CtlResponse, DaemonStatus, GcRequest, PkgEventReq, SvcEventReq, decode_frame,
-    encode_frame,
+    CtlRequest, CtlResponse, DaemonStatus, GcRequest, NetEventReq, PkgEventReq, SvcEventReq,
+    decode_frame, encode_frame,
 };
 use shit_store::{BlobStore, Index};
 
@@ -25,6 +26,7 @@ pub struct CtlState {
     pub blob_store: Arc<BlobStore>,
     pub pkg_stash: Arc<PkgPreStash>,
     pub svc_stash: Arc<SvcPreStash>,
+    pub net_stash: Arc<NetPreStash>,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -85,6 +87,7 @@ async fn handle_client(
         blob_store,
         pkg_stash,
         svc_stash,
+        net_stash,
     } = state;
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -113,12 +116,7 @@ async fn handle_client(
         CtlRequest::PinList => handle_pin_list(index),
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
-        CtlRequest::NetEvent(_) => {
-            // S17.9 wires this to a real handler. Stub-ack so a
-            // helper that ships ahead of the daemon doesn't deadlock
-            // the user's `iptables`/`nft` invocation.
-            CtlResponse::NetEventAck
-        }
+        CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -285,4 +283,13 @@ fn handle_pkg_event(req: PkgEventReq, pkg_stash: &PkgPreStash) -> CtlResponse {
 fn handle_svc_event(req: SvcEventReq, svc_stash: &SvcPreStash) -> CtlResponse {
     let _ = crate::svc_track::handle(svc_stash, req);
     CtlResponse::SvcEventAck
+}
+
+/// Handle one network-tool hook event (S17.9). Pre stashes the
+/// raw state dump; Post pairs by `(tool, pid, scope_hint)` and
+/// returns a byte-equality result. The journal-write under
+/// `(session, seq)` is DR-41.
+fn handle_net_event(req: NetEventReq, net_stash: &NetPreStash) -> CtlResponse {
+    let _ = crate::net_track::handle(net_stash, req);
+    CtlResponse::NetEventAck
 }
