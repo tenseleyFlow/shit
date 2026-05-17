@@ -82,6 +82,19 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
+    // S21.2 — root span carrying the schema-required component/pid/
+    // version/commit fields. Child events inherit when the span is
+    // entered. Per-subsystem child spans (ctl-listener, hook-listener,
+    // command-window) open below as their work begins.
+    let root_span = tracing::info_span!(
+        "daemon",
+        component = "daemon",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("VERGEN_GIT_SHA"),
+    );
+    let _root_guard = root_span.enter();
+
     let stats = stats::Stats::new();
     let shutdown = Arc::new(Notify::new());
 

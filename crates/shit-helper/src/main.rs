@@ -254,6 +254,20 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // S21.2 — root span carrying schema-required fields. Entered for
+    // the duration of `main`; transient *-event sidecar invocations
+    // get their own child spans inside `run_mode` (deferred to S21.3
+    // when the JSON subscriber lands and the inheritance becomes
+    // observable end-to-end).
+    let root_span = tracing::info_span!(
+        "helper",
+        component = "helper",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("VERGEN_GIT_SHA"),
+    );
+    let _root_guard = root_span.enter();
+
     // Transient modes short-circuit before any privileged setup. They
     // need their own modest runtime; the sidecar's `current_thread`
     // runtime is overkill for a one-shot UDS write, but it's already

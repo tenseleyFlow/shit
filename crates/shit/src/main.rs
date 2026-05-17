@@ -212,6 +212,18 @@ fn main() -> std::process::ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // S21.2 — root span carrying schema-required fields. The CLI is
+    // one-shot per invocation, so this span lives for the duration of
+    // `main`. Subcommand handlers see it via tracing's task-local
+    // span stack.
+    let root_span = tracing::info_span!(
+        "cli",
+        component = "cli",
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("VERGEN_GIT_SHA"),
+    );
+    let _root_guard = root_span.enter();
     // Bare `shit` (cli.cmd == None) → dispatch to undo with defaults.
     // Do NOT parse further argv tokens here — see the doc-comment on
     // the `Cli` struct for why.
