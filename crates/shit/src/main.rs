@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use shit_proto::ShellKind;
 use std::path::PathBuf;
 
+mod cmd;
 mod doctor;
 mod hooks;
 mod paths;
@@ -29,14 +30,28 @@ const LONG_VERSION: &str = concat!(
     about = "magic undo for the command line",
     version = env!("CARGO_PKG_VERSION"),
     long_version = LONG_VERSION,
+    // Bare `shit` (no subcommand, no args) must work — it's the
+    // headline UX. clap's `args_conflicts_with_subcommands` would
+    // let us also accept top-level flags as a shorthand, but we
+    // *do not* want that: bare `shit` only accepts the no-arg form.
+    // `shit --dry-run`, `shit 3`, `shit --on-conflict=skip` must all
+    // be rejected — those belong to `shit undo`. The `Option<Cmd>`
+    // + no top-level args achieves that.
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Reverse the effects of recent commands.
+    ///
+    /// Bare `shit` is equivalent to `shit undo` with default args.
+    /// To use a non-default arg (like `--dry-run` or `N`), you MUST
+    /// type `shit undo` explicitly — the top-level `shit` does not
+    /// accept undo's flags.
+    Undo(cmd::undo::UndoArgs),
     /// Manage shell hook integration.
     Hooks {
         #[command(subcommand)]
@@ -144,7 +159,12 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    match cli.cmd {
+    // Bare `shit` (cli.cmd == None) → dispatch to undo with defaults.
+    // Do NOT parse further argv tokens here — see the doc-comment on
+    // the `Cli` struct for why.
+    let cmd = cli.cmd.unwrap_or(Cmd::Undo(cmd::undo::UndoArgs::default()));
+    match cmd {
+        Cmd::Undo(args) => cmd::undo::run(args),
         Cmd::Hooks { action } => match action {
             HooksCmd::Install { shell } => hooks::install(shell.resolve()),
             HooksCmd::Uninstall { shell } => hooks::uninstall(shell.resolve()),
