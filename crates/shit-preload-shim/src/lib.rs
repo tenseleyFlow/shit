@@ -93,18 +93,20 @@ mod interposers {
 // symbol into the cdylib's export table directly — no `pub use` shim
 // is required and adding one would only produce an unused-import lint.
 
-#[cfg(test)]
-mod tests {
-    use std::ffi::CString;
-
-    #[test]
-    #[cfg(any(
+#[cfg(all(
+    test,
+    any(
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
-    ))]
+    )
+))]
+mod tests {
+    use std::ffi::CString;
+
+    #[test]
     fn unlink_passthrough_returns_negative_on_missing_path() {
         let c = CString::new("/tmp/shit-preload-shim-nonexistent-XXX").unwrap();
         let r = unsafe { super::shit_preload_unlink(c.as_ptr()) };
