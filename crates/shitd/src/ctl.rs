@@ -7,11 +7,12 @@
 use crate::config::ResolvedConfig;
 use crate::net_track::NetPreStash;
 use crate::pkg::PkgPreStash;
+use crate::proc_track::ProcPreStash;
 use crate::stats::Stats;
 use crate::svc_track::SvcPreStash;
 use shit_proto::{
-    CtlRequest, CtlResponse, DaemonStatus, GcRequest, NetEventReq, PkgEventReq, SvcEventReq,
-    decode_frame, encode_frame,
+    CtlRequest, CtlResponse, DaemonStatus, GcRequest, NetEventReq, PkgEventReq, ProcEventReq,
+    SvcEventReq, decode_frame, encode_frame,
 };
 use shit_store::{BlobStore, Index};
 
@@ -27,6 +28,7 @@ pub struct CtlState {
     pub pkg_stash: Arc<PkgPreStash>,
     pub svc_stash: Arc<SvcPreStash>,
     pub net_stash: Arc<NetPreStash>,
+    pub proc_stash: Arc<ProcPreStash>,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -88,6 +90,7 @@ async fn handle_client(
         pkg_stash,
         svc_stash,
         net_stash,
+        proc_stash,
     } = state;
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -117,12 +120,7 @@ async fn handle_client(
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
-        CtlRequest::ProcEvent(_) => {
-            // S18.6 wires this to a real handler. Stub-ack so a
-            // helper that ships ahead of the daemon doesn't deadlock
-            // the user's `kill` invocation.
-            CtlResponse::ProcEventAck
-        }
+        CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -298,4 +296,13 @@ fn handle_svc_event(req: SvcEventReq, svc_stash: &SvcPreStash) -> CtlResponse {
 fn handle_net_event(req: NetEventReq, net_stash: &NetPreStash) -> CtlResponse {
     let _ = crate::net_track::handle(net_stash, req);
     CtlResponse::NetEventAck
+}
+
+/// Handle one process-lifecycle hook event (S18.6). Pre stashes
+/// the captured target snapshots; Post diffs against the post-state
+/// to classify each target as Killed or Survived. Journal-write
+/// under `(session, seq)` is DR-53.
+fn handle_proc_event(req: ProcEventReq, proc_stash: &ProcPreStash) -> CtlResponse {
+    let _ = crate::proc_track::handle(proc_stash, req);
+    CtlResponse::ProcEventAck
 }
