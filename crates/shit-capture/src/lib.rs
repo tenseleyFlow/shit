@@ -10,6 +10,13 @@ pub mod cow;
 pub mod fs_matrix;
 #[cfg(target_os = "linux")]
 pub mod linux_kernel;
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+pub mod bsd_probe;
 
 pub use cow::{
     CaptureOpts, CaptureOutcome, CowEngine, CowError, CowTier, DefaultEngine, would_pick,
