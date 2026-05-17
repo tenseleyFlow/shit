@@ -132,9 +132,15 @@ impl<R: BlobReader> FileExecutor<'_, R> {
         Ok(())
     }
 
-    fn apply_restore_metadata(&self, _op: &InverseOp) -> ExecutionOutcome {
-        ExecutionOutcome::Failed {
-            err: "S11.4: RestoreMetadata not yet implemented".into(),
+    fn apply_restore_metadata(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::RestoreMetadata { path, target, .. } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_restore_metadata: wrong variant".into(),
+            };
+        };
+        match restore_metadata_inner(path, target) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed { err: e },
         }
     }
 
@@ -161,6 +167,73 @@ impl<R: BlobReader> FileExecutor<'_, R> {
             err: "S11.5: CreateSymlink not yet implemented".into(),
         }
     }
+}
+
+/// Restore the captured mode/uid/gid/mtime onto `path`.
+///
+/// **What stage 1 restores:** mode (chmod), uid + gid (chown), mtime
+/// (utimensat). **What it defers:** xattrs and ACLs — both need
+/// per-platform handling we'd rather implement once we have a real
+/// integration test pass (see DR-* in DEFERRED-RUNTIME.md).
+///
+/// **Privilege failure mode:** when the chown would require
+/// CAP_CHOWN or root (target uid/gid differs from caller's), Linux
+/// returns EPERM. We surface that as a `Failed { err }` mentioning
+/// the helper-IPC privileged-op routing (DR-15). No silent skip.
+fn restore_metadata_inner(
+    path: &Path,
+    target: &crate::metadata::FileMetadata,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Mode. Stripping the file-type bits is intentional — chmod takes
+    // only the permission bits; the type lives in the inode and is
+    // immutable from userspace.
+    let mode_only = target.mode & 0o7777;
+    let perms = std::fs::Permissions::from_mode(mode_only);
+    fs::set_permissions(path, perms)
+        .map_err(|e| format!("chmod {path:?} -> {mode_only:o}: {e}"))?;
+
+    // uid + gid. nix::unistd::chown follows symlinks (calls chown(2),
+    // not lchown(2)). For a symlink target's metadata we'd want
+    // lchown — defer that case until the integration sprint.
+    let uid = Some(nix::unistd::Uid::from_raw(target.uid));
+    let gid = Some(nix::unistd::Gid::from_raw(target.gid));
+    nix::unistd::chown(path, uid, gid).map_err(|e| match e {
+        nix::errno::Errno::EPERM => format!(
+            "chown {path:?} -> uid={} gid={}: EPERM (needs helper-IPC privileged-op routing, DR-15)",
+            target.uid, target.gid
+        ),
+        other => format!(
+            "chown {path:?} -> uid={} gid={}: {other}",
+            target.uid, target.gid
+        ),
+    })?;
+
+    // mtime. Skip atime restoration — it's not captured.
+    if target.mtime_unix_nanos > 0 {
+        use nix::sys::stat::utimensat;
+        use nix::sys::time::TimeSpec;
+        let secs = target.mtime_unix_nanos.div_euclid(1_000_000_000);
+        let nsecs = target.mtime_unix_nanos.rem_euclid(1_000_000_000);
+        // i128 -> i64 cast: any mtime that doesn't fit in i64 seconds
+        // is pre-1970 or far-future garbage. Cap rather than panic.
+        let secs_i64: i64 = secs.try_into().unwrap_or(i64::MAX);
+        let nsecs_i64: i64 = nsecs.try_into().unwrap_or(0);
+        let ts = TimeSpec::new(secs_i64, nsecs_i64);
+        // UTIME_OMIT for atime; only mtime is restored.
+        let omit = TimeSpec::new(0, libc::UTIME_OMIT);
+        utimensat(
+            None,
+            path,
+            &omit,
+            &ts,
+            nix::sys::stat::UtimensatFlags::FollowSymlink,
+        )
+        .map_err(|e| format!("utimensat {path:?}: {e}"))?;
+    }
+
+    Ok(())
 }
 
 /// Monotonic-ish suffix for tmpfile names. We use nanoseconds since
@@ -309,6 +382,79 @@ mod tests {
         }
         // Target was never created.
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn restore_metadata_restores_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("perms");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+
+        // Pretend the captured mode was 0o600.
+        let captured = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+            size: 1,
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+        };
+        let op = InverseOp::RestoreMetadata {
+            inode: InodeRef::new(1, 1),
+            path: target.clone(),
+            target: captured,
+        };
+        let out = exec.execute(&op, false, ConflictPolicy::default());
+        assert_eq!(out, ExecutionOutcome::Applied, "{out:?}");
+
+        let m = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m, 0o600);
+    }
+
+    #[test]
+    fn restore_metadata_to_different_uid_fails_with_dr15_message() {
+        // Unprivileged tests can't chown to a uid we don't own, so this
+        // exercise's the EPERM->DR-15 message path.
+        if nix::unistd::geteuid().is_root() {
+            // Running as root would actually succeed; skip.
+            return;
+        }
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("foreign");
+        std::fs::write(&target, b"x").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+
+        // Pick a uid not equal to current uid. uid 0 is always a foreign
+        // uid for an unprivileged caller.
+        let foreign_uid = 0;
+        let captured = crate::metadata::FileMetadata {
+            mode: 0o100644,
+            uid: foreign_uid,
+            gid: nix::unistd::getgid().as_raw(),
+            size: 1,
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+        };
+        let op = InverseOp::RestoreMetadata {
+            inode: InodeRef::new(1, 1),
+            path: target,
+            target: captured,
+        };
+        match exec.execute(&op, false, ConflictPolicy::default()) {
+            ExecutionOutcome::Failed { err } => {
+                assert!(err.contains("DR-15"), "got: {err}");
+            }
+            other => panic!("expected Failed (DR-15), got {other:?}"),
+        }
     }
 
     #[test]

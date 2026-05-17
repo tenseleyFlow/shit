@@ -14,6 +14,11 @@ postcard = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# S11 executor: chown / chmod / utimensat. Used only on Unix-family targets;
+# the executor module is unix-only by construction (path semantics differ
+# enough on Windows that we'd want a separate impl, not a port).
+nix = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
