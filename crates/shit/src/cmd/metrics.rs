@@ -117,7 +117,10 @@ pub fn render_text(s: &MetricsSnapshot) -> String {
     let mut out = String::new();
     out.push_str("daemon\n");
     out.push_str(&format!("  pid                  {}\n", s.pid));
-    out.push_str(&format!("  uptime               {}\n", fmt_secs(s.uptime_secs)));
+    out.push_str(&format!(
+        "  uptime               {}\n",
+        fmt_secs(s.uptime_secs)
+    ));
     if !s.kernel_tier.is_empty() {
         out.push_str(&format!("  kernel tier          {}\n", s.kernel_tier));
     }
@@ -198,9 +201,7 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         s.hook_decode_errors
     ));
 
-    out.push_str(
-        "# HELP shit_hook_latency_microseconds Hook-handling latency percentiles (us).\n",
-    );
+    out.push_str("# HELP shit_hook_latency_microseconds Hook-handling latency percentiles (us).\n");
     out.push_str("# TYPE shit_hook_latency_microseconds summary\n");
     out.push_str(&format!(
         "shit_hook_latency_microseconds{{quantile=\"0.5\"}} {}\n",

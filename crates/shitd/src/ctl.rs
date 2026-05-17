@@ -287,12 +287,7 @@ fn metrics_snapshot(stats: &Stats, index: &Arc<Index>) -> shit_proto::MetricsSna
     let store_size_bytes = index.total_blob_size().unwrap_or(0);
     let store_blob_count = index.blob_count().unwrap_or(0);
     let store_command_count = index.command_count().unwrap_or(0);
-    stats.snapshot(
-        pid,
-        store_size_bytes,
-        store_blob_count,
-        store_command_count,
-    )
+    stats.snapshot(pid, store_size_bytes, store_blob_count, store_command_count)
 }
 
 /// Handle one package-manager hook event (S14.9). Pre events are
