@@ -1232,6 +1232,7 @@ dependencies = [
  "anyhow",
  "aya",
  "bitflags",
+ "blake3",
  "clap",
  "crossbeam-channel",
  "inotify",
