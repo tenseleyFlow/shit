@@ -179,11 +179,22 @@ async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
         "handshake complete"
     );
 
-    // S08.13 will spawn the fanotify event loop here using
-    // `setup.fanotify_fd`. For now we just stash it so the fd lives
-    // long enough; drop on shutdown closes it.
+    // Spawn the fanotify reader thread, if we have a privileged fd.
+    // The thread owns the read+write loop on the kernel fd; the async
+    // side talks to it via the shared `FanotifyState`. Reader exits
+    // when `state.shutdown()` is called (we trigger that below on the
+    // signal-handler shutdown path).
     #[cfg(target_os = "linux")]
-    let _fanotify_fd = setup.fanotify_fd;
+    let fanotify_state: Option<fanotify::runtime::FanotifyState> =
+        setup.fanotify_fd.map(|fd| {
+            let state = fanotify::runtime::FanotifyState::new(fd);
+            let reader_state = state.clone();
+            std::thread::Builder::new()
+                .name("fanotify-reader".into())
+                .spawn(move || fanotify::runtime::reader_thread(reader_state))
+                .expect("spawn fanotify reader");
+            state
+        });
 
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
@@ -192,9 +203,19 @@ async fn run(cli: Cli, setup: PrivilegedSetup) -> anyhow::Result<()> {
         _ = shutdown.notified() => {
             tracing::info!("shutdown signal received; exiting");
         }
-        // Placeholder: real event loop arrives in S06.4 + S07/8/9.
+        // Placeholder: real daemon-request loop arrives in S08.14.
         _ = idle(&conn) => {}
     }
+
+    // Signal the reader thread (if any) to wind down before we drop
+    // the FanotifyState. The thread exits within ~250ms (poll timeout).
+    #[cfg(target_os = "linux")]
+    if let Some(state) = &fanotify_state {
+        state.shutdown();
+    }
+    #[cfg(target_os = "linux")]
+    drop(fanotify_state);
+
     Ok(())
 }
 

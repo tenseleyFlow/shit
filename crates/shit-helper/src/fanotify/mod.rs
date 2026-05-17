@@ -21,6 +21,7 @@ pub mod init;
 pub mod mark;
 pub mod parse;
 pub mod queue;
+pub mod runtime;
 pub mod tree;
 
 // kernel_probe lives in `shit-capture::linux_kernel` so the `shit doctor`
