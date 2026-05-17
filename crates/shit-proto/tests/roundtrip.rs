@@ -279,6 +279,41 @@ fn db_event_req_with_large_statement_blob_encodes() {
 }
 
 #[test]
+fn metrics_snapshot_postcard_roundtrip() {
+    use shit_proto::{CtlResponse, MetricsSnapshot};
+    let snap = MetricsSnapshot {
+        uptime_secs: 3600,
+        pid: 12345,
+        hook_messages_received: 42,
+        hook_decode_errors: 0,
+        hook_latency_us_p50: 850,
+        hook_latency_us_p99: 9100,
+        hook_latency_samples: 42,
+        store_size_bytes: 1024 * 1024 * 17,
+        store_blob_count: 100,
+        store_command_count: 50,
+        last_gc_duration_ms: 142,
+        last_gc_bytes_reclaimed: 1024 * 1024,
+        last_gc_at_unix_secs: 1_700_000_000,
+        kernel_tier: "fanotify".into(),
+    };
+    let frame = encode_frame(&CtlResponse::Metrics(snap.clone())).unwrap();
+    let back: CtlResponse = decode_frame(&frame).unwrap();
+    match back {
+        CtlResponse::Metrics(r) => assert_eq!(r, snap),
+        other => panic!("expected Metrics, got {other:?}"),
+    }
+}
+
+#[test]
+fn metrics_request_postcard_roundtrip() {
+    use shit_proto::CtlRequest;
+    let frame = encode_frame(&CtlRequest::Metrics).unwrap();
+    let back: CtlRequest = decode_frame(&frame).unwrap();
+    assert!(matches!(back, CtlRequest::Metrics));
+}
+
+#[test]
 fn db_event_req_postcard_roundtrip() {
     use shit_proto::{CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase};
     use std::collections::BTreeMap;
