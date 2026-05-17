@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 
 mod config;
 mod ctl;
+mod helper_link;
 mod lock;
 mod server;
 mod stats;
