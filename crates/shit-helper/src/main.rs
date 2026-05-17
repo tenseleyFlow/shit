@@ -41,6 +41,7 @@ mod pkg;
 mod priv_linux;
 mod proc;
 mod sandbox;
+mod self_verify;
 #[cfg(target_os = "linux")]
 mod seccomp_linux;
 mod svc;
@@ -278,6 +279,39 @@ fn main() -> anyhow::Result<()> {
 
     // Crash hook: panics in worker tasks get a one-line summary on disk.
     crash::install_panic_hook(&sidecar.state_dir);
+
+    // S20.8 — self-signature gate. Defense-in-depth; on mismatch we
+    // log and continue (the daemon's handshake will surface the issue
+    // via degraded-mode reporting in `shit status`). Debug builds and
+    // platforms without `/proc/self/exe` get a `Skipped` outcome.
+    match self_verify::verify(&sidecar.state_dir) {
+        Ok(self_verify::VerifyOutcome::Match) => {
+            tracing::debug!("self-verify: baseline matched");
+        }
+        Ok(self_verify::VerifyOutcome::BaselineMissing { computed }) => {
+            tracing::info!(
+                "self-verify: baseline absent; install-time baseline-write missed. \
+                 Helper proceeds; operator should re-run install."
+            );
+            // Write the current hash so subsequent runs gate on it.
+            if let Err(e) = self_verify::write_baseline(&sidecar.state_dir, &computed) {
+                tracing::warn!(err = %e, "self-verify: baseline write failed");
+            }
+        }
+        Ok(self_verify::VerifyOutcome::Mismatch { computed, baseline }) => {
+            tracing::warn!(
+                expected = %baseline,
+                actual = %computed,
+                "self-verify: hash mismatch; helper continuing in degraded mode (see threat-model.md TC-8)"
+            );
+        }
+        Ok(self_verify::VerifyOutcome::Skipped { reason }) => {
+            tracing::debug!(reason, "self-verify: skipped");
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "self-verify: probe failed; continuing");
+        }
+    }
 
     // ---- privileged phase ----
     // Open any fd that requires `CAP_SYS_ADMIN` while we still have it,
