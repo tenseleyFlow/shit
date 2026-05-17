@@ -9,7 +9,7 @@
 use std::path::Path;
 
 pub fn enter(_state_dir: &Path) -> anyhow::Result<()> {
-    // S06.6 wires `crate::seccomp_linux::install_filter()` here.
-    tracing::debug!("linux sandbox stub (S06.6 fills in seccomp)");
+    crate::seccomp_linux::install_filter()
+        .map_err(|e| anyhow::anyhow!("seccomp filter install failed: {e}"))?;
     Ok(())
 }

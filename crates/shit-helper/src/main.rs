@@ -20,6 +20,8 @@ mod handshake;
 mod health;
 mod ipc;
 mod sandbox;
+#[cfg(target_os = "linux")]
+mod seccomp_linux;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
