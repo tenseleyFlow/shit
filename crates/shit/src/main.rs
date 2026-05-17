@@ -5,6 +5,7 @@ use shit_proto::ShellKind;
 use std::path::PathBuf;
 
 mod cmd;
+mod crash;
 mod doctor;
 mod exitcode;
 mod hooks;
@@ -207,6 +208,10 @@ fn detect_shell() -> Option<ShellKind> {
 }
 
 fn main() -> std::process::ExitCode {
+    // S21.8 — install panic hook first so any panic during
+    // tracing init or arg parsing produces a canonical crash file.
+    // No-op if state_dir isn't writable (sandboxed CI runs).
+    crash::install_panic_hook();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
