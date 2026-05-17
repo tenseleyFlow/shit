@@ -25,6 +25,13 @@ mod health;
 #[cfg(target_os = "linux")]
 mod inotify_supplement;
 mod ipc;
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+mod kqueue;
 #[cfg(target_os = "linux")]
 mod priv_linux;
 mod sandbox;
