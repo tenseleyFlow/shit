@@ -30,7 +30,7 @@ pub fn install_filter() -> Result<(), SeccompError> {
     let filter = build_filter()?;
     let program: BpfProgram = filter
         .try_into()
-        .map_err(|e: seccompiler::Error| SeccompError::Compiler(e.to_string()))?;
+        .map_err(|e: seccompiler::BackendError| SeccompError::Compiler(e.to_string()))?;
     seccompiler::apply_filter(&program).map_err(|e| SeccompError::Apply(e.to_string()))?;
     tracing::info!("seccomp filter installed");
     Ok(())
