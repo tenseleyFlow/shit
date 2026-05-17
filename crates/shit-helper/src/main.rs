@@ -382,6 +382,16 @@ fn linux_privileged_setup() -> (shit_proto::HelperCaps, Option<fanotify::Fanotif
     match fanotify::init_pre_content() {
         Ok(fd) => {
             tracing::info!("fanotify pre-content client opened");
+            // Intentionally *not* installing any mark here. Marks are
+            // a destructive operation on a live system — every
+            // process touching the marked filesystem stalls on the
+            // helper's response loop. Past incident (2026-05-17):
+            // marking `$HOME` at startup wedged the entire box until
+            // reboot. The lesson: marks must be scoped tightly and
+            // installed only when the daemon has explicitly asked
+            // for a watch via `HelperRequest::WatchTree` — never
+            // implicitly at startup. See HP-18 in
+            // `.docs/audits/helper-protocol.md`.
             (
                 shit_proto::HelperCaps {
                     watch_tree: true,
