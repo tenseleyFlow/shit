@@ -111,14 +111,33 @@ fn truncate(s: &str, max: usize) -> String {
 fn print_linux_kernel_tier() {
     match shit_capture::linux_kernel::probe() {
         Ok((version, features)) => {
-            println!("kernel: {version}  ({})", features.tier_label());
-            println!();
+            println!("kernel:   {version}  ({})", features.tier_label());
         }
         Err(e) => {
-            println!("kernel: probe failed ({e})");
-            println!();
+            println!("kernel:   probe failed ({e})");
         }
     }
+
+    let bpf = shit_capture::linux_kernel::probe_bpf_lsm();
+    println!("bpf-lsm:  {}", bpf.diagnose());
+    println!(
+        "  btf={}  active-lsm-includes-bpf={}  CONFIG_BPF_LSM={}",
+        bpf.btf_available,
+        bpf.bpf_in_active_lsm,
+        match bpf.config_bpf_lsm {
+            Some(true) => "y",
+            Some(false) => "n",
+            None => "unknown",
+        }
+    );
+    if let Some(hint) = bpf.cmdline_remediation_hint() {
+        println!();
+        println!("To enable BPF-LSM:");
+        for line in hint.lines() {
+            println!("  {line}");
+        }
+    }
+    println!();
 }
 
 /// Walk a path and print the doctor row for it. Useful from tests.
