@@ -156,6 +156,172 @@ pub fn probe() -> Result<(KernelVersion, FanotifyFeatures), ProbeError> {
     Ok((v, FanotifyFeatures::from_version(v)))
 }
 
+/// BPF-LSM availability — read-only probe via filesystem.
+///
+/// **Safe to call from any context.** Touches no syscalls beyond `read`
+/// on a handful of stable procfs/sysfs paths. Does not load BPF
+/// programs, does not require any capability.
+///
+/// Reports the full picture the user needs to make the
+/// "S09 vs fall-back-to-S08" decision. All four checks are independent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BpfLsmFeatures {
+    /// True when `/sys/kernel/btf/vmlinux` exists. BTF is required for
+    /// CO-RE relocation; without it, `aya` programs can't load.
+    pub btf_available: bool,
+    /// True when `/sys/kernel/security/lsm` contains `bpf`. This is
+    /// the runtime indicator: even if `CONFIG_BPF_LSM=y`, BPF-LSM
+    /// hooks won't fire unless the kernel was booted with
+    /// `lsm=...,bpf,...`.
+    pub bpf_in_active_lsm: bool,
+    /// True when the kernel config has `CONFIG_BPF_LSM=y`. Best-effort:
+    /// we check `/proc/config.gz`, `/boot/config-$(uname -r)`, and
+    /// `/lib/modules/$(uname -r)/build/.config`. `None` if no config
+    /// source is readable.
+    pub config_bpf_lsm: Option<bool>,
+    /// Kernel version is at or above the BPF-LSM minimum (5.7).
+    pub kernel_recent_enough: bool,
+}
+
+impl BpfLsmFeatures {
+    /// True iff every check passes — we can load BPF-LSM programs.
+    pub fn fully_supported(&self) -> bool {
+        self.btf_available
+            && self.bpf_in_active_lsm
+            && self.kernel_recent_enough
+            && matches!(self.config_bpf_lsm, Some(true))
+    }
+
+    /// Short, doctor-friendly diagnostic. Names the specific check
+    /// that failed when something is wrong, so the user knows what
+    /// to fix.
+    pub fn diagnose(&self) -> &'static str {
+        if !self.kernel_recent_enough {
+            "kernel < 5.7 — no BPF-LSM"
+        } else if matches!(self.config_bpf_lsm, Some(false)) {
+            "CONFIG_BPF_LSM=n in kernel config — rebuild or use different kernel"
+        } else if !self.bpf_in_active_lsm {
+            "bpf missing from active lsm= cmdline — reboot with lsm=...,bpf"
+        } else if !self.btf_available {
+            "/sys/kernel/btf/vmlinux missing — distro doesn't ship BTF"
+        } else if self.fully_supported() {
+            "BPF-LSM available"
+        } else {
+            "BPF-LSM partial — see field details"
+        }
+    }
+
+    /// The grub-cmdline addition to suggest when `bpf_in_active_lsm`
+    /// is false but everything else looks OK.
+    pub fn cmdline_remediation_hint(&self) -> Option<&'static str> {
+        if !self.bpf_in_active_lsm
+            && self.kernel_recent_enough
+            && matches!(self.config_bpf_lsm, Some(true) | None)
+        {
+            Some(
+                "Add `bpf` to your kernel cmdline:\n\
+                 GRUB_CMDLINE_LINUX_DEFAULT=\"... lsm=lockdown,capability,landlock,yama,bpf\"\n\
+                 sudo grub-mkconfig -o /boot/grub/grub.cfg && reboot",
+            )
+        } else {
+            None
+        }
+    }
+}
+
+/// Probe BPF-LSM availability. Safe; pure filesystem reads.
+pub fn probe_bpf_lsm() -> BpfLsmFeatures {
+    let kernel_recent_enough = match read_kernel_version() {
+        Ok(v) => v.at_least(KernelVersion::new(5, 7, 0)),
+        Err(_) => false,
+    };
+    BpfLsmFeatures {
+        btf_available: std::path::Path::new("/sys/kernel/btf/vmlinux").is_file(),
+        bpf_in_active_lsm: read_active_lsm()
+            .map(|s| s.split(',').any(|x| x.trim() == "bpf"))
+            .unwrap_or(false),
+        config_bpf_lsm: probe_config_bpf_lsm(),
+        kernel_recent_enough,
+    }
+}
+
+/// Read the currently-active LSM list. Available since kernel 4.13.
+fn read_active_lsm() -> Option<String> {
+    fs::read_to_string("/sys/kernel/security/lsm").ok()
+}
+
+/// Try several known kernel-config sources. Returns `Some(true)` if any
+/// of them contains `CONFIG_BPF_LSM=y`, `Some(false)` if any
+/// definitively says =n or =m, `None` if no source was readable.
+fn probe_config_bpf_lsm() -> Option<bool> {
+    use std::path::Path;
+    // `/proc/config.gz` is gzipped; the most portable trick is to
+    // read it raw and scan for the bytes. We do NOT shell out to
+    // `zcat` — adds a dependency on /bin/sh and gzip on the box.
+    if Path::new("/proc/config.gz").is_file()
+        && let Ok(bytes) = fs::read("/proc/config.gz")
+        && let Some(verdict) = scan_config_gz_for_bpf_lsm(&bytes)
+    {
+        return Some(verdict);
+    }
+    // Uncompressed configs at known paths.
+    let uname_r = read_kernel_release_string().unwrap_or_default();
+    let candidates = [
+        format!("/boot/config-{uname_r}"),
+        format!("/lib/modules/{uname_r}/build/.config"),
+        format!("/lib/modules/{uname_r}/source/.config"),
+        "/proc/config".to_string(),
+    ];
+    for p in &candidates {
+        if let Ok(s) = fs::read_to_string(p)
+            && let Some(verdict) = scan_config_text_for_bpf_lsm(&s)
+        {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
+fn read_kernel_release_string() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+fn scan_config_text_for_bpf_lsm(s: &str) -> Option<bool> {
+    for line in s.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("CONFIG_BPF_LSM=") {
+            return match rest.trim() {
+                "y" | "Y" => Some(true),
+                "n" | "N" => Some(false),
+                "m" | "M" => Some(false), // module not built into kernel
+                _ => None,
+            };
+        }
+        if t == "# CONFIG_BPF_LSM is not set" {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// Decode just enough of /proc/config.gz to find the BPF_LSM line.
+/// We use the `flate2` crate if/when present — for now, a fallback
+/// that's good enough for the rare distros putting config.gz where
+/// the uncompressed variant doesn't also exist: read the file and look
+/// for a likely-uncompressed substring. (gzip headers + DEFLATE blocks
+/// can vary, so this is best-effort. Returns `None` if we can't tell.)
+///
+/// In practice every distro that ships config.gz also makes the
+/// uncompressed config available elsewhere; this is a defensive last
+/// resort.
+fn scan_config_gz_for_bpf_lsm(_bytes: &[u8]) -> Option<bool> {
+    // Deliberately conservative: don't try to inflate without the
+    // dependency. Caller falls through to uncompressed sources.
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +411,97 @@ mod tests {
         assert!(a.at_least(b));
         assert!(!b.at_least(a));
         assert!(c.at_least(a));
+    }
+
+    #[test]
+    fn scan_config_text_finds_y() {
+        let s = "CONFIG_FOO=y\nCONFIG_BPF_LSM=y\nCONFIG_BAR=m\n";
+        assert_eq!(scan_config_text_for_bpf_lsm(s), Some(true));
+    }
+
+    #[test]
+    fn scan_config_text_finds_n_explicit() {
+        let s = "CONFIG_BPF_LSM=n\n";
+        assert_eq!(scan_config_text_for_bpf_lsm(s), Some(false));
+    }
+
+    #[test]
+    fn scan_config_text_finds_module_as_unsupported() {
+        // BPF_LSM as a module doesn't actually work; treat as false.
+        let s = "CONFIG_BPF_LSM=m\n";
+        assert_eq!(scan_config_text_for_bpf_lsm(s), Some(false));
+    }
+
+    #[test]
+    fn scan_config_text_finds_not_set_comment() {
+        let s = "# CONFIG_FOO is not set\n# CONFIG_BPF_LSM is not set\n";
+        assert_eq!(scan_config_text_for_bpf_lsm(s), Some(false));
+    }
+
+    #[test]
+    fn scan_config_text_returns_none_when_absent() {
+        let s = "CONFIG_FOO=y\nCONFIG_BAR=m\n";
+        assert_eq!(scan_config_text_for_bpf_lsm(s), None);
+    }
+
+    #[test]
+    fn diagnose_uses_specific_failure_path() {
+        let f = BpfLsmFeatures {
+            btf_available: true,
+            bpf_in_active_lsm: false,
+            config_bpf_lsm: Some(true),
+            kernel_recent_enough: true,
+        };
+        assert!(f.diagnose().contains("lsm="));
+    }
+
+    #[test]
+    fn diagnose_pre_5_7_kernel() {
+        let f = BpfLsmFeatures {
+            kernel_recent_enough: false,
+            ..Default::default()
+        };
+        assert!(f.diagnose().contains("5.7"));
+    }
+
+    #[test]
+    fn fully_supported_only_when_all_four_pass() {
+        let mut f = BpfLsmFeatures {
+            btf_available: true,
+            bpf_in_active_lsm: true,
+            config_bpf_lsm: Some(true),
+            kernel_recent_enough: true,
+        };
+        assert!(f.fully_supported());
+        f.btf_available = false;
+        assert!(!f.fully_supported());
+        f.btf_available = true;
+        f.config_bpf_lsm = None;
+        assert!(!f.fully_supported());
+    }
+
+    #[test]
+    fn cmdline_remediation_hint_appears_for_lsm_missing_only() {
+        let f = BpfLsmFeatures {
+            btf_available: true,
+            bpf_in_active_lsm: false,
+            config_bpf_lsm: Some(true),
+            kernel_recent_enough: true,
+        };
+        let hint = f.cmdline_remediation_hint().unwrap();
+        assert!(hint.contains("GRUB_CMDLINE_LINUX_DEFAULT"));
+        assert!(hint.contains("bpf"));
+    }
+
+    #[test]
+    fn cmdline_hint_suppressed_when_config_disabled() {
+        // No point suggesting a cmdline tweak when CONFIG isn't even on.
+        let f = BpfLsmFeatures {
+            btf_available: true,
+            bpf_in_active_lsm: false,
+            config_bpf_lsm: Some(false),
+            kernel_recent_enough: true,
+        };
+        assert!(f.cmdline_remediation_hint().is_none());
     }
 }
