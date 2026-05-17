@@ -1,0 +1,11 @@
+// apt/dpkg hook config — drop into /etc/apt/apt.conf.d/99shit
+//
+// Fires `shit-helper pkg-event apt {pre,post}` before and after
+// every dpkg invocation. The helper is hook-friendly: it never
+// breaks the apt transaction on its own failures (see
+// crates/shit-helper/src/pkg/mod.rs).
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+DPkg::Pre-Invoke { "/usr/local/bin/shit-helper pkg-event apt pre || true"; };
+DPkg::Post-Invoke { "/usr/local/bin/shit-helper pkg-event apt post || true"; };

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# brew wrapper — installed to $XDG_CONFIG_HOME/shit/bin/brew and
+# PATH-prepended by the shell hook. Real brew lives at the homebrew
+# prefix and is invoked unchanged; we just bracket it with the pkg-
+# event hook.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+
+# Find the real brew, skipping ourselves. Standard prefixes on
+# macOS:
+#   /opt/homebrew/bin/brew   (arm64)
+#   /usr/local/bin/brew      (x86_64 + Linux brew)
+real_brew=""
+for cand in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+    if [[ -x "$cand" ]]; then
+        real_brew="$cand"
+        break
+    fi
+done
+
+if [[ -z "$real_brew" ]]; then
+    echo "shit-brew-wrapper: real brew not found in standard prefixes" >&2
+    exit 127
+fi
+
+# Only bracket commands that mutate state. `brew list`, `brew search`,
+# `brew --version` etc. don't need a hook firing — those are noisy
+# and don't change anything.
+case "${1:-}" in
+    install|uninstall|reinstall|upgrade|tap|untap|pin|unpin|link|unlink)
+        "$HELPER" pkg-event brew pre 2>/dev/null || true
+        "$real_brew" "$@"
+        rc=$?
+        "$HELPER" pkg-event brew post 2>/dev/null || true
+        exit "$rc"
+        ;;
+    *)
+        exec "$real_brew" "$@"
+        ;;
+esac

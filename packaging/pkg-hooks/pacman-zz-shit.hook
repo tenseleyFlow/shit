@@ -1,0 +1,35 @@
+# pacman hook — drop into /usr/share/libalpm/hooks/zz-shit.hook
+#
+# Fires PreTransaction and PostTransaction. The `zz-` prefix sorts
+# the hook last so other hooks (e.g. systemd reload) run first; we
+# only need to observe state, not influence it.
+#
+# We deliberately do NOT set `AbortOnFail` — shit's hook failures
+# must never break the user's pacman transaction. The hook script
+# itself is best-effort.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Recording for shit undo (pre)
+When = PreTransaction
+Exec = /usr/bin/sh -c '/usr/local/bin/shit-helper pkg-event pacman pre || true'
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Recording for shit undo (post)
+When = PostTransaction
+Exec = /usr/bin/sh -c '/usr/local/bin/shit-helper pkg-event pacman post || true'
