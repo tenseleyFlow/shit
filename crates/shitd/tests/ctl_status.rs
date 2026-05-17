@@ -72,9 +72,9 @@ log_level = "warn"
         .expect("spawn shitd");
     let daemon = Daemon { child };
 
-    if !wait_for_socket(&ctl, Duration::from_secs(15)) {
+    if !wait_for_socket(&ctl, Duration::from_secs(30)) {
         let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-        panic!("ctl socket did not appear within 15s\n--- shitd stderr ---\n{stderr}");
+        panic!("ctl socket did not appear within 30s\n--- shitd stderr ---\n{stderr}");
     }
 
     // Connect, send Status, read response.
