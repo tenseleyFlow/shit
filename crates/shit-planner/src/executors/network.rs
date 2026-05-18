@@ -190,6 +190,7 @@ pub fn full_reload_argv(tool: NetworkTool, dump_path: &std::path::Path) -> Vec<S
         | NetworkTool::IpAddr
         | NetworkTool::IpLink
         | NetworkTool::Route
+        | NetworkTool::Ifconfig
         | NetworkTool::Networksetup => {
             // DiffApply tools should not reach this synthesizer.
             // Return an obviously-bogus argv so a misroute

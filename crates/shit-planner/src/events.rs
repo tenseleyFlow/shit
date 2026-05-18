@@ -193,6 +193,7 @@ pub enum NetworkTool {
     IpAddr,
     IpLink,
     Route,
+    Ifconfig,
     Networksetup,
 }
 

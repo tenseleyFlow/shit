@@ -56,6 +56,7 @@ pub fn restore_method(tool: NetworkTool) -> RestoreMethod {
         | NetworkTool::IpAddr
         | NetworkTool::IpLink
         | NetworkTool::Route
+        | NetworkTool::Ifconfig
         | NetworkTool::Networksetup => RestoreMethod::DiffApply,
     }
 }
