@@ -129,7 +129,7 @@ async fn handle_client(
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash, &active, &index),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
-        CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash),
+        CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
     };
     let frame = encode_frame(&resp)?;
@@ -357,7 +357,9 @@ fn handle_proc_event(
 fn handle_db_event(
     req: shit_proto::DbEventReq,
     db_stash: &crate::db_track::DbPreStash,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
 ) -> CtlResponse {
-    let _ = crate::db_track::handle(db_stash, req);
+    let _ = crate::db_track::handle(db_stash, req, active, index);
     CtlResponse::DbEventAck
 }
