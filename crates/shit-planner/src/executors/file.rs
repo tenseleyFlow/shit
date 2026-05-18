@@ -27,23 +27,44 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::executor::{BlobReader, ConflictPolicy, ExecutionOutcome, InverseOpExecutor};
+use crate::executor::{
+    BlobReader, ConflictPolicy, ExecutionOutcome, InverseOpExecutor, NoOpPrivilegedOpRouter,
+    PrivilegedOpOutcome, PrivilegedOpRouter,
+};
 use crate::inode::BlobHash;
 use crate::inverse::{InverseOp, InverseTier};
 
 /// File-tier executor. Cheap to construct; holds a reference to the
 /// blob reader so per-op calls don't pass it through.
-pub struct FileExecutor<'a, R: BlobReader> {
+pub struct FileExecutor<'a, R: BlobReader, P: PrivilegedOpRouter = NoOpPrivilegedOpRouter> {
     blob_reader: &'a R,
+    privileged_router: P,
 }
 
-impl<'a, R: BlobReader> FileExecutor<'a, R> {
+impl<'a, R: BlobReader> FileExecutor<'a, R, NoOpPrivilegedOpRouter> {
+    /// Construct without a helper-IPC route. EPERM on chown surfaces
+    /// as `Failed { err }`; the executor never blocks waiting on a
+    /// helper that doesn't exist.
     pub fn new(blob_reader: &'a R) -> Self {
-        Self { blob_reader }
+        Self {
+            blob_reader,
+            privileged_router: NoOpPrivilegedOpRouter,
+        }
     }
 }
 
-impl<R: BlobReader> InverseOpExecutor for FileExecutor<'_, R> {
+impl<'a, R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'a, R, P> {
+    /// Construct with a privileged-op router (DR-15). The daemon
+    /// wires up a router that forwards to `shit-helper`.
+    pub fn with_privileged_router(blob_reader: &'a R, privileged_router: P) -> Self {
+        Self {
+            blob_reader,
+            privileged_router,
+        }
+    }
+}
+
+impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_, R, P> {
     fn supports(&self, op: &InverseOp) -> bool {
         op.tier() == InverseTier::Files
     }
@@ -73,7 +94,7 @@ impl<R: BlobReader> InverseOpExecutor for FileExecutor<'_, R> {
     }
 }
 
-impl<R: BlobReader> FileExecutor<'_, R> {
+impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
     fn apply_restore_content(&self, op: &InverseOp) -> ExecutionOutcome {
         let InverseOp::RestoreContent { path, blob, .. } = op else {
             return ExecutionOutcome::Failed {
@@ -140,7 +161,38 @@ impl<R: BlobReader> FileExecutor<'_, R> {
         };
         match restore_metadata_inner(path, target) {
             Ok(()) => ExecutionOutcome::Applied,
-            Err(e) => ExecutionOutcome::Failed { err: e },
+            Err(MetadataRestoreError::ChownNeedsPrivilege { uid, gid }) => {
+                // DR-15: retry via the helper IPC router.
+                match self.privileged_router.chown(path, uid, gid, false) {
+                    PrivilegedOpOutcome::Applied => {
+                        // chown via helper succeeded; finish the mtime
+                        // half ourselves.
+                        match restore_mtime_only(path, target) {
+                            Ok(()) => ExecutionOutcome::Applied,
+                            Err(e) => ExecutionOutcome::Failed { err: e },
+                        }
+                    }
+                    PrivilegedOpOutcome::OutOfScope => ExecutionOutcome::Failed {
+                        err: format!(
+                            "chown {path:?} -> uid={uid} gid={gid}: helper refused (out of session scope)"
+                        ),
+                    },
+                    PrivilegedOpOutcome::PermissionDenied => ExecutionOutcome::Failed {
+                        err: format!(
+                            "chown {path:?} -> uid={uid} gid={gid}: EPERM (helper also lacks privilege)"
+                        ),
+                    },
+                    PrivilegedOpOutcome::NotFound => ExecutionOutcome::Failed {
+                        err: format!(
+                            "chown {path:?}: ENOENT (path vanished between capture and undo)"
+                        ),
+                    },
+                    PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
+                        err: format!("chown {path:?} via helper: {err}"),
+                    },
+                }
+            }
+            Err(MetadataRestoreError::Other(e)) => ExecutionOutcome::Failed { err: e },
         }
     }
 
@@ -205,71 +257,76 @@ impl<R: BlobReader> FileExecutor<'_, R> {
     }
 }
 
-/// Restore the captured mode/uid/gid/mtime onto `path`.
-///
-/// **What stage 1 restores:** mode (chmod), uid + gid (chown), mtime
-/// (utimensat). **What it defers:** xattrs and ACLs — both need
-/// per-platform handling we'd rather implement once we have a real
-/// integration test pass (see DR-* in DEFERRED-RUNTIME.md).
-///
-/// **Privilege failure mode:** when the chown would require
-/// CAP_CHOWN or root (target uid/gid differs from caller's), Linux
-/// returns EPERM. We surface that as a `Failed { err }` mentioning
-/// the helper-IPC privileged-op routing (DR-15). No silent skip.
+/// Categorised metadata-restore failure. `ChownNeedsPrivilege` is the
+/// DR-15 signal: caller (the executor) retries via the helper IPC
+/// router, then finishes the mtime half via [`restore_mtime_only`].
+/// Everything else is a hard failure with a human-readable message.
+#[derive(Debug)]
+pub(crate) enum MetadataRestoreError {
+    ChownNeedsPrivilege { uid: u32, gid: u32 },
+    Other(String),
+}
+
+/// Restore mode + chown + mtime. On EPERM during chown, returns
+/// [`MetadataRestoreError::ChownNeedsPrivilege`] so the executor can
+/// route through the helper. mode and mtime are applied before the
+/// chown returns the signal (mtime restoration happens via the
+/// post-router path); any other error becomes `Other(err)`.
 fn restore_metadata_inner(
     path: &Path,
     target: &crate::metadata::FileMetadata,
-) -> Result<(), String> {
+) -> Result<(), MetadataRestoreError> {
     use std::os::unix::fs::PermissionsExt;
 
-    // Mode. Stripping the file-type bits is intentional — chmod takes
-    // only the permission bits; the type lives in the inode and is
-    // immutable from userspace.
     let mode_only = target.mode & 0o7777;
     let perms = std::fs::Permissions::from_mode(mode_only);
-    fs::set_permissions(path, perms)
-        .map_err(|e| format!("chmod {path:?} -> {mode_only:o}: {e}"))?;
-
-    // uid + gid. nix::unistd::chown follows symlinks (calls chown(2),
-    // not lchown(2)). For a symlink target's metadata we'd want
-    // lchown — defer that case until the integration sprint.
-    let uid = Some(nix::unistd::Uid::from_raw(target.uid));
-    let gid = Some(nix::unistd::Gid::from_raw(target.gid));
-    nix::unistd::chown(path, uid, gid).map_err(|e| match e {
-        nix::errno::Errno::EPERM => format!(
-            "chown {path:?} -> uid={} gid={}: EPERM (needs helper-IPC privileged-op routing, DR-15)",
-            target.uid, target.gid
-        ),
-        other => format!(
-            "chown {path:?} -> uid={} gid={}: {other}",
-            target.uid, target.gid
-        ),
+    fs::set_permissions(path, perms).map_err(|e| {
+        MetadataRestoreError::Other(format!("chmod {path:?} -> {mode_only:o}: {e}"))
     })?;
 
-    // mtime. Skip atime restoration — it's not captured.
-    if target.mtime_unix_nanos > 0 {
-        use nix::sys::stat::utimensat;
-        use nix::sys::time::TimeSpec;
-        let secs = target.mtime_unix_nanos.div_euclid(1_000_000_000);
-        let nsecs = target.mtime_unix_nanos.rem_euclid(1_000_000_000);
-        // i128 -> i64 cast: any mtime that doesn't fit in i64 seconds
-        // is pre-1970 or far-future garbage. Cap rather than panic.
-        let secs_i64: i64 = secs.try_into().unwrap_or(i64::MAX);
-        let nsecs_i64: i64 = nsecs.try_into().unwrap_or(0);
-        let ts = TimeSpec::new(secs_i64, nsecs_i64);
-        // UTIME_OMIT for atime; only mtime is restored.
-        let omit = TimeSpec::new(0, libc::UTIME_OMIT);
-        utimensat(
-            None,
-            path,
-            &omit,
-            &ts,
-            nix::sys::stat::UtimensatFlags::FollowSymlink,
-        )
-        .map_err(|e| format!("utimensat {path:?}: {e}"))?;
+    let uid = Some(nix::unistd::Uid::from_raw(target.uid));
+    let gid = Some(nix::unistd::Gid::from_raw(target.gid));
+    match nix::unistd::chown(path, uid, gid) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EPERM) => {
+            return Err(MetadataRestoreError::ChownNeedsPrivilege {
+                uid: target.uid,
+                gid: target.gid,
+            });
+        }
+        Err(other) => {
+            return Err(MetadataRestoreError::Other(format!(
+                "chown {path:?} -> uid={} gid={}: {other}",
+                target.uid, target.gid
+            )));
+        }
     }
 
-    Ok(())
+    restore_mtime_only(path, target).map_err(MetadataRestoreError::Other)
+}
+
+/// Apply mtime alone — used after a successful helper-routed chown
+/// to finish the metadata-restore sequence.
+fn restore_mtime_only(path: &Path, target: &crate::metadata::FileMetadata) -> Result<(), String> {
+    if target.mtime_unix_nanos == 0 {
+        return Ok(());
+    }
+    use nix::sys::stat::utimensat;
+    use nix::sys::time::TimeSpec;
+    let secs = target.mtime_unix_nanos.div_euclid(1_000_000_000);
+    let nsecs = target.mtime_unix_nanos.rem_euclid(1_000_000_000);
+    let secs_i64: i64 = secs.try_into().unwrap_or(i64::MAX);
+    let nsecs_i64: i64 = nsecs.try_into().unwrap_or(0);
+    let ts = TimeSpec::new(secs_i64, nsecs_i64);
+    let omit = TimeSpec::new(0, libc::UTIME_OMIT);
+    utimensat(
+        None,
+        path,
+        &omit,
+        &ts,
+        nix::sys::stat::UtimensatFlags::FollowSymlink,
+    )
+    .map_err(|e| format!("utimensat {path:?}: {e}"))
 }
 
 /// Remove `path`. Auto-detects file-vs-directory via lstat so the
@@ -661,11 +718,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_metadata_to_different_uid_fails_with_dr15_message() {
-        // Unprivileged tests can't chown to a uid we don't own, so this
-        // exercise's the EPERM->DR-15 message path.
+    fn restore_metadata_to_different_uid_without_router_surfaces_eperm() {
+        // Unprivileged tests can't chown to a uid we don't own, so
+        // this exercises the EPERM → no-op-router PermissionDenied
+        // path. With a real helper-IPC router the chown would
+        // succeed; without one, the EPERM propagates as Failed.
         if nix::unistd::geteuid().is_root() {
-            // Running as root would actually succeed; skip.
             return;
         }
         let tmpdir = tempfile::tempdir().expect("tempdir");
@@ -673,14 +731,90 @@ mod tests {
         std::fs::write(&target, b"x").unwrap();
 
         let reader = InMemoryBlobReader::new();
-        let exec = FileExecutor::new(&reader);
-
-        // Pick a uid not equal to current uid. uid 0 is always a foreign
-        // uid for an unprivileged caller.
+        let exec = FileExecutor::new(&reader); // NoOpPrivilegedOpRouter
         let foreign_uid = 0;
         let captured = crate::metadata::FileMetadata {
             mode: 0o100644,
             uid: foreign_uid,
+            gid: nix::unistd::getgid().as_raw(),
+            size: 1,
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+        };
+        let op = InverseOp::RestoreMetadata {
+            inode: InodeRef::new(1, 1),
+            path: target.clone(),
+            target: captured,
+        };
+        match exec.execute(&op, false, ConflictPolicy::default()) {
+            ExecutionOutcome::Failed { err } => {
+                assert!(err.contains("chown"), "expected chown error, got: {err}");
+                assert!(err.contains("EPERM"), "expected EPERM mention, got: {err}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_metadata_with_router_retries_via_chown_route() {
+        // DR-15: when the local chown EPERMs, the executor falls
+        // back to the privileged-op router. With the in-memory
+        // router returning Applied, the overall outcome is Applied
+        // and the router records the call.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("foreign");
+        std::fs::write(&target, b"x").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let router = crate::executor::InMemoryPrivilegedOpRouter::new();
+        router.set_outcome(PrivilegedOpOutcome::Applied);
+        let exec = FileExecutor::with_privileged_router(&reader, router);
+        let captured = crate::metadata::FileMetadata {
+            mode: 0o100644,
+            uid: 0,
+            gid: nix::unistd::getgid().as_raw(),
+            size: 1,
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+        };
+        let op = InverseOp::RestoreMetadata {
+            inode: InodeRef::new(1, 1),
+            path: target.clone(),
+            target: captured,
+        };
+        let outcome = exec.execute(&op, false, ConflictPolicy::default());
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        let log = exec.privileged_router.chown_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0, target);
+        assert_eq!(log[0].1, 0);
+        assert!(
+            !log[0].3,
+            "no_dereference should be false for a regular file"
+        );
+    }
+
+    #[test]
+    fn restore_metadata_with_router_out_of_scope_surfaces_clear_error() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("foreign");
+        std::fs::write(&target, b"x").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let router = crate::executor::InMemoryPrivilegedOpRouter::new();
+        router.set_outcome(PrivilegedOpOutcome::OutOfScope);
+        let exec = FileExecutor::with_privileged_router(&reader, router);
+        let captured = crate::metadata::FileMetadata {
+            mode: 0o100644,
+            uid: 0,
             gid: nix::unistd::getgid().as_raw(),
             size: 1,
             mtime_unix_nanos: 0,
@@ -694,9 +828,9 @@ mod tests {
         };
         match exec.execute(&op, false, ConflictPolicy::default()) {
             ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("DR-15"), "got: {err}");
+                assert!(err.contains("out of session scope"), "got: {err}");
             }
-            other => panic!("expected Failed (DR-15), got {other:?}"),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
