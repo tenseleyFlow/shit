@@ -20,6 +20,7 @@ pub mod inode;
 pub mod inverse;
 pub mod metadata;
 pub mod network;
+pub mod network_diff;
 pub mod orchestrator;
 pub mod plan;
 pub mod probe;
