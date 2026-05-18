@@ -24,6 +24,7 @@ pub mod network;
 pub mod network_diff;
 pub mod orchestrator;
 pub mod plan;
+pub mod plan_forward;
 pub mod probe;
 pub mod probe_live;
 pub mod proc;
