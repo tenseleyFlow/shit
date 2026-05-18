@@ -23,6 +23,7 @@ mod server;
 mod stats;
 mod svc_track;
 mod telemetry;
+mod tracing_ring_layer;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -97,7 +98,13 @@ fn main() -> anyhow::Result<()> {
     // (daily rotation) + a stderr fallback for warn+ events. The
     // returned guard MUST live until shutdown — dropping it stops
     // the appender's worker thread.
-    let _log_guard = log_setup::init(&resolved.state_dir, &resolved.log_level);
+    // DR-68: pass the crash ring so each event also lands in the
+    // panic-hook tail buffer.
+    let _log_guard = log_setup::init(
+        &resolved.state_dir,
+        &resolved.log_level,
+        crash::ring(),
+    );
 
     // S21.6 — surface OTLP feature/config drift loudly. If the
     // operator set `[telemetry] otlp_endpoint` but the daemon wasn't
