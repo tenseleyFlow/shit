@@ -10,6 +10,7 @@
 //! See `.docs/sprints/S03-undo-planner-spec.md` for the design and
 //! `.docs/audits/planner-spec.md` for the longer rationale.
 
+pub mod cohort;
 pub mod db;
 pub mod env;
 pub mod events;
