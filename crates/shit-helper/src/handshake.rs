@@ -11,6 +11,43 @@ use std::os::fd::RawFd;
 
 use crate::ipc::{Conn, ConnError};
 
+/// Per-platform capture-tier classifier reported in the handshake
+/// ack (DR-66). The string surfaces in `shit metrics` and the
+/// telemetry stream so operators can tell *which* tier is actually
+/// running — Linux can degrade from bpf-lsm → fanotify → inotify;
+/// FreeBSD's preload-shim is best-effort; the daemon needs to know.
+///
+/// Stage 1 returns the compile-time tier expectation. When the real
+/// runtime probes land (DR-01..DR-13), the classifier becomes a
+/// runtime check and the cfg gating moves into the per-tier modules.
+pub fn kernel_tier_classifier() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        // DR-01..04 light up bpf-lsm; until then the helper falls
+        // back to fanotify-perm (DR-08). The string mirrors the
+        // expected production tier so the operator sees the right
+        // banner during Stage 1 even though the runtime is degraded.
+        "fanotify"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // DR-12 lights up EndpointSecurity. Stage 1 helper runs
+        // without the entitlement; the tier string is still
+        // "endpoint-security" because that's the *intended* tier —
+        // when the runtime falls back, the helper updates the
+        // string to "degraded" before sending the ack.
+        "endpoint-security"
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        "kqueue"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        "unsupported"
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
     #[error("ipc: {0}")]
@@ -102,6 +139,7 @@ pub fn perform_helper_side(
         protocol_version: HELPER_PROTOCOL_VERSION,
         granted,
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
+        kernel_tier: kernel_tier_classifier().to_string(),
     };
     conn.send_response(&ack)?;
 
@@ -133,6 +171,7 @@ pub fn perform_daemon_side(
         protocol_version,
         granted,
         helper_version: _,
+        kernel_tier: _,
     } = resp
     else {
         return Err(HandshakeError::NotHandshake);
