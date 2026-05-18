@@ -57,6 +57,29 @@ struct Cli {
     sock: Option<PathBuf>,
 }
 
+/// DR-66: per-OS classifier the daemon uses to prime
+/// `Stats::kernel_tier` at startup. Mirrors
+/// `shit_helper::handshake::kernel_tier_classifier`; once the helper
+/// links up it overwrites this with its own runtime probe result.
+const fn daemon_kernel_tier_default() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "fanotify"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "endpoint-security"
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        "kqueue"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        "unsupported"
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -126,6 +149,12 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let _root_guard = root_span.enter();
 
     let stats = stats::Stats::new();
+    // DR-66: prime the kernel-tier banner with the compile-time
+    // expectation. When `helper_link::spawn_and_handshake` actually
+    // runs (DR-01..DR-13 wiring), the helper's reported tier
+    // overrides this via `Stats::set_kernel_tier` from the handshake
+    // ack.
+    stats.set_kernel_tier(daemon_kernel_tier_default());
     let shutdown = Arc::new(Notify::new());
 
     let index_path = cfg.state_dir.join("index.sqlite");
