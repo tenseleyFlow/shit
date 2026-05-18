@@ -132,6 +132,47 @@ pub enum CaptureEventKind {
         parent_pid: u32,
         signal: Option<i32>,
     },
+    /// DB CLI shim event (S19, DR-58). Captures a list of statements
+    /// that crossed a `psql`/`mysql`/`sqlite3` invocation. Informational
+    /// only — the planner emits an [`crate::inverse::InverseOp::DbNote`]
+    /// pointing the user at a manual rollback. For sqlite3 the file
+    /// tier captures the database file directly and the DbOp is a
+    /// hint for renderable context.
+    DbOp {
+        engine: DbEngine,
+        /// Connection target (db name for psql/mysql; file path for sqlite3).
+        target: String,
+        statements: Vec<String>,
+        /// Engine-observed transaction state delta. `Unknown` when
+        /// the engine probe (DR-56/57) wasn't wired or returned no info.
+        transaction_state: DbTxState,
+    },
+}
+
+/// Mirror of [`shit_proto::DbEngineWire`] on the planner side so
+/// events can serialize without dragging the wire crate into the
+/// planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DbEngine {
+    Postgres,
+    Mysql,
+    Sqlite3,
+}
+
+/// Mirror of [`shit_proto::DbTxStateWire`]. Drives the renderer's
+/// "rollback may not be required (transaction rolled back)" hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DbTxState {
+    /// Autocommit-on session; each statement is its own tx.
+    AutoCommit,
+    /// Engine reported commit during this command.
+    Committed,
+    /// Engine reported rollback during this command.
+    RolledBack,
+    /// Tx opened but not closed by the captured invocation.
+    Unfinished,
+    /// Engine probe wasn't wired or didn't return a state.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
