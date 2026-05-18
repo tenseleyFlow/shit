@@ -42,6 +42,7 @@ hdrhistogram = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
