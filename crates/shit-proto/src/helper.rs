@@ -137,6 +137,35 @@ pub enum HelperRequest {
     Shutdown {
         reason: String,
     },
+    /// DR-15 privileged-op routing: ask the helper to chown a path
+    /// the daemon's unprivileged FileExecutor couldn't touch (target
+    /// uid/gid differs from the daemon's effective uid, kernel
+    /// returned EPERM). Helper validates the path is under the
+    /// session's watched scope before applying.
+    ApplyChown {
+        session: Uuid,
+        command_seq: u64,
+        path: String,
+        uid: u32,
+        gid: u32,
+        /// `true` = call lchown(2) instead of chown(2). The executor
+        /// passes `true` when the target is a symlink — the captured
+        /// metadata is the symlink's, not the target's.
+        no_dereference: bool,
+    },
+    /// DR-15 privileged-op routing: mknod for character/block special
+    /// files and FIFOs. Same audit shape as ApplyChown — helper
+    /// rejects when the path escapes the watched scope.
+    ApplyMknod {
+        session: Uuid,
+        command_seq: u64,
+        path: String,
+        /// `S_IFCHR | S_IFBLK | S_IFIFO` plus the permission bits.
+        mode: u32,
+        /// Major + minor packed via libc::makedev. Ignored when
+        /// `mode` indicates a FIFO.
+        dev: u64,
+    },
 }
 
 /// Helper → daemon message catalog. The helper reports its capabilities,
@@ -176,6 +205,13 @@ pub enum HelperResponse {
         inode: u64,
         requesting_pid: u32,
     },
+    /// DR-15 result of `ApplyChown` / `ApplyMknod`. Helper either
+    /// applied the op or refused with a category.
+    PrivilegedOpResult {
+        session: Uuid,
+        command_seq: u64,
+        outcome: PrivilegedOpOutcome,
+    },
     Pong {
         nonce: u64,
     },
@@ -189,6 +225,25 @@ pub enum HelperResponse {
     Error {
         message: String,
     },
+}
+
+/// DR-15 helper-applied result for a privileged-op request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrivilegedOpOutcome {
+    /// Helper applied the op.
+    Applied,
+    /// Helper refused: target path escaped the session's watched
+    /// scope. Likely an executor or planner bug — surfaces as a
+    /// clear error rather than silent success.
+    OutOfScope,
+    /// Helper attempted the op but the kernel still refused (e.g.,
+    /// helper isn't running as root and the target uid still
+    /// requires CAP_CHOWN). Caller surfaces as a Conflict.
+    PermissionDenied,
+    /// Path no longer exists. Race between capture and undo.
+    NotFound,
+    /// Any other helper-side failure.
+    Failed { err: String },
 }
 
 /// Daemon's verdict on a pending kernel auth event.
