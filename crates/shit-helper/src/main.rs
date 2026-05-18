@@ -779,6 +779,32 @@ fn request_loop(
             HelperRequest::Handshake { .. } => {
                 tracing::warn!("unexpected duplicate Handshake; ignoring");
             }
+            // DR-15 wire surface lands here. The actual sandboxed
+            // chown / mknod implementation is gated on DR-12 (macOS
+            // entitlement) and DR-01..04 (Linux LSM); until then we
+            // refuse and surface PermissionDenied so the executor
+            // gets a clear signal.
+            HelperRequest::ApplyChown {
+                session,
+                command_seq,
+                ..
+            }
+            | HelperRequest::ApplyMknod {
+                session,
+                command_seq,
+                ..
+            } => {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    "privileged-op request received but helper runtime is not yet wired (DR-15 stage-1)"
+                );
+                let _ = conn.send_response(&HelperResponse::PrivilegedOpResult {
+                    session,
+                    command_seq,
+                    outcome: shit_proto::PrivilegedOpOutcome::PermissionDenied,
+                });
+            }
         }
     }
 }
