@@ -166,13 +166,12 @@ pub fn run(kind: HookSendKind) -> Result<()> {
             sock,
         ),
         HookSendKind::PreExecEnv { session, seq, sock } => {
-            let block = read_env_block_from_stdin()?;
-            let env_hash = shit_planner::hash_env_block(&block);
+            let env_block = read_env_block_from_stdin()?;
             (
                 HookMessage::PreExecEnv {
                     session,
                     seq,
-                    env_hash,
+                    env_block,
                     ts_unix_nanos: ts_now(),
                 },
                 sock,
