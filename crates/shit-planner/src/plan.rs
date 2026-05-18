@@ -56,6 +56,12 @@ pub fn plan(
         emit_for_event(ev, probe, store, &mut nodes, &mut warnings);
     }
 
+    // DR-14: partition nodes into cohorts so the orchestrator's
+    // `run_parallel` only runs commuting ops concurrently. Without
+    // this pass every node would land in cohort 0 and the parallel
+    // path would race conflicting ops on the same path/inode.
+    crate::cohort::assign_cohorts(&mut nodes);
+
     UndoPlan {
         command,
         nodes,
