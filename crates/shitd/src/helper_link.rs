@@ -58,6 +58,12 @@ pub struct HelperLink {
     pub helper_pid: u32,
     pub helper_uid: u32,
     pub granted: HelperCaps,
+    /// Capture-tier classifier the helper reported in the handshake
+    /// (DR-66). E.g. `"fanotify"`, `"bpf-lsm"`, `"endpoint-security"`,
+    /// `"kqueue"`. Forwarded to `Stats::set_kernel_tier` after
+    /// link-up so `shit metrics` and the structured log stream
+    /// surface what's actually running.
+    pub kernel_tier: String,
 }
 
 impl HelperLink {
@@ -173,6 +179,7 @@ pub fn spawn_and_handshake(
         protocol_version,
         granted,
         helper_version: _,
+        kernel_tier,
     } = resp
     else {
         return Err(HelperLinkError::NotHandshakeAck);
@@ -190,6 +197,7 @@ pub fn spawn_and_handshake(
         helper_pid,
         helper_uid,
         granted,
+        kernel_tier,
     })
 }
 
