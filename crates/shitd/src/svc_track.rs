@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Service-manager hook ingestion on the daemon side (S16.6).
+//! Service-manager hook ingestion on the daemon side (S16.6, DR-36).
 //!
-//! Mirrors [`crate::pkg`] and [`crate::env_track`]: an in-memory
-//! Pre stash keyed by `(pid, unit)`, Post pairs and computes the
-//! before/after diff, journal-write under `(session, seq)` is
-//! deferred (DR-36 — same family as DR-25 / DR-32).
+//! Mirrors [`crate::pkg`]: an in-memory Pre stash keyed by
+//! `(pid, unit)`, Post pairs and computes the before/after diff,
+//! resolves the active command via [`ActiveCommands`] and writes a
+//! [`CaptureEventKind::SystemdOp`] under `(session, seq)`.
 //!
 //! The pid+unit key is the right granularity: a single shell may
 //! run `systemctl start a.service && systemctl start b.service`,
@@ -18,8 +18,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId, SystemdScope};
 use shit_planner::{ServiceState, parse_launchctl_print, parse_systemctl_show};
-use shit_proto::{SvcEventReq, SvcToolWire};
+use shit_proto::{SvcEventReq, SvcScopeWire, SvcToolWire};
+use shit_store::Index;
+
+use crate::active_commands::ActiveCommands;
 
 /// Pre-stash TTL. Same value as pkg/env.
 pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
@@ -106,7 +110,12 @@ fn parse_state(tool: SvcToolWire, raw: &str) -> ServiceState {
     }
 }
 
-pub fn handle(stash: &SvcPreStash, req: SvcEventReq) -> PostOutcome {
+pub fn handle(
+    stash: &SvcPreStash,
+    req: SvcEventReq,
+    active: &ActiveCommands,
+    index: &Index,
+) -> PostOutcome {
     let key = SvcKey {
         tool: req.tool,
         pid: req.pid,
@@ -152,13 +161,52 @@ pub fn handle(stash: &SvcPreStash, req: SvcEventReq) -> PostOutcome {
                 );
                 return PostOutcome::Unchanged;
             }
-            tracing::info!(
-                tool = req.tool.as_str(),
-                pid = req.pid,
-                unit = %req.unit,
-                verb = %pre.verb,
-                "svc-post changed (DR-36 will journal the diff)"
-            );
+            // DR-36: resolve the active command via ancestor walk.
+            let Some(command) = active.resolve_by_descendant(req.pid) else {
+                tracing::warn!(
+                    tool = req.tool.as_str(),
+                    pid = req.pid,
+                    unit = %req.unit,
+                    "svc-post not attributable to active command window; dropping"
+                );
+                return PostOutcome::Changed {
+                    before: pre.state,
+                    after: state,
+                    verb: pre.verb,
+                };
+            };
+            let kind = CaptureEventKind::SystemdOp {
+                scope: wire_to_planner_scope(req.scope),
+                unit: req.unit.clone(),
+                before: pre.state.clone(),
+                after: state.clone(),
+            };
+            let ev = CaptureEvent {
+                id: EventId(0),
+                command,
+                ts: crate::server::next_ts(),
+                partial: false,
+                kind,
+            };
+            match index.put_event(&ev) {
+                Ok(eid) => tracing::info!(
+                    tool = req.tool.as_str(),
+                    pid = req.pid,
+                    unit = %req.unit,
+                    verb = %pre.verb,
+                    session = %command.session,
+                    seq = command.seq,
+                    %eid,
+                    "svc-post journaled (DR-36)"
+                ),
+                Err(e) => tracing::warn!(
+                    err = %e,
+                    tool = req.tool.as_str(),
+                    pid = req.pid,
+                    unit = %req.unit,
+                    "svc-post journal write failed"
+                ),
+            }
             PostOutcome::Changed {
                 before: pre.state,
                 after: state,
@@ -168,10 +216,22 @@ pub fn handle(stash: &SvcPreStash, req: SvcEventReq) -> PostOutcome {
     }
 }
 
+fn wire_to_planner_scope(w: SvcScopeWire) -> SystemdScope {
+    match w {
+        SvcScopeWire::User => SystemdScope::User,
+        SvcScopeWire::System => SystemdScope::System,
+        SvcScopeWire::LaunchdGui => SystemdScope::LaunchdGui,
+        SvcScopeWire::LaunchdSystem => SystemdScope::LaunchdSystem,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use shit_proto::{PkgPhase, SvcScopeWire};
+
+    use shit_planner::{CommandId, CommandRecord, PlannerStore, TimePoint};
+    use uuid::Uuid;
 
     fn req(phase: PkgPhase, pid: u32, verb: &str, raw: &str) -> SvcEventReq {
         SvcEventReq {
@@ -186,23 +246,63 @@ mod tests {
         }
     }
 
+    /// Build an Index + ActiveCommands so resolve_by_descendant for
+    /// `req.pid = std::process::id()` finds the test command.
+    fn fixture() -> (tempfile::TempDir, Index, ActiveCommands, CommandId) {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = Index::open(tmp.path().join("index.sqlite")).unwrap();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = CommandId { session, seq: 1 };
+        idx.put_command(&CommandRecord {
+            command,
+            cmd_string: None,
+            cwd: std::path::PathBuf::from("/"),
+            pid: std::process::id(),
+            shell_kind: shit_proto::ShellKind::Bash,
+            started_at: TimePoint::new(0, 0),
+            ended_at: None,
+            exit_code: None,
+            event_ids: vec![],
+        })
+        .unwrap();
+        let active = ActiveCommands::new();
+        active.insert(std::process::id(), command);
+        (tmp, idx, active, command)
+    }
+
     #[test]
     fn pre_then_post_unchanged_when_state_identical() {
+        let (_tmp, idx, active, _) = fixture();
         let stash = SvcPreStash::new();
         let raw = "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n";
-        let _ = handle(&stash, req(PkgPhase::Pre, 42, "start", raw));
-        let outcome = handle(&stash, req(PkgPhase::Post, 42, "start", raw));
+        let pid = std::process::id();
+        let _ = handle(&stash, req(PkgPhase::Pre, pid, "start", raw), &active, &idx);
+        let outcome = handle(&stash, req(PkgPhase::Post, pid, "start", raw), &active, &idx);
         assert_eq!(outcome, PostOutcome::Unchanged);
         assert_eq!(stash.len(), 0, "Post drains stash");
     }
 
     #[test]
-    fn pre_then_post_changed_when_state_differs() {
+    fn pre_then_post_changed_writes_systemd_op_event() {
+        let (_tmp, idx, active, command) = fixture();
         let stash = SvcPreStash::new();
         let pre_raw = "ActiveState=inactive\nUnitFileState=disabled\nLoadState=loaded\n";
         let post_raw = "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n";
-        let _ = handle(&stash, req(PkgPhase::Pre, 42, "enable --now", pre_raw));
-        let outcome = handle(&stash, req(PkgPhase::Post, 42, "enable --now", post_raw));
+        let pid = std::process::id();
+        let _ = handle(
+            &stash,
+            req(PkgPhase::Pre, pid, "enable --now", pre_raw),
+            &active,
+            &idx,
+        );
+        let outcome = handle(
+            &stash,
+            req(PkgPhase::Post, pid, "enable --now", post_raw),
+            &active,
+            &idx,
+        );
         match outcome {
             PostOutcome::Changed {
                 before,
@@ -217,10 +317,27 @@ mod tests {
             }
             other => panic!("expected Changed, got {other:?}"),
         }
+        let events = idx.events_for_command(command);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            CaptureEventKind::SystemdOp {
+                scope,
+                unit,
+                before,
+                after,
+            } => {
+                assert_eq!(*scope, SystemdScope::User);
+                assert_eq!(unit, "nginx.service");
+                assert!(!before.active);
+                assert!(after.active);
+            }
+            other => panic!("expected SystemdOp, got {other:?}"),
+        }
     }
 
     #[test]
     fn orphan_post_is_dropped() {
+        let (_tmp, idx, active, _) = fixture();
         let stash = SvcPreStash::new();
         let outcome = handle(
             &stash,
@@ -230,8 +347,32 @@ mod tests {
                 "start",
                 "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n",
             ),
+            &active,
+            &idx,
         );
         assert_eq!(outcome, PostOutcome::Orphan);
+    }
+
+    #[test]
+    fn post_change_with_no_active_command_does_not_journal() {
+        let (_tmp, idx, active, command) = fixture();
+        let stash = SvcPreStash::new();
+        let stranger_pid = u32::MAX - 1;
+        let pre_raw = "ActiveState=inactive\nUnitFileState=disabled\nLoadState=loaded\n";
+        let post_raw = "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n";
+        let _ = handle(
+            &stash,
+            req(PkgPhase::Pre, stranger_pid, "start", pre_raw),
+            &active,
+            &idx,
+        );
+        let _ = handle(
+            &stash,
+            req(PkgPhase::Post, stranger_pid, "start", post_raw),
+            &active,
+            &idx,
+        );
+        assert_eq!(idx.events_for_command(command).len(), 0);
     }
 
     #[test]
