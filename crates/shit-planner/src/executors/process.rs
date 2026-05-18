@@ -47,9 +47,11 @@ impl UnitRef {
     }
 }
 
-/// Stage-1 cross-reference: lookup by process key (typically `comm`
-/// or the basename of argv[0]) → known unit. The daemon will fill
-/// this from journaled S16 events. See DR-51.
+/// Cross-reference (DR-51): lookup by process key (typically `comm`
+/// or the basename of argv[0]) → known unit. Populated from journaled
+/// `SystemdOp` events via [`DaemonCrossRef::from_events`] so the CLI
+/// can suggest `systemctl restart <unit>` instead of the raw argv
+/// when the user killed something a service manager owns.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonCrossRef {
     by_key: BTreeMap<String, UnitRef>,
@@ -68,6 +70,77 @@ impl DaemonCrossRef {
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
     }
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Build the cross-ref by scanning an iterator of events for
+    /// `SystemdOp` records. Each unit name is reduced to a process
+    /// key via [`unit_to_process_key`] — `nginx.service` → `nginx`,
+    /// `redis-server@instance.service` → `redis-server`.
+    ///
+    /// Later events overwrite earlier ones for the same key. That's
+    /// usually what we want — if the user changed which unit manages
+    /// a daemon, the latest record reflects the current truth.
+    pub fn from_events<'a, I>(events: I) -> Self
+    where
+        I: IntoIterator<Item = &'a crate::events::CaptureEvent>,
+    {
+        use crate::events::CaptureEventKind;
+        let mut out = Self::new();
+        for ev in events {
+            if let CaptureEventKind::SystemdOp { scope, unit, .. } = &ev.kind {
+                let Some(key) = unit_to_process_key(unit) else {
+                    continue;
+                };
+                out.insert(key, UnitRef::new(*scope, unit.clone()));
+            }
+        }
+        out
+    }
+}
+
+/// Reduce a service unit name to the process key the executor uses
+/// for lookups: the comm / argv[0] basename.
+///
+/// Rules (systemd + launchd):
+/// - Strip the `.service`, `.socket`, `.timer`, etc. suffix.
+/// - For templated units `foo@instance.service`, strip the `@instance`
+///   too — the live process's `comm` is the template name.
+/// - launchd labels like `com.apple.nginx` are returned as-is; the
+///   basename rule still maps to the underlying daemon name via the
+///   final dot-component (`nginx`). We do that too.
+/// - Returns `None` for an empty input or a name that's all
+///   suffix (e.g., `.service`).
+pub fn unit_to_process_key(unit: &str) -> Option<String> {
+    if unit.is_empty() {
+        return None;
+    }
+    // Strip a known suffix.
+    const SUFFIXES: &[&str] = &[
+        ".service", ".socket", ".timer", ".path", ".mount", ".target", ".slice",
+    ];
+    let mut base = unit;
+    for suf in SUFFIXES {
+        if let Some(stripped) = base.strip_suffix(suf) {
+            base = stripped;
+            break;
+        }
+    }
+    // Strip @instance for templated systemd units.
+    if let Some((tmpl, _instance)) = base.split_once('@') {
+        base = tmpl;
+    }
+    // launchd labels: reverse-DNS → take last component.
+    // (Has to come after suffix-strip; .service.com.apple.foo would
+    // be exotic but harmless.)
+    if base.contains('.') {
+        base = base.rsplit('.').next().unwrap_or(base);
+    }
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.to_string())
 }
 
 /// Renderable suggestion for one killed process. Carried by the
@@ -310,6 +383,136 @@ fn process_key(argv: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CommandId;
+    use crate::events::{CaptureEvent, CaptureEventKind, EventId, ServiceState};
+    use crate::time::TimePoint;
+    use uuid::Uuid;
+
+    #[test]
+    fn unit_to_process_key_strips_service_suffix() {
+        assert_eq!(unit_to_process_key("nginx.service"), Some("nginx".into()));
+    }
+
+    #[test]
+    fn unit_to_process_key_strips_template_instance() {
+        assert_eq!(
+            unit_to_process_key("redis-server@inst.service"),
+            Some("redis-server".into())
+        );
+    }
+
+    #[test]
+    fn unit_to_process_key_handles_launchd_label() {
+        // `com.apple.nginx` is the launchd label; the daemon's
+        // process comm is "nginx" — last dot-component.
+        assert_eq!(unit_to_process_key("com.apple.nginx"), Some("nginx".into()));
+    }
+
+    #[test]
+    fn unit_to_process_key_strips_timer_socket_suffixes() {
+        assert_eq!(unit_to_process_key("foo.socket"), Some("foo".into()));
+        assert_eq!(unit_to_process_key("foo.timer"), Some("foo".into()));
+        assert_eq!(unit_to_process_key("foo.target"), Some("foo".into()));
+    }
+
+    #[test]
+    fn unit_to_process_key_returns_none_for_empty_or_suffix_only() {
+        assert_eq!(unit_to_process_key(""), None);
+        // ".service" → after strip "" → fail.
+        assert_eq!(unit_to_process_key(".service"), None);
+    }
+
+    #[test]
+    fn from_events_builds_cross_ref_from_systemd_ops() {
+        let session = Uuid::nil();
+        let mk = |unit: &str, scope: SystemdScope| CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 1),
+            partial: false,
+            kind: CaptureEventKind::SystemdOp {
+                scope,
+                unit: unit.into(),
+                before: ServiceState {
+                    active: false,
+                    enabled: false,
+                    masked: false,
+                    raw: String::new(),
+                },
+                after: ServiceState {
+                    active: true,
+                    enabled: true,
+                    masked: false,
+                    raw: String::new(),
+                },
+            },
+        };
+        let events = [
+            mk("nginx.service", SystemdScope::System),
+            mk("redis-server@inst.service", SystemdScope::User),
+        ];
+        let cr = DaemonCrossRef::from_events(events.iter());
+        assert_eq!(cr.len(), 2);
+        let nginx = cr.lookup("nginx").expect("nginx key present");
+        assert_eq!(nginx.scope, SystemdScope::System);
+        assert_eq!(nginx.unit, "nginx.service");
+        let redis = cr.lookup("redis-server").expect("template key present");
+        assert_eq!(redis.scope, SystemdScope::User);
+    }
+
+    #[test]
+    fn from_events_ignores_non_systemd_events() {
+        let session = Uuid::nil();
+        let ev = CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 1),
+            partial: false,
+            kind: CaptureEventKind::EnvDiff {
+                added: Default::default(),
+                removed: Default::default(),
+                modified: Default::default(),
+            },
+        };
+        let cr = DaemonCrossRef::from_events([ev].iter());
+        assert!(cr.is_empty());
+    }
+
+    #[test]
+    fn from_events_later_event_overwrites_earlier_for_same_key() {
+        let session = Uuid::nil();
+        let mk = |unit: &str, scope: SystemdScope, seq: u64| CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq },
+            ts: TimePoint::new(seq, seq * 1000),
+            partial: false,
+            kind: CaptureEventKind::SystemdOp {
+                scope,
+                unit: unit.into(),
+                before: ServiceState {
+                    active: false,
+                    enabled: false,
+                    masked: false,
+                    raw: String::new(),
+                },
+                after: ServiceState {
+                    active: true,
+                    enabled: true,
+                    masked: false,
+                    raw: String::new(),
+                },
+            },
+        };
+        // Same unit name, two scopes — last one wins.
+        let cr = DaemonCrossRef::from_events(
+            [
+                mk("nginx.service", SystemdScope::User, 1),
+                mk("nginx.service", SystemdScope::System, 2),
+            ]
+            .iter(),
+        );
+        assert_eq!(cr.lookup("nginx").unwrap().scope, SystemdScope::System);
+    }
 
     fn note(argv: Vec<&str>, cwd: &str, env: &[(&str, &str)], msg: &str) -> InverseOp {
         InverseOp::ProcessNote {
