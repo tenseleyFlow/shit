@@ -241,6 +241,115 @@ impl BlobReader for InMemoryBlobReader {
     }
 }
 
+/// DR-15: privileged-op routing trait. The file executor calls into
+/// this when an op (chown to a foreign uid, mknod for a special
+/// file) requires CAP_CHOWN / root and the local syscall returned
+/// EPERM.
+///
+/// Implementations:
+/// - **Production** (daemon side): wraps a `HelperLink` and sends
+///   `HelperRequest::ApplyChown` / `ApplyMknod`, blocking on the
+///   `HelperResponse::PrivilegedOpResult` reply. The crate that
+///   implements this lives in `shitd` (planner stays helper-free).
+/// - **Tests**: an `InMemoryPrivilegedOpRouter` that records the
+///   requested ops and returns `Outcome::Applied`.
+/// - **CLI without helper**: `NoOpPrivilegedOpRouter` returns
+///   `PermissionDenied`, propagating the original EPERM to the user.
+pub trait PrivilegedOpRouter {
+    /// Request a chown the local process can't perform. `no_dereference`
+    /// = true means lchown(2) — used for symlink-target metadata.
+    fn chown(
+        &self,
+        path: &std::path::Path,
+        uid: u32,
+        gid: u32,
+        no_dereference: bool,
+    ) -> PrivilegedOpOutcome;
+
+    /// Request mknod for a character/block special file or FIFO.
+    /// `dev` is ignored when `mode` encodes a FIFO.
+    fn mknod(&self, path: &std::path::Path, mode: u32, dev: u64) -> PrivilegedOpOutcome;
+}
+
+/// Local-friendly mirror of `shit_proto::PrivilegedOpOutcome` so the
+/// planner stays wire-free. Daemon-side impls convert between them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PrivilegedOpOutcome {
+    #[default]
+    Applied,
+    OutOfScope,
+    PermissionDenied,
+    NotFound,
+    Failed {
+        err: String,
+    },
+}
+
+/// No-op router for executors running without a helper link. Every
+/// op returns `PermissionDenied`, so the file executor surfaces the
+/// EPERM that originally got us here.
+#[derive(Default, Debug, Clone)]
+pub struct NoOpPrivilegedOpRouter;
+
+impl PrivilegedOpRouter for NoOpPrivilegedOpRouter {
+    fn chown(&self, _: &std::path::Path, _: u32, _: u32, _: bool) -> PrivilegedOpOutcome {
+        PrivilegedOpOutcome::PermissionDenied
+    }
+    fn mknod(&self, _: &std::path::Path, _: u32, _: u64) -> PrivilegedOpOutcome {
+        PrivilegedOpOutcome::PermissionDenied
+    }
+}
+
+/// In-memory router for tests. Records requested ops; returns a
+/// configurable outcome per call.
+#[derive(Debug, Default)]
+pub struct InMemoryPrivilegedOpRouter {
+    pub chown_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u32, bool)>>,
+    pub mknod_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u64)>>,
+    pub outcome: std::sync::Mutex<PrivilegedOpOutcome>,
+}
+
+impl InMemoryPrivilegedOpRouter {
+    pub fn new() -> Self {
+        Self {
+            chown_calls: std::sync::Mutex::new(Vec::new()),
+            mknod_calls: std::sync::Mutex::new(Vec::new()),
+            outcome: std::sync::Mutex::new(PrivilegedOpOutcome::Applied),
+        }
+    }
+
+    pub fn set_outcome(&self, o: PrivilegedOpOutcome) {
+        *self.outcome.lock().unwrap() = o;
+    }
+
+    pub fn chown_log(&self) -> Vec<(std::path::PathBuf, u32, u32, bool)> {
+        self.chown_calls.lock().unwrap().clone()
+    }
+}
+
+impl PrivilegedOpRouter for InMemoryPrivilegedOpRouter {
+    fn chown(
+        &self,
+        path: &std::path::Path,
+        uid: u32,
+        gid: u32,
+        no_dereference: bool,
+    ) -> PrivilegedOpOutcome {
+        self.chown_calls
+            .lock()
+            .unwrap()
+            .push((path.to_path_buf(), uid, gid, no_dereference));
+        self.outcome.lock().unwrap().clone()
+    }
+    fn mknod(&self, path: &std::path::Path, mode: u32, dev: u64) -> PrivilegedOpOutcome {
+        self.mknod_calls
+            .lock()
+            .unwrap()
+            .push((path.to_path_buf(), mode, dev));
+        self.outcome.lock().unwrap().clone()
+    }
+}
+
 /// Tier-specific executor contract. Implementors handle a subset of
 /// [`InverseOp`] variants identified by [`InverseTier`](crate::inverse::InverseTier).
 ///
