@@ -212,9 +212,13 @@ fn handle(
                 }
             }
         }
-        HookMessage::PreExecEnv { seq, env_hash, .. } => {
-            debug!(%session, kind, seq, hash = %hex8(env_hash), "pre-exec-env");
-            env_track::handle_pre(env_stash, CommandId { session, seq: *seq }, *env_hash);
+        HookMessage::PreExecEnv { seq, env_block, .. } => {
+            debug!(%session, kind, seq, bytes = env_block.len(), "pre-exec-env");
+            env_track::handle_pre(
+                env_stash,
+                CommandId { session, seq: *seq },
+                env_block.clone(),
+            );
         }
         HookMessage::PostExecEnv { seq, env_block, .. } => {
             debug!(%session, kind, seq, bytes = env_block.len(), "post-exec-env");
@@ -223,9 +227,8 @@ fn handle(
                 CommandId { session, seq: *seq },
                 env_block,
                 env_filter,
+                index,
             );
-            // The PostOutcome is logged inside handle_post; the
-            // journal-write integration is DR-32.
         }
         HookMessage::SessionClose { .. } => {
             info!(%session, kind, "session close");
@@ -235,16 +238,4 @@ fn handle(
         }
     }
     debug!(?msg, "decoded frame");
-}
-
-/// Stable short hash rendering for log lines — first 8 hex chars of
-/// a 32-byte blake3 digest. The full digest is preserved by the
-/// daemon; logs just need a glance-friendly identifier.
-fn hex8(h: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(8);
-    for b in &h[..4] {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
