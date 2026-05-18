@@ -126,7 +126,7 @@ async fn handle_client(
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash, &active, &index),
-        CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash),
+        CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash, &active, &index),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash),
@@ -312,8 +312,13 @@ fn handle_pkg_event(
 /// returns the before/after diff to the caller. The journal-write
 /// under `(session, seq)` is DR-36 — gated on the same
 /// command-window binding that DR-25 / DR-32 wait on.
-fn handle_svc_event(req: SvcEventReq, svc_stash: &SvcPreStash) -> CtlResponse {
-    let _ = crate::svc_track::handle(svc_stash, req);
+fn handle_svc_event(
+    req: SvcEventReq,
+    svc_stash: &SvcPreStash,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+) -> CtlResponse {
+    let _ = crate::svc_track::handle(svc_stash, req, active, index);
     CtlResponse::SvcEventAck
 }
 
