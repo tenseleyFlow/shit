@@ -1,33 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Env-tracking ingestion on the daemon side (S15.4).
+//! Env-tracking ingestion on the daemon side (S15.4, DR-32).
 //!
 //! `shit hook-send pre-exec-env` and `... post-exec-env` produce
 //! [`HookMessage::PreExecEnv`] and [`HookMessage::PostExecEnv`]. The
 //! handlers below pair them by `(session, seq)`:
 //!
-//! - `PreExecEnv` arrives carrying only the 32-byte hash plus the
-//!   `(session, seq)` key. We stash the hash; the daemon does not
-//!   ask the shell to re-send the block on the common no-change
-//!   path.
-//! - `PostExecEnv` arrives with the full block. We hash it; if the
-//!   hash matches the stashed pre, the env didn't change and the
-//!   event is dropped. Otherwise we diff against… well, against
-//!   nothing yet — the pre-block isn't retained. Stage 1 records
-//!   the *post* state plus the pre-hash; the planner's eventual
-//!   diff phase needs the pre block too.
+//! - `PreExecEnv` arrives with the full pre-command env block. We
+//!   stash both the hash (for cheap unchanged-check) and the block
+//!   bytes (for diff computation).
+//! - `PostExecEnv` arrives with the post-command block. We hash it;
+//!   if the hash matches the stashed pre, env is unchanged and the
+//!   event is dropped. Otherwise we compute the diff via
+//!   [`shit_planner::diff_env_blocks`] and write a
+//!   [`CaptureEventKind::EnvDiff`] under the matching `(session, seq)`.
 //!
-//! That last bullet is the gap S15 deliberately doesn't try to
-//! close in this sprint: the pre-block-retention scheme (either
-//! always-send-on-pre or daemon-asks-on-mismatch) lands together
-//! with the capture-runtime pipeline (DR-32). Stage 1 logs what it
-//! sees and provides a hook for tests.
+//! Env events arrive with `(session, seq)` already known (from the
+//! shell-hook side), so unlike pkg/svc/net/proc/db this tier doesn't
+//! need an ancestry lookup.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::{CommandId, EnvFilter};
+use shit_store::Index;
 
 /// TTL for stashed Pre events. Same logic as the pkg-event stash:
 /// orphan entries (no matching Post within this window) get evicted
@@ -37,6 +35,10 @@ pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvPre {
     pub env_hash: [u8; 32],
+    /// Pre-command env block bytes (DR-32). Retained so the
+    /// post-handler can compute a real `EnvDiff` rather than just
+    /// flagging "changed."
+    pub env_block: Vec<u8>,
     pub ts: Instant,
 }
 
@@ -54,12 +56,14 @@ impl EnvPreStash {
         }
     }
 
-    pub fn insert(&self, key: CommandId, env_hash: [u8; 32]) {
+    pub fn insert(&self, key: CommandId, env_block: Vec<u8>) {
+        let env_hash = shit_planner::hash_env_block(&env_block);
         let mut g = self.inner.lock().unwrap();
         g.insert(
             key,
             EnvPre {
                 env_hash,
+                env_block,
                 ts: Instant::now(),
             },
         );
@@ -102,18 +106,20 @@ pub enum PostOutcome {
     Orphan,
     /// Pre + Post hashes match — env didn't change; dropped.
     Unchanged,
-    /// Hashes differ — Stage 1 will record this for the planner.
-    /// Carries the parsed post-block as a map so the renderer can
-    /// inspect it.
+    /// Hashes differ AND the diff has at least one non-filtered key —
+    /// DR-32 journals a `CaptureEvent::EnvDiff` under `(session, seq)`.
     Changed {
         pre_hash: [u8; 32],
         post_hash: [u8; 32],
+        added: usize,
+        removed: usize,
+        modified: usize,
     },
 }
 
-/// Handle a PreExecEnv message: stash the hash.
-pub fn handle_pre(stash: &EnvPreStash, key: CommandId, env_hash: [u8; 32]) {
-    stash.insert(key, env_hash);
+/// Handle a PreExecEnv message: stash the pre-block.
+pub fn handle_pre(stash: &EnvPreStash, key: CommandId, env_block: Vec<u8>) {
+    stash.insert(key, env_block);
     tracing::debug!(
         session = %key.session,
         seq = key.seq,
@@ -121,21 +127,19 @@ pub fn handle_pre(stash: &EnvPreStash, key: CommandId, env_hash: [u8; 32]) {
     );
 }
 
-/// Handle a PostExecEnv message. Returns a [`PostOutcome`] describing
-/// what we decided. The actual journal write happens in a follow-up
-/// (DR-32) when the (session, seq) → CaptureEvent::EnvDiff binding
-/// is in place.
+/// Handle a PostExecEnv message. Returns a [`PostOutcome`].
 ///
-/// `filter` is consulted at the per-var redaction/ignore level when
-/// the diff is non-empty. Stage 1 doesn't retain the pre-block (only
-/// its hash), so we can't compute a per-key diff yet; the filter is
-/// threaded through anyway so the wiring is exercised end-to-end
-/// before DR-32 lands.
+/// On `Changed`: writes a [`CaptureEventKind::EnvDiff`] to `index`
+/// under `(session, seq)`. The diff respects the filter's ignore and
+/// redaction rules — ignored vars are dropped, redact-marked vars
+/// have their values replaced with the redaction token. The renderer
+/// applies the filter again at display time for defence-in-depth.
 pub fn handle_post(
     stash: &EnvPreStash,
     key: CommandId,
     env_block: &[u8],
     filter: &EnvFilter,
+    index: &Index,
 ) -> PostOutcome {
     let pre = match stash.take(key) {
         Some(p) => p,
@@ -157,35 +161,62 @@ pub fn handle_post(
         );
         return PostOutcome::Unchanged;
     }
-    // Filter doesn't gate the Changed outcome (the daemon's response
-    // is "we noticed a change"). The renderer applies the filter
-    // again at display time, but consulting it here lets us drop
-    // post entries that consist *entirely* of ignored vars — those
-    // shouldn't surface as "changed" to the user.
-    let post = shit_planner::env_parse_block(env_block);
-    let surfaces_to_user = post.keys().any(|k| !filter.is_ignored(k));
-    if !surfaces_to_user {
+    // DR-32: compute the diff and journal it. `diff_env_blocks`
+    // applies the filter (ignore + redact) inline.
+    let diff = shit_planner::diff_env_blocks(&pre.env_block, env_block, filter);
+    if diff.is_empty() {
+        // Hash differed but the user-visible diff is empty — every
+        // changed var is filter-ignored (e.g. a tool only touched
+        // OLDPWD). Drop.
         tracing::debug!(
             session = %key.session,
             seq = key.seq,
-            "env-post changed but all post vars are filter-ignored; dropping"
+            "env-post hash changed but filtered diff is empty; dropping"
         );
         return PostOutcome::Unchanged;
     }
-    tracing::info!(
-        session = %key.session,
-        seq = key.seq,
-        "env-post changed (DR-32 will journal the diff)"
-    );
+    let kind = CaptureEventKind::EnvDiff {
+        added: diff.added.clone(),
+        removed: diff.removed.clone(),
+        modified: diff.modified.clone(),
+    };
+    let ev = CaptureEvent {
+        id: EventId(0), // sqlite assigns
+        command: key,
+        ts: crate::server::next_ts(),
+        partial: false,
+        kind,
+    };
+    match index.put_event(&ev) {
+        Ok(eid) => tracing::info!(
+            session = %key.session,
+            seq = key.seq,
+            %eid,
+            added = diff.added.len(),
+            removed = diff.removed.len(),
+            modified = diff.modified.len(),
+            "env-post journaled (DR-32)"
+        ),
+        Err(e) => tracing::warn!(
+            err = %e,
+            session = %key.session,
+            seq = key.seq,
+            "env-post journal write failed"
+        ),
+    }
     PostOutcome::Changed {
         pre_hash: pre.env_hash,
         post_hash,
+        added: diff.added.len(),
+        removed: diff.removed.len(),
+        modified: diff.modified.len(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shit_planner::{CommandRecord, PlannerStore, TimePoint};
     use uuid::Uuid;
 
     fn cid() -> CommandId {
@@ -195,51 +226,126 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pre_post_pair_unchanged_when_hashes_match() {
-        let stash = EnvPreStash::new();
-        let block = b"FOO=bar\0BAZ=qux".as_slice();
-        let h = shit_planner::hash_env_block(block);
-        handle_pre(&stash, cid(), h);
-        let outcome = handle_post(&stash, cid(), block, &EnvFilter::default());
-        assert_eq!(outcome, PostOutcome::Unchanged);
-        assert_eq!(stash.len(), 0, "Post drains the stash");
+    /// Build a temp-dir Index pre-populated with the test session
+    /// and command so put_event() doesn't FK-fail.
+    fn fixture() -> (tempfile::TempDir, Index) {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = Index::open(tmp.path().join("index.sqlite")).unwrap();
+        idx.put_session(Uuid::nil(), "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&CommandRecord {
+            command: cid(),
+            cmd_string: None,
+            cwd: std::path::PathBuf::from("/"),
+            pid: 0,
+            shell_kind: shit_proto::ShellKind::Bash,
+            started_at: TimePoint::new(0, 0),
+            ended_at: None,
+            exit_code: None,
+            event_ids: vec![],
+        })
+        .unwrap();
+        (tmp, idx)
     }
 
     #[test]
-    fn pre_post_pair_changed_when_hashes_differ() {
+    fn pre_post_pair_unchanged_when_hashes_match() {
+        let (_tmp, idx) = fixture();
         let stash = EnvPreStash::new();
-        let pre_h = shit_planner::hash_env_block(b"FOO=bar");
-        handle_pre(&stash, cid(), pre_h);
-        let outcome = handle_post(&stash, cid(), b"FOO=NEW", &EnvFilter::default());
+        let block = b"FOO=bar\0BAZ=qux".to_vec();
+        handle_pre(&stash, cid(), block.clone());
+        let outcome = handle_post(&stash, cid(), &block, &EnvFilter::default(), &idx);
+        assert_eq!(outcome, PostOutcome::Unchanged);
+        assert_eq!(stash.len(), 0, "Post drains the stash");
+        // No event journaled.
+        assert_eq!(idx.events_for_command(cid()).len(), 0);
+    }
+
+    #[test]
+    fn pre_post_pair_changed_writes_env_diff_event() {
+        let (_tmp, idx) = fixture();
+        let stash = EnvPreStash::new();
+        let pre_block = b"FOO=bar".to_vec();
+        let pre_h = shit_planner::hash_env_block(&pre_block);
+        handle_pre(&stash, cid(), pre_block);
+        let outcome = handle_post(&stash, cid(), b"FOO=NEW", &EnvFilter::default(), &idx);
         match outcome {
             PostOutcome::Changed {
                 pre_hash,
                 post_hash,
+                added,
+                removed,
+                modified,
             } => {
                 assert_eq!(pre_hash, pre_h);
                 assert_ne!(post_hash, pre_h);
+                assert_eq!(added, 0);
+                assert_eq!(removed, 0);
+                assert_eq!(modified, 1);
             }
             other => panic!("expected Changed, got {other:?}"),
+        }
+        let events = idx.events_for_command(cid());
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            CaptureEventKind::EnvDiff {
+                added,
+                removed,
+                modified,
+            } => {
+                assert!(added.is_empty());
+                assert!(removed.is_empty());
+                assert_eq!(modified.get("FOO").unwrap().0, "bar");
+                assert_eq!(modified.get("FOO").unwrap().1, "NEW");
+            }
+            other => panic!("expected EnvDiff, got {other:?}"),
         }
     }
 
     #[test]
     fn orphan_post_is_dropped() {
+        let (_tmp, idx) = fixture();
         let stash = EnvPreStash::new();
-        let outcome = handle_post(&stash, cid(), b"FOO=bar", &EnvFilter::default());
+        let outcome = handle_post(&stash, cid(), b"FOO=bar", &EnvFilter::default(), &idx);
         assert_eq!(outcome, PostOutcome::Orphan);
+        assert_eq!(idx.events_for_command(cid()).len(), 0);
     }
 
     #[test]
-    fn filtered_only_post_is_treated_as_unchanged() {
+    fn filtered_only_diff_is_treated_as_unchanged() {
+        let (_tmp, idx) = fixture();
         let stash = EnvPreStash::new();
-        // Pre is empty; Post contains only an ignored var → user
-        // shouldn't see "changed."
-        let pre_h = shit_planner::hash_env_block(b"");
-        handle_pre(&stash, cid(), pre_h);
-        let outcome = handle_post(&stash, cid(), b"OLDPWD=/tmp", &EnvFilter::default());
+        // Pre is empty; Post adds only OLDPWD, which the default
+        // filter ignores. User shouldn't see "changed" and no event
+        // should be journaled.
+        handle_pre(&stash, cid(), b"".to_vec());
+        let outcome = handle_post(&stash, cid(), b"OLDPWD=/tmp", &EnvFilter::default(), &idx);
         assert_eq!(outcome, PostOutcome::Unchanged);
+        assert_eq!(idx.events_for_command(cid()).len(), 0);
+    }
+
+    #[test]
+    fn redacted_var_value_does_not_leak_into_journal() {
+        let (_tmp, idx) = fixture();
+        let stash = EnvPreStash::new();
+        handle_pre(&stash, cid(), b"".to_vec());
+        // GITHUB_TOKEN is in the default redact list.
+        handle_post(
+            &stash,
+            cid(),
+            b"GITHUB_TOKEN=ghp_supersecret",
+            &EnvFilter::default(),
+            &idx,
+        );
+        let events = idx.events_for_command(cid());
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            CaptureEventKind::EnvDiff { added, .. } => {
+                let v = added.get("GITHUB_TOKEN").expect("token var present");
+                assert_ne!(v, "ghp_supersecret", "value MUST be redacted in journal");
+            }
+            other => panic!("expected EnvDiff, got {other:?}"),
+        }
     }
 
     #[test]
@@ -252,6 +358,7 @@ mod tests {
                 cid(),
                 EnvPre {
                     env_hash: [0; 32],
+                    env_block: Vec::new(),
                     ts: Instant::now()
                         .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
                         .expect("system clock supports subtraction"),
