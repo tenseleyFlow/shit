@@ -70,15 +70,20 @@ pub enum HookMessage {
         exit_code: i32,
         ts_unix_nanos: u64,
     },
-    /// Optional companion to [`PreExec`] (S15). Carries only the
-    /// blake3 hash of the shell's env block — small enough to send
-    /// unconditionally on every command. The full block is sent
-    /// post-command via [`PostExecEnv`] *only when the hash changed*.
-    /// Hash is over sorted `KEY=VALUE` bytes joined by NUL.
+    /// Optional companion to [`PreExec`] (S15). Carries the full
+    /// pre-command env block (sorted `KEY=VALUE` joined by NUL) so
+    /// the daemon can compute the post→pre diff once
+    /// [`PostExecEnv`] arrives.
+    ///
+    /// DR-32 changed this from hash-only to block-carrying: the
+    /// daemon needs the pre values to emit a real `EnvDiff`, and the
+    /// 1–4 KB cost of sending the block over a local UDS is below
+    /// noise (env blocks are typically <2 KB; the next biggest hook
+    /// message — PostExec frame with argv — already runs larger).
     PreExecEnv {
         session: Uuid,
         seq: u64,
-        env_hash: [u8; 32],
+        env_block: Vec<u8>,
         ts_unix_nanos: u64,
     },
     /// Companion to [`PostExec`] (S15). Sent **only** when the env
