@@ -246,6 +246,81 @@ fn emit_for_event(
                 message: "process events cannot be mechanically undone".to_string(),
             });
         }
+        CaptureEventKind::DbOp {
+            engine,
+            target,
+            statements,
+            transaction_state,
+        } => {
+            // DR-58: every DbOp becomes an InverseOp::DbNote. For
+            // sqlite3 the file tier captures the database file
+            // separately, so the rollback hint just records the path;
+            // the actual restore happens via the file tier's
+            // RestoreContent op. For psql/mysql the hint is
+            // informational only — the planner never executes SQL.
+            let inverse_engine = match engine {
+                crate::events::DbEngine::Postgres => crate::inverse::DbEngine::Postgres,
+                crate::events::DbEngine::Mysql => crate::inverse::DbEngine::Mysql,
+                crate::events::DbEngine::Sqlite3 => crate::inverse::DbEngine::Sqlite3,
+            };
+            let rollback_hint = match engine {
+                crate::events::DbEngine::Postgres => crate::inverse::RollbackHint::Postgres {
+                    pitr_recommended: matches!(
+                        transaction_state,
+                        crate::events::DbTxState::Committed
+                    ),
+                    wal_position: None,
+                    statements_for_review: statements.clone(),
+                },
+                crate::events::DbEngine::Mysql => crate::inverse::RollbackHint::Mysql {
+                    binlog_position: None,
+                    statements_for_review: statements.clone(),
+                },
+                crate::events::DbEngine::Sqlite3 => crate::inverse::RollbackHint::Sqlite {
+                    path: std::path::PathBuf::from(target),
+                    file_blob: None,
+                },
+            };
+            // If the engine explicitly observed a rollback, skip
+            // emitting the hint — there's nothing to undo. We still
+            // surface the tier in warnings so the renderer can say
+            // "DB statements were observed but engine rolled back."
+            if *transaction_state == crate::events::DbTxState::RolledBack {
+                warnings.push(PlanWarning::Informational {
+                    tier: crate::inverse::InverseTier::Database,
+                    message: format!(
+                        "{} statements observed against `{target}` but engine rolled back",
+                        engine_label(*engine)
+                    ),
+                });
+                return;
+            }
+            nodes.push(PlanNode {
+                op: InverseOp::DbNote {
+                    engine: inverse_engine,
+                    target: target.clone(),
+                    statements: statements.clone(),
+                    rollback_hint,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+            warnings.push(PlanWarning::Informational {
+                tier: crate::inverse::InverseTier::Database,
+                message: format!(
+                    "{} statements against `{target}` need manual rollback review",
+                    engine_label(*engine)
+                ),
+            });
+        }
+    }
+}
+
+fn engine_label(e: crate::events::DbEngine) -> &'static str {
+    match e {
+        crate::events::DbEngine::Postgres => "psql",
+        crate::events::DbEngine::Mysql => "mysql",
+        crate::events::DbEngine::Sqlite3 => "sqlite3",
     }
 }
 
