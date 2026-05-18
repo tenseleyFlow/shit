@@ -20,13 +20,17 @@
 //! flattens the active span stack into the event's fields by default.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use shit_proto::crash::TracingRing;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+use crate::tracing_ring_layer::RingLayer;
 
 /// Where the JSON log lands relative to `state_dir`.
 pub const LOG_SUBDIR: &str = "log";
@@ -37,7 +41,11 @@ pub const RETENTION_DAYS: u64 = 7;
 /// Initialize the daemon's logging stack. Returns a `WorkerGuard`
 /// that the caller must hold until shutdown — dropping it shuts
 /// the appender's worker thread and flushes the queue.
-pub fn init(state_dir: &Path, log_level_default: &str) -> WorkerGuard {
+pub fn init(
+    state_dir: &Path,
+    log_level_default: &str,
+    crash_ring: Option<Arc<TracingRing>>,
+) -> WorkerGuard {
     let log_dir = state_dir.join(LOG_SUBDIR);
     let _ = std::fs::create_dir_all(&log_dir);
 
@@ -58,10 +66,17 @@ pub fn init(state_dir: &Path, log_level_default: &str) -> WorkerGuard {
         .with_writer(std::io::stderr)
         .with_target(false);
 
+    // DR-68: optionally attach the crash-tail layer. When the
+    // panic-hook ring is wired, every event also pushes a JSON line
+    // into the bounded ring so a panic produces a crash file with
+    // the last 100 events in-line.
+    let ring_layer = crash_ring.map(RingLayer::new);
+
     let subscriber = tracing_subscriber::registry()
         .with(env_filter)
         .with(json_layer)
-        .with(stderr_layer.with_filter(stderr_filter));
+        .with(stderr_layer.with_filter(stderr_filter))
+        .with(ring_layer);
     let _ = subscriber.try_init();
 
     guard
@@ -151,7 +166,7 @@ mod tests {
         // either outcome here. The function MUST NOT panic.
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("doesnt-exist-yet");
-        let _guard = init(&state_dir, "info");
+        let _guard = init(&state_dir, "info", None);
         assert!(state_dir.join(LOG_SUBDIR).exists());
     }
 }
