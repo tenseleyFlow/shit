@@ -194,14 +194,42 @@ fn emit_for_event(
         CaptureEventKind::NetworkOp {
             tool,
             before_state,
+            after_state,
             inverse_invocations,
-            ..
         } => {
+            // DR-46: for DiffApply tools the capture path leaves
+            // inverse_invocations empty; synthesise them from the
+            // pre/after JSON dumps here. FullReload tools (iptables,
+            // nft, pfctl) reload before_state directly so we don't
+            // synthesise. Ufw is DiffApplyWithReset and the executor
+            // has its own reset+replay pipeline.
+            let mut invs = inverse_invocations.clone();
+            if invs.is_empty()
+                && matches!(
+                    crate::network::restore_method(*tool),
+                    crate::network::RestoreMethod::DiffApply
+                )
+            {
+                invs = crate::network_diff::synthesise_diff_apply_inverse(
+                    *tool,
+                    before_state,
+                    after_state,
+                );
+                if invs.is_empty() {
+                    warnings.push(PlanWarning::Informational {
+                        tier: crate::inverse::InverseTier::Network,
+                        message: format!(
+                            "no DiffApply inverse synthesised for {tool:?}; \
+                             review captured before/after states for manual rollback"
+                        ),
+                    });
+                }
+            }
             nodes.push(PlanNode {
                 op: InverseOp::NetworkRollback {
                     tool: *tool,
                     before_state: before_state.clone(),
-                    inverse_invocations: inverse_invocations.clone(),
+                    inverse_invocations: invs,
                 },
                 cohort: 0,
                 conflict: None,
