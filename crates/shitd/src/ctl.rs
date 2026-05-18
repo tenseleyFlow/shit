@@ -128,7 +128,7 @@ async fn handle_client(
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash, &active, &index),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash, &active, &index),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
-        CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash),
+        CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
     };
@@ -340,8 +340,13 @@ fn handle_net_event(
 /// the captured target snapshots; Post diffs against the post-state
 /// to classify each target as Killed or Survived. Journal-write
 /// under `(session, seq)` is DR-53.
-fn handle_proc_event(req: ProcEventReq, proc_stash: &ProcPreStash) -> CtlResponse {
-    let _ = crate::proc_track::handle(proc_stash, req);
+fn handle_proc_event(
+    req: ProcEventReq,
+    proc_stash: &ProcPreStash,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+) -> CtlResponse {
+    let _ = crate::proc_track::handle(proc_stash, req, active, index);
     CtlResponse::ProcEventAck
 }
 
