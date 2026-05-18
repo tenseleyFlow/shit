@@ -107,12 +107,19 @@ fn spawn_helper_and_complete_handshake() {
             protocol_version,
             granted,
             helper_version,
+            kernel_tier,
         } => {
             assert_eq!(protocol_version, HELPER_PROTOCOL_VERSION);
             assert_eq!(helper_uid, daemon_uid);
             // S06 helper advertises watch_tree only (no real ES/fanotify yet).
             assert!(granted.watch_tree);
             assert!(!helper_version.is_empty());
+            // DR-66: per-OS classifier; non-empty + finite vocab.
+            assert!(matches!(
+                kernel_tier.as_str(),
+                "fanotify" | "bpf-lsm" | "endpoint-security" | "kqueue" | "preload-shim"
+                | "degraded" | "unsupported"
+            ));
         }
         other => panic!("expected HandshakeAck, got {other:?}"),
     }
