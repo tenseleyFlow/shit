@@ -100,11 +100,7 @@ fn main() -> anyhow::Result<()> {
     // the appender's worker thread.
     // DR-68: pass the crash ring so each event also lands in the
     // panic-hook tail buffer.
-    let _log_guard = log_setup::init(
-        &resolved.state_dir,
-        &resolved.log_level,
-        crash::ring(),
-    );
+    let _log_guard = log_setup::init(&resolved.state_dir, &resolved.log_level, crash::ring());
 
     // S21.6 — surface OTLP feature/config drift loudly. If the
     // operator set `[telemetry] otlp_endpoint` but the daemon wasn't

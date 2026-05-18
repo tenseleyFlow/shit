@@ -212,7 +212,10 @@ fn synthesise_ip_addr(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
     // Addresses added in post but absent in pre → del.
     for (ifname, post_iface) in &post_by_if {
         let empty: Vec<IpAddrInfo> = Vec::new();
-        let pre_addrs = pre_by_if.get(ifname).map(|i| &i.addr_info).unwrap_or(&empty);
+        let pre_addrs = pre_by_if
+            .get(ifname)
+            .map(|i| &i.addr_info)
+            .unwrap_or(&empty);
         for a in &post_iface.addr_info {
             if !pre_addrs.iter().any(|p| p.identity() == a.identity()) {
                 inverse.push(addr_argv("del", ifname, a));
@@ -222,7 +225,10 @@ fn synthesise_ip_addr(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
     // Addresses absent in post but present in pre → add back.
     for (ifname, pre_iface) in &pre_by_if {
         let empty: Vec<IpAddrInfo> = Vec::new();
-        let post_addrs = post_by_if.get(ifname).map(|i| &i.addr_info).unwrap_or(&empty);
+        let post_addrs = post_by_if
+            .get(ifname)
+            .map(|i| &i.addr_info)
+            .unwrap_or(&empty);
         for a in &pre_iface.addr_info {
             if !post_addrs.iter().any(|p| p.identity() == a.identity()) {
                 inverse.push(addr_argv("add", ifname, a));
@@ -333,8 +339,7 @@ mod tests {
     #[test]
     fn ip_route_added_route_is_inverted_via_del() {
         let pre = b"[]";
-        let post =
-            br#"[{"dst":"10.0.0.0/24","gateway":"192.168.1.1","dev":"eth0","metric":100}]"#;
+        let post = br#"[{"dst":"10.0.0.0/24","gateway":"192.168.1.1","dev":"eth0","metric":100}]"#;
         let inv = synthesise_ip_route(pre, post);
         assert_eq!(inv.len(), 1);
         assert_eq!(inv[0][0], "ip");

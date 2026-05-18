@@ -154,7 +154,8 @@ impl Visit for JsonFieldVisitor {
 
     fn record_f64(&mut self, field: &Field, value: f64) {
         if let Some(n) = serde_json::Number::from_f64(value) {
-            self.fields.insert(field.name().to_string(), Value::Number(n));
+            self.fields
+                .insert(field.name().to_string(), Value::Number(n));
         }
     }
 
@@ -278,12 +279,7 @@ mod tests {
         let snap = ring.snapshot();
         let v: Value = serde_json::from_str(&snap[0]).unwrap();
         // record_debug renders via the Debug impl as a string.
-        assert!(
-            v["fields"]["thing"]
-                .as_str()
-                .unwrap()
-                .contains("x: 7")
-        );
+        assert!(v["fields"]["thing"].as_str().unwrap().contains("x: 7"));
     }
 
     #[test]

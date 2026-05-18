@@ -117,8 +117,13 @@ fn spawn_helper_and_complete_handshake() {
             // DR-66: per-OS classifier; non-empty + finite vocab.
             assert!(matches!(
                 kernel_tier.as_str(),
-                "fanotify" | "bpf-lsm" | "endpoint-security" | "kqueue" | "preload-shim"
-                | "degraded" | "unsupported"
+                "fanotify"
+                    | "bpf-lsm"
+                    | "endpoint-security"
+                    | "kqueue"
+                    | "preload-shim"
+                    | "degraded"
+                    | "unsupported"
             ));
         }
         other => panic!("expected HandshakeAck, got {other:?}"),
