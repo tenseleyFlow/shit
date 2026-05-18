@@ -674,6 +674,14 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::DbOp { .. } => Denormalized {
+            discriminant: "DbOp",
+            dev: None,
+            inode: None,
+            path: None,
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 
