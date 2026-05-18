@@ -151,6 +151,12 @@ pub enum HelperResponse {
         granted: HelperCaps,
         /// Free-form helper version string (e.g. `"shit-helper 0.1.0 (commit abc123)"`).
         helper_version: String,
+        /// Capture tier classifier the helper is actually running on
+        /// (DR-66). Examples: `"endpoint-security"`, `"fanotify"`,
+        /// `"bpf-lsm"`, `"kqueue"`, `"preload-shim"`, `"degraded"`.
+        /// Daemon stashes this in `Stats::kernel_tier` so
+        /// `shit metrics` surfaces what's actually active.
+        kernel_tier: String,
     },
     /// One pending auth event awaiting daemon's `AuthDecision`. The
     /// content fd (when needed) is attached via SCM_RIGHTS — never
@@ -255,6 +261,7 @@ mod tests {
                 package_hook: true,
             },
             helper_version: "shit-helper 0.1.0 (commit deadbeef)".into(),
+            kernel_tier: "fanotify".into(),
         };
         let bytes = encode_frame(&ack).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
