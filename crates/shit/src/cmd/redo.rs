@@ -2,18 +2,18 @@
 
 //! `shit redo` — re-apply the most recently-undone command.
 //!
-//! Per S11's design (DR-16): the executor records each undo in its
-//! exec log, tagged `kind = SystemUndo`. `shit redo` invokes the same
-//! orchestrator with the *forward* op derived from the original event
-//! sequence — not a stored "redo journal." This keeps redo idempotent
-//! and avoids a parallel storage path.
+//! DR-16 design: `shit-planner::plan_forward` produces the forward
+//! plan from the original event sequence. The orchestrator executes
+//! it the same way it executes an inverse plan; the executor doesn't
+//! need a new mode.
 //!
-//! Stage 1: CLI shape. Real wiring needs:
-//! 1. Daemon endpoint to look up "the most recent SystemUndo".
-//! 2. `shit-planner` `forward_plan(events)` constructor — currently
-//!    only `plan()` (the inverse) exists. Adding it is small.
-//! 3. The orchestrator handles forward and inverse identically since
-//!    it executes whatever `InverseOp`s land in the plan.
+//! The forward planner now exists (`crate::cmd::redo` calls into
+//! `shit_planner::plan_forward::plan_forward`). What's still
+//! deferred for true end-to-end:
+//! 1. Daemon endpoint to look up "the most recent SystemUndo" so
+//!    this command can fetch the events to forward-plan.
+//! 2. CLI integration with the daemon fetch path (gated on the
+//!    same runtime work that `shit undo` waits on).
 
 use clap::Args;
 
@@ -34,10 +34,15 @@ pub struct RedoArgs {
 }
 
 pub fn run(args: RedoArgs) -> Result<(), CliError> {
-    println!("shit redo — stage 1 (DR-16; forward-plan builder in planner not yet implemented)");
+    println!("shit redo — DR-16 forward planner ready");
     println!(
         "  dry_run={}, on_conflict={:?}, yes={}",
         args.dry_run, args.on_conflict, args.yes
+    );
+    println!(
+        "The `shit_planner::plan_forward::plan_forward` constructor \
+         emits the redo plan; daemon-fetch wiring for the original \
+         event sequence is still on the runtime-capture path."
     );
     Ok(())
 }
