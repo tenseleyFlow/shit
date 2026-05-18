@@ -14,9 +14,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shit_planner::events::{
-    CaptureEvent, CaptureEventKind, DbEngine, DbTxState, EventId,
-};
+use shit_planner::events::{CaptureEvent, CaptureEventKind, DbEngine, DbTxState, EventId};
 use shit_proto::{DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire};
 use shit_store::Index;
 

@@ -345,7 +345,11 @@ mod tests {
             other => panic!("expected Resolved, got {other:?}"),
         }
         let events = idx.events_for_command(command);
-        assert_eq!(events.len(), 1, "exactly one ProcessOp event for the killed target");
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one ProcessOp event for the killed target"
+        );
         match &events[0].kind {
             CaptureEventKind::ProcessOp {
                 kind,

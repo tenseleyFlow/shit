@@ -276,7 +276,12 @@ mod tests {
         let (_tmp, idx, active, command) = fixture();
         let stash = NetPreStash::new();
         let pid = std::process::id();
-        let _ = handle(&stash, req(PkgPhase::Pre, pid, "-A", b"before"), &active, &idx);
+        let _ = handle(
+            &stash,
+            req(PkgPhase::Pre, pid, "-A", b"before"),
+            &active,
+            &idx,
+        );
         let outcome = handle(
             &stash,
             req(PkgPhase::Post, pid, "-A", b"after-bytes"),
@@ -320,12 +325,7 @@ mod tests {
     fn orphan_post_is_dropped() {
         let (_tmp, idx, active, _) = fixture();
         let stash = NetPreStash::new();
-        let outcome = handle(
-            &stash,
-            req(PkgPhase::Post, 99, "-A", b"x"),
-            &active,
-            &idx,
-        );
+        let outcome = handle(&stash, req(PkgPhase::Post, 99, "-A", b"x"), &active, &idx);
         assert_eq!(outcome, PostOutcome::Orphan);
     }
 

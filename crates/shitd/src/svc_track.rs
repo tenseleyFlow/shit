@@ -279,7 +279,12 @@ mod tests {
         let raw = "ActiveState=active\nUnitFileState=enabled\nLoadState=loaded\n";
         let pid = std::process::id();
         let _ = handle(&stash, req(PkgPhase::Pre, pid, "start", raw), &active, &idx);
-        let outcome = handle(&stash, req(PkgPhase::Post, pid, "start", raw), &active, &idx);
+        let outcome = handle(
+            &stash,
+            req(PkgPhase::Post, pid, "start", raw),
+            &active,
+            &idx,
+        );
         assert_eq!(outcome, PostOutcome::Unchanged);
         assert_eq!(stash.len(), 0, "Post drains stash");
     }
