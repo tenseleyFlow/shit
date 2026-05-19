@@ -73,6 +73,10 @@ fi
 smoke_log "prep ruleset active: shit-b01-flush-prep"
 
 cleanup() {
+    # MUST call smoke_stop_shitd because we're overriding lib.sh's
+    # EXIT trap. Without it, shitd is orphaned and the CI action's
+    # SSH session waits for its inherited fds to close → 5-min hang.
+    smoke_stop_shitd 2>/dev/null || true
     echo 'pass all' | ${PRIV} tee /etc/pf-shit-smoke-restore.conf >/dev/null
     ${PRIV} /sbin/pfctl -f /etc/pf-shit-smoke-restore.conf >/dev/null 2>&1 || true
     ${PRIV} rm -f /etc/pf-shit-smoke-restore.conf 2>/dev/null || true

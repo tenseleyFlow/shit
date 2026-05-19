@@ -76,6 +76,10 @@ if [ "${PRE_ACTIVE}" != "running" ]; then
 fi
 
 cleanup() {
+    # MUST call smoke_stop_shitd because we're overriding lib.sh's
+    # EXIT trap. Without it, shitd is orphaned and the CI action's
+    # SSH session waits for its inherited fds to close → 5-min hang.
+    smoke_stop_shitd 2>/dev/null || true
     # Best-effort restore.
     ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start >/dev/null 2>&1 || true
 }
