@@ -17,3 +17,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 libc = { workspace = true }
+shit-proto = { path = "../shit-proto" }

@@ -183,15 +183,76 @@ mod policy {
     /// over the per-process UDS at `$XDG_RUNTIME_DIR/shit/shim.sock`
     /// and waits up to 50ms for an ack via `select(2)`. For S24.D.1
     /// we passthrough always.
-    pub fn notify_pre_mutation(_syscall: &'static str, _arg: &str) {
+    /// Resolve the shim socket path. Mirrors `shitd::shim_listener::shim_socket_path`'s
+    /// derivation: `${XDG_RUNTIME_DIR:-/tmp}/shit-shim.sock`. Cached for
+    /// the process lifetime.
+    fn socket_path() -> &'static std::path::Path {
+        static P: OnceLock<std::path::PathBuf> = OnceLock::new();
+        P.get_or_init(|| {
+            let dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+            dir.join("shit-shim.sock")
+        })
+        .as_path()
+    }
+
+    /// Notify the daemon of a pending mutation. Best-effort: failures
+    /// (no daemon, socket missing, timeout, encode error) are silently
+    /// swallowed and we allow the syscall through. The contract is
+    /// **fail-open** — the shim must never block a user's command
+    /// because the daemon's shim listener is unavailable.
+    ///
+    /// 50 ms read deadline mirrors the locked design decision in
+    /// the S24 plan. We can't use `select(2)` directly from safe Rust
+    /// here, but `set_read_timeout` on a `UnixStream` gives the same
+    /// allow-on-timeout property.
+    pub fn notify_pre_mutation(syscall: &'static str, arg: &str) {
         if disabled() {
-            // Kill switch active — never emit notifications.
-            // TODO(S24.D.2): UDS client wiring lands once the daemon's
-            // shim_listener accept loop exists. Until then this is a
-            // no-op; the interposers still serve as a placement check —
-            // they prove the LD_PRELOAD binding works.
-            let _ = (_syscall, _arg);
+            return;
         }
+        let _ = try_notify(syscall, arg);
+    }
+
+    fn try_notify(syscall: &'static str, arg: &str) -> std::io::Result<()> {
+        use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_frame};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, SystemTime};
+
+        let path = socket_path();
+        // Best-effort `connect(2)` — if the socket doesn't exist (no
+        // daemon, daemon down, wrong $XDG_RUNTIME_DIR), bail silently.
+        let mut stream = UnixStream::connect(path)?;
+        stream.set_write_timeout(Some(Duration::from_millis(50)))?;
+        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // SAFETY: shim runs in arbitrary user processes; getpid is a
+        // syscall, not an interposer target, so this is safe.
+        let pid = unsafe { libc::getpid() } as u32;
+        let note = ShimNotification {
+            pid,
+            syscall: syscall.to_string(),
+            arg: arg.to_string(),
+            ts_unix_nanos: now,
+        };
+        let frame = encode_frame(&note)
+            .map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
+        stream.write_all(&frame)?;
+
+        // Best-effort ack read. We don't actually act on the ack today
+        // (Allow-always), but draining it lets the listener's per-conn
+        // task observe a clean close. Errors here are non-fatal.
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n > 0 {
+            let _: Result<ShimAck, _> = decode_frame(&buf[..n]);
+        }
+        Ok(())
     }
 }
 
