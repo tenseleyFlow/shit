@@ -184,7 +184,7 @@ fn emit_for_event(
             op,
             packages_before,
             packages_after,
-            ..
+            repo_state_hint,
         } => {
             nodes.push(PlanNode {
                 op: InverseOp::PackageRollback {
@@ -192,6 +192,7 @@ fn emit_for_event(
                     original_op: *op,
                     packages_before: packages_before.clone(),
                     packages_after: packages_after.clone(),
+                    repo_state_hint: repo_state_hint.clone(),
                 },
                 cohort: 0,
                 conflict: None,

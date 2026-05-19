@@ -155,13 +155,17 @@ fn emit_forward_for_event(
             // Forward: target packages_after starting from
             // packages_before. We reuse PackageRollback as the
             // executor's primitive but swap the two state fields so
-            // the synthesised invocation moves forward.
+            // the synthesised invocation moves forward. The
+            // repo_state_hint is dropped — forward replay can't use
+            // `dnf history undo`, the redo path always goes through
+            // per-package install/remove.
             nodes.push(PlanNode {
                 op: InverseOp::PackageRollback {
                     manager: *manager,
                     original_op: *op,
                     packages_before: packages_after.clone(),
                     packages_after: packages_before.clone(),
+                    repo_state_hint: None,
                 },
                 cohort: 0,
                 conflict: None,
