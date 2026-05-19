@@ -56,12 +56,23 @@ if ! [ -f "/etc/rc.d/${TARGET_UNIT}" ]; then
     smoke_fail "/etc/rc.d/${TARGET_UNIT} missing — unexpected on FreeBSD base"
 fi
 
-# Capture baseline so we can restore even if the smoke aborts mid-way.
-PRE_ACTIVE="$(/usr/sbin/service "${TARGET_UNIT}" onestatus >/dev/null 2>&1 && echo running || echo stopped)"
+# Capture baseline. `service onestatus` reads /var/run/<unit>.pid
+# which is mode 0600 root:wheel — so the unprivileged check
+# false-negatives. Use pgrep instead (same shape as the helper's
+# active-state probe in svc/freebsd.rs).
+unit_running() {
+    pgrep -q "${TARGET_UNIT}"
+}
+if unit_running; then
+    PRE_ACTIVE="running"
+else
+    PRE_ACTIVE="stopped"
+fi
 smoke_log "baseline: ${TARGET_UNIT}=${PRE_ACTIVE}"
 if [ "${PRE_ACTIVE}" != "running" ]; then
     smoke_log "starting ${TARGET_UNIT} first (need a running→stopped transition to reverse)"
     ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start >/dev/null 2>&1 || true
+    sleep 1
 fi
 
 cleanup() {
@@ -99,8 +110,9 @@ smoke_log "svc-event pre"
 smoke_log "${PRIV} service ${TARGET_UNIT} stop"
 ${PRIV} /usr/sbin/service "${TARGET_UNIT}" stop >/dev/null 2>&1 || smoke_fail "service stop failed"
 
-# Verify it really stopped.
-if /usr/sbin/service "${TARGET_UNIT}" onestatus >/dev/null 2>&1; then
+# Verify it really stopped (pgrep — see baseline note above).
+sleep 0.5
+if unit_running; then
     smoke_fail "service ${TARGET_UNIT} still running after stop"
 fi
 
@@ -126,7 +138,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 
 # Post-undo: target should be running again.
 sleep 1
-if ! /usr/sbin/service "${TARGET_UNIT}" onestatus >/dev/null 2>&1; then
+if ! unit_running; then
     smoke_log "undo log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_fail "${TARGET_UNIT} not running after undo — service rollback didn't fire"
