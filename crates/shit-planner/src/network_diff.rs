@@ -328,6 +328,208 @@ fn synthesise_ip_link(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
     inverse
 }
 
+// =================================================================
+// ufw (DR-47)
+// =================================================================
+
+/// Threshold for switching from per-rule delete to a single
+/// `ufw --force reset` plus reapply. Above this many net changes,
+/// individual deletes/adds become noisy and error-prone; one reset
+/// is cleaner. 10 is the documented default from the sprint
+/// open-question. Users may override by configuration once we
+/// expose a knob.
+pub const UFW_RESET_THRESHOLD: usize = 10;
+
+/// Synthesise ufw inverse invocations. `before` and `after` are the
+/// raw `UfwInspector::collect_state` blobs (`status verbose` +
+/// `\n---\n` + `status numbered`).
+///
+/// Decision logic:
+/// 1. Parse both blobs into rule-string sets.
+/// 2. Compute `added = after - before` and `removed = before - after`.
+/// 3. If `added.len() + removed.len() <= UFW_RESET_THRESHOLD`:
+///    emit `ufw delete <rule>` per added rule, then `ufw <rule>` per
+///    removed rule. Order: deletes first so reinstated rules don't
+///    collide with the rules they're replacing.
+/// 4. Otherwise: emit one `ufw --force reset`, then `ufw <rule>` for
+///    every rule in `before`. This is the safe-but-disruptive path.
+///
+/// Returns `Vec::new()` when both states parse empty or when the
+/// before/after rule sets are identical.
+pub fn synthesise_ufw_inverse(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
+    let before_rules = parse_ufw_rules(before);
+    let after_rules = parse_ufw_rules(after);
+
+    let before_set: std::collections::BTreeSet<&String> = before_rules.iter().collect();
+    let after_set: std::collections::BTreeSet<&String> = after_rules.iter().collect();
+
+    let added: Vec<&&String> = after_set.difference(&before_set).collect();
+    let removed: Vec<&&String> = before_set.difference(&after_set).collect();
+
+    if added.is_empty() && removed.is_empty() {
+        return Vec::new();
+    }
+
+    let total_changes = added.len() + removed.len();
+    if total_changes > UFW_RESET_THRESHOLD {
+        let mut out = vec![vec!["ufw".into(), "--force".into(), "reset".into()]];
+        // Reapply in the captured order so rule numbering is preserved.
+        for rule in &before_rules {
+            out.push(rule_to_add_argv(rule));
+        }
+        return out;
+    }
+
+    let mut out = Vec::with_capacity(total_changes);
+    // Deletes first: drop rules added since capture.
+    for rule in &added {
+        out.push(rule_to_delete_argv(rule));
+    }
+    // Then re-add: restore rules removed since capture.
+    for rule in &removed {
+        out.push(rule_to_add_argv(rule));
+    }
+    out
+}
+
+/// Parse a `UfwInspector::collect_state` blob into the ordered list
+/// of rule body strings (the part after the `[N]` index). Returns
+/// `Vec::new()` if the blob is malformed or ufw is inactive.
+///
+/// Looks at the `status numbered` half of the blob (after the
+/// `\n---\n` separator). Lines that match `[ N] <body>` are
+/// extracted; lines outside the rule table are ignored.
+fn parse_ufw_rules(blob: &[u8]) -> Vec<String> {
+    let s = match std::str::from_utf8(blob) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    // The capture blob has "verbose\n---\nnumbered". Take the numbered half.
+    let numbered = s.split_once("\n---\n").map(|(_v, n)| n).unwrap_or(s);
+    let mut rules = Vec::new();
+    for line in numbered.lines() {
+        let trimmed = line.trim_start();
+        // Match "[N] " or "[ N] " prefix.
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        let rest = match trimmed.split_once(']') {
+            Some((idx, rest)) => {
+                if !idx[1..].trim().chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                rest.trim()
+            }
+            None => continue,
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        // Collapse internal whitespace runs and drop `(v6)` markers
+        // so a v4/v6 mirror pair collapses to a single canonical
+        // rule. ufw auto-creates the v6 mirror; we never want it
+        // to produce a duplicate inverse invocation.
+        let normalized: String = rest
+            .split_whitespace()
+            .filter(|t| *t != "(v6)")
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !normalized.is_empty() && !rules.iter().any(|r| r == &normalized) {
+            rules.push(normalized);
+        }
+    }
+    rules
+}
+
+/// Build a `ufw delete <rule>` argv. The rule string comes verbatim
+/// from `parse_ufw_rules`; ufw accepts the same syntax for delete
+/// that it does for the original add (modulo trailing v6 markers
+/// which the wrapper preserves).
+fn rule_to_delete_argv(rule: &str) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["ufw".into(), "delete".into()];
+    for tok in canonicalize_ufw_rule(rule) {
+        argv.push(tok);
+    }
+    argv
+}
+
+/// Build the original `ufw <rule>` argv to reinstate a rule.
+fn rule_to_add_argv(rule: &str) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["ufw".into()];
+    for tok in canonicalize_ufw_rule(rule) {
+        argv.push(tok);
+    }
+    argv
+}
+
+/// Convert the parsed `status numbered` body to the argv form ufw
+/// accepts for `ufw <action> ...`.
+///
+/// Status format: `<to> <ACTION> [IN|OUT|FWD] <from>` (with optional
+/// `(v6)` markers and `from <addr> to <addr> port <port>` clauses).
+///
+/// Two output forms:
+/// - Compact (`allow 80`): when the rule is `<to-token> <ACTION> IN Anywhere`
+///   — the implicit IN/Anywhere is the ufw CLI default.
+/// - Verbose (`allow in to any port 80 from <addr>`): for non-default
+///   directions or non-default source addresses.
+fn canonicalize_ufw_rule(rule: &str) -> Vec<String> {
+    let tokens: Vec<&str> = rule.split_whitespace().filter(|t| *t != "(v6)").collect();
+    let mut to_buf: Vec<String> = Vec::new();
+    let mut from_buf: Vec<String> = Vec::new();
+    let mut action: Option<String> = None;
+    let mut direction: Option<String> = None;
+    let mut seen_action = false;
+
+    for tok in &tokens {
+        if !seen_action {
+            if matches!(*tok, "ALLOW" | "DENY" | "REJECT" | "LIMIT") {
+                action = Some(tok.to_ascii_lowercase());
+                seen_action = true;
+                continue;
+            }
+            to_buf.push((*tok).to_string());
+        } else if direction.is_none() && matches!(*tok, "IN" | "OUT" | "FWD") {
+            direction = Some(tok.to_ascii_lowercase());
+        } else {
+            from_buf.push((*tok).to_string());
+        }
+    }
+
+    let Some(act) = action else {
+        // No action verb — fall back to the rule verbatim.
+        return tokens.iter().map(|s| (*s).to_string()).collect();
+    };
+
+    let dir_is_default = direction.as_deref().is_none_or(|d| d == "in");
+    let from_joined = from_buf.join(" ");
+    let from_is_default = from_joined.eq_ignore_ascii_case("Anywhere") || from_joined.is_empty();
+    let to_is_simple_token = to_buf.len() == 1
+        && !to_buf[0].contains(' ')
+        && !to_buf[0].eq_ignore_ascii_case("Anywhere");
+
+    if dir_is_default && from_is_default && to_is_simple_token {
+        return vec![act, to_buf.remove(0)];
+    }
+
+    // Verbose form.
+    let mut out: Vec<String> = vec![act];
+    if let Some(dir) = direction {
+        out.push(dir);
+    }
+    if !from_is_default {
+        out.push("from".into());
+        out.push(from_joined);
+    }
+    if !to_buf.is_empty() {
+        out.push("to".into());
+        out.push("any".into());
+        out.push("port".into());
+        out.extend(to_buf);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +732,148 @@ mod tests {
         let inv = synthesise_diff_apply_inverse(NetworkTool::IpRoute, b"[]", post);
         assert_eq!(inv.len(), 1);
         assert_eq!(inv[0][2], "del");
+    }
+
+    // -----------------------------------------------------------------
+    // ufw (DR-47)
+    // -----------------------------------------------------------------
+
+    fn ufw_blob(verbose: &str, numbered: &str) -> Vec<u8> {
+        format!("{verbose}\n---\n{numbered}").into_bytes()
+    }
+
+    const VERBOSE_SAMPLE: &str = "Status: active\nLogging: on (low)\n";
+
+    #[test]
+    fn ufw_added_rule_yields_single_delete() {
+        // Before: empty rules. After: one rule added.
+        let before = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let after = ufw_blob(
+            VERBOSE_SAMPLE,
+            "Status: active\n\n     To                         Action      From\n\
+             [ 1] 8080                       ALLOW IN    Anywhere\n",
+        );
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0], vec!["ufw", "delete", "allow", "8080"]);
+    }
+
+    #[test]
+    fn ufw_removed_rule_yields_single_add() {
+        let before = ufw_blob(
+            VERBOSE_SAMPLE,
+            "Status: active\n\n[ 1] 22/tcp                     ALLOW IN    Anywhere\n",
+        );
+        let after = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0], vec!["ufw", "allow", "22/tcp"]);
+    }
+
+    #[test]
+    fn ufw_under_threshold_emits_per_rule_inverse() {
+        // 3 rules added — under threshold; per-rule deletes.
+        let before = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let after = ufw_blob(
+            VERBOSE_SAMPLE,
+            "Status: active\n\n\
+             [ 1] 80                         ALLOW IN    Anywhere\n\
+             [ 2] 443                        ALLOW IN    Anywhere\n\
+             [ 3] 8080                       ALLOW IN    Anywhere\n",
+        );
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert_eq!(inv.len(), 3);
+        assert!(inv.iter().all(|v| v[1] == "delete"));
+    }
+
+    #[test]
+    fn ufw_over_threshold_emits_reset_plus_reapply() {
+        // 11 rules added — exceeds UFW_RESET_THRESHOLD (10). We
+        // emit `ufw --force reset` + zero rules to reapply since
+        // before was empty.
+        let mut numbered = String::from("Status: active\n\n");
+        for i in 1..=11 {
+            numbered.push_str(&format!(
+                "[{i:>2}] {port:<25} ALLOW IN    Anywhere\n",
+                port = 8000 + i
+            ));
+        }
+        let before = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let after = ufw_blob(VERBOSE_SAMPLE, &numbered);
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert_eq!(inv[0], vec!["ufw", "--force", "reset"]);
+        assert_eq!(inv.len(), 1, "before was empty, no rules to reapply");
+    }
+
+    #[test]
+    fn ufw_over_threshold_reapplies_before_rules_in_order() {
+        // 11 rules removed — reset, then reapply each of the 11.
+        let mut before_numbered = String::from("Status: active\n\n");
+        for i in 1..=11 {
+            before_numbered.push_str(&format!(
+                "[{i:>2}] {port:<25} ALLOW IN    Anywhere\n",
+                port = 9000 + i
+            ));
+        }
+        let before = ufw_blob(VERBOSE_SAMPLE, &before_numbered);
+        let after = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert_eq!(inv.len(), 12);
+        assert_eq!(inv[0], vec!["ufw", "--force", "reset"]);
+        assert_eq!(inv[1], vec!["ufw", "allow", "9001"]);
+        assert_eq!(inv[11], vec!["ufw", "allow", "9011"]);
+    }
+
+    #[test]
+    fn ufw_identical_before_after_emits_no_inverse() {
+        let blob = ufw_blob(
+            VERBOSE_SAMPLE,
+            "Status: active\n\n[ 1] 80 ALLOW IN Anywhere\n",
+        );
+        let inv = synthesise_ufw_inverse(&blob, &blob);
+        assert!(inv.is_empty());
+    }
+
+    #[test]
+    fn ufw_v6_marker_is_dropped_for_dedup() {
+        // The v4 and v6 mirror rules collapse to the same rule
+        // string after `(v6)` is stripped, so they shouldn't
+        // generate duplicate inverse invocations on identical state.
+        let before = ufw_blob(
+            VERBOSE_SAMPLE,
+            "Status: active\n\n\
+             [ 1] 80                         ALLOW IN    Anywhere\n\
+             [ 2] 80 (v6)                    ALLOW IN    Anywhere (v6)\n",
+        );
+        let after = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let inv = synthesise_ufw_inverse(&before, &after);
+        // Both rows collapse to "80 ALLOW IN Anywhere" → single add.
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0], vec!["ufw", "allow", "80"]);
+    }
+
+    #[test]
+    fn ufw_complex_rule_uses_verbose_form() {
+        let before = ufw_blob(
+            VERBOSE_SAMPLE,
+            "Status: active\n\n\
+             [ 1] 22/tcp                     ALLOW IN    192.168.1.0/24\n",
+        );
+        let after = ufw_blob(VERBOSE_SAMPLE, "Status: active\n\n");
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert_eq!(inv.len(), 1);
+        let argv = &inv[0];
+        assert_eq!(argv[0], "ufw");
+        assert_eq!(argv[1], "allow");
+        assert!(argv.contains(&"192.168.1.0/24".to_string()), "{argv:?}");
+        assert!(argv.contains(&"22/tcp".to_string()), "{argv:?}");
+    }
+
+    #[test]
+    fn ufw_malformed_blob_yields_no_inverse() {
+        let before = b"garbage with no numbered section".to_vec();
+        let after = b"different garbage".to_vec();
+        let inv = synthesise_ufw_inverse(&before, &after);
+        assert!(inv.is_empty());
     }
 }
