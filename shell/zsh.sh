@@ -89,3 +89,32 @@ add-zsh-hook precmd  __shit_post
 add-zsh-hook zshexit __shit_close
 
 __shit_send_open
+
+# C05: per-command auto-injection of the install-prefix shim.
+# Same shape as bash.sh — see that file for the full rationale.
+__shit_install_wrap() {
+    local _cmd="$1"
+    shift
+    if [[ -n "${SHIT_DISABLE:-}" ]] || [[ -n "${SHIT_PRELOAD_ACTIVE:-}" ]]; then
+        command "$_cmd" "$@"
+        return $?
+    fi
+    local _prefix
+    _prefix="$("$_SHIT_BIN" auto-inject-install-env --shell prefix -- "$_cmd" "$@" 2>/dev/null)"
+    if [[ -n "$_prefix" ]]; then
+        eval "$_prefix command \"\$_cmd\" \"\$@\""
+    else
+        command "$_cmd" "$@"
+    fi
+}
+
+make()    { __shit_install_wrap make    "$@"; }
+gmake()   { __shit_install_wrap gmake   "$@"; }
+cmake()   { __shit_install_wrap cmake   "$@"; }
+ninja()   { __shit_install_wrap ninja   "$@"; }
+meson()   { __shit_install_wrap meson   "$@"; }
+cargo()   { __shit_install_wrap cargo   "$@"; }
+pip()     { __shit_install_wrap pip     "$@"; }
+pip3()    { __shit_install_wrap pip3    "$@"; }
+python()  { __shit_install_wrap python  "$@"; }
+python3() { __shit_install_wrap python3 "$@"; }
