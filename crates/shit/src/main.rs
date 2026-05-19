@@ -94,6 +94,10 @@ enum Cmd {
     /// sqlite3). Opt-in stretch UX. See `shit db-hooks --help`.
     #[command(name = "db-hooks")]
     DbHooks(cmd::db_hooks::DbHooksArgs),
+    /// Install/remove/status the cloud-tool wrappers (kubectl, gh,
+    /// aws, terraform). See `shit cloud-hooks --help`.
+    #[command(name = "cloud-hooks")]
+    CloudHooks(cmd::cloud_hooks::CloudHooksArgs),
     /// Query the daemon's perf-counter snapshot. `--format prometheus`
     /// for scraping; `--watch 1s` for live updates.
     Metrics(cmd::metrics::MetricsArgs),
@@ -290,6 +294,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::NetHooks(args) => Ok(cmd::net_hooks::run(args)?),
         Cmd::ProcHooks(args) => Ok(cmd::proc_hooks::run(args)?),
         Cmd::DbHooks(args) => Ok(cmd::db_hooks::run(args)?),
+        Cmd::CloudHooks(args) => Ok(cmd::cloud_hooks::run(args)?),
         Cmd::Metrics(args) => Ok(cmd::metrics::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),

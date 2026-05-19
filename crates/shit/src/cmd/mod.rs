@@ -4,6 +4,7 @@
 //! subcommand's *behavior* lives here.
 
 pub mod bookmark;
+pub mod cloud_hooks;
 pub mod completions;
 pub mod config;
 pub mod ctl_client;

@@ -1743,6 +1743,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "shit-desc",
  "shit-proto",
  "tempfile",
  "thiserror 2.0.18",
