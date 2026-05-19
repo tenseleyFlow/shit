@@ -196,6 +196,10 @@ impl Index {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock().unwrap();
+        // DR-64 fault-injection: crash before opening the txn. On
+        // restart, the events should not be in the DB; the daemon
+        // re-ships them from the in-memory ring.
+        shit_proto::fault_inject::maybe_inject("index.put_event_batch.before_tx");
         let tx = conn.unchecked_transaction()?;
         let mut ids = Vec::with_capacity(events.len());
         {
@@ -235,7 +239,12 @@ impl Index {
                 update_path_history_with_conn(&tx, &ev.kind, ev.ts)?;
             }
         }
+        // DR-64 fault-injection: crash between txn-body and commit.
+        // On restart, sqlite WAL rolls back the partial work; the
+        // daemon re-ships from the ring buffer.
+        shit_proto::fault_inject::maybe_inject("index.put_event_batch.before_commit");
         tx.commit()?;
+        shit_proto::fault_inject::maybe_inject("index.put_event_batch.after_commit");
         Ok(ids)
     }
 
