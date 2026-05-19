@@ -238,8 +238,10 @@ pub fn check_size_cap(
     SizeCapStatus::Approaching
 }
 
-/// Query the next batch of expired commands. Pinned commands are
-/// filtered out at the SQL level (LEFT JOIN pins ... IS NULL).
+/// Query the next batch of expired commands. Pinned commands (`pins` —
+/// user-facing named savepoints) and held commands (`holds` — C01
+/// programmatic per-pid pins) are filtered out at the SQL level via
+/// LEFT JOINs whose right side must be NULL.
 /// Ordering: `(importance ASC, started_logical ASC)` so low-importance
 /// + old-first.
 fn mark_expired_batch(
@@ -251,8 +253,10 @@ fn mark_expired_batch(
     let mut stmt = conn.prepare(
         "SELECT c.session, c.seq
          FROM commands c
-         LEFT JOIN pins p ON c.session = p.session AND c.seq = p.seq
+         LEFT JOIN pins  p ON c.session = p.session AND c.seq = p.seq
+         LEFT JOIN holds h ON c.session = h.session AND c.seq = h.seq
          WHERE p.session IS NULL
+           AND h.session IS NULL
            AND c.started_logical < ?1
          ORDER BY c.importance ASC, c.started_logical ASC
          LIMIT ?2",

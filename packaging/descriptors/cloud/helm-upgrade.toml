@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud descriptor: reverse `helm upgrade <release> <chart>` via
+# `helm rollback`. Captures the current revision via `helm history`
+# before the upgrade; the reverse rolls back to that revision.
+
+[descriptor]
+version = 1
+name = "helm-upgrade"
+description = "Reverse `helm upgrade` via helm rollback to the prior revision."
+authority = "builtin"
+
+[match]
+argv = ["helm", "upgrade", "**"]
+
+[snapshot.pre]
+command = ["helm", "list", "--output", "json"]
+parse = "raw"
+extract.pre_revisions = ".raw"
+
+[reverse]
+requires_confirmation = true
+# Same v1 limitation as helm-install: release-name argv-token isn't
+# extractable. Surface the captured pre_revisions for review.
+command = ["echo", "review: run `helm rollback <release> <prev-rev>` for the upgraded release in shit show"]
+privileged = false

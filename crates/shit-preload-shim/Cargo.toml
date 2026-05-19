@@ -9,12 +9,27 @@ authors.workspace = true
 description = "LD_PRELOAD/DYLD_INSERT_LIBRARIES libc-interposition shim for shit-helper (S10 BSD tier)"
 
 [lib]
-# cdylib produces libshit_preload.{so,dylib} suitable for LD_PRELOAD.
-# We deliberately keep this a no_main, no-Rust-runtime cdylib so the
-# shim adds negligible load-time overhead to every process the user
-# runs with LD_PRELOAD set.
-crate-type = ["cdylib"]
+# `cdylib` produces libshit_preload.{so,dylib} suitable for LD_PRELOAD.
+# `rlib` is added so downstream Rust consumers (the `shit install`
+# wrapper, the auto-inject helper, the daemon-side install_hook
+# config) can reuse the pure-logic prefix matcher / install-pattern
+# matcher from this crate without duplicating them. The cdylib still
+# adds negligible load-time overhead — the Rust runtime is only paid
+# for once, at lib load, regardless of how many crate-types are
+# emitted.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = { workspace = true }
+# S24.D: the shim notifies the daemon's shim_listener over a UDS via
+# postcard-framed ShimNotification messages defined in shit-proto.
 shit-proto = { path = "../shit-proto" }
+# C05: pulled in only by the rlib face of the crate for the config
+# loader. The cdylib hot path doesn't touch serde / toml — they're
+# behind the `install_config::load_*` rlib-only entry points.
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

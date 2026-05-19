@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud descriptor: Azure VM delete is irreversible at the API
+# level (similar to GCP). Capture the VM descriptor before delete; the
+# user re-creates manually via `az vm create` from the captured spec.
+
+[descriptor]
+version = 1
+name = "az-vm-delete"
+description = "Capture pre-delete state for az vm delete (informational reverse)."
+authority = "builtin"
+
+[match]
+argv = ["az", "vm", "delete", "**"]
+
+[snapshot.pre]
+command = ["az", "vm", "list", "--output", "json"]
+parse = "raw"
+extract.pre_list = ".raw"
+
+[reverse]
+requires_confirmation = true
+command = ["echo", "review: az vm delete is irreversible; recreate via az vm create using pre_list in shit show"]
+privileged = false

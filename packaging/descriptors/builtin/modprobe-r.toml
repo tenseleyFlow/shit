@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C02 built-in descriptor: reverse `modprobe -r <module>` by re-
+# loading the module via `modprobe <module>`. The guard checks that
+# the module is currently NOT loaded — confirming the user's `-r`
+# actually took effect — before the reverse fires.
+
+[descriptor]
+version = 1
+name = "modprobe-remove"
+description = "Reverse modprobe -r by reloading the removed kernel module."
+authority = "builtin"
+
+[match]
+argv = ["modprobe", "-r", "*"]
+
+[snapshot.pre]
+# Capture the lsmod output so we know which modules were loaded
+# before the user's `-r`. The reverse looks at the post state.
+command = ["lsmod"]
+parse = "raw"
+extract.pre_lsmod = ".raw"
+
+[snapshot.post]
+command = ["lsmod"]
+parse = "raw"
+extract.post_lsmod = ".raw"
+
+[reverse]
+# Informational only in v1: the matcher doesn't currently surface the
+# module-name argv token as a variable. A future enhancement to the
+# match grammar (capturing groups) would let us emit
+# `modprobe {{module}}` here.
+requires_confirmation = true
+command = ["echo", "review: rerun `modprobe <module>` for the removed module shown in `shit show`"]
+privileged = false

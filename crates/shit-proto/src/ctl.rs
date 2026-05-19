@@ -23,6 +23,21 @@ pub enum CtlRequest {
     Forget { id: String, yes: bool },
     /// List currently pinned commands.
     PinList,
+    /// Bookmark a captured command — a metadata-only durable reference
+    /// that survives blob-tier GC (and eventually survives the command
+    /// row being reaped). C01.7-8.
+    Bookmark(BookmarkRequest),
+    /// Drop a bookmark.
+    BookmarkRemove { id: String, yes: bool },
+    /// List bookmarks.
+    BookmarkList,
+    /// C04.7: list container-runtime stashes (`docker save` image
+    /// tarballs and volume tarballs).
+    ContainerStashesList,
+    /// C04.7: prune container stashes older than `older_than_secs`.
+    /// Returns the count + total bytes freed in
+    /// `ContainerStashPruneReport`.
+    ContainerStashesPrune { older_than_secs: u64 },
     /// Package-manager hook invocation (S14). Sent by `shit-helper
     /// pkg-event ...` once per Pre and once per Post phase of a
     /// package operation. The daemon binds the event to the most
@@ -139,6 +154,44 @@ pub struct PinSummary {
     pub name: Option<String>,
     pub pinned_logical: u64,
     pub expires_logical: Option<u64>,
+}
+
+/// C01.8: bookmark request body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookmarkRequest {
+    /// Command id in `<session-uuid>:<seq>` form.
+    pub id: String,
+    pub note: Option<String>,
+}
+
+/// C01.8: bookmark summary returned by `BookmarkList`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookmarkSummary {
+    pub id: String,
+    pub created_logical: u64,
+    pub note: Option<String>,
+}
+
+/// C04.7: one row of `shit container-stashes list`. The wire shape is
+/// dependency-free — we don't lift the planner's `ContainerStash`
+/// type here because shit-proto stays leaf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerStashSummary {
+    /// Hex-encoded blake3 of the tarball bytes.
+    pub blob_hash: String,
+    /// `"image-save"` or `"volume-tar"`.
+    pub kind: String,
+    /// `"docker"` or `"podman"`.
+    pub runtime: String,
+    /// Image name (e.g. `nginx:1.25`) or volume name.
+    pub name: String,
+    pub size_bytes: u64,
+    pub created_unix_secs: u64,
+    /// Best-effort link back to the originating command, in
+    /// `<session-uuid>:<seq>` form. `None` when the stash was
+    /// registered before the command-window closed.
+    pub command: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Which side of a package transaction the hook is reporting.
@@ -556,6 +609,17 @@ pub enum CtlResponse {
     PinAck,
     /// Reply to `PinList`.
     Pins(Vec<PinSummary>),
+    /// Reply to `Bookmark` / `BookmarkRemove` — short acknowledgement.
+    BookmarkAck,
+    /// Reply to `BookmarkList`.
+    Bookmarks(Vec<BookmarkSummary>),
+    /// Reply to `ContainerStashesList` (C04.7).
+    ContainerStashes(Vec<ContainerStashSummary>),
+    /// Reply to `ContainerStashesPrune` (C04.7).
+    ContainerStashPruneReport {
+        pruned_count: u64,
+        bytes_freed: u64,
+    },
     /// Reply to `PkgEvent` — short acknowledgement. The daemon does
     /// not return the diff or anything resembling it; the helper
     /// hook only cares that the event was recorded so it can return

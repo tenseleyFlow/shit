@@ -1667,7 +1667,9 @@ dependencies = [
  "serde",
  "serde_json",
  "shit-capture",
+ "shit-desc",
  "shit-planner",
+ "shit-preload-shim",
  "shit-proto",
  "shit-shell",
  "tempfile",
@@ -1691,6 +1693,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "shit-desc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -1731,6 +1744,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "shit-desc",
  "shit-proto",
  "tempfile",
  "thiserror 2.0.18",
@@ -1743,7 +1757,11 @@ name = "shit-preload-shim"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "serde",
  "shit-proto",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

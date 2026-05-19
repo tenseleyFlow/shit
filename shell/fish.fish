@@ -85,3 +85,40 @@ $_SHIT_BIN hook-send session-open \
     --tty (tty 2>/dev/null; or echo unknown) \
     --sock $_SHIT_SOCK \
     >/dev/null 2>&1
+
+# C05: per-command auto-injection of the install-prefix shim.
+# Same shape as bash/zsh hooks — fish-syntax wrappers around each
+# known install command. See `shell/bash.sh` for the full rationale.
+function __shit_install_wrap --argument cmd
+    set -l args $argv[2..-1]
+    if test -n "$SHIT_DISABLE"; or test -n "$SHIT_PRELOAD_ACTIVE"
+        command $cmd $args
+        return $status
+    end
+    set -l fish_lines ($_SHIT_BIN auto-inject-install-env --shell fish -- $cmd $args 2>/dev/null)
+    if test (count $fish_lines) -gt 0
+        # Each line is `set -x KEY 'value'`. Eval line-by-line then
+        # invoke the command in the same scope so the exports apply.
+        for line in $fish_lines
+            eval $line
+        end
+        command $cmd $args
+        # The exports were local to this function scope; fish auto-
+        # unexports them when the function returns.
+        return $status
+    else
+        command $cmd $args
+        return $status
+    end
+end
+
+function make    ; __shit_install_wrap make    $argv; end
+function gmake   ; __shit_install_wrap gmake   $argv; end
+function cmake   ; __shit_install_wrap cmake   $argv; end
+function ninja   ; __shit_install_wrap ninja   $argv; end
+function meson   ; __shit_install_wrap meson   $argv; end
+function cargo   ; __shit_install_wrap cargo   $argv; end
+function pip     ; __shit_install_wrap pip     $argv; end
+function pip3    ; __shit_install_wrap pip3    $argv; end
+function python  ; __shit_install_wrap python  $argv; end
+function python3 ; __shit_install_wrap python3 $argv; end

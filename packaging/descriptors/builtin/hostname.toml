@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C02 built-in descriptor: reverse `hostname <new>` by re-issuing
+# `hostname <old>`. The undo path is privileged because most systems
+# restrict the hostname syscall to root.
+
+[descriptor]
+version = 1
+name = "hostname-set"
+description = "Reverse hostname(1) changes by restoring the prior hostname."
+authority = "builtin"
+
+[match]
+argv = ["hostname", "*"]
+exclude_argv = [
+    ["hostname", "-h"],
+    ["hostname", "--help"],
+    ["hostname", "-V"],
+    ["hostname", "--version"],
+]
+
+[snapshot.pre]
+command = ["hostname"]
+parse = "raw"
+extract.old_hostname = ".raw"
+
+[reverse]
+requires_confirmation = false
+command = ["hostname", "{{old_hostname}}"]
+privileged = true

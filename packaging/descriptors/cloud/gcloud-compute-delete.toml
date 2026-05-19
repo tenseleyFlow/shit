@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud descriptor: GCP compute-instance delete is irreversible at
+# the API level (no undelete grace period for compute instances). The
+# descriptor captures the instance descriptor before delete so the
+# user can manually re-create via `gcloud compute instances create`.
+
+[descriptor]
+version = 1
+name = "gcloud-compute-instances-delete"
+description = "Capture pre-delete state for gcloud compute instances delete (informational reverse)."
+authority = "builtin"
+
+[match]
+argv = ["gcloud", "compute", "instances", "delete", "**"]
+
+[snapshot.pre]
+command = ["gcloud", "compute", "instances", "list", "--format=json"]
+parse = "raw"
+extract.pre_list = ".raw"
+
+[reverse]
+requires_confirmation = true
+command = ["echo", "review: gcloud compute instances delete is irreversible; recreate manually using the captured pre_list in shit show"]
+privileged = false

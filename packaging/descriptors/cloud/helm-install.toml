@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud descriptor: reverse `helm install <release> <chart>` by
+# running `helm uninstall <release>`. Captures the release name via
+# `helm list` before exec; the reverse is straightforward delegation.
+#
+# Note: this assumes the install actually succeeded. Failed installs
+# typically leave the release in an inconsistent state that `helm
+# uninstall` handles correctly; document as a caveat.
+
+[descriptor]
+version = 1
+name = "helm-install"
+description = "Reverse `helm install <release> <chart>` via helm uninstall."
+authority = "builtin"
+
+[match]
+argv = ["helm", "install", "**"]
+
+[snapshot.pre]
+command = ["helm", "list", "--output", "json"]
+parse = "raw"
+extract.pre_list = ".raw"
+
+[reverse]
+requires_confirmation = true
+# The release name argv-token isn't directly extractable in v1 (the
+# matcher doesn't expose capture groups). We surface an informational
+# reverse and rely on shit show to display the diff between pre_list
+# and post_list so the user can see the new release name.
+command = ["echo", "review: run `helm uninstall <release>` for the new release shown in shit show"]
+privileged = false

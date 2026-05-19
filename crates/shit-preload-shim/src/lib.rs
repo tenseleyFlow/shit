@@ -52,6 +52,12 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod dispatch;
+pub mod install_config;
+pub mod install_pattern;
+pub mod prefix_match;
+pub mod runtime;
+
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",

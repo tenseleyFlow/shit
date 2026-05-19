@@ -24,6 +24,8 @@ mod capsicum_bsd;
     target_os = "dragonfly",
 ))]
 mod capture;
+mod cloud;
+mod container;
 mod crash;
 mod db;
 #[cfg(target_os = "linux")]
