@@ -25,6 +25,12 @@
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
+// Stage-1: kqueue/* exposes the public API DR-05..DR-11 will wire up
+// (vnode/proc watchers, kevent drain loop). Until then there are no
+// in-crate callers, which trips dead_code / unused_imports under
+// `-D warnings` on FreeBSD CI. Drop the allow when the runtime path
+// lights up (paired with the FreeBSD VM tooling).
+#![allow(dead_code, unused_imports)]
 
 pub mod error;
 pub mod event_loop;

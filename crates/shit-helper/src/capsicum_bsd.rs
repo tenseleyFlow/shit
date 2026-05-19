@@ -26,6 +26,10 @@
 //! once we have a FreeBSD VM target — same prerequisite as the kqueue
 //! runtime work.
 
+// Stage-1: CapsicumError variants aren't constructed until DR-10
+// wires the real cap_enter(2) call. Drop the allow then.
+#![allow(dead_code)]
+
 #[derive(Debug, thiserror::Error)]
 pub enum CapsicumError {
     #[error("cap_enter(2): {0}")]

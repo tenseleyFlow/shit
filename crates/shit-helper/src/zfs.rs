@@ -28,6 +28,10 @@
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
+// Stage-1: probe-only API; DR-09 wires the snapshot/list/rollback
+// callers. Until then the public functions have no in-crate callers
+// and trip dead_code under `-D warnings`.
+#![allow(dead_code)]
 
 use std::path::Path;
 
