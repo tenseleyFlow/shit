@@ -39,8 +39,8 @@ pub use frame::{
 };
 pub use shim::{ShimAck, ShimNotification};
 pub use helper::{
-    AuthDecision, AuthEventKind, FileKindWire, HELPER_PATH_HINT_MAX, HELPER_PROTOCOL_VERSION,
-    HelperCaps, TreeOpWire,
+    AuthDecision, AuthEventKind, FileKindWire, FileMetadataWire, HELPER_PATH_HINT_MAX,
+    HELPER_PROTOCOL_VERSION, HelperCaps, TreeOpWire,
     HelperProtoError, HelperRequest, HelperResponse, MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome,
     validate_outgoing,
 };

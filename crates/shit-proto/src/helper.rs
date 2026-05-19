@@ -35,7 +35,7 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// **Version 2 (S24.A):** added `HelperResponse::CapturedPreImage` for
 /// the kqueue post-hoc capture path; daemon learns to recvmsg with a
 /// cmsg buffer to extract the SCM_RIGHTS-attached staging fd.
-pub const HELPER_PROTOCOL_VERSION: u16 = 3;
+pub const HELPER_PROTOCOL_VERSION: u16 = 4;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -271,6 +271,21 @@ pub enum HelperResponse {
         op: TreeOpWire,
         ts_unix_nanos: u64,
     },
+    /// S29.3 — metadata mutation observation (chmod/chown/touch).
+    /// `before` is the snapshot captured at fd-registration time (or
+    /// after the last MetadataChange event for this fd); `after` is
+    /// the current `fstat` reading. Daemon converts to
+    /// `CaptureEventKind::MetadataChange { ... }`.
+    CapturedMetadataChange {
+        session: Uuid,
+        seq: u64,
+        dev: u64,
+        inode: u64,
+        path: Option<String>,
+        before: FileMetadataWire,
+        after: FileMetadataWire,
+        ts_unix_nanos: u64,
+    },
     /// DR-15 result of `ApplyChown` / `ApplyMknod`. Helper either
     /// applied the op or refused with a category.
     PrivilegedOpResult {
@@ -348,6 +363,21 @@ pub enum TreeOpWire {
     },
 }
 
+/// Wire mirror of a subset of `shit_planner::FileMetadata`. xattrs and
+/// ACL are omitted — neither is currently captured by the BSD producer.
+/// When kqueue gains an xattr-change signal (it doesn't have one in
+/// the base API), the field gets added here without changing the
+/// existing wire shape (postcard handles backward-compatible enums but
+/// not struct field additions; we'd version the struct then).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMetadataWire {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime_unix_nanos: i128,
+}
+
 /// Wire mirror of `shit_planner::FileKind`. Same enum shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileKindWire {
@@ -412,6 +442,16 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
             if longest > HELPER_PATH_HINT_MAX {
                 return Err(HelperProtoError::PathHintTooLong {
                     got: longest,
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::CapturedMetadataChange { path, .. } => {
+            if let Some(p) = path
+                && p.len() > HELPER_PATH_HINT_MAX
+            {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: p.len(),
                     max: HELPER_PATH_HINT_MAX,
                 });
             }
@@ -575,14 +615,46 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_constant_is_three() {
+    fn protocol_version_constant_is_four() {
         // Bumping this is intentional and should be paired with an
         // explicit migration plan; this test catches accidental bumps.
         //   Version 2 (S24.A) added `HelperResponse::CapturedPreImage`
         //     for the kqueue post-hoc capture path.
         //   Version 3 (S29.1) added `HelperResponse::TreeMutation`
         //     for mkdir/rmdir/rename/symlink/link observations.
-        assert_eq!(HELPER_PROTOCOL_VERSION, 3);
+        //   Version 4 (S29.3) added `HelperResponse::CapturedMetadataChange`
+        //     for chmod/chown/touch (NOTE_ATTRIB).
+        assert_eq!(HELPER_PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn captured_metadata_change_round_trip() {
+        let ev = HelperResponse::CapturedMetadataChange {
+            session: Uuid::nil(),
+            seq: 7,
+            dev: 64,
+            inode: 1042,
+            path: Some("/tmp/scratch/probe".into()),
+            before: FileMetadataWire {
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 100,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+            },
+            after: FileMetadataWire {
+                mode: 0o100755,
+                uid: 1000,
+                gid: 1000,
+                size: 100,
+                mtime_unix_nanos: 1_700_000_000_100_000_000,
+            },
+            ts_unix_nanos: 1_700_000_000_200_000_000,
+        };
+        let encoded = crate::frame::encode_frame(&ev).expect("encode");
+        let decoded: HelperResponse =
+            crate::frame::decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, ev);
     }
 
     #[test]
