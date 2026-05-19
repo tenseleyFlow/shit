@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId, NetworkTool};
+use shit_planner::events::{CaptureEvent, CaptureEventKind, CommandId, EventId, NetworkTool};
 use shit_proto::{NetEventReq, NetToolWire};
 use shit_store::Index;
 
@@ -28,10 +28,23 @@ use crate::active_commands::ActiveCommands;
 
 pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 
+/// Pid-based stash key — fallback when ancestry doesn't resolve to
+/// an active command.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NetKey {
     pub tool: NetToolWire,
     pub pid: u32,
+    pub scope_hint: String,
+}
+
+/// Command-based stash key — used when Pre and Post resolve to the
+/// same shell-ancestor (the wrappers are PATH-prepended scripts that
+/// invoke shit-helper twice in separate processes; pairing by pid
+/// would never match).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NetCommandKey {
+    pub command: CommandId,
+    pub tool: NetToolWire,
     pub scope_hint: String,
 }
 
@@ -43,33 +56,48 @@ pub struct NetPre {
 }
 
 pub struct NetPreStash {
-    inner: Mutex<HashMap<NetKey, NetPre>>,
+    by_command: Mutex<HashMap<NetCommandKey, NetPre>>,
+    by_pid: Mutex<HashMap<NetKey, NetPre>>,
 }
 
 impl NetPreStash {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            by_command: Mutex::new(HashMap::new()),
+            by_pid: Mutex::new(HashMap::new()),
         }
     }
-    pub fn insert(&self, key: NetKey, pre: NetPre) {
-        self.inner.lock().unwrap().insert(key, pre);
+    pub fn insert_by_command(&self, key: NetCommandKey, pre: NetPre) {
+        self.by_command.lock().unwrap().insert(key, pre);
     }
-    pub fn take(&self, key: &NetKey) -> Option<NetPre> {
-        self.inner.lock().unwrap().remove(key)
+    pub fn take_by_command(&self, key: &NetCommandKey) -> Option<NetPre> {
+        self.by_command.lock().unwrap().remove(key)
+    }
+    pub fn insert_by_pid(&self, key: NetKey, pre: NetPre) {
+        self.by_pid.lock().unwrap().insert(key, pre);
+    }
+    pub fn take_by_pid(&self, key: &NetKey) -> Option<NetPre> {
+        self.by_pid.lock().unwrap().remove(key)
     }
     pub fn sweep_expired(&self) -> usize {
-        let mut g = self.inner.lock().unwrap();
         let cutoff = Instant::now()
             .checked_sub(PRE_STASH_TTL)
             .unwrap_or_else(Instant::now);
+        let mut evicted = 0;
+        let mut g = self.by_command.lock().unwrap();
         let before = g.len();
         g.retain(|_, e| e.ts >= cutoff);
-        before - g.len()
+        evicted += before - g.len();
+        drop(g);
+        let mut g = self.by_pid.lock().unwrap();
+        let before = g.len();
+        g.retain(|_, e| e.ts >= cutoff);
+        evicted += before - g.len();
+        evicted
     }
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.by_command.lock().unwrap().len() + self.by_pid.lock().unwrap().len()
     }
 }
 
@@ -99,11 +127,18 @@ pub fn handle(
     active: &ActiveCommands,
     index: &Index,
 ) -> PostOutcome {
-    let key = NetKey {
+    let pid_key = NetKey {
         tool: req.tool,
         pid: req.pid,
         scope_hint: req.scope_hint.clone(),
     };
+    let cmd_key = active
+        .resolve_by_descendant(req.pid)
+        .map(|c| NetCommandKey {
+            command: c,
+            tool: req.tool,
+            scope_hint: req.scope_hint.clone(),
+        });
     match req.phase {
         shit_proto::PkgPhase::Pre => {
             tracing::debug!(
@@ -112,20 +147,29 @@ pub fn handle(
                 scope = %req.scope_hint,
                 verb = %req.verb,
                 bytes = req.state_raw.len(),
+                command = ?cmd_key.as_ref().map(|k| k.command),
                 "net-pre stashed"
             );
-            stash.insert(
-                key,
-                NetPre {
-                    state_raw: req.state_raw,
-                    verb: req.verb,
-                    ts: Instant::now(),
-                },
-            );
+            let pre = NetPre {
+                state_raw: req.state_raw,
+                verb: req.verb,
+                ts: Instant::now(),
+            };
+            if let Some(k) = cmd_key {
+                stash.insert_by_command(k, pre);
+            } else {
+                stash.insert_by_pid(pid_key, pre);
+            }
             PostOutcome::Orphan
         }
         shit_proto::PkgPhase::Post => {
-            let Some(pre) = stash.take(&key) else {
+            let pre = match cmd_key.as_ref() {
+                Some(k) => stash
+                    .take_by_command(k)
+                    .or_else(|| stash.take_by_pid(&pid_key)),
+                None => stash.take_by_pid(&pid_key),
+            };
+            let Some(pre) = pre else {
                 tracing::warn!(
                     tool = req.tool.as_str(),
                     pid = req.pid,
@@ -143,7 +187,7 @@ pub fn handle(
             }
             let before_len = pre.state_raw.len();
             let after_len = req.state_raw.len();
-            let Some(command) = active.resolve_by_descendant(req.pid) else {
+            let Some(command) = cmd_key.as_ref().map(|k| k.command) else {
                 tracing::warn!(
                     tool = req.tool.as_str(),
                     pid = req.pid,
@@ -357,19 +401,16 @@ mod tests {
             pid: 42,
             scope_hint: "filter".into(),
         };
-        {
-            let mut g = stash.inner.lock().unwrap();
-            g.insert(
-                key,
-                NetPre {
-                    state_raw: vec![],
-                    verb: "-A".into(),
-                    ts: Instant::now()
-                        .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
-                        .expect("clock subtraction"),
-                },
-            );
-        }
+        stash.insert_by_pid(
+            key,
+            NetPre {
+                state_raw: vec![],
+                verb: "-A".into(),
+                ts: Instant::now()
+                    .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
+                    .expect("clock subtraction"),
+            },
+        );
         assert_eq!(stash.sweep_expired(), 1);
         assert_eq!(stash.len(), 0);
     }
