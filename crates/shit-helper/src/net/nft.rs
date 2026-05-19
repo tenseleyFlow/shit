@@ -24,8 +24,12 @@ impl NetInspector for NftInspector {
         NetToolWire::Nft
     }
     fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+        // `-a` (include rule handles) is a global flag; nft requires
+        // it before the subcommand, not after. `nft list ruleset -a`
+        // fails with "syntax error, options must be specified before
+        // commands"; `nft -a list ruleset` is the right form.
         let out = Command::new("nft")
-            .args(["list", "ruleset", "-a"])
+            .args(["-a", "list", "ruleset"])
             .output()?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
