@@ -658,8 +658,7 @@ impl shit_planner::executors::NetRunner for PrivilegedNetRunner {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         path.push(format!("shit-net-{pid}-{nanos}.dump"));
-        let mut f =
-            std::fs::File::create(&path).map_err(|e| format!("create tmp: {e}"))?;
+        let mut f = std::fs::File::create(&path).map_err(|e| format!("create tmp: {e}"))?;
         f.write_all(bytes).map_err(|e| format!("write tmp: {e}"))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .map_err(|e| format!("chmod tmp: {e}"))?;
