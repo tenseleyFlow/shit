@@ -43,7 +43,27 @@ smoke_log() {
 
 smoke_fail() {
     smoke_log "FAIL: $*"
+    # Stop the daemon so its tracing-appender's WorkerGuard drops
+    # and the JSON log is fully flushed to disk. Then dump it so the
+    # failure surfaces the daemon-side breadcrumbs.
+    smoke_stop_shitd
+    smoke_dump_daemon_logs
     exit 1
+}
+
+# Dump the daemon's rolling JSON log on failure. The `info`-level
+# breadcrumbs the daemon emits (`pkg-event Pre stashed by command`,
+# `net-pre stashed`, etc.) land only here, not in shitd.log.
+smoke_dump_daemon_logs() {
+    local log_dir="${XDG_STATE_HOME}/shit/log"
+    if [ -d "${log_dir}" ]; then
+        smoke_log "daemon JSON log:"
+        find "${log_dir}" -name 'daemon.jsonl*' -type f -print 2>/dev/null \
+            | while read -r f; do
+                echo "    --- ${f} ---" >&2
+                tail -100 "${f}" 2>/dev/null | sed 's/^/    /' >&2 || true
+            done
+    fi
 }
 
 # Start shitd in the background. Blocks until the ctl socket appears
