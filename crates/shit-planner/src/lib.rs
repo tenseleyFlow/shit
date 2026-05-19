@@ -51,7 +51,8 @@ pub use executor::{
 pub use executors::FileExecutor;
 pub use inode::{BlobHash, InodeRef};
 pub use inverse::{
-    Conflict, DbEngine, InverseOp, InverseTier, PlanNode, PlanWarning, RollbackHint, UndoPlan,
+    AliasDiff, Conflict, ContainerOp, ContainerRuntime, DbEngine, FuncDiff, InverseOp, InverseTier,
+    OptDiff, PlanNode, PlanWarning, RollbackHint, UndoPlan,
 };
 pub use metadata::{FileKind, FileMetadata};
 pub use network::{

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C02 built-in descriptor: reverse `date -s "..."` by restoring the
+# clock to the pre-set timestamp. The captured value is unix-epoch
+# seconds so it's stable across timezones; the reverse uses
+# `date -s @<seconds>` which most BSD/GNU `date` implementations
+# accept.
+#
+# CAVEAT: undo time may be much later than capture time. Any work
+# scheduled by cron/launchd between capture and undo will misfire.
+# The descriptor surfaces a warning via requires_confirmation = true.
+
+[descriptor]
+version = 1
+name = "date-set"
+description = "Reverse system clock mutations from date(1) -s."
+authority = "builtin"
+
+[match]
+argv = ["date", "-s", "*"]
+exclude_argv = [
+    ["date", "-s", "--help"],
+]
+
+[snapshot.pre]
+command = ["date", "+%s"]
+parse = "raw"
+extract.old_unix = ".raw"
+
+[reverse]
+requires_confirmation = true
+command = ["date", "-s", "@{{old_unix}}"]
+privileged = true

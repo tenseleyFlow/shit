@@ -10,20 +10,32 @@
 //! - S17 — network/firewall tier
 //! - S18 — process tier (note-only)
 
+pub mod aws;
+pub mod container;
 pub mod db;
+pub mod descriptor;
 pub mod env;
 pub mod file;
+pub mod gh;
+pub mod kubectl;
 pub mod network;
 pub mod package;
 pub mod process;
 pub mod services;
+pub mod shell_state;
+pub mod terraform;
 
+pub use aws::{AwsExecutor, AwsRunner, SystemAwsRunner};
+pub use container::{ContainerExecutor, ContainerRunner, SystemContainerRunner};
 pub use db::{
     DbExecOutcome, DbExecutor, DbSuggestion, DbSuggestionSink, VecDbSuggestionSink,
     decide as db_decide,
 };
+pub use descriptor::{DescRunner, DescriptorExecutor, SystemDescRunner};
 pub use env::{EnvExecutor, SnippetSink, StringSnippetSink};
 pub use file::FileExecutor;
+pub use gh::{GhExecutor, GhRunner, SystemGhRunner};
+pub use kubectl::{KubectlExecutor, KubectlRunner, SystemKubectlRunner};
 pub use network::{NetRunner, NetworkExecutor, SystemNetRunner};
 pub use package::{PackageExecutor, PkgRunner, SystemPkgRunner};
 pub use process::{
@@ -31,3 +43,5 @@ pub use process::{
     VecSuggestionSink, render_snippet as render_process_snippet,
 };
 pub use services::{ServiceExecutor, SvcRunner, SystemSvcRunner};
+pub use shell_state::{ShellStateExecutor, ShellStateRunner, ShellTarget, SystemShellStateRunner};
+pub use terraform::{SystemTerraformRunner, TerraformExecutor, TerraformRunner};

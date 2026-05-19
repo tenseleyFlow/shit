@@ -166,6 +166,7 @@ fn emit_forward_for_event(
                     packages_before: packages_after.clone(),
                     packages_after: packages_before.clone(),
                     repo_state_hint: None,
+                    delegation: None,
                 },
                 cohort: 0,
                 conflict: None,

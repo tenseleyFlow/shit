@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C02 built-in descriptor: reverse `timedatectl set-time <iso>` by
+# capturing the unix epoch and restoring via `date -s @<sec>`. We use
+# `date` for the reverse because timedatectl's own set-time wants an
+# ISO timestamp string and our captured value is epoch-seconds.
+
+[descriptor]
+version = 1
+name = "timedatectl-set-time"
+description = "Reverse timedatectl set-time clock changes."
+authority = "builtin"
+
+[match]
+argv = ["timedatectl", "set-time", "*"]
+
+[snapshot.pre]
+command = ["date", "+%s"]
+parse = "raw"
+extract.old_unix = ".raw"
+
+[reverse]
+requires_confirmation = true
+command = ["date", "-s", "@{{old_unix}}"]
+privileged = true

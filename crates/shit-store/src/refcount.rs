@@ -60,8 +60,10 @@ pub fn reap_commands(index: &Index, ids: &[CommandId]) -> Result<ReapBatch, Inde
     let mut summary = ReapBatch::default();
 
     for id in ids {
-        // TOCTOU guard: if this command became pinned since the
-        // mark-expired pass enumerated it, skip.
+        // TOCTOU guard: if this command became pinned (via `pins`, the
+        // user-facing savepoint table) or held (via `holds`, the C01
+        // programmatic per-pid pin) since the mark-expired pass enumerated
+        // it, skip.
         let pinned: bool = tx
             .query_row(
                 "SELECT 1 FROM pins WHERE session = ?1 AND seq = ?2",
@@ -70,6 +72,16 @@ pub fn reap_commands(index: &Index, ids: &[CommandId]) -> Result<ReapBatch, Inde
             )
             .unwrap_or(false);
         if pinned {
+            continue;
+        }
+        let held: bool = tx
+            .query_row(
+                "SELECT 1 FROM holds WHERE session = ?1 AND seq = ?2 LIMIT 1",
+                params![id.session.as_bytes().as_slice(), id.seq as i64],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if held {
             continue;
         }
 
@@ -184,6 +196,42 @@ mod tests {
         let ids = vec![CommandId { session, seq: 0 }, CommandId { session, seq: 1 }];
         let summary = reap_commands(&idx, &ids).unwrap();
         // Only seq=0 was reaped.
+        assert_eq!(summary.commands_dropped, 1);
+        let conn = idx.conn().lock().unwrap();
+        let remaining: Vec<i64> = {
+            let mut s = conn
+                .prepare("SELECT seq FROM commands WHERE session = ?1 ORDER BY seq")
+                .unwrap();
+            s.query_map(params![session.as_bytes().as_slice()], |row| row.get(0))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert_eq!(remaining, vec![1]);
+    }
+
+    #[test]
+    fn reap_skips_held_command() {
+        // C01: a programmatic hold also protects from GC, distinct from
+        // the user-facing `pins` table.
+        let idx = make_index();
+        let session = Uuid::now_v7();
+        insert_command(&idx, session, 0);
+        insert_command(&idx, session, 1);
+
+        // Hold seq=1 directly.
+        {
+            let conn = idx.conn().lock().unwrap();
+            conn.execute(
+                "INSERT INTO holds (session, seq, owner_pid, owner_user, taken_logical)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session.as_bytes().as_slice(), 1i64, 4242i64, "alice", 0i64],
+            )
+            .unwrap();
+        }
+
+        let ids = vec![CommandId { session, seq: 0 }, CommandId { session, seq: 1 }];
+        let summary = reap_commands(&idx, &ids).unwrap();
         assert_eq!(summary.commands_dropped, 1);
         let conn = idx.conn().lock().unwrap();
         let remaining: Vec<i64> = {

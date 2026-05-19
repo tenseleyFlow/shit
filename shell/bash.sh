@@ -100,3 +100,49 @@ PROMPT_COMMAND="__shit_post${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
 trap '__shit_close' EXIT
 
 __shit_send_open
+
+# C05: per-command auto-injection of the install-prefix shim.
+#
+# Each wrapper below asks `shit auto-inject-install-env --shell prefix`
+# whether the about-to-run argv matches an install pattern (make
+# install, cargo install --path/--force/--root, pip install --user,
+# python setup.py install, etc.). If yes, the helper emits a
+# single-line POSIX prefix of the form:
+#
+#   LD_PRELOAD='/path' SHIT_PRELOAD_ACTIVE='1' SHIT_DAEMON_SOCK='/path'
+#
+# The wrapper `eval`s that prefix directly in front of `command
+# <name> "$@"`, so the shim env only scopes to the user's one
+# invocation. If the helper exits with empty stdout (no match), the
+# command runs unhooked.
+#
+# Set SHIT_DISABLE=1 to bypass auto-injection.
+
+__shit_install_wrap() {
+    local _cmd="$1"
+    shift
+    if [[ -n "${SHIT_DISABLE:-}" ]] || [[ -n "${SHIT_PRELOAD_ACTIVE:-}" ]]; then
+        # Already inside an active shim invocation or user has
+        # disabled — fall through.
+        command "$_cmd" "$@"
+        return $?
+    fi
+    local _prefix
+    _prefix="$("$_SHIT_BIN" auto-inject-install-env --shell prefix -- "$_cmd" "$@" 2>/dev/null)"
+    if [[ -n "$_prefix" ]]; then
+        eval "$_prefix command \"\$_cmd\" \"\$@\""
+    else
+        command "$_cmd" "$@"
+    fi
+}
+
+make()    { __shit_install_wrap make    "$@"; }
+gmake()   { __shit_install_wrap gmake   "$@"; }
+cmake()   { __shit_install_wrap cmake   "$@"; }
+ninja()   { __shit_install_wrap ninja   "$@"; }
+meson()   { __shit_install_wrap meson   "$@"; }
+cargo()   { __shit_install_wrap cargo   "$@"; }
+pip()     { __shit_install_wrap pip     "$@"; }
+pip3()    { __shit_install_wrap pip3    "$@"; }
+python()  { __shit_install_wrap python  "$@"; }
+python3() { __shit_install_wrap python3 "$@"; }

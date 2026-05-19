@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C04 container wrapper: podman. PATH-prepended under
+# $XDG_CONFIG_HOME/shit/bin/ when `shit container-hooks install` runs.
+#
+# Pre/post capture invocations of `shit-helper container-event podman ...`
+# are gated on DR-CR-21/26 (daemon-side container capture pipeline +
+# helper subcommand). Stage 1 just execs the real podman with
+# SHIT_DURING_UNDO recursion guard.
+
+set -e
+
+# Recursion guard: a podman invocation issued FROM the helper itself
+# (during a shit undo) must NOT re-capture. The executors set
+# SHIT_DURING_UNDO=1.
+if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
+    real=$(command -v -- podman | grep -v "$(dirname "$0")" | head -n1)
+    [ -n "$real" ] || { echo "shit: real podman not found on PATH" >&2; exit 127; }
+    exec "$real" "$@"
+fi
+
+# Locate the real podman (first non-wrapper entry on PATH).
+real=$(PATH="${PATH#*$(dirname "$0"):}" command -v podman 2>/dev/null || command -v -- podman)
+[ -n "$real" ] || { echo "shit: real podman not found on PATH" >&2; exit 127; }
+
+# DR-CR-21/26: pre/post hooks via `shit-helper container-event` go
+# here. Stage 1: just exec.
+exec "$real" "$@"

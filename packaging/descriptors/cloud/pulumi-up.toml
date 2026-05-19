@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud descriptor: reverse `pulumi up` by exporting + restoring
+# the stack state. Pulumi has `stack export` / `stack import` for
+# exactly this case.
+
+[descriptor]
+version = 1
+name = "pulumi-up"
+description = "Reverse `pulumi up` by capturing + restoring the prior stack state."
+authority = "builtin"
+
+[match]
+argv = ["pulumi", "up", "**"]
+exclude_argv = [
+    ["pulumi", "up", "--help"],
+]
+
+[snapshot.pre]
+# pulumi stack export emits JSON; we capture raw bytes and pipe back
+# via stack import on reverse. The captured snapshot represents the
+# pre-up state.
+command = ["pulumi", "stack", "export"]
+parse = "raw"
+extract.pre_state = ".raw"
+
+[reverse]
+requires_confirmation = true
+# Informational v1: pulumi stack import wants stdin and we don't have
+# a v1 grammar for piping captured state into the reverse. The user
+# runs `pulumi stack import` manually with the captured pre_state.
+command = ["echo", "review: run `pulumi stack import < pre_state` using the captured state in shit show"]
+privileged = false

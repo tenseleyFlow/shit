@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud descriptor: reverse a Vercel deploy by rolling back to the
+# previously-active deployment. Vercel has a native `vercel rollback`
+# verb — we capture the deployment list pre-deploy and surface the id
+# of what was active.
+
+[descriptor]
+version = 1
+name = "vercel-deploy"
+description = "Reverse `vercel deploy` by rolling back to the prior active deployment."
+authority = "builtin"
+
+[match]
+# Both `vercel` and `vercel deploy` shape a deployment in Vercel's CLI.
+# We match the explicit form here; bare `vercel` would require argv-
+# disambiguation that v1 doesn't have.
+argv = ["vercel", "deploy", "**"]
+
+[snapshot.pre]
+command = ["vercel", "list", "--json"]
+parse = "raw"
+extract.pre_deployments = ".raw"
+
+[reverse]
+requires_confirmation = true
+command = ["echo", "review: run `vercel rollback --to=<prev-id>` for the active deployment in shit show"]
+privileged = false

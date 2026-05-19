@@ -85,6 +85,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
             InverseOp::RecreatePath { .. } => self.apply_recreate_path(op),
             InverseOp::Rename { .. } => self.apply_rename(op),
             InverseOp::CreateSymlink { .. } => self.apply_create_symlink(op),
+            InverseOp::FileExtend { .. } => self.apply_file_extend(op),
             other => ExecutionOutcome::Failed {
                 err: format!(
                     "FileExecutor: unexpected variant {other:?} after supports() said yes — bug?"
@@ -252,6 +253,58 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             Ok(()) => ExecutionOutcome::Applied,
             Err(e) => ExecutionOutcome::Failed {
                 err: format!("symlink {path:?} -> {link_target:?}: {e}"),
+            },
+        }
+    }
+
+    /// C06.6: truncate a file back to its pre-append size. The
+    /// capture path stashed `truncate_to` as a single `stat` call —
+    /// dramatically cheaper than reading the entire file just to
+    /// emit a no-op restore for the bytes the user never touched.
+    /// Append-only ops are the common case (logs, command output
+    /// captured via `>>`).
+    fn apply_file_extend(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::FileExtend { path, truncate_to } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_file_extend: wrong variant".into(),
+            };
+        };
+        // Defensive size check: if the current file is SHORTER than
+        // truncate_to, something has rewritten the file out from
+        // under us (another process truncated; the redirect
+        // semantics differ from what the capture assumed). Refuse —
+        // truncating UP would write zero bytes the user never put
+        // there.
+        match fs::metadata(path) {
+            Ok(m) if m.len() < *truncate_to => {
+                return ExecutionOutcome::Failed {
+                    err: format!(
+                        "FileExtend: current size {} < pre-append size {}; refusing to grow \
+                         file with zeros (something else truncated the file since capture)",
+                        m.len(),
+                        truncate_to,
+                    ),
+                };
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return ExecutionOutcome::Failed {
+                    err: format!("FileExtend: stat {path:?}: {e}"),
+                };
+            }
+        }
+        // Open RW + ftruncate. `OpenOptions::write(true)` doesn't
+        // truncate the existing content (no `truncate(true)`); the
+        // explicit `set_len` does the truncate-back.
+        match fs::OpenOptions::new().write(true).open(path) {
+            Ok(f) => match f.set_len(*truncate_to) {
+                Ok(()) => ExecutionOutcome::Applied,
+                Err(e) => ExecutionOutcome::Failed {
+                    err: format!("FileExtend: truncate {path:?} to {truncate_to}: {e}"),
+                },
+            },
+            Err(e) => ExecutionOutcome::Failed {
+                err: format!("FileExtend: open {path:?}: {e}"),
             },
         }
     }
@@ -453,6 +506,81 @@ mod tests {
             e.execute(&op, true, ConflictPolicy::default()),
             ExecutionOutcome::WouldApply
         );
+    }
+
+    #[test]
+    fn file_extend_truncates_file_back_to_pre_size() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("log");
+        // Pre: 8 bytes. Post (after `>>`): 32 bytes. Reverse: truncate to 8.
+        std::fs::write(&target, vec![0u8; 32]).unwrap();
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::FileExtend {
+            path: target.clone(),
+            truncate_to: 8,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn file_extend_refuses_to_grow_with_zeros() {
+        // If something truncated the file shorter than truncate_to
+        // since capture, refusing is the right answer — we'd be
+        // appending zeros the user never wrote.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("log");
+        std::fs::write(&target, vec![0u8; 4]).unwrap(); // current = 4
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::FileExtend {
+            path: target.clone(),
+            truncate_to: 16, // would grow with zeros
+        };
+        match e.execute(&op, false, ConflictPolicy::default()) {
+            ExecutionOutcome::Failed { err } => {
+                assert!(err.contains("refusing to grow"), "got: {err}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // File was not modified.
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn file_extend_missing_path_returns_failed() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("ghost");
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::FileExtend {
+            path: target,
+            truncate_to: 0,
+        };
+        let out = e.execute(&op, false, ConflictPolicy::default());
+        assert!(matches!(out, ExecutionOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn file_extend_to_zero_makes_file_empty() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("log");
+        std::fs::write(&target, b"some content here").unwrap();
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::FileExtend {
+            path: target.clone(),
+            truncate_to: 0,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
     }
 
     #[test]

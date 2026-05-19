@@ -8,6 +8,7 @@ members = [
     "crates/shit-proto",
     "crates/shit-store",
     "crates/shit-capture",
+    "crates/shit-desc",
     "crates/shit-planner",
     "crates/shit-shell",
     "benches/regression",
@@ -55,7 +56,9 @@ toml = "0.9"
 proptest = "1.6"
 bitflags = "2.6"
 
+shit-desc = { path = "crates/shit-desc" }
 shit-planner = { path = "crates/shit-planner" }
+shit-preload-shim = { path = "crates/shit-preload-shim" }
 shit-proto = { path = "crates/shit-proto" }
 shit-store = { path = "crates/shit-store" }
 shit-capture = { path = "crates/shit-capture" }

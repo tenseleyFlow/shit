@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C04 container wrapper: docker-compose (the standalone v1 binary).
+# The v2 plugin form `docker compose ...` is intercepted by the
+# docker-wrapper above; this script catches the v1 binary that's
+# still ubiquitous in CI images.
+#
+# Pre/post capture invocations of
+# `shit-helper container-event docker-compose ...` are gated on
+# DR-CR-21/26. Stage 1 just execs the real docker-compose with
+# SHIT_DURING_UNDO recursion guard.
+
+set -e
+
+# Recursion guard: a docker-compose invocation issued FROM the
+# helper itself (during a shit undo) must NOT re-capture. The
+# executors set SHIT_DURING_UNDO=1.
+if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
+    real=$(command -v -- docker-compose | grep -v "$(dirname "$0")" | head -n1)
+    [ -n "$real" ] || { echo "shit: real docker-compose not found on PATH" >&2; exit 127; }
+    exec "$real" "$@"
+fi
+
+# Locate the real docker-compose (first non-wrapper entry on PATH).
+real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker-compose 2>/dev/null || command -v -- docker-compose)
+[ -n "$real" ] || { echo "shit: real docker-compose not found on PATH" >&2; exit 127; }
+
+# DR-CR-21/26: pre/post hooks via `shit-helper container-event` go
+# here. Stage 1: just exec.
+exec "$real" "$@"

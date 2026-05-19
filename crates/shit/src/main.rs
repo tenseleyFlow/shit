@@ -67,6 +67,13 @@ enum Cmd {
     Show(cmd::show::ShowArgs),
     /// Pin a command's savepoint to protect it from GC.
     Pin(cmd::pin::PinArgs),
+    /// Bookmark a command — a metadata-only durable reference that
+    /// survives blob-tier GC and the eventual reaping of the command
+    /// row. C01.
+    Bookmark(cmd::bookmark::BookmarkArgs),
+    /// Administer reverse-API descriptor packs (list / validate / test).
+    /// C02. See `shit descriptors --help`.
+    Descriptors(cmd::descriptors::DescriptorsArgs),
     /// Install/remove/status the package-manager hooks (apt, pacman,
     /// dnf, brew, FreeBSD pkg). See `shit pkg-hooks --help`.
     #[command(name = "pkg-hooks")]
@@ -87,6 +94,26 @@ enum Cmd {
     /// sqlite3). Opt-in stretch UX. See `shit db-hooks --help`.
     #[command(name = "db-hooks")]
     DbHooks(cmd::db_hooks::DbHooksArgs),
+    /// Install/remove/status the cloud-tool wrappers (kubectl, gh,
+    /// aws, terraform). See `shit cloud-hooks --help`.
+    #[command(name = "cloud-hooks")]
+    CloudHooks(cmd::cloud_hooks::CloudHooksArgs),
+    /// Install/remove/status the container-runtime wrappers (docker,
+    /// podman, docker-compose). See `shit container-hooks --help`.
+    #[command(name = "container-hooks")]
+    ContainerHooks(cmd::container_hooks::ContainerHooksArgs),
+    /// List or prune container-runtime stashes (image / volume
+    /// tarballs from C04). See `shit container-stashes --help`.
+    #[command(name = "container-stashes")]
+    ContainerStashes(cmd::container_stashes::ContainerStashesArgs),
+    /// Run a command under the install-prefix shim (LD_PRELOAD /
+    /// DYLD_INSERT_LIBRARIES). C05. See `shit install --help`.
+    Install(cmd::install::InstallArgs),
+    /// Shell preexec helper: classify an argv and emit shim env-var
+    /// assignments if it matches a known install pattern. Wired into
+    /// the auto-inject path from `shit hooks install`. C05.
+    #[command(name = "auto-inject-install-env")]
+    AutoInjectInstallEnv(cmd::auto_inject::AutoInjectArgs),
     /// Query the daemon's perf-counter snapshot. `--format prometheus`
     /// for scraping; `--watch 1s` for live updates.
     Metrics(cmd::metrics::MetricsArgs),
@@ -276,11 +303,18 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::List(args) => Ok(cmd::list::run(args)?),
         Cmd::Show(args) => Ok(cmd::show::run(args)?),
         Cmd::Pin(args) => Ok(cmd::pin::run(args)?),
+        Cmd::Bookmark(args) => Ok(cmd::bookmark::run(args)?),
+        Cmd::Descriptors(args) => Ok(cmd::descriptors::run(args)?),
         Cmd::PkgHooks(args) => Ok(cmd::pkg_hooks::run(args)?),
         Cmd::SvcHooks(args) => Ok(cmd::svc_hooks::run(args)?),
         Cmd::NetHooks(args) => Ok(cmd::net_hooks::run(args)?),
         Cmd::ProcHooks(args) => Ok(cmd::proc_hooks::run(args)?),
         Cmd::DbHooks(args) => Ok(cmd::db_hooks::run(args)?),
+        Cmd::CloudHooks(args) => Ok(cmd::cloud_hooks::run(args)?),
+        Cmd::ContainerHooks(args) => Ok(cmd::container_hooks::run(args)?),
+        Cmd::ContainerStashes(args) => Ok(cmd::container_stashes::run(args)?),
+        Cmd::Install(args) => Ok(cmd::install::run(args)?),
+        Cmd::AutoInjectInstallEnv(args) => Ok(cmd::auto_inject::run(args)?),
         Cmd::Metrics(args) => Ok(cmd::metrics::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
