@@ -125,6 +125,9 @@ async fn handle_client(
         CtlRequest::Pin(req) => handle_pin(req, index),
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
+        CtlRequest::Bookmark(req) => handle_bookmark(req, index),
+        CtlRequest::BookmarkRemove { id, yes: _ } => handle_bookmark_remove(id, index),
+        CtlRequest::BookmarkList => handle_bookmark_list(index),
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash, &active, &index),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash, &active, &index),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
@@ -248,6 +251,51 @@ fn handle_pin_list(index: Arc<Index>) -> CtlResponse {
             CtlResponse::Pins(summaries)
         }
         Err(e) => CtlResponse::Error(format!("pin list: {e}")),
+    }
+}
+
+fn handle_bookmark(req: shit_proto::BookmarkRequest, index: Arc<Index>) -> CtlResponse {
+    let (session, seq) = match parse_command_id(&req.id) {
+        Ok(p) => p,
+        Err(e) => return CtlResponse::Error(format!("bookmark: {e}")),
+    };
+    let cmd = shit_planner::CommandId { session, seq };
+    // Stage 1: synthetic monotonic logical counter, same approach as
+    // `handle_pin`. When the daemon's real logical clock lands, replace.
+    let created_logical = index.pin_count().map(|n| n + 1).unwrap_or(1);
+    match shit_store::bookmarks::create(&index, cmd, created_logical, req.note.as_deref()) {
+        Ok(()) => CtlResponse::BookmarkAck,
+        Err(e) => CtlResponse::Error(format!("bookmark: {e}")),
+    }
+}
+
+fn handle_bookmark_remove(id: String, index: Arc<Index>) -> CtlResponse {
+    let (session, seq) = match parse_command_id(&id) {
+        Ok(p) => p,
+        Err(e) => return CtlResponse::Error(format!("bookmark-remove: {e}")),
+    };
+    let cmd = shit_planner::CommandId { session, seq };
+    match shit_store::bookmarks::remove(&index, cmd) {
+        Ok(true) => CtlResponse::BookmarkAck,
+        Ok(false) => CtlResponse::Error(format!("bookmark-remove: no bookmark for {id}")),
+        Err(e) => CtlResponse::Error(format!("bookmark-remove: {e}")),
+    }
+}
+
+fn handle_bookmark_list(index: Arc<Index>) -> CtlResponse {
+    match shit_store::bookmarks::list_all(&index) {
+        Ok(rows) => {
+            let summaries = rows
+                .into_iter()
+                .map(|b| shit_proto::BookmarkSummary {
+                    id: format!("{}:{}", b.command.session, b.command.seq),
+                    created_logical: b.created_logical,
+                    note: b.note,
+                })
+                .collect();
+            CtlResponse::Bookmarks(summaries)
+        }
+        Err(e) => CtlResponse::Error(format!("bookmark list: {e}")),
     }
 }
 

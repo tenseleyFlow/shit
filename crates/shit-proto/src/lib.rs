@@ -27,11 +27,11 @@ pub mod frame;
 pub mod helper;
 
 pub use ctl::{
-    CtlRequest, CtlResponse, DaemonStatus, DbConnInfo, DbEngineParseError, DbEngineWire,
-    DbEventReq, DbTxStateWire, GcReport, GcRequest, MetricsSnapshot, NetEventReq,
-    NetToolParseError, NetToolWire, PinRequest, PinSummary, PkgEventReq, PkgManagerParseError,
-    PkgManagerWire, PkgPhase, ProcEventReq, ProcSnapshot, ProcToolParseError, ProcToolWire,
-    SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire,
+    BookmarkRequest, BookmarkSummary, CtlRequest, CtlResponse, DaemonStatus, DbConnInfo,
+    DbEngineParseError, DbEngineWire, DbEventReq, DbTxStateWire, GcReport, GcRequest,
+    MetricsSnapshot, NetEventReq, NetToolParseError, NetToolWire, PinRequest, PinSummary,
+    PkgEventReq, PkgManagerParseError, PkgManagerWire, PkgPhase, ProcEventReq, ProcSnapshot,
+    ProcToolParseError, ProcToolWire, SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire,
 };
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
