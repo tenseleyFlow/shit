@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 #[cfg(target_os = "freebsd")]
 mod capsicum_bsd;
 mod cloud;
+mod container;
 mod crash;
 mod db;
 #[cfg(target_os = "linux")]
