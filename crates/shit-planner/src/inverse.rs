@@ -65,11 +65,18 @@ pub enum InverseOp {
     UnsetEnv { name: String },
     /// Roll back a package-manager operation. The executor synthesizes the
     /// inverse invocation per manager.
+    ///
+    /// `repo_state_hint` is an opaque pre-capture token whose meaning is
+    /// per-manager. For dnf it carries the `dnf history` transaction id
+    /// so the executor can emit a single `dnf history undo <id>` (DR-26)
+    /// instead of synthesizing per-package install/remove invocations.
+    /// Other managers leave it `None` today.
     PackageRollback {
         manager: PackageManager,
         original_op: PackageOpKind,
         packages_before: BTreeMap<String, String>,
         packages_after: BTreeMap<String, String>,
+        repo_state_hint: Option<String>,
     },
     /// Roll back a network-tool change. Reload-style tools (iptables-restore,
     /// nft -f, pfctl -f) use `before_state`; diff-style tools (`ip route`,
