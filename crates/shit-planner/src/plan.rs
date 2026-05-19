@@ -208,20 +208,30 @@ fn emit_for_event(
             // inverse_invocations empty; synthesise them from the
             // pre/after JSON dumps here. FullReload tools (iptables,
             // nft, pfctl) reload before_state directly so we don't
-            // synthesise. Ufw is DiffApplyWithReset and the executor
-            // has its own reset+replay pipeline.
+            // synthesise. DR-47: ufw is DiffApplyWithReset — its
+            // synthesiser decides between per-rule delete/add and a
+            // single `ufw --force reset` + reapply based on a
+            // threshold.
             let mut invs = inverse_invocations.clone();
-            if invs.is_empty()
-                && matches!(
-                    crate::network::restore_method(*tool),
-                    crate::network::RestoreMethod::DiffApply
-                )
-            {
-                invs = crate::network_diff::synthesise_diff_apply_inverse(
-                    *tool,
-                    before_state,
-                    after_state,
-                );
+            if invs.is_empty() {
+                match crate::network::restore_method(*tool) {
+                    crate::network::RestoreMethod::DiffApply => {
+                        invs = crate::network_diff::synthesise_diff_apply_inverse(
+                            *tool,
+                            before_state,
+                            after_state,
+                        );
+                    }
+                    crate::network::RestoreMethod::DiffApplyWithReset => {
+                        if matches!(*tool, crate::events::NetworkTool::Ufw) {
+                            invs = crate::network_diff::synthesise_ufw_inverse(
+                                before_state,
+                                after_state,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
                 if invs.is_empty() {
                     warnings.push(PlanWarning::Informational {
                         tier: crate::inverse::InverseTier::Network,
