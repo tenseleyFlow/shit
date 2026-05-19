@@ -85,6 +85,20 @@ struct DedupeEntry {
     invalidated: bool,
 }
 
+/// Decide whether the producer should emit a pre-image capture for
+/// the given `(dev, inode)`, given the current dedupe map state.
+///
+/// First-write-wins per (dev, inode) within a watch window. A delete
+/// flips `invalidated=true`, which lets the *next* write re-capture
+/// (handles inode reuse and the rm-then-recreate pattern).
+fn should_capture_dedupe(map: &HashMap<(u64, u64), DedupeEntry>, key: (u64, u64)) -> bool {
+    match map.get(&key) {
+        None => true,
+        Some(e) if e.invalidated => true,
+        Some(_) => false,
+    }
+}
+
 /// Pump thread's working set. Maps RawFd to which CommandId owns it,
 /// so a DrainEvent's `fd` resolves quickly to its watch state.
 struct PumpState {
@@ -196,14 +210,7 @@ impl PumpState {
                 return;
             }
         };
-        // First-write-wins per (dev, inode), with re-capture after
-        // delete (inode either invalidated, or reused with the same key).
-        let should_capture = match ws.dedupe.get(&(dev, inode)) {
-            None => true,
-            Some(e) if e.invalidated => true,
-            Some(_) => false,
-        };
-        if !should_capture {
+        if !should_capture_dedupe(&ws.dedupe, (dev, inode)) {
             tracing::trace!(fd, dev, inode, "dedupe hit; skipping recapture");
             return;
         }
@@ -519,5 +526,56 @@ mod tests {
         let f = std::fs::File::open(&path).unwrap();
         let (dev, inode) = fstat_dev_inode(f.as_raw_fd()).expect("fstat ok");
         assert!(dev > 0 || inode > 0);
+    }
+
+    #[test]
+    fn dedupe_first_write_wins() {
+        let mut map: HashMap<(u64, u64), DedupeEntry> = HashMap::new();
+        let key = (1u64, 42u64);
+        // First write: empty map → should capture.
+        assert!(should_capture_dedupe(&map, key));
+        // Record the capture (not invalidated — was a Write/Extend).
+        map.insert(key, DedupeEntry { invalidated: false });
+        // Second write to the same inode: dedupe hit → skip.
+        assert!(!should_capture_dedupe(&map, key));
+        // Different inode in the same watch: independent dedupe.
+        assert!(should_capture_dedupe(&map, (1, 43)));
+    }
+
+    #[test]
+    fn delete_invalidates_then_recaptures() {
+        let mut map: HashMap<(u64, u64), DedupeEntry> = HashMap::new();
+        let key = (2u64, 100u64);
+        // Initial write captures.
+        assert!(should_capture_dedupe(&map, key));
+        map.insert(key, DedupeEntry { invalidated: false });
+        // Subsequent write: skipped.
+        assert!(!should_capture_dedupe(&map, key));
+        // NOTE_DELETE flips the entry — simulates the helper's
+        // post-Delete bookkeeping.
+        map.insert(key, DedupeEntry { invalidated: true });
+        // Next write (inode reuse or recreate-with-same-key): captures.
+        assert!(should_capture_dedupe(&map, key));
+    }
+
+    #[test]
+    fn late_event_after_unwatch_dropped() {
+        // After detach, the PumpState's watches map no longer contains
+        // the command; handle_vnode short-circuits at the
+        // `self.watches.get_mut(&command)` lookup. We simulate the
+        // "fd is registered but watch is gone" race by populating
+        // fd_to_command without an entry in watches and asserting the
+        // code path returns cleanly.
+        let (conn_a, _conn_b) = crate::ipc::socketpair().expect("socketpair");
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a));
+        let ghost = CommandId {
+            session: Uuid::nil(),
+            seq: 0,
+        };
+        state.fd_to_command.insert(999, ghost);
+        // Must not panic; must not send.
+        state.handle_vnode(999, VnodeEventKind::Write);
+        assert!(state.watches.is_empty(), "watches must still be empty");
     }
 }
