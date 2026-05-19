@@ -17,7 +17,9 @@
 //! payload — no string parsing lives in the helper itself.
 
 pub mod conn;
+pub mod redact;
 pub mod stmt;
 
 pub use conn::{ConnInfo, ConnParseError, parse_mysql_argv, parse_psql_argv, parse_sqlite3_argv};
+pub use redact::{is_sensitive_column, redact_statement};
 pub use stmt::{StatementKind, classify_statement, split_statements};

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use shit_planner::db::{
     ConnInfo, classify_statement, parse_mysql_argv, parse_psql_argv, parse_sqlite3_argv,
-    split_statements,
+    redact_statement, split_statements,
 };
 use shit_proto::{
     CtlRequest, CtlResponse, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase, decode_frame,
@@ -118,8 +118,12 @@ pub async fn run_event(
     Ok(())
 }
 
-/// Split a statement blob and drop read-only entries. Exposed for
-/// tests and for future use by the daemon-cross-ref path.
+/// Split a statement blob, drop read-only entries, and redact
+/// sensitive literal values (DR-54). Exposed for tests and for
+/// future use by the daemon-cross-ref path.
+///
+/// Redaction runs *after* classification, so the classifier's
+/// keyword scan still sees the original statement shape.
 pub fn filter_statements(blob: &str) -> Vec<String> {
     if blob.trim().is_empty() {
         return Vec::new();
@@ -127,6 +131,7 @@ pub fn filter_statements(blob: &str) -> Vec<String> {
     split_statements(blob)
         .into_iter()
         .filter(|s| classify_statement(s).is_mutating())
+        .map(|s| redact_statement(&s))
         .collect()
 }
 
@@ -198,5 +203,31 @@ mod tests {
         let kept = filter_statements("SELECT * FROM t FOR UPDATE; SELECT * INTO new FROM old");
         assert_eq!(kept.len(), 1);
         assert!(kept[0].contains("INTO new"));
+    }
+
+    #[test]
+    fn filter_redacts_identified_by_password() {
+        let kept = filter_statements("CREATE USER alice IDENTIFIED BY 'hunter2'");
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].contains("hunter2"), "{}", kept[0]);
+        assert!(kept[0].contains("<redacted:"), "{}", kept[0]);
+    }
+
+    #[test]
+    fn filter_redacts_insert_sensitive_column() {
+        let kept = filter_statements(
+            "INSERT INTO creds (name, api_key) VALUES ('svc', 'ghp_supersecrettoken')",
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].contains("ghp_supersecrettoken"), "{}", kept[0]);
+        assert!(kept[0].contains("'svc'"), "{}", kept[0]);
+    }
+
+    #[test]
+    fn filter_redacts_update_password_set() {
+        let kept = filter_statements("UPDATE users SET password = 'leak' WHERE id = 1");
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].contains("'leak'"), "{}", kept[0]);
+        assert!(kept[0].contains("WHERE id = 1"), "{}", kept[0]);
     }
 }
