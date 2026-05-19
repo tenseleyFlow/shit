@@ -15,8 +15,10 @@
 //! `MAJOR.MINOR.PATCH`. We deliberately *don't* try `uname(2)` because
 //! it pulls in glibc-specific behavior; the procfs path is portable
 //! across libcs.
-
-#![cfg(target_os = "linux")]
+//!
+//! Parent `lib.rs` gates this module with `#[cfg(target_os =
+//! "linux")]`; we don't repeat the inner `#![cfg]` because rustc's
+//! `duplicated_attributes` flags the dup under `-D warnings`.
 
 use std::fs;
 use std::io;

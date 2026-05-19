@@ -7,8 +7,10 @@
 //! file diverge via COW. Hash through the clone (cheap on a hot cache,
 //! and the kernel guarantees byte-identity to the source at the moment
 //! of the clone call).
-
-#![cfg(target_os = "macos")]
+//!
+//! Parent `cow::mod` gates this with `#[cfg(target_os = "macos")]`;
+//! no inner `#![cfg]` here (rustc's `duplicated_attributes` flags
+//! the dup under `-D warnings`).
 
 use std::ffi::CString;
 use std::fs::{self, File};

@@ -6,8 +6,11 @@
 //! Same-volume only; cross-volume returns EXDEV (we surface as
 //! `TierUnsupported` so the engine falls through). XFS without
 //! `reflink=1` returns EOPNOTSUPP — same treatment.
-
-#![cfg(target_os = "linux")]
+//!
+//! The parent `cow::mod` gates this module with `#[cfg(target_os =
+//! "linux")]`; we don't repeat the inner `#![cfg]` here because
+//! rustc's `duplicated_attributes` warns on it (CI fails with
+//! `-D warnings`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
