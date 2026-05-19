@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C02 built-in descriptor: reverse a single-key `sysctl -w key=value`
+# by capturing the prior value and re-setting it. Only matches the
+# `-w key=value` form; multi-key writes and `-p file` forms fall
+# through to file-tier capture on /etc/sysctl.d/*.
+#
+# CAVEAT: this descriptor only fires for the runtime sysctl knob.
+# Persistent /etc/sysctl.d/ edits are captured by the file tier
+# independently; both undo paths may apply.
+
+[descriptor]
+version = 1
+name = "sysctl-set"
+description = "Reverse a single sysctl -w key=value runtime change."
+authority = "builtin"
+
+[match]
+# Pattern matches `sysctl -w <key>=<value>`. Lint enforces argv[0]
+# literal; the `-w` and `*=*` are matched by exact tokens. Multi-arg
+# forms (`sysctl -w a=1 b=2`) don't fit this descriptor and fall to
+# the file tier.
+argv = ["sysctl", "-w", "*"]
+
+[snapshot.pre]
+# Capture the prior value. The exact key isn't available as an
+# extracted variable yet (the matcher doesn't currently split the
+# `key=value` form), so we capture `-a` and rely on the lines parse.
+# Authors who want stricter behavior can layer a per-key descriptor
+# in their user pack.
+command = ["sysctl", "-a"]
+parse = "raw"
+extract.snapshot = ".raw"
+
+[reverse]
+# Reverse is informational: we surface the snapshot so the user can
+# review and re-apply manually. A true automated reverse would need
+# the matcher to expose argv-token substrings; out of v1.
+requires_confirmation = true
+command = ["echo", "review: prior sysctl snapshot stored in shit log; re-apply specific keys manually"]
+privileged = false

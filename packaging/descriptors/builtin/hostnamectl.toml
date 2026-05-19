@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C02 built-in descriptor: reverse `hostnamectl set-hostname <new>`.
+# Same intent as hostname.toml, but routed through systemd's
+# hostnamectl, which also updates /etc/hostname.
+
+[descriptor]
+version = 1
+name = "hostnamectl-set"
+description = "Reverse hostnamectl set-hostname mutations."
+authority = "builtin"
+
+[match]
+argv = ["hostnamectl", "set-hostname", "*"]
+
+[snapshot.pre]
+command = ["hostnamectl", "--static"]
+parse = "raw"
+extract.old_hostname = ".raw"
+
+[reverse]
+requires_confirmation = false
+command = ["hostnamectl", "set-hostname", "{{old_hostname}}"]
+privileged = true

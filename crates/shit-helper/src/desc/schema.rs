@@ -745,4 +745,40 @@ command = ["tp", "{{v}}"]
         let toks = interpolation_vars("hello {{a}} world {{b");
         assert_eq!(toks, vec!["a".to_string()]);
     }
+
+    /// C02.8: every built-in descriptor pack ships parseable + lint-clean.
+    /// This is the only sprint-level guarantee that the packs in
+    /// `packaging/descriptors/builtin/` stay in sync with the schema; if
+    /// the schema tightens a rule, this test catches it before release.
+    #[test]
+    fn builtin_descriptor_packs_parse_and_lint() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pack_dir = here
+            .parent() // crates/
+            .and_then(|p| p.parent()) // workspace root
+            .map(|p| p.join("packaging/descriptors/builtin"))
+            .expect("locate builtin pack dir");
+        assert!(
+            pack_dir.is_dir(),
+            "expected builtin pack dir at {}",
+            pack_dir.display()
+        );
+        let mut found = 0usize;
+        for entry in std::fs::read_dir(&pack_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            match Descriptor::from_toml(&text) {
+                Ok(_) => found += 1,
+                Err(e) => panic!("pack {} failed: {e}", path.display()),
+            }
+        }
+        // We ship six builtins in C02.8 (hostname, hostnamectl, date,
+        // timedatectl, sysctl, modprobe-r). The lower-bound check lets
+        // future packs join without breaking this test.
+        assert!(found >= 6, "expected ≥6 builtin packs, found {found}");
+    }
 }
