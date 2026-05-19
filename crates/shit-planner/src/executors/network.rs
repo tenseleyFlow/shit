@@ -184,7 +184,11 @@ pub fn full_reload_argv(tool: NetworkTool, dump_path: &std::path::Path) -> Vec<S
             // `with_nft_flush_prefix`).
             vec!["nft".into(), "-f".into(), p]
         }
-        NetworkTool::Pfctl => vec!["pfctl".into(), "-f".into(), p],
+        // Absolute path: `doas pfctl ...` runs with a reduced PATH
+        // that typically omits /sbin (same situation as S29.5's
+        // /usr/sbin/pkg and S29.6's /usr/sbin/service). pfctl lives
+        // at /sbin/pfctl on FreeBSD/macOS.
+        NetworkTool::Pfctl => vec!["/sbin/pfctl".into(), "-f".into(), p],
         NetworkTool::Ufw
         | NetworkTool::IpRoute
         | NetworkTool::IpAddr
