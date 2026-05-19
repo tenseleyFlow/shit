@@ -19,6 +19,7 @@ exec rsync -av --delete \
   --exclude=.refs/ \
   --exclude=.git/ \
   --exclude=tools/freebsd-vm/work/ \
+  --exclude=tools/linux-bpf-vm/work/ \
   -e "ssh -p 2225 -i ${SSH_KEY} -o UserKnownHostsFile=${KNOWN_HOSTS} -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes" \
   "${REPO_ROOT}/" \
   "freebsd@127.0.0.1:shit/"
