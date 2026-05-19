@@ -196,7 +196,14 @@ pub fn handle(
                 op: classify_op(&req.op_hint, &diff),
                 packages_before: pre.packages.clone(),
                 packages_after: req.packages.clone(),
-                repo_state_hint: req.extras.get("repo_state").cloned(),
+                // dnf ships its history transaction id under
+                // `dnf_history_id` (DR-26); other managers may carry a
+                // generic `repo_state`. Prefer the manager-specific key.
+                repo_state_hint: req
+                    .extras
+                    .get("dnf_history_id")
+                    .or_else(|| req.extras.get("repo_state"))
+                    .cloned(),
             };
             let ev = CaptureEvent {
                 id: EventId(0), // sqlite assigns
