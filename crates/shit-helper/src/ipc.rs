@@ -221,7 +221,6 @@ pub fn socketpair() -> Result<(Conn, Conn), ConnError> {
     Ok((Conn { fd: a }, Conn { fd: b }))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
