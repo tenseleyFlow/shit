@@ -502,6 +502,7 @@ struct MultiTierExecutor<'a> {
     file_executor: shit_planner::FileExecutor<'a, BlobReaderShim<'a>>,
     package_executor: shit_planner::executors::PackageExecutor<PrivilegedPkgRunner>,
     service_executor: shit_planner::executors::ServiceExecutor<PrivilegedSvcRunner>,
+    network_executor: shit_planner::executors::NetworkExecutor<PrivilegedNetRunner>,
 }
 
 /// PkgRunner that prefixes `doas` on non-Linux platforms where the
@@ -598,11 +599,79 @@ impl shit_planner::executors::SvcRunner for PrivilegedSvcRunner {
     }
 }
 
+/// Same shape as [`PrivilegedSvcRunner`] for `pfctl`/`iptables`/`nft`
+/// /`ufw` etc. The wrappers in `packaging/net-hooks/` intercept the
+/// user's invocation and ship a `net-event` to the daemon; on undo
+/// the daemon shells out via this runner to restore the prior state.
+/// On BSD/macOS that requires root (pfctl needs CAP_NET_ADMIN on
+/// Linux; pf-equivalent on BSD); doas/sudo is the privilege bridge.
+struct PrivilegedNetRunner;
+
+impl shit_planner::executors::NetRunner for PrivilegedNetRunner {
+    fn run(&self, argv: &[String]) -> Result<(), String> {
+        let (cmd, args) = match argv.split_first() {
+            Some(v) => v,
+            None => return Err("empty argv".into()),
+        };
+        let escalator = [
+            "/usr/local/bin/doas",
+            "/usr/local/bin/sudo",
+            "/usr/bin/sudo",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file());
+        let mut command = match escalator {
+            Some(e) => {
+                let mut c = std::process::Command::new(e);
+                c.arg(cmd);
+                c.args(args);
+                c
+            }
+            None => {
+                let mut c = std::process::Command::new(cmd);
+                c.args(args);
+                c
+            }
+        };
+        let status = command
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+    fn stash_bytes(&self, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+        // No privilege needed — write to the daemon's temp dir.
+        // The escalated tool (doas pfctl …) reads the file as root
+        // and the daemon-owned tempfile is world-readable enough
+        // for that path (mode 0644 by default). We set 0644
+        // explicitly to be sure.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut path = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("shit-net-{pid}-{nanos}.dump"));
+        let mut f = std::fs::File::create(&path).map_err(|e| format!("create tmp: {e}"))?;
+        f.write_all(bytes).map_err(|e| format!("write tmp: {e}"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("chmod tmp: {e}"))?;
+        Ok(path)
+    }
+}
+
 impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
     fn supports(&self, op: &shit_planner::InverseOp) -> bool {
         self.file_executor.supports(op)
             || self.package_executor.supports(op)
             || self.service_executor.supports(op)
+            || self.network_executor.supports(op)
     }
 
     fn execute(
@@ -617,6 +686,8 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             self.package_executor.execute(op, dry_run, policy)
         } else if self.service_executor.supports(op) {
             self.service_executor.execute(op, dry_run, policy)
+        } else if self.network_executor.supports(op) {
+            self.network_executor.execute(op, dry_run, policy)
         } else {
             shit_planner::ExecutionOutcome::Failed {
                 err: format!("no executor wired for tier {:?}", op.tier()),
@@ -670,6 +741,7 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
         file_executor: FileExecutor::new(&reader),
         package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
         service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
+        network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),
     };
 
     let mut commands_attempted = 0u32;
