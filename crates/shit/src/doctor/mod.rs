@@ -10,6 +10,7 @@
 //!   and external tooling consumption (B03).
 
 pub mod json;
+pub mod probes;
 
 use shit_capture::{CaptureOpts, CowTier, FsKind, detect_fs, supported_tiers, would_pick};
 use std::path::{Path, PathBuf};
