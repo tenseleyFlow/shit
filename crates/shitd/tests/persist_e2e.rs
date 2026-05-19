@@ -66,6 +66,9 @@ log_level = "warn"
     let child = Command::new(shitd_bin())
         .arg("--config")
         .arg(&cfg)
+        // S24.A: persist-e2e test exercises hook journaling, not the
+        // helper tier.
+        .env("SHIT_HELPER_DISABLED", "1")
         .stdout(Stdio::null())
         .stderr(stderr_file)
         .spawn()
