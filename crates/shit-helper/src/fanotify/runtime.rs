@@ -25,6 +25,8 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +36,8 @@ use super::event_loop::{
 };
 use super::init::FanotifyFd;
 use super::tree::TreeMap;
+use crate::capture::linux::{FanotifyCaptureKind, FanotifyEventView, LinuxCaptureRuntime};
+use shit_planner::events::CommandId;
 
 /// Shared state between the reader thread and the async helper task.
 ///
@@ -52,6 +56,16 @@ pub struct FanotifyState {
     /// Once non-zero the session is degraded; daemon should hard-fail
     /// subsequent preexecs.
     pub overflows: Arc<AtomicU64>,
+    /// L01 — the capture runtime the reader thread feeds. `None` when
+    /// the helper started without an IPC conn to the daemon (test /
+    /// degraded paths), in which case the reader still ALLOWs every
+    /// perm event but doesn't capture.
+    pub capture_runtime: Option<Arc<Mutex<LinuxCaptureRuntime>>>,
+    /// L01 — per-CommandId path that was marked at WatchTree time.
+    /// Looked up at UnwatchTree to know which path to unmark.
+    /// Without this map the helper would leak marks across commands
+    /// (slowly accumulating fanotify watches over time).
+    pub marked_paths: Arc<Mutex<HashMap<CommandId, PathBuf>>>,
 }
 
 impl FanotifyState {
@@ -62,7 +76,17 @@ impl FanotifyState {
             shutdown: Arc::new(AtomicBool::new(false)),
             events_seen: Arc::new(AtomicU64::new(0)),
             overflows: Arc::new(AtomicU64::new(0)),
+            capture_runtime: None,
+            marked_paths: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach a capture runtime so the reader's perm-event handler
+    /// emits `CapturedPreImage` upstream. Called once at helper boot
+    /// after the conn handshake completes.
+    pub fn with_capture_runtime(mut self, rt: Arc<Mutex<LinuxCaptureRuntime>>) -> Self {
+        self.capture_runtime = Some(rt);
+        self
     }
 
     pub fn shutdown(&self) {
@@ -78,6 +102,8 @@ impl Clone for FanotifyState {
             shutdown: Arc::clone(&self.shutdown),
             events_seen: Arc::clone(&self.events_seen),
             overflows: Arc::clone(&self.overflows),
+            capture_runtime: self.capture_runtime.as_ref().map(Arc::clone),
+            marked_paths: Arc::clone(&self.marked_paths),
         }
     }
 }
@@ -119,12 +145,46 @@ pub fn reader_thread(state: FanotifyState) {
         };
 
         let events_seen = Arc::clone(&state.events_seen);
+        let tree = Arc::clone(&state.tree);
+        let runtime = state.capture_runtime.as_ref().map(Arc::clone);
         let result = process_batch(
             bytes,
-            |_ev| {
-                // S08 default: ALLOW everything. S11 swaps this for
-                // capture-and-ALLOW once daemon-side decision logic
-                // lands. For now we only emit telemetry.
+            |ev| {
+                // L01: resolve the event's pid to a tracked CommandId
+                // via the TreeMap; if untracked, ALLOW without capture.
+                // If tracked AND we have a runtime wired, dispatch the
+                // event to it for pre-image capture, then ALLOW.
+                //
+                // The kernel holds the syscall behind FAN_ALLOW; staying
+                // under the CAPTURE_TO_ALLOW p99 budget (10ms) means the
+                // dedupe lookup + pre-image read + staging write +
+                // SCM_RIGHTS send all complete before we return here.
+                let mut tg = tree.lock().ok()?;
+                let resolved = tg.is_tracked(ev.pid);
+                drop(tg);
+                let Some((session, command_seq)) = resolved else {
+                    return Some(Decision::Allow);
+                };
+                if let Some(rt) = runtime.as_ref() {
+                    let kind = if (ev.mask & libc::FAN_OPEN_EXEC_PERM) != 0 {
+                        FanotifyCaptureKind::OpenExec
+                    } else {
+                        FanotifyCaptureKind::OpenWrite
+                    };
+                    let view = FanotifyEventView {
+                        command: CommandId {
+                            session,
+                            seq: command_seq,
+                        },
+                        fd: ev.fd,
+                        pid: ev.pid,
+                        kind,
+                        _life: std::marker::PhantomData,
+                    };
+                    if let Ok(mut g) = rt.lock() {
+                        g.handle_event(&view);
+                    }
+                }
                 Some(Decision::Allow)
             },
             |_ev| {

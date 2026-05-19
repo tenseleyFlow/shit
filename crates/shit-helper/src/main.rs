@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 #[cfg(target_os = "freebsd")]
 mod capsicum_bsd;
 #[cfg(any(
+    target_os = "linux",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
@@ -844,9 +845,27 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // side talks to it via the shared `FanotifyState`. Reader exits
     // when `state.shutdown()` is called (we trigger that below on the
     // signal-handler shutdown path).
+    //
+    // L01: when a fanotify fd is available, also boot the
+    // LinuxCaptureRuntime and attach it. The reader thread's
+    // perm-event closure dispatches into it for pre-image capture.
     #[cfg(target_os = "linux")]
     let fanotify_state: Option<fanotify::runtime::FanotifyState> = setup.fanotify_fd.map(|fd| {
-        let state = fanotify::runtime::FanotifyState::new(fd);
+        let staging_dir = cli.state_dir.join("helper-staging");
+        let capture_rt = match capture::linux::LinuxCaptureRuntime::new(
+            staging_dir,
+            Arc::clone(&conn),
+        ) {
+            Ok(rt) => Some(Arc::new(std::sync::Mutex::new(rt))),
+            Err(e) => {
+                tracing::warn!(err = %e, "linux capture runtime failed to init; reader will ALLOW without capture");
+                None
+            }
+        };
+        let mut state = fanotify::runtime::FanotifyState::new(fd);
+        if let Some(rt) = capture_rt.clone() {
+            state = state.with_capture_runtime(rt);
+        }
         let reader_state = state.clone();
         std::thread::Builder::new()
             .name("fanotify-reader".into())
@@ -1020,12 +1039,55 @@ fn request_loop(
                         .lock()
                         .unwrap()
                         .watch(session, command_seq, root_pid as i32);
-                    tracing::info!(
-                        %session,
-                        command_seq,
-                        root_pid,
-                        "watch_tree registered"
-                    );
+                    // L01: explicit dedupe-state init for the command.
+                    // The first event would lazy-init via `entry().or_default()`
+                    // but doing it here keeps the watch_tree path explicit
+                    // and matches the BSD producer's shape.
+                    let cmd = shit_planner::events::CommandId {
+                        session,
+                        seq: command_seq,
+                    };
+                    if let Some(rt) = &state.capture_runtime
+                        && let Ok(mut g) = rt.lock()
+                    {
+                        g.on_watch_tree(cmd);
+                    }
+                    // L01: add a narrow-scope fanotify mark on the
+                    // root_pid's cwd directory (FAN_EVENT_ON_CHILD,
+                    // ONLYDIR). Without this the reader sees no events.
+                    // We deliberately do NOT use FAN_MARK_FILESYSTEM
+                    // here (HP-18: marking $HOME at boot wedged the
+                    // box). Stash the cwd path so UnwatchTree can
+                    // unmark cleanly on command end.
+                    let cwd_link = format!("/proc/{root_pid}/cwd");
+                    match std::fs::read_link(&cwd_link) {
+                        Ok(cwd) => match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
+                            Ok(()) => {
+                                state.marked_paths.lock().unwrap().insert(cmd, cwd.clone());
+                                tracing::info!(
+                                    %session,
+                                    command_seq,
+                                    root_pid,
+                                    cwd = %cwd.display(),
+                                    "watch_tree registered + cwd marked"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    err = %e,
+                                    cwd = %cwd.display(),
+                                    "mark_dir_for_capture failed; tree tracked but no events will fire"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                err = %e,
+                                root_pid,
+                                "cannot read /proc/<pid>/cwd; tree tracked but no fanotify mark"
+                            );
+                        }
+                    }
                 } else {
                     tracing::debug!(
                         %session,
@@ -1072,6 +1134,24 @@ fn request_loop(
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
                     state.tree.lock().unwrap().unwatch(session, command_seq);
+                    let cmd = shit_planner::events::CommandId {
+                        session,
+                        seq: command_seq,
+                    };
+                    if let Some(rt) = &state.capture_runtime
+                        && let Ok(mut g) = rt.lock()
+                    {
+                        g.on_unwatch_tree(cmd);
+                    }
+                    if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd) {
+                        if let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path) {
+                            tracing::warn!(
+                                err = %e,
+                                path = %path.display(),
+                                "unmark_dir_for_capture failed (continuing)"
+                            );
+                        }
+                    }
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 }
                 #[cfg(any(

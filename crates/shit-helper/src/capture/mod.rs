@@ -7,8 +7,8 @@
 //! to the daemon. The wire format is shared (see `shit-proto`); the
 //! producer logic is platform-specific because the syscalls are.
 //!
-//! S24.B lands the FreeBSD/kqueue producer ([`bsd`]). Linux fanotify
-//! and macOS ES producers land in S25 and S27 respectively.
+//! S24.B lands the FreeBSD/kqueue producer ([`bsd`]). L01 lands the
+//! Linux/fanotify producer ([`linux`]). macOS ES producer is S27.
 
 #[cfg(any(
     target_os = "freebsd",
@@ -25,3 +25,6 @@ pub mod bsd;
     target_os = "dragonfly",
 ))]
 pub mod cwd;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
