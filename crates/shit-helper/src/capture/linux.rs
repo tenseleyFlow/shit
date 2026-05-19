@@ -1,0 +1,379 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Linux fanotify-perm-driven pre-image capture producer (L01).
+//!
+//! Mirrors the BSD producer at `capture/bsd.rs` but with two
+//! event-source differences:
+//!
+//! 1. Events arrive from the fanotify reader thread already running
+//!    in `fanotify/runtime.rs`, not from a kqueue drain loop. The
+//!    runtime calls `LinuxCaptureRuntime::handle_event` synchronously
+//!    inside `process_batch`'s `decide` closure.
+//! 2. The fd we read the pre-image from is the kernel-provided fd
+//!    inside `fanotify_event_metadata.fd`, not a subtree-tracked fd.
+//!    fanotify opens a fresh fd per event; we close it after use.
+//!
+//! Dedupe model: identical to BSD. `BTreeMap<(dev, inode), DedupeEntry>`
+//! per CommandId. First write per inode produces a CapturedPreImage.
+//! Delete events flip `invalidated=true` so a subsequent open of the
+//! same inode (the reuse-after-rm case) re-captures.
+//!
+//! Hot-path budget: capture-then-ALLOW must complete in ≤10ms p99 (the
+//! `CAPTURE_TO_ALLOW` budget gate codified in
+//! `benches/regression/src/lib.rs`). The fanotify-perm protocol allows
+//! the kernel to back up perm events behind a slow userspace responder;
+//! taking >50ms (`CAPTURE_KERNEL_DEADLINE`) creates queue overflow.
+//! The staging-fd upload path (write blob to a temp file, send the fd
+//! via SCM_RIGHTS, ALLOW immediately, daemon does its blake3 verify
+//! asynchronously) is what keeps us under budget.
+//!
+//! Concurrency model: the runtime is owned by the helper's main task
+//! and shared with the fanotify reader thread via `Arc<Mutex<...>>`.
+//! The mutex critical section is the dedupe lookup + send_response_with_fd
+//! — both microsecond-scale operations. Reader and request loops
+//! never both hold this mutex for long enough to contend.
+
+// Module is cfg-gated at the `pub mod linux;` declaration in
+// `capture/mod.rs`; no inner `#![cfg(...)]` here so unit tests aren't
+// accidentally filtered out on Linux.
+
+// L01 chunk 1 — skeleton. Dead-code lint suppressed until chunk 3/5
+// wires the runtime into `fanotify/runtime.rs` and the WatchTree
+// dispatch in `main.rs`. Remove once integrated.
+#![allow(dead_code)]
+
+use std::collections::BTreeMap;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use shit_planner::events::CommandId;
+
+use crate::ipc::Conn;
+
+/// Bounded pre-image read size. Larger files ALLOW without capture
+/// and log `partial=true` on the event (L04 may revisit). 256 MiB is
+/// the open question default from L01 design notes — small enough to
+/// avoid OOM under hostile inputs, large enough to catch real
+/// user-edit-huge-file scenarios.
+pub const MAX_PRE_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Per-CommandId capture state. Lazy: created on the first event for
+/// a tracked command and dropped when the command's
+/// `HelperRequest::UnwatchTree` clears it.
+#[derive(Debug, Default)]
+struct WatchState {
+    /// `(dev, inode) → DedupeEntry`. First-write-wins per inode.
+    dedupe: BTreeMap<(u64, u64), DedupeEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DedupeEntry {
+    invalidated: bool,
+}
+
+/// Fanotify event class our handler cares about. The fanotify reader
+/// thread maps from `Event.mask` to this enum so the producer doesn't
+/// have to know the libc bit constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanotifyCaptureKind {
+    /// `FAN_OPEN_PERM` or `FAN_ACCESS_PERM` for a write-intent open.
+    /// The pre-mutation moment we want to capture.
+    OpenWrite,
+    /// `FAN_OPEN_EXEC_PERM`. Not currently captured — the binary's
+    /// pre-state is implicit. Reserved for future shim-stacking.
+    OpenExec,
+    /// Deletion observed via eBPF-LSM `inode_unlink` (L04). fanotify
+    /// alone doesn't surface unlink as a perm event; L01 stubs this
+    /// arm and L04 fills it in.
+    Delete,
+}
+
+/// View struct passed from the fanotify reader to the capture runtime.
+/// Constructed in `runtime.rs` from the raw `Event` plus the resolved
+/// CommandId (looked up via the `TreeMap` already there).
+#[derive(Debug)]
+pub struct FanotifyEventView<'a> {
+    pub command: CommandId,
+    pub fd: RawFd,
+    pub pid: i32,
+    pub kind: FanotifyCaptureKind,
+    pub _life: std::marker::PhantomData<&'a ()>,
+}
+
+/// Capture runtime. Owns dedupe state per CommandId, the IPC conn to
+/// the daemon, and the staging dir for SCM_RIGHTS uploads.
+pub struct LinuxCaptureRuntime {
+    watches: BTreeMap<CommandId, WatchState>,
+    conn: Arc<Conn>,
+    staging_dir: PathBuf,
+}
+
+impl LinuxCaptureRuntime {
+    pub fn new(staging_dir: PathBuf, conn: Arc<Conn>) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&staging_dir)?;
+        Ok(Self {
+            watches: BTreeMap::new(),
+            conn,
+            staging_dir,
+        })
+    }
+
+    /// Begin watching for events from descendants of a command's
+    /// tracked tree. The tree-pid resolution is done by the existing
+    /// `fanotify::tree::TreeMap` — this method just sets up dedupe
+    /// state.
+    pub fn on_watch_tree(&mut self, command: CommandId) {
+        self.watches.entry(command).or_default();
+    }
+
+    /// Stop watching. Drops the dedupe state; subsequent events for
+    /// this command's pids fall through `handle_event` without
+    /// capture (the TreeMap will have already removed the pid).
+    pub fn on_unwatch_tree(&mut self, command: CommandId) {
+        self.watches.remove(&command);
+    }
+
+    /// Called by the fanotify reader thread per event. Returns once
+    /// the kernel-side ALLOW response is ready to send. Per L01's
+    /// budget: best-effort capture, never block the kernel queue.
+    /// All error paths log and continue — the producer's job is to
+    /// keep the kernel moving.
+    pub fn handle_event(&mut self, _ev: &FanotifyEventView<'_>) {
+        // TODO L01.2: implement (fstat → dedupe → read pre-image → blake3 →
+        // staging-write → SCM_RIGHTS send → mark dedupe). For now this
+        // is a no-op so the workspace compiles clean while the rest of
+        // the wiring lands.
+    }
+}
+
+/// fstat that also returns the file kind. Mirror of BSD helper —
+/// fanotify hands us a kernel-opened fd per event; we use it for
+/// dedupe (dev, inode) and for the pre-image read.
+fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    let kind = match (st.st_mode as libc::mode_t) & libc::S_IFMT {
+        libc::S_IFREG => FileType::Regular,
+        libc::S_IFDIR => FileType::Directory,
+        _ => FileType::Other,
+    };
+    Some((st.st_dev, st.st_ino, kind))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileType {
+    Regular,
+    Directory,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatMeta {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime_unix_nanos: i128,
+}
+
+impl StatMeta {
+    fn to_wire(self) -> shit_proto::FileMetadataWire {
+        shit_proto::FileMetadataWire {
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            size: self.size,
+            mtime_unix_nanos: self.mtime_unix_nanos,
+        }
+    }
+}
+
+fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    let mtime = (st.st_mtime as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(st.st_mtime_nsec as i128);
+    Some(StatMeta {
+        mode: st.st_mode,
+        uid: st.st_uid,
+        gid: st.st_gid,
+        size: st.st_size as u64,
+        mtime_unix_nanos: mtime,
+    })
+}
+
+/// Resolve the kernel-provided fd to a path via `/proc/self/fd/<fd>`.
+/// Best-effort: returns `None` if the symlink read fails (e.g. the
+/// file was already unlinked and `/proc` cleared the link).
+fn path_for_kernel_fd(fd: RawFd) -> Option<PathBuf> {
+    let link = format!("/proc/self/fd/{fd}");
+    std::fs::read_link(&link).ok()
+}
+
+/// Read pre-image bytes from the kernel-provided fd. fanotify hands
+/// us an fd pre-opened at the moment of the syscall — pread(2) on it
+/// returns the bytes as they existed before the about-to-happen
+/// mutation, even after the file is unlinked.
+fn read_pre_image(fd: RawFd) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    // Stat to size-cap; refuse to capture huge files (the kernel
+    // budget cliff is 50ms — reading 4GB at ~1GB/s overshoots).
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let size = st.st_size as usize;
+    if size > MAX_PRE_IMAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("pre-image size {size} exceeds cap {MAX_PRE_IMAGE_BYTES}"),
+        ));
+    }
+    // Use a fresh File handle bound to the fd so we don't move
+    // ownership — the caller owns the fd. dup(2) lets us read without
+    // mutating the kernel's offset.
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+    let mut f = std::fs::File::from(owned);
+    let mut buf = Vec::with_capacity(size.min(MAX_PRE_IMAGE_BYTES));
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// blake3 the bytes — same hasher the daemon side verifies against.
+fn blake3_of(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+/// Write the captured bytes to a uniquely-named staging file under
+/// `staging_dir`, return an OwnedFd suitable for SCM_RIGHTS. The
+/// daemon ingests + unlinks; if it fails the file lingers and the
+/// helper's GC pass cleans on the next boot.
+fn write_to_staging(dir: &Path, bytes: &[u8]) -> std::io::Result<OwnedFd> {
+    use std::io::Write;
+    let name = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let path = dir.join(&name);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        f.write_all(bytes)?;
+        // No fsync — staging files don't need durability. The
+        // SCM_RIGHTS fd is pinned by the kernel until the daemon
+        // closes it; if we crash before the daemon reads, the
+        // staging file is dropped by GC.
+    }
+    let f = std::fs::OpenOptions::new().read(true).open(&path)?;
+    Ok(f.into())
+}
+
+fn path_to_string(p: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+}
+
+fn now_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+// Wire-builder helper is folded into handle_event in chunk 3 — kept
+// out of the skeleton to avoid an 8-arg-clippy-lint dead helper.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use uuid::Uuid;
+
+    fn fresh_runtime() -> (LinuxCaptureRuntime, tempfile::TempDir, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (a, _b) = crate::ipc::socketpair().expect("socketpair");
+        let rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        (rt, dir, staging)
+    }
+
+    fn ghost_cmd() -> CommandId {
+        CommandId {
+            session: Uuid::nil(),
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn fstat_returns_regular_for_open_file_and_directory_for_open_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe");
+        std::fs::write(&path, b"x").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let (dev, inode, kind) = fstat_dev_inode_kind(f.as_raw_fd()).expect("fstat ok");
+        assert!(dev > 0 || inode > 0);
+        assert_eq!(kind, FileType::Regular);
+        let d = std::fs::File::open(dir.path()).unwrap();
+        let (_, _, dir_kind) = fstat_dev_inode_kind(d.as_raw_fd()).expect("fstat ok");
+        assert_eq!(dir_kind, FileType::Directory);
+    }
+
+    #[test]
+    fn read_pre_image_returns_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe");
+        let expected = b"hello world".repeat(100);
+        std::fs::write(&path, &expected).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let got = read_pre_image(f.as_raw_fd()).expect("pre-image read");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn write_to_staging_round_trips_bytes() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"staging-round-trip-linux";
+        let fd = write_to_staging(dir.path(), bytes).unwrap();
+        let mut f = std::fs::File::from(fd);
+        let mut out = Vec::new();
+        f.read_to_end(&mut out).unwrap();
+        assert_eq!(out.as_slice(), bytes);
+    }
+
+    #[test]
+    fn blake3_of_matches_known_vector() {
+        let got = blake3_of(b"");
+        assert_eq!(got[..4], [0xAF, 0x13, 0x49, 0xB9]);
+    }
+
+    #[test]
+    fn on_watch_tree_then_unwatch_clears_state() {
+        let (mut rt, _dir, _staging) = fresh_runtime();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        assert!(rt.watches.contains_key(&cmd));
+        rt.on_unwatch_tree(cmd);
+        assert!(!rt.watches.contains_key(&cmd));
+    }
+}

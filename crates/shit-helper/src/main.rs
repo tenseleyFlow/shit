@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 #[cfg(target_os = "freebsd")]
 mod capsicum_bsd;
 #[cfg(any(
+    target_os = "linux",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
