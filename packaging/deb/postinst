@@ -1,0 +1,38 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Debian/Ubuntu postinst — DR-65.
+#
+# Writes the helper's self-verify baseline so the first runtime
+# check returns Match instead of BaselineMissing. The baseline lives
+# under /var/lib/shit/, the helper's release-build state-dir.
+
+set -eu
+
+STATE_DIR=/var/lib/shit
+HELPER=/usr/libexec/shit/shit-helper
+
+case "$1" in
+    configure)
+        if [ ! -x "$HELPER" ]; then
+            echo "shit: helper binary missing at $HELPER" >&2
+            exit 0  # not fatal; the package is partially-installed
+        fi
+        mkdir -p "$STATE_DIR"
+        chmod 0755 "$STATE_DIR"
+        # Idempotent: re-running rewrites the baseline against the
+        # newly-installed binary, which is the right behaviour after
+        # an upgrade.
+        if ! "$HELPER" self-baseline-write --state-dir "$STATE_DIR"; then
+            echo "shit: self-verify baseline write failed (non-fatal)" >&2
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
