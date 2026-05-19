@@ -61,8 +61,15 @@ pub struct GitRestoreGroup {
     /// could parse it as `ref: refs/heads/<name>`. None for detached
     /// HEAD or when HEAD wasn't among the restores.
     ///
-    /// Stage 1: always None (we don't read blob content yet).
+    /// `detect_git_restores` always returns None here.
+    /// [`detect_git_restores_enriched`] reads the captured HEAD blob
+    /// and parses the symref to populate it.
     pub branch: Option<String>,
+    /// Captured HEAD's commit SHA. Populated by
+    /// [`detect_git_restores_enriched`] when the captured `HEAD`
+    /// or `refs/heads/<branch>` blob is a 40-hex SHA. None on
+    /// parse failure or when the relevant blob wasn't in the plan.
+    pub head_sha: Option<String>,
     /// Files within `.git/` that this group covers.
     pub affected_files: Vec<PathBuf>,
 }
@@ -80,8 +87,12 @@ impl GitRestoreGroup {
             Some(b) => format!("branch {b} "),
             None => String::new(),
         };
+        let sha_bit = match &self.head_sha {
+            Some(sha) if sha.len() >= 7 => format!(" → {}", &sha[..7]),
+            _ => String::new(),
+        };
         format!(
-            "revert {branch_bit}(in {}): restores {}",
+            "revert {branch_bit}(in {}){sha_bit}: restores {}",
             self.git_dir.display(),
             basenames.join(", ")
         )
@@ -118,12 +129,107 @@ pub fn detect_git_restores(plan: &UndoPlan) -> Vec<GitRestoreGroup> {
             .or_insert_with(|| GitRestoreGroup {
                 git_dir,
                 branch: None,
+                head_sha: None,
                 affected_files: Vec::new(),
             })
             .affected_files
             .push(path.to_path_buf());
     }
     groups.into_values().collect()
+}
+
+/// DR-18 enrichment: walk the plan as [`detect_git_restores`] does,
+/// but for each group also read the captured `HEAD` and (if present)
+/// `refs/heads/<branch>` blobs through `reader`. Populates
+/// `group.branch` from `HEAD` (`ref: refs/heads/<name>` symref) and
+/// `group.head_sha` from the branch ref or directly from HEAD when
+/// detached.
+///
+/// `reader` is anything that can read a blob by hash. The CLI wires
+/// up the daemon's blob store as the reader; tests use an in-memory
+/// mock.
+pub fn detect_git_restores_enriched<R: BlobByPath>(
+    plan: &UndoPlan,
+    reader: &R,
+) -> Vec<GitRestoreGroup> {
+    let mut groups = detect_git_restores(plan);
+    for g in &mut groups {
+        // Try to read the captured HEAD blob first.
+        let head_path = g.git_dir.join("HEAD");
+        if let Some(content) = reader.read_blob_for(plan, &head_path) {
+            match parse_head_blob(&content) {
+                ParsedHead::Symref(branch) => {
+                    // Symref → branch is the symref target; SHA
+                    // comes from the captured refs/heads/<branch>
+                    // blob if that's in the plan.
+                    let ref_path = g.git_dir.join("refs").join("heads").join(&branch);
+                    let sha = reader
+                        .read_blob_for(plan, &ref_path)
+                        .and_then(|b| parse_ref_blob(&b));
+                    g.branch = Some(branch);
+                    g.head_sha = sha;
+                }
+                ParsedHead::Detached(sha) => {
+                    g.head_sha = Some(sha);
+                }
+                ParsedHead::Unparseable => {}
+            }
+        }
+    }
+    groups
+}
+
+/// Trait that lets the enrichment pass read the blob behind a captured
+/// path *without* the renderer depending on `shit-store`. The CLI
+/// implements this against the daemon's blob store; tests use an
+/// in-memory map.
+pub trait BlobByPath {
+    /// Look up the captured blob for `path` within `plan` and return
+    /// its bytes. `None` when the path isn't in the plan or the blob
+    /// isn't available.
+    fn read_blob_for(&self, plan: &UndoPlan, path: &Path) -> Option<Vec<u8>>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedHead {
+    /// `HEAD` was a symref: `ref: refs/heads/<branch>\n`.
+    Symref(String),
+    /// `HEAD` was a detached-mode 40-hex SHA + newline.
+    Detached(String),
+    Unparseable,
+}
+
+fn parse_head_blob(content: &[u8]) -> ParsedHead {
+    let s = match std::str::from_utf8(content) {
+        Ok(s) => s.trim(),
+        Err(_) => return ParsedHead::Unparseable,
+    };
+    if let Some(rest) = s.strip_prefix("ref: refs/heads/") {
+        let branch = rest.trim().to_string();
+        if branch.is_empty() {
+            ParsedHead::Unparseable
+        } else {
+            ParsedHead::Symref(branch)
+        }
+    } else if is_hex_sha(s) {
+        ParsedHead::Detached(s.to_string())
+    } else {
+        ParsedHead::Unparseable
+    }
+}
+
+/// Parse a `refs/heads/<branch>` blob: 40-hex SHA + optional newline.
+fn parse_ref_blob(content: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(content).ok()?.trim();
+    if is_hex_sha(s) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_hex_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Return the nearest ancestor of `path` named `.git`, if any.
@@ -218,6 +324,7 @@ mod tests {
         let g = GitRestoreGroup {
             git_dir: PathBuf::from("/repo/.git"),
             branch: None,
+            head_sha: None,
             affected_files: vec![
                 PathBuf::from("/repo/.git/HEAD"),
                 PathBuf::from("/repo/.git/index"),
@@ -227,5 +334,132 @@ mod tests {
         assert!(s.contains("/repo/.git"), "{s}");
         assert!(s.contains("HEAD"), "{s}");
         assert!(s.contains("index"), "{s}");
+    }
+
+    // -----------------------------------------------------------------
+    // DR-18 enrichment: HEAD/refs parsing + summary integration
+    // -----------------------------------------------------------------
+
+    /// Stub BlobByPath impl that maps captured paths → bytes.
+    struct StubBlobs(std::collections::HashMap<PathBuf, Vec<u8>>);
+    impl BlobByPath for StubBlobs {
+        fn read_blob_for(&self, _: &UndoPlan, path: &Path) -> Option<Vec<u8>> {
+            self.0.get(path).cloned()
+        }
+    }
+
+    #[test]
+    fn parse_head_blob_recognises_symref() {
+        let v = parse_head_blob(b"ref: refs/heads/main\n");
+        assert_eq!(v, ParsedHead::Symref("main".to_string()));
+    }
+
+    #[test]
+    fn parse_head_blob_recognises_detached_sha() {
+        let v = parse_head_blob(b"a1b2c3d4e5f607182930414253647586979a0b1c\n");
+        assert!(matches!(v, ParsedHead::Detached(_)));
+    }
+
+    #[test]
+    fn parse_head_blob_rejects_invalid() {
+        assert_eq!(parse_head_blob(b"garbage"), ParsedHead::Unparseable);
+        assert_eq!(parse_head_blob(b"ref: refs/heads/"), ParsedHead::Unparseable);
+        assert_eq!(parse_head_blob(b"a1b2c3"), ParsedHead::Unparseable);
+    }
+
+    #[test]
+    fn parse_ref_blob_accepts_sha() {
+        assert_eq!(
+            parse_ref_blob(b"a1b2c3d4e5f607182930414253647586979a0b1c\n"),
+            Some("a1b2c3d4e5f607182930414253647586979a0b1c".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ref_blob_rejects_non_sha() {
+        assert_eq!(parse_ref_blob(b"not-a-sha"), None);
+    }
+
+    #[test]
+    fn enriched_detection_populates_branch_and_sha_from_symref() {
+        let mut plan = empty_plan();
+        plan.nodes
+            .push(restore_node(PathBuf::from("/repo/.git/HEAD")));
+        plan.nodes
+            .push(restore_node(PathBuf::from("/repo/.git/refs/heads/main")));
+        let mut blobs = std::collections::HashMap::new();
+        blobs.insert(
+            PathBuf::from("/repo/.git/HEAD"),
+            b"ref: refs/heads/main\n".to_vec(),
+        );
+        blobs.insert(
+            PathBuf::from("/repo/.git/refs/heads/main"),
+            b"a1b2c3d4e5f607182930414253647586979a0b1c\n".to_vec(),
+        );
+        let stub = StubBlobs(blobs);
+        let groups = detect_git_restores_enriched(&plan, &stub);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].branch.as_deref(), Some("main"));
+        assert_eq!(
+            groups[0].head_sha.as_deref(),
+            Some("a1b2c3d4e5f607182930414253647586979a0b1c")
+        );
+        // Summary line includes both branch and short SHA.
+        let s = groups[0].summary_line();
+        assert!(s.contains("branch main"), "got: {s}");
+        assert!(s.contains("a1b2c3d"), "got: {s}");
+    }
+
+    #[test]
+    fn enriched_detection_handles_detached_head() {
+        let mut plan = empty_plan();
+        plan.nodes
+            .push(restore_node(PathBuf::from("/repo/.git/HEAD")));
+        let mut blobs = std::collections::HashMap::new();
+        blobs.insert(
+            PathBuf::from("/repo/.git/HEAD"),
+            b"a1b2c3d4e5f607182930414253647586979a0b1c\n".to_vec(),
+        );
+        let stub = StubBlobs(blobs);
+        let groups = detect_git_restores_enriched(&plan, &stub);
+        assert_eq!(groups.len(), 1);
+        // Detached HEAD → no branch, but SHA populated.
+        assert_eq!(groups[0].branch, None);
+        assert_eq!(
+            groups[0].head_sha.as_deref(),
+            Some("a1b2c3d4e5f607182930414253647586979a0b1c")
+        );
+    }
+
+    #[test]
+    fn enriched_detection_falls_back_when_head_blob_absent() {
+        let mut plan = empty_plan();
+        plan.nodes
+            .push(restore_node(PathBuf::from("/repo/.git/index")));
+        // No HEAD restore in this plan → enrichment leaves branch/sha None.
+        let stub = StubBlobs(std::collections::HashMap::new());
+        let groups = detect_git_restores_enriched(&plan, &stub);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].branch, None);
+        assert_eq!(groups[0].head_sha, None);
+    }
+
+    #[test]
+    fn enriched_detection_handles_unparseable_head() {
+        // Captured HEAD is corrupt — enrichment doesn't populate
+        // branch but doesn't panic either.
+        let mut plan = empty_plan();
+        plan.nodes
+            .push(restore_node(PathBuf::from("/repo/.git/HEAD")));
+        let mut blobs = std::collections::HashMap::new();
+        blobs.insert(
+            PathBuf::from("/repo/.git/HEAD"),
+            b"\xff\xff\xff garbage \x00".to_vec(),
+        );
+        let stub = StubBlobs(blobs);
+        let groups = detect_git_restores_enriched(&plan, &stub);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].branch, None);
+        assert_eq!(groups[0].head_sha, None);
     }
 }
