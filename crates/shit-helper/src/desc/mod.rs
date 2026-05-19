@@ -17,6 +17,7 @@
 //! Spec: `.docs/audits/descriptor-format.md`.
 //! Frozen schema version: `1`.
 
+pub mod interpolate;
 pub mod matcher;
 pub mod parse;
 pub mod schema;
@@ -24,6 +25,8 @@ pub mod schema;
 // Re-exports are unused until later C02 chunks wire the loader and
 // executor; `#[allow(unused_imports)]` mirrors the same posture as the
 // crate-level `dead_code` allow on this module.
+#[allow(unused_imports)]
+pub use interpolate::{InterpolateError, interpolate_argv, interpolate_token};
 #[allow(unused_imports)]
 pub use matcher::{MatchOutcome, match_descriptor, match_pattern};
 #[allow(unused_imports)]
