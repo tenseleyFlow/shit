@@ -260,6 +260,27 @@ impl BudgetGate {
         median_us_max: 2_000,
         p99_us_max: 5_000,
     };
+
+    /// Linux fanotify-perm capture-to-ALLOW budget. The fanotify-perm
+    /// kernel buffer holds events behind a slow userspace responder;
+    /// if we take >~50ms the kernel starts marking events FAN_NOFD
+    /// (overflow) and the syscalls fail with EPERM. 10ms p99 leaves
+    /// a comfortable 5x margin to that cliff. See L01 design notes.
+    pub const CAPTURE_TO_ALLOW: BudgetGate = BudgetGate {
+        median_us_max: 5_000,
+        p99_us_max: 10_000,
+    };
+
+    /// Hard upper bound from the fanotify-perm kernel buffer behaviour.
+    /// Crossing this is a correctness failure, not a perf regression —
+    /// once the kernel overflows, events are silently dropped and
+    /// capture is unsound. Reserved as a panic-grade gate for any
+    /// future capture-stress harness that wants to assert "we never
+    /// approach the deadlock cliff."
+    pub const CAPTURE_KERNEL_DEADLINE: BudgetGate = BudgetGate {
+        median_us_max: 25_000,
+        p99_us_max: 50_000,
+    };
 }
 
 /// Per-comparison verdict. Carries the numbers that made the call
@@ -620,6 +641,19 @@ mod tests {
         assert_eq!(BudgetGate::AUTH_EVENT.median_us_max, 100);
         assert_eq!(BudgetGate::AUTH_EVENT.p99_us_max, 1_000);
         assert_eq!(BudgetGate::POSTEXEC_ACK.median_us_max, 2_000);
+        assert_eq!(BudgetGate::CAPTURE_TO_ALLOW.median_us_max, 5_000);
+        assert_eq!(BudgetGate::CAPTURE_TO_ALLOW.p99_us_max, 10_000);
+        assert_eq!(BudgetGate::CAPTURE_KERNEL_DEADLINE.median_us_max, 25_000);
+        assert_eq!(BudgetGate::CAPTURE_KERNEL_DEADLINE.p99_us_max, 50_000);
+    }
+
+    #[test]
+    fn capture_budget_is_below_kernel_deadline() {
+        // The 10ms target must stay strictly under the 50ms cliff so
+        // a passing CAPTURE_TO_ALLOW run never approaches the kernel
+        // overflow behaviour. Five-times margin is the design intent.
+        assert!(BudgetGate::CAPTURE_TO_ALLOW.p99_us_max * 5 <= BudgetGate::CAPTURE_KERNEL_DEADLINE.p99_us_max);
+        assert!(BudgetGate::CAPTURE_TO_ALLOW.median_us_max * 5 <= BudgetGate::CAPTURE_KERNEL_DEADLINE.median_us_max);
     }
 
     #[test]
