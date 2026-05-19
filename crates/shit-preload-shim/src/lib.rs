@@ -42,6 +42,7 @@
 pub mod install_config;
 pub mod install_pattern;
 pub mod prefix_match;
+pub mod runtime;
 
 #[cfg(any(
     target_os = "freebsd",
