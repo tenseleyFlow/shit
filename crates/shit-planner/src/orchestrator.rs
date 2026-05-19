@@ -346,7 +346,8 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         match op {
             InverseOp::RestoreContent { path, .. }
             | InverseOp::RestoreMetadata { path, .. }
-            | InverseOp::Unlink { path } => {
+            | InverseOp::Unlink { path }
+            | InverseOp::FileExtend { path, .. } => {
                 if self.probe.exists(path) {
                     None
                 } else {
@@ -391,6 +392,7 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             | InverseOp::AwsReverse { .. }
             | InverseOp::TerraformReverse { .. }
             | InverseOp::ContainerRestore { .. }
+            | InverseOp::ShellStateRestore { .. }
             | InverseOp::DbNote { .. } => None,
         }
     }

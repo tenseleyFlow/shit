@@ -74,7 +74,8 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         }
         InverseOp::Unlink { path }
         | InverseOp::RecreatePath { path, .. }
-        | InverseOp::CreateSymlink { path, .. } => {
+        | InverseOp::CreateSymlink { path, .. }
+        | InverseOp::FileExtend { path, .. } => {
             out.push(TouchKey::Path(path.clone()));
         }
         // Env / package / network / systemd / process / db ops are
@@ -95,6 +96,7 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         | InverseOp::AwsReverse { .. }
         | InverseOp::TerraformReverse { .. }
         | InverseOp::ContainerRestore { .. }
+        | InverseOp::ShellStateRestore { .. }
         | InverseOp::DbNote { .. } => {}
     }
     out
