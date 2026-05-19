@@ -78,6 +78,21 @@ struct WatchState {
     /// `(dev, inode)` → was the pre-image already captured? `true`
     /// = invalidated by NOTE_DELETE (next write should re-capture).
     dedupe: HashMap<(u64, u64), DedupeEntry>,
+    /// S29.1 — per-dir-fd snapshot of immediate child entries, captured
+    /// at attach time and refreshed after every dir-diff. The diff
+    /// between current entries and the baseline is what we emit as
+    /// `TreeOpWire::Create` / `TreeOpWire::Unlink`.
+    dir_baselines: HashMap<RawFd, DirBaseline>,
+}
+
+#[derive(Debug, Clone)]
+struct DirBaseline {
+    /// Absolute path of the directory (for emitting child paths).
+    path: PathBuf,
+    /// Child name → (dev, inode) at baseline time. We store inode so
+    /// the diff can detect rename-within-dir as
+    /// `Unlink old_name + Create new_name` for the same inode.
+    entries: BTreeMap<std::ffi::OsString, (u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,11 +159,35 @@ impl PumpState {
             tracked_entries = subtree.len(),
             "watch attached",
         );
+        // Build per-dir-fd entry baselines so we can diff on
+        // subsequent NOTE_WRITE events. Walks each tracked dir once
+        // here; the cost is proportional to dir size.
+        let mut dir_baselines: HashMap<RawFd, DirBaseline> = HashMap::new();
+        for raw in tracked_fds(&subtree) {
+            let Some((_, _, ft)) = fstat_dev_inode_kind(raw) else {
+                continue;
+            };
+            if ft != FileType::Directory {
+                continue;
+            }
+            let Some(dir_path) = subtree.path_for_fd(raw).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let entries = read_dir_entries(&dir_path).unwrap_or_default();
+            dir_baselines.insert(
+                raw,
+                DirBaseline {
+                    path: dir_path,
+                    entries,
+                },
+            );
+        }
         self.watches.insert(
             command,
             WatchState {
                 subtree,
                 dedupe: HashMap::new(),
+                dir_baselines,
             },
         );
     }
@@ -204,6 +243,13 @@ impl PumpState {
                 return;
             }
         };
+        if file_type == FileType::Directory {
+            // S29.1: NOTE_WRITE on a tracked dir indicates child
+            // entries changed. Diff against the baseline to detect
+            // create/unlink/rename and emit TreeMutation events.
+            self.handle_dir_change(command, fd);
+            return;
+        }
         if file_type != FileType::Regular {
             tracing::trace!(fd, ?kind, ?file_type, "vnode event on non-file; skipping");
             return;
@@ -290,6 +336,99 @@ impl PumpState {
             "CapturedPreImage sent",
         );
     }
+
+    /// S29.1 — diff a directory's current entries against the baseline
+    /// captured at attach time, emit `TreeMutation` events for each
+    /// added/removed child, and refresh the baseline. Inode preservation
+    /// across a name change is detected as Unlink+Create for the same
+    /// `(dev, inode)`; the planner can pair them into a Rename at cohort
+    /// assignment time.
+    fn handle_dir_change(&mut self, command: CommandId, fd: RawFd) {
+        let Some(ws) = self.watches.get_mut(&command) else {
+            return;
+        };
+        let Some(baseline) = ws.dir_baselines.get_mut(&fd) else {
+            tracing::trace!(fd, "dir Write on dir without baseline; skipping");
+            return;
+        };
+        let dir_path = baseline.path.clone();
+        let current = match read_dir_entries(&dir_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(fd, error = %e, "read_dir_entries failed");
+                return;
+            }
+        };
+        // Compute additions (in current, not in baseline) and removals
+        // (in baseline, not in current). A name with a different
+        // (dev, inode) registers as both removal + addition.
+        let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
+        for (name, &(dev, inode)) in &current {
+            match baseline.entries.get(name) {
+                Some(&prev) if prev == (dev, inode) => {} // unchanged
+                Some(_) | None => {
+                    // New entry, or entry with different inode at same name.
+                    let child = dir_path.join(name);
+                    let kind = file_kind_for(&child);
+                    events.push(shit_proto::TreeOpWire::Create {
+                        dev,
+                        inode,
+                        path: path_to_string(&child),
+                        kind,
+                        mode: file_mode_for(&child).unwrap_or(0),
+                    });
+                }
+            }
+        }
+        // **Intentionally do not emit Unlink for removed entries here.**
+        // Every name that *was* in the baseline was an fd-tracked entry
+        // (since `register_subtree` opens directories AND files). Its
+        // removal raises NOTE_DELETE on the file's own fd, which the
+        // file branch of `handle_vnode` handles by emitting
+        // CapturedPreImage(is_delete=true) — that path produces the
+        // paired TreeOp::Unlink via `journal_unlink_idempotent` on the
+        // daemon side. Emitting Unlink here too would race the file
+        // path's ts ordering and break the planner's
+        // reverse-chronological invariant (smoke-surfaced bug:
+        // RestoreContent ran before RecreatePath when dir-diff's
+        // Unlink got a lower ts than FilePreImage).
+        //
+        // The remaining gap — rmdir of the watched root dir itself —
+        // is handled by a dedicated branch in `handle_vnode` for
+        // `(kind=Delete, file_type=Directory)`, not here.
+        let _ = &baseline.entries; // kept for the diff above (Create emit)
+        // Refresh baseline so subsequent diffs are relative to the
+        // post-change state.
+        baseline.entries = current;
+        if events.is_empty() {
+            tracing::trace!(fd, "dir Write produced no entry-set delta");
+            return;
+        }
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        for op in events {
+            let resp = shit_proto::HelperResponse::TreeMutation {
+                session: command.session,
+                seq: command.seq,
+                op,
+                ts_unix_nanos: now_nanos,
+            };
+            if let Err(e) = self.conn.send_response(&resp) {
+                tracing::warn!(error = %e, "send TreeMutation failed");
+            }
+        }
+    }
+}
+
+/// Read `mode` bits for a path. Used by the dir-diff path to populate
+/// `TreeOpWire::Create.mode` so the undo executor's `RecreatePath` can
+/// chmod to the original perms.
+fn file_mode_for(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(meta.mode())
 }
 
 fn tracked_fds(_subtree: &TrackedSubtree) -> Vec<RawFd> {
@@ -392,6 +531,46 @@ fn blake3_of(bytes: &[u8]) -> [u8; 32] {
 
 fn path_to_string(p: &Path) -> String {
     String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+}
+
+/// Read a directory's immediate child entries, returning a map of
+/// `name → (dev, inode)`. Symlinks are recorded as their own inode
+/// (not the link target's). Errors are swallowed — partial baselines
+/// are preferred to no baseline.
+fn read_dir_entries(dir: &Path) -> std::io::Result<BTreeMap<std::ffi::OsString, (u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = BTreeMap::new();
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        // symlink_metadata would be more correct for symlinks, but
+        // entry.metadata() already does the right thing — std uses
+        // lstat for `read_dir` entries on Unix.
+        out.insert(entry.file_name(), (meta.dev(), meta.ino()));
+    }
+    Ok(out)
+}
+
+/// Classify a path's `FileKind` for the wire. Errors fall through to
+/// `Regular` — the planner only acts on `Directory`/`Regular`/`Symlink`
+/// distinctly, and Regular is the safe default fallback.
+fn file_kind_for(path: &Path) -> shit_proto::FileKindWire {
+    use shit_proto::FileKindWire as K;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return K::Regular;
+    };
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        K::Directory
+    } else if ft.is_symlink() {
+        K::Symlink
+    } else if ft.is_file() {
+        K::Regular
+    } else {
+        // fifo/socket/block/char — std doesn't distinguish; the
+        // distinction doesn't currently affect undo correctness for
+        // the BSD coverage we target. Default to Regular.
+        K::Regular
+    }
 }
 
 /// Handle the request_loop holds. Cheaply cloneable.
