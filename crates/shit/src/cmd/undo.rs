@@ -71,6 +71,15 @@ pub struct UndoArgs {
     /// Override the daemon ctl socket. Diagnostic; not for normal use.
     #[arg(long)]
     pub ctl_sock: Option<PathBuf>,
+
+    /// C06.8: when a `ShellStateRestore` op is in the plan, queue the
+    /// per-shell undo snippet through the bash / zsh precmd
+    /// mechanism so it applies before your next prompt. Fish refuses
+    /// (no safe precmd-queue equivalent). OFF BY DEFAULT — surprise-
+    /// mutating the interactive shell is worse UX than missing one
+    /// undo step; opt in explicitly per invocation.
+    #[arg(long = "apply-shell-state", action = ArgAction::SetTrue)]
+    pub apply_shell_state: bool,
 }
 
 impl Default for UndoArgs {
@@ -83,6 +92,7 @@ impl Default for UndoArgs {
             raw: false,
             paths: Vec::new(),
             ctl_sock: None,
+            apply_shell_state: false,
         }
     }
 }
