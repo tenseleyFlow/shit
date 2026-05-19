@@ -13,8 +13,6 @@
 //! eBPF-LSM (S09) replaces this with proper pre-mutation hooks; this
 //! module is the degraded-but-portable fallback for pre-eBPF kernels.
 
-#![cfg(target_os = "linux")]
-
 use std::io;
 use std::path::Path;
 

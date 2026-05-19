@@ -11,8 +11,6 @@
 //! Order: this runs *before* `sandbox::enter`. After sandbox entry the
 //! seccomp filter would itself block `capset(2)`.
 
-#![cfg(target_os = "linux")]
-
 use std::io;
 
 #[derive(Debug, thiserror::Error)]

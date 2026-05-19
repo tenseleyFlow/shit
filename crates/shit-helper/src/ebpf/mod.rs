@@ -25,8 +25,6 @@
 //!   4. Tracepoint programs (read-only observers) are the safer entry
 //!      point; LSM programs come after tracepoints are proven.
 
-#![cfg(target_os = "linux")]
-
 pub mod error;
 pub mod loader;
 

@@ -26,8 +26,6 @@
 //! once we have a FreeBSD VM target — same prerequisite as the kqueue
 //! runtime work.
 
-#![cfg(target_os = "freebsd")]
-
 #[derive(Debug, thiserror::Error)]
 pub enum CapsicumError {
     #[error("cap_enter(2): {0}")]

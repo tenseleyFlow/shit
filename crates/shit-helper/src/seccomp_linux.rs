@@ -7,8 +7,6 @@
 //! the helper). Louder than `SCMP_ACT_ERRNO`; we want crashes-on-policy
 //! during development. Re-evaluate before v1.0.
 
-#![cfg(target_os = "linux")]
-
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 use std::collections::BTreeMap;
 

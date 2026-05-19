@@ -14,8 +14,6 @@
 //! at the parent (`crate::main`). Non-Linux builds see an empty module
 //! and never link against fanotify symbols.
 
-#![cfg(target_os = "linux")]
-
 pub mod event_loop;
 pub mod init;
 pub mod mark;
