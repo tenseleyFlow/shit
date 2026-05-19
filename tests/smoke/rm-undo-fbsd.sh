@@ -106,10 +106,10 @@ smoke_log "PostExec seq=${SEQ} exit=0"
 
 # Wait up to 10s for the FilePreImage event to land in the index.
 smoke_wait_for_event "discriminant = 'FilePreImage'" 1 10
-# And for the paired TreeOp::Unlink — that's what `shit undo` consults
+# And for the paired TreeOpUnlink — that's what `shit undo` consults
 # to know "this command unlinked foo.txt" rather than just "this command
 # wrote some blob".
-smoke_wait_for_event "discriminant = 'TreeOp'" 1 10
+smoke_wait_for_event "discriminant = 'TreeOpUnlink'" 1 10
 
 # Sanity: the file is gone now.
 if [ -e "${FOO}" ]; then
