@@ -227,23 +227,50 @@ fn peer_cred(fd: RawFd) -> Result<(u32, u32), HandshakeError> {
     Ok((pid as u32, euid))
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+#[cfg(target_os = "freebsd")]
 fn peer_cred(fd: RawFd) -> Result<(u32, u32), HandshakeError> {
-    // BSD's getpeereid gives uid; for pid we'd want LOCAL_PEERCRED's
-    // xucred, which carries cr_pid on some BSDs and not others. We
-    // accept best-effort pid=0 on BSDs that don't surface it.
+    // FreeBSD: SOL_LOCAL/LOCAL_PEERCRED getsockopt returns a full
+    // `struct xucred` including `cr_pid` (FreeBSD 12+). On socketpair-
+    // created pairs the kernel returns ENOTCONN; in that case both
+    // ends started in the same process, so falling back to local
+    // pid/uid is correct. The daemon ↔ helper production path uses
+    // listen/connect/accept where this returns the peer's real pid.
+    use std::mem::MaybeUninit;
+    let mut xucred: MaybeUninit<libc::xucred> = MaybeUninit::zeroed();
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            0, // SOL_LOCAL on FreeBSD
+            libc::LOCAL_PEERCRED,
+            xucred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOTCONN) {
+            return Ok((std::process::id(), current_uid()));
+        }
+        return Err(HandshakeError::PeerCred(err.to_string()));
+    }
+    let xucred = unsafe { xucred.assume_init() };
+    // SAFETY: the kernel filled in `cr_pid` as part of the xucred
+    // payload; the union access reads that same pid_t.
+    let pid = unsafe { xucred.cr_pid__c_anonymous_union.cr_pid };
+    Ok((pid as u32, xucred.cr_uid))
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn peer_cred(fd: RawFd) -> Result<(u32, u32), HandshakeError> {
+    // NetBSD/OpenBSD: getpeereid gives uid only; no portable pid.
+    // We accept best-effort pid=0 — DR-49/50 track full peer auth
+    // on those BSDs when we have VM targets in CI.
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
     let rc = unsafe { libc::getpeereid(fd, &mut euid as *mut _, &mut egid as *mut _) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        // FreeBSD's getpeereid returns ENOTCONN for socketpair(2)-created
-        // pairs (the socket is "connected" via socketpair, not connect/
-        // accept, and the kernel surfaces them differently). Since both
-        // ends of a socketpair start in the same process, falling back to
-        // the local pid/uid is correct: the daemon ↔ helper production
-        // path uses filesystem-path connections (connect/accept), where
-        // getpeereid works normally.
         if err.raw_os_error() == Some(libc::ENOTCONN) {
             return Ok((std::process::id(), current_uid()));
         }
@@ -270,18 +297,12 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{connected_pair_via_path, socketpair};
+    use crate::ipc::socketpair;
     use std::thread;
 
     #[test]
     fn handshake_round_trip_via_socketpair() {
-        // Use a real listen/connect/accept pair instead of socketpair():
-        // FreeBSD's getpeereid(2) returns ENOTCONN on socketpair-created
-        // pairs (peer_cred has a fallback for that case), but stream
-        // send/recv across threads on socketpair fds also exhibits ENOTCONN
-        // on FreeBSD — accept()-derived sockets behave correctly. This
-        // exercises the production transport on every OS.
-        let (client, server) = connected_pair_via_path().unwrap();
+        let (client, server) = socketpair().unwrap();
         let expected_pid = std::process::id();
         let expected_uid = current_uid();
 
@@ -299,7 +320,7 @@ mod tests {
 
     #[test]
     fn handshake_caps_intersect_with_helper_local() {
-        let (client, server) = connected_pair_via_path().unwrap();
+        let (client, server) = socketpair().unwrap();
         let expected_pid = std::process::id();
         let expected_uid = current_uid();
         let helper_local = HelperCaps {
