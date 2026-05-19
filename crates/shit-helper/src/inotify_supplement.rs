@@ -12,6 +12,12 @@
 //!
 //! eBPF-LSM (S09) replaces this with proper pre-mutation hooks; this
 //! module is the degraded-but-portable fallback for pre-eBPF kernels.
+//!
+//! Stage-1 surface: `read_events` / `as_raw_fd` are the API DR-01..04
+//! will call once the watcher loop wires up; until then there are no
+//! in-crate callers. Module-level allow keeps the surface ready.
+
+#![allow(dead_code)]
 
 use std::io;
 use std::path::Path;

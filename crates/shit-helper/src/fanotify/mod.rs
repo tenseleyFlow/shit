@@ -13,6 +13,15 @@
 //! **Visibility:** the entire module is gated by `cfg(target_os = "linux")`
 //! at the parent (`crate::main`). Non-Linux builds see an empty module
 //! and never link against fanotify symbols.
+//!
+//! **Stage-1 status:** the `pub use` re-exports below surface symbols
+//! that DR-01..DR-04 will wire into the helper's runtime; until then
+//! they have no in-crate callers, which triggers `unused_imports`
+//! / `dead_code` under `-D warnings`. The module-level allow keeps
+//! the public API surface intact without per-symbol `#[allow]`
+//! sprinkling. Drop it when DR-01..DR-04 light up.
+
+#![allow(dead_code, unused_imports)]
 
 pub mod event_loop;
 pub mod init;

@@ -476,7 +476,9 @@ struct PrivilegedSetup {
     /// The kernel-tier we'd ideally use vs. the one we'll actually
     /// run with. They can differ: a kernel that *supports* BPF-LSM
     /// may still be backed by fanotify until S09 ships the loader.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Stage-1: written at privileged_setup time, not yet read in
+    /// the runtime path (DR-01..DR-04 will use it).
+    #[allow(dead_code)]
     tier: CaptureTier,
 }
 
@@ -527,11 +529,11 @@ fn privileged_setup() -> PrivilegedSetup {
         let (caps, fanotify_fd) = linux_privileged_setup();
         let tier = pick_linux_tier(fanotify_fd.is_some());
         tracing::info!(tier = tier.label(), "kernel capture tier picked");
-        return PrivilegedSetup {
+        PrivilegedSetup {
             caps,
             fanotify_fd,
             tier,
-        };
+        }
     }
     #[cfg(any(
         target_os = "freebsd",
@@ -542,7 +544,7 @@ fn privileged_setup() -> PrivilegedSetup {
     {
         let tier = pick_bsd_tier();
         tracing::info!(tier = tier.label(), "kernel capture tier picked");
-        return PrivilegedSetup {
+        PrivilegedSetup {
             caps: shit_proto::HelperCaps {
                 watch_tree: true,
                 // BSD tier doesn't have a kernel-blocking primitive on
@@ -554,7 +556,7 @@ fn privileged_setup() -> PrivilegedSetup {
                 package_hook: false,
             },
             tier,
-        };
+        }
     }
     #[cfg(not(any(
         target_os = "linux",

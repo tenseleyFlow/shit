@@ -24,6 +24,12 @@
 //!      review per `.docs/audits/helper-protocol.md` standing rules.
 //!   4. Tracepoint programs (read-only observers) are the safer entry
 //!      point; LSM programs come after tracepoints are proven.
+//!
+//! Stage-1 surface: `pub use` exports below have no in-crate callers
+//! until DR-01..DR-04 light up. Module-level allow keeps the API
+//! intact without per-symbol noise.
+
+#![allow(dead_code, unused_imports)]
 
 pub mod error;
 pub mod loader;
