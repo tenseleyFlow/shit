@@ -21,13 +21,18 @@
 --      `commands` row. Deliberately *no* foreign key to `commands` so
 --      the row outlives its referent.
 
+-- `blob_hash` here is the blake3 of the WHOLE logical large object — its
+-- identity, not a pointer into `blobs`. The parent isn't necessarily ever
+-- stored as a single blob: each `chunks.hash` is its own content-addressed
+-- entry in the BlobStore. The parent hash exists so callers can look up
+-- "the pre-image of file X by its full content hash" and find the chunk
+-- map even when no monolithic blob was written. No FK to `blobs`.
 CREATE TABLE large_objects (
     blob_hash           BLOB PRIMARY KEY,
     total_size          INTEGER NOT NULL,
     chunk_count         INTEGER NOT NULL,
-    materialized        INTEGER NOT NULL DEFAULT 0,        -- 0 = chunk bytes deferred; 1 = all chunks present
-    created_logical     INTEGER NOT NULL,
-    FOREIGN KEY (blob_hash) REFERENCES blobs(hash)
+    materialized        INTEGER NOT NULL DEFAULT 0,        -- 0 = some chunk bytes deferred; 1 = all chunks present
+    created_logical     INTEGER NOT NULL
 );
 
 CREATE INDEX idx_large_objects_unmaterialized

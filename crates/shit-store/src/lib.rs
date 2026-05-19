@@ -9,6 +9,7 @@ pub mod caibx;
 pub mod gc;
 pub mod importance;
 pub mod index;
+pub mod large_objects;
 pub mod refcount;
 pub mod schema;
 
@@ -17,5 +18,6 @@ pub use caibx::{CaibxError, ChunkIndex, ChunkRef};
 pub use gc::{GcConfig, GcError, GcReport, SizeCapStatus, check_size_cap, run_pass};
 pub use importance::{ImportanceConfig, ScoreInputs, bump_for_undo, score_command, set_importance};
 pub use index::{Index, IndexError};
+pub use large_objects::{ChunkStat, LargeObjectError, LargeObjectStat};
 pub use refcount::{ReapBatch, reap_commands};
 pub use schema::SchemaError;
