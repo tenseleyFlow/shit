@@ -1043,20 +1043,57 @@ fn request_loop(
                     // The first event would lazy-init via `entry().or_default()`
                     // but doing it here keeps the watch_tree path explicit
                     // and matches the BSD producer's shape.
+                    let cmd = shit_planner::events::CommandId {
+                        session,
+                        seq: command_seq,
+                    };
                     if let Some(rt) = &state.capture_runtime
                         && let Ok(mut g) = rt.lock()
                     {
-                        g.on_watch_tree(shit_planner::events::CommandId {
-                            session,
-                            seq: command_seq,
-                        });
+                        g.on_watch_tree(cmd);
                     }
-                    tracing::info!(
-                        %session,
-                        command_seq,
-                        root_pid,
-                        "watch_tree registered"
-                    );
+                    // L01: add a narrow-scope fanotify mark on the
+                    // root_pid's cwd directory (FAN_EVENT_ON_CHILD,
+                    // ONLYDIR). Without this the reader sees no events.
+                    // We deliberately do NOT use FAN_MARK_FILESYSTEM
+                    // here (HP-18: marking $HOME at boot wedged the
+                    // box). Stash the cwd path so UnwatchTree can
+                    // unmark cleanly on command end.
+                    let cwd_link = format!("/proc/{root_pid}/cwd");
+                    match std::fs::read_link(&cwd_link) {
+                        Ok(cwd) => {
+                            match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
+                                Ok(()) => {
+                                    state
+                                        .marked_paths
+                                        .lock()
+                                        .unwrap()
+                                        .insert(cmd, cwd.clone());
+                                    tracing::info!(
+                                        %session,
+                                        command_seq,
+                                        root_pid,
+                                        cwd = %cwd.display(),
+                                        "watch_tree registered + cwd marked"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        err = %e,
+                                        cwd = %cwd.display(),
+                                        "mark_dir_for_capture failed; tree tracked but no events will fire"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                err = %e,
+                                root_pid,
+                                "cannot read /proc/<pid>/cwd; tree tracked but no fanotify mark"
+                            );
+                        }
+                    }
                 } else {
                     tracing::debug!(
                         %session,
@@ -1103,13 +1140,23 @@ fn request_loop(
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
                     state.tree.lock().unwrap().unwatch(session, command_seq);
+                    let cmd = shit_planner::events::CommandId {
+                        session,
+                        seq: command_seq,
+                    };
                     if let Some(rt) = &state.capture_runtime
                         && let Ok(mut g) = rt.lock()
                     {
-                        g.on_unwatch_tree(shit_planner::events::CommandId {
-                            session,
-                            seq: command_seq,
-                        });
+                        g.on_unwatch_tree(cmd);
+                    }
+                    if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd) {
+                        if let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path) {
+                            tracing::warn!(
+                                err = %e,
+                                path = %path.display(),
+                                "unmark_dir_for_capture failed (continuing)"
+                            );
+                        }
                     }
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 }
