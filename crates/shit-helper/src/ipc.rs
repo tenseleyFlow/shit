@@ -6,7 +6,8 @@
 //! processing in S07/8/9 runs on the helper's own event loop.
 
 use nix::sys::socket::{
-    AddressFamily, Shutdown, SockFlag, SockType, UnixAddr, recv, send, shutdown, socket,
+    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, Shutdown, SockFlag, SockType,
+    UnixAddr, cmsg_space, recv, recvmsg, send, sendmsg, shutdown, socket,
 };
 
 /// Transport choice. macOS XNU does not support `AF_UNIX + SOCK_SEQPACKET`
@@ -22,7 +23,7 @@ const HELPER_SOCK_TYPE: SockType = SockType::Stream;
 use shit_proto::{
     HelperRequest, HelperResponse, MAX_HELPER_FRAME_SIZE, decode_frame, encode_frame,
 };
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -58,15 +59,49 @@ impl Conn {
         let frame = encode_frame(msg)?;
         let mut sent = 0;
         while sent < frame.len() {
-            let n = send(
-                self.fd.as_raw_fd(),
-                &frame[sent..],
-                nix::sys::socket::MsgFlags::empty(),
-            )?;
+            let n = send(self.fd.as_raw_fd(), &frame[sent..], MsgFlags::empty())?;
             if n == 0 {
                 return Err(ConnError::PeerClosed);
             }
             sent += n;
+        }
+        Ok(())
+    }
+
+    /// Send a `HelperResponse` with a single `RawFd` attached via
+    /// `SCM_RIGHTS` (S24.A). The receiver must call
+    /// [`Conn::recv_response_with_fd`] (or the daemon-side analog) with
+    /// a cmsg buffer to extract the fd.
+    ///
+    /// On STREAM transports the kernel may split a large send into
+    /// multiple internal chunks; the cmsg always rides with the first
+    /// chunk. We assume the frame fits in a single `sendmsg(2)` because
+    /// `MAX_HELPER_FRAME_SIZE` is well under any plausible kernel
+    /// send-buffer limit. If `sendmsg` returns short, the rest is
+    /// completed with plain `send(2)` (the cmsg was already delivered).
+    #[allow(dead_code)]
+    pub fn send_response_with_fd(
+        &self,
+        msg: &HelperResponse,
+        attach: RawFd,
+    ) -> Result<(), ConnError> {
+        let frame = encode_frame(msg)?;
+        let iov = [std::io::IoSlice::new(&frame)];
+        let fds = [attach];
+        let cmsgs = [ControlMessage::ScmRights(&fds)];
+        // SAFETY (the nix wrapper): iov + cmsgs outlive the call; fd is
+        // owned by us; we don't take an address (None).
+        let n = sendmsg::<()>(self.fd.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None)?;
+        if n == 0 {
+            return Err(ConnError::PeerClosed);
+        }
+        let mut sent = n;
+        while sent < frame.len() {
+            let m = send(self.fd.as_raw_fd(), &frame[sent..], MsgFlags::empty())?;
+            if m == 0 {
+                return Err(ConnError::PeerClosed);
+            }
+            sent += m;
         }
         Ok(())
     }
@@ -102,6 +137,80 @@ impl Conn {
     pub fn recv_response(&self) -> Result<HelperResponse, ConnError> {
         let buf = self.recv_frame()?;
         Ok(decode_frame(&buf)?)
+    }
+
+    /// Receive one `HelperResponse` frame plus an optional fd attached
+    /// via `SCM_RIGHTS` (S24.A). Returns `(message, Some(fd))` when the
+    /// peer attached one; `(message, None)` otherwise.
+    ///
+    /// The cmsg always arrives with the first chunk of a STREAM
+    /// recvmsg, so we issue one recvmsg sized to `MAX_HELPER_FRAME_SIZE`;
+    /// on the rare case where the kernel delivers fewer bytes than the
+    /// frame's length-prefix demands (only possible on STREAM), we
+    /// complete via plain `recv(2)` for the tail.
+    #[allow(dead_code)]
+    pub fn recv_response_with_fd(&self) -> Result<(HelperResponse, Option<OwnedFd>), ConnError> {
+        let (buf, fd) = self.recv_frame_with_fd()?;
+        Ok((decode_frame(&buf)?, fd))
+    }
+
+    fn recv_frame_with_fd(&self) -> Result<(Vec<u8>, Option<OwnedFd>), ConnError> {
+        let mut buf = vec![0u8; MAX_HELPER_FRAME_SIZE];
+        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let mut cmsg_buf: Vec<u8> = Vec::with_capacity(cmsg_space::<RawFd>());
+        let result = recvmsg::<()>(
+            self.fd.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg_buf),
+            MsgFlags::empty(),
+        )?;
+        let n = result.bytes;
+        if n == 0 {
+            return Err(ConnError::PeerClosed);
+        }
+        let mut received_fd: Option<OwnedFd> = None;
+        for cmsg in result.cmsgs()? {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg
+                && let Some(raw) = fds.first()
+            {
+                // SAFETY: the kernel just handed us a fresh fd via
+                // SCM_RIGHTS; ownership transfers to us. Multiple fds
+                // in one cmsg would be unusual; we take the first and
+                // close any others below.
+                received_fd = Some(unsafe { OwnedFd::from_raw_fd(*raw) });
+                for extra in fds.iter().skip(1) {
+                    // SAFETY: same — we own these but won't use them.
+                    drop(unsafe { OwnedFd::from_raw_fd(*extra) });
+                }
+            }
+        }
+        buf.truncate(n);
+        // STREAM transports may deliver the cmsg with a short read;
+        // SEQPACKET delivers the whole packet atomically. For STREAM,
+        // parse the length prefix and complete the read if needed.
+        #[cfg(not(target_os = "linux"))]
+        {
+            if buf.len() >= 4 {
+                let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                let frame_len = 4 + body_len;
+                if frame_len > MAX_HELPER_FRAME_SIZE {
+                    return Err(ConnError::Decode(shit_proto::DecodeError::TooLarge(
+                        frame_len,
+                    )));
+                }
+                while buf.len() < frame_len {
+                    let needed = frame_len - buf.len();
+                    let mut chunk = vec![0u8; needed];
+                    let m = recv(self.fd.as_raw_fd(), &mut chunk, MsgFlags::empty())?;
+                    if m == 0 {
+                        return Err(ConnError::PeerClosed);
+                    }
+                    chunk.truncate(m);
+                    buf.extend_from_slice(&chunk);
+                }
+            }
+        }
+        Ok((buf, received_fd))
     }
 
     fn recv_frame(&self) -> Result<Vec<u8>, ConnError> {
@@ -255,5 +364,52 @@ mod tests {
         drop(b);
         let res = a.recv_request();
         assert!(matches!(res, Err(ConnError::PeerClosed)));
+    }
+
+    #[test]
+    fn scm_rights_round_trip_via_socketpair() {
+        // Sender attaches a memfd-style temp file containing known
+        // bytes; receiver extracts the fd from the cmsg and reads
+        // back the bytes via pread. Validates the SCM_RIGHTS path
+        // end-to-end against our own IPC layer.
+        use shit_proto::HelperResponse;
+        use uuid::Uuid;
+        let (a, b) = socketpair().unwrap();
+        // Stage a payload in a temp file.
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("payload");
+        std::fs::write(&staging, b"scm-rights-payload").unwrap();
+        let staging_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&staging)
+            .unwrap();
+        let resp = HelperResponse::CapturedPreImage {
+            session: Uuid::nil(),
+            seq: 1,
+            dev: 0,
+            inode: 0,
+            path: None,
+            blob_hash: [0xAB; 32],
+            stored_bytes: 18,
+            post_content_hash: None,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            mtime_unix_nanos: 0,
+            is_delete: false,
+            fd_sent_via_scm: true,
+        };
+        a.send_response_with_fd(&resp, staging_fd.as_raw_fd())
+            .unwrap();
+        drop(staging_fd);
+        let (got_msg, got_fd) = b.recv_response_with_fd().unwrap();
+        assert_eq!(got_msg, resp);
+        let owned_fd = got_fd.expect("expected attached fd");
+        // Read bytes back via the received fd.
+        let mut buf = [0u8; 32];
+        // SAFETY: owned_fd is a valid open RawFd we just received.
+        let n = unsafe { libc::pread(owned_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert!(n > 0);
+        assert_eq!(&buf[..n as usize], b"scm-rights-payload");
     }
 }
