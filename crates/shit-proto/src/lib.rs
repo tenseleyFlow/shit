@@ -25,6 +25,7 @@ pub mod ctl;
 pub mod fault_inject;
 pub mod frame;
 pub mod helper;
+pub mod shim;
 
 pub use ctl::{
     ConflictPolicyWire, CtlRequest, CtlResponse, DaemonStatus, DbConnInfo, DbEngineParseError,
@@ -36,6 +37,7 @@ pub use ctl::{
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
 };
+pub use shim::{ShimAck, ShimNotification};
 pub use helper::{
     AuthDecision, AuthEventKind, HELPER_PATH_HINT_MAX, HELPER_PROTOCOL_VERSION, HelperCaps,
     HelperProtoError, HelperRequest, HelperResponse, MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome,
