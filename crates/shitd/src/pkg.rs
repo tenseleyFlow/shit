@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use shit_planner::events::{
-    CaptureEvent, CaptureEventKind, EventId, PackageManager, PackageOpKind,
+    CaptureEvent, CaptureEventKind, CommandId, EventId, PackageManager, PackageOpKind,
 };
 use shit_proto::{PkgEventReq, PkgManagerWire, PkgPhase};
 use shit_store::Index;
@@ -33,48 +33,79 @@ use crate::active_commands::ActiveCommands;
 /// `apt upgrade` of every package on a slow system fits comfortably.
 pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 
-/// In-memory Pre-phase stash, keyed by helper pid. Cleared by a
-/// matching Post or by the janitor TTL pass.
+/// In-memory Pre-phase stash.
+///
+/// Keyed by `CommandId` resolved from the helper's ancestor walk
+/// (DR-25). Real hook configs (apt's `DPkg::Pre-Invoke` /
+/// `Post-Invoke`, brew's wrapper, dnf's plugin) fire Pre and Post as
+/// *separate* helper processes with *different* PIDs; pairing by
+/// helper pid would never match in production. The resolved
+/// CommandId is stable across both phases because both helpers walk
+/// to the same shell-pid ancestor.
+///
+/// Falls back to keying by pid only when ancestry resolution returns
+/// `None` (orphan, e.g. a pkg manager invoked outside a shell hook).
 pub struct PkgPreStash {
-    inner: Mutex<HashMap<u32, (PkgEventReq, Instant)>>,
+    by_command: Mutex<HashMap<CommandId, (PkgEventReq, Instant)>>,
+    by_pid: Mutex<HashMap<u32, (PkgEventReq, Instant)>>,
 }
 
 impl PkgPreStash {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            by_command: Mutex::new(HashMap::new()),
+            by_pid: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record a Pre event. If a previous Pre with the same pid is
-    /// still in the stash (orphan from a torn earlier run) it is
-    /// replaced.
-    pub fn insert_pre(&self, req: PkgEventReq) {
-        let mut g = self.inner.lock().unwrap();
+    /// Record a Pre event keyed by command. Replaces any prior Pre
+    /// for the same command (orphan from a torn earlier run).
+    pub fn insert_pre_by_command(&self, command: CommandId, req: PkgEventReq) {
+        let mut g = self.by_command.lock().unwrap();
+        g.insert(command, (req, Instant::now()));
+    }
+
+    /// Take the Pre stash for `command` if present.
+    pub fn take_pre_by_command(&self, command: CommandId) -> Option<PkgEventReq> {
+        let mut g = self.by_command.lock().unwrap();
+        g.remove(&command).map(|(req, _)| req)
+    }
+
+    /// Record a Pre event keyed by pid — fallback when ancestry
+    /// resolution didn't find a command.
+    pub fn insert_pre_by_pid(&self, req: PkgEventReq) {
+        let mut g = self.by_pid.lock().unwrap();
         g.insert(req.pid, (req, Instant::now()));
     }
 
     /// Take the Pre stash for `pid` if present.
-    pub fn take_pre(&self, pid: u32) -> Option<PkgEventReq> {
-        let mut g = self.inner.lock().unwrap();
+    pub fn take_pre_by_pid(&self, pid: u32) -> Option<PkgEventReq> {
+        let mut g = self.by_pid.lock().unwrap();
         g.remove(&pid).map(|(req, _)| req)
     }
 
-    /// Evict entries older than `PRE_STASH_TTL`. Returns the number
-    /// evicted.
+    /// Evict entries older than `PRE_STASH_TTL` across both maps.
+    /// Returns the number evicted.
     pub fn sweep_expired(&self) -> usize {
-        let mut g = self.inner.lock().unwrap();
         let cutoff = Instant::now()
             .checked_sub(PRE_STASH_TTL)
             .unwrap_or_else(Instant::now);
+        let mut evicted = 0;
+        let mut g = self.by_command.lock().unwrap();
         let before = g.len();
         g.retain(|_, (_, ts)| *ts >= cutoff);
-        before - g.len()
+        evicted += before - g.len();
+        drop(g);
+        let mut g = self.by_pid.lock().unwrap();
+        let before = g.len();
+        g.retain(|_, (_, ts)| *ts >= cutoff);
+        evicted += before - g.len();
+        evicted
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.by_command.lock().unwrap().len() + self.by_pid.lock().unwrap().len()
     }
 }
 
@@ -145,21 +176,49 @@ pub fn handle(
 ) -> Option<PkgDiff> {
     match req.phase {
         PkgPhase::Pre => {
-            tracing::info!(
-                manager = req.manager.as_str(),
-                pid = req.pid,
-                uid = req.uid,
-                pkgs = req.packages.len(),
-                "pkg-event Pre stashed"
-            );
-            stash.insert_pre(req);
+            // Resolve ancestry on Pre too so the stash key is stable
+            // across Pre/Post processes. apt's DPkg::Pre-Invoke and
+            // Post-Invoke fire as separate helper processes — they
+            // share an ancestor (the running shell), not a pid.
+            if let Some(command) = active.resolve_by_descendant(req.pid) {
+                tracing::info!(
+                    manager = req.manager.as_str(),
+                    pid = req.pid,
+                    uid = req.uid,
+                    pkgs = req.packages.len(),
+                    %command,
+                    "pkg-event Pre stashed by command"
+                );
+                stash.insert_pre_by_command(command, req);
+            } else {
+                tracing::info!(
+                    manager = req.manager.as_str(),
+                    pid = req.pid,
+                    uid = req.uid,
+                    pkgs = req.packages.len(),
+                    "pkg-event Pre stashed by pid (no active command ancestor)"
+                );
+                stash.insert_pre_by_pid(req);
+            }
             None
         }
         PkgPhase::Post => {
-            let Some(pre) = stash.take_pre(req.pid) else {
+            // Same ancestry walk as Pre — find the command, look up
+            // the stashed Pre by command. Fall back to pid for
+            // unattributed events (orphan: same self-spawned helper,
+            // unit-test style).
+            let resolved_command = active.resolve_by_descendant(req.pid);
+            let pre = match resolved_command {
+                Some(c) => stash
+                    .take_pre_by_command(c)
+                    .or_else(|| stash.take_pre_by_pid(req.pid)),
+                None => stash.take_pre_by_pid(req.pid),
+            };
+            let Some(pre) = pre else {
                 tracing::warn!(
                     manager = req.manager.as_str(),
                     pid = req.pid,
+                    command = ?resolved_command,
                     "pkg-event Post with no matching Pre; ignoring (orphan)"
                 );
                 return None;
@@ -174,13 +233,12 @@ pub fn handle(
                 return None;
             }
             let diff = diff_packages(&pre.packages, &req.packages);
-            // DR-25: attribute the event to the active command window.
-            // Walk ancestors of the helper pid until we hit a tracked
-            // shell. If the chain doesn't include one, the event is
-            // an orphan (e.g., a pkg manager invoked outside a shell
-            // hook, or after the originating shell exited); log and
-            // drop.
-            let Some(command) = active.resolve_by_descendant(req.pid) else {
+            // DR-25: attribute the event to the active command window
+            // we already resolved at stash-lookup time. If the chain
+            // didn't include a tracked shell, the event is an orphan
+            // (e.g., a pkg manager invoked outside a shell hook); log
+            // and drop.
+            let Some(command) = resolved_command else {
                 tracing::warn!(
                     manager = req.manager.as_str(),
                     pid = req.pid,
@@ -391,7 +449,7 @@ mod tests {
         let (_tmp, idx, active, _) = fixture();
         let stash = PkgPreStash::new();
         let pid = std::process::id();
-        stash.insert_pre(req(PkgPhase::Pre, pid, pkgs(&[("bash", "5.1")])));
+        stash.insert_pre_by_pid(req(PkgPhase::Pre, pid, pkgs(&[("bash", "5.1")])));
         let mut bad_post = req(PkgPhase::Post, pid, pkgs(&[("bash", "5.2")]));
         bad_post.manager = shit_proto::PkgManagerWire::Pacman;
         assert!(handle(&stash, bad_post, &active, &idx).is_none());
