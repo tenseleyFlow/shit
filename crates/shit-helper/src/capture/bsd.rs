@@ -121,15 +121,20 @@ struct PumpState {
     fd_to_command: HashMap<RawFd, CommandId>,
     staging_dir: PathBuf,
     conn: Arc<Conn>,
+    /// S29.2 — kept here so `handle_dir_change` can register fresh
+    /// kqueue watches via `TrackedSubtree::add_path` when a new entry
+    /// appears in a watched directory.
+    kq: Arc<KqueueFd>,
 }
 
 impl PumpState {
-    fn new(staging_dir: PathBuf, conn: Arc<Conn>) -> Self {
+    fn new(staging_dir: PathBuf, conn: Arc<Conn>, kq: Arc<KqueueFd>) -> Self {
         Self {
             watches: BTreeMap::new(),
             fd_to_command: HashMap::new(),
             staging_dir,
             conn,
+            kq,
         }
     }
 
@@ -254,7 +259,17 @@ impl PumpState {
             tracing::trace!(fd, ?kind, ?file_type, "vnode event on non-file; skipping");
             return;
         }
-        if !should_capture_dedupe(&ws.dedupe, (dev, inode)) {
+        // Delete events ALWAYS go through, even if we already captured
+        // a pre-image for this (dev, inode) earlier in the command —
+        // the daemon needs the paired TreeOp::Unlink to plan the
+        // recreate side of undo. (Smoke-surfaced bug: touch + echo +
+        // rm produced only Create + FilePreImage; the rm's
+        // CapturedPreImage was dedupe-suppressed and the Unlink half
+        // never landed.) For Write/Extend, first-write-wins still
+        // applies — repeated writes to the same file get one
+        // pre-image, the post-content can be reconstructed from
+        // post_content_hash + the original blob.
+        if !is_delete && !should_capture_dedupe(&ws.dedupe, (dev, inode)) {
             tracing::trace!(fd, dev, inode, "dedupe hit; skipping recapture");
             return;
         }
@@ -343,6 +358,12 @@ impl PumpState {
     /// across a name change is detected as Unlink+Create for the same
     /// `(dev, inode)`; the planner can pair them into a Rename at cohort
     /// assignment time.
+    ///
+    /// S29.2 — when a new entry is a regular file, auto-add it to the
+    /// kqueue watch via `subtree.add_path` so subsequent
+    /// NOTE_WRITE/NOTE_DELETE on the new file's fd are picked up by
+    /// the regular file branch of `handle_vnode`. The kq fd is the
+    /// pump's shared `Arc<KqueueFd>` (`self.kq`).
     fn handle_dir_change(&mut self, command: CommandId, fd: RawFd) {
         let Some(ws) = self.watches.get_mut(&command) else {
             return;
@@ -359,10 +380,18 @@ impl PumpState {
                 return;
             }
         };
-        // Compute additions (in current, not in baseline) and removals
-        // (in baseline, not in current). A name with a different
-        // (dev, inode) registers as both removal + addition.
+        // Compute additions (in current, not in baseline). A name with
+        // a different (dev, inode) at the same name is treated as an
+        // addition (the inode-replacement case — file deleted and a new
+        // one created with the same name).
+        //
+        // S29.2: for each *new regular file*, register a kqueue watch
+        // on it via `subtree.add_path` and index its fd in
+        // `fd_to_command`. Subsequent writes/deletes then fire on the
+        // tracked fd and the regular-file branch of `handle_vnode`
+        // picks them up.
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
+        let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
         for (name, &(dev, inode)) in &current {
             match baseline.entries.get(name) {
                 Some(&prev) if prev == (dev, inode) => {} // unchanged
@@ -377,6 +406,9 @@ impl PumpState {
                         kind,
                         mode: file_mode_for(&child).unwrap_or(0),
                     });
+                    if matches!(kind, shit_proto::FileKindWire::Regular) {
+                        new_files_to_watch.push(child);
+                    }
                 }
             }
         }
@@ -400,6 +432,25 @@ impl PumpState {
         // Refresh baseline so subsequent diffs are relative to the
         // post-change state.
         baseline.entries = current;
+
+        // S29.2 — register fresh fds for each new regular file. Mutate
+        // both the watch's subtree (so add_path's bookkeeping is
+        // visible) and our `fd_to_command` index (so when the new
+        // fd's NOTE_WRITE/NOTE_DELETE fires later, the file branch in
+        // `handle_vnode` resolves it correctly).
+        for new_path in new_files_to_watch {
+            if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
+                self.fd_to_command.insert(new_fd, command);
+                tracing::info!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %new_path.display(),
+                    new_fd,
+                    "auto-added new file to subtree watch",
+                );
+            }
+        }
+
         if events.is_empty() {
             tracing::trace!(fd, "dir Write produced no entry-set delta");
             return;
@@ -644,7 +695,7 @@ fn pump(
     staging_dir: PathBuf,
     ctrl_rx: Receiver<ControlMsg>,
 ) {
-    let mut state = PumpState::new(staging_dir, conn);
+    let mut state = PumpState::new(staging_dir, conn, Arc::clone(&kq));
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
@@ -768,7 +819,8 @@ mod tests {
         // code path returns cleanly.
         let (conn_a, _conn_b) = crate::ipc::socketpair().expect("socketpair");
         let dir = tempfile::tempdir().unwrap();
-        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a));
+        let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
+        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a), kq);
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,
