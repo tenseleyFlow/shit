@@ -11,6 +11,7 @@
 //! - S18 — process tier (note-only)
 
 pub mod db;
+pub mod descriptor;
 pub mod env;
 pub mod file;
 pub mod network;
@@ -22,6 +23,7 @@ pub use db::{
     DbExecOutcome, DbExecutor, DbSuggestion, DbSuggestionSink, VecDbSuggestionSink,
     decide as db_decide,
 };
+pub use descriptor::{DescRunner, DescriptorExecutor, SystemDescRunner};
 pub use env::{EnvExecutor, SnippetSink, StringSnippetSink};
 pub use file::FileExecutor;
 pub use network::{NetRunner, NetworkExecutor, SystemNetRunner};
