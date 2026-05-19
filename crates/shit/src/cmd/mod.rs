@@ -7,6 +7,7 @@ pub mod bookmark;
 pub mod cloud_hooks;
 pub mod completions;
 pub mod config;
+pub mod container_stashes;
 pub mod ctl_client;
 pub mod db_hooks;
 pub mod descriptors;

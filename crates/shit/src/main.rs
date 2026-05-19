@@ -98,6 +98,10 @@ enum Cmd {
     /// aws, terraform). See `shit cloud-hooks --help`.
     #[command(name = "cloud-hooks")]
     CloudHooks(cmd::cloud_hooks::CloudHooksArgs),
+    /// List or prune container-runtime stashes (image / volume
+    /// tarballs from C04). See `shit container-stashes --help`.
+    #[command(name = "container-stashes")]
+    ContainerStashes(cmd::container_stashes::ContainerStashesArgs),
     /// Query the daemon's perf-counter snapshot. `--format prometheus`
     /// for scraping; `--watch 1s` for live updates.
     Metrics(cmd::metrics::MetricsArgs),
@@ -295,6 +299,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::ProcHooks(args) => Ok(cmd::proc_hooks::run(args)?),
         Cmd::DbHooks(args) => Ok(cmd::db_hooks::run(args)?),
         Cmd::CloudHooks(args) => Ok(cmd::cloud_hooks::run(args)?),
+        Cmd::ContainerStashes(args) => Ok(cmd::container_stashes::run(args)?),
         Cmd::Metrics(args) => Ok(cmd::metrics::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),
