@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId, SystemdScope};
+use shit_planner::events::{CaptureEvent, CaptureEventKind, CommandId, EventId, SystemdScope};
 use shit_planner::{ServiceState, parse_launchctl_print, parse_systemctl_show};
 use shit_proto::{SvcEventReq, SvcScopeWire, SvcToolWire};
 use shit_store::Index;
@@ -28,13 +28,25 @@ use crate::active_commands::ActiveCommands;
 /// Pre-stash TTL. Same value as pkg/env.
 pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 
-/// Stash key. We include the tool because the same pid could
-/// theoretically invoke both systemctl and launchctl (unusual but
-/// legal in a script).
+/// Stash key — pid-based, used as fallback when ancestry doesn't
+/// resolve to an active command. Production-path pairing keys by
+/// `SvcCommandKey` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SvcKey {
     pub tool: SvcToolWire,
     pub pid: u32,
+    pub unit: String,
+}
+
+/// Command-aware stash key — used when both Pre and Post resolve to
+/// the same active command via ancestor walk. Real wrappers (the
+/// systemctl/launchctl PATH-prepended ones) spawn the helper as a
+/// separate process per phase, so the helper pids differ between
+/// Pre and Post; the resolved command is the only stable pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SvcCommandKey {
+    pub command: CommandId,
+    pub tool: SvcToolWire,
     pub unit: String,
 }
 
@@ -46,39 +58,54 @@ pub struct SvcPre {
 }
 
 pub struct SvcPreStash {
-    inner: Mutex<HashMap<SvcKey, SvcPre>>,
+    by_command: Mutex<HashMap<SvcCommandKey, SvcPre>>,
+    by_pid: Mutex<HashMap<SvcKey, SvcPre>>,
 }
 
 impl SvcPreStash {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            by_command: Mutex::new(HashMap::new()),
+            by_pid: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn insert(&self, key: SvcKey, pre: SvcPre) {
-        let mut g = self.inner.lock().unwrap();
-        g.insert(key, pre);
+    pub fn insert_by_command(&self, key: SvcCommandKey, pre: SvcPre) {
+        self.by_command.lock().unwrap().insert(key, pre);
     }
 
-    pub fn take(&self, key: &SvcKey) -> Option<SvcPre> {
-        let mut g = self.inner.lock().unwrap();
-        g.remove(key)
+    pub fn take_by_command(&self, key: &SvcCommandKey) -> Option<SvcPre> {
+        self.by_command.lock().unwrap().remove(key)
+    }
+
+    pub fn insert_by_pid(&self, key: SvcKey, pre: SvcPre) {
+        self.by_pid.lock().unwrap().insert(key, pre);
+    }
+
+    pub fn take_by_pid(&self, key: &SvcKey) -> Option<SvcPre> {
+        self.by_pid.lock().unwrap().remove(key)
     }
 
     pub fn sweep_expired(&self) -> usize {
-        let mut g = self.inner.lock().unwrap();
         let cutoff = Instant::now()
             .checked_sub(PRE_STASH_TTL)
             .unwrap_or_else(Instant::now);
+        let mut evicted = 0;
+        let mut g = self.by_command.lock().unwrap();
         let before = g.len();
         g.retain(|_, e| e.ts >= cutoff);
-        before - g.len()
+        evicted += before - g.len();
+        drop(g);
+        let mut g = self.by_pid.lock().unwrap();
+        let before = g.len();
+        g.retain(|_, e| e.ts >= cutoff);
+        evicted += before - g.len();
+        evicted
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.by_command.lock().unwrap().len() + self.by_pid.lock().unwrap().len()
     }
 }
 
@@ -116,11 +143,21 @@ pub fn handle(
     active: &ActiveCommands,
     index: &Index,
 ) -> PostOutcome {
-    let key = SvcKey {
+    let pid_key = SvcKey {
         tool: req.tool,
         pid: req.pid,
         unit: req.unit.clone(),
     };
+    // Ancestry-based key for the production path. Both Pre and Post
+    // helper invocations resolve to the same command via their
+    // shared shell ancestor.
+    let cmd_key = active
+        .resolve_by_descendant(req.pid)
+        .map(|c| SvcCommandKey {
+            command: c,
+            tool: req.tool,
+            unit: req.unit.clone(),
+        });
     let state = parse_state(req.tool, &req.state_raw);
     match req.phase {
         shit_proto::PkgPhase::Pre => {
@@ -129,21 +166,30 @@ pub fn handle(
                 pid = req.pid,
                 unit = %req.unit,
                 verb = %req.verb,
+                command = ?cmd_key.as_ref().map(|k| k.command),
                 "svc-pre stashed"
             );
-            stash.insert(
-                key,
-                SvcPre {
-                    state,
-                    verb: req.verb,
-                    ts: Instant::now(),
-                },
-            );
+            let pre = SvcPre {
+                state,
+                verb: req.verb,
+                ts: Instant::now(),
+            };
+            if let Some(k) = cmd_key {
+                stash.insert_by_command(k, pre);
+            } else {
+                stash.insert_by_pid(pid_key, pre);
+            }
             // Pre never returns a diff; the caller logs and acks.
             PostOutcome::Orphan
         }
         shit_proto::PkgPhase::Post => {
-            let Some(pre) = stash.take(&key) else {
+            let pre = match cmd_key.as_ref() {
+                Some(k) => stash
+                    .take_by_command(k)
+                    .or_else(|| stash.take_by_pid(&pid_key)),
+                None => stash.take_by_pid(&pid_key),
+            };
+            let Some(pre) = pre else {
                 tracing::warn!(
                     tool = req.tool.as_str(),
                     pid = req.pid,
@@ -161,8 +207,9 @@ pub fn handle(
                 );
                 return PostOutcome::Unchanged;
             }
-            // DR-36: resolve the active command via ancestor walk.
-            let Some(command) = active.resolve_by_descendant(req.pid) else {
+            // DR-36: attribute the event to the active command we
+            // already resolved at stash-lookup time.
+            let Some(command) = cmd_key.as_ref().map(|k| k.command) else {
                 tracing::warn!(
                     tool = req.tool.as_str(),
                     pid = req.pid,
@@ -388,24 +435,21 @@ mod tests {
             pid: 42,
             unit: "x.service".into(),
         };
-        {
-            let mut g = stash.inner.lock().unwrap();
-            g.insert(
-                key,
-                SvcPre {
-                    state: ServiceState {
-                        active: false,
-                        enabled: false,
-                        masked: false,
-                        raw: String::new(),
-                    },
-                    verb: "start".into(),
-                    ts: Instant::now()
-                        .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
-                        .expect("clock subtraction"),
+        stash.insert_by_pid(
+            key,
+            SvcPre {
+                state: ServiceState {
+                    active: false,
+                    enabled: false,
+                    masked: false,
+                    raw: String::new(),
                 },
-            );
-        }
+                verb: "start".into(),
+                ts: Instant::now()
+                    .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
+                    .expect("clock subtraction"),
+            },
+        );
         assert_eq!(stash.sweep_expired(), 1);
         assert_eq!(stash.len(), 0);
     }
