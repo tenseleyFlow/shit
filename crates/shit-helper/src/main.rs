@@ -726,6 +726,22 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
+    // S24.F — Capsicum capability mode. Off by default because
+    // register_subtree currently opens by absolute path, which
+    // cap_enter forbids. Gated on SHIT_CAPSICUM=1 so we can validate
+    // the call site incrementally before the dir-fd rewrite in S25.
+    #[cfg(target_os = "freebsd")]
+    if std::env::var("SHIT_CAPSICUM").as_deref() == Ok("1") {
+        match capsicum_bsd::enter_capability_mode() {
+            Ok(()) => {
+                tracing::info!("entered Capsicum capability mode (SHIT_CAPSICUM=1)");
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
+            }
+        }
+    }
+
     let request_conn = Arc::clone(&conn);
     #[cfg(target_os = "linux")]
     let request_state = fanotify_state.clone();
