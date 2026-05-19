@@ -116,3 +116,37 @@ pub fn unmark_filesystem(fd: &FanotifyFd, path: &Path) -> Result<(), MarkError> 
         path,
     )
 }
+
+/// L01 — per-WatchTree narrow mark. Marks the directory inode at
+/// `path` itself + its DIRECT children for write-intent perm events.
+/// Grandchildren are not auto-marked; for deeper trees the daemon
+/// should call this again on each subdirectory (or upgrade to the
+/// FS-wide mark, accepting the HP-18 risk).
+///
+/// FAN_EVENT_ON_CHILD is the bit that makes children fire events;
+/// without it the mark only fires for opens of the directory inode
+/// itself. ONLYDIR keeps the mark from accidentally pinning a
+/// regular file passed in by mistake.
+pub fn mark_dir_for_capture(fd: &FanotifyFd, dir: &Path) -> Result<(), MarkError> {
+    let mask = libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_EVENT_ON_CHILD;
+    mark(
+        fd,
+        MarkFlags::ADD | MarkFlags::ONLYDIR,
+        mask,
+        libc::AT_FDCWD,
+        dir,
+    )
+}
+
+/// Remove a mark previously added by [`mark_dir_for_capture`]. Pair
+/// with UnwatchTree so per-command marks are cleaned up.
+pub fn unmark_dir_for_capture(fd: &FanotifyFd, dir: &Path) -> Result<(), MarkError> {
+    let mask = libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_EVENT_ON_CHILD;
+    mark(
+        fd,
+        MarkFlags::REMOVE | MarkFlags::ONLYDIR,
+        mask,
+        libc::AT_FDCWD,
+        dir,
+    )
+}
