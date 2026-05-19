@@ -2,6 +2,14 @@
 
 //! `shit doctor` — walk likely-to-matter mount points, print the
 //! detected FS kind, the COW tier we'd pick, and any caveats.
+//!
+//! ## Output modes
+//!
+//! - Default: human-readable table (the long-standing behavior).
+//! - `--json`: machine-readable [`json::DoctorReport`] for CI gates
+//!   and external tooling consumption (B03).
+
+pub mod json;
 
 use shit_capture::{CaptureOpts, CowTier, FsKind, detect_fs, supported_tiers, would_pick};
 use std::path::{Path, PathBuf};
