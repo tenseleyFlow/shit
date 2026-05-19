@@ -250,6 +250,40 @@ pub fn watch_path(_kq: &KqueueFd, _path: &Path) -> Result<(), KqueueError> {
     ))
 }
 
+impl TrackedSubtree {
+    /// S29.2 — add an incremental watch on a single path that wasn't
+    /// known at `register_subtree` time. Used when the dir-diff in
+    /// `capture::bsd::handle_dir_change` sees a new entry appear and
+    /// we want subsequent NOTE_WRITE/NOTE_DELETE on that entry to
+    /// fire on a tracked fd. Returns the new fd on success, or
+    /// `None` if the open failed (permission-denied, race-deleted,
+    /// etc. — non-fatal; the watch silently drops that entry).
+    pub fn add_path(&mut self, kq: &KqueueFd, path: &Path) -> Option<RawFd> {
+        let fd = match open_for_watch(path) {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::trace!(path = %path.display(), error = ?e, "add_path open failed");
+                return None;
+            }
+        };
+        let raw = fd.as_raw_fd();
+        let entry = TrackedEntry {
+            fd,
+            path: path.to_path_buf(),
+        };
+        // Register one filter against the new fd. We re-use
+        // `register_entries` with a single-element slice to keep the
+        // changelist construction in one place.
+        let single = std::slice::from_ref(&entry);
+        if let Err(e) = register_entries(kq, single) {
+            tracing::warn!(path = %path.display(), error = %e, "add_path kevent register failed");
+            return None;
+        }
+        self.entries.push(entry);
+        Some(raw)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
