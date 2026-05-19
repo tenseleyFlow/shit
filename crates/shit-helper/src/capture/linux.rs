@@ -37,17 +37,18 @@
 // `capture/mod.rs`; no inner `#![cfg(...)]` here so unit tests aren't
 // accidentally filtered out on Linux.
 
-// L01 chunk 1 — skeleton. Dead-code lint suppressed until chunk 3/5
-// wires the runtime into `fanotify/runtime.rs` and the WatchTree
-// dispatch in `main.rs`. Remove once integrated.
+// L01 chunk 2 — handle_event body is in. FanotifyCaptureKind +
+// FanotifyEventView + path_for_kernel_fd stay dead until chunk 4
+// wires fanotify/runtime.rs to construct views.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use shit_planner::events::CommandId;
+use shit_proto::HelperResponse;
 
 use crate::ipc::Conn;
 
@@ -139,11 +140,130 @@ impl LinuxCaptureRuntime {
     /// budget: best-effort capture, never block the kernel queue.
     /// All error paths log and continue — the producer's job is to
     /// keep the kernel moving.
-    pub fn handle_event(&mut self, _ev: &FanotifyEventView<'_>) {
-        // TODO L01.2: implement (fstat → dedupe → read pre-image → blake3 →
-        // staging-write → SCM_RIGHTS send → mark dedupe). For now this
-        // is a no-op so the workspace compiles clean while the rest of
-        // the wiring lands.
+    ///
+    /// Flow (mirror of `capture/bsd.rs::PumpState::handle_vnode`):
+    ///   1. fstat the kernel-provided fd → (dev, inode, kind)
+    ///   2. Bail if non-regular file (directories, fifos, sockets —
+    ///      pread is invalid on those; the fanotify mark may have
+    ///      caught their parent dir's open).
+    ///   3. Dedupe by (dev, inode). Delete bypasses dedupe — see the
+    ///      S29 bug-fix lesson in bsd.rs: the paired Unlink TreeOp
+    ///      depends on the daemon seeing the Delete event.
+    ///   4. Read pre-image bytes from the kernel-provided fd (capped
+    ///      at MAX_PRE_IMAGE_BYTES — huge files ALLOW without capture).
+    ///   5. fstat for metadata (mode/uid/gid/mtime).
+    ///   6. blake3 the bytes. Daemon verifies independently before
+    ///      committing the blob.
+    ///   7. Write bytes to staging file; pass the fd via SCM_RIGHTS.
+    ///   8. Update dedupe state.
+    pub fn handle_event(&mut self, ev: &FanotifyEventView<'_>) {
+        // Lazy WatchState — first event for a command initializes its
+        // dedupe map. `on_watch_tree` may have been called already, in
+        // which case `or_default` is a cheap lookup.
+        let ws = self.watches.entry(ev.command).or_default();
+
+        let (dev, inode, file_type) = match fstat_dev_inode_kind(ev.fd) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(fd = ev.fd, "fstat failed; skipping capture");
+                return;
+            }
+        };
+
+        // Directories and specials (fifo/socket/blk/chr) don't carry a
+        // useful pre-image. The fanotify mark may have caught e.g. an
+        // open on a directory itself (`open(O_DIRECTORY)`); ignore.
+        if file_type != FileType::Regular {
+            tracing::trace!(fd = ev.fd, ?file_type, "non-regular fd; skipping");
+            return;
+        }
+
+        let is_delete = matches!(ev.kind, FanotifyCaptureKind::Delete);
+        if !is_delete && !should_capture_dedupe(&ws.dedupe, (dev, inode)) {
+            tracing::trace!(fd = ev.fd, dev, inode, "dedupe hit; skipping");
+            return;
+        }
+
+        let bytes = match read_pre_image(ev.fd) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(fd = ev.fd, error = %e, "pre-image read failed");
+                return;
+            }
+        };
+        let meta = match fstat_meta(ev.fd) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(fd = ev.fd, "fstat_meta failed");
+                return;
+            }
+        };
+        let blob_hash = blake3_of(&bytes);
+        let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::warn!(error = %e, "staging write failed");
+                return;
+            }
+        };
+        let path = path_for_kernel_fd(ev.fd);
+
+        let resp = HelperResponse::CapturedPreImage {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            dev,
+            inode,
+            path: path.as_deref().map(path_to_string),
+            blob_hash,
+            stored_bytes: bytes.len() as u64,
+            post_content_hash: None,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+            mtime_unix_nanos: meta.mtime_unix_nanos,
+            is_delete,
+            fd_sent_via_scm: true,
+        };
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+        {
+            tracing::warn!(error = %e, "send_response_with_fd failed");
+        }
+
+        ws.dedupe.insert(
+            (dev, inode),
+            DedupeEntry {
+                invalidated: is_delete,
+            },
+        );
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            dev,
+            inode,
+            kind = ?ev.kind,
+            bytes = bytes.len(),
+            "CapturedPreImage sent",
+        );
+    }
+}
+
+/// Decide whether the producer should emit a pre-image capture for
+/// the given `(dev, inode)` given the current dedupe map state.
+///
+/// First-write-wins per (dev, inode) within a watch window. A delete
+/// flips `invalidated=true`, which lets the *next* write re-capture —
+/// handles inode reuse and the rm-then-recreate pattern.
+///
+/// Factored out as a pure function so the dedupe logic is testable
+/// without spinning up a real fanotify event source.
+fn should_capture_dedupe(map: &BTreeMap<(u64, u64), DedupeEntry>, key: (u64, u64)) -> bool {
+    match map.get(&key) {
+        None => true,
+        Some(e) if e.invalidated => true,
+        Some(_) => false,
     }
 }
 
@@ -375,5 +495,66 @@ mod tests {
         assert!(rt.watches.contains_key(&cmd));
         rt.on_unwatch_tree(cmd);
         assert!(!rt.watches.contains_key(&cmd));
+    }
+
+    /// First write per inode captures; the second is dedupe-suppressed
+    /// within the same watch window. A different inode in the same
+    /// watch captures independently.
+    #[test]
+    fn dedupe_first_write_wins() {
+        let mut map: BTreeMap<(u64, u64), DedupeEntry> = BTreeMap::new();
+        let key = (1u64, 42u64);
+        assert!(should_capture_dedupe(&map, key));
+        map.insert(key, DedupeEntry { invalidated: false });
+        assert!(!should_capture_dedupe(&map, key));
+        assert!(should_capture_dedupe(&map, (1, 43)));
+    }
+
+    /// `Delete` flips `invalidated=true`. The next write to the same
+    /// (dev, inode) re-captures — handles the rm-then-recreate /
+    /// inode-reuse cases.
+    #[test]
+    fn delete_invalidates_then_recaptures() {
+        let mut map: BTreeMap<(u64, u64), DedupeEntry> = BTreeMap::new();
+        let key = (2u64, 100u64);
+        assert!(should_capture_dedupe(&map, key));
+        map.insert(key, DedupeEntry { invalidated: false });
+        assert!(!should_capture_dedupe(&map, key));
+        // Simulate the post-Delete bookkeeping that handle_event
+        // performs after a Delete-kind capture.
+        map.insert(key, DedupeEntry { invalidated: true });
+        assert!(should_capture_dedupe(&map, key));
+    }
+
+    /// After `on_unwatch_tree`, the WatchState is gone. A late event
+    /// arriving with the same CommandId initializes a *fresh* state
+    /// via `entry().or_default()` rather than panicking — the
+    /// fanotify reader can race the unwatch and we must tolerate it.
+    /// This test verifies the lazy-init path doesn't crash; capture
+    /// still works (the late event behaves as a first event for a
+    /// new window).
+    #[test]
+    fn late_event_after_unwatch_dropped() {
+        let (mut rt, _dir, _staging) = fresh_runtime();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        rt.on_unwatch_tree(cmd);
+        assert!(!rt.watches.contains_key(&cmd));
+        // Drive handle_event with a synthetic view. fd=-1 means
+        // fstat will fail at step 1 and the handler returns cleanly
+        // without panicking. The new WatchState lazy-inited by
+        // entry().or_default() is left in place — the next real
+        // unwatch will clear it.
+        let view = FanotifyEventView {
+            command: cmd,
+            fd: -1,
+            pid: 0,
+            kind: FanotifyCaptureKind::OpenWrite,
+            _life: std::marker::PhantomData,
+        };
+        rt.handle_event(&view);
+        // Lazy-init left an empty WatchState; this is correctness, not a leak.
+        assert!(rt.watches.contains_key(&cmd));
+        assert!(rt.watches.get(&cmd).unwrap().dedupe.is_empty());
     }
 }
