@@ -52,15 +52,9 @@ PID="$$"
 # the runner's umask.
 chmod 0666 "${SHIT_CTL_SOCK}" 2>/dev/null || true
 
-smoke_log "pre-state via sudo nft list ruleset:"
-sudo nft list ruleset -a 2>&1 | sed 's/^/    pre: /' >&2 || true
-
 smoke_log "sudo wrapper add table inet ${TEST_TABLE}"
 sudo env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "SHIT_HELPER=${HELPER}" \
     bash "${WRAPPER}" add table inet "${TEST_TABLE}"
-
-smoke_log "post-state via sudo nft list ruleset:"
-sudo nft list ruleset -a 2>&1 | sed 's/^/    post: /' >&2 || true
 
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
