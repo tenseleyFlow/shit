@@ -24,6 +24,7 @@
 ))]
 
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -167,7 +168,7 @@ impl Drop for DrainSession {
 /// a [`DrainSession`] for the consumer side. The kqueue must already
 /// have any vnode / proc filters registered against it — register
 /// first, spawn second.
-pub fn spawn(kq: KqueueFd, capacity: usize) -> Result<DrainSession, DrainError> {
+pub fn spawn(kq: Arc<KqueueFd>, capacity: usize) -> Result<DrainSession, DrainError> {
     let shutdown_fd = dup_for_shutdown(&kq)?;
     register_shutdown_user_event(&kq)?;
     let (tx, rx) = sync_channel(capacity);
@@ -183,11 +184,11 @@ pub fn spawn(kq: KqueueFd, capacity: usize) -> Result<DrainSession, DrainError> 
 }
 
 /// Convenience: spawn with [`DEFAULT_CAPACITY`].
-pub fn spawn_default(kq: KqueueFd) -> Result<DrainSession, DrainError> {
+pub fn spawn_default(kq: Arc<KqueueFd>) -> Result<DrainSession, DrainError> {
     spawn(kq, DEFAULT_CAPACITY)
 }
 
-fn dup_for_shutdown(kq: &KqueueFd) -> Result<std::os::fd::OwnedFd, DrainError> {
+fn dup_for_shutdown(kq: &Arc<KqueueFd>) -> Result<std::os::fd::OwnedFd, DrainError> {
     use std::os::fd::FromRawFd;
     // SAFETY: dup returns a fresh fd or -1; we own the result.
     let raw = unsafe { libc::dup(kq.as_raw_fd()) };
@@ -198,7 +199,7 @@ fn dup_for_shutdown(kq: &KqueueFd) -> Result<std::os::fd::OwnedFd, DrainError> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
 }
 
-fn register_shutdown_user_event(kq: &KqueueFd) -> Result<(), DrainError> {
+fn register_shutdown_user_event(kq: &Arc<KqueueFd>) -> Result<(), DrainError> {
     let ev = libc::kevent {
         ident: SHUTDOWN_IDENT,
         filter: libc::EVFILT_USER,
@@ -225,7 +226,7 @@ fn register_shutdown_user_event(kq: &KqueueFd) -> Result<(), DrainError> {
     Ok(())
 }
 
-fn run(kq: KqueueFd, tx: SyncSender<DrainEvent>, capacity: usize) -> Result<(), DrainError> {
+fn run(kq: Arc<KqueueFd>, tx: SyncSender<DrainEvent>, capacity: usize) -> Result<(), DrainError> {
     let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
     loop {
         // Blocking wait — timeout=NULL.
@@ -315,13 +316,13 @@ mod tests {
 
     #[test]
     fn vnode_event_surfaces_through_channel() {
-        let kq = init().expect("kqueue");
+        let kq = Arc::new(init().expect("kqueue"));
         let dir = tempfile::tempdir().expect("tempdir");
         let foo = dir.path().join("foo");
         std::fs::write(&foo, b"initial").unwrap();
         let tree = register_subtree(&kq, dir.path(), 4).expect("register");
         // Hold tree alive across the test so fds aren't closed.
-        let session = spawn(kq, 64).expect("spawn drain");
+        let session = spawn(Arc::clone(&kq), 64).expect("spawn drain");
         std::fs::write(&foo, b"modified-content-longer").unwrap();
         let ev = recv_with_timeout(&session, Duration::from_millis(500))
             .expect("expected a drain event");
@@ -342,7 +343,7 @@ mod tests {
 
     #[test]
     fn shutdown_unblocks_the_loop() {
-        let kq = init().expect("kqueue");
+        let kq = Arc::new(init().expect("kqueue"));
         let session = spawn(kq, 16).expect("spawn drain");
         // Nothing registered — drain is blocked in kevent(2).
         // Shutdown must wake it up.
@@ -357,14 +358,14 @@ mod tests {
 
     #[test]
     fn queue_overflow_is_a_hard_fail() {
-        let kq = init().expect("kqueue");
+        let kq = Arc::new(init().expect("kqueue"));
         let self_pid = std::process::id();
         // Track all forks from the test process so any subprocess
         // spawn surfaces a NOTE_FORK event. Multiple fast forks fill
         // the channel quickly.
         let _tracker = track_descendants(&kq, self_pid).expect("track");
         // Capacity = 1: one event fits; the second triggers overflow.
-        let mut session = spawn(kq, 1).expect("spawn drain");
+        let mut session = spawn(Arc::clone(&kq), 1).expect("spawn drain");
         // Generate a bunch of forks. Don't recv anything.
         for _ in 0..32 {
             let mut child = std::process::Command::new("true").spawn().expect("spawn");
