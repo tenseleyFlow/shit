@@ -251,11 +251,7 @@ mod tests {
     fn process_note_lands_in_cohort_0_with_others() {
         // ProcessNote touches nothing → always cohort 0 even
         // alongside content restores.
-        let mut nodes = vec![
-            process_note(),
-            restore_content("/x", 1, 1),
-            process_note(),
-        ];
+        let mut nodes = vec![process_note(), restore_content("/x", 1, 1), process_note()];
         let count = assign_cohorts(&mut nodes);
         assert_eq!(count, 1);
         assert!(nodes.iter().all(|n| n.cohort == 0));

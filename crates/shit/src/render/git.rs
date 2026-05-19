@@ -363,7 +363,10 @@ mod tests {
     #[test]
     fn parse_head_blob_rejects_invalid() {
         assert_eq!(parse_head_blob(b"garbage"), ParsedHead::Unparseable);
-        assert_eq!(parse_head_blob(b"ref: refs/heads/"), ParsedHead::Unparseable);
+        assert_eq!(
+            parse_head_blob(b"ref: refs/heads/"),
+            ParsedHead::Unparseable
+        );
         assert_eq!(parse_head_blob(b"a1b2c3"), ParsedHead::Unparseable);
     }
 

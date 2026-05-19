@@ -181,20 +181,12 @@ fn emit_forward_for_event(
             // (after, before) — flip the args so the planner's
             // existing diff helper produces the forward direction.
             let forward_invocations = if inverse_invocations.is_empty() {
-                crate::network_diff::synthesise_diff_apply_inverse(
-                    *tool,
-                    after_state,
-                    before_state,
-                )
+                crate::network_diff::synthesise_diff_apply_inverse(*tool, after_state, before_state)
             } else {
                 // The inverse was synthesised at capture/plan time.
                 // For forward, swap before/after via the same
                 // routine — guarantees the symmetric op.
-                crate::network_diff::synthesise_diff_apply_inverse(
-                    *tool,
-                    after_state,
-                    before_state,
-                )
+                crate::network_diff::synthesise_diff_apply_inverse(*tool, after_state, before_state)
             };
             nodes.push(PlanNode {
                 op: InverseOp::NetworkRollback {
@@ -471,7 +463,12 @@ mod tests {
             },
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         // Expect: SetEnv FOO=bar, UnsetEnv OLD, SetEnv PATH=/usr/local/bin.
         let mut set_count = 0;
         let mut unset_count = 0;
@@ -517,12 +514,20 @@ mod tests {
             },
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         assert_eq!(plan.nodes.len(), 0, "no node — content can't be redone");
         assert!(
             plan.warnings.iter().any(|w| matches!(
                 w,
-                PlanWarning::Informational { tier: InverseTier::Files, .. }
+                PlanWarning::Informational {
+                    tier: InverseTier::Files,
+                    ..
+                }
             )),
             "expected informational file-tier warning"
         );
@@ -550,7 +555,12 @@ mod tests {
             },
             1,
         )];
-        let plan = plan_forward(command(1), &events, &probe_with(&["/tmp/newdir", "/tmp/script"]), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&["/tmp/newdir", "/tmp/script"]),
+            &InMemoryStore::new(),
+        );
         assert_eq!(plan.nodes.len(), 1);
         match &plan.nodes[0].op {
             InverseOp::RestoreMetadata { target, .. } => {
@@ -583,7 +593,12 @@ mod tests {
             },
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         match &plan.nodes[0].op {
             InverseOp::SystemdRollback { before, after, .. } => {
                 // Forward swaps — the "before" of the forward
@@ -608,7 +623,12 @@ mod tests {
             }),
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         assert_eq!(plan.nodes.len(), 1);
         assert!(matches!(plan.nodes[0].op, InverseOp::RecreatePath { .. }));
         // No conflict — EmptyProbe says path doesn't exist.
@@ -626,8 +646,16 @@ mod tests {
             }),
             1,
         )];
-        let plan = plan_forward(command(1), &events, &probe_with(&["/tmp/newdir", "/tmp/script"]), &InMemoryStore::new());
-        assert!(matches!(plan.nodes[0].conflict, Some(Conflict::Phantom { .. })));
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&["/tmp/newdir", "/tmp/script"]),
+            &InMemoryStore::new(),
+        );
+        assert!(matches!(
+            plan.nodes[0].conflict,
+            Some(Conflict::Phantom { .. })
+        ));
     }
 
     #[test]
@@ -639,9 +667,17 @@ mod tests {
             }),
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         assert!(matches!(plan.nodes[0].op, InverseOp::Unlink { .. }));
-        assert!(matches!(plan.nodes[0].conflict, Some(Conflict::Missing { .. })));
+        assert!(matches!(
+            plan.nodes[0].conflict,
+            Some(Conflict::Missing { .. })
+        ));
     }
 
     #[test]
@@ -658,13 +694,15 @@ mod tests {
             },
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         match &plan.nodes[0].op {
             InverseOp::ProcessNote { message, .. } => {
-                assert!(
-                    message.contains("cannot be replayed"),
-                    "got: {message}"
-                );
+                assert!(message.contains("cannot be replayed"), "got: {message}");
             }
             other => panic!("expected ProcessNote, got {other:?}"),
         }
@@ -681,7 +719,12 @@ mod tests {
             },
             1,
         )];
-        let plan = plan_forward(command(1), &events, &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         match &plan.nodes[0].op {
             InverseOp::DbNote {
                 rollback_hint,
@@ -718,7 +761,12 @@ mod tests {
             2,
         );
         // Input order shouldn't matter; sort is by ts.
-        let plan = plan_forward(command(1), &[e2.clone(), e1.clone()], &InMemoryProbe::new(), &InMemoryStore::new());
+        let plan = plan_forward(
+            command(1),
+            &[e2.clone(), e1.clone()],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
         let paths: Vec<&Path> = plan
             .nodes
             .iter()

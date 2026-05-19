@@ -44,7 +44,9 @@ pub const DEFAULT_COHORT_PARALLELISM: usize = 4;
 /// - `Ok(Some(set))` when at least one pattern compiled.
 /// - `Err` when a pattern is malformed; the error names the bad
 ///   pattern so the CLI can render it back to the user.
-pub fn compile_paths_filter(patterns: &[String]) -> Result<Option<globset::GlobSet>, PathsFilterError> {
+pub fn compile_paths_filter(
+    patterns: &[String],
+) -> Result<Option<globset::GlobSet>, PathsFilterError> {
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -768,7 +770,9 @@ mod tests {
 
     #[test]
     fn compile_paths_filter_single_pattern_matches_expected_paths() {
-        let r = compile_paths_filter(&["/etc/**".to_string()]).unwrap().unwrap();
+        let r = compile_paths_filter(&["/etc/**".to_string()])
+            .unwrap()
+            .unwrap();
         assert!(r.is_match("/etc/nginx/nginx.conf"));
         assert!(r.is_match("/etc/passwd"));
         assert!(!r.is_match("/var/log/syslog"));
@@ -776,12 +780,9 @@ mod tests {
 
     #[test]
     fn compile_paths_filter_multiple_patterns_are_unioned() {
-        let r = compile_paths_filter(&[
-            "/etc/**".to_string(),
-            "/var/log/**".to_string(),
-        ])
-        .unwrap()
-        .unwrap();
+        let r = compile_paths_filter(&["/etc/**".to_string(), "/var/log/**".to_string()])
+            .unwrap()
+            .unwrap();
         assert!(r.is_match("/etc/passwd"));
         assert!(r.is_match("/var/log/syslog"));
         assert!(!r.is_match("/tmp/foo"));
