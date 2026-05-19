@@ -95,29 +95,34 @@ jobs:
       - name: setcap helper for fanotify
         if: matrix.os == 'ubuntu-24.04'
         run: sudo setcap cap_sys_admin+ep ./target/release/fanotify-capture
-      - name: run fanotify-capture workload
+      - name: run fanotify-capture workload (full-capture mode)
         if: matrix.os == 'ubuntu-24.04'
         run: |
+          # --full-capture mirrors LinuxCaptureRuntime::handle_event
+          # step-for-step (fstat → dup → read pre-image → blake3 →
+          # staging write); without it the bench measures only the
+          # kernel-roundtrip floor. Local hasu measurement (L01
+          # chunk 6 close): median 45µs / p99 82µs, ~120x under the
+          # 10ms p99 budget. --deadline-secs 30 prevents the bench
+          # from hanging if events never arrive (the prior CI hang
+          # ran 49 minutes before manual cancel).
           ./target/release/fanotify-capture \
             --n 500 \
+            --deadline-secs 30 \
+            --full-capture \
             --out target/bench/fanotify-capture.json
           cat target/bench/fanotify-capture.json
       - name: compare fanotify-capture vs CAPTURE_TO_ALLOW gate
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          # Relative-only until a baseline is committed. The
-          # absolute CAPTURE_TO_ALLOW gate (5ms median / 10ms p99)
-          # measures the L01 capture hot path — this workload only
-          # measures the kernel-roundtrip floor BELOW that path, so
-          # we use --no-budget to skip the absolute check until the
-          # bench is updated to drive the real capture handler.
-          # Relative regression detection vs the seeded baseline
-          # still applies and catches drift.
+          # Absolute CAPTURE_TO_ALLOW gate (5ms median / 10ms p99) is
+          # load-bearing as of L01 chunk 6: a regression past either
+          # threshold fails CI and blocks merge. Relative-baseline
+          # check (10% median / 20% p99) applies on top.
           ./target/release/compare \
             --current target/bench/fanotify-capture.json \
             --baseline ${{ steps.baseline.outputs.fanotify_capture }} \
-            --gate capture \
-            --no-budget
+            --gate capture
 
       # Note: the `baseline` workload is the no-hook floor (raw
       # /bin/sh spawn cost). We do NOT gate it against SHELL_HOOK —

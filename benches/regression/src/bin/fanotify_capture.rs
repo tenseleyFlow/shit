@@ -143,14 +143,18 @@ mod linux_impl {
         // Mark the scratch dir (NOT FAN_MARK_FILESYSTEM — we want a
         // narrow blast radius). FAN_OPEN_PERM gives us pre-content
         // permission events the responder must ack within the
-        // kernel-buffer budget.
+        // kernel-buffer budget. FAN_EVENT_ON_CHILD is what makes the
+        // events fire for direct children of the marked dir; without
+        // it only opens of the dir inode itself fire and we'd see
+        // zero events from a `cat $dir/file` workload (surfaced on
+        // hasu run, deadline saved us from another hang).
         let cpath = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
             .context("build CString for scratch path")?;
         let rc = unsafe {
             libc::fanotify_mark(
                 fan_fd.as_raw_fd(),
-                libc::FAN_MARK_ADD,
-                libc::FAN_OPEN_PERM,
+                libc::FAN_MARK_ADD | libc::FAN_MARK_ONLYDIR,
+                libc::FAN_OPEN_PERM | libc::FAN_EVENT_ON_CHILD,
                 libc::AT_FDCWD,
                 cpath.as_ptr(),
             )
