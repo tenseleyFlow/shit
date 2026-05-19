@@ -39,6 +39,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+pub mod prefix_match;
+
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
