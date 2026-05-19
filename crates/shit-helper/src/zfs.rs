@@ -61,6 +61,76 @@ pub fn refresh() -> ZfsProbe {
     probe_zfs()
 }
 
+/// Errors from the `zfs(8)` shell-outs. The helper logs these and
+/// the daemon decides whether to refuse the watch (hard-fail) or fall
+/// back to per-file capture (degraded), per the project's default-on
+/// capture-failure policy.
+#[derive(Debug, thiserror::Error)]
+pub enum ZfsError {
+    #[error("zfs(8) not on PATH and not at /sbin/zfs")]
+    NotInstalled,
+    #[error("zfs invocation failed: {0}")]
+    Spawn(#[from] std::io::Error),
+    #[error("zfs exited with status {status}: {stderr}")]
+    NonZero { status: i32, stderr: String },
+}
+
+/// Path the BSD base system installs `zfs(8)` at. Same on FreeBSD and
+/// the major Linux ZFS-on-Linux packages; we shell out to the
+/// absolute path so PATH manipulation can't redirect us mid-undo.
+const ZFS_BIN: &str = "/sbin/zfs";
+
+fn zfs_exec(args: &[&str]) -> Result<std::process::Output, ZfsError> {
+    if !std::path::Path::new(ZFS_BIN).exists() {
+        return Err(ZfsError::NotInstalled);
+    }
+    let out = std::process::Command::new(ZFS_BIN).args(args).output()?;
+    if !out.status.success() {
+        return Err(ZfsError::NonZero {
+            status: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(out)
+}
+
+/// Create a snapshot of `dataset` named `name`. Equivalent to
+/// `zfs snapshot dataset@name`. Recursive (`-r`) is intentionally
+/// *not* set — the planner explicitly picks one dataset per command,
+/// and `-r` would silently snapshot children that may belong to a
+/// different command's watch tree.
+pub fn snapshot_create(dataset: &str, name: &str) -> Result<(), ZfsError> {
+    let snap = format!("{dataset}@{name}");
+    zfs_exec(&["snapshot", &snap]).map(|_| ())
+}
+
+/// List snapshots under `dataset` matching the prefix `shit-`. The
+/// planner uses this for inventory at undo time. `-H` strips the
+/// header so the first line is data; `-o name` returns just the
+/// snapshot name column.
+pub fn snapshot_list(dataset: &str) -> Result<Vec<String>, ZfsError> {
+    let out = zfs_exec(&["list", "-t", "snapshot", "-H", "-o", "name", "-r", dataset])?;
+    let names = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            // Drop snapshots that aren't ours — other tooling shares
+            // the dataset.
+            line.split_once('@')
+                .and_then(|(_ds, snap)| snap.starts_with("shit-").then_some(line.to_string()))
+        })
+        .collect();
+    Ok(names)
+}
+
+/// Roll the dataset back to `snap` (full `dataset@name`). The `-r`
+/// flag deletes any snapshots newer than the target — required for
+/// a clean rollback when intermediate `shit-...` snapshots from
+/// subsequent commands are present.
+pub fn snapshot_rollback(snap: &str) -> Result<(), ZfsError> {
+    zfs_exec(&["rollback", "-r", snap]).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +155,17 @@ mod tests {
         // ordering drifts but uniqueness holds.
         assert_eq!(snapshot_name("abcd", 1), "shit-abcd-00000001");
         assert_eq!(snapshot_name("abcd", 12345678), "shit-abcd-12345678");
+    }
+
+    #[test]
+    fn zfs_not_installed_is_surfaced() {
+        // Only run when /sbin/zfs really isn't there — most dev hosts
+        // (macOS, generic Linux) don't have it. Skip otherwise so this
+        // test doesn't false-fail on a ZFS-on-Linux box.
+        if std::path::Path::new(ZFS_BIN).exists() {
+            return;
+        }
+        let err = snapshot_create("rpool/test", "shit-probe-1").unwrap_err();
+        assert!(matches!(err, ZfsError::NotInstalled));
     }
 }
