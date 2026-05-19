@@ -40,6 +40,11 @@ fn main() -> anyhow::Result<()> {
         #[arg(long, default_value_t = 1000)]
         #[allow(dead_code)]
         n: usize,
+        // Accepted for CLI parity with the Linux build (perf.yml passes
+        // the same args on every platform leg). Ignored in the stub.
+        #[arg(long, default_value_t = 30)]
+        #[allow(dead_code)]
+        deadline_secs: u64,
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     }
@@ -81,6 +86,15 @@ mod linux_impl {
         /// Number of FAN_OPEN_PERM events to drive (default 1000).
         #[arg(long, default_value_t = 1000)]
         n: usize,
+        /// Hard deadline on the responder loop in seconds. If the
+        /// workload finishes (or never fires events) before reaching
+        /// N samples, we exit cleanly with whatever we collected.
+        /// Without this, a misconfigured fanotify mark (or a kernel
+        /// that doesn't support fanotify-perm on the test fs) would
+        /// block the bench forever — surfaced on a CI runner where
+        /// the workflow hung 49 minutes on the bare `fan.read`.
+        #[arg(long, default_value_t = 30)]
+        deadline_secs: u64,
         /// Output file for the JSON result.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -166,7 +180,41 @@ mod linux_impl {
         let metadata_size = std::mem::size_of::<libc::fanotify_event_metadata>();
         let mut buf = vec![0u8; metadata_size * 16];
         let mut got = 0usize;
+        let deadline = Instant::now() + std::time::Duration::from_secs(args.deadline_secs);
+        let fan_raw = fan.as_raw_fd();
         while got < args.n {
+            // Wait for the fd to be readable, bounded by the
+            // remaining deadline. poll(2) returns 0 on timeout, >0
+            // when ready, -1 on error. Without this gate the bare
+            // `read` blocks indefinitely when no events arrive,
+            // wedging the bench (the CI runner hang root cause).
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                eprintln!(
+                    "fanotify-capture: deadline reached at {got}/{} events; emitting partial sample",
+                    args.n
+                );
+                break;
+            }
+            let mut pfd = libc::pollfd {
+                fd: fan_raw,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining
+                .as_millis()
+                .min(libc::c_int::MAX as u128) as libc::c_int;
+            let pr = unsafe { libc::poll(&mut pfd as *mut _, 1, timeout_ms) };
+            if pr < 0 {
+                return Err(std::io::Error::last_os_error()).context("poll fanotify fd");
+            }
+            if pr == 0 {
+                eprintln!(
+                    "fanotify-capture: poll timeout at {got}/{} events; emitting partial sample",
+                    args.n
+                );
+                break;
+            }
             let read_at = Instant::now();
             let n_bytes = match fan.read(&mut buf) {
                 Ok(0) => break,
@@ -205,6 +253,10 @@ mod linux_impl {
             }
         }
 
+        // Best-effort child cleanup. If we hit the deadline before the
+        // child's `for` loop drained, the child is still running and
+        // `wait` would block; kill it first.
+        let _ = child.kill();
         let _ = child.wait();
 
         let summary =
