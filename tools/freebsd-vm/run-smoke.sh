@@ -35,8 +35,8 @@ cd ~/shit
 
 # Build release binaries we need for the smoke. Cached after the first
 # pass; ~30s incremental after a code change.
-echo "[fbsd-vm-remote] cargo build --release -p shit -p shitd -p shit-helper"
-cargo build --release -p shit -p shitd -p shit-helper --locked 2>&1 | tail -5
+echo "[fbsd-vm-remote] cargo build --release -p shit -p shitd -p shit-helper -p shit-preload-shim"
+cargo build --release -p shit -p shitd -p shit-helper -p shit-preload-shim --locked 2>&1 | tail -5
 
 # The smoke script auto-discovers SHIT_SMOKE_BIN_DIR=${SHIT_REPO_ROOT}/target/release.
 SMOKE_PATH="tests/smoke/${SMOKE_NAME}"
