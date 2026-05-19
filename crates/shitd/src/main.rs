@@ -297,10 +297,42 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             tracing::info!("shutdown requested via ctl");
             Ok(())
         }
+        _ = wait_for_term_signal() => {
+            tracing::info!("shutdown requested via signal");
+            Ok(())
+        }
     };
 
     ctl_handle.abort();
     gc_handle.abort();
     pkg_janitor.abort();
     result
+}
+
+/// Wait for SIGTERM or SIGINT and return when either is observed.
+/// Lets the daemon shut down gracefully — the tracing-appender's
+/// `WorkerGuard` drops on the return path, flushing buffered JSON
+/// log lines. Without this, `kill -TERM shitd` exits the process
+/// before the appender drains.
+async fn wait_for_term_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return std::future::pending().await,
+        };
+        let mut intr = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return std::future::pending().await,
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = intr.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
