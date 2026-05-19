@@ -292,12 +292,20 @@ fn blob_size_for(index: &Index, hash: &BlobHash) -> Option<u64> {
 fn compact_paths(index: &Index, age_cutoff_logical: u64) -> Result<usize, IndexError> {
     let conn = index.conn().lock().unwrap();
     let cutoff_signed: i64 = age_cutoff_logical.min(i64::MAX as u64) as i64;
+    // DR-64 fault-injection: crash before the DELETE issues. The
+    // compaction is idempotent (next sweep restarts from the same
+    // age cutoff); the test asserts no rows were dropped.
+    shit_proto::fault_inject::maybe_inject("gc.compact_paths.before_delete");
     let removed = conn.execute(
         "DELETE FROM paths
          WHERE valid_to_logical IS NOT NULL
            AND valid_to_logical < ?1",
         params![cutoff_signed],
     )?;
+    // DR-64 fault-injection: crash after the DELETE issues but
+    // before the function returns. The compaction must remain
+    // idempotent — re-running it on the same cutoff is a no-op.
+    shit_proto::fault_inject::maybe_inject("gc.compact_paths.after_delete");
     Ok(removed)
 }
 
