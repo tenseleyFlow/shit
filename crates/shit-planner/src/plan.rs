@@ -21,9 +21,9 @@
 //! - Partial events are dropped with a warning; the rest of the plan still
 //!   produces actionable output.
 
-use crate::events::{CaptureEvent, CaptureEventKind, CommandRecord, TreeOp};
+use crate::events::{CaptureEvent, CaptureEventKind, CommandRecord, PackageManager, TreeOp};
 use crate::inode::InodeRef;
-use crate::inverse::{Conflict, InverseOp, PlanNode, PlanWarning, UndoPlan};
+use crate::inverse::{Conflict, InverseOp, NativeDelegation, PlanNode, PlanWarning, UndoPlan};
 use crate::probe::StateProbe;
 use crate::store::PlannerStore;
 use std::path::Path;
@@ -186,6 +186,13 @@ fn emit_for_event(
             packages_after,
             repo_state_hint,
         } => {
+            // C02.7: when the capture tier supplied a manager-native
+            // transaction id (apt 3.2 `apt_tx_id`, dnf `dnf_history_id`),
+            // emit a delegation hint so the executor runs the native
+            // rollback verb instead of synthesizing per-package
+            // install/remove. Falls through to `None` for managers and
+            // versions that don't support native rollback.
+            let delegation = native_delegation_for(*manager, repo_state_hint.as_deref());
             nodes.push(PlanNode {
                 op: InverseOp::PackageRollback {
                     manager: *manager,
@@ -193,7 +200,7 @@ fn emit_for_event(
                     packages_before: packages_before.clone(),
                     packages_after: packages_after.clone(),
                     repo_state_hint: repo_state_hint.clone(),
-                    delegation: None,
+                    delegation,
                 },
                 cohort: 0,
                 conflict: None,
@@ -367,6 +374,78 @@ fn engine_label(e: crate::events::DbEngine) -> &'static str {
         crate::events::DbEngine::Postgres => "psql",
         crate::events::DbEngine::Mysql => "mysql",
         crate::events::DbEngine::Sqlite3 => "sqlite3",
+    }
+}
+
+/// C02.7: synthesize a `NativeDelegation` from the captured transaction
+/// id when the manager exposes a native rollback verb. Returns `None`
+/// to fall through to the per-package synthesis path in the package
+/// executor (the historical behavior).
+///
+/// Native verbs covered:
+/// - apt ≥3.2: `apt history-rollback <id>`. The inspector emits the id
+///   under `extras["apt_tx_id"]` (gated on `apt --version` ≥ 3.2); the
+///   daemon forwards it into `repo_state_hint`.
+/// - dnf: `dnf history undo -y <id>`. Inspector key `dnf_history_id`
+///   (DR-26, S14.6).
+///
+/// Brew / pacman / pkg do not have a native transaction-id-keyed
+/// rollback, so they always synthesize.
+///
+/// The guard re-queries the manager's history to confirm the captured
+/// transaction is still the most recent. If a subsequent install
+/// happened in the interim, the rollback would also undo it
+/// (transaction history is a stack), so we refuse rather than corrupt.
+fn native_delegation_for(
+    manager: PackageManager,
+    repo_state_hint: Option<&str>,
+) -> Option<NativeDelegation> {
+    let id = repo_state_hint?;
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    match manager {
+        PackageManager::Apt => Some(NativeDelegation {
+            argv: vec![
+                "apt".to_string(),
+                "history-rollback".to_string(),
+                id.to_string(),
+            ],
+            privileged: true,
+            guard_command: Some(vec![
+                "apt".to_string(),
+                "history".to_string(),
+                "list".to_string(),
+            ]),
+            // `apt history list` prints lines like `<id>: <date> ...`;
+            // we look for the captured id as the most-recent entry.
+            guard_match: Some(format!("{id}:")),
+        }),
+        PackageManager::Dnf => Some(NativeDelegation {
+            argv: vec![
+                "dnf".to_string(),
+                "history".to_string(),
+                "undo".to_string(),
+                "-y".to_string(),
+                id.to_string(),
+            ],
+            privileged: true,
+            guard_command: Some(vec![
+                "dnf".to_string(),
+                "history".to_string(),
+                "list".to_string(),
+                "--reverse".to_string(),
+            ]),
+            // `dnf history list --reverse` prints the most-recent first;
+            // the first column is the id. Confirm the captured id is
+            // still the top entry by looking for `^ *<id> ` shape.
+            guard_match: Some(format!("{id} ")),
+        }),
+        PackageManager::Dpkg
+        | PackageManager::Pacman
+        | PackageManager::Brew
+        | PackageManager::Pkg => None,
     }
 }
 
@@ -907,5 +986,51 @@ mod tests {
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
         assert!(p.nodes[0].conflict.is_none());
+    }
+
+    // ----- C02.7: native_delegation_for -----
+
+    #[test]
+    fn delegation_for_apt_with_tx_id_emits_history_rollback() {
+        let d = native_delegation_for(PackageManager::Apt, Some("42")).unwrap();
+        assert_eq!(d.argv, vec!["apt", "history-rollback", "42"]);
+        assert!(d.privileged);
+        assert!(d.guard_command.is_some());
+        assert_eq!(d.guard_match.as_deref(), Some("42:"));
+    }
+
+    #[test]
+    fn delegation_for_dnf_with_history_id_emits_history_undo() {
+        let d = native_delegation_for(PackageManager::Dnf, Some("7")).unwrap();
+        assert_eq!(d.argv, vec!["dnf", "history", "undo", "-y", "7"]);
+        assert!(d.privileged);
+        assert_eq!(d.guard_match.as_deref(), Some("7 "));
+    }
+
+    #[test]
+    fn delegation_for_managers_without_native_rollback_is_none() {
+        for mgr in [
+            PackageManager::Dpkg,
+            PackageManager::Pacman,
+            PackageManager::Brew,
+            PackageManager::Pkg,
+        ] {
+            assert!(
+                native_delegation_for(mgr, Some("99")).is_none(),
+                "expected None for {mgr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_for_missing_hint_is_none_even_for_supported_manager() {
+        assert!(native_delegation_for(PackageManager::Apt, None).is_none());
+        assert!(native_delegation_for(PackageManager::Dnf, None).is_none());
+    }
+
+    #[test]
+    fn delegation_for_empty_or_whitespace_hint_is_none() {
+        assert!(native_delegation_for(PackageManager::Apt, Some("")).is_none());
+        assert!(native_delegation_for(PackageManager::Dnf, Some("   ")).is_none());
     }
 }

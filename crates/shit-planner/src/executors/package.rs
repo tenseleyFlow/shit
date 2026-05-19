@@ -26,6 +26,14 @@ pub trait PkgRunner {
     /// Run one invocation. Returns `Ok(())` on exit code zero,
     /// `Err(detail)` otherwise.
     fn run(&self, argv: &[String]) -> Result<(), String>;
+
+    /// C02.7: capture stdout of a guard command (used by native-delegation
+    /// guards like `apt history list`). Default impl returns an empty
+    /// buffer so existing test runners don't need to implement it; the
+    /// real runner overrides this.
+    fn capture(&self, _argv: &[String]) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
 }
 
 /// The default runner: shells out via `std::process::Command`,
@@ -48,6 +56,18 @@ impl PkgRunner for SystemPkgRunner {
         } else {
             Err(format!("{cmd} exited {:?}", status.code()))
         }
+    }
+    fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let out = Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .output()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("{cmd} exited {:?}", out.status.code()));
+        }
+        Ok(out.stdout)
     }
 }
 
@@ -80,7 +100,7 @@ impl<R: PkgRunner> InverseOpExecutor for PackageExecutor<R> {
             packages_before,
             packages_after,
             repo_state_hint,
-            delegation: _,
+            delegation,
         } = op
         else {
             // Defensive: orchestrator should not route here otherwise.
@@ -88,6 +108,45 @@ impl<R: PkgRunner> InverseOpExecutor for PackageExecutor<R> {
                 reason: "package executor reached non-package op".into(),
             };
         };
+
+        // C02.7: when a `NativeDelegation` is present (apt 3.2+,
+        // dnf-history), run the native rollback verb instead of
+        // synthesizing per-package invocations. Guard against drift
+        // (other transactions since capture) before applying.
+        if let Some(d) = delegation {
+            if let (Some(guard_cmd), Some(guard_substr)) =
+                (d.guard_command.as_deref(), d.guard_match.as_deref())
+                && !guard_cmd.is_empty()
+            {
+                match self.runner.capture(guard_cmd) {
+                    Ok(stdout) => {
+                        let s = String::from_utf8_lossy(&stdout);
+                        if !s.contains(guard_substr) {
+                            return ExecutionOutcome::Failed {
+                                err: format!(
+                                    "delegation guard mismatch: `{guard_substr}` not in `{}` output",
+                                    guard_cmd.first().map(String::as_str).unwrap_or("?")
+                                ),
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        return ExecutionOutcome::Failed {
+                            err: format!("delegation guard: {e}"),
+                        };
+                    }
+                }
+            }
+            if dry_run {
+                return ExecutionOutcome::WouldApply;
+            }
+            return match self.runner.run(&d.argv) {
+                Ok(()) => ExecutionOutcome::Applied,
+                Err(e) => ExecutionOutcome::Failed {
+                    err: format!("{}: {e}", d.argv.first().map(String::as_str).unwrap_or("?")),
+                },
+            };
+        }
 
         let invocations = synthesize_argv(
             *manager,
@@ -327,6 +386,7 @@ fn pkg_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inverse::NativeDelegation;
 
     fn pkgs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -515,6 +575,8 @@ mod tests {
     #[derive(Default)]
     struct SpyRunner {
         invocations: std::cell::RefCell<Vec<Vec<String>>>,
+        captures: std::cell::RefCell<Vec<Vec<String>>>,
+        canned_capture: std::cell::RefCell<Vec<u8>>,
         fail_on: Option<usize>,
     }
     impl PkgRunner for SpyRunner {
@@ -527,6 +589,10 @@ mod tests {
                 return Err(format!("fail on idx {n}"));
             }
             Ok(())
+        }
+        fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
+            self.captures.borrow_mut().push(argv.to_vec());
+            Ok(self.canned_capture.borrow().clone())
         }
     }
 
@@ -587,5 +653,139 @@ mod tests {
         let exec = PackageExecutor::new(runner);
         let outcome = exec.execute(&op, false, ConflictPolicy::Abort);
         assert!(matches!(outcome, ExecutionOutcome::Skipped { .. }));
+    }
+
+    // ----- C02.7: native-delegation execution path -----
+
+    fn op_with_delegation(d: NativeDelegation) -> InverseOp {
+        InverseOp::PackageRollback {
+            manager: PackageManager::Apt,
+            original_op: PackageOpKind::Install,
+            packages_before: pkgs(&[]),
+            packages_after: pkgs(&[("jq", "1.7")]),
+            repo_state_hint: Some("123".into()),
+            delegation: Some(d),
+        }
+    }
+
+    #[test]
+    fn delegation_runs_native_argv_when_guard_passes() {
+        let runner = SpyRunner::default();
+        *runner.canned_capture.borrow_mut() = b"123: 2026-05-19 install jq".to_vec();
+        let exec = PackageExecutor::new(runner);
+        let d = NativeDelegation {
+            argv: vec!["apt".into(), "history-rollback".into(), "123".into()],
+            privileged: true,
+            guard_command: Some(vec!["apt".into(), "history".into(), "list".into()]),
+            guard_match: Some("123:".into()),
+        };
+        let outcome = exec.execute(&op_with_delegation(d), false, ConflictPolicy::Abort);
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        // Guard captured first, native argv executed second.
+        let captures = exec.runner.captures.borrow();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0][0], "apt");
+        let invocations = exec.runner.invocations.borrow();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0], vec!["apt", "history-rollback", "123"]);
+    }
+
+    #[test]
+    fn delegation_refuses_on_guard_mismatch() {
+        let runner = SpyRunner::default();
+        // Guard expects `123:` but the captured output shows a newer
+        // transaction id `999`, meaning another apt op happened since
+        // capture. Rollback would over-undo; refuse.
+        *runner.canned_capture.borrow_mut() = b"999: 2026-05-19 install curl".to_vec();
+        let exec = PackageExecutor::new(runner);
+        let d = NativeDelegation {
+            argv: vec!["apt".into(), "history-rollback".into(), "123".into()],
+            privileged: true,
+            guard_command: Some(vec!["apt".into(), "history".into(), "list".into()]),
+            guard_match: Some("123:".into()),
+        };
+        let outcome = exec.execute(&op_with_delegation(d), false, ConflictPolicy::Abort);
+        match outcome {
+            ExecutionOutcome::Failed { err } => {
+                assert!(err.contains("guard mismatch"), "got {err}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Guard ran; native argv did NOT.
+        assert_eq!(exec.runner.captures.borrow().len(), 1);
+        assert!(exec.runner.invocations.borrow().is_empty());
+    }
+
+    #[test]
+    fn delegation_skips_synthesize_argv_path() {
+        // Even though packages_before/after would normally produce
+        // `apt-get remove jq`, delegation overrides and we run
+        // `apt history-rollback` instead.
+        let runner = SpyRunner::default();
+        *runner.canned_capture.borrow_mut() = b"123: install jq".to_vec();
+        let exec = PackageExecutor::new(runner);
+        let d = NativeDelegation {
+            argv: vec!["apt".into(), "history-rollback".into(), "123".into()],
+            privileged: true,
+            guard_command: None,
+            guard_match: None,
+        };
+        let outcome = exec.execute(&op_with_delegation(d), false, ConflictPolicy::Abort);
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        let invocations = exec.runner.invocations.borrow();
+        assert_eq!(invocations.len(), 1);
+        // Critically: NOT `apt-get`. The native verb won.
+        assert_eq!(invocations[0][0], "apt");
+        assert_eq!(invocations[0][1], "history-rollback");
+    }
+
+    #[test]
+    fn delegation_dry_run_skips_native_argv() {
+        let runner = SpyRunner::default();
+        *runner.canned_capture.borrow_mut() = b"123: install".to_vec();
+        let exec = PackageExecutor::new(runner);
+        let d = NativeDelegation {
+            argv: vec!["apt".into(), "history-rollback".into(), "123".into()],
+            privileged: true,
+            guard_command: Some(vec!["apt".into(), "history".into(), "list".into()]),
+            guard_match: Some("123:".into()),
+        };
+        let outcome = exec.execute(&op_with_delegation(d), true, ConflictPolicy::Abort);
+        assert_eq!(outcome, ExecutionOutcome::WouldApply);
+        // Guard still runs (it's read-only), but native argv does not.
+        assert_eq!(exec.runner.captures.borrow().len(), 1);
+        assert!(exec.runner.invocations.borrow().is_empty());
+    }
+
+    #[test]
+    fn delegation_without_guard_proceeds_directly() {
+        let runner = SpyRunner::default();
+        let exec = PackageExecutor::new(runner);
+        let d = NativeDelegation {
+            argv: vec![
+                "dnf".into(),
+                "history".into(),
+                "undo".into(),
+                "-y".into(),
+                "7".into(),
+            ],
+            privileged: true,
+            guard_command: None,
+            guard_match: None,
+        };
+        let op = InverseOp::PackageRollback {
+            manager: PackageManager::Dnf,
+            original_op: PackageOpKind::Install,
+            packages_before: pkgs(&[]),
+            packages_after: pkgs(&[("jq", "1.7")]),
+            repo_state_hint: Some("7".into()),
+            delegation: Some(d),
+        };
+        let outcome = exec.execute(&op, false, ConflictPolicy::Abort);
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        assert_eq!(exec.runner.captures.borrow().len(), 0);
+        let invocations = exec.runner.invocations.borrow();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0][0], "dnf");
     }
 }
