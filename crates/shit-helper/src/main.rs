@@ -845,9 +845,27 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // side talks to it via the shared `FanotifyState`. Reader exits
     // when `state.shutdown()` is called (we trigger that below on the
     // signal-handler shutdown path).
+    //
+    // L01: when a fanotify fd is available, also boot the
+    // LinuxCaptureRuntime and attach it. The reader thread's
+    // perm-event closure dispatches into it for pre-image capture.
     #[cfg(target_os = "linux")]
     let fanotify_state: Option<fanotify::runtime::FanotifyState> = setup.fanotify_fd.map(|fd| {
-        let state = fanotify::runtime::FanotifyState::new(fd);
+        let staging_dir = cli.state_dir.join("helper-staging");
+        let capture_rt = match capture::linux::LinuxCaptureRuntime::new(
+            staging_dir,
+            Arc::clone(&conn),
+        ) {
+            Ok(rt) => Some(Arc::new(std::sync::Mutex::new(rt))),
+            Err(e) => {
+                tracing::warn!(err = %e, "linux capture runtime failed to init; reader will ALLOW without capture");
+                None
+            }
+        };
+        let mut state = fanotify::runtime::FanotifyState::new(fd);
+        if let Some(rt) = capture_rt.clone() {
+            state = state.with_capture_runtime(rt);
+        }
         let reader_state = state.clone();
         std::thread::Builder::new()
             .name("fanotify-reader".into())
@@ -1021,6 +1039,18 @@ fn request_loop(
                         .lock()
                         .unwrap()
                         .watch(session, command_seq, root_pid as i32);
+                    // L01: explicit dedupe-state init for the command.
+                    // The first event would lazy-init via `entry().or_default()`
+                    // but doing it here keeps the watch_tree path explicit
+                    // and matches the BSD producer's shape.
+                    if let Some(rt) = &state.capture_runtime
+                        && let Ok(mut g) = rt.lock()
+                    {
+                        g.on_watch_tree(shit_planner::events::CommandId {
+                            session,
+                            seq: command_seq,
+                        });
+                    }
                     tracing::info!(
                         %session,
                         command_seq,
@@ -1073,6 +1103,14 @@ fn request_loop(
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
                     state.tree.lock().unwrap().unwatch(session, command_seq);
+                    if let Some(rt) = &state.capture_runtime
+                        && let Ok(mut g) = rt.lock()
+                    {
+                        g.on_unwatch_tree(shit_planner::events::CommandId {
+                            session,
+                            seq: command_seq,
+                        });
+                    }
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 }
                 #[cfg(any(
