@@ -56,8 +56,27 @@ impl SvcInspector for ServiceInspector {
     }
 }
 
-/// Run `service <unit> onestatus`; exit 0 → running, 1 → stopped, else unknown.
+/// Active-state probe. `service <unit> onestatus` is the rc.d
+/// idiomatic answer, but rc.d scripts read `/var/run/<unit>.pid` which
+/// is mode 0600 root:wheel on most installs — so an unprivileged
+/// helper sees "not running" for everything. We use `pgrep -q <unit>`
+/// as the primary signal (process name typically matches the unit
+/// name on FreeBSD: cron, sshd, nginx, etc.) and fall back to
+/// `service onestatus` if pgrep is absent.
+///
+/// **Known limitation:** when the unit name differs from the process
+/// name (e.g. rc.d script `postgresql` → binary `postgres`), pgrep
+/// returns "stopped" even when the unit is up. Documented in
+/// `bsd-coverage.md`; the proper fix requires parsing the rc.d
+/// script's `procname` variable and is deferred.
 fn service_active_state(unit: &str) -> &'static str {
+    if let Ok(out) = Command::new("/bin/pgrep").args(["-q", unit]).output() {
+        return match out.status.code() {
+            Some(0) => "running",
+            Some(1) => "stopped",
+            _ => "unknown",
+        };
+    }
     let out = Command::new("/usr/sbin/service")
         .args([unit, "onestatus"])
         .output();
