@@ -21,6 +21,19 @@
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
+// `helper_handshake_probe` + `find_helper_bin` are dev-tool functions
+// kept for direct testing of the `shit-helper handshake-probe`
+// subcommand (they spawn it and parse the JSON reply). After the
+// ctl-Metrics pivot in B03, doctor's main path doesn't call them —
+// it goes through `crate::doctor::mod.rs::probe_helper_handshake`
+// against the daemon's persistent ctl socket. The functions stay
+// because (a) the dev-side handshake-probe subcommand is still
+// shipped on the helper, (b) the tests below exercise them, and
+// (c) a future doctor option (e.g. `--fresh-helper-probe`) could
+// wire them back into the main path. Without this allow, the
+// FreeBSD bin-target dead-code lint trips `-D warnings` even
+// though the items are exercised by tests.
+#![allow(dead_code)]
 
 use crate::doctor::json::HelperHandshakeReport;
 use std::path::Path;
