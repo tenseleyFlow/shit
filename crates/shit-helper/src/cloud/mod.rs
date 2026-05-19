@@ -14,6 +14,7 @@
 pub mod aws;
 pub mod gh;
 pub mod kubectl;
+pub mod terraform;
 
 #[allow(unused_imports)]
 pub use aws::{AwsVerb, classify_aws_argv};
@@ -21,3 +22,5 @@ pub use aws::{AwsVerb, classify_aws_argv};
 pub use gh::{GhVerb, classify_gh_argv};
 #[allow(unused_imports)]
 pub use kubectl::{KubectlVerb, classify_kubectl_argv};
+#[allow(unused_imports)]
+pub use terraform::{TerraformVerb, classify_terraform_argv};
