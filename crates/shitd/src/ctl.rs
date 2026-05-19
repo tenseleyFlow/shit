@@ -11,8 +11,8 @@ use crate::proc_track::ProcPreStash;
 use crate::stats::Stats;
 use crate::svc_track::SvcPreStash;
 use shit_proto::{
-    CtlRequest, CtlResponse, DaemonStatus, GcRequest, NetEventReq, PkgEventReq, ProcEventReq,
-    SvcEventReq, decode_frame, encode_frame,
+    ConflictPolicyWire, CtlRequest, CtlResponse, DaemonStatus, GcRequest, NetEventReq, PkgEventReq,
+    ProcEventReq, SvcEventReq, UndoReportWire, UndoRequest, decode_frame, encode_frame,
 };
 use shit_store::{BlobStore, Index};
 
@@ -138,6 +138,7 @@ async fn handle_client(
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
+        CtlRequest::Undo(req) => handle_undo(req, &index, &blob_store),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -472,4 +473,209 @@ fn handle_db_event(
 ) -> CtlResponse {
     let _ = crate::db_track::handle(db_stash, req, active, index);
     CtlResponse::DbEventAck
+}
+
+/// Adapt `BlobStore::get` into the planner's `BlobReader` trait.
+struct BlobReaderShim<'a> {
+    blob_store: &'a BlobStore,
+}
+
+impl shit_planner::BlobReader for BlobReaderShim<'_> {
+    fn read(&self, hash: &shit_planner::BlobHash) -> Result<Vec<u8>, shit_planner::BlobReadError> {
+        self.blob_store
+            .get(*hash)
+            .map_err(|e| shit_planner::BlobReadError::NotFound(format!("{hash:?}: {e}")))
+    }
+}
+
+/// Multi-tier dispatcher used by `handle_undo`. The Orchestrator
+/// takes one `InverseOpExecutor`; in production we need to route ops
+/// to the file tier OR the package tier (and, future sprints, env /
+/// service / network / proc tiers). Each tier's executor declares
+/// which `InverseOp` variants it supports; we route by that.
+///
+/// Why not a planner-side composite executor: dispatch is daemon
+/// policy, not planner logic. The planner doesn't know which tiers
+/// the operator wants enabled (a hardened deployment might disable
+/// PackageExecutor to refuse pkg rollbacks entirely).
+struct MultiTierExecutor<'a> {
+    file_executor: shit_planner::FileExecutor<'a, BlobReaderShim<'a>>,
+    package_executor: shit_planner::executors::PackageExecutor<PrivilegedPkgRunner>,
+}
+
+/// PkgRunner that prefixes `doas` on non-Linux platforms where the
+/// daemon runs unprivileged but pkg(8)/apt(8)/etc need root. On
+/// Linux we expect `shit-helper` to hold the cap; here on BSD the
+/// per-tool wrappers are the standard path. `SHIT_DURING_UNDO=1` is
+/// set so the `pkg-event` hook short-circuits on re-entry.
+struct PrivilegedPkgRunner;
+
+impl shit_planner::executors::PkgRunner for PrivilegedPkgRunner {
+    fn run(&self, argv: &[String]) -> Result<(), String> {
+        let (cmd, args) = match argv.split_first() {
+            Some(v) => v,
+            None => return Err("empty argv".into()),
+        };
+        // Look up doas / sudo at runtime; refuse if neither is available.
+        let escalator = [
+            "/usr/local/bin/doas",
+            "/usr/local/bin/sudo",
+            "/usr/bin/sudo",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file());
+        let mut command = match escalator {
+            Some(e) => {
+                let mut c = std::process::Command::new(e);
+                c.arg(cmd);
+                c.args(args);
+                c
+            }
+            None => {
+                // Run directly — works if shitd happens to be root or
+                // the operator deliberately runs as root. Tests on the
+                // dev box go through here.
+                let mut c = std::process::Command::new(cmd);
+                c.args(args);
+                c
+            }
+        };
+        let status = command
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+}
+
+impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
+    fn supports(&self, op: &shit_planner::InverseOp) -> bool {
+        self.file_executor.supports(op) || self.package_executor.supports(op)
+    }
+
+    fn execute(
+        &self,
+        op: &shit_planner::InverseOp,
+        dry_run: bool,
+        policy: shit_planner::ConflictPolicy,
+    ) -> shit_planner::ExecutionOutcome {
+        if self.file_executor.supports(op) {
+            self.file_executor.execute(op, dry_run, policy)
+        } else if self.package_executor.supports(op) {
+            self.package_executor.execute(op, dry_run, policy)
+        } else {
+            shit_planner::ExecutionOutcome::Failed {
+                err: format!("no executor wired for tier {:?}", op.tier()),
+            }
+        }
+    }
+}
+
+/// S24.C — execute an UndoPlan derived from the most recent N completed
+/// commands. Returns a wire-friendly report; the CLI prints it as-is.
+fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlResponse {
+    use shit_planner::{
+        ConflictPolicy, FileExecutor, LiveStateProbe, Orchestrator, OutcomeKind, plan,
+    };
+
+    let policy = match req.on_conflict {
+        ConflictPolicyWire::Abort => ConflictPolicy::Abort,
+        ConflictPolicyWire::Skip => ConflictPolicy::Skip,
+        ConflictPolicyWire::Force => ConflictPolicy::Force,
+    };
+
+    let paths_filter = match shit_planner::compile_paths_filter(&req.paths) {
+        Ok(set) => set,
+        Err(e) => {
+            return CtlResponse::Error(format!("undo: bad --paths filter: {e}"));
+        }
+    };
+
+    let commands = match index.list_recent_commands(req.steps.max(1)) {
+        Ok(v) => v,
+        Err(e) => {
+            return CtlResponse::Error(format!("undo: list_recent_commands: {e}"));
+        }
+    };
+    if commands.is_empty() {
+        return CtlResponse::UndoReport(UndoReportWire {
+            commands_attempted: 0,
+            ops_applied: 0,
+            ops_skipped: 0,
+            ops_failed: 0,
+            ops_conflicted: 0,
+            dry_run: req.dry_run,
+            summary: "no completed commands recorded; nothing to undo".to_string(),
+            detail_lines: Vec::new(),
+        });
+    }
+
+    let probe = LiveStateProbe::new();
+    let reader = BlobReaderShim { blob_store };
+    let executor = MultiTierExecutor {
+        file_executor: FileExecutor::new(&reader),
+        package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
+    };
+
+    let mut commands_attempted = 0u32;
+    let mut ops_applied = 0u32;
+    let mut ops_skipped = 0u32;
+    let mut ops_failed = 0u32;
+    let mut ops_conflicted = 0u32;
+    let mut detail_lines: Vec<String> = Vec::new();
+
+    use shit_planner::PlannerStore;
+    for cmd in commands {
+        commands_attempted += 1;
+        let events = index.events_for_command(cmd.command);
+        let undo_plan = plan(cmd.clone(), &events, &probe, index);
+        let orch = Orchestrator::new(&executor, &probe).with_paths_filter(paths_filter.clone());
+        let report = orch.run(&undo_plan, req.dry_run, policy);
+        for rec in &report.records {
+            match rec.outcome_kind {
+                OutcomeKind::Applied | OutcomeKind::WouldApply => ops_applied += 1,
+                OutcomeKind::Skipped => ops_skipped += 1,
+                OutcomeKind::Failed => {
+                    ops_failed += 1;
+                    detail_lines.push(format!(
+                        "failed: {:?} — {}",
+                        rec.tier,
+                        rec.detail.as_deref().unwrap_or("(no detail)")
+                    ));
+                }
+                OutcomeKind::ConflictSoft
+                | OutcomeKind::ConflictHard
+                | OutcomeKind::ConflictMissing
+                | OutcomeKind::ConflictPhantom => {
+                    ops_conflicted += 1;
+                    detail_lines.push(format!(
+                        "conflict ({:?}): {}",
+                        rec.outcome_kind,
+                        rec.detail.as_deref().unwrap_or("(no detail)")
+                    ));
+                }
+            }
+        }
+    }
+
+    let summary = format!(
+        "undo report: commands={commands_attempted} applied={ops_applied} \
+         skipped={ops_skipped} failed={ops_failed} conflicts={ops_conflicted} \
+         dry_run={}",
+        req.dry_run,
+    );
+    CtlResponse::UndoReport(UndoReportWire {
+        commands_attempted,
+        ops_applied,
+        ops_skipped,
+        ops_failed,
+        ops_conflicted,
+        dry_run: req.dry_run,
+        summary,
+        detail_lines,
+    })
 }

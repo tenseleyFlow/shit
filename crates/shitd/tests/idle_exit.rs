@@ -41,6 +41,8 @@ log_level = "warn"
     let status = Command::new(shitd_bin())
         .args(["--config"])
         .arg(&cfg)
+        // S24.A: idle-exit test doesn't need the helper tier.
+        .env("SHIT_HELPER_DISABLED", "1")
         .status()
         .expect("spawn shitd");
     let elapsed = start.elapsed();

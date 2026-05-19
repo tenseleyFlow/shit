@@ -31,7 +31,11 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// Helper protocol version negotiated at handshake. We bump this whenever
 /// the message catalog changes incompatibly. Match-or-fail: helper and
 /// daemon must agree exactly; cross-version connections refuse.
-pub const HELPER_PROTOCOL_VERSION: u16 = 1;
+///
+/// **Version 2 (S24.A):** added `HelperResponse::CapturedPreImage` for
+/// the kqueue post-hoc capture path; daemon learns to recvmsg with a
+/// cmsg buffer to extract the SCM_RIGHTS-attached staging fd.
+pub const HELPER_PROTOCOL_VERSION: u16 = 4;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -205,6 +209,83 @@ pub enum HelperResponse {
         inode: u64,
         requesting_pid: u32,
     },
+    /// One post-hoc captured pre-image (S24.A, kqueue-tier producer).
+    /// The bytes themselves arrive out-of-band via `SCM_RIGHTS` — the
+    /// helper opens a staging file (or `memfd_create` on Linux,
+    /// `shm_open(SHM_ANON)` on FreeBSD), writes the pre-image, and
+    /// attaches the fd to the sendmsg. Daemon recvmsg's with a cmsg
+    /// buffer to recover the fd, then reads, hashes (verify against
+    /// `blob_hash`), and ingests into the canonical blob store.
+    ///
+    /// One-way: no daemon decision needed (unlike `AuthEvent`) because
+    /// the kqueue path is post-hoc — the user's syscall has already
+    /// completed by the time we emit this.
+    CapturedPreImage {
+        session: Uuid,
+        seq: u64,
+        /// Inode identity at capture time. Raw `(dev, inode)` rather
+        /// than `shit_planner::InodeRef` to keep `shit-proto` free of
+        /// the planner dep; daemon converts on ingest.
+        dev: u64,
+        inode: u64,
+        /// Path the helper resolved the fd to at capture time. Bounded
+        /// by [`HELPER_PATH_HINT_MAX`]. `None` when path recovery
+        /// failed (e.g. inode-only access after unlink + dir close).
+        path: Option<String>,
+        /// blake3 hash the helper claims over the staging file's bytes.
+        /// Daemon recomputes on ingest and refuses on mismatch — this
+        /// is the integrity check that justifies the helper writing
+        /// blobs the daemon trusts.
+        blob_hash: [u8; 32],
+        /// Size of the blob the helper claims it wrote. Daemon sizes
+        /// its read buffer to this and refuses if the actual read
+        /// length disagrees.
+        stored_bytes: u64,
+        /// Hash of the file's content immediately after the user's
+        /// mutation (helper reads the post-state when reachable).
+        /// `None` when the file was unlinked (the user `rm`'d it) and
+        /// there is no post-state on disk to hash.
+        post_content_hash: Option<[u8; 32]>,
+        /// Stat-style metadata at capture time. Daemon converts to
+        /// `shit_planner::FileMetadata` for `CaptureEvent::FilePreImage`.
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime_unix_nanos: i128,
+        /// True when this capture was triggered by `NOTE_DELETE`. The
+        /// daemon journals a paired `TreeOp::Unlink` so `shit undo`
+        /// knows to recreate the file at `path`, not just restore the
+        /// blob content to a now-deleted path.
+        is_delete: bool,
+        /// True when the corresponding sendmsg included the staging
+        /// fd via `SCM_RIGHTS`. Decoders must recvmsg with a cmsg
+        /// buffer to extract the fd.
+        fd_sent_via_scm: bool,
+    },
+    /// S29.1 — tree-mutation observation (mkdir/rmdir/rename/symlink/link).
+    /// One-way: no blob attached; the daemon converts to
+    /// `CaptureEventKind::TreeOp(...)` and journals.
+    TreeMutation {
+        session: Uuid,
+        seq: u64,
+        op: TreeOpWire,
+        ts_unix_nanos: u64,
+    },
+    /// S29.3 — metadata mutation observation (chmod/chown/touch).
+    /// `before` is the snapshot captured at fd-registration time (or
+    /// after the last MetadataChange event for this fd); `after` is
+    /// the current `fstat` reading. Daemon converts to
+    /// `CaptureEventKind::MetadataChange { ... }`.
+    CapturedMetadataChange {
+        session: Uuid,
+        seq: u64,
+        dev: u64,
+        inode: u64,
+        path: Option<String>,
+        before: FileMetadataWire,
+        after: FileMetadataWire,
+        ts_unix_nanos: u64,
+    },
     /// DR-15 result of `ApplyChown` / `ApplyMknod`. Helper either
     /// applied the op or refused with a category.
     PrivilegedOpResult {
@@ -246,6 +327,69 @@ pub enum PrivilegedOpOutcome {
     Failed { err: String },
 }
 
+/// Wire-side mirror of `shit_planner::TreeOp`. Kept duplicated here
+/// rather than imported so `shit-proto` stays free of the planner
+/// dep. The daemon converts on ingest (`shitd::helper_link::handle_tree_mutation`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeOpWire {
+    Create {
+        dev: u64,
+        inode: u64,
+        path: String,
+        kind: FileKindWire,
+        mode: u32,
+    },
+    Unlink {
+        dev: u64,
+        inode: u64,
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+        dev: u64,
+        inode: u64,
+    },
+    Link {
+        source_dev: u64,
+        source_inode: u64,
+        target: String,
+    },
+    Symlink {
+        /// Symlink target as the kernel returns (`readlink` output).
+        target: String,
+        /// Path of the symlink itself.
+        path: String,
+    },
+}
+
+/// Wire mirror of a subset of `shit_planner::FileMetadata`. xattrs and
+/// ACL are omitted — neither is currently captured by the BSD producer.
+/// When kqueue gains an xattr-change signal (it doesn't have one in
+/// the base API), the field gets added here without changing the
+/// existing wire shape (postcard handles backward-compatible enums but
+/// not struct field additions; we'd version the struct then).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMetadataWire {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime_unix_nanos: i128,
+}
+
+/// Wire mirror of `shit_planner::FileKind`. Same enum shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileKindWire {
+    Regular,
+    Directory,
+    Symlink,
+    Fifo,
+    Socket,
+    BlockDevice,
+    CharDevice,
+}
+
 /// Daemon's verdict on a pending kernel auth event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthDecision {
@@ -266,14 +410,53 @@ pub enum AuthDecision {
 /// the message would be obviously wrong on the wire — e.g. an
 /// over-long `path_hint`.
 pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> {
-    if let HelperResponse::AuthEvent { path_hint, .. } = resp
-        && let Some(p) = path_hint
-        && p.len() > HELPER_PATH_HINT_MAX
-    {
-        return Err(HelperProtoError::PathHintTooLong {
-            got: p.len(),
-            max: HELPER_PATH_HINT_MAX,
-        });
+    match resp {
+        HelperResponse::AuthEvent { path_hint, .. } => {
+            if let Some(p) = path_hint
+                && p.len() > HELPER_PATH_HINT_MAX
+            {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::CapturedPreImage { path, .. } => {
+            if let Some(p) = path
+                && p.len() > HELPER_PATH_HINT_MAX
+            {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::TreeMutation { op, .. } => {
+            // Validate every path field in the op variant.
+            let longest = match op {
+                TreeOpWire::Create { path, .. } | TreeOpWire::Unlink { path, .. } => path.len(),
+                TreeOpWire::Rename { from, to, .. } => from.len().max(to.len()),
+                TreeOpWire::Link { target, .. } => target.len(),
+                TreeOpWire::Symlink { target, path } => target.len().max(path.len()),
+            };
+            if longest > HELPER_PATH_HINT_MAX {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: longest,
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::CapturedMetadataChange { path, .. } => {
+            if let Some(p) = path
+                && p.len() > HELPER_PATH_HINT_MAX
+            {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -432,9 +615,109 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_constant_is_one() {
+    fn protocol_version_constant_is_four() {
         // Bumping this is intentional and should be paired with an
         // explicit migration plan; this test catches accidental bumps.
-        assert_eq!(HELPER_PROTOCOL_VERSION, 1);
+        //   Version 2 (S24.A) added `HelperResponse::CapturedPreImage`
+        //     for the kqueue post-hoc capture path.
+        //   Version 3 (S29.1) added `HelperResponse::TreeMutation`
+        //     for mkdir/rmdir/rename/symlink/link observations.
+        //   Version 4 (S29.3) added `HelperResponse::CapturedMetadataChange`
+        //     for chmod/chown/touch (NOTE_ATTRIB).
+        assert_eq!(HELPER_PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn captured_metadata_change_round_trip() {
+        let ev = HelperResponse::CapturedMetadataChange {
+            session: Uuid::nil(),
+            seq: 7,
+            dev: 64,
+            inode: 1042,
+            path: Some("/tmp/scratch/probe".into()),
+            before: FileMetadataWire {
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 100,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+            },
+            after: FileMetadataWire {
+                mode: 0o100755,
+                uid: 1000,
+                gid: 1000,
+                size: 100,
+                mtime_unix_nanos: 1_700_000_000_100_000_000,
+            },
+            ts_unix_nanos: 1_700_000_000_200_000_000,
+        };
+        let encoded = crate::frame::encode_frame(&ev).expect("encode");
+        let decoded: HelperResponse = crate::frame::decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn tree_mutation_round_trip() {
+        let ev = HelperResponse::TreeMutation {
+            session: Uuid::nil(),
+            seq: 17,
+            op: TreeOpWire::Create {
+                dev: 1,
+                inode: 42,
+                path: "/tmp/foo/bar".into(),
+                kind: FileKindWire::Directory,
+                mode: 0o40755,
+            },
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+        };
+        let encoded = crate::frame::encode_frame(&ev).expect("encode");
+        let decoded: HelperResponse = crate::frame::decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn captured_pre_image_round_trip() {
+        let ev = HelperResponse::CapturedPreImage {
+            session: Uuid::nil(),
+            seq: 17,
+            dev: 64,
+            inode: 999,
+            path: Some("/tmp/shit-vm-test/foo".into()),
+            blob_hash: [0xCD; 32],
+            stored_bytes: 1024,
+            post_content_hash: None,
+            mode: 0o100644,
+            uid: 1001,
+            gid: 1001,
+            mtime_unix_nanos: 1_700_000_000_000_000_000,
+            is_delete: true,
+            fd_sent_via_scm: true,
+        };
+        let bytes = encode_frame(&ev).unwrap();
+        let decoded: HelperResponse = decode_frame(&bytes).unwrap();
+        assert_eq!(ev, decoded);
+    }
+
+    #[test]
+    fn validate_outgoing_rejects_over_long_captured_pre_image_path() {
+        let too_long = "/".repeat(HELPER_PATH_HINT_MAX + 1);
+        let ev = HelperResponse::CapturedPreImage {
+            session: Uuid::nil(),
+            seq: 0,
+            dev: 0,
+            inode: 0,
+            path: Some(too_long),
+            blob_hash: [0; 32],
+            stored_bytes: 0,
+            post_content_hash: None,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            mtime_unix_nanos: 0,
+            is_delete: false,
+            fd_sent_via_scm: true,
+        };
+        let err = validate_outgoing(&ev).unwrap_err();
+        assert!(matches!(err, HelperProtoError::PathHintTooLong { .. }));
     }
 }

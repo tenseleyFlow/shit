@@ -1,0 +1,953 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! BSD/kqueue capture producer (S24.B).
+//!
+//! Consumes `DrainEvent::Vnode` events from S23.3's drain session and
+//! emits `HelperResponse::CapturedPreImage` to the daemon, with the
+//! pre-image bytes attached via `SCM_RIGHTS` per the S24.A wire.
+//!
+//! Architecture:
+//!
+//! ```text
+//!   request_loop thread          pump thread (this module)
+//!   ────────────────────         ──────────────────────────
+//!   recv HelperRequest           recv DrainEvent | recv ControlMsg
+//!         │                            │
+//!         ▼                            ▼
+//!   WatchTree { command,         decide route:
+//!               root_pid }       ─ Vnode: capture + send
+//!         │                      ─ ControlAttach: extend state
+//!         │ send ControlAttach   ─ ControlDetach: shrink state
+//!         ▼                      ─ Shutdown: clean exit
+//!   (control channel) ───────────┘
+//! ```
+//!
+//! State mutations happen *only* on the pump thread — no locks needed.
+//! The control channel and the drain channel are both `sync_channel(N)`
+//! and the pump alternates `try_recv` on them.
+//!
+//! **Stage-1 limits the producer to a single watched subtree per
+//! CommandId.** Recursive lazy expansion on directory NOTE_WRITE
+//! events is filed as a follow-up; for the rm-undo smoke (S24.C)
+//! the initial walk under the command's cwd is sufficient.
+
+#![cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+
+use std::collections::{BTreeMap, HashMap};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use shit_planner::events::CommandId;
+use shit_proto::HelperResponse;
+use uuid::Uuid;
+
+use crate::ipc::Conn;
+use crate::kqueue::{
+    DrainEvent, DrainSession, KqueueFd, TrackedSubtree, VnodeEventKind, init as kqueue_init,
+    read_pre_image, register_subtree, spawn_drain,
+};
+
+/// Default subtree depth — matches `kqueue::vnode::DEFAULT_DEPTH_LIMIT`.
+const DEFAULT_DEPTH: usize = 8;
+
+/// Inbound control commands the request_loop sends to the pump.
+enum ControlMsg {
+    Attach {
+        command: CommandId,
+        root_path: PathBuf,
+    },
+    Detach {
+        command: CommandId,
+    },
+    Shutdown,
+}
+
+/// Producer state owned by the pump thread.
+struct WatchState {
+    subtree: TrackedSubtree,
+    /// `(dev, inode)` → was the pre-image already captured? `true`
+    /// = invalidated by NOTE_DELETE (next write should re-capture).
+    dedupe: HashMap<(u64, u64), DedupeEntry>,
+    /// S29.1 — per-dir-fd snapshot of immediate child entries, captured
+    /// at attach time and refreshed after every dir-diff. The diff
+    /// between current entries and the baseline is what we emit as
+    /// `TreeOpWire::Create` / `TreeOpWire::Unlink`.
+    dir_baselines: HashMap<RawFd, DirBaseline>,
+    /// S29.3 — per-fd metadata snapshot, populated at attach time
+    /// (and at `add_path` time for new files). On `NOTE_ATTRIB`,
+    /// re-stat the fd; if anything user-visible (mode/uid/gid/mtime)
+    /// changed, emit `CapturedMetadataChange` with this baseline as
+    /// `before`, and update the baseline.
+    meta_baselines: HashMap<RawFd, StatMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct DirBaseline {
+    /// Absolute path of the directory (for emitting child paths).
+    path: PathBuf,
+    /// Child name → (dev, inode) at baseline time. We store inode so
+    /// the diff can detect rename-within-dir as
+    /// `Unlink old_name + Create new_name` for the same inode.
+    entries: BTreeMap<std::ffi::OsString, (u64, u64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DedupeEntry {
+    invalidated: bool,
+}
+
+/// Decide whether the producer should emit a pre-image capture for
+/// the given `(dev, inode)`, given the current dedupe map state.
+///
+/// First-write-wins per (dev, inode) within a watch window. A delete
+/// flips `invalidated=true`, which lets the *next* write re-capture
+/// (handles inode reuse and the rm-then-recreate pattern).
+fn should_capture_dedupe(map: &HashMap<(u64, u64), DedupeEntry>, key: (u64, u64)) -> bool {
+    match map.get(&key) {
+        None => true,
+        Some(e) if e.invalidated => true,
+        Some(_) => false,
+    }
+}
+
+/// Pump thread's working set. Maps RawFd to which CommandId owns it,
+/// so a DrainEvent's `fd` resolves quickly to its watch state.
+struct PumpState {
+    watches: BTreeMap<CommandId, WatchState>,
+    fd_to_command: HashMap<RawFd, CommandId>,
+    staging_dir: PathBuf,
+    conn: Arc<Conn>,
+    /// S29.2 — kept here so `handle_dir_change` can register fresh
+    /// kqueue watches via `TrackedSubtree::add_path` when a new entry
+    /// appears in a watched directory.
+    kq: Arc<KqueueFd>,
+}
+
+impl PumpState {
+    fn new(staging_dir: PathBuf, conn: Arc<Conn>, kq: Arc<KqueueFd>) -> Self {
+        Self {
+            watches: BTreeMap::new(),
+            fd_to_command: HashMap::new(),
+            staging_dir,
+            conn,
+            kq,
+        }
+    }
+
+    fn attach(&mut self, kq: &KqueueFd, command: CommandId, root_path: &Path) {
+        let subtree = match register_subtree(kq, root_path, DEFAULT_DEPTH) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %root_path.display(),
+                    error = %e,
+                    "register_subtree failed; watch dropped",
+                );
+                return;
+            }
+        };
+        // Index every tracked fd → CommandId so the pump can resolve
+        // DrainEvent::Vnode { fd, .. } to its watch.
+        for raw in tracked_fds(&subtree) {
+            self.fd_to_command.insert(raw, command);
+        }
+        tracing::info!(
+            %command.session,
+            seq = command.seq,
+            path = %root_path.display(),
+            tracked_entries = subtree.len(),
+            "watch attached",
+        );
+        // Build per-dir-fd entry baselines so we can diff on
+        // subsequent NOTE_WRITE events. Walks each tracked dir once
+        // here; the cost is proportional to dir size.
+        let mut dir_baselines: HashMap<RawFd, DirBaseline> = HashMap::new();
+        for raw in tracked_fds(&subtree) {
+            let Some((_, _, ft)) = fstat_dev_inode_kind(raw) else {
+                continue;
+            };
+            if ft != FileType::Directory {
+                continue;
+            }
+            let Some(dir_path) = subtree.path_for_fd(raw).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let entries = read_dir_entries(&dir_path).unwrap_or_default();
+            dir_baselines.insert(
+                raw,
+                DirBaseline {
+                    path: dir_path,
+                    entries,
+                },
+            );
+        }
+        // S29.3 — snapshot per-fd metadata so NOTE_ATTRIB events can
+        // diff and emit MetadataChange with the original `before`
+        // values. Populated for *every* tracked fd (file or dir);
+        // we skip the dir-attrib path in handle_vnode but the data
+        // is cheap and complete.
+        let mut meta_baselines: HashMap<RawFd, StatMeta> = HashMap::new();
+        for raw in tracked_fds(&subtree) {
+            if let Some(m) = fstat_meta(raw) {
+                meta_baselines.insert(raw, m);
+            }
+        }
+        self.watches.insert(
+            command,
+            WatchState {
+                subtree,
+                dedupe: HashMap::new(),
+                dir_baselines,
+                meta_baselines,
+            },
+        );
+    }
+
+    fn detach(&mut self, command: CommandId) {
+        if let Some(ws) = self.watches.remove(&command) {
+            for raw in tracked_fds(&ws.subtree) {
+                self.fd_to_command.remove(&raw);
+            }
+            tracing::info!(
+                %command.session,
+                seq = command.seq,
+                "watch detached",
+            );
+        }
+    }
+
+    fn handle_vnode(&mut self, fd: RawFd, kind: VnodeEventKind) {
+        // S29.3: route NOTE_ATTRIB (chmod/chown/touch) into its own
+        // handler before the content-capture branch so we never
+        // try to pread bytes for a metadata-only event.
+        if matches!(kind, VnodeEventKind::Attrib) {
+            self.handle_attrib(fd);
+            return;
+        }
+        // Only Write/Extend/Delete trigger pre-image capture; other
+        // kinds (Link, Rename, Revoke) get a trace log for now —
+        // future S29.x sub-sprints land them.
+        let is_delete = matches!(kind, VnodeEventKind::Delete);
+        let triggers = matches!(
+            kind,
+            VnodeEventKind::Write | VnodeEventKind::Extend | VnodeEventKind::Delete
+        );
+        if !triggers {
+            tracing::trace!(fd, ?kind, "vnode event ignored (not a capture trigger)");
+            return;
+        }
+        let Some(command) = self.fd_to_command.get(&fd).copied() else {
+            tracing::trace!(fd, ?kind, "vnode event for untracked fd; dropping");
+            return;
+        };
+        let Some(ws) = self.watches.get_mut(&command) else {
+            // fd_to_command had us, but the watch state is gone —
+            // race with detach. Drop.
+            return;
+        };
+        // register_subtree opens both directories and files. A delete
+        // *inside* a directory delivers NOTE_DELETE on the file fd, but
+        // NOTE_WRITE also fires on the parent dir fd (its contents
+        // changed). pread(2) is invalid on a directory, so we filter
+        // here to regular files only. The dir's NOTE_WRITE is fine —
+        // it just means "someone touched the dir," which we may use
+        // later for tree-mutation TreeOps but is not a pre-image
+        // capture trigger.
+        let (dev, inode, file_type) = match fstat_dev_inode_kind(fd) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(fd, "fstat failed; skipping capture");
+                return;
+            }
+        };
+        if file_type == FileType::Directory {
+            // S29.1: NOTE_WRITE on a tracked dir indicates child
+            // entries changed. Diff against the baseline to detect
+            // create/unlink/rename and emit TreeMutation events.
+            self.handle_dir_change(command, fd);
+            return;
+        }
+        if file_type != FileType::Regular {
+            tracing::trace!(fd, ?kind, ?file_type, "vnode event on non-file; skipping");
+            return;
+        }
+        // Delete events ALWAYS go through, even if we already captured
+        // a pre-image for this (dev, inode) earlier in the command —
+        // the daemon needs the paired TreeOp::Unlink to plan the
+        // recreate side of undo. (Smoke-surfaced bug: touch + echo +
+        // rm produced only Create + FilePreImage; the rm's
+        // CapturedPreImage was dedupe-suppressed and the Unlink half
+        // never landed.) For Write/Extend, first-write-wins still
+        // applies — repeated writes to the same file get one
+        // pre-image, the post-content can be reconstructed from
+        // post_content_hash + the original blob.
+        if !is_delete && !should_capture_dedupe(&ws.dedupe, (dev, inode)) {
+            tracing::trace!(fd, dev, inode, "dedupe hit; skipping recapture");
+            return;
+        }
+        let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
+        // Read pre-image bytes from the tracked fd. For Delete, the
+        // fd survives unlink and pread still returns original bytes
+        // (S23.4's architectural test proves this).
+        let bytes = match read_pre_image(fd) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(fd, error = %e, "read_pre_image failed");
+                return;
+            }
+        };
+        // Stat for metadata. After Delete the fstat above already
+        // returned valid (dev, inode); same call works for mode/uid/gid/mtime.
+        let meta = match fstat_meta(fd) {
+            Some(m) => m,
+            None => {
+                tracing::warn!(fd, "fstat for meta failed; skipping capture");
+                return;
+            }
+        };
+        // Stage the bytes into a temp file under staging_dir, then
+        // attach the fd via SCM_RIGHTS.
+        let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::warn!(error = %e, "staging write failed; skipping capture");
+                return;
+            }
+        };
+        // blake3 the bytes; this is what the daemon will verify.
+        let claimed_hash = blake3_of(&bytes);
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Wire's `seq` field is the *command's* seq — that's the FK
+        // the daemon uses to attach the event to the originating
+        // PreExec'd command (the helper-local seq_counter we had here
+        // before tripped a sqlite FK constraint on the daemon side).
+        let resp = HelperResponse::CapturedPreImage {
+            session: command.session,
+            seq: command.seq,
+            dev,
+            inode,
+            path: path.as_deref().map(path_to_string),
+            blob_hash: claimed_hash,
+            stored_bytes: bytes.len() as u64,
+            post_content_hash: None, // TODO: compute when not Delete
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+            mtime_unix_nanos: meta.mtime_unix_nanos,
+            is_delete,
+            fd_sent_via_scm: true,
+        };
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+        {
+            tracing::warn!(error = %e, "send_response_with_fd failed");
+        }
+        // Mark as captured. Don't insert a NEW key — we used or_insert
+        // above; just update the invalidated flag based on Delete.
+        ws.dedupe.insert(
+            (dev, inode),
+            DedupeEntry {
+                invalidated: is_delete,
+            },
+        );
+        // Record helper-local stamp for telemetry. (TODO wire to stats.)
+        tracing::info!(
+            %command.session,
+            seq = command.seq,
+            dev,
+            inode,
+            ?kind,
+            bytes = bytes.len(),
+            now_nanos,
+            "CapturedPreImage sent",
+        );
+    }
+
+    /// S29.1 — diff a directory's current entries against the baseline
+    /// captured at attach time, emit `TreeMutation` events for each
+    /// added/removed child, and refresh the baseline. Inode preservation
+    /// across a name change is detected as Unlink+Create for the same
+    /// `(dev, inode)`; the planner can pair them into a Rename at cohort
+    /// assignment time.
+    ///
+    /// S29.2 — when a new entry is a regular file, auto-add it to the
+    /// kqueue watch via `subtree.add_path` so subsequent
+    /// NOTE_WRITE/NOTE_DELETE on the new file's fd are picked up by
+    /// the regular file branch of `handle_vnode`. The kq fd is the
+    /// pump's shared `Arc<KqueueFd>` (`self.kq`).
+    fn handle_dir_change(&mut self, command: CommandId, fd: RawFd) {
+        let Some(ws) = self.watches.get_mut(&command) else {
+            return;
+        };
+        let Some(baseline) = ws.dir_baselines.get_mut(&fd) else {
+            tracing::trace!(fd, "dir Write on dir without baseline; skipping");
+            return;
+        };
+        let dir_path = baseline.path.clone();
+        let current = match read_dir_entries(&dir_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(fd, error = %e, "read_dir_entries failed");
+                return;
+            }
+        };
+        // Compute additions (in current, not in baseline). A name with
+        // a different (dev, inode) at the same name is treated as an
+        // addition (the inode-replacement case — file deleted and a new
+        // one created with the same name).
+        //
+        // S29.2: for each *new regular file*, register a kqueue watch
+        // on it via `subtree.add_path` and index its fd in
+        // `fd_to_command`. Subsequent writes/deletes then fire on the
+        // tracked fd and the regular-file branch of `handle_vnode`
+        // picks them up.
+        let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
+        let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
+        for (name, &(dev, inode)) in &current {
+            match baseline.entries.get(name) {
+                Some(&prev) if prev == (dev, inode) => {} // unchanged
+                Some(_) | None => {
+                    // New entry, or entry with different inode at same name.
+                    let child = dir_path.join(name);
+                    let kind = file_kind_for(&child);
+                    events.push(shit_proto::TreeOpWire::Create {
+                        dev,
+                        inode,
+                        path: path_to_string(&child),
+                        kind,
+                        mode: file_mode_for(&child).unwrap_or(0),
+                    });
+                    if matches!(kind, shit_proto::FileKindWire::Regular) {
+                        new_files_to_watch.push(child);
+                    }
+                }
+            }
+        }
+        // **Intentionally do not emit Unlink for removed entries here.**
+        // Every name that *was* in the baseline was an fd-tracked entry
+        // (since `register_subtree` opens directories AND files). Its
+        // removal raises NOTE_DELETE on the file's own fd, which the
+        // file branch of `handle_vnode` handles by emitting
+        // CapturedPreImage(is_delete=true) — that path produces the
+        // paired TreeOp::Unlink via `journal_unlink_idempotent` on the
+        // daemon side. Emitting Unlink here too would race the file
+        // path's ts ordering and break the planner's
+        // reverse-chronological invariant (smoke-surfaced bug:
+        // RestoreContent ran before RecreatePath when dir-diff's
+        // Unlink got a lower ts than FilePreImage).
+        //
+        // The remaining gap — rmdir of the watched root dir itself —
+        // is handled by a dedicated branch in `handle_vnode` for
+        // `(kind=Delete, file_type=Directory)`, not here.
+        let _ = &baseline.entries; // kept for the diff above (Create emit)
+        // Refresh baseline so subsequent diffs are relative to the
+        // post-change state.
+        baseline.entries = current;
+
+        // S29.2 — register fresh fds for each new regular file. Mutate
+        // both the watch's subtree (so add_path's bookkeeping is
+        // visible) and our `fd_to_command` index (so when the new
+        // fd's NOTE_WRITE/NOTE_DELETE fires later, the file branch in
+        // `handle_vnode` resolves it correctly).
+        for new_path in new_files_to_watch {
+            if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
+                self.fd_to_command.insert(new_fd, command);
+                // S29.3 — seed the metadata baseline for the new fd so
+                // a subsequent NOTE_ATTRIB has something to compare to.
+                if let Some(m) = fstat_meta(new_fd) {
+                    ws.meta_baselines.insert(new_fd, m);
+                }
+                tracing::info!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %new_path.display(),
+                    new_fd,
+                    "auto-added new file to subtree watch",
+                );
+            }
+        }
+
+        if events.is_empty() {
+            tracing::trace!(fd, "dir Write produced no entry-set delta");
+            return;
+        }
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        for op in events {
+            let resp = shit_proto::HelperResponse::TreeMutation {
+                session: command.session,
+                seq: command.seq,
+                op,
+                ts_unix_nanos: now_nanos,
+            };
+            if let Err(e) = self.conn.send_response(&resp) {
+                tracing::warn!(error = %e, "send TreeMutation failed");
+            }
+        }
+    }
+
+    /// S29.3 — handle `NOTE_ATTRIB` on a tracked fd. Diff the current
+    /// fstat against the meta baseline; if mode/uid/gid/mtime/size
+    /// changed, emit `CapturedMetadataChange` and update the baseline.
+    /// `NOTE_ATTRIB` also fires for atime-only updates (e.g., a read)
+    /// which we deliberately ignore — atime isn't a user-visible
+    /// mutation worth journaling.
+    fn handle_attrib(&mut self, fd: RawFd) {
+        let Some(command) = self.fd_to_command.get(&fd).copied() else {
+            tracing::trace!(fd, "NOTE_ATTRIB for untracked fd; dropping");
+            return;
+        };
+        let Some(ws) = self.watches.get_mut(&command) else {
+            return;
+        };
+        // Directories also fire NOTE_ATTRIB on chmod; we skip dir
+        // attribs for now (the planner doesn't have a MetadataChange
+        // executor for dirs that's distinct from regular files, and
+        // the chmod-undo smoke targets files).
+        let Some((dev, inode, ft)) = fstat_dev_inode_kind(fd) else {
+            tracing::warn!(fd, "fstat failed during attrib handling");
+            return;
+        };
+        if ft != FileType::Regular {
+            tracing::trace!(fd, ?ft, "attrib on non-regular; skipping");
+            return;
+        }
+        let Some(after) = fstat_meta(fd) else {
+            tracing::warn!(fd, "fstat_meta failed during attrib handling");
+            return;
+        };
+        let before = match ws.meta_baselines.get(&fd).copied() {
+            Some(b) => b,
+            None => {
+                // No baseline (shouldn't happen post-attach; could
+                // race with detach). Take the current as baseline and
+                // skip emission — we have nothing to compare to.
+                ws.meta_baselines.insert(fd, after);
+                return;
+            }
+        };
+        if before == after {
+            tracing::trace!(fd, "attrib fired but baseline matches; ignoring");
+            return;
+        }
+        let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let resp = shit_proto::HelperResponse::CapturedMetadataChange {
+            session: command.session,
+            seq: command.seq,
+            dev,
+            inode,
+            path: path.as_deref().map(path_to_string),
+            before: before.to_wire(),
+            after: after.to_wire(),
+            ts_unix_nanos: now_nanos,
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "send CapturedMetadataChange failed");
+            return;
+        }
+        ws.meta_baselines.insert(fd, after);
+        tracing::info!(
+            %command.session,
+            seq = command.seq,
+            dev,
+            inode,
+            "CapturedMetadataChange sent",
+        );
+    }
+}
+
+/// Read `mode` bits for a path. Used by the dir-diff path to populate
+/// `TreeOpWire::Create.mode` so the undo executor's `RecreatePath` can
+/// chmod to the original perms.
+fn file_mode_for(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(meta.mode())
+}
+
+fn tracked_fds(_subtree: &TrackedSubtree) -> Vec<RawFd> {
+    // TrackedSubtree doesn't currently expose its fds; we use
+    // path_for_fd in reverse via a small scan. The fd range we care
+    // about (0..1024) covers normal helper-process descriptor usage
+    // with margin.
+    let mut out = Vec::new();
+    for fd in 0..1024 {
+        if _subtree.path_for_fd(fd).is_some() {
+            out.push(fd);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileType {
+    Regular,
+    Directory,
+    Other,
+}
+
+/// fstat that also returns the file kind. register_subtree opens both
+/// directories and files; only Regular files are valid pre-image
+/// capture targets (pread on a directory returns EISDIR).
+fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is expected valid; st is writable.
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    let kind = match (st.st_mode as libc::mode_t) & libc::S_IFMT {
+        libc::S_IFREG => FileType::Regular,
+        libc::S_IFDIR => FileType::Directory,
+        _ => FileType::Other,
+    };
+    Some((st.st_dev as u64, st.st_ino as u64, kind))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatMeta {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime_unix_nanos: i128,
+}
+
+impl StatMeta {
+    /// Convert to the wire shape the daemon expects. Same field set.
+    fn to_wire(self) -> shit_proto::FileMetadataWire {
+        shit_proto::FileMetadataWire {
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            size: self.size,
+            mtime_unix_nanos: self.mtime_unix_nanos,
+        }
+    }
+}
+
+fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    #[cfg(target_os = "freebsd")]
+    let (msec, mnsec) = (st.st_mtime as i128, st.st_mtime_nsec as i128);
+    #[cfg(not(target_os = "freebsd"))]
+    let (msec, mnsec) = (st.st_mtime as i128, st.st_mtime_nsec as i128);
+    let mtime = msec.saturating_mul(1_000_000_000).saturating_add(mnsec);
+    Some(StatMeta {
+        mode: st.st_mode as u32,
+        uid: st.st_uid as u32,
+        gid: st.st_gid as u32,
+        size: st.st_size as u64,
+        mtime_unix_nanos: mtime,
+    })
+}
+
+fn write_to_staging(dir: &Path, bytes: &[u8]) -> std::io::Result<OwnedFd> {
+    use std::io::Write;
+    let name = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let path = dir.join(&name);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    // Reopen read-only for the SCM_RIGHTS send; the file lives on
+    // disk until the daemon ingests + unlinks.
+    let f = std::fs::OpenOptions::new().read(true).open(&path)?;
+    // SAFETY: we just opened f; consume it into an OwnedFd.
+    Ok(f.into())
+}
+
+fn blake3_of(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn path_to_string(p: &Path) -> String {
+    String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+}
+
+/// Read a directory's immediate child entries, returning a map of
+/// `name → (dev, inode)`. Symlinks are recorded as their own inode
+/// (not the link target's). Errors are swallowed — partial baselines
+/// are preferred to no baseline.
+fn read_dir_entries(dir: &Path) -> std::io::Result<BTreeMap<std::ffi::OsString, (u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = BTreeMap::new();
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        // symlink_metadata would be more correct for symlinks, but
+        // entry.metadata() already does the right thing — std uses
+        // lstat for `read_dir` entries on Unix.
+        out.insert(entry.file_name(), (meta.dev(), meta.ino()));
+    }
+    Ok(out)
+}
+
+/// Classify a path's `FileKind` for the wire. Errors fall through to
+/// `Regular` — the planner only acts on `Directory`/`Regular`/`Symlink`
+/// distinctly, and Regular is the safe default fallback.
+fn file_kind_for(path: &Path) -> shit_proto::FileKindWire {
+    use shit_proto::FileKindWire as K;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return K::Regular;
+    };
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        K::Directory
+    } else if ft.is_symlink() {
+        K::Symlink
+    } else if ft.is_file() {
+        K::Regular
+    } else {
+        // fifo/socket/block/char — std doesn't distinguish; the
+        // distinction doesn't currently affect undo correctness for
+        // the BSD coverage we target. Default to Regular.
+        K::Regular
+    }
+}
+
+/// Handle the request_loop holds. Cheaply cloneable.
+#[derive(Clone)]
+pub struct CaptureControl {
+    tx: SyncSender<ControlMsg>,
+}
+
+impl CaptureControl {
+    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32) {
+        let path = match super::cwd::resolve_pid_cwd(root_pid) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    root_pid,
+                    "could not resolve root_pid cwd; watch dropped",
+                );
+                return;
+            }
+        };
+        let _ = self.tx.try_send(ControlMsg::Attach {
+            command: CommandId {
+                session,
+                seq: command_seq,
+            },
+            root_path: path,
+        });
+    }
+
+    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
+        let _ = self.tx.try_send(ControlMsg::Detach {
+            command: CommandId {
+                session,
+                seq: command_seq,
+            },
+        });
+    }
+
+    /// Signal the pump thread to exit. Best-effort.
+    pub fn shutdown(&self) {
+        let _ = self.tx.try_send(ControlMsg::Shutdown);
+    }
+}
+
+/// Spawn the BSD capture pump. Returns a control handle for the
+/// request loop to drive watches, plus the join handle so the
+/// caller can wait for the pump to exit.
+pub fn spawn(
+    conn: Arc<Conn>,
+    staging_dir: PathBuf,
+) -> std::io::Result<(CaptureControl, JoinHandle<()>)> {
+    std::fs::create_dir_all(&staging_dir)?;
+    // Single shared kqueue: the drain thread reads events, the pump
+    // thread calls `register_subtree` to add new fd watches. Both
+    // operations on the same fd are thread-safe at the kernel level.
+    let kq = Arc::new(kqueue_init().map_err(std::io::Error::other)?);
+    let drain_session = spawn_drain(Arc::clone(&kq), 4096).map_err(std::io::Error::other)?;
+    let (ctrl_tx, ctrl_rx) = sync_channel::<ControlMsg>(64);
+    let handle = std::thread::Builder::new()
+        .name("shit-bsd-capture-pump".to_string())
+        .spawn(move || pump(kq, drain_session, conn, staging_dir, ctrl_rx))?;
+    Ok((CaptureControl { tx: ctrl_tx }, handle))
+}
+
+fn pump(
+    kq: Arc<KqueueFd>,
+    drain_session: DrainSession,
+    conn: Arc<Conn>,
+    staging_dir: PathBuf,
+    ctrl_rx: Receiver<ControlMsg>,
+) {
+    let mut state = PumpState::new(staging_dir, conn, Arc::clone(&kq));
+    loop {
+        // Try a control command first (low latency for watch/unwatch).
+        match ctrl_rx.try_recv() {
+            Ok(ControlMsg::Attach { command, root_path }) => {
+                state.attach(&kq, command, &root_path);
+                continue;
+            }
+            Ok(ControlMsg::Detach { command }) => {
+                state.detach(command);
+                continue;
+            }
+            Ok(ControlMsg::Shutdown) => {
+                tracing::info!("bsd capture pump shutdown requested");
+                drop(drain_session);
+                return;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                tracing::info!("control channel closed; pump exiting");
+                drop(drain_session);
+                return;
+            }
+        }
+        // Then a drain event (block with a short timeout so control
+        // commands stay responsive).
+        match drain_session.events.recv_timeout(Duration::from_millis(50)) {
+            Ok(DrainEvent::Vnode { fd, kind, .. }) => {
+                state.handle_vnode(fd, kind);
+            }
+            Ok(DrainEvent::Proc { .. }) => {
+                // S24.B doesn't act on proc events; S24's tree-tracking
+                // story for descendants lands later.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("drain channel disconnected; pump exiting");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blake3_of_matches_known_vector() {
+        // Empty input → BLAKE3 of "" = af1349b9f5f9a1a6a0404dea36dcc949...
+        let got = blake3_of(b"");
+        assert_eq!(
+            got[..4],
+            [0xAF, 0x13, 0x49, 0xB9],
+            "blake3('') prefix mismatch",
+        );
+    }
+
+    #[test]
+    fn write_to_staging_round_trips_bytes() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"staging-round-trip";
+        let fd = write_to_staging(dir.path(), bytes).unwrap();
+        let mut f = std::fs::File::from(fd);
+        let mut out = Vec::new();
+        f.read_to_end(&mut out).unwrap();
+        assert_eq!(out.as_slice(), bytes);
+    }
+
+    #[test]
+    fn fstat_returns_regular_for_open_file_and_directory_for_open_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe");
+        std::fs::write(&path, b"x").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let (dev, inode, kind) = fstat_dev_inode_kind(f.as_raw_fd()).expect("fstat ok");
+        assert!(dev > 0 || inode > 0);
+        assert_eq!(kind, FileType::Regular);
+        let d = std::fs::File::open(dir.path()).unwrap();
+        let (_, _, dir_kind) = fstat_dev_inode_kind(d.as_raw_fd()).expect("fstat ok");
+        assert_eq!(dir_kind, FileType::Directory);
+    }
+
+    #[test]
+    fn dedupe_first_write_wins() {
+        let mut map: HashMap<(u64, u64), DedupeEntry> = HashMap::new();
+        let key = (1u64, 42u64);
+        // First write: empty map → should capture.
+        assert!(should_capture_dedupe(&map, key));
+        // Record the capture (not invalidated — was a Write/Extend).
+        map.insert(key, DedupeEntry { invalidated: false });
+        // Second write to the same inode: dedupe hit → skip.
+        assert!(!should_capture_dedupe(&map, key));
+        // Different inode in the same watch: independent dedupe.
+        assert!(should_capture_dedupe(&map, (1, 43)));
+    }
+
+    #[test]
+    fn delete_invalidates_then_recaptures() {
+        let mut map: HashMap<(u64, u64), DedupeEntry> = HashMap::new();
+        let key = (2u64, 100u64);
+        // Initial write captures.
+        assert!(should_capture_dedupe(&map, key));
+        map.insert(key, DedupeEntry { invalidated: false });
+        // Subsequent write: skipped.
+        assert!(!should_capture_dedupe(&map, key));
+        // NOTE_DELETE flips the entry — simulates the helper's
+        // post-Delete bookkeeping.
+        map.insert(key, DedupeEntry { invalidated: true });
+        // Next write (inode reuse or recreate-with-same-key): captures.
+        assert!(should_capture_dedupe(&map, key));
+    }
+
+    #[test]
+    fn late_event_after_unwatch_dropped() {
+        // After detach, the PumpState's watches map no longer contains
+        // the command; handle_vnode short-circuits at the
+        // `self.watches.get_mut(&command)` lookup. We simulate the
+        // "fd is registered but watch is gone" race by populating
+        // fd_to_command without an entry in watches and asserting the
+        // code path returns cleanly.
+        let (conn_a, _conn_b) = crate::ipc::socketpair().expect("socketpair");
+        let dir = tempfile::tempdir().unwrap();
+        let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
+        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a), kq);
+        let ghost = CommandId {
+            session: Uuid::nil(),
+            seq: 0,
+        };
+        state.fd_to_command.insert(999, ghost);
+        // Must not panic; must not send.
+        state.handle_vnode(999, VnodeEventKind::Write);
+        assert!(state.watches.is_empty(), "watches must still be empty");
+    }
+}

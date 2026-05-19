@@ -11,10 +11,9 @@
 //!
 //! Spec: `.docs/sprints/S10-bsd-tier.md`.
 //!
-//! **Stage 1**: only the skeleton + init wrapper are real; vnode/proc
-//! registration are stubs that compile cleanly but don't yet wire up
-//! to the daemon's tree-tracking. Runtime validation deferred until
-//! a FreeBSD VM target is ready, paired with S20's security audit.
+//! **S23.1 (DR-05)**: vnode subtree registration is real; proc and the
+//! drain loop are still stubs that land in S23.2 + S23.3. Runtime is
+//! validated on the FreeBSD VM under `tools/freebsd-vm/`.
 //!
 //! **Visibility:** the entire module is gated to BSD targets at the
 //! parent (`crate::main`). Non-BSD builds see no kqueue symbols.
@@ -32,6 +31,8 @@
 // lights up (paired with the FreeBSD VM tooling).
 #![allow(dead_code, unused_imports)]
 
+pub mod capture;
+pub mod drain;
 pub mod error;
 pub mod event_loop;
 pub mod init;
@@ -39,8 +40,18 @@ pub mod proc;
 pub mod tree;
 pub mod vnode;
 
+pub use capture::{CaptureError, PRE_IMAGE_INLINE_CAP, read_pre_image};
+pub use drain::{
+    DEFAULT_CAPACITY, DrainError, DrainEvent, DrainHandle, DrainSession, spawn as spawn_drain,
+    spawn_default as spawn_drain_default,
+};
 pub use error::KqueueError;
 pub use init::{KqueueFd, init};
-pub use proc::{ProcEventKind, watch_pid};
+pub use proc::{
+    PROC_FFLAGS_DESCENDANTS, PROC_FFLAGS_SINGLE, ProcEventKind, TrackedPid, track_descendants,
+    track_pid,
+};
 pub use tree::TrackedTree;
-pub use vnode::{VnodeEventKind, watch_path};
+pub use vnode::{
+    DEFAULT_DEPTH_LIMIT, TrackedSubtree, VNODE_FFLAGS, VnodeEventKind, register_subtree, watch_path,
+};

@@ -21,9 +21,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = { workspace = true }
-# Pulled in only by the rlib face of the crate for the config loader.
-# The cdylib hot path doesn't touch serde / toml — they're behind the
-# `install_config::load_*` rlib-only entry points.
+# S24.D: the shim notifies the daemon's shim_listener over a UDS via
+# postcard-framed ShimNotification messages defined in shit-proto.
+shit-proto = { path = "../shit-proto" }
+# C05: pulled in only by the rlib face of the crate for the config
+# loader. The cdylib hot path doesn't touch serde / toml — they're
+# behind the `install_config::load_*` rlib-only entry points.
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

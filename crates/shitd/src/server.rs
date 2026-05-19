@@ -3,6 +3,7 @@
 use crate::active_commands::ActiveCommands;
 use crate::config::ResolvedConfig;
 use crate::env_track::{self, EnvPreStash};
+use crate::helper_link::HelperLink;
 use crate::stats::Stats;
 use shit_planner::{CommandId, CommandRecord, TimePoint};
 use shit_proto::{HookMessage, MAX_FRAME_SIZE, decode_frame};
@@ -42,6 +43,7 @@ pub async fn serve(
     index: Arc<Index>,
     env_stash: Arc<EnvPreStash>,
     active: Arc<ActiveCommands>,
+    helper_link: Option<Arc<HelperLink>>,
 ) -> anyhow::Result<()> {
     let env_filter = cfg.env.filter();
     if let Some(parent) = cfg.hook_socket_path.parent() {
@@ -88,7 +90,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index, &env_stash, &env_filter, &active);
+                                handle(msg, &index, &env_stash, &env_filter, &active, helper_link.as_deref());
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -122,6 +124,7 @@ fn handle(
     env_stash: &EnvPreStash,
     env_filter: &shit_planner::EnvFilter,
     active: &ActiveCommands,
+    helper_link: Option<&HelperLink>,
 ) {
     let session = msg.session();
     let kind = msg.kind();
@@ -191,6 +194,21 @@ fn handle(
             if let Err(e) = index.put_command(&cmd) {
                 warn!(err = %e, "put_command failed");
             }
+            // S24.C: tell the privileged helper to start watching the
+            // command's process tree. The kqueue producer (FreeBSD)
+            // and the fanotify producer (Linux) both consume this.
+            if let Some(link) = helper_link {
+                let req = shit_proto::HelperRequest::WatchTree {
+                    root_pid: *pid,
+                    descendants_too: true,
+                    session: command.session,
+                    command_seq: command.seq,
+                    shell_kind: *shell_kind,
+                };
+                if let Err(e) = link.send_request(&req) {
+                    warn!(err = %e, "WatchTree dispatch to helper failed");
+                }
+            }
         }
         HookMessage::PostExec { seq, exit_code, .. } => {
             info!(%session, kind, seq, exit_code, "post-exec");
@@ -209,6 +227,19 @@ fn handle(
                 existing.exit_code = Some(*exit_code);
                 if let Err(e) = index.put_command(&existing) {
                     warn!(err = %e, "put_command (post) failed");
+                }
+            }
+            // S24.C: tell the helper to stop watching this command's
+            // tree. CapturedPreImage events for this (session, seq)
+            // that arrive after the helper acks UnwatchTree are
+            // dropped by the producer.
+            if let Some(link) = helper_link {
+                let req = shit_proto::HelperRequest::UnwatchTree {
+                    session,
+                    command_seq: *seq,
+                };
+                if let Err(e) = link.send_request(&req) {
+                    warn!(err = %e, "UnwatchTree dispatch to helper failed");
                 }
             }
         }

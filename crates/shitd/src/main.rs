@@ -20,6 +20,7 @@ mod net_track;
 mod pkg;
 mod proc_track;
 mod server;
+mod shim_listener;
 mod stats;
 mod svc_track;
 mod telemetry;
@@ -168,6 +169,69 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let blob_store = Arc::new(shit_store::BlobStore::open(&blobs_path)?);
     tracing::info!(path = %blobs_path.display(), "blob store opened");
 
+    // S24.A — spawn shit-helper and start its dispatch loop. Best-
+    // effort: if the helper binary isn't discoverable or the
+    // handshake fails, the daemon continues in helper-less mode
+    // (shell-hook journaling still works; capture-tier events just
+    // won't arrive). Off entirely when `SHIT_HELPER_DISABLED=1`.
+    let (helper_link_arc, helper_dispatch_handle): (
+        Option<Arc<helper_link::HelperLink>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) = if std::env::var("SHIT_HELPER_DISABLED").as_deref() == Ok("1") {
+        tracing::info!("SHIT_HELPER_DISABLED=1; skipping helper spawn");
+        (None, None)
+    } else {
+        match helper_link::discover_helper_bin() {
+            None => {
+                tracing::warn!(
+                    "shit-helper binary not found; daemon continues without capture tier. \
+                     Set SHIT_HELPER_BIN or install on PATH to enable."
+                );
+                (None, None)
+            }
+            Some(bin) => {
+                let helper_sock = cfg.state_dir.join("helper.sock");
+                let caps = shit_proto::HelperCaps::full();
+                match helper_link::spawn_and_handshake(&bin, &helper_sock, &cfg.state_dir, caps) {
+                    Ok(link) => {
+                        tracing::info!(
+                            helper_pid = link.helper_pid,
+                            kernel_tier = %link.kernel_tier,
+                            "shit-helper handshake complete"
+                        );
+                        stats.set_kernel_tier(&link.kernel_tier);
+                        let link = Arc::new(link);
+                        let dispatch_link = Arc::clone(&link);
+                        let dispatch_index = Arc::clone(&index);
+                        let dispatch_blob_store = Arc::clone(&blob_store);
+                        let dispatch_shutdown = Arc::clone(&shutdown);
+                        let handle = tokio::spawn(async move {
+                            if let Err(e) = helper_link::dispatch_loop(
+                                dispatch_link,
+                                dispatch_index,
+                                dispatch_blob_store,
+                                dispatch_shutdown,
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "helper dispatch loop exited with error");
+                            }
+                        });
+                        (Some(link), Some(handle))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            bin = %bin.display(),
+                            "helper handshake failed; daemon continues without capture tier"
+                        );
+                        (None, None)
+                    }
+                }
+            }
+        }
+    };
+
     let gc_signal = Arc::new(gc::GcSignal::new());
     let gc_handle = {
         let index = Arc::clone(&index);
@@ -287,12 +351,31 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         })
     };
 
+    // S24.D.2 — accept loop for the LD_PRELOAD shim's per-process UDS.
+    let shim_handle = {
+        let cfg = cfg.clone();
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            if let Err(e) = shim_listener::serve(&cfg, shutdown).await {
+                tracing::error!(err = %e, "shim listener exited");
+            }
+        })
+    };
+
     let stats_for_server = Arc::clone(&stats);
     let shutdown_for_server = Arc::clone(&shutdown);
     let env_stash_for_server = Arc::clone(&env_stash);
     let active_for_server = Arc::clone(&active);
+    let helper_link_for_server = helper_link_arc.clone();
     let result = tokio::select! {
-        r = server::serve(cfg, stats_for_server, index, env_stash_for_server, active_for_server) => r,
+        r = server::serve(
+            cfg,
+            stats_for_server,
+            index,
+            env_stash_for_server,
+            active_for_server,
+            helper_link_for_server,
+        ) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
             Ok(())
@@ -304,8 +387,12 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     };
 
     ctl_handle.abort();
+    shim_handle.abort();
     gc_handle.abort();
     pkg_janitor.abort();
+    if let Some(h) = helper_dispatch_handle {
+        h.abort();
+    }
     result
 }
 

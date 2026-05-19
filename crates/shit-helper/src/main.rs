@@ -17,6 +17,13 @@ use tokio::sync::Notify;
 
 #[cfg(target_os = "freebsd")]
 mod capsicum_bsd;
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+mod capture;
 mod cloud;
 mod container;
 mod crash;
@@ -695,17 +702,70 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         state
     });
 
+    // S24.B — BSD kqueue capture runtime. Spawn the pump + drain
+    // threads *before* sandbox entry so any future cap_enter (S24.F)
+    // sees the staging-dir fds already open.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    let bsd_capture: Option<capture::bsd::CaptureControl> = {
+        let staging_dir = cli.state_dir.join("helper-staging");
+        match capture::bsd::spawn(Arc::clone(&conn), staging_dir) {
+            Ok((ctrl, _join)) => {
+                tracing::info!("bsd capture runtime spawned");
+                Some(ctrl)
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "bsd capture runtime failed to start; continuing without it");
+                None
+            }
+        }
+    };
+
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
+
+    // S24.F — Capsicum capability mode. Off by default because
+    // register_subtree currently opens by absolute path, which
+    // cap_enter forbids. Gated on SHIT_CAPSICUM=1 so we can validate
+    // the call site incrementally before the dir-fd rewrite in S25.
+    #[cfg(target_os = "freebsd")]
+    if std::env::var("SHIT_CAPSICUM").as_deref() == Ok("1") {
+        match capsicum_bsd::enter_capability_mode() {
+            Ok(()) => {
+                tracing::info!("entered Capsicum capability mode (SHIT_CAPSICUM=1)");
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
+            }
+        }
+    }
 
     let request_conn = Arc::clone(&conn);
     #[cfg(target_os = "linux")]
     let request_state = fanotify_state.clone();
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    let request_bsd_capture = bsd_capture.clone();
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
             #[cfg(target_os = "linux")]
             request_state,
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            ))]
+            request_bsd_capture,
         )
     });
 
@@ -731,6 +791,27 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     drop(fanotify_state);
 
+    // S24.B — wind down the BSD capture pump. Best-effort; the JoinHandle
+    // was dropped at spawn time so we can't wait on it, but Drop on
+    // CaptureControl closes the control channel which signals the pump
+    // to exit on its next iteration.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    if let Some(ctrl) = &bsd_capture {
+        ctrl.shutdown();
+    }
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    drop(bsd_capture);
+
     Ok(())
 }
 
@@ -740,6 +821,13 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 fn request_loop(
     conn: Arc<ipc::Conn>,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    bsd_capture: Option<capture::bsd::CaptureControl>,
 ) -> anyhow::Result<()> {
     use shit_proto::{HelperRequest, HelperResponse};
 
@@ -792,7 +880,34 @@ fn request_loop(
                         "watch_tree ignored — no fanotify (degraded)"
                     );
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(any(
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                ))]
+                if let Some(ctrl) = &bsd_capture {
+                    ctrl.on_watch_tree(session, command_seq, root_pid);
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        "watch_tree dispatched to bsd capture"
+                    );
+                } else {
+                    tracing::debug!(
+                        %session,
+                        command_seq,
+                        "watch_tree ignored — no bsd capture (degraded)"
+                    );
+                }
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )))]
                 {
                     let _ = (root_pid, session, command_seq);
                 }
@@ -806,7 +921,23 @@ fn request_loop(
                     state.tree.lock().unwrap().unwatch(session, command_seq);
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(any(
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                ))]
+                if let Some(ctrl) = &bsd_capture {
+                    ctrl.on_unwatch_tree(session, command_seq);
+                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
+                }
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )))]
                 {
                     let _ = (session, command_seq);
                 }
