@@ -86,6 +86,38 @@ jobs:
             *)            bp=unknown ;;
           esac
           echo "tight_loop=benches/regression/baselines/$bp-tight-loop.json" >> "$GITHUB_OUTPUT"
+          echo "fanotify_capture=benches/regression/baselines/$bp-fanotify-capture.json" >> "$GITHUB_OUTPUT"
+
+      # L01 perf gate: fanotify-perm responder-loop baseline. Linux
+      # only — the bin's stub path makes macOS exit 0 with an empty
+      # RunResult, but the gate is gated to Linux to avoid wasting a
+      # no-op `compare` step on the macOS leg of the matrix.
+      - name: setcap helper for fanotify
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo setcap cap_sys_admin+ep ./target/release/fanotify-capture
+      - name: run fanotify-capture workload
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          ./target/release/fanotify-capture \
+            --n 500 \
+            --out target/bench/fanotify-capture.json
+          cat target/bench/fanotify-capture.json
+      - name: compare fanotify-capture vs CAPTURE_TO_ALLOW gate
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          # Relative-only until a baseline is committed. The
+          # absolute CAPTURE_TO_ALLOW gate (5ms median / 10ms p99)
+          # measures the L01 capture hot path — this workload only
+          # measures the kernel-roundtrip floor BELOW that path, so
+          # we use --no-budget to skip the absolute check until the
+          # bench is updated to drive the real capture handler.
+          # Relative regression detection vs the seeded baseline
+          # still applies and catches drift.
+          ./target/release/compare \
+            --current target/bench/fanotify-capture.json \
+            --baseline ${{ steps.baseline.outputs.fanotify_capture }} \
+            --gate capture \
+            --no-budget
 
       # Note: the `baseline` workload is the no-hook floor (raw
       # /bin/sh spawn cost). We do NOT gate it against SHELL_HOOK —

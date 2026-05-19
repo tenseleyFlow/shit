@@ -193,7 +193,8 @@ mod linux_impl {
                         std::mem::size_of::<libc::fanotify_response>(),
                     )
                 };
-                fan.write_all(resp_bytes).context("write fanotify_response")?;
+                fan.write_all(resp_bytes)
+                    .context("write fanotify_response")?;
                 let wrote_at = Instant::now();
                 if md.fd >= 0 {
                     unsafe { libc::close(md.fd) };
@@ -218,8 +219,7 @@ mod linux_impl {
 
     fn emit_skip(args: &Args, host_os: &str, host_arch: &str, reason: &str) -> Result<()> {
         eprintln!("fanotify-capture: skipping ({reason}) — run via setcap or sudo");
-        let r =
-            shit_regression_bench::summarize("fanotify-capture", host_os, host_arch, &[], 0);
+        let r = shit_regression_bench::summarize("fanotify-capture", host_os, host_arch, &[], 0);
         let json = shit_regression_bench::to_json(&r);
         match &args.out {
             Some(p) => std::fs::write(p, json)?,

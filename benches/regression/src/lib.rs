@@ -652,8 +652,18 @@ mod tests {
         // The 10ms target must stay strictly under the 50ms cliff so
         // a passing CAPTURE_TO_ALLOW run never approaches the kernel
         // overflow behaviour. Five-times margin is the design intent.
-        assert!(BudgetGate::CAPTURE_TO_ALLOW.p99_us_max * 5 <= BudgetGate::CAPTURE_KERNEL_DEADLINE.p99_us_max);
-        assert!(BudgetGate::CAPTURE_TO_ALLOW.median_us_max * 5 <= BudgetGate::CAPTURE_KERNEL_DEADLINE.median_us_max);
+        // const-block so a future budget move that breaks the invariant
+        // fails at compile time, not just at `cargo test`.
+        const _: () = {
+            assert!(
+                BudgetGate::CAPTURE_TO_ALLOW.p99_us_max * 5
+                    <= BudgetGate::CAPTURE_KERNEL_DEADLINE.p99_us_max
+            );
+            assert!(
+                BudgetGate::CAPTURE_TO_ALLOW.median_us_max * 5
+                    <= BudgetGate::CAPTURE_KERNEL_DEADLINE.median_us_max
+            );
+        };
     }
 
     #[test]
