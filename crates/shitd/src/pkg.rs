@@ -254,12 +254,16 @@ pub fn handle(
                 op: classify_op(&req.op_hint, &diff),
                 packages_before: pre.packages.clone(),
                 packages_after: req.packages.clone(),
-                // dnf ships its history transaction id under
-                // `dnf_history_id` (DR-26); other managers may carry a
-                // generic `repo_state`. Prefer the manager-specific key.
+                // Each manager carries its own transaction-id key.
+                // The planner uses (manager, repo_state_hint) to
+                // synthesize the right native-undo dispatch:
+                //   - dnf: `dnf_history_id` → `dnf history undo <id>` (DR-26)
+                //   - apt 3.2+: `apt_tx_id` → `apt history-rollback <id>` (C02.7)
+                //   - otherwise: generic `repo_state` (fallback to per-pkg synthesis)
                 repo_state_hint: req
                     .extras
                     .get("dnf_history_id")
+                    .or_else(|| req.extras.get("apt_tx_id"))
                     .or_else(|| req.extras.get("repo_state"))
                     .cloned(),
             };
