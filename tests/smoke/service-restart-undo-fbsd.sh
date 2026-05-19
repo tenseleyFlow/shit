@@ -76,22 +76,24 @@ if [ "${PRE_ACTIVE}" != "running" ]; then
 fi
 
 cleanup() {
-    # MUST call smoke_stop_shitd because we're overriding lib.sh's
-    # EXIT trap. Without it, shitd is orphaned and the CI action's
-    # SSH session waits for its inherited fds to close → 5-min hang.
+    # DIAGNOSTIC: log each step so we can see which one hangs in CI.
+    echo "[cleanup $(date -u +%H:%M:%S)] entered, rc=$?" >&2
+    echo "[cleanup $(date -u +%H:%M:%S)] calling smoke_stop_shitd" >&2
     smoke_stop_shitd 2>/dev/null || true
-    # Defensive restore: only invoke `service cron start` if cron
-    # isn't running. The smoke's undo path already restarts cron;
-    # this branch only fires when the smoke aborts before undo.
-    # Skipping the start when cron is alive avoids a CI-VM hang —
-    # `doas service cron start` for an already-running unit takes
-    # ~5 minutes under cross-platform-actions FreeBSD VMs (the rc
-    # script's already-running detection blocks for reasons we
-    # haven't fully root-caused; defaulting to skip is the
-    # honest answer).
+    echo "[cleanup $(date -u +%H:%M:%S)] smoke_stop_shitd returned" >&2
+    echo "[cleanup $(date -u +%H:%M:%S)] checking pgrep -q ${TARGET_UNIT}" >&2
     if ! pgrep -q "${TARGET_UNIT}"; then
+        echo "[cleanup $(date -u +%H:%M:%S)] cron not running; starting" >&2
         ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start </dev/null >/dev/null 2>&1 || true
+        echo "[cleanup $(date -u +%H:%M:%S)] service start returned" >&2
+    else
+        echo "[cleanup $(date -u +%H:%M:%S)] cron already running; skip" >&2
     fi
+    echo "[cleanup $(date -u +%H:%M:%S)] dumping ps -auxd" >&2
+    ps -auxd 2>&1 | tail -30 >&2 || true
+    echo "[cleanup $(date -u +%H:%M:%S)] dumping fstat for current shell" >&2
+    fstat -p $$ 2>&1 | head -20 >&2 || true
+    echo "[cleanup $(date -u +%H:%M:%S)] cleanup returning" >&2
 }
 trap cleanup EXIT
 
