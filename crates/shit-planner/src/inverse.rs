@@ -197,6 +197,29 @@ pub enum InverseOp {
         statements: Vec<String>,
         rollback_hint: RollbackHint,
     },
+    /// C06: append-only file truncate-back. Append undo doesn't need
+    /// the full pre-content blob — just the pre-existing length.
+    /// `pre_size` was captured by the shell redirect pre-stash before
+    /// `>>` opened the file; reverse is `truncate(path, pre_size)`.
+    FileExtend { path: PathBuf, truncate_to: u64 },
+    /// C06: shell-state diff between pre-exec and post-exec snapshots.
+    /// Reverse is an informational snippet the user sources (or, with
+    /// `shit undo --apply-shell-state`, queued via the bash/zsh
+    /// precmd mechanism). Fish always emits informational only.
+    /// Restores `cd`, `set -o` / `setopt`, alias defs, and function
+    /// bodies.
+    ShellStateRestore {
+        pwd_before: Option<PathBuf>,
+        opts_diff: Vec<OptDiff>,
+        aliases_diff: Vec<AliasDiff>,
+        funcs_diff: Vec<FuncDiff>,
+        /// Pre-rendered bash snippet. `None` when the originating
+        /// shell wasn't bash and rendering for cross-shell apply
+        /// would be lossy.
+        snippet_bash: Option<String>,
+        snippet_zsh: Option<String>,
+        snippet_fish: Option<String>,
+    },
     /// C04: container-runtime op reverse (docker / podman / compose).
     /// `captured_config` is the postcard-serialized `docker inspect` /
     /// `podman inspect` output (always present); `stash_image` is the
@@ -288,6 +311,36 @@ pub enum TerraformOp {
     StateRm,
     /// `terraform import`.
     Import,
+}
+
+/// C06: per-shell-option diff entry. `pre` is the value at PreBlock;
+/// `post` is the value at PostBlock. For boolean options (`set -o
+/// errexit`, bash's `set -o nounset`, etc.) the values are
+/// `"on"`/`"off"`. The renderer collapses to short-form snippets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptDiff {
+    pub name: String,
+    pub pre: String,
+    pub post: String,
+}
+
+/// C06: per-alias diff entry. `pre` is `None` if the alias didn't
+/// exist before the command; `post` is `None` if it was unset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasDiff {
+    pub name: String,
+    pub pre: Option<String>,
+    pub post: Option<String>,
+}
+
+/// C06: per-function diff entry. Bodies are captured up to
+/// `FUNC_BODY_MAX_BYTES` (the per-function size cap); larger bodies
+/// flag a warning and store `None` for that side of the diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuncDiff {
+    pub name: String,
+    pub pre: Option<String>,
+    pub post: Option<String>,
 }
 
 /// C04: container runtime discriminator. Docker and Podman share the
@@ -444,7 +497,8 @@ impl InverseOp {
             | Self::RestoreMetadata { path, .. }
             | Self::Unlink { path, .. }
             | Self::RecreatePath { path, .. }
-            | Self::CreateSymlink { path, .. } => Some(path),
+            | Self::CreateSymlink { path, .. }
+            | Self::FileExtend { path, .. } => Some(path),
             Self::Rename { to, .. } => Some(to),
             Self::SetEnv { .. }
             | Self::UnsetEnv { .. }
@@ -458,6 +512,7 @@ impl InverseOp {
             | Self::AwsReverse { .. }
             | Self::TerraformReverse { .. }
             | Self::ContainerRestore { .. }
+            | Self::ShellStateRestore { .. }
             | Self::DbNote { .. } => None,
         }
     }
@@ -480,7 +535,8 @@ impl InverseOp {
             | Self::Unlink { .. }
             | Self::RecreatePath { .. }
             | Self::Rename { .. }
-            | Self::CreateSymlink { .. } => InverseTier::Files,
+            | Self::CreateSymlink { .. }
+            | Self::FileExtend { .. } => InverseTier::Files,
             Self::SetEnv { .. } | Self::UnsetEnv { .. } => InverseTier::Env,
             Self::PackageRollback { .. } => InverseTier::Packages,
             Self::NetworkRollback { .. } => InverseTier::Network,
@@ -492,6 +548,7 @@ impl InverseOp {
             | Self::AwsReverse { .. }
             | Self::TerraformReverse { .. } => InverseTier::Cloud,
             Self::ContainerRestore { .. } => InverseTier::Container,
+            Self::ShellStateRestore { .. } => InverseTier::ShellState,
             Self::DbNote { .. } => InverseTier::Database,
         }
     }
@@ -508,6 +565,7 @@ pub enum InverseTier {
     Descriptor,
     Cloud,
     Container,
+    ShellState,
     Database,
 }
 
@@ -873,5 +931,105 @@ mod tests {
     fn container_runtime_as_str_matches_binary_name() {
         assert_eq!(ContainerRuntime::Docker.as_str(), "docker");
         assert_eq!(ContainerRuntime::Podman.as_str(), "podman");
+    }
+
+    // ----- C06.1: shell-state + file-extend -----
+
+    #[test]
+    fn file_extend_classifies_as_files_tier_and_targets_path() {
+        let op = InverseOp::FileExtend {
+            path: PathBuf::from("/var/log/app.log"),
+            truncate_to: 4096,
+        };
+        assert_eq!(op.tier(), InverseTier::Files);
+        assert_eq!(
+            op.primary_path(),
+            Some(std::path::Path::new("/var/log/app.log"))
+        );
+        assert!(op.primary_inode().is_none());
+    }
+
+    #[test]
+    fn file_extend_roundtrips_through_postcard() {
+        let op = InverseOp::FileExtend {
+            path: PathBuf::from("/tmp/x.log"),
+            truncate_to: 1234,
+        };
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    fn sample_shell_state() -> InverseOp {
+        InverseOp::ShellStateRestore {
+            pwd_before: Some(PathBuf::from("/home/u/project")),
+            opts_diff: vec![OptDiff {
+                name: "errexit".into(),
+                pre: "off".into(),
+                post: "on".into(),
+            }],
+            aliases_diff: vec![AliasDiff {
+                name: "ll".into(),
+                pre: Some("ls -la".into()),
+                post: Some("ls -laG".into()),
+            }],
+            funcs_diff: vec![FuncDiff {
+                name: "greet".into(),
+                pre: None,
+                post: Some("greet() { echo hi; }".into()),
+            }],
+            snippet_bash: Some("cd /home/u/project\nset +o errexit\n".into()),
+            snippet_zsh: None,
+            snippet_fish: None,
+        }
+    }
+
+    #[test]
+    fn shell_state_restore_classifies_as_shell_state_tier() {
+        let op = sample_shell_state();
+        assert_eq!(op.tier(), InverseTier::ShellState);
+        assert!(op.primary_path().is_none());
+        assert!(op.primary_inode().is_none());
+    }
+
+    #[test]
+    fn shell_state_restore_roundtrips_through_postcard() {
+        let op = sample_shell_state();
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    #[test]
+    fn shell_state_diff_types_roundtrip_independently() {
+        // Each diff sub-type is independently postcard-serializable
+        // so the daemon can stash the diff in a separate column from
+        // the pre-rendered snippets.
+        let opt = OptDiff {
+            name: "noclobber".into(),
+            pre: "off".into(),
+            post: "on".into(),
+        };
+        let bytes = postcard::to_allocvec(&opt).unwrap();
+        let back: OptDiff = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(opt, back);
+
+        let alias = AliasDiff {
+            name: "g".into(),
+            pre: None,
+            post: Some("git".into()),
+        };
+        let bytes = postcard::to_allocvec(&alias).unwrap();
+        let back: AliasDiff = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(alias, back);
+
+        let func = FuncDiff {
+            name: "f".into(),
+            pre: Some("f() { :; }".into()),
+            post: None,
+        };
+        let bytes = postcard::to_allocvec(&func).unwrap();
+        let back: FuncDiff = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(func, back);
     }
 }
