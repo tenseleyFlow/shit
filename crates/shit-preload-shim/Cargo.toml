@@ -21,3 +21,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = { workspace = true }
+# Pulled in only by the rlib face of the crate for the config loader.
+# The cdylib hot path doesn't touch serde / toml — they're behind the
+# `install_config::load_*` rlib-only entry points.
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
