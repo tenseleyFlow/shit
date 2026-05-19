@@ -19,7 +19,6 @@ use tokio::sync::Notify;
 mod capsicum_bsd;
 mod crash;
 mod db;
-mod desc;
 #[cfg(target_os = "linux")]
 mod ebpf;
 #[cfg(target_os = "linux")]

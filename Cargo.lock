@@ -1667,6 +1667,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shit-capture",
+ "shit-desc",
  "shit-planner",
  "shit-proto",
  "shit-shell",
@@ -1691,6 +1692,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "shit-desc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
