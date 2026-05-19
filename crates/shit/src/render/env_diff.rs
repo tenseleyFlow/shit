@@ -115,13 +115,7 @@ fn format_row(
     let pre_disp = pre.map(value_for_display);
     let post_disp = post.map(value_for_display);
     let mut line = String::with_capacity(64);
-    let _ = write!(
-        line,
-        "  {sym} {name:<width$}  ",
-        sym = sym,
-        name = name,
-        width = pad
-    );
+    let _ = write!(line, "  {sym} {name:<pad$}  ");
     match (pre_disp, post_disp) {
         (None, Some(p)) => line.push_str(&p),
         (Some(p), None) => line.push_str(&p),

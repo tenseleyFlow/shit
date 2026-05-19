@@ -338,7 +338,7 @@ mod tests {
         let post = env(&[("PATH", "/usr/bin"), ("OLDPWD", "/home")]);
         let d = diff_env_maps(&pre, &post, &EnvFilter::default());
         // OLDPWD must NOT appear in modified.
-        assert!(d.modified.is_empty(), "{:?}", d);
+        assert!(d.modified.is_empty(), "{d:?}");
     }
 
     #[test]

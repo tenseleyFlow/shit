@@ -80,8 +80,8 @@ pub fn apply_prompt(risk: Risk) -> Result<ApplyDecision, PromptError> {
     let default_marker = if matches!(risk, Risk::Low) { "Y" } else { "N" };
     // Lowercase non-default options.
     let prompt = match risk {
-        Risk::Low => format!("Apply? [{}/n/d/e/q] ", default_marker),
-        Risk::High => format!("Apply? [y/{}/d/e/q] ", default_marker),
+        Risk::Low => format!("Apply? [{default_marker}/n/d/e/q] "),
+        Risk::High => format!("Apply? [y/{default_marker}/d/e/q] "),
     };
     eprint!("{prompt}");
     std::io::stderr().flush()?;
