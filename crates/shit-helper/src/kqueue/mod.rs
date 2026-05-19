@@ -11,10 +11,9 @@
 //!
 //! Spec: `.docs/sprints/S10-bsd-tier.md`.
 //!
-//! **Stage 1**: only the skeleton + init wrapper are real; vnode/proc
-//! registration are stubs that compile cleanly but don't yet wire up
-//! to the daemon's tree-tracking. Runtime validation deferred until
-//! a FreeBSD VM target is ready, paired with S20's security audit.
+//! **S23.1 (DR-05)**: vnode subtree registration is real; proc and the
+//! drain loop are still stubs that land in S23.2 + S23.3. Runtime is
+//! validated on the FreeBSD VM under `tools/freebsd-vm/`.
 //!
 //! **Visibility:** the entire module is gated to BSD targets at the
 //! parent (`crate::main`). Non-BSD builds see no kqueue symbols.
@@ -43,4 +42,6 @@ pub use error::KqueueError;
 pub use init::{KqueueFd, init};
 pub use proc::{ProcEventKind, watch_pid};
 pub use tree::TrackedTree;
-pub use vnode::{VnodeEventKind, watch_path};
+pub use vnode::{
+    DEFAULT_DEPTH_LIMIT, TrackedSubtree, VNODE_FFLAGS, VnodeEventKind, register_subtree, watch_path,
+};
