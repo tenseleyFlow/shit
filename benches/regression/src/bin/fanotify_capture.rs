@@ -122,7 +122,7 @@ mod linux_impl {
             libc::fanotify_mark(
                 fan_fd.as_raw_fd(),
                 libc::FAN_MARK_ADD,
-                libc::FAN_OPEN_PERM as u64,
+                libc::FAN_OPEN_PERM,
                 libc::AT_FDCWD,
                 cpath.as_ptr(),
             )
