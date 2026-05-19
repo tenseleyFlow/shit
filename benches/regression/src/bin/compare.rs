@@ -79,10 +79,7 @@ fn main() -> Result<std::process::ExitCode> {
             Some(from_json(&raw)?)
         }
         Some(p) => {
-            eprintln!(
-                "warning: baseline {:?} not present; falling back to absolute-budget only",
-                p
-            );
+            eprintln!("warning: baseline {p:?} not present; falling back to absolute-budget only");
             None
         }
         None => None,
