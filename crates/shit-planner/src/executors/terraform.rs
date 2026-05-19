@@ -105,9 +105,8 @@ impl<R: TerraformRunner> InverseOpExecutor for TerraformExecutor<R> {
             TerraformOp::StateRm | TerraformOp::Import => {
                 return ExecutionOutcome::Skipped {
                     reason: format!(
-                        "terraform {:?} undo requires manual state surgery; see `shit show` \
-                         for the captured pre-state",
-                        tf_op
+                        "terraform {tf_op:?} undo requires manual state surgery; see `shit show` \
+                         for the captured pre-state"
                     ),
                 };
             }
