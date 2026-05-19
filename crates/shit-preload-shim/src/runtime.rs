@@ -128,14 +128,19 @@ pub fn injection_env(lib_path: &str, sock_path: &str) -> Vec<(&'static str, Stri
     ]
 }
 
+/// `std::env` reads/writes process-wide globals; tests that touch them
+/// must serialise to avoid cross-test poisoning. The lock is exported
+/// `pub(crate)` so sibling test modules (currently `dispatch::tests`)
+/// share a single critical section with `runtime::tests`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// `std::env` reads/writes process-wide globals; tests that
-    /// touch them must serialise to avoid cross-test poisoning.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Local alias to keep the test bodies readable.
+    static ENV_LOCK: &std::sync::Mutex<()> = &TEST_ENV_LOCK;
 
     #[test]
     fn is_active_returns_true_only_when_env_equals_one() {
