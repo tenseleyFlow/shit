@@ -80,11 +80,18 @@ cleanup() {
     # EXIT trap. Without it, shitd is orphaned and the CI action's
     # SSH session waits for its inherited fds to close → 5-min hang.
     smoke_stop_shitd 2>/dev/null || true
-    # Best-effort restore. `</dev/null` is load-bearing: cron's rc.d
-    # script (or one of its children) may read stdin under some
-    # FreeBSD CI VM image configurations, blocking the trap for
-    # ~5 min until the smoke driver's `timeout` fires.
-    ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start </dev/null >/dev/null 2>&1 || true
+    # Defensive restore: only invoke `service cron start` if cron
+    # isn't running. The smoke's undo path already restarts cron;
+    # this branch only fires when the smoke aborts before undo.
+    # Skipping the start when cron is alive avoids a CI-VM hang —
+    # `doas service cron start` for an already-running unit takes
+    # ~5 minutes under cross-platform-actions FreeBSD VMs (the rc
+    # script's already-running detection blocks for reasons we
+    # haven't fully root-caused; defaulting to skip is the
+    # honest answer).
+    if ! pgrep -q "${TARGET_UNIT}"; then
+        ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start </dev/null >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
