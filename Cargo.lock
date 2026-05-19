@@ -1669,6 +1669,7 @@ dependencies = [
  "shit-capture",
  "shit-desc",
  "shit-planner",
+ "shit-preload-shim",
  "shit-proto",
  "shit-shell",
  "tempfile",
@@ -1756,6 +1757,9 @@ name = "shit-preload-shim"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

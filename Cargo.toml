@@ -58,6 +58,7 @@ bitflags = "2.6"
 
 shit-desc = { path = "crates/shit-desc" }
 shit-planner = { path = "crates/shit-planner" }
+shit-preload-shim = { path = "crates/shit-preload-shim" }
 shit-proto = { path = "crates/shit-proto" }
 shit-store = { path = "crates/shit-store" }
 shit-capture = { path = "crates/shit-capture" }
