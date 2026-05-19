@@ -1,20 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! pfctl inspector (S17.7).
+//! pfctl inspector (S17.7, refined B01).
 //!
-//! pf state lives across several query commands; we capture all of
-//! them and concatenate. The dump is delineated by section markers
-//! the executor splits on:
+//! The captured dump must be reload-able by `pfctl -f` so the
+//! executor can restore prior state via `doas /sbin/pfctl -f
+//! <captured.dump>`. That constrains us to sections pfctl emits in
+//! its own parseable format:
+//!
+//! - `pfctl -sr -a '*'` — filter rules, walks all anchors. Output
+//!   is pf.conf syntax (each anchor wrapped in `anchor "name" { … }`).
+//! - `pfctl -sn` — translation (nat/rdr) rules. pf.conf syntax.
+//!
+//! Earlier versions of this inspector also captured `pfctl -sa`
+//! ("show all") and `pfctl -s tables -v` — but `-sa` emits a
+//! human-readable diagnostic (FILTER RULES:, TIMEOUTS:, STATES:, …)
+//! that pfctl CANNOT reload, and `-s tables` is an OpenBSD-ism that
+//! FreeBSD's pfctl rejects with "Unknown show modifier". Dropped
+//! both in B01; tables are uncommonly mutated and are reachable via
+//! anchors when they are. Live state (STATES:, LIMITS:) is
+//! operational, not configuration — not part of undo.
+//!
+//! The dump is delineated by section markers the executor strips
+//! (pfctl accepts `#`-prefixed comments in pf.conf):
 //!
 //! ```text
 //! # SHIT pfctl section: rules
-//! ...output of pfctl -s rules -a '*'...
+//! ...output of pfctl -sr -a '*'...
 //! # SHIT pfctl section: nat
-//! ...output of pfctl -s nat...
-//! # SHIT pfctl section: tables
-//! ...output of pfctl -s tables -v...
-//! # SHIT pfctl section: all
-//! ...output of pfctl -sa...
+//! ...output of pfctl -sn...
 //! ```
 //!
 //! `pfctl -s rules` requires root on BSD (reads /dev/pf, which is
@@ -40,10 +53,8 @@ impl NetInspector for PfctlInspector {
     }
     fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         let sections: &[(&str, &[&str])] = &[
-            ("rules", &["-s", "rules", "-a", "*"]),
-            ("nat", &["-s", "nat"]),
-            ("tables", &["-s", "tables", "-v"]),
-            ("all", &["-sa"]),
+            ("rules", &["-sr", "-a", "*"]),
+            ("nat", &["-sn"]),
         ];
         let mut out = Vec::new();
         for (name, args) in sections {
