@@ -74,7 +74,12 @@ smoke_start_shitd() {
         smoke_fail "shitd binary missing at ${shitd}"
     fi
     smoke_log "starting shitd (state=${XDG_STATE_HOME}/shit)"
-    "${shitd}" --foreground >"${SHIT_SMOKE_TMP}/shitd.log" 2>&1 &
+    # Pin RUST_LOG=debug for the daemon so per-tier handlers' debug
+    # breadcrumbs (`net-pre stashed`, `svc-pre stashed`, etc.) land
+    # in the JSON log — they're the most reliable signal that a
+    # helper-side send_event reached the daemon at all.
+    RUST_LOG="${SHIT_SMOKE_RUST_LOG:-debug}" \
+        "${shitd}" --foreground >"${SHIT_SMOKE_TMP}/shitd.log" 2>&1 &
     SHITD_PID=$!
     SHIT_SMOKE_PIDS+=("${SHITD_PID}")
     for _ in $(seq 1 100); do
