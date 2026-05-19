@@ -280,9 +280,21 @@ jobs:
             echo "===== install deps ====="
             sudo pkg install -y rust gmake python3 sqlite3 doas jq
 
-            echo "===== configure doas (permit nopass :wheel) ====="
-            echo 'permit nopass :wheel' | sudo tee /usr/local/etc/doas.conf >/dev/null
+            echo "===== configure doas (permit the CI runner user directly) ====="
+            # The cross-platform-actions VM runs commands as a user
+            # that's NOT in `wheel`, so `permit nopass :wheel` doesn't
+            # apply. Grant the current user explicitly.
+            CI_USER="$(id -un)"
+            echo "  user: ${CI_USER}"
+            printf 'permit nopass %s\npermit nopass :wheel\n' "${CI_USER}" \
+              | sudo tee /usr/local/etc/doas.conf >/dev/null
             sudo chmod 0640 /usr/local/etc/doas.conf
+            # Verify doas actually works before continuing.
+            doas /sbin/sysctl -n kern.ostype || {
+              echo "FAIL: doas misconfigured; cat /usr/local/etc/doas.conf:"
+              sudo cat /usr/local/etc/doas.conf
+              exit 1
+            }
 
             echo "===== build release binaries ====="
             cargo build --release \
