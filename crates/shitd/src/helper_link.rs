@@ -487,6 +487,27 @@ fn dispatch_response(
                 tracing::error!(error = %e, %session, seq, "failed to journal TreeMutation");
             }
         }
+        HelperResponse::CapturedMetadataChange {
+            session,
+            seq,
+            dev,
+            inode,
+            path,
+            before,
+            after,
+            ts_unix_nanos,
+        } => {
+            if let Err(e) = handle_metadata_change(
+                session, seq, dev, inode, path, before, after, ts_unix_nanos, index,
+            ) {
+                tracing::error!(
+                    error = %e,
+                    %session,
+                    seq,
+                    "failed to journal CapturedMetadataChange"
+                );
+            }
+        }
         other => {
             tracing::trace!(
                 ?other,
@@ -602,6 +623,56 @@ struct CapturedPreImageArgs {
     mtime_unix_nanos: i128,
     is_delete: bool,
     staging: OwnedFd,
+}
+
+/// S29.3 — convert a wire `CapturedMetadataChange` into a planner
+/// `MetadataChange` capture event and journal it. Idempotence is not
+/// needed here (no race-prone duplication path); a single NOTE_ATTRIB
+/// produces a single emission on the helper side.
+#[allow(clippy::too_many_arguments)]
+fn handle_metadata_change(
+    session: uuid::Uuid,
+    seq: u64,
+    dev: u64,
+    inode: u64,
+    path: Option<String>,
+    before: shit_proto::FileMetadataWire,
+    after: shit_proto::FileMetadataWire,
+    _ts_unix_nanos: u64,
+    index: &Index,
+) -> Result<(), HelperLinkError> {
+    use shit_planner::metadata::FileMetadata;
+    use std::collections::BTreeMap;
+    fn convert(m: shit_proto::FileMetadataWire) -> FileMetadata {
+        FileMetadata {
+            mode: m.mode,
+            uid: m.uid,
+            gid: m.gid,
+            size: m.size,
+            mtime_unix_nanos: m.mtime_unix_nanos,
+            xattrs: BTreeMap::new(),
+            acl: None,
+        }
+    }
+    let inode_ref = InodeRef::new(dev, inode);
+    let path_buf: std::path::PathBuf = path.unwrap_or_default().into();
+    let ts = crate::server::next_ts();
+    let event = CaptureEvent {
+        id: EventId(0),
+        command: CommandId { session, seq },
+        ts,
+        partial: false,
+        kind: CaptureEventKind::MetadataChange {
+            inode: inode_ref,
+            path: path_buf,
+            before: convert(before),
+            after: convert(after),
+        },
+    };
+    index.put_event(&event).map_err(|e| {
+        HelperLinkError::Io(std::io::Error::other(format!("put_event (meta): {e}")))
+    })?;
+    Ok(())
 }
 
 fn handle_captured_pre_image(
