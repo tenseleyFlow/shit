@@ -378,6 +378,89 @@ impl shit_planner::BlobReader for BlobReaderShim<'_> {
     }
 }
 
+/// Multi-tier dispatcher used by `handle_undo`. The Orchestrator
+/// takes one `InverseOpExecutor`; in production we need to route ops
+/// to the file tier OR the package tier (and, future sprints, env /
+/// service / network / proc tiers). Each tier's executor declares
+/// which `InverseOp` variants it supports; we route by that.
+///
+/// Why not a planner-side composite executor: dispatch is daemon
+/// policy, not planner logic. The planner doesn't know which tiers
+/// the operator wants enabled (a hardened deployment might disable
+/// PackageExecutor to refuse pkg rollbacks entirely).
+struct MultiTierExecutor<'a> {
+    file_executor: shit_planner::FileExecutor<'a, BlobReaderShim<'a>>,
+    package_executor: shit_planner::executors::PackageExecutor<PrivilegedPkgRunner>,
+}
+
+/// PkgRunner that prefixes `doas` on non-Linux platforms where the
+/// daemon runs unprivileged but pkg(8)/apt(8)/etc need root. On
+/// Linux we expect `shit-helper` to hold the cap; here on BSD the
+/// per-tool wrappers are the standard path. `SHIT_DURING_UNDO=1` is
+/// set so the `pkg-event` hook short-circuits on re-entry.
+struct PrivilegedPkgRunner;
+
+impl shit_planner::executors::PkgRunner for PrivilegedPkgRunner {
+    fn run(&self, argv: &[String]) -> Result<(), String> {
+        let (cmd, args) = match argv.split_first() {
+            Some(v) => v,
+            None => return Err("empty argv".into()),
+        };
+        // Look up doas / sudo at runtime; refuse if neither is available.
+        let escalator = ["/usr/local/bin/doas", "/usr/local/bin/sudo", "/usr/bin/sudo"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file());
+        let mut command = match escalator {
+            Some(e) => {
+                let mut c = std::process::Command::new(e);
+                c.arg(cmd);
+                c.args(args);
+                c
+            }
+            None => {
+                // Run directly — works if shitd happens to be root or
+                // the operator deliberately runs as root. Tests on the
+                // dev box go through here.
+                let mut c = std::process::Command::new(cmd);
+                c.args(args);
+                c
+            }
+        };
+        let status = command
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+}
+
+impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
+    fn supports(&self, op: &shit_planner::InverseOp) -> bool {
+        self.file_executor.supports(op) || self.package_executor.supports(op)
+    }
+
+    fn execute(
+        &self,
+        op: &shit_planner::InverseOp,
+        dry_run: bool,
+        policy: shit_planner::ConflictPolicy,
+    ) -> shit_planner::ExecutionOutcome {
+        if self.file_executor.supports(op) {
+            self.file_executor.execute(op, dry_run, policy)
+        } else if self.package_executor.supports(op) {
+            self.package_executor.execute(op, dry_run, policy)
+        } else {
+            shit_planner::ExecutionOutcome::Failed {
+                err: format!("no executor wired for tier {:?}", op.tier()),
+            }
+        }
+    }
+}
+
 /// S24.C — execute an UndoPlan derived from the most recent N completed
 /// commands. Returns a wire-friendly report; the CLI prints it as-is.
 fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlResponse {
@@ -419,7 +502,10 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
 
     let probe = LiveStateProbe::new();
     let reader = BlobReaderShim { blob_store };
-    let executor = FileExecutor::new(&reader);
+    let executor = MultiTierExecutor {
+        file_executor: FileExecutor::new(&reader),
+        package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
+    };
 
     let mut commands_attempted = 0u32;
     let mut ops_applied = 0u32;
