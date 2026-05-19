@@ -20,6 +20,7 @@ mod net_track;
 mod pkg;
 mod proc_track;
 mod server;
+mod shim_listener;
 mod stats;
 mod svc_track;
 mod telemetry;
@@ -350,6 +351,17 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         })
     };
 
+    // S24.D.2 — accept loop for the LD_PRELOAD shim's per-process UDS.
+    let shim_handle = {
+        let cfg = cfg.clone();
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            if let Err(e) = shim_listener::serve(&cfg, shutdown).await {
+                tracing::error!(err = %e, "shim listener exited");
+            }
+        })
+    };
+
     let stats_for_server = Arc::clone(&stats);
     let shutdown_for_server = Arc::clone(&shutdown);
     let env_stash_for_server = Arc::clone(&env_stash);
@@ -375,6 +387,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     };
 
     ctl_handle.abort();
+    shim_handle.abort();
     gc_handle.abort();
     pkg_janitor.abort();
     if let Some(h) = helper_dispatch_handle {
