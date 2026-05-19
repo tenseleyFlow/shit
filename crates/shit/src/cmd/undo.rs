@@ -117,46 +117,55 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("force without --yes"));
     }
 
-    // DR-17: compile --paths filters here so a malformed pattern
-    // fails the command before any daemon round-trip. The compiled
-    // GlobSet is what the orchestrator's `with_paths_filter`
-    // consumes once the daemon-fetch path lights up.
-    let paths_filter = match shit_planner::compile_paths_filter(&args.paths) {
-        Ok(set) => set,
-        Err(e) => {
-            eprintln!("{e}");
-            return Err(anyhow::anyhow!("invalid --paths pattern"));
-        }
-    };
+    // Compile --paths filters here so a malformed pattern fails before
+    // we round-trip the daemon. The compiled set is then ignored — the
+    // daemon recompiles from the raw strings itself. We do this client
+    // side first because the error message is friendlier.
+    if let Err(e) = shit_planner::compile_paths_filter(&args.paths) {
+        eprintln!("{e}");
+        return Err(anyhow::anyhow!("invalid --paths pattern"));
+    }
 
-    // Stage 1: print a clear status message describing what would happen.
-    // Real plumbing (daemon → plan fetch → orchestrator.run) lands once
-    // the runtime capture pipeline is wired (DR-* items in
-    // .docs/sprints/DEFERRED-RUNTIME.md).
-    let policy: ConflictPolicy = args.on_conflict.into();
-    println!("shit undo — stage 1 (executor + orchestrator landed; daemon plumbing pending)");
-    println!("  steps:       {}", args.steps);
-    println!("  dry-run:     {}", args.dry_run);
-    println!("  on-conflict: {policy:?}");
-    println!("  raw:         {}", args.raw);
-    println!(
-        "  paths:       {:?}{}",
-        args.paths,
-        if paths_filter.is_some() {
-            " (compiled)"
-        } else {
-            ""
+    let policy_wire = match args.on_conflict {
+        ConflictPolicyArg::Abort => shit_proto::ConflictPolicyWire::Abort,
+        ConflictPolicyArg::Skip => shit_proto::ConflictPolicyWire::Skip,
+        ConflictPolicyArg::Force => shit_proto::ConflictPolicyWire::Force,
+    };
+    let req = shit_proto::CtlRequest::Undo(shit_proto::UndoRequest {
+        steps: args.steps,
+        dry_run: args.dry_run,
+        on_conflict: policy_wire,
+        paths: args.paths.clone(),
+    });
+
+    let ctl_path = args
+        .ctl_sock
+        .clone()
+        .unwrap_or_else(crate::paths::default_ctl_socket_path);
+    let resp = crate::cmd::ctl_client::call(&ctl_path, &req)
+        .map_err(|e| anyhow::anyhow!("daemon call failed: {e:?}"))?;
+
+    match resp {
+        shit_proto::CtlResponse::UndoReport(report) => {
+            println!("{}", report.summary);
+            if !report.detail_lines.is_empty() {
+                println!();
+                for line in &report.detail_lines {
+                    println!("  {line}");
+                }
+            }
+            // Exit non-zero when anything failed/conflicted so scripts
+            // and the smoke matrix get an actionable status.
+            if report.ops_failed > 0 || report.ops_conflicted > 0 {
+                return Err(anyhow::anyhow!(
+                    "undo: {} failed, {} conflicted",
+                    report.ops_failed,
+                    report.ops_conflicted,
+                ));
+            }
+            Ok(())
         }
-    );
-    println!();
-    println!(
-        "The S11 executor pipeline is in place: \
-         FileExecutor + Orchestrator + ExecLog all work against an UndoPlan."
-    );
-    println!(
-        "The daemon-side plan-fetch endpoint that supplies the plan to this \
-         command is on the S12 / runtime-capture path; see \
-         .docs/sprints/DEFERRED-RUNTIME.md for tracking."
-    );
-    Ok(())
+        shit_proto::CtlResponse::Error(msg) => Err(anyhow::anyhow!("daemon error: {msg}")),
+        other => Err(anyhow::anyhow!("unexpected ctl response: {other:?}")),
+    }
 }
