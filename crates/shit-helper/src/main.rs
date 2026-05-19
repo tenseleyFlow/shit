@@ -1061,31 +1061,25 @@ fn request_loop(
                     // unmark cleanly on command end.
                     let cwd_link = format!("/proc/{root_pid}/cwd");
                     match std::fs::read_link(&cwd_link) {
-                        Ok(cwd) => {
-                            match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
-                                Ok(()) => {
-                                    state
-                                        .marked_paths
-                                        .lock()
-                                        .unwrap()
-                                        .insert(cmd, cwd.clone());
-                                    tracing::info!(
-                                        %session,
-                                        command_seq,
-                                        root_pid,
-                                        cwd = %cwd.display(),
-                                        "watch_tree registered + cwd marked"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        err = %e,
-                                        cwd = %cwd.display(),
-                                        "mark_dir_for_capture failed; tree tracked but no events will fire"
-                                    );
-                                }
+                        Ok(cwd) => match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
+                            Ok(()) => {
+                                state.marked_paths.lock().unwrap().insert(cmd, cwd.clone());
+                                tracing::info!(
+                                    %session,
+                                    command_seq,
+                                    root_pid,
+                                    cwd = %cwd.display(),
+                                    "watch_tree registered + cwd marked"
+                                );
                             }
-                        }
+                            Err(e) => {
+                                tracing::warn!(
+                                    err = %e,
+                                    cwd = %cwd.display(),
+                                    "mark_dir_for_capture failed; tree tracked but no events will fire"
+                                );
+                            }
+                        },
                         Err(e) => {
                             tracing::warn!(
                                 err = %e,

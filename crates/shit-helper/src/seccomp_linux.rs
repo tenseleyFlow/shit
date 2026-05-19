@@ -109,10 +109,10 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     // allowed, any thread spawn post-sandbox (tokio's spawn_blocking,
     // blake3 worker, etc.) SIGSYS-kills the helper. Surfaced by L01
     // chunk 5's first end-to-end run on hasu.
-    libc::SYS_madvise, // stack page hints (MADV_DONTFORK etc.)
-    libc::SYS_clone3,  // primary thread-spawn syscall on glibc >= 2.34
-    libc::SYS_clone,   // fallback when clone3 returns ENOSYS
-    libc::SYS_rseq,    // restartable sequences (kernel >= 4.18)
+    libc::SYS_madvise,         // stack page hints (MADV_DONTFORK etc.)
+    libc::SYS_clone3,          // primary thread-spawn syscall on glibc >= 2.34
+    libc::SYS_clone,           // fallback when clone3 returns ENOSYS
+    libc::SYS_rseq,            // restartable sequences (kernel >= 4.18)
     libc::SYS_set_robust_list, // robust futex list init per-thread
     libc::SYS_clock_gettime,
     libc::SYS_clock_nanosleep,
