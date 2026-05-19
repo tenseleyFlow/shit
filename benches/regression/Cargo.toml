@@ -42,8 +42,21 @@ path = "src/bin/baseline.rs"
 name = "compare"
 path = "src/bin/compare.rs"
 
+# Linux-only fanotify-perm responder workload. The bin exists on all
+# platforms (builds with an `eprintln!("not Linux") + exit 0` stub)
+# so CI workflows can invoke it unconditionally; the real measurement
+# only runs on Linux.
+[[bin]]
+name = "fanotify-capture"
+path = "src/bin/fanotify_capture.rs"
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "ioctl", "process", "signal"] }
+tempfile = "3.10"

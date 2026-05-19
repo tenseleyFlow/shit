@@ -56,6 +56,10 @@ enum GateChoice {
     ShellHook,
     AuthEvent,
     PostexecAck,
+    /// L01 fanotify-perm capture-to-ALLOW hot path.
+    Capture,
+    /// Kernel-overflow deadline (panic-grade; reserved for stress harnesses).
+    CaptureKernelDeadline,
 }
 
 impl GateChoice {
@@ -64,6 +68,8 @@ impl GateChoice {
             GateChoice::ShellHook => BudgetGate::SHELL_HOOK,
             GateChoice::AuthEvent => BudgetGate::AUTH_EVENT,
             GateChoice::PostexecAck => BudgetGate::POSTEXEC_ACK,
+            GateChoice::Capture => BudgetGate::CAPTURE_TO_ALLOW,
+            GateChoice::CaptureKernelDeadline => BudgetGate::CAPTURE_KERNEL_DEADLINE,
         }
     }
 }
