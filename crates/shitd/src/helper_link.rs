@@ -115,6 +115,18 @@ impl HelperLink {
     }
 }
 
+/// Translate "peer is gone" errnos (ECONNRESET, EPIPE) into the
+/// dispatch loop's clean-exit signal. The kernel can deliver these on
+/// SEQPACKET/STREAM when the helper exits ungracefully (e.g. signaled)
+/// instead of the EOF that orderly shutdown produces. Both mean the
+/// same thing to us — there is no one to read from anymore.
+fn map_peer_gone(e: nix::Error) -> HelperLinkError {
+    match e {
+        nix::Error::ECONNRESET | nix::Error::EPIPE => HelperLinkError::HelperExited,
+        other => HelperLinkError::Nix(other),
+    }
+}
+
 fn recv_frame_with_fd_blocking(
     fd: std::os::fd::RawFd,
 ) -> Result<(Vec<u8>, Option<OwnedFd>), HelperLinkError> {
@@ -122,7 +134,8 @@ fn recv_frame_with_fd_blocking(
     let mut buf = vec![0u8; shit_proto::MAX_HELPER_FRAME_SIZE];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
     let mut cmsg_buf: Vec<u8> = Vec::with_capacity(cmsg_space::<std::os::fd::RawFd>());
-    let result = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())?;
+    let result = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
+        .map_err(map_peer_gone)?;
     let n = result.bytes;
     if n == 0 {
         return Err(HelperLinkError::HelperExited);
@@ -159,7 +172,8 @@ fn recv_frame_with_fd_blocking(
             while buf.len() < frame_len {
                 let needed = frame_len - buf.len();
                 let mut chunk = vec![0u8; needed];
-                let m = nix::sys::socket::recv(fd, &mut chunk, MsgFlags::empty())?;
+                let m = nix::sys::socket::recv(fd, &mut chunk, MsgFlags::empty())
+                    .map_err(map_peer_gone)?;
                 if m == 0 {
                     return Err(HelperLinkError::HelperExited);
                 }
