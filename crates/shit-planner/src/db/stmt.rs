@@ -177,8 +177,11 @@ fn strip_leading_comments_and_whitespace(s: &str) -> &str {
     }
 }
 
-/// Split a multi-statement script on `;`, honoring `'...'` and
-/// `"..."` literals. Does NOT honor `$tag$ ... $tag$` (DR-55).
+/// Split a multi-statement script on `;`, honoring `'...'`, `"..."`,
+/// and Postgres `$tag$ ... $tag$` literals (DR-55). Tags are
+/// case-sensitive and may be empty (`$$ ... $$`) or alphanumeric +
+/// underscore — anything else `$` precedes is treated as a plain
+/// dollar sign.
 pub fn split_statements(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -186,6 +189,7 @@ pub fn split_statements(script: &str) -> Vec<String> {
     let mut in_double = false;
     let mut line_comment = false;
     let mut block_comment = false;
+    let mut dollar_tag: Option<String> = None;
     let chars: Vec<char> = script.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -210,6 +214,21 @@ pub fn split_statements(script: &str) -> Vec<String> {
             i += 1;
             continue;
         }
+        if let Some(tag) = dollar_tag.as_ref() {
+            // Inside a $tag$...$tag$ block. Look for the matching
+            // closing $tag$ at the current position.
+            if c == '$'
+                && let Some(consumed) = match_dollar_tag(&chars, i, tag)
+            {
+                buf.extend(chars[i..i + consumed].iter());
+                i += consumed;
+                dollar_tag = None;
+                continue;
+            }
+            buf.push(c);
+            i += 1;
+            continue;
+        }
         if in_single {
             buf.push(c);
             if c == '\'' {
@@ -230,6 +249,15 @@ pub fn split_statements(script: &str) -> Vec<String> {
                 in_double = false;
             }
             i += 1;
+            continue;
+        }
+        // Dollar-quote opener?
+        if c == '$'
+            && let Some((tag, consumed)) = read_dollar_open(&chars, i)
+        {
+            buf.extend(chars[i..i + consumed].iter());
+            i += consumed;
+            dollar_tag = Some(tag);
             continue;
         }
         match c {
@@ -268,6 +296,59 @@ pub fn split_statements(script: &str) -> Vec<String> {
         out.push(last.to_string());
     }
     out
+}
+
+/// At an opening `$`, attempt to read a dollar-quote tag. Returns
+/// `Some((tag, total_chars_consumed))` if the syntax is a valid
+/// `$<tag>$` opener — otherwise `None` and the caller treats `$` as
+/// a plain character.
+///
+/// A dollar tag matches `$[A-Za-z_][A-Za-z0-9_]*$` or the empty form
+/// `$$`. Anything else (e.g. `$1` as a bind param, `$foo bar`) is
+/// not a dollar-quote opener.
+fn read_dollar_open(chars: &[char], start: usize) -> Option<(String, usize)> {
+    debug_assert_eq!(chars[start], '$');
+    let mut end = start + 1;
+    let mut first = true;
+    while end < chars.len() {
+        let c = chars[end];
+        if c == '$' {
+            // Found the closing `$`. Tag is chars[start+1..end].
+            let tag: String = chars[start + 1..end].iter().collect();
+            return Some((tag, end - start + 1));
+        }
+        let ok = if first {
+            c.is_ascii_alphabetic() || c == '_'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_'
+        };
+        if !ok {
+            return None;
+        }
+        first = false;
+        end += 1;
+    }
+    None
+}
+
+/// At a `$`, check whether the next characters spell `$<tag>$`.
+/// Returns the number of chars consumed if matched, or `None`.
+fn match_dollar_tag(chars: &[char], at: usize, tag: &str) -> Option<usize> {
+    debug_assert_eq!(chars[at], '$');
+    let tag_chars: Vec<char> = tag.chars().collect();
+    let needed = 2 + tag_chars.len();
+    if at + needed > chars.len() {
+        return None;
+    }
+    for (k, t) in tag_chars.iter().enumerate() {
+        if chars[at + 1 + k] != *t {
+            return None;
+        }
+    }
+    if chars[at + 1 + tag_chars.len()] != '$' {
+        return None;
+    }
+    Some(needed)
 }
 
 #[cfg(test)]
@@ -466,5 +547,74 @@ mod tests {
             StatementKind::Mutating
         );
         assert_eq!(classify_statement("select 1"), StatementKind::ReadOnly);
+    }
+
+    #[test]
+    fn split_honors_dollar_quote_no_tag() {
+        let stmts = split_statements("DO $$ BEGIN RAISE NOTICE 'a;b'; END; $$; SELECT 1");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("BEGIN RAISE"));
+        assert!(stmts[0].contains("END;"));
+        assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn split_honors_dollar_quote_with_tag() {
+        let stmts = split_statements(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $body$ BEGIN \
+             RAISE NOTICE 'x;y'; SELECT 1; END $body$; SELECT 2",
+        );
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("$body$"));
+        assert!(stmts[0].contains("SELECT 1"));
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn split_does_not_match_wrong_tag() {
+        // $foo$ ... $bar$ — the $bar$ does NOT close the $foo$ block.
+        // The whole thing stays one (malformed) statement.
+        let stmts = split_statements("SELECT $foo$ inner;text $bar$ junk $foo$; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("$foo$"));
+        assert!(stmts[0].contains("$bar$"));
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn split_treats_dollar_bindparam_as_plain() {
+        // `$1`, `$2` are bind parameters in psql, not dollar quotes.
+        // They must not start a quote block.
+        let stmts = split_statements("SELECT $1; INSERT INTO t VALUES ($2)");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT $1");
+        assert_eq!(stmts[1], "INSERT INTO t VALUES ($2)");
+    }
+
+    #[test]
+    fn split_treats_isolated_dollar_as_plain() {
+        // A bare `$` followed by whitespace / EOF / non-tag char is
+        // just a dollar sign.
+        let stmts = split_statements("SELECT '$amount'; SELECT $");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("$amount"));
+    }
+
+    #[test]
+    fn split_handles_nested_quotes_inside_dollar_block() {
+        let stmts = split_statements(
+            "DO $$ BEGIN PERFORM 'it''s; ok'; PERFORM \"col;name\"; END $$; SELECT 1",
+        );
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn split_handles_two_dollar_blocks_in_one_script() {
+        let stmts = split_statements("DO $$ a; $$; DO $tag$ b; $tag$; SELECT 1");
+        assert_eq!(stmts.len(), 3);
+        assert!(stmts[0].contains("$$"));
+        assert!(stmts[1].contains("$tag$"));
+        assert_eq!(stmts[2], "SELECT 1");
     }
 }
