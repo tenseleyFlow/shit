@@ -215,6 +215,22 @@ enum Mode {
     ///
     /// Same hook-friendly error policy as `pkg-event` etc.: shit-side
     /// failure never breaks the user's DB invocation.
+    /// Compute the running helper binary's blake3 hash and write it
+    /// to `<state-dir>/helper.sha256.baseline` (DR-65). Called by the
+    /// .deb/.rpm postinst (and packaging equivalents) so the first
+    /// runtime self-verify returns `Match` instead of `BaselineMissing`.
+    ///
+    /// Idempotent: a second invocation rewrites the baseline with
+    /// the current hash, which is the right behaviour after an
+    /// upgrade (the binary just changed).
+    #[command(name = "self-baseline-write")]
+    SelfBaselineWrite {
+        /// State directory under which `helper.sha256.baseline` is
+        /// written. Must exist and be writable; the postinst script
+        /// is responsible for creating it.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     #[command(name = "db-event")]
     DbEvent {
         /// DB engine identifier (psql|mysql|sqlite3).
@@ -422,7 +438,32 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             )
             .await
         }
+        Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
     }
+}
+
+/// DR-65 — install-time baseline writer.
+///
+/// Hashes the running helper binary and writes the hex digest to
+/// `<state_dir>/helper.sha256.baseline`. Invoked by the packaging
+/// postinst scripts (.deb / .rpm) so a fresh install passes the
+/// first runtime self-verify check.
+///
+/// Returns `Err` if the binary can't be hashed (e.g. `/proc/self/exe`
+/// missing on a non-Linux platform) or the baseline write fails. The
+/// postinst script is expected to surface the error to the user.
+fn run_self_baseline_write(state_dir: &std::path::Path) -> anyhow::Result<()> {
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe lookup failed: {e}"))?;
+    let hash =
+        self_verify::hash_path(&exe).map_err(|e| anyhow::anyhow!("hash {}: {e}", exe.display()))?;
+    self_verify::write_baseline(state_dir, &hash)
+        .map_err(|e| anyhow::anyhow!("write baseline to {}: {e}", state_dir.display()))?;
+    eprintln!(
+        "shit-helper: baseline written ({hash}) to {}",
+        state_dir.display()
+    );
+    Ok(())
 }
 
 /// Outcome of the privileged setup phase. The fanotify fd (if present)
