@@ -462,6 +462,62 @@ impl Index {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))?;
         Ok(n.max(0) as u64)
     }
+
+    /// List the N most recently completed commands, latest first. S24.C
+    /// uses this for `shit undo` (bare-`shit`) — no session UUID needed,
+    /// the daemon picks the user's last command across all sessions.
+    /// Skips commands that haven't closed yet (`ended_wall_nanos IS NULL`)
+    /// to avoid clobbering an in-flight command.
+    pub fn list_recent_commands(&self, limit: u32) -> Result<Vec<CommandRecord>, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session, seq, cmd_string, cwd, pid, shell_kind,
+                    started_logical, started_wall_nanos,
+                    ended_logical, ended_wall_nanos, exit_code
+             FROM commands
+             WHERE ended_wall_nanos IS NOT NULL
+             ORDER BY ended_wall_nanos DESC, seq DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let session_blob: Vec<u8> = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            let cmd_string: Option<String> = row.get(2)?;
+            let cwd: String = row.get(3)?;
+            let pid: i64 = row.get(4)?;
+            let shell_kind: String = row.get(5)?;
+            let started_logical: i64 = row.get(6)?;
+            let started_wall: i64 = row.get(7)?;
+            let ended_logical: Option<i64> = row.get(8)?;
+            let ended_wall: Option<i64> = row.get(9)?;
+            let exit_code: Option<i32> = row.get(10)?;
+            // session_blob comes back as 16 bytes for a uuid; fall through
+            // to nil on any other length (shouldn't happen — PK ensures it).
+            let session = Uuid::from_slice(&session_blob).unwrap_or_else(|_| Uuid::nil());
+            Ok(CommandRecord {
+                command: CommandId {
+                    session,
+                    seq: seq as u64,
+                },
+                cmd_string,
+                cwd: PathBuf::from(cwd),
+                pid: pid as u32,
+                shell_kind: shell_kind.parse().unwrap_or(shit_proto::ShellKind::Unknown),
+                started_at: TimePoint::new(started_logical as u64, started_wall as u64),
+                ended_at: match (ended_logical, ended_wall) {
+                    (Some(l), Some(w)) => Some(TimePoint::new(l as u64, w as u64)),
+                    _ => None,
+                },
+                exit_code,
+                event_ids: vec![],
+            })
+        })?;
+        let mut out = Vec::with_capacity(limit as usize);
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
 }
 
 /// Apply path-history maintenance using a borrowed Connection (so the same
