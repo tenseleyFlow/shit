@@ -251,8 +251,8 @@ fn extract_path_from_kinfo_file(buf: &[u8]) -> String {
 /// of `linux::snapshot` in `enumerate.rs`. Returns Err if the pid
 /// doesn't exist; populates whatever it can otherwise.
 pub fn snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
-    let kp = kinfo_proc_for_pid(pid)?
-        .ok_or_else(|| anyhow::anyhow!("pid {pid} not found (ESRCH)"))?;
+    let kp =
+        kinfo_proc_for_pid(pid)?.ok_or_else(|| anyhow::anyhow!("pid {pid} not found (ESRCH)"))?;
 
     let comm = unsafe { CStr::from_ptr(kp.ki_comm.as_ptr()) }
         .to_string_lossy()
