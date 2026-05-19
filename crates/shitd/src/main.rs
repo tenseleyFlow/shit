@@ -168,6 +168,59 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let blob_store = Arc::new(shit_store::BlobStore::open(&blobs_path)?);
     tracing::info!(path = %blobs_path.display(), "blob store opened");
 
+    // S24.A — spawn shit-helper and start its dispatch loop. Best-
+    // effort: if the helper binary isn't discoverable or the
+    // handshake fails, the daemon continues in helper-less mode
+    // (shell-hook journaling still works; capture-tier events just
+    // won't arrive). Off entirely when `SHIT_HELPER_DISABLED=1`.
+    let helper_dispatch_handle = if std::env::var("SHIT_HELPER_DISABLED").as_deref() == Ok("1") {
+        tracing::info!("SHIT_HELPER_DISABLED=1; skipping helper spawn");
+        None
+    } else {
+        match helper_link::discover_helper_bin() {
+            None => {
+                tracing::warn!(
+                    "shit-helper binary not found; daemon continues without capture tier. \
+                     Set SHIT_HELPER_BIN or install on PATH to enable."
+                );
+                None
+            }
+            Some(bin) => {
+                let helper_sock = cfg.state_dir.join("helper.sock");
+                let caps = shit_proto::HelperCaps::full();
+                match helper_link::spawn_and_handshake(&bin, &helper_sock, &cfg.state_dir, caps) {
+                    Ok(link) => {
+                        tracing::info!(
+                            helper_pid = link.helper_pid,
+                            kernel_tier = %link.kernel_tier,
+                            "shit-helper handshake complete"
+                        );
+                        stats.set_kernel_tier(&link.kernel_tier);
+                        let link = Arc::new(link);
+                        let index = Arc::clone(&index);
+                        let blob_store = Arc::clone(&blob_store);
+                        let shutdown = Arc::clone(&shutdown);
+                        Some(tokio::spawn(async move {
+                            if let Err(e) =
+                                helper_link::dispatch_loop(link, index, blob_store, shutdown).await
+                            {
+                                tracing::error!(error = %e, "helper dispatch loop exited with error");
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            bin = %bin.display(),
+                            "helper handshake failed; daemon continues without capture tier"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    };
+
     let gc_signal = Arc::new(gc::GcSignal::new());
     let gc_handle = {
         let index = Arc::clone(&index);
@@ -306,6 +359,9 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     ctl_handle.abort();
     gc_handle.abort();
     pkg_janitor.abort();
+    if let Some(h) = helper_dispatch_handle {
+        h.abort();
+    }
     result
 }
 
