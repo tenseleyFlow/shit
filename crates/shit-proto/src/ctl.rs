@@ -55,6 +55,50 @@ pub enum CtlRequest {
     DbEvent(DbEventReq),
     /// One-shot perf-counter snapshot for `shit metrics` (S21.4).
     Metrics,
+    /// S24.C — `shit undo` plan-fetch + execute. The daemon walks
+    /// recent commands, builds an UndoPlan via shit_planner, and
+    /// runs it via the Orchestrator. Returns an [`UndoReportWire`].
+    /// We execute on the daemon side rather than shipping a serialized
+    /// plan because the planner + blob store + index live there already.
+    Undo(UndoRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoRequest {
+    /// How many commands back to undo (LIFO).
+    pub steps: u32,
+    pub dry_run: bool,
+    pub on_conflict: ConflictPolicyWire,
+    /// Optional glob filters; ops whose path doesn't match are
+    /// recorded as skipped. Empty means "no filter."
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictPolicyWire {
+    Abort,
+    Skip,
+    Force,
+}
+
+/// Daemon-side execution report shipped back to the `shit undo` CLI.
+/// Mirrors `shit_planner::ExecutionReport`'s essentials in a wire-safe
+/// form — we deliberately don't serialize the full ExecutionRecord
+/// list because some fields (Path, etc.) need stringification first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoReportWire {
+    /// How many commands we attempted (after honoring `steps` and
+    /// however many are available).
+    pub commands_attempted: u32,
+    pub ops_applied: u32,
+    pub ops_skipped: u32,
+    pub ops_failed: u32,
+    pub ops_conflicted: u32,
+    pub dry_run: bool,
+    /// Human-readable summary for `shit undo` to print.
+    pub summary: String,
+    /// One line per failed/conflicted op, for the user to read.
+    pub detail_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +561,8 @@ pub enum CtlResponse {
     DbEventAck,
     /// Reply to `Metrics` (S21.4).
     Metrics(MetricsSnapshot),
+    /// Reply to `Undo` — execution report.
+    UndoReport(UndoReportWire),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
