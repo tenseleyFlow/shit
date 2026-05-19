@@ -27,8 +27,8 @@ pub mod frame;
 pub mod helper;
 
 pub use ctl::{
-    BookmarkRequest, BookmarkSummary, CtlRequest, CtlResponse, DaemonStatus, DbConnInfo,
-    DbEngineParseError, DbEngineWire, DbEventReq, DbTxStateWire, GcReport, GcRequest,
+    BookmarkRequest, BookmarkSummary, ContainerStashSummary, CtlRequest, CtlResponse, DaemonStatus,
+    DbConnInfo, DbEngineParseError, DbEngineWire, DbEventReq, DbTxStateWire, GcReport, GcRequest,
     MetricsSnapshot, NetEventReq, NetToolParseError, NetToolWire, PinRequest, PinSummary,
     PkgEventReq, PkgManagerParseError, PkgManagerWire, PkgPhase, ProcEventReq, ProcSnapshot,
     ProcToolParseError, ProcToolWire, SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire,
