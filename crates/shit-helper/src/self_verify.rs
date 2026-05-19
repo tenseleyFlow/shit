@@ -121,7 +121,12 @@ fn self_exe_path() -> Option<PathBuf> {
     }
     #[cfg(target_os = "freebsd")]
     {
-        Some(PathBuf::from("/proc/curproc/file"))
+        // Prefer the sysctl path — FreeBSD's procfs is opt-in and not
+        // mounted by default on production hosts (the smoke runs and
+        // user installs both saw `read /proc/self/exe: No such file
+        // or directory` because of this). `KERN_PROC_PATHNAME` works
+        // without procfs.
+        sysctl_self_path().or_else(|| Some(PathBuf::from("/proc/curproc/file")))
     }
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
@@ -129,6 +134,51 @@ fn self_exe_path() -> Option<PathBuf> {
         // for self-verify because macOS users get a richer check
         // via `codesign --verify --strict` (DR-NEW-codesign-verify).
         None
+    }
+}
+
+/// Resolve the running executable's pathname via the FreeBSD-only
+/// `KERN_PROC_PATHNAME` sysctl. Works without procfs mounted.
+///
+/// MIB shape (per `sysctl.h` + `sys/sysctl.h`):
+///   `[CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1]`
+/// where `-1` resolves "this process". Returns `None` if the sysctl
+/// fails or produces unparseable bytes — caller falls back to
+/// `/proc/curproc/file`.
+#[cfg(target_os = "freebsd")]
+fn sysctl_self_path() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // CTL_KERN = 1, KERN_PROC = 14, KERN_PROC_PATHNAME = 12 on FreeBSD
+    // (stable across 12/13/14). libc::CTL_KERN/KERN_PROC are exported;
+    // KERN_PROC_PATHNAME is FreeBSD-only and not on every libc version,
+    // so we hardcode the constant.
+    let mib: [libc::c_int; 4] = [libc::CTL_KERN, libc::KERN_PROC, 12, -1];
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: mib is a valid 4-element array; buf is a writable byte
+    // slice; len is its length; new value is NULL.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // sysctl writes a NUL-terminated C string; `len` includes the NUL.
+    // Trim trailing NUL bytes before constructing the PathBuf.
+    let end = buf[..len].iter().position(|&b| b == 0).unwrap_or(len);
+    let path = std::ffi::OsStr::from_bytes(&buf[..end]).to_owned();
+    let pb = PathBuf::from(path);
+    if pb.as_os_str().is_empty() {
+        None
+    } else {
+        Some(pb)
     }
 }
 
@@ -152,6 +202,19 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On FreeBSD, sysctl(KERN_PROC_PATHNAME) returns a real path
+    /// without procfs. We can't predict the path (cargo test names
+    /// the test binary) but we can require it's non-empty, absolute,
+    /// and pointing at a regular file that exists.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn sysctl_self_path_resolves_without_procfs() {
+        let p = sysctl_self_path().expect("sysctl path returned None");
+        assert!(p.is_absolute(), "path not absolute: {}", p.display());
+        let meta = std::fs::metadata(&p).expect("stat self path");
+        assert!(meta.is_file(), "self path is not a file: {}", p.display());
+    }
 
     #[test]
     fn hex_encode_round_trips_a_known_blake3() {
