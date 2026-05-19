@@ -781,4 +781,35 @@ command = ["tp", "{{v}}"]
         // future packs join without breaking this test.
         assert!(found >= 6, "expected ≥6 builtin packs, found {found}");
     }
+
+    /// C03.6: every cloud descriptor pack ships parseable + lint-clean.
+    #[test]
+    fn cloud_descriptor_packs_parse_and_lint() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let pack_dir = here
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("packaging/descriptors/cloud"))
+            .expect("locate cloud pack dir");
+        assert!(
+            pack_dir.is_dir(),
+            "expected cloud pack dir at {}",
+            pack_dir.display()
+        );
+        let mut found = 0usize;
+        for entry in std::fs::read_dir(&pack_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            match Descriptor::from_toml(&text) {
+                Ok(_) => found += 1,
+                Err(e) => panic!("cloud pack {} failed: {e}", path.display()),
+            }
+        }
+        // C03.6 ships 6 cloud packs: helm-install, helm-upgrade,
+        // vercel-deploy, gcloud-compute-delete, az-vm-delete, pulumi-up.
+        assert!(found >= 6, "expected ≥6 cloud packs, found {found}");
+    }
 }
