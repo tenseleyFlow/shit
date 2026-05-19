@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shit_planner::events::{CaptureEvent, CaptureEventKind, DbEngine, DbTxState, EventId};
+use shit_planner::events::{
+    CaptureEvent, CaptureEventKind, CommandId, DbEngine, DbTxState, EventId,
+};
 use shit_proto::{DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire};
 use shit_store::Index;
 
@@ -22,10 +24,22 @@ use crate::active_commands::ActiveCommands;
 
 pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 
+/// Pid-based stash key — fallback for orphans / self-spawned tests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DbKey {
     pub engine: DbEngineWire,
     pub pid: u32,
+    pub target: String,
+}
+
+/// Command-based stash key — used when ancestry resolves to an
+/// active command. The psql/mysql/sqlite3 wrappers fire the
+/// `db-event` helper twice (pre + post) in distinct processes; the
+/// resolved command is the only stable pairing key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DbCommandKey {
+    pub command: CommandId,
+    pub engine: DbEngineWire,
     pub target: String,
 }
 
@@ -37,33 +51,48 @@ pub struct DbPre {
 }
 
 pub struct DbPreStash {
-    inner: Mutex<HashMap<DbKey, DbPre>>,
+    by_command: Mutex<HashMap<DbCommandKey, DbPre>>,
+    by_pid: Mutex<HashMap<DbKey, DbPre>>,
 }
 
 impl DbPreStash {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            by_command: Mutex::new(HashMap::new()),
+            by_pid: Mutex::new(HashMap::new()),
         }
     }
-    pub fn insert(&self, key: DbKey, pre: DbPre) {
-        self.inner.lock().unwrap().insert(key, pre);
+    pub fn insert_by_command(&self, key: DbCommandKey, pre: DbPre) {
+        self.by_command.lock().unwrap().insert(key, pre);
     }
-    pub fn take(&self, key: &DbKey) -> Option<DbPre> {
-        self.inner.lock().unwrap().remove(key)
+    pub fn take_by_command(&self, key: &DbCommandKey) -> Option<DbPre> {
+        self.by_command.lock().unwrap().remove(key)
+    }
+    pub fn insert_by_pid(&self, key: DbKey, pre: DbPre) {
+        self.by_pid.lock().unwrap().insert(key, pre);
+    }
+    pub fn take_by_pid(&self, key: &DbKey) -> Option<DbPre> {
+        self.by_pid.lock().unwrap().remove(key)
     }
     pub fn sweep_expired(&self) -> usize {
-        let mut g = self.inner.lock().unwrap();
         let cutoff = Instant::now()
             .checked_sub(PRE_STASH_TTL)
             .unwrap_or_else(Instant::now);
+        let mut evicted = 0;
+        let mut g = self.by_command.lock().unwrap();
         let before = g.len();
         g.retain(|_, e| e.ts >= cutoff);
-        before - g.len()
+        evicted += before - g.len();
+        drop(g);
+        let mut g = self.by_pid.lock().unwrap();
+        let before = g.len();
+        g.retain(|_, e| e.ts >= cutoff);
+        evicted += before - g.len();
+        evicted
     }
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.by_command.lock().unwrap().len() + self.by_pid.lock().unwrap().len()
     }
 }
 
@@ -92,11 +121,16 @@ pub fn handle(
     active: &ActiveCommands,
     index: &Index,
 ) -> PostOutcome {
-    let key = DbKey {
+    let pid_key = DbKey {
         engine: req.engine,
         pid: req.pid,
         target: req.conn.target.clone(),
     };
+    let cmd_key = active.resolve_by_descendant(req.pid).map(|c| DbCommandKey {
+        command: c,
+        engine: req.engine,
+        target: req.conn.target.clone(),
+    });
     match req.phase {
         shit_proto::PkgPhase::Pre => {
             tracing::debug!(
@@ -104,20 +138,29 @@ pub fn handle(
                 pid = req.pid,
                 target = %req.conn.target,
                 stmt_count = req.statements.len(),
+                command = ?cmd_key.as_ref().map(|k| k.command),
                 "db-pre stashed"
             );
-            stash.insert(
-                key,
-                DbPre {
-                    conn: req.conn,
-                    statements: req.statements,
-                    ts: Instant::now(),
-                },
-            );
+            let pre = DbPre {
+                conn: req.conn,
+                statements: req.statements,
+                ts: Instant::now(),
+            };
+            if let Some(k) = cmd_key {
+                stash.insert_by_command(k, pre);
+            } else {
+                stash.insert_by_pid(pid_key, pre);
+            }
             PostOutcome::Orphan
         }
         shit_proto::PkgPhase::Post => {
-            let Some(pre) = stash.take(&key) else {
+            let pre = match cmd_key.as_ref() {
+                Some(k) => stash
+                    .take_by_command(k)
+                    .or_else(|| stash.take_by_pid(&pid_key)),
+                None => stash.take_by_pid(&pid_key),
+            };
+            let Some(pre) = pre else {
                 tracing::warn!(
                     engine = req.engine.as_str(),
                     pid = req.pid,
@@ -126,11 +169,11 @@ pub fn handle(
                 );
                 return PostOutcome::Orphan;
             };
-            // DR-58: resolve and journal a CaptureEvent::DbOp under
-            // (session, seq). If no active command in the ancestor
-            // chain, fall through with the diagnostic outcome but
-            // skip the journal write (orphan tier event).
-            if let Some(command) = active.resolve_by_descendant(req.pid) {
+            // DR-58: attribute the event to the active command we
+            // already resolved at stash-lookup time. If no active
+            // command, fall through with the diagnostic outcome but
+            // skip the journal write.
+            if let Some(command) = cmd_key.as_ref().map(|k| k.command) {
                 let kind = CaptureEventKind::DbOp {
                     engine: wire_to_planner_engine(req.engine),
                     target: pre.conn.target.clone(),
@@ -395,24 +438,21 @@ mod tests {
             pid: 42,
             target: "/tmp/test.db".into(),
         };
-        {
-            let mut g = stash.inner.lock().unwrap();
-            g.insert(
-                key,
-                DbPre {
-                    conn: DbConnInfo {
-                        host: String::new(),
-                        port: None,
-                        user: String::new(),
-                        target: "/tmp/test.db".into(),
-                    },
-                    statements: vec![],
-                    ts: Instant::now()
-                        .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
-                        .expect("clock subtraction"),
+        stash.insert_by_pid(
+            key,
+            DbPre {
+                conn: DbConnInfo {
+                    host: String::new(),
+                    port: None,
+                    user: String::new(),
+                    target: "/tmp/test.db".into(),
                 },
-            );
-        }
+                statements: vec![],
+                ts: Instant::now()
+                    .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
+                    .expect("clock subtraction"),
+            },
+        );
         assert_eq!(stash.sweep_expired(), 1);
         assert_eq!(stash.len(), 0);
     }
