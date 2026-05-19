@@ -31,7 +31,7 @@ pub fn is_alive(pid: u32) -> bool {
 pub fn read_proc_snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
     #[cfg(target_os = "linux")]
     {
-        return linux::snapshot(pid);
+        linux::snapshot(pid)
     }
     #[cfg(not(target_os = "linux"))]
     {

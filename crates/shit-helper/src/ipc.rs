@@ -125,7 +125,7 @@ impl Conn {
                 return Err(ConnError::PeerClosed);
             }
             buf.truncate(n);
-            return Ok(buf);
+            Ok(buf)
         }
 
         #[cfg(not(target_os = "linux"))]

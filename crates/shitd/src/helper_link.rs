@@ -259,7 +259,7 @@ fn recv_frame_blocking(fd: std::os::fd::RawFd) -> Result<Vec<u8>, HelperLinkErro
             return Err(HelperLinkError::HelperExited);
         }
         buf.truncate(n);
-        return Ok(buf);
+        Ok(buf)
     }
     #[cfg(not(target_os = "linux"))]
     {

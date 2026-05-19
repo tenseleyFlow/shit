@@ -32,7 +32,7 @@ pub fn resolve_job_spec(spec: &str) -> Option<u32> {
 pub fn resolve_pgroup(pgid: u32) -> Option<Vec<u32>> {
     #[cfg(target_os = "linux")]
     {
-        return linux::pids_in_pgroup(pgid);
+        linux::pids_in_pgroup(pgid)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -44,7 +44,7 @@ pub fn resolve_pgroup(pgid: u32) -> Option<Vec<u32>> {
 pub fn resolve_pattern(pattern: &str, filters: &BTreeMap<String, String>) -> Vec<u32> {
     #[cfg(target_os = "linux")]
     {
-        return linux::pids_matching(pattern, filters);
+        linux::pids_matching(pattern, filters)
     }
     #[cfg(not(target_os = "linux"))]
     {

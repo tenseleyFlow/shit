@@ -110,7 +110,7 @@ pub fn reader_thread(state: FanotifyState) {
         }
 
         let bytes = match read_step(&state.fd, &mut buf) {
-            Ok(b) if b.is_empty() => continue,
+            Ok([]) => continue,
             Ok(b) => b,
             Err(e) => {
                 tracing::error!(err = %e, "fanotify read failed; exiting reader");
