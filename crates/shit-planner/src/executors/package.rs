@@ -80,6 +80,7 @@ impl<R: PkgRunner> InverseOpExecutor for PackageExecutor<R> {
             packages_before,
             packages_after,
             repo_state_hint,
+            delegation: _,
         } = op
         else {
             // Defensive: orchestrator should not route here otherwise.
@@ -536,6 +537,7 @@ mod tests {
             packages_before: pkgs(&[]),
             packages_after: pkgs(&[("jq", "1.7")]),
             repo_state_hint: None,
+            delegation: None,
         }
     }
 
@@ -579,6 +581,7 @@ mod tests {
             packages_before: same.clone(),
             packages_after: same,
             repo_state_hint: None,
+            delegation: None,
         };
         let runner = SpyRunner::default();
         let exec = PackageExecutor::new(runner);

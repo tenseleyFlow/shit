@@ -193,6 +193,7 @@ fn emit_for_event(
                     packages_before: packages_before.clone(),
                     packages_after: packages_after.clone(),
                     repo_state_hint: repo_state_hint.clone(),
+                    delegation: None,
                 },
                 cohort: 0,
                 conflict: None,

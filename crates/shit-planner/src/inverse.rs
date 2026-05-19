@@ -77,6 +77,14 @@ pub enum InverseOp {
         packages_before: BTreeMap<String, String>,
         packages_after: BTreeMap<String, String>,
         repo_state_hint: Option<String>,
+        /// C02.7: optional native-tool dispatch. When present, the
+        /// `PackageExecutor` runs the delegation argv (typically
+        /// `apt history-rollback <id>` or `dnf history undo <id>`)
+        /// instead of synthesizing per-package install/remove
+        /// invocations. The inspector populates this when the running
+        /// version of the manager exposes a native rollback verb.
+        #[serde(default)]
+        delegation: Option<NativeDelegation>,
     },
     /// Roll back a network-tool change. Reload-style tools (iptables-restore,
     /// nft -f, pfctl -f) use `before_state`; diff-style tools (`ip route`,
@@ -101,6 +109,27 @@ pub enum InverseOp {
         env_summary: BTreeMap<String, String>,
         message: String,
     },
+    /// C02: reverse-API descriptor application. The daemon captured a
+    /// snapshot via the descriptor's pre/post commands and stored the
+    /// extracted state; the executor re-interpolates `reverse_argv` from
+    /// `captured_state` at apply time and runs it (privileged routes via
+    /// helper). All cloud-CLI long-tail packs use this op; only the
+    /// hand-coded wrappers in C03 emit their own ops.
+    DescriptorReverse {
+        descriptor_name: String,
+        descriptor_version: u32,
+        captured_state: BTreeMap<String, String>,
+        /// Pre-rendered argv at capture time. Executor re-renders from
+        /// `captured_state` defensively; falls back to this if the
+        /// descriptor file has gone missing between capture and undo.
+        reverse_argv: Vec<String>,
+        privileged: bool,
+        requires_confirmation: bool,
+        /// Optional pre-execute guard: `(check_argv, expected_substring)`.
+        /// The substring is matched after interpolation. None = no guard.
+        #[serde(default)]
+        guard: Option<DescriptorGuardOp>,
+    },
     /// Informational (S19): record what statements crossed the DB shim.
     /// For sqlite3 the file is captured via the file tier and the
     /// `rollback_hint` carries the blob; for postgres/mysql we emit a
@@ -112,6 +141,35 @@ pub enum InverseOp {
         statements: Vec<String>,
         rollback_hint: RollbackHint,
     },
+}
+
+/// C02.7: native-tool dispatch carried by `InverseOp::PackageRollback`.
+/// When set, the executor runs the delegation argv instead of
+/// synthesizing per-package invocations.
+///
+/// The shape is intentionally narrower than the C02 descriptor format:
+/// the value (the transaction id) is already extracted by the inspector,
+/// so there is no template language or parser here — just an argv to run
+/// and an optional guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDelegation {
+    pub argv: Vec<String>,
+    pub privileged: bool,
+    /// Optional pre-execute check. If `guard_command`'s stdout does not
+    /// contain `guard_match`, the executor refuses with a clear error
+    /// (defends against transaction-history drift since capture time).
+    pub guard_command: Option<Vec<String>>,
+    pub guard_match: Option<String>,
+}
+
+/// C02: guard for `InverseOp::DescriptorReverse`. Same shape as
+/// [`NativeDelegation`]'s guard but lives on the descriptor variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescriptorGuardOp {
+    pub command: Vec<String>,
+    /// `{{var}}` placeholders allowed; executor interpolates from
+    /// `captured_state` before matching.
+    pub expected_substring: String,
 }
 
 /// Which DB engine the captured statements belong to. Mirrors
@@ -184,6 +242,7 @@ impl InverseOp {
             | Self::NetworkRollback { .. }
             | Self::SystemdRollback { .. }
             | Self::ProcessNote { .. }
+            | Self::DescriptorReverse { .. }
             | Self::DbNote { .. } => None,
         }
     }
@@ -212,6 +271,7 @@ impl InverseOp {
             Self::NetworkRollback { .. } => InverseTier::Network,
             Self::SystemdRollback { .. } => InverseTier::Services,
             Self::ProcessNote { .. } => InverseTier::Processes,
+            Self::DescriptorReverse { .. } => InverseTier::Descriptor,
             Self::DbNote { .. } => InverseTier::Database,
         }
     }
@@ -225,6 +285,7 @@ pub enum InverseTier {
     Network,
     Services,
     Processes,
+    Descriptor,
     Database,
 }
 
