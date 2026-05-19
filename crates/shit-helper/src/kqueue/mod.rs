@@ -31,6 +31,7 @@
 // lights up (paired with the FreeBSD VM tooling).
 #![allow(dead_code, unused_imports)]
 
+pub mod drain;
 pub mod error;
 pub mod event_loop;
 pub mod init;
@@ -38,6 +39,10 @@ pub mod proc;
 pub mod tree;
 pub mod vnode;
 
+pub use drain::{
+    DEFAULT_CAPACITY, DrainError, DrainEvent, DrainHandle, DrainSession, spawn as spawn_drain,
+    spawn_default as spawn_drain_default,
+};
 pub use error::KqueueError;
 pub use init::{KqueueFd, init};
 pub use proc::{
