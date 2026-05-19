@@ -83,6 +83,12 @@ struct WatchState {
     /// between current entries and the baseline is what we emit as
     /// `TreeOpWire::Create` / `TreeOpWire::Unlink`.
     dir_baselines: HashMap<RawFd, DirBaseline>,
+    /// S29.3 — per-fd metadata snapshot, populated at attach time
+    /// (and at `add_path` time for new files). On `NOTE_ATTRIB`,
+    /// re-stat the fd; if anything user-visible (mode/uid/gid/mtime)
+    /// changed, emit `CapturedMetadataChange` with this baseline as
+    /// `before`, and update the baseline.
+    meta_baselines: HashMap<RawFd, StatMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,12 +193,24 @@ impl PumpState {
                 },
             );
         }
+        // S29.3 — snapshot per-fd metadata so NOTE_ATTRIB events can
+        // diff and emit MetadataChange with the original `before`
+        // values. Populated for *every* tracked fd (file or dir);
+        // we skip the dir-attrib path in handle_vnode but the data
+        // is cheap and complete.
+        let mut meta_baselines: HashMap<RawFd, StatMeta> = HashMap::new();
+        for raw in tracked_fds(&subtree) {
+            if let Some(m) = fstat_meta(raw) {
+                meta_baselines.insert(raw, m);
+            }
+        }
         self.watches.insert(
             command,
             WatchState {
                 subtree,
                 dedupe: HashMap::new(),
                 dir_baselines,
+                meta_baselines,
             },
         );
     }
@@ -211,10 +229,16 @@ impl PumpState {
     }
 
     fn handle_vnode(&mut self, fd: RawFd, kind: VnodeEventKind) {
+        // S29.3: route NOTE_ATTRIB (chmod/chown/touch) into its own
+        // handler before the content-capture branch so we never
+        // try to pread bytes for a metadata-only event.
+        if matches!(kind, VnodeEventKind::Attrib) {
+            self.handle_attrib(fd);
+            return;
+        }
         // Only Write/Extend/Delete trigger pre-image capture; other
-        // kinds (Attrib, Link, Rename, Revoke) get a debug log for
-        // now — full coverage lands when paired with the planner's
-        // TreeOp variants in a follow-up.
+        // kinds (Link, Rename, Revoke) get a trace log for now —
+        // future S29.x sub-sprints land them.
         let is_delete = matches!(kind, VnodeEventKind::Delete);
         let triggers = matches!(
             kind,
@@ -441,6 +465,11 @@ impl PumpState {
         for new_path in new_files_to_watch {
             if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
                 self.fd_to_command.insert(new_fd, command);
+                // S29.3 — seed the metadata baseline for the new fd so
+                // a subsequent NOTE_ATTRIB has something to compare to.
+                if let Some(m) = fstat_meta(new_fd) {
+                    ws.meta_baselines.insert(new_fd, m);
+                }
                 tracing::info!(
                     %command.session,
                     seq = command.seq,
@@ -470,6 +499,79 @@ impl PumpState {
                 tracing::warn!(error = %e, "send TreeMutation failed");
             }
         }
+    }
+
+    /// S29.3 — handle `NOTE_ATTRIB` on a tracked fd. Diff the current
+    /// fstat against the meta baseline; if mode/uid/gid/mtime/size
+    /// changed, emit `CapturedMetadataChange` and update the baseline.
+    /// `NOTE_ATTRIB` also fires for atime-only updates (e.g., a read)
+    /// which we deliberately ignore — atime isn't a user-visible
+    /// mutation worth journaling.
+    fn handle_attrib(&mut self, fd: RawFd) {
+        let Some(command) = self.fd_to_command.get(&fd).copied() else {
+            tracing::trace!(fd, "NOTE_ATTRIB for untracked fd; dropping");
+            return;
+        };
+        let Some(ws) = self.watches.get_mut(&command) else {
+            return;
+        };
+        // Directories also fire NOTE_ATTRIB on chmod; we skip dir
+        // attribs for now (the planner doesn't have a MetadataChange
+        // executor for dirs that's distinct from regular files, and
+        // the chmod-undo smoke targets files).
+        let Some((dev, inode, ft)) = fstat_dev_inode_kind(fd) else {
+            tracing::warn!(fd, "fstat failed during attrib handling");
+            return;
+        };
+        if ft != FileType::Regular {
+            tracing::trace!(fd, ?ft, "attrib on non-regular; skipping");
+            return;
+        }
+        let Some(after) = fstat_meta(fd) else {
+            tracing::warn!(fd, "fstat_meta failed during attrib handling");
+            return;
+        };
+        let before = match ws.meta_baselines.get(&fd).copied() {
+            Some(b) => b,
+            None => {
+                // No baseline (shouldn't happen post-attach; could
+                // race with detach). Take the current as baseline and
+                // skip emission — we have nothing to compare to.
+                ws.meta_baselines.insert(fd, after);
+                return;
+            }
+        };
+        if before == after {
+            tracing::trace!(fd, "attrib fired but baseline matches; ignoring");
+            return;
+        }
+        let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let resp = shit_proto::HelperResponse::CapturedMetadataChange {
+            session: command.session,
+            seq: command.seq,
+            dev,
+            inode,
+            path: path.as_deref().map(path_to_string),
+            before: before.to_wire(),
+            after: after.to_wire(),
+            ts_unix_nanos: now_nanos,
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "send CapturedMetadataChange failed");
+            return;
+        }
+        ws.meta_baselines.insert(fd, after);
+        tracing::info!(
+            %command.session,
+            seq = command.seq,
+            dev,
+            inode,
+            "CapturedMetadataChange sent",
+        );
     }
 }
 
@@ -521,12 +623,26 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     Some((st.st_dev as u64, st.st_ino as u64, kind))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatMeta {
     mode: u32,
     uid: u32,
     gid: u32,
+    size: u64,
     mtime_unix_nanos: i128,
+}
+
+impl StatMeta {
+    /// Convert to the wire shape the daemon expects. Same field set.
+    fn to_wire(self) -> shit_proto::FileMetadataWire {
+        shit_proto::FileMetadataWire {
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            size: self.size,
+            mtime_unix_nanos: self.mtime_unix_nanos,
+        }
+    }
 }
 
 fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
@@ -544,6 +660,7 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         mode: st.st_mode as u32,
         uid: st.st_uid as u32,
         gid: st.st_gid as u32,
+        size: st.st_size as u64,
         mtime_unix_nanos: mtime,
     })
 }
