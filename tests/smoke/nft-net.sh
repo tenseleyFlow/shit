@@ -52,17 +52,15 @@ PID="$$"
 # the runner's umask.
 chmod 0666 "${SHIT_CTL_SOCK}" 2>/dev/null || true
 
+smoke_log "pre-state via sudo nft list ruleset:"
+sudo nft list ruleset -a 2>&1 | sed 's/^/    pre: /' >&2 || true
+
 smoke_log "sudo wrapper add table inet ${TEST_TABLE}"
-# Capture wrapper stdout+stderr so a silent helper failure isn't
-# hidden by the wrapper's `2>/dev/null` on its helper invocations.
-WRAPPER_LOG="${SHIT_SMOKE_TMP}/wrapper.log"
 sudo env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "SHIT_HELPER=${HELPER}" \
-    "RUST_LOG=debug" \
-    bash -x "${WRAPPER}" add table inet "${TEST_TABLE}" \
-    >"${WRAPPER_LOG}" 2>&1
-wrapper_rc=$?
-smoke_log "wrapper exited rc=${wrapper_rc}; tail:"
-tail -50 "${WRAPPER_LOG}" | sed 's/^/    /' >&2 || true
+    bash "${WRAPPER}" add table inet "${TEST_TABLE}"
+
+smoke_log "post-state via sudo nft list ruleset:"
+sudo nft list ruleset -a 2>&1 | sed 's/^/    post: /' >&2 || true
 
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
