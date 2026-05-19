@@ -79,6 +79,7 @@ impl<R: PkgRunner> InverseOpExecutor for PackageExecutor<R> {
             original_op,
             packages_before,
             packages_after,
+            repo_state_hint,
         } = op
         else {
             // Defensive: orchestrator should not route here otherwise.
@@ -87,7 +88,13 @@ impl<R: PkgRunner> InverseOpExecutor for PackageExecutor<R> {
             };
         };
 
-        let invocations = synthesize_argv(*manager, *original_op, packages_before, packages_after);
+        let invocations = synthesize_argv(
+            *manager,
+            *original_op,
+            packages_before,
+            packages_after,
+            repo_state_hint.as_deref(),
+        );
         if invocations.is_empty() {
             return ExecutionOutcome::Skipped {
                 reason: "no-op diff (packages_before == packages_after)".into(),
@@ -138,6 +145,7 @@ pub fn synthesize_argv(
     _original_op: PackageOpKind,
     packages_before: &BTreeMap<String, String>,
     packages_after: &BTreeMap<String, String>,
+    repo_state_hint: Option<&str>,
 ) -> Vec<Vec<String>> {
     let installed: Vec<&String> = packages_after
         .keys()
@@ -164,7 +172,7 @@ pub fn synthesize_argv(
     match manager {
         PackageManager::Apt | PackageManager::Dpkg => apt_argv(&installed, &removed, &changed),
         PackageManager::Pacman => pacman_argv(&installed, &removed, &changed),
-        PackageManager::Dnf => dnf_argv(&installed, &removed, &changed),
+        PackageManager::Dnf => dnf_argv(&installed, &removed, &changed, repo_state_hint),
         PackageManager::Brew => brew_argv(&installed, &removed, &changed),
         PackageManager::Pkg => pkg_argv(&installed, &removed, &changed),
     }
@@ -231,12 +239,27 @@ fn dnf_argv(
     installed: &[&String],
     removed: &[(&String, &String)],
     changed: &[(&String, &String)],
+    history_id: Option<&str>,
 ) -> Vec<Vec<String>> {
     // dnf history undo is the canonical inverse if the daemon stored
-    // the history id. Without it (the pre stash didn't see one — e.g.
-    // for an `rpm` operation), we fall back to per-pkg install/remove.
-    // For S14.10 we always emit the per-pkg form; DR-26 wires the
-    // dnf_history_id extras through the planner.
+    // the history id (DR-26). It handles dep math correctly and
+    // restores the system to its pre-transaction state. The id must
+    // look numeric — `dnf history undo` only accepts integers.
+    if let Some(id) = history_id
+        && id.chars().all(|c| c.is_ascii_digit())
+        && !id.is_empty()
+    {
+        return vec![vec![
+            "dnf".into(),
+            "history".into(),
+            "undo".into(),
+            "-y".into(),
+            id.to_string(),
+        ]];
+    }
+    // Fallback: per-package install/remove. Used when the pre stash
+    // didn't see a history id (e.g. an `rpm` invocation) or when the
+    // id is malformed.
     let mut out = Vec::new();
     if !installed.is_empty() {
         let mut argv = vec!["dnf".into(), "remove".into(), "-y".into()];
@@ -315,7 +338,13 @@ mod tests {
     fn apt_install_reverses_to_remove() {
         let before = pkgs(&[("bash", "5.1")]);
         let after = pkgs(&[("bash", "5.1"), ("jq", "1.7")]);
-        let argv = synthesize_argv(PackageManager::Apt, PackageOpKind::Install, &before, &after);
+        let argv = synthesize_argv(
+            PackageManager::Apt,
+            PackageOpKind::Install,
+            &before,
+            &after,
+            None,
+        );
         assert_eq!(argv.len(), 1);
         assert_eq!(argv[0][0], "apt-get");
         assert_eq!(argv[0][1], "remove");
@@ -326,7 +355,13 @@ mod tests {
     fn apt_upgrade_reverses_to_downgrade() {
         let before = pkgs(&[("bash", "5.1")]);
         let after = pkgs(&[("bash", "5.2")]);
-        let argv = synthesize_argv(PackageManager::Apt, PackageOpKind::Upgrade, &before, &after);
+        let argv = synthesize_argv(
+            PackageManager::Apt,
+            PackageOpKind::Upgrade,
+            &before,
+            &after,
+            None,
+        );
         assert_eq!(argv.len(), 1);
         assert_eq!(argv[0][0], "apt-get");
         assert_eq!(argv[0][1], "install");
@@ -338,7 +373,13 @@ mod tests {
     fn apt_remove_reverses_to_install_at_old_version() {
         let before = pkgs(&[("bash", "5.1"), ("jq", "1.7")]);
         let after = pkgs(&[("bash", "5.1")]);
-        let argv = synthesize_argv(PackageManager::Apt, PackageOpKind::Remove, &before, &after);
+        let argv = synthesize_argv(
+            PackageManager::Apt,
+            PackageOpKind::Remove,
+            &before,
+            &after,
+            None,
+        );
         assert!(argv.iter().any(|v| v.contains(&"jq=1.7".to_string())));
     }
 
@@ -351,6 +392,7 @@ mod tests {
             PackageOpKind::Install,
             &before,
             &after,
+            None,
         );
         assert_eq!(argv[0][0], "pacman");
         assert_eq!(argv[0][1], "-R");
@@ -365,6 +407,7 @@ mod tests {
             PackageOpKind::Install,
             &before,
             &after,
+            None,
         );
         assert_eq!(argv[0][0], "brew");
         assert_eq!(argv[0][1], "uninstall");
@@ -375,7 +418,13 @@ mod tests {
     fn freebsd_pkg_install_reverses_to_delete() {
         let before = pkgs(&[]);
         let after = pkgs(&[("jq", "1.7.1")]);
-        let argv = synthesize_argv(PackageManager::Pkg, PackageOpKind::Install, &before, &after);
+        let argv = synthesize_argv(
+            PackageManager::Pkg,
+            PackageOpKind::Install,
+            &before,
+            &after,
+            None,
+        );
         assert_eq!(argv[0][0], "pkg");
         assert_eq!(argv[0][1], "delete");
     }
@@ -383,8 +432,82 @@ mod tests {
     #[test]
     fn empty_diff_is_no_op() {
         let same = pkgs(&[("bash", "5.1")]);
-        let argv = synthesize_argv(PackageManager::Apt, PackageOpKind::Install, &same, &same);
+        let argv = synthesize_argv(
+            PackageManager::Apt,
+            PackageOpKind::Install,
+            &same,
+            &same,
+            None,
+        );
         assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn dnf_with_history_id_uses_single_undo_invocation() {
+        let before = pkgs(&[]);
+        let after = pkgs(&[("jq", "1.7.1-1")]);
+        let argv = synthesize_argv(
+            PackageManager::Dnf,
+            PackageOpKind::Install,
+            &before,
+            &after,
+            Some("42"),
+        );
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0], vec!["dnf", "history", "undo", "-y", "42"]);
+    }
+
+    #[test]
+    fn dnf_without_history_id_falls_back_to_per_package() {
+        let before = pkgs(&[]);
+        let after = pkgs(&[("jq", "1.7.1-1")]);
+        let argv = synthesize_argv(
+            PackageManager::Dnf,
+            PackageOpKind::Install,
+            &before,
+            &after,
+            None,
+        );
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0][0], "dnf");
+        assert_eq!(argv[0][1], "remove");
+        assert!(argv[0].contains(&"jq".to_string()));
+    }
+
+    #[test]
+    fn dnf_with_malformed_history_id_falls_back() {
+        // Non-numeric or empty IDs should not reach `dnf history undo`.
+        for bad in ["", "abc", "12.3", "-1"] {
+            let argv = synthesize_argv(
+                PackageManager::Dnf,
+                PackageOpKind::Install,
+                &pkgs(&[]),
+                &pkgs(&[("jq", "1.7-1")]),
+                Some(bad),
+            );
+            assert!(
+                argv[0][0] == "dnf" && argv[0][1] == "remove",
+                "expected fallback for {bad:?}, got {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dnf_with_history_id_ignores_diff_details() {
+        // When history id is present, the per-package diff is
+        // entirely subsumed by `dnf history undo`. The argv should
+        // not echo the package names.
+        let before = pkgs(&[("a", "1"), ("b", "1")]);
+        let after = pkgs(&[("a", "2"), ("c", "1")]);
+        let argv = synthesize_argv(
+            PackageManager::Dnf,
+            PackageOpKind::Upgrade,
+            &before,
+            &after,
+            Some("7"),
+        );
+        assert_eq!(argv.len(), 1);
+        assert!(!argv[0].iter().any(|t| t == "a" || t == "b" || t == "c"));
     }
 
     /// Spy runner: records every argv that would have executed.
@@ -412,6 +535,7 @@ mod tests {
             original_op: PackageOpKind::Install,
             packages_before: pkgs(&[]),
             packages_after: pkgs(&[("jq", "1.7")]),
+            repo_state_hint: None,
         }
     }
 
@@ -454,6 +578,7 @@ mod tests {
             original_op: PackageOpKind::Install,
             packages_before: same.clone(),
             packages_after: same,
+            repo_state_hint: None,
         };
         let runner = SpyRunner::default();
         let exec = PackageExecutor::new(runner);
