@@ -128,6 +128,10 @@ async fn handle_client(
         CtlRequest::Bookmark(req) => handle_bookmark(req, index),
         CtlRequest::BookmarkRemove { id, yes: _ } => handle_bookmark_remove(id, index),
         CtlRequest::BookmarkList => handle_bookmark_list(index),
+        CtlRequest::ContainerStashesList => handle_container_stashes_list(index),
+        CtlRequest::ContainerStashesPrune { older_than_secs } => {
+            handle_container_stashes_prune(older_than_secs, index)
+        }
         CtlRequest::PkgEvent(req) => handle_pkg_event(req, &pkg_stash, &active, &index),
         CtlRequest::SvcEvent(req) => handle_svc_event(req, &svc_stash, &active, &index),
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
@@ -296,6 +300,64 @@ fn handle_bookmark_list(index: Arc<Index>) -> CtlResponse {
             CtlResponse::Bookmarks(summaries)
         }
         Err(e) => CtlResponse::Error(format!("bookmark list: {e}")),
+    }
+}
+
+/// C04.7: enumerate container-runtime stashes.
+fn handle_container_stashes_list(index: Arc<Index>) -> CtlResponse {
+    match shit_store::container_stash::list_all(&index) {
+        Ok(rows) => {
+            let summaries = rows
+                .into_iter()
+                .map(|s| shit_proto::ContainerStashSummary {
+                    blob_hash: hex_encode(&s.blob_hash),
+                    kind: s.kind.as_str().to_string(),
+                    runtime: s.runtime,
+                    name: s.name,
+                    size_bytes: s.size_bytes,
+                    created_unix_secs: s.created_unix_secs,
+                    command: s.command.map(|c| format!("{}:{}", c.session, c.seq)),
+                    note: s.note,
+                })
+                .collect();
+            CtlResponse::ContainerStashes(summaries)
+        }
+        Err(e) => CtlResponse::Error(format!("container-stashes list: {e}")),
+    }
+}
+
+/// Hex-encode a 32-byte hash. Lowercase, no separators. Avoids
+/// pulling in the `hex` crate for one call site.
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// C04.7: prune container stashes older than `older_than_secs`.
+fn handle_container_stashes_prune(older_than_secs: u64, index: Arc<Index>) -> CtlResponse {
+    // Fetch sizes BEFORE the prune so we can report bytes freed.
+    let by_hash: std::collections::HashMap<[u8; 32], u64> =
+        match shit_store::container_stash::list_all(&index) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|s| (s.blob_hash, s.size_bytes))
+                .collect(),
+            Err(e) => {
+                return CtlResponse::Error(format!("container-stashes prune (pre-scan): {e}"));
+            }
+        };
+    match shit_store::container_stash::prune_older_than(&index, older_than_secs) {
+        Ok(pruned) => {
+            let bytes_freed: u64 = pruned.iter().filter_map(|h| by_hash.get(h)).sum();
+            CtlResponse::ContainerStashPruneReport {
+                pruned_count: pruned.len() as u64,
+                bytes_freed,
+            }
+        }
+        Err(e) => CtlResponse::Error(format!("container-stashes prune: {e}")),
     }
 }
 
