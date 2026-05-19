@@ -78,8 +78,17 @@ smoke_start_shitd() {
     # breadcrumbs (`net-pre stashed`, `svc-pre stashed`, etc.) land
     # in the JSON log — they're the most reliable signal that a
     # helper-side send_event reached the daemon at all.
+    # `</dev/null` is load-bearing under cross-platform-actions
+    # FreeBSD VMs: without it, shitd inherits the smoke shell's
+    # stdin, shit-helper inherits it from shitd, and the SSH session
+    # the CI action runs over waits for every fd-holder to close
+    # before terminating — surfacing as a 5-minute hang at smoke
+    # exit. Local interactive ssh hides this because the terminal
+    # fd is implicitly closed when the user closes the session.
     RUST_LOG="${SHIT_SMOKE_RUST_LOG:-debug}" \
-        "${shitd}" --foreground >"${SHIT_SMOKE_TMP}/shitd.log" 2>&1 &
+        "${shitd}" --foreground \
+        </dev/null \
+        >"${SHIT_SMOKE_TMP}/shitd.log" 2>&1 &
     SHITD_PID=$!
     SHIT_SMOKE_PIDS+=("${SHITD_PID}")
     for _ in $(seq 1 100); do
