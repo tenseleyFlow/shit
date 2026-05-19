@@ -767,16 +767,25 @@ fn collect_events(
 
 fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<CaptureEvent> {
     let payload: Vec<u8> = row.get("payload")?;
-    postcard::from_bytes(&payload).map_err(|e| {
+    let id: i64 = row.get("id")?;
+    let mut ev: CaptureEvent = postcard::from_bytes(&payload).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
-    })
+    })?;
+    // Overlay the sqlite rowid onto the in-memory event. The payload's
+    // own `id` field is always EventId(0) (put_event serializes before
+    // INSERT, so the autoincrement isn't known yet). Without this
+    // overlay, two events with the same `ts` would tie on (ts, id) and
+    // the planner's reverse-chronological sort would be unstable —
+    // bug surfaced by the rm-undo smoke (S24.C).
+    ev.id = shit_planner::events::EventId(id as u64);
+    Ok(ev)
 }
 
 impl PlannerStore for Index {
     fn events_for_command(&self, command: CommandId) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT payload FROM events
+            "SELECT id, payload FROM events
              WHERE session = ?1 AND seq = ?2
              ORDER BY ts_logical, id",
         ) {
@@ -796,7 +805,7 @@ impl PlannerStore for Index {
     fn events_for_session(&self, session: Uuid, seq_range: SeqRange) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT payload FROM events
+            "SELECT id, payload FROM events
              WHERE session = ?1 AND seq >= ?2 AND seq < ?3
              ORDER BY seq, ts_logical, id",
         ) {
@@ -820,7 +829,7 @@ impl PlannerStore for Index {
     fn events_touching_inode(&self, inode: InodeRef, since: TimePoint) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT payload FROM events
+            "SELECT id, payload FROM events
              WHERE dev = ?1 AND inode = ?2 AND ts_logical >= ?3
              ORDER BY ts_logical, id",
         ) {
@@ -848,14 +857,14 @@ impl PlannerStore for Index {
         match inode_at {
             Some(i) => collect_events(
                 &conn,
-                "SELECT payload FROM events
+                "SELECT id, payload FROM events
                  WHERE ts_logical <= ?1 AND (path = ?2 OR (dev = ?3 AND inode = ?4))
                  ORDER BY ts_logical, id",
                 params![at.logical as i64, path_str, i.dev as i64, i.inode as i64,],
             ),
             None => collect_events(
                 &conn,
-                "SELECT payload FROM events
+                "SELECT id, payload FROM events
                  WHERE ts_logical <= ?1 AND path = ?2
                  ORDER BY ts_logical, id",
                 params![at.logical as i64, path_str],
@@ -923,7 +932,7 @@ impl PlannerStore for Index {
     fn event_by_id(&self, id: EventId) -> Option<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT payload FROM events WHERE id = ?1",
+            "SELECT id, payload FROM events WHERE id = ?1",
             params![id.0 as i64],
             decode_event_row,
         )
