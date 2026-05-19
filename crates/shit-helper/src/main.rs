@@ -258,6 +258,28 @@ enum Mode {
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
+    /// `shit doctor` probe (B03): connect to the daemon, exchange
+    /// a Handshake/HandshakeAck, print a one-line JSON result to
+    /// stdout, exit. No capture loop, no sandbox, no privileged
+    /// setup — just the IPC round-trip so doctor can measure
+    /// helper⇄daemon health.
+    ///
+    /// Schema of the JSON line:
+    /// ```text
+    /// {"ok": bool, "latency_ms": u32, "helper_version": "…",
+    ///  "kernel_tier": "…", "error": "…"}
+    /// ```
+    /// `error` is present iff `ok=false`. Always exits 0 — the
+    /// caller parses the JSON to discover whether the handshake
+    /// succeeded.
+    #[command(name = "handshake-probe")]
+    HandshakeProbe {
+        /// Path to the daemon's helper-side socket. Doctor passes
+        /// the system default; alternative paths supported for
+        /// test harnesses.
+        #[arg(long)]
+        daemon_sock: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -448,6 +470,137 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             .await
         }
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
+        Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
+    }
+}
+
+/// B03 — `shit doctor` handshake probe.
+///
+/// Connect to the daemon at `daemon_sock`, perform one
+/// Handshake/HandshakeAck round-trip, time it, print the result as
+/// a single line of JSON on stdout, and exit 0 (the JSON's `ok`
+/// field carries success/failure; the caller — `shit doctor` —
+/// uses that, not the exit code).
+///
+/// Hook-friendly: never panics, never hangs forever. A connect
+/// failure or a non-Ack reply produces `ok=false` with the error
+/// in the `error` field.
+async fn run_handshake_probe(daemon_sock: &std::path::Path) -> anyhow::Result<()> {
+    use shit_proto::{HelperCaps, HelperRequest, HelperResponse, helper::HELPER_PROTOCOL_VERSION};
+
+    let started = std::time::Instant::now();
+    // SAFETY: getpid/getuid always succeed.
+    let pid = unsafe { libc::getpid() } as u32;
+    let uid = unsafe { libc::getuid() };
+
+    let result = async {
+        let conn = ipc::connect(daemon_sock)
+            .await
+            .map_err(|e| format!("connect {}: {e}", daemon_sock.display()))?;
+        let req = HelperRequest::Handshake {
+            daemon_pid: 0, // probe doesn't know — daemon ignores this field
+            daemon_uid: uid,
+            protocol_version: HELPER_PROTOCOL_VERSION,
+            capability_request: HelperCaps {
+                watch_tree: false,
+                auth_subscribe: false,
+                package_hook: false,
+            },
+        };
+        conn.send_request(&req).map_err(|e| format!("send: {e}"))?;
+        let resp = conn.recv_response().map_err(|e| format!("recv: {e}"))?;
+        match resp {
+            HelperResponse::HandshakeAck {
+                helper_version,
+                kernel_tier,
+                ..
+            } => Ok((helper_version, kernel_tier)),
+            other => Err(format!("unexpected response: {other:?}")),
+        }
+    }
+    .await;
+
+    let latency_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    // Hand-format the JSON line. We keep shit-helper free of
+    // serde_json to minimize privileged-binary attack surface; the
+    // consumer (`shit doctor`'s probes::bsd::helper_handshake_probe)
+    // parses with serde_json on the unprivileged side. The five-key
+    // shape is fixed by the B03 sprint spec.
+    let line = match result {
+        Ok((helper_version, kernel_tier)) => format!(
+            r#"{{"ok":true,"latency_ms":{},"helper_version":{},"kernel_tier":{},"error":null}}"#,
+            latency_ms,
+            json_string(&helper_version),
+            json_string(&kernel_tier),
+        ),
+        Err(e) => format!(
+            r#"{{"ok":false,"latency_ms":{},"helper_version":null,"kernel_tier":null,"error":{}}}"#,
+            latency_ms,
+            json_string(&e),
+        ),
+    };
+
+    println!("{line}");
+    let _ = pid; // currently unused; reserved for future audit log
+    Ok(())
+}
+
+/// Quote a Rust string as a JSON string literal. Handles the
+/// minimal set of escapes JSON requires (the seven RFC 8259
+/// must-escapes plus the < 0x20 control-character range). Adequate
+/// for handshake-probe payloads — helper_version and kernel_tier
+/// are ASCII strings under our control; the error string comes
+/// from `Display` on local errors and may contain quotes or
+/// backslashes (path strings, etc.).
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod handshake_probe_tests {
+    use super::json_string;
+
+    #[test]
+    fn json_string_quotes_basic() {
+        assert_eq!(json_string("hello"), r#""hello""#);
+    }
+
+    #[test]
+    fn json_string_escapes_quotes() {
+        assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
+    }
+
+    #[test]
+    fn json_string_escapes_backslashes() {
+        assert_eq!(json_string(r"C:\foo"), r#""C:\\foo""#);
+    }
+
+    #[test]
+    fn json_string_escapes_newlines() {
+        assert_eq!(json_string("line1\nline2"), r#""line1\nline2""#);
+    }
+
+    #[test]
+    fn json_string_escapes_control_chars() {
+        // ASCII 0x01 (SOH).
+        let s = format!("a{}b", '\u{01}');
+        assert_eq!(json_string(&s), r#""a\u0001b""#);
     }
 }
 

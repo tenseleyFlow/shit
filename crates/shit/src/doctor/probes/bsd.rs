@@ -96,16 +96,7 @@ pub fn kqueue_functional() -> bool {
     };
     // SAFETY: kq_fd open, events points to one valid kevent slot,
     // ts is a valid timespec.
-    let n = unsafe {
-        libc::kevent(
-            kq_fd,
-            std::ptr::null(),
-            0,
-            events.as_mut_ptr(),
-            1,
-            &ts,
-        )
-    };
+    let n = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, events.as_mut_ptr(), 1, &ts) };
     n >= 1 && (events[0].fflags & libc::NOTE_WRITE) != 0
 }
 
@@ -263,10 +254,7 @@ pub fn helper_handshake_probe(daemon_sock: &Path) -> HelperHandshakeReport {
             .get("kernel_tier")
             .and_then(|x| x.as_str())
             .map(String::from),
-        error: v
-            .get("error")
-            .and_then(|x| x.as_str())
-            .map(String::from),
+        error: v.get("error").and_then(|x| x.as_str()).map(String::from),
     }
 }
 
