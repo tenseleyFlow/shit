@@ -18,9 +18,12 @@ jobs:
       matrix:
         os:
           - macos-14
-          - macos-13
           - ubuntu-24.04
           - ubuntu-24.04-arm
+        # macos-13 (Intel) lives in nightly.yml — GitHub's hosted Intel
+        # runner pool is heavily oversubscribed and consistently sat
+        # in queue for 15–100min on per-push runs. Nightly gives us
+        # x86_64 mac coverage without blocking the feedback loop.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85

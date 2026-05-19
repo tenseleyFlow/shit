@@ -1,0 +1,39 @@
+name: nightly
+
+# Coverage that's too slow or capacity-constrained for the per-push
+# CI loop. Currently:
+#   - macos-13 (Intel) — GitHub's hosted Intel runner pool is heavily
+#     oversubscribed; per-push queue waits ran 15–100min. Nightly gives
+#     us x86_64 mac coverage without holding up trunk feedback.
+#
+# Triggers: scheduled daily, plus workflow_dispatch for ad-hoc runs.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  macos-intel:
+    name: macos-13
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: license-check
+        run: cargo run --quiet --package xtask -- license-check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: build (release)
+        run: cargo build --workspace --release
