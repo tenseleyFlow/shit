@@ -290,6 +290,10 @@ pub fn synthesize(
                 scope: u.scope,
                 unit: u.unit.clone(),
             },
+            // FreeBSD rc.d uses `service <unit> restart` — render the
+            // raw service-argv as a snippet rather than synthesizing a
+            // systemd/launchd unit hint that doesn't apply.
+            SystemdScope::RcBase => RestartHint::RawArgv,
         },
         None => RestartHint::RawArgv,
     };
