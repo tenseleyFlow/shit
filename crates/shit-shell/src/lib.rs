@@ -12,6 +12,7 @@ use shit_proto::ShellKind;
 use std::path::{Path, PathBuf};
 
 pub mod redirect;
+pub mod snippet;
 pub mod state;
 
 pub const MARKER_BEGIN: &str = "# >>> shit hooks >>>";
