@@ -117,6 +117,18 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("force without --yes"));
     }
 
+    // DR-17: compile --paths filters here so a malformed pattern
+    // fails the command before any daemon round-trip. The compiled
+    // GlobSet is what the orchestrator's `with_paths_filter`
+    // consumes once the daemon-fetch path lights up.
+    let paths_filter = match shit_planner::compile_paths_filter(&args.paths) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(anyhow::anyhow!("invalid --paths pattern"));
+        }
+    };
+
     // Stage 1: print a clear status message describing what would happen.
     // Real plumbing (daemon → plan fetch → orchestrator.run) lands once
     // the runtime capture pipeline is wired (DR-* items in
@@ -127,7 +139,15 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
     println!("  dry-run:     {}", args.dry_run);
     println!("  on-conflict: {policy:?}");
     println!("  raw:         {}", args.raw);
-    println!("  paths:       {:?}", args.paths);
+    println!(
+        "  paths:       {:?}{}",
+        args.paths,
+        if paths_filter.is_some() {
+            " (compiled)"
+        } else {
+            ""
+        }
+    );
     println!();
     println!(
         "The S11 executor pipeline is in place: \
