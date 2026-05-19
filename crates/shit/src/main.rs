@@ -106,6 +106,9 @@ enum Cmd {
     /// tarballs from C04). See `shit container-stashes --help`.
     #[command(name = "container-stashes")]
     ContainerStashes(cmd::container_stashes::ContainerStashesArgs),
+    /// Run a command under the install-prefix shim (LD_PRELOAD /
+    /// DYLD_INSERT_LIBRARIES). C05. See `shit install --help`.
+    Install(cmd::install::InstallArgs),
     /// Query the daemon's perf-counter snapshot. `--format prometheus`
     /// for scraping; `--watch 1s` for live updates.
     Metrics(cmd::metrics::MetricsArgs),
@@ -305,6 +308,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::CloudHooks(args) => Ok(cmd::cloud_hooks::run(args)?),
         Cmd::ContainerHooks(args) => Ok(cmd::container_hooks::run(args)?),
         Cmd::ContainerStashes(args) => Ok(cmd::container_stashes::run(args)?),
+        Cmd::Install(args) => Ok(cmd::install::run(args)?),
         Cmd::Metrics(args) => Ok(cmd::metrics::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),

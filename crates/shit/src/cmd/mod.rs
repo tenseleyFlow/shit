@@ -15,6 +15,7 @@ pub mod descriptors;
 pub mod disable;
 pub mod forget;
 pub mod gc;
+pub mod install;
 pub mod list;
 pub mod manpages;
 pub mod metrics;
