@@ -80,6 +80,27 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  brew-pkg:
+    name: brew-pkg smoke (DR-22)
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/brew-pkg.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brew-pkg-smoke-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   apt-pkg:
     name: apt-pkg smoke (DR-19)
     runs-on: ubuntu-24.04
