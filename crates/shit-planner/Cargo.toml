@@ -26,3 +26,7 @@ globset = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = "3.10"
+# Integration tests for the descriptor executor stitch shit-desc's
+# schema/matcher/parse/interpolate together with the planner's
+# `DescriptorExecutor`. Only a dev-dep so prod planner stays small.
+shit-desc = { workspace = true }
