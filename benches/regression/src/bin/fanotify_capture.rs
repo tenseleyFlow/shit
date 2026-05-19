@@ -201,9 +201,7 @@ mod linux_impl {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let timeout_ms = remaining
-                .as_millis()
-                .min(libc::c_int::MAX as u128) as libc::c_int;
+            let timeout_ms = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
             let pr = unsafe { libc::poll(&mut pfd as *mut _, 1, timeout_ms) };
             if pr < 0 {
                 return Err(std::io::Error::last_os_error()).context("poll fanotify fd");
