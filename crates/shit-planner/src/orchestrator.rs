@@ -170,6 +170,11 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         // and never interleave.
         let cohorts = group_by_cohort(&plan.nodes);
         for (_cohort_id, cohort_indices) in cohorts {
+            // DR-64 fault-injection: crash at the cohort boundary.
+            // Cohorts are disjoint by construction, so a crash here
+            // leaves every prior cohort fully applied. Recovery
+            // resumes at this cohort.
+            shit_proto::fault_inject::maybe_inject("orchestrator.run_parallel.between_cohorts");
             // Collect parallel results in a thread-safe slot.
             let records_slot: Mutex<&mut Vec<Option<ExecutionRecord>>> = Mutex::new(&mut records);
             let abort_flag = Mutex::new(false);
@@ -297,7 +302,13 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
 
         for (op_index, node) in plan.nodes.iter().enumerate() {
             let op = &node.op;
+            // DR-64 fault-injection: crash between serial ops. On
+            // restart, the exec log is the source of truth for what
+            // was already applied; the recovery path re-runs the
+            // plan starting after the last recorded record.
+            shit_proto::fault_inject::maybe_inject("orchestrator.run.before_op");
             let record = self.execute_one(op_index, op, dry_run, policy);
+            shit_proto::fault_inject::maybe_inject("orchestrator.run.after_op");
             let outcome_kind = record.outcome_kind;
             records.push(record);
             if matches!(policy, ConflictPolicy::Abort)
