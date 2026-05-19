@@ -19,6 +19,7 @@ shit-proto = { workspace = true }
 shit-shell = { workspace = true }
 shit-capture = { workspace = true }
 shit-planner = { workspace = true }
+shit-desc = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 clap_mangen = { workspace = true }
