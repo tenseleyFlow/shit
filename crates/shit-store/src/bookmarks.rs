@@ -51,10 +51,7 @@ pub fn remove(index: &Index, command: CommandId) -> Result<bool, IndexError> {
     let conn = index.conn().lock().unwrap();
     let rows = conn.execute(
         "DELETE FROM bookmarks WHERE session = ?1 AND seq = ?2",
-        params![
-            command.session.as_bytes().as_slice(),
-            command.seq as i64,
-        ],
+        params![command.session.as_bytes().as_slice(), command.seq as i64,],
     )?;
     Ok(rows > 0)
 }

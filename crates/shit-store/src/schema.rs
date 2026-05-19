@@ -17,7 +17,10 @@ pub enum SchemaError {
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001-init.sql")),
     (2, include_str!("../migrations/0002-importance.sql")),
-    (3, include_str!("../migrations/0003-large-objects-and-holds.sql")),
+    (
+        3,
+        include_str!("../migrations/0003-large-objects-and-holds.sql"),
+    ),
 ];
 
 const TARGET_VERSION: u32 = 3;

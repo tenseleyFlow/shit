@@ -142,9 +142,8 @@ pub(crate) fn lookup_with_conn(
         None => return Ok(None),
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT offset, length, hash FROM chunks WHERE blob_hash = ?1 ORDER BY idx ASC",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT offset, length, hash FROM chunks WHERE blob_hash = ?1 ORDER BY idx ASC")?;
     let rows = stmt.query_map(params![blob_hash.as_bytes().as_slice()], |row| {
         let offset: i64 = row.get(0)?;
         let length: i64 = row.get(1)?;
@@ -165,7 +164,10 @@ pub(crate) fn lookup_with_conn(
 }
 
 /// Status (without the chunk list).
-pub fn stat(index: &Index, blob_hash: BlobHash) -> Result<Option<LargeObjectStat>, LargeObjectError> {
+pub fn stat(
+    index: &Index,
+    blob_hash: BlobHash,
+) -> Result<Option<LargeObjectStat>, LargeObjectError> {
     let conn = index.conn().lock().unwrap();
     let row = conn
         .query_row(

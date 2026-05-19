@@ -74,7 +74,9 @@ pub enum CaibxError {
     BadMagic([u8; 4]),
     #[error("version {actual} not supported (this build understands {supported})")]
     BadVersion { actual: u16, supported: u16 },
-    #[error("chunks not contiguous at idx {idx}: prev ends at {prev_end}, next starts at {next_offset}")]
+    #[error(
+        "chunks not contiguous at idx {idx}: prev ends at {prev_end}, next starts at {next_offset}"
+    )]
     NonContiguous {
         idx: usize,
         prev_end: u64,

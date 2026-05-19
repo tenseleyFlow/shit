@@ -67,6 +67,10 @@ enum Cmd {
     Show(cmd::show::ShowArgs),
     /// Pin a command's savepoint to protect it from GC.
     Pin(cmd::pin::PinArgs),
+    /// Bookmark a command — a metadata-only durable reference that
+    /// survives blob-tier GC and the eventual reaping of the command
+    /// row. C01.
+    Bookmark(cmd::bookmark::BookmarkArgs),
     /// Install/remove/status the package-manager hooks (apt, pacman,
     /// dnf, brew, FreeBSD pkg). See `shit pkg-hooks --help`.
     #[command(name = "pkg-hooks")]
@@ -276,6 +280,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::List(args) => Ok(cmd::list::run(args)?),
         Cmd::Show(args) => Ok(cmd::show::run(args)?),
         Cmd::Pin(args) => Ok(cmd::pin::run(args)?),
+        Cmd::Bookmark(args) => Ok(cmd::bookmark::run(args)?),
         Cmd::PkgHooks(args) => Ok(cmd::pkg_hooks::run(args)?),
         Cmd::SvcHooks(args) => Ok(cmd::svc_hooks::run(args)?),
         Cmd::NetHooks(args) => Ok(cmd::net_hooks::run(args)?),
