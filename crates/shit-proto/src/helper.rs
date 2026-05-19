@@ -35,7 +35,7 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// **Version 2 (S24.A):** added `HelperResponse::CapturedPreImage` for
 /// the kqueue post-hoc capture path; daemon learns to recvmsg with a
 /// cmsg buffer to extract the SCM_RIGHTS-attached staging fd.
-pub const HELPER_PROTOCOL_VERSION: u16 = 2;
+pub const HELPER_PROTOCOL_VERSION: u16 = 3;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -262,6 +262,15 @@ pub enum HelperResponse {
         /// buffer to extract the fd.
         fd_sent_via_scm: bool,
     },
+    /// S29.1 — tree-mutation observation (mkdir/rmdir/rename/symlink/link).
+    /// One-way: no blob attached; the daemon converts to
+    /// `CaptureEventKind::TreeOp(...)` and journals.
+    TreeMutation {
+        session: Uuid,
+        seq: u64,
+        op: TreeOpWire,
+        ts_unix_nanos: u64,
+    },
     /// DR-15 result of `ApplyChown` / `ApplyMknod`. Helper either
     /// applied the op or refused with a category.
     PrivilegedOpResult {
@@ -303,6 +312,54 @@ pub enum PrivilegedOpOutcome {
     Failed { err: String },
 }
 
+/// Wire-side mirror of `shit_planner::TreeOp`. Kept duplicated here
+/// rather than imported so `shit-proto` stays free of the planner
+/// dep. The daemon converts on ingest (`shitd::helper_link::handle_tree_mutation`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeOpWire {
+    Create {
+        dev: u64,
+        inode: u64,
+        path: String,
+        kind: FileKindWire,
+        mode: u32,
+    },
+    Unlink {
+        dev: u64,
+        inode: u64,
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+        dev: u64,
+        inode: u64,
+    },
+    Link {
+        source_dev: u64,
+        source_inode: u64,
+        target: String,
+    },
+    Symlink {
+        /// Symlink target as the kernel returns (`readlink` output).
+        target: String,
+        /// Path of the symlink itself.
+        path: String,
+    },
+}
+
+/// Wire mirror of `shit_planner::FileKind`. Same enum shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileKindWire {
+    Regular,
+    Directory,
+    Symlink,
+    Fifo,
+    Socket,
+    BlockDevice,
+    CharDevice,
+}
+
 /// Daemon's verdict on a pending kernel auth event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthDecision {
@@ -340,6 +397,21 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
             {
                 return Err(HelperProtoError::PathHintTooLong {
                     got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::TreeMutation { op, .. } => {
+            // Validate every path field in the op variant.
+            let longest = match op {
+                TreeOpWire::Create { path, .. } | TreeOpWire::Unlink { path, .. } => path.len(),
+                TreeOpWire::Rename { from, to, .. } => from.len().max(to.len()),
+                TreeOpWire::Link { target, .. } => target.len(),
+                TreeOpWire::Symlink { target, path } => target.len().max(path.len()),
+            };
+            if longest > HELPER_PATH_HINT_MAX {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: longest,
                     max: HELPER_PATH_HINT_MAX,
                 });
             }
@@ -503,12 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_constant_is_two() {
+    fn protocol_version_constant_is_three() {
         // Bumping this is intentional and should be paired with an
         // explicit migration plan; this test catches accidental bumps.
-        // Version 2 (S24.A) added `HelperResponse::CapturedPreImage`
-        // for the kqueue post-hoc capture path.
-        assert_eq!(HELPER_PROTOCOL_VERSION, 2);
+        //   Version 2 (S24.A) added `HelperResponse::CapturedPreImage`
+        //     for the kqueue post-hoc capture path.
+        //   Version 3 (S29.1) added `HelperResponse::TreeMutation`
+        //     for mkdir/rmdir/rename/symlink/link observations.
+        assert_eq!(HELPER_PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
+    fn tree_mutation_round_trip() {
+        let ev = HelperResponse::TreeMutation {
+            session: Uuid::nil(),
+            seq: 17,
+            op: TreeOpWire::Create {
+                dev: 1,
+                inode: 42,
+                path: "/tmp/foo/bar".into(),
+                kind: FileKindWire::Directory,
+                mode: 0o40755,
+            },
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+        };
+        let encoded = crate::frame::encode_frame(&ev).expect("encode");
+        let decoded: HelperResponse =
+            crate::frame::decode_frame(&encoded).expect("decode");
+        assert_eq!(decoded, ev);
     }
 
     #[test]
