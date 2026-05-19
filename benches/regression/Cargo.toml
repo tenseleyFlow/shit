@@ -60,3 +60,7 @@ anyhow = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl", "process", "signal"] }
 tempfile = "3.10"
+# L01 chunk 6: --full-capture mode hashes the pre-image with the same
+# algorithm `shit-helper`'s LinuxCaptureRuntime uses, so the measured
+# cost reflects the real CAPTURE_TO_ALLOW hot path.
+blake3 = { workspace = true }

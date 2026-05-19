@@ -45,6 +45,9 @@ fn main() -> anyhow::Result<()> {
         #[arg(long, default_value_t = 30)]
         #[allow(dead_code)]
         deadline_secs: u64,
+        #[arg(long, default_value_t = false)]
+        #[allow(dead_code)]
+        full_capture: bool,
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     }
@@ -95,6 +98,17 @@ mod linux_impl {
         /// the workflow hung 49 minutes on the bare `fan.read`.
         #[arg(long, default_value_t = 30)]
         deadline_secs: u64,
+        /// L01 chunk 6: when set, perform the SAME load-bearing capture
+        /// work between read and ALLOW that `shit-helper`'s
+        /// `LinuxCaptureRuntime::handle_event` does — dup the fd, read
+        /// the pre-image bytes, blake3-hash them, write a staging file,
+        /// then ack ALLOW. Measures the realistic capture-to-ALLOW
+        /// p99 against the CAPTURE_TO_ALLOW BudgetGate (5ms/10ms).
+        /// Without this flag the bench measures only the kernel
+        /// fanotify-fd round-trip baseline (the floor below the
+        /// budget).
+        #[arg(long, default_value_t = false)]
+        full_capture: bool,
         /// Output file for the JSON result.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -177,6 +191,11 @@ mod linux_impl {
         // OwnedFd — std::mem::forget the OwnedFd ownership.
         std::mem::forget(fan_fd);
 
+        // Staging dir for the full-capture mode's write-then-ack flow.
+        // Created once; files are written under it and cleaned up via
+        // the TempDir drop at end of run.
+        let staging = tempfile::tempdir().context("create staging dir")?;
+
         let metadata_size = std::mem::size_of::<libc::fanotify_event_metadata>();
         let mut buf = vec![0u8; metadata_size * 16];
         let mut got = 0usize;
@@ -229,6 +248,18 @@ mod linux_impl {
                     break;
                 }
                 // The fd in `md.fd` is owned by us now; close after ACK.
+                //
+                // L01 chunk 6 — full-capture mode performs the same
+                // work-between-read-and-ALLOW that the helper's
+                // LinuxCaptureRuntime::handle_event does: fstat → dup →
+                // read pre-image → blake3 → staging-write. The SCM_RIGHTS
+                // send_response_with_fd is NOT replayed (no daemon here);
+                // its cost is in the same order as the `fan.write_all`
+                // below, both being short kernel-side IPC writes.
+                if args.full_capture && md.fd >= 0 {
+                    simulate_capture_work(md.fd, staging.path()).context("capture work")?;
+                }
+
                 let response = libc::fanotify_response {
                     fd: md.fd,
                     response: libc::FAN_ALLOW,
@@ -275,6 +306,68 @@ mod linux_impl {
             Some(p) => std::fs::write(p, json)?,
             None => println!("{json}"),
         }
+        Ok(())
+    }
+
+    /// Reproduces the load-bearing work of
+    /// `shit-helper::capture::linux::LinuxCaptureRuntime::handle_event`
+    /// step-for-step so the bench measures the realistic cost of the
+    /// CAPTURE_TO_ALLOW hot path. If this drifts from the helper's
+    /// implementation, the bench drifts too — that's the trade-off for
+    /// keeping the bench dep-light (no shit-helper crate dependency).
+    fn simulate_capture_work(event_fd: i32, staging_dir: &std::path::Path) -> Result<()> {
+        use std::io::{Read, Write};
+
+        // 1. fstat — get (dev, inode) + size. Same as runtime's
+        //    fstat_dev_inode_kind + fstat_meta.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(event_fd, &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("fstat");
+        }
+        // 2. dup the fd so we can read without disturbing the kernel's
+        //    fanotify-owned position. Runtime does the same.
+        let dup_fd = unsafe { libc::dup(event_fd) };
+        if dup_fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup");
+        }
+        let owned = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(dup_fd) };
+        // 3. Read the pre-image. Bounded read to mirror MAX_PRE_IMAGE_BYTES.
+        let size = (st.st_size as usize).min(256 * 1024 * 1024);
+        let mut bytes = Vec::with_capacity(size);
+        let mut f = owned;
+        f.read_to_end(&mut bytes).context("read pre-image")?;
+        // 4. blake3 the bytes. Same algorithm + same single-threaded
+        //    path the runtime uses.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&bytes);
+        let _hash = *hasher.finalize().as_bytes();
+        // 5. Staging-write. Same unique-name + create_new + write_all
+        //    pattern as runtime's write_to_staging.
+        let name = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let staging_path = staging_dir.join(&name);
+        let mut sf = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging_path)
+            .context("staging open")?;
+        sf.write_all(&bytes).context("staging write")?;
+        drop(sf);
+        // 6. Reopen read-only — the runtime hands this fd to the daemon
+        //    via SCM_RIGHTS. Here we just open and immediately close;
+        //    measures the same fs metadata-update cost.
+        let _ro = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&staging_path)
+            .context("staging reopen")?;
+        // Clean up so the staging dir doesn't grow unbounded across N events.
+        let _ = std::fs::remove_file(&staging_path);
         Ok(())
     }
 
