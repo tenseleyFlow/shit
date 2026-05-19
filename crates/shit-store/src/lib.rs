@@ -7,6 +7,7 @@
 pub mod blob;
 pub mod bookmarks;
 pub mod caibx;
+pub mod container_stash;
 pub mod gc;
 pub mod holds;
 pub mod importance;
@@ -18,6 +19,9 @@ pub mod schema;
 pub use blob::{BlobError, BlobStat, BlobStore};
 pub use bookmarks::Bookmark;
 pub use caibx::{CaibxError, ChunkIndex, ChunkRef};
+pub use container_stash::{
+    CONTAINER_STASH_RETENTION_SECS, ContainerStash, RegisterRequest, StashKind,
+};
 pub use gc::{GcConfig, GcError, GcReport, SizeCapStatus, check_size_cap, run_pass};
 pub use holds::Hold;
 pub use importance::{ImportanceConfig, ScoreInputs, bump_for_undo, score_command, set_importance};
