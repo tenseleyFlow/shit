@@ -47,7 +47,7 @@
     target_os = "linux",
 ))]
 mod interposers {
-    use libc::{c_char, c_int, mode_t};
+    use libc::{c_char, c_int, c_uint, mode_t};
 
     /// Stage-1 `unlink` interposer. Calls through to libc immediately.
     /// Stage 2 will notify the helper first and await a verdict.
@@ -72,8 +72,11 @@ mod interposers {
         flags: c_int,
         mode: mode_t,
     ) -> c_int {
-        // SAFETY: forwarded contract.
-        unsafe { libc::open(path, flags, mode) }
+        // libc::open is variadic; mode must arrive as at least
+        // c_uint after default-argument promotion. On Linux mode_t is
+        // already c_uint, but on FreeBSD it's u16 and needs an
+        // explicit promotion or the call fails to compile (E0617).
+        unsafe { libc::open(path, flags, mode as c_uint) }
     }
 }
 
@@ -109,7 +112,7 @@ mod tests {
     #[test]
     fn unlink_passthrough_returns_negative_on_missing_path() {
         let c = CString::new("/tmp/shit-preload-shim-nonexistent-XXX").unwrap();
-        let r = unsafe { super::shit_preload_unlink(c.as_ptr()) };
+        let r = unsafe { super::interposers::shit_preload_unlink(c.as_ptr()) };
         assert!(r < 0, "unlink of nonexistent path should fail");
     }
 }
