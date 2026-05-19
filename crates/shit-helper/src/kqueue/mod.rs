@@ -40,7 +40,10 @@ pub mod vnode;
 
 pub use error::KqueueError;
 pub use init::{KqueueFd, init};
-pub use proc::{ProcEventKind, watch_pid};
+pub use proc::{
+    PROC_FFLAGS_DESCENDANTS, PROC_FFLAGS_SINGLE, ProcEventKind, TrackedPid, track_descendants,
+    track_pid,
+};
 pub use tree::TrackedTree;
 pub use vnode::{
     DEFAULT_DEPTH_LIMIT, TrackedSubtree, VNODE_FFLAGS, VnodeEventKind, register_subtree, watch_path,
