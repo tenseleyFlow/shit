@@ -18,6 +18,7 @@
 //! Frozen schema version: `1`.
 
 pub mod matcher;
+pub mod parse;
 pub mod schema;
 
 // Re-exports are unused until later C02 chunks wire the loader and
@@ -25,6 +26,8 @@ pub mod schema;
 // crate-level `dead_code` allow on this module.
 #[allow(unused_imports)]
 pub use matcher::{MatchOutcome, match_descriptor, match_pattern};
+#[allow(unused_imports)]
+pub use parse::{ParseError, extract_all};
 #[allow(unused_imports)]
 pub use schema::{
     Descriptor, DescriptorAuthority, DescriptorMatch, DescriptorReverse, DescriptorSnapshot,
