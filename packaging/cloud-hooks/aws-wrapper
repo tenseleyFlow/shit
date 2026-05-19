@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# C03 cloud wrapper: aws (AWS CLI v2). PATH-prepended under
+# $XDG_CONFIG_HOME/shit/bin/ when `shit cloud-hooks install` runs.
+#
+# Pre/post capture invocations of `shit-helper cloud-event aws ...`
+# are gated on DR-CR-06 (daemon-side capture pipeline). Stage 1 just
+# execs the real aws with SHIT_DURING_UNDO recursion guard.
+
+set -e
+
+# Recursion guard: an aws invocation issued FROM the helper itself
+# (during a shit undo) must NOT re-capture. The executors set
+# SHIT_DURING_UNDO=1.
+if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
+    real=$(command -v -- aws | grep -v "$(dirname "$0")" | head -n1)
+    [ -n "$real" ] || { echo "shit: real aws not found on PATH" >&2; exit 127; }
+    exec "$real" "$@"
+fi
+
+# Locate the real aws (first non-wrapper entry on PATH).
+real=$(PATH="${PATH#*$(dirname "$0"):}" command -v aws 2>/dev/null || command -v -- aws)
+[ -n "$real" ] || { echo "shit: real aws not found on PATH" >&2; exit 127; }
+
+# DR-CR-06: pre/post hooks via `shit-helper cloud-event` go here.
+# Stage 1: just exec.
+exec "$real" "$@"
