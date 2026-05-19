@@ -59,7 +59,7 @@ pub use network::{
     is_ip_mutating, is_iptables_mutating, is_nft_mutating, is_pfctl_mutating, is_ufw_mutating,
     restore_method,
 };
-pub use orchestrator::Orchestrator;
+pub use orchestrator::{Orchestrator, PathsFilterError, compile_paths_filter};
 pub use probe::{ProbeStat, StateProbe};
 pub use probe_live::{LiveStateProbe, hash_file};
 pub use proc::{KillCommand, KillTarget, parse_kill, parse_pattern_kill};
