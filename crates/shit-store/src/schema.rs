@@ -21,9 +21,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
         3,
         include_str!("../migrations/0003-large-objects-and-holds.sql"),
     ),
+    (4, include_str!("../migrations/0004-container-stash.sql")),
 ];
 
-const TARGET_VERSION: u32 = 3;
+const TARGET_VERSION: u32 = 4;
 
 pub fn apply(conn: &Connection) -> Result<(), SchemaError> {
     // Pragmas first: durable but not paranoid.
@@ -102,6 +103,7 @@ mod tests {
             "chunks",
             "holds",
             "bookmarks",
+            "container_stashes",
         ];
         for table in want {
             let exists: bool = conn
@@ -137,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v3_forward_migrates_from_v2() {
+    fn migration_forward_from_v2_reaches_target() {
         // Apply migrations 1+2 only by faking schema_version = 2 mid-flight.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../migrations/0001-init.sql"))
@@ -146,7 +148,7 @@ mod tests {
             .unwrap();
         assert_eq!(current_version(&conn).unwrap(), 2);
 
-        // Seed a row in the v2 store; v3 must not disturb it.
+        // Seed a row in the v2 store; later migrations must not disturb it.
         conn.execute(
             "INSERT INTO sessions
              (id, shell_kind, parent_pid, tty, opened_logical, opened_wall_nanos)
@@ -155,13 +157,57 @@ mod tests {
         )
         .unwrap();
 
-        // Run apply(); only v3 should execute.
+        // Run apply(); v3 and v4 should both execute.
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), TARGET_VERSION);
 
         // The seeded session row survived.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migration_v4_forward_migrates_from_v3() {
+        // Apply migrations 1+2+3 only by stopping mid-chain. v4 must
+        // be additive — pre-existing rows in v3-era tables survive.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../migrations/0001-init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/0002-importance.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/0003-large-objects-and-holds.sql"
+        ))
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 3);
+
+        // Seed a v3-era bookmark row.
+        conn.execute(
+            "INSERT INTO bookmarks (session, seq, created_logical, note)
+             VALUES (X'00000000000000000000000000000000', 1, 0, 'pre-v4')",
+            [],
+        )
+        .unwrap();
+
+        // Run apply(); only v4 should execute.
+        apply(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+
+        // The container_stashes table exists.
+        let has_table: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='container_stashes'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_table);
+
+        // Pre-v4 bookmark row survived.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
     }
