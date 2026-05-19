@@ -84,9 +84,13 @@ smoke_stop_shitd() {
 smoke_cleanup() {
     local rc=$?
     smoke_stop_shitd
-    for pid in "${SHIT_SMOKE_PIDS[@]}"; do
-        kill -KILL "${pid}" 2>/dev/null || true
-    done
+    # Iterate guarded: precondition-skip paths exit before populating
+    # the array, and `set -u` would explode on `"${arr[@]}"` then.
+    if [ "${#SHIT_SMOKE_PIDS[@]}" -gt 0 ]; then
+        for pid in "${SHIT_SMOKE_PIDS[@]}"; do
+            kill -KILL "${pid}" 2>/dev/null || true
+        done
+    fi
     if [ "${SMOKE_KEEP_TMP:-0}" != "1" ]; then
         rm -rf "${SHIT_SMOKE_TMP}"
     else
