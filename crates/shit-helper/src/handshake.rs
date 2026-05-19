@@ -141,7 +141,13 @@ pub fn perform_helper_side(
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
         kernel_tier: kernel_tier_classifier().to_string(),
     };
+    // DR-64 fault-injection: crash mid-reply. The daemon must
+    // observe the disconnect, log the failed handshake, and
+    // re-spawn the helper rather than treating the dropped socket
+    // as a permanent failure.
+    shit_proto::fault_inject::maybe_inject("helper.handshake.before_ack_send");
     conn.send_response(&ack)?;
+    shit_proto::fault_inject::maybe_inject("helper.handshake.after_ack_send");
 
     Ok(HandshakeOutcome {
         daemon_pid,
