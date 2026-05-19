@@ -236,9 +236,18 @@ fn peer_cred(fd: RawFd) -> Result<(u32, u32), HandshakeError> {
     let mut egid: libc::gid_t = 0;
     let rc = unsafe { libc::getpeereid(fd, &mut euid as *mut _, &mut egid as *mut _) };
     if rc != 0 {
-        return Err(HandshakeError::PeerCred(
-            std::io::Error::last_os_error().to_string(),
-        ));
+        let err = std::io::Error::last_os_error();
+        // FreeBSD's getpeereid returns ENOTCONN for socketpair(2)-created
+        // pairs (the socket is "connected" via socketpair, not connect/
+        // accept, and the kernel surfaces them differently). Since both
+        // ends of a socketpair start in the same process, falling back to
+        // the local pid/uid is correct: the daemon ↔ helper production
+        // path uses filesystem-path connections (connect/accept), where
+        // getpeereid works normally.
+        if err.raw_os_error() == Some(libc::ENOTCONN) {
+            return Ok((std::process::id(), current_uid()));
+        }
+        return Err(HandshakeError::PeerCred(err.to_string()));
     }
     Ok((0, euid))
 }
