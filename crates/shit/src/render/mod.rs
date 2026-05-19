@@ -23,6 +23,7 @@ pub mod git;
 pub mod json;
 pub mod pager;
 pub mod process;
+pub mod shell_state;
 
 #[allow(unused_imports)]
 pub use color::{ColorPref, resolve_color};
