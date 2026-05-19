@@ -40,15 +40,20 @@ pub fn kqueue_functional() -> bool {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    let path = dir.path().join("doctor-kqueue-probe");
+    // Manual tempfile in /tmp — tempfile crate is a dev-dep only,
+    // not available at runtime. Path is per-pid + nanos for uniqueness.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("shit-doctor-kq-{pid}-{nanos}"));
     let mut f = match std::fs::File::create(&path) {
         Ok(f) => f,
         Err(_) => return false,
     };
+    // Best-effort cleanup on drop via a scoped guard.
+    let _cleanup = scopeguard(path.clone());
 
     // SAFETY: kqueue() returns a fresh fd we own.
     let kq_fd = unsafe { libc::kqueue() };
@@ -58,14 +63,19 @@ pub fn kqueue_functional() -> bool {
     // SAFETY: kq_fd is a valid fresh fd we own.
     let _kq_guard = unsafe { OwnedFd::from_raw_fd(kq_fd) };
 
-    let mut changes = [libc::kevent {
-        ident: f.as_raw_fd() as usize,
-        filter: libc::EVFILT_VNODE,
-        flags: libc::EV_ADD | libc::EV_CLEAR,
-        fflags: libc::NOTE_WRITE,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    }];
+    // Use mem::zeroed() to initialize all kevent fields portably —
+    // FreeBSD adds an `ext: [i64; 4]` field that NetBSD/OpenBSD/
+    // DragonFly lack; zeroed-then-override avoids the per-OS literal.
+    // SAFETY: libc::kevent is `#[repr(C)]` with primitive fields;
+    // an all-zeros bit pattern is a valid kevent (zeroed udata is
+    // a null ptr, which is what we want anyway).
+    let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+    change.ident = f.as_raw_fd() as usize;
+    change.filter = libc::EVFILT_VNODE;
+    change.flags = libc::EV_ADD | libc::EV_CLEAR;
+    change.fflags = libc::NOTE_WRITE;
+    let mut changes = [change];
+
     // SAFETY: kq_fd is open, changes points to one valid kevent.
     let r = unsafe {
         libc::kevent(
@@ -98,6 +108,18 @@ pub fn kqueue_functional() -> bool {
     // ts is a valid timespec.
     let n = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, events.as_mut_ptr(), 1, &ts) };
     n >= 1 && (events[0].fflags & libc::NOTE_WRITE) != 0
+}
+
+/// Tiny scoped-guard helper for unlinking a temp file on drop.
+/// Avoids pulling in `scopeguard` or `tempfile` (both dev-deps).
+fn scopeguard(path: std::path::PathBuf) -> impl Drop {
+    struct G(std::path::PathBuf);
+    impl Drop for G {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    G(path)
 }
 
 /// True iff `cap_getmode(2)` returns 0 (the capsicum syscall is
