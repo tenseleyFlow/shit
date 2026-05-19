@@ -52,10 +52,7 @@ impl NetInspector for PfctlInspector {
         NetToolWire::Pfctl
     }
     fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
-        let sections: &[(&str, &[&str])] = &[
-            ("rules", &["-sr", "-a", "*"]),
-            ("nat", &["-sn"]),
-        ];
+        let sections: &[(&str, &[&str])] = &[("rules", &["-sr", "-a", "*"]), ("nat", &["-sn"])];
         let mut out = Vec::new();
         for (name, args) in sections {
             out.extend_from_slice(format!("# SHIT pfctl section: {name}\n").as_bytes());
@@ -80,9 +77,13 @@ fn run(args: &[&str]) -> anyhow::Result<Vec<u8>> {
     let escalator = if is_root {
         None
     } else {
-        ["/usr/local/bin/doas", "/usr/local/bin/sudo", "/usr/bin/sudo"]
-            .into_iter()
-            .find(|p| Path::new(p).is_file())
+        [
+            "/usr/local/bin/doas",
+            "/usr/local/bin/sudo",
+            "/usr/bin/sudo",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
     };
     let mut cmd = match escalator {
         Some(e) => {
