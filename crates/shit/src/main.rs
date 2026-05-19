@@ -165,7 +165,15 @@ enum Cmd {
         action: InternalCmd,
     },
     /// Inspect filesystem support and capture-tier choices for your mounts.
-    Doctor,
+    /// Pass `--json` for the machine-readable envelope (B03).
+    Doctor {
+        /// Emit the [`shit::doctor::json::DoctorReport`] envelope on
+        /// stdout instead of the human table. Schema version is
+        /// stable per [`shit::doctor::json::SCHEMA_VERSION`]; see
+        /// `.docs/audits/doctor-json-schema.md` for the contract.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -344,7 +352,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
                 Ok(())
             }
         },
-        Cmd::Doctor => Ok(doctor::run()?),
+        Cmd::Doctor { json } => Ok(doctor::run(json)?),
     }
 }
 

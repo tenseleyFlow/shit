@@ -1,19 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `shit doctor` — walk likely-to-matter mount points, print the
-//! detected FS kind, the COW tier we'd pick, and any caveats.
+//! `shit doctor` — walk likely-to-matter mount points, run runtime
+//! probes against the host's kernel + helper, and report.
 //!
 //! ## Output modes
 //!
-//! - Default: human-readable table (the long-standing behavior).
+//! - Default: human-readable table (the long-standing behavior;
+//!   preserved byte-for-byte for the BSD path so CI doesn't notice
+//!   the refactor).
 //! - `--json`: machine-readable [`json::DoctorReport`] for CI gates
-//!   and external tooling consumption (B03).
+//!   and external tooling consumption (B03). Schema is versioned;
+//!   see [`json::SCHEMA_VERSION`] and `.docs/audits/doctor-json-schema.md`.
+//!
+//! The two modes are produced from the same [`json::DoctorReport`]
+//! struct so the human and machine outputs always agree.
 
 pub mod json;
 pub mod probes;
 
 use shit_capture::{CaptureOpts, CowTier, FsKind, detect_fs, supported_tiers, would_pick};
 use std::path::{Path, PathBuf};
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+use crate::doctor::json::HelperHandshakeReport;
+use crate::doctor::json::{DoctorReport, HostInfo, MountReport, SCHEMA_VERSION};
 
 const CANDIDATE_PATHS: &[&str] = &["$HOME", "/etc", "/usr/local", "/opt", "/tmp", "/var/tmp"];
 
@@ -25,29 +40,31 @@ struct Row {
     caveats: Vec<String>,
 }
 
-pub fn run() -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    print_linux_kernel_tier();
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    ))]
-    print_bsd_tier();
+/// Top-level entry. `json=true` emits the serialized envelope on
+/// stdout; `json=false` preserves the long-standing human table.
+pub fn run(json: bool) -> anyhow::Result<()> {
+    let (rows, report) = collect();
+    if json {
+        let s = serde_json::to_string_pretty(&report)?;
+        println!("{s}");
+    } else {
+        render_table(&rows, &report);
+    }
+    Ok(())
+}
 
+/// Build the full report. Side-effect-free except for the probes
+/// in [`probes::bsd`] (which do small kqueue + sysctl + subprocess
+/// I/O — all documented to be <2s total).
+fn collect() -> (Vec<Row>, DoctorReport) {
     let mut rows: Vec<Row> = Vec::new();
     for raw in CANDIDATE_PATHS {
         let resolved = resolve_path(raw);
-        let Some(path) = resolved else {
-            continue;
-        };
+        let Some(path) = resolved else { continue };
         if !path.exists() {
             continue;
         }
         let fs = detect_fs(&path).unwrap_or(FsKind::Other("unknown".into()));
-        // Pick assuming same destination (the typical case for shit's
-        // own blob store under $XDG_STATE_HOME).
         let picked = would_pick(&path, &path, CaptureOpts::default());
         let caveats = caveats_for(&fs, picked.as_ref());
         rows.push(Row {
@@ -58,8 +75,150 @@ pub fn run() -> anyhow::Result<()> {
         });
     }
 
-    print_table(&rows);
-    Ok(())
+    let mounts: Vec<MountReport> = rows
+        .iter()
+        .map(|r| MountReport {
+            path: r.path.display().to_string(),
+            fs_kind: r.fs.as_str().to_string(),
+            picked_cow_tier: r.picked.map(|t| t.as_str().to_string()),
+            caveats: r.caveats.clone(),
+        })
+        .collect();
+
+    let report = DoctorReport {
+        schema_version: SCHEMA_VERSION,
+        host: host_info(),
+        bsd: collect_bsd(),
+        linux: None,
+        macos: None,
+        mounts,
+    };
+
+    (rows, report)
+}
+
+fn host_info() -> HostInfo {
+    HostInfo {
+        os: std::env::consts::OS.to_string(),
+        os_release: read_os_release(),
+        arch: std::env::consts::ARCH.to_string(),
+    }
+}
+
+/// Best-effort kernel/OS release string. Linux: kernel release via
+/// `uname -r`. BSD: `uname -r` equivalent. macOS: Darwin version.
+/// Returns empty string when `uname(3)` fails (extremely rare).
+fn read_os_release() -> String {
+    // SAFETY: uname() takes a pointer to a buffer it fills in;
+    // libc::utsname is zeroable.
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::uname(&mut u) };
+    if r != 0 {
+        return String::new();
+    }
+    // SAFETY: the kernel guarantees release is NUL-terminated.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) };
+    cstr.to_string_lossy().into_owned()
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn collect_bsd() -> Option<json::BsdReport> {
+    use crate::doctor::probes::bsd;
+
+    Some(json::BsdReport {
+        runtime_capture: bsd::runtime_capture_label(),
+        kqueue_functional: bsd::kqueue_functional(),
+        capsicum_available: bsd::capsicum_available(),
+        zfs_datasets: bsd::zfs_datasets(),
+        helper_handshake: probe_helper_handshake(),
+        preload_shim_installed: bsd::preload_shim_installed(),
+    })
+}
+
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+fn collect_bsd() -> Option<json::BsdReport> {
+    None
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn probe_helper_handshake() -> HelperHandshakeReport {
+    let Some(sock) = default_helper_sock() else {
+        return HelperHandshakeReport {
+            ok: false,
+            latency_ms: 0,
+            helper_version: None,
+            kernel_tier: None,
+            error: Some("could not resolve state_dir for helper.sock".into()),
+        };
+    };
+    if !sock.exists() {
+        return HelperHandshakeReport {
+            ok: false,
+            latency_ms: 0,
+            helper_version: None,
+            kernel_tier: None,
+            error: Some(format!(
+                "no daemon running ({}): start with `shitd --foreground` or via systemd",
+                sock.display()
+            )),
+        };
+    }
+    crate::doctor::probes::bsd::helper_handshake_probe(&sock)
+}
+
+/// `$XDG_STATE_HOME/shit/helper.sock` (or `$HOME/.local/state/shit/helper.sock`).
+/// Mirrors `shitd`'s state-dir resolution. Returns `None` when
+/// neither env var is set.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn default_helper_sock() -> Option<PathBuf> {
+    let state = if let Some(s) = std::env::var_os("XDG_STATE_HOME") {
+        PathBuf::from(s).join("shit")
+    } else {
+        let home = std::env::var_os("HOME")?;
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("shit")
+    };
+    Some(state.join("helper.sock"))
+}
+
+/// Render the table-mode output. Designed to match the pre-B03
+/// byte stream for the BSD / Linux per-platform sections so the
+/// table-mode UX doesn't regress.
+fn render_table(rows: &[Row], _report: &DoctorReport) {
+    #[cfg(target_os = "linux")]
+    print_linux_kernel_tier();
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    if let Some(bsd) = _report.bsd.as_ref() {
+        print_bsd_tier(bsd);
+    }
+    print_mount_table(rows);
 }
 
 fn resolve_path(raw: &str) -> Option<PathBuf> {
@@ -96,7 +255,7 @@ fn caveats_for(fs: &FsKind, picked: Option<&CowTier>) -> Vec<String> {
     out
 }
 
-fn print_table(rows: &[Row]) {
+fn print_mount_table(rows: &[Row]) {
     println!("{:<22}  {:<10}  {:<16}  caveats", "path", "fs", "tier");
     println!("{}", "-".repeat(72));
     for r in rows {
@@ -162,7 +321,7 @@ fn print_linux_kernel_tier() {
     target_os = "openbsd",
     target_os = "dragonfly",
 ))]
-fn print_bsd_tier() {
+fn print_bsd_tier(bsd: &json::BsdReport) {
     let probe = shit_capture::bsd_probe::probe_bsd();
     println!(
         "os:       {} ({})",
@@ -174,28 +333,57 @@ fn print_bsd_tier() {
         }
     );
     println!("kqueue:   {}", kqueue_features_line(&probe.kqueue));
+    println!(
+        "kqueue-functional: {}",
+        if bsd.kqueue_functional { "yes" } else { "NO" }
+    );
+    println!(
+        "capsicum: {}",
+        if bsd.capsicum_available {
+            "syscall available"
+        } else {
+            "not available"
+        }
+    );
     print!("zfs:      ");
-    if probe.zfs.usable() {
-        let v = probe.zfs.version.as_deref().unwrap_or("unknown");
-        println!(
-            "available — {} pool(s), {}",
-            probe.zfs.pool_count.unwrap_or(0),
-            v
-        );
-    } else if probe.zfs.binary_present {
-        println!("binary present, no pools imported");
-    } else {
+    if bsd.zfs_datasets.is_empty() && !probe.zfs.binary_present {
         println!("not installed");
+    } else if bsd.zfs_datasets.is_empty() {
+        println!("binary present, no datasets enumerated");
+    } else {
+        println!(
+            "{} dataset(s): {}",
+            bsd.zfs_datasets.len(),
+            bsd.zfs_datasets.join(", ")
+        );
     }
-    let shim = std::path::Path::new("/usr/local/lib/shit/libshit_preload.so");
     println!(
         "preload:  {}",
-        if shim.is_file() {
+        if bsd.preload_shim_installed {
             "installed at /usr/local/lib/shit/libshit_preload.so"
         } else {
             "not installed — kqueue-only coverage; see `shit hooks install`"
         }
     );
+    print!("helper:   ");
+    if bsd.helper_handshake.ok {
+        println!(
+            "ok ({} ms, {})",
+            bsd.helper_handshake.latency_ms,
+            bsd.helper_handshake
+                .helper_version
+                .as_deref()
+                .unwrap_or("version unknown"),
+        );
+    } else {
+        println!(
+            "FAILED: {}",
+            bsd.helper_handshake
+                .error
+                .as_deref()
+                .unwrap_or("(no error message)")
+        );
+    }
     println!();
 }
 
@@ -233,5 +421,5 @@ pub fn print_row(path: &Path) {
         picked,
         caveats: caveats_for(&fs, picked.as_ref()),
     };
-    print_table(std::slice::from_ref(&row));
+    print_mount_table(std::slice::from_ref(&row));
 }
