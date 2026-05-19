@@ -25,6 +25,8 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,6 +61,11 @@ pub struct FanotifyState {
     /// degraded paths), in which case the reader still ALLOWs every
     /// perm event but doesn't capture.
     pub capture_runtime: Option<Arc<Mutex<LinuxCaptureRuntime>>>,
+    /// L01 — per-CommandId path that was marked at WatchTree time.
+    /// Looked up at UnwatchTree to know which path to unmark.
+    /// Without this map the helper would leak marks across commands
+    /// (slowly accumulating fanotify watches over time).
+    pub marked_paths: Arc<Mutex<HashMap<CommandId, PathBuf>>>,
 }
 
 impl FanotifyState {
@@ -70,6 +77,7 @@ impl FanotifyState {
             events_seen: Arc::new(AtomicU64::new(0)),
             overflows: Arc::new(AtomicU64::new(0)),
             capture_runtime: None,
+            marked_paths: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,6 +103,7 @@ impl Clone for FanotifyState {
             events_seen: Arc::clone(&self.events_seen),
             overflows: Arc::clone(&self.overflows),
             capture_runtime: self.capture_runtime.as_ref().map(Arc::clone),
+            marked_paths: Arc::clone(&self.marked_paths),
         }
     }
 }
