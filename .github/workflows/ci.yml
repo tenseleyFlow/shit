@@ -44,7 +44,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build + test on FreeBSD 14
-        uses: cross-platform-actions/action@v0.25.0
+        # v0.25.0 didn't know about FreeBSD 14.2 (added in v0.26.0)
+        # and 404'd on the VM image fetch. v0.30.0 has the image +
+        # the GHSA-928q-63gf-mc2x security fix.
+        uses: cross-platform-actions/action@v0.30.0
         with:
           operating_system: freebsd
           version: '14.2'
