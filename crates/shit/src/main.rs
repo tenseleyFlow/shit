@@ -109,6 +109,11 @@ enum Cmd {
     /// Run a command under the install-prefix shim (LD_PRELOAD /
     /// DYLD_INSERT_LIBRARIES). C05. See `shit install --help`.
     Install(cmd::install::InstallArgs),
+    /// Shell preexec helper: classify an argv and emit shim env-var
+    /// assignments if it matches a known install pattern. Wired into
+    /// the auto-inject path from `shit hooks install`. C05.
+    #[command(name = "auto-inject-install-env")]
+    AutoInjectInstallEnv(cmd::auto_inject::AutoInjectArgs),
     /// Query the daemon's perf-counter snapshot. `--format prometheus`
     /// for scraping; `--watch 1s` for live updates.
     Metrics(cmd::metrics::MetricsArgs),
@@ -309,6 +314,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         Cmd::ContainerHooks(args) => Ok(cmd::container_hooks::run(args)?),
         Cmd::ContainerStashes(args) => Ok(cmd::container_stashes::run(args)?),
         Cmd::Install(args) => Ok(cmd::install::run(args)?),
+        Cmd::AutoInjectInstallEnv(args) => Ok(cmd::auto_inject::run(args)?),
         Cmd::Metrics(args) => Ok(cmd::metrics::run(args)?),
         Cmd::Forget(args) => Ok(cmd::forget::run(args)?),
         Cmd::Gc(args) => Ok(cmd::gc::run(args)?),

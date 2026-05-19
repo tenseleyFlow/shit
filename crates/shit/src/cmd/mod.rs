@@ -3,6 +3,7 @@
 //! Subcommand bodies. The CLI parser lives in `main.rs`; each
 //! subcommand's *behavior* lives here.
 
+pub mod auto_inject;
 pub mod bookmark;
 pub mod cloud_hooks;
 pub mod completions;
