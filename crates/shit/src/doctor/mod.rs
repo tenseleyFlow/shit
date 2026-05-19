@@ -157,50 +157,50 @@ fn collect_bsd() -> Option<json::BsdReport> {
     target_os = "dragonfly",
 ))]
 fn probe_helper_handshake() -> HelperHandshakeReport {
-    let Some(sock) = default_helper_sock() else {
-        return HelperHandshakeReport {
-            ok: false,
-            latency_ms: 0,
-            helper_version: None,
-            kernel_tier: None,
-            error: Some("could not resolve state_dir for helper.sock".into()),
-        };
-    };
-    if !sock.exists() {
-        return HelperHandshakeReport {
-            ok: false,
-            latency_ms: 0,
-            helper_version: None,
-            kernel_tier: None,
-            error: Some(format!(
-                "no daemon running ({}): start with `shitd --foreground` or via systemd",
-                sock.display()
-            )),
-        };
-    }
-    crate::doctor::probes::bsd::helper_handshake_probe(&sock)
-}
+    use shit_proto::{CtlRequest, CtlResponse};
 
-/// `$XDG_STATE_HOME/shit/helper.sock` (or `$HOME/.local/state/shit/helper.sock`).
-/// Mirrors `shitd`'s state-dir resolution. Returns `None` when
-/// neither env var is set.
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
-fn default_helper_sock() -> Option<PathBuf> {
-    let state = if let Some(s) = std::env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(s).join("shit")
-    } else {
-        let home = std::env::var_os("HOME")?;
-        PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("shit")
-    };
-    Some(state.join("helper.sock"))
+    let ctl_path = crate::paths::default_ctl_socket_path();
+    let started = std::time::Instant::now();
+    let resp = crate::cmd::ctl_client::call(&ctl_path, &CtlRequest::Metrics);
+    let latency_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+
+    match resp {
+        Ok(CtlResponse::Metrics(m)) => {
+            let tier_empty = m.kernel_tier.is_empty();
+            HelperHandshakeReport {
+                ok: !tier_empty,
+                latency_ms,
+                helper_version: None,
+                kernel_tier: if tier_empty {
+                    None
+                } else {
+                    Some(m.kernel_tier)
+                },
+                error: if tier_empty {
+                    Some(
+                        "daemon reachable but kernel_tier empty — helper handshake not completed"
+                            .into(),
+                    )
+                } else {
+                    None
+                },
+            }
+        }
+        Ok(other) => HelperHandshakeReport {
+            ok: false,
+            latency_ms,
+            helper_version: None,
+            kernel_tier: None,
+            error: Some(format!("unexpected ctl response: {other:?}")),
+        },
+        Err(e) => HelperHandshakeReport {
+            ok: false,
+            latency_ms,
+            helper_version: None,
+            kernel_tier: None,
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 /// Render the table-mode output. Designed to match the pre-B03
