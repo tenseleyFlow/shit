@@ -108,11 +108,20 @@ smoke_stop_shitd() {
         smoke_log "stopping shitd (pid=${SHITD_PID})"
         kill -TERM "${SHITD_PID}" 2>/dev/null || true
         for _ in $(seq 1 50); do
-            kill -0 "${SHITD_PID}" 2>/dev/null || return 0
+            kill -0 "${SHITD_PID}" 2>/dev/null || break
             sleep 0.1
         done
         kill -KILL "${SHITD_PID}" 2>/dev/null || true
     fi
+    # Reap any orphaned shit-helper subprocesses. shitd spawns
+    # shit-helper as a child on handshake; if shitd dies via SIGKILL
+    # before completing graceful teardown, the helper may briefly
+    # outlive its parent. On the cross-platform-actions FreeBSD VM,
+    # an orphaned helper keeps bash's exit blocked (the SSH session
+    # waits for tty-fd-sharing processes). Wait for `wait` to reap
+    # the shitd job, then nuke any leftover helpers by name.
+    wait "${SHITD_PID}" 2>/dev/null || true
+    pkill -f 'target/release/shit-helper' 2>/dev/null || true
 }
 
 smoke_cleanup() {
