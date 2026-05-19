@@ -386,6 +386,10 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             | InverseOp::SystemdRollback { .. }
             | InverseOp::ProcessNote { .. }
             | InverseOp::DescriptorReverse { .. }
+            | InverseOp::KubectlReverse { .. }
+            | InverseOp::GhReverse { .. }
+            | InverseOp::AwsReverse { .. }
+            | InverseOp::TerraformReverse { .. }
             | InverseOp::DbNote { .. } => None,
         }
     }

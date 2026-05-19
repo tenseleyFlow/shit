@@ -130,6 +130,62 @@ pub enum InverseOp {
         #[serde(default)]
         guard: Option<DescriptorGuardOp>,
     },
+    /// C03: kubectl resource reverse. Capture the resource YAML (via
+    /// `kubectl get -o yaml`) before a destructive verb; on undo, run
+    /// `kubectl apply -f -` against the captured manifest. Context is
+    /// guard-checked at apply time (refuse if the active kube-context
+    /// has changed since capture).
+    KubectlReverse {
+        context: String,
+        namespace: Option<String>,
+        op: KubectlOp,
+        /// Captured `kubectl get -o yaml` output (managed-fields stripped).
+        /// Stored verbatim; serialized as utf-8 bytes for round-trip
+        /// fidelity across YAML producers.
+        captured_yaml: Vec<u8>,
+        requires_confirmation: bool,
+    },
+    /// C03: GitHub-CLI op reverse. Lightweight: captures the resource
+    /// metadata as JSON, and on undo either re-creates (for delete
+    /// verbs) or re-opens (for close verbs). Asset re-uploads are
+    /// out of v1; the captured JSON describes what was deleted so the
+    /// user can manually re-upload large assets.
+    GhReverse {
+        op: GhOp,
+        captured_json: Vec<u8>,
+        requires_confirmation: bool,
+    },
+    /// C03: aws-cli op reverse. Per-service shape; `service` discriminates
+    /// (`s3`, `ec2`, `iam`). The capture is service-specific (S3 carries
+    /// VersionId; EC2 carries an instance descriptor; IAM carries policy
+    /// docs). The executor dispatches on `op` to synthesize the right
+    /// reverse argv.
+    AwsReverse {
+        service: String,
+        op: AwsOp,
+        captured_state: BTreeMap<String, String>,
+        /// Optional stashed object bytes for `s3 rm` of unversioned
+        /// buckets where the only durable recovery is re-uploading.
+        stashed_content_hash: Option<BlobHash>,
+        requires_confirmation: bool,
+    },
+    /// C03: terraform apply/destroy reverse. The pre-state is captured
+    /// via `terraform state pull`; the plan JSON from `terraform plan
+    /// -out=plan.tfplan` describes the intended changes. Reverse runs
+    /// `terraform state push` against the captured state file, then
+    /// `terraform apply -refresh-only` to reconcile.
+    TerraformReverse {
+        /// Working directory the original `terraform` command ran in.
+        workdir: PathBuf,
+        op: TerraformOp,
+        /// Captured `terraform state pull` output, zstd-compressed.
+        prior_state: Vec<u8>,
+        /// Captured `terraform show -json plan.tfplan` output. Optional
+        /// because some applied operations (auto-approve without an
+        /// explicit `-out`) miss the plan capture.
+        plan_json: Option<Vec<u8>>,
+        requires_confirmation: bool,
+    },
     /// Informational (S19): record what statements crossed the DB shim.
     /// For sqlite3 the file is captured via the file tier and the
     /// `rollback_hint` carries the blob; for postgres/mysql we emit a
@@ -141,6 +197,77 @@ pub enum InverseOp {
         statements: Vec<String>,
         rollback_hint: RollbackHint,
     },
+}
+
+/// C03: kubectl verb captured against a single resource (or a
+/// declarative file). The executor dispatches on this to choose
+/// `kubectl apply` vs `kubectl delete` for the reverse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KubectlOp {
+    /// `kubectl delete <kind> <name>` (or `delete -f file.yaml`).
+    /// Reverse: `kubectl apply -f -` with the captured YAML.
+    Delete { kind: String, name: String },
+    /// `kubectl apply -f file.yaml` against an existing resource.
+    /// Reverse: `kubectl apply -f -` with the *pre-state* YAML.
+    Apply { kind: String, name: String },
+    /// `kubectl scale ...`. Reverse: `kubectl scale` with the old
+    /// replica count from `captured_yaml`.
+    Scale { kind: String, name: String },
+    /// `kubectl rollout restart` / `rollout undo`. Reverse: the
+    /// inverse rollout verb when supported.
+    Rollout { kind: String, name: String },
+}
+
+/// C03: gh-cli verb captured against a remote resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GhOp {
+    /// `gh release delete <tag>`. Reverse: `gh release create` with
+    /// the captured tag + body. Assets are best-effort: the JSON
+    /// includes asset URLs but reverse does not auto-download +
+    /// re-upload (large binaries).
+    ReleaseDelete { tag: String },
+    /// `gh release delete-asset <tag> <name>`. Reverse:
+    /// `gh release upload <tag> <local-path>` IF the asset bytes
+    /// were stashed; otherwise informational.
+    ReleaseDeleteAsset { tag: String, asset: String },
+    /// `gh issue close <n>`. Reverse: `gh issue reopen <n>`.
+    IssueClose { number: u64 },
+    /// `gh pr close <n>`. Reverse: `gh pr reopen <n>`.
+    PrClose { number: u64 },
+}
+
+/// C03: aws-cli verb captured against a service resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AwsOp {
+    /// `aws s3 cp local s3://bucket/key`. Reverse:
+    /// `aws s3api delete-object --version-id=<vid>` (when versioned)
+    /// or `aws s3 rm` (unversioned).
+    S3Cp { bucket: String, key: String },
+    /// `aws s3 rm s3://bucket/key`. Reverse:
+    /// `aws s3 cp <stashed>` if bytes were stashed; else
+    /// `aws s3api delete-object --version-id=<vid>` to undelete
+    /// when the bucket is versioned.
+    S3Rm { bucket: String, key: String },
+    /// `aws ec2 terminate-instances --instance-ids X`. Reverse:
+    /// informational note only — re-launch needs the captured
+    /// instance descriptor; we surface the `aws ec2 run-instances`
+    /// argv but never auto-apply.
+    Ec2Terminate { instance_id: String },
+    /// `aws ec2 stop-instances`. Reverse: `aws ec2 start-instances`.
+    Ec2Stop { instance_id: String },
+}
+
+/// C03: terraform op kind. Drives the executor's reverse strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerraformOp {
+    /// `terraform apply` (with or without `-auto-approve`).
+    Apply,
+    /// `terraform destroy`.
+    Destroy,
+    /// `terraform state rm <addr>`.
+    StateRm,
+    /// `terraform import`.
+    Import,
 }
 
 /// C02.7: native-tool dispatch carried by `InverseOp::PackageRollback`.
@@ -243,6 +370,10 @@ impl InverseOp {
             | Self::SystemdRollback { .. }
             | Self::ProcessNote { .. }
             | Self::DescriptorReverse { .. }
+            | Self::KubectlReverse { .. }
+            | Self::GhReverse { .. }
+            | Self::AwsReverse { .. }
+            | Self::TerraformReverse { .. }
             | Self::DbNote { .. } => None,
         }
     }
@@ -272,6 +403,10 @@ impl InverseOp {
             Self::SystemdRollback { .. } => InverseTier::Services,
             Self::ProcessNote { .. } => InverseTier::Processes,
             Self::DescriptorReverse { .. } => InverseTier::Descriptor,
+            Self::KubectlReverse { .. }
+            | Self::GhReverse { .. }
+            | Self::AwsReverse { .. }
+            | Self::TerraformReverse { .. } => InverseTier::Cloud,
             Self::DbNote { .. } => InverseTier::Database,
         }
     }
@@ -286,6 +421,7 @@ pub enum InverseTier {
     Services,
     Processes,
     Descriptor,
+    Cloud,
     Database,
 }
 
@@ -503,5 +639,65 @@ mod tests {
         assert_eq!(DbEngine::Postgres.as_str(), "psql");
         assert_eq!(DbEngine::Mysql.as_str(), "mysql");
         assert_eq!(DbEngine::Sqlite3.as_str(), "sqlite3");
+    }
+
+    // ----- C03.1: cloud variants -----
+
+    #[test]
+    fn cloud_variants_classify_as_cloud_tier() {
+        let ku = InverseOp::KubectlReverse {
+            context: "ctx".into(),
+            namespace: Some("ns".into()),
+            op: KubectlOp::Delete {
+                kind: "pod".into(),
+                name: "p".into(),
+            },
+            captured_yaml: b"kind: Pod\n".to_vec(),
+            requires_confirmation: true,
+        };
+        let gh = InverseOp::GhReverse {
+            op: GhOp::ReleaseDelete { tag: "v1".into() },
+            captured_json: b"{}".to_vec(),
+            requires_confirmation: true,
+        };
+        let aws = InverseOp::AwsReverse {
+            service: "s3".into(),
+            op: AwsOp::S3Rm {
+                bucket: "b".into(),
+                key: "k".into(),
+            },
+            captured_state: BTreeMap::new(),
+            stashed_content_hash: None,
+            requires_confirmation: true,
+        };
+        let tf = InverseOp::TerraformReverse {
+            workdir: PathBuf::from("/tmp/tf"),
+            op: TerraformOp::Apply,
+            prior_state: vec![],
+            plan_json: None,
+            requires_confirmation: true,
+        };
+        for op in &[ku, gh, aws, tf] {
+            assert_eq!(op.tier(), InverseTier::Cloud);
+            assert!(op.primary_path().is_none());
+            assert!(op.primary_inode().is_none());
+        }
+    }
+
+    #[test]
+    fn cloud_variants_roundtrip_through_postcard() {
+        let op = InverseOp::KubectlReverse {
+            context: "kind-c1".into(),
+            namespace: Some("prod".into()),
+            op: KubectlOp::Delete {
+                kind: "Deployment".into(),
+                name: "api".into(),
+            },
+            captured_yaml: b"apiVersion: apps/v1\nkind: Deployment\n".to_vec(),
+            requires_confirmation: true,
+        };
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
     }
 }

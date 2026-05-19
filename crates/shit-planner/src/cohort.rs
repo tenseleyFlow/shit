@@ -90,6 +90,10 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         | InverseOp::SystemdRollback { .. }
         | InverseOp::ProcessNote { .. }
         | InverseOp::DescriptorReverse { .. }
+        | InverseOp::KubectlReverse { .. }
+        | InverseOp::GhReverse { .. }
+        | InverseOp::AwsReverse { .. }
+        | InverseOp::TerraformReverse { .. }
         | InverseOp::DbNote { .. } => {}
     }
     out
