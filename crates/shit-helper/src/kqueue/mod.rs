@@ -31,6 +31,7 @@
 // lights up (paired with the FreeBSD VM tooling).
 #![allow(dead_code, unused_imports)]
 
+pub mod capture;
 pub mod drain;
 pub mod error;
 pub mod event_loop;
@@ -39,6 +40,7 @@ pub mod proc;
 pub mod tree;
 pub mod vnode;
 
+pub use capture::{CaptureError, PRE_IMAGE_INLINE_CAP, read_pre_image};
 pub use drain::{
     DEFAULT_CAPACITY, DrainError, DrainEvent, DrainHandle, DrainSession, spawn as spawn_drain,
     spawn_default as spawn_drain_default,
