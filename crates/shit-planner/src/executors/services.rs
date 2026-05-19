@@ -137,7 +137,12 @@ pub fn synthesize_argv(
 /// "masked" concept on FreeBSD (the closest equivalent — removing
 /// the script — is out of scope here).
 fn service_argv(unit: &str, before: &ServiceState, after: &ServiceState) -> Vec<Vec<String>> {
-    let mk = |verb: &str| -> Vec<String> { vec!["service".into(), unit.into(), verb.into()] };
+    // Absolute path: `doas service ...` runs with a reduced PATH that
+    // typically omits /usr/sbin, so a bare "service" fails with
+    // "command not found". The executable is at /usr/sbin/service on
+    // FreeBSD/NetBSD/OpenBSD/DragonFly.
+    let mk =
+        |verb: &str| -> Vec<String> { vec!["/usr/sbin/service".into(), unit.into(), verb.into()] };
     let mut out = Vec::new();
     // 1. Enabled delta.
     if before.enabled != after.enabled {
@@ -331,7 +336,7 @@ mod tests {
         let after = state(true, true, false);
         let argv = synthesize_argv(SystemdScope::RcBase, "cron", &before, &after);
         assert_eq!(argv.len(), 1);
-        assert_eq!(argv[0], vec!["service", "cron", "stop"]);
+        assert_eq!(argv[0], vec!["/usr/sbin/service", "cron", "stop"]);
     }
 
     #[test]
@@ -339,7 +344,7 @@ mod tests {
         let before = state(true, true, false);
         let after = state(false, true, false);
         let argv = synthesize_argv(SystemdScope::RcBase, "cron", &before, &after);
-        assert_eq!(argv[0], vec!["service", "cron", "start"]);
+        assert_eq!(argv[0], vec!["/usr/sbin/service", "cron", "start"]);
     }
 
     #[test]
