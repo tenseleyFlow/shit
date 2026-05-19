@@ -8,7 +8,10 @@
 //!   gives us everything we need. Helper has CAP_SYS_PTRACE so
 //!   `/proc/<pid>/environ` is readable across uids.
 //! - **macOS**: `libproc` (DR-49 — not implemented Stage 1).
-//! - **BSD**: `sysctl(KERN_PROC_PID)` (DR-50 — not implemented Stage 1).
+//! - **FreeBSD**: `sysctl(KERN_PROC_*)` via [`super::freebsd`]
+//!   (DR-50 — landed in B02).
+//! - **Other BSDs (NetBSD/OpenBSD/DragonFly)**: not implemented;
+//!   B06 stretch sprint.
 //!
 //! ## Env summary whitelist
 //!
@@ -33,11 +36,15 @@ pub fn read_proc_snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
     {
         linux::snapshot(pid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        super::freebsd::snapshot(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = pid;
         Err(anyhow::anyhow!(
-            "proc snapshot not implemented on this platform (DR-49/DR-50)"
+            "proc snapshot not implemented on this platform (DR-49 / B06)"
         ))
     }
 }

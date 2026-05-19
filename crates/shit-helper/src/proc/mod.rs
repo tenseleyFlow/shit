@@ -24,6 +24,8 @@ use shit_proto::{
 };
 
 pub mod enumerate;
+#[cfg(target_os = "freebsd")]
+pub mod freebsd;
 pub mod kill_targets;
 
 pub async fn run_event(

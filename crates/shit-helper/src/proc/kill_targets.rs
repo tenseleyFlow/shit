@@ -43,7 +43,11 @@ pub fn resolve_pgroup(pgid: u32) -> Option<Vec<u32>> {
     {
         linux::pids_in_pgroup(pgid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        super::freebsd::pids_in_pgroup(pgid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = pgid;
         None
@@ -55,7 +59,11 @@ pub fn resolve_pattern(pattern: &str, filters: &BTreeMap<String, String>) -> Vec
     {
         linux::pids_matching(pattern, filters)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        super::freebsd::pids_matching(pattern, filters)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = (pattern, filters);
         Vec::new()
