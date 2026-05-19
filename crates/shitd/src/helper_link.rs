@@ -477,13 +477,114 @@ fn dispatch_response(
                 tracing::error!(error = %e, %session, seq, "failed to journal CapturedPreImage");
             }
         }
+        HelperResponse::TreeMutation {
+            session,
+            seq,
+            op,
+            ts_unix_nanos,
+        } => {
+            if let Err(e) = handle_tree_mutation(session, seq, op, ts_unix_nanos, index) {
+                tracing::error!(error = %e, %session, seq, "failed to journal TreeMutation");
+            }
+        }
         other => {
             tracing::trace!(
                 ?other,
-                "unhandled helper response (S24.A only handles CapturedPreImage)"
+                "unhandled helper response (S24.A handles CapturedPreImage; S29.1 handles TreeMutation)"
             );
         }
     }
+}
+
+/// S29.1 — convert a wire `TreeMutation` into a planner `CaptureEvent`
+/// and journal it. Cheap; no blob round-trip needed.
+fn handle_tree_mutation(
+    session: uuid::Uuid,
+    seq: u64,
+    op: shit_proto::TreeOpWire,
+    _ts_unix_nanos: u64,
+    index: &Index,
+) -> Result<(), HelperLinkError> {
+    use shit_planner::TreeOp;
+    use shit_planner::metadata::FileKind;
+    use shit_proto::{FileKindWire, TreeOpWire};
+
+    fn convert_kind(k: FileKindWire) -> FileKind {
+        match k {
+            FileKindWire::Regular => FileKind::Regular,
+            FileKindWire::Directory => FileKind::Directory,
+            FileKindWire::Symlink => FileKind::Symlink,
+            FileKindWire::Fifo => FileKind::Fifo,
+            FileKindWire::Socket => FileKind::Socket,
+            FileKindWire::BlockDevice => FileKind::BlockDevice,
+            FileKindWire::CharDevice => FileKind::CharDevice,
+        }
+    }
+
+    // Unlink is dedupe-sensitive: the dir-diff and the per-file Delete
+    // both surface Unlink for the same removal. Route through
+    // `journal_unlink_idempotent` and return early.
+    if let TreeOpWire::Unlink { dev, inode, path } = &op {
+        let ts = crate::server::next_ts();
+        return journal_unlink_idempotent(
+            index,
+            CommandId { session, seq },
+            ts,
+            InodeRef::new(*dev, *inode),
+            std::path::PathBuf::from(path),
+        );
+    }
+
+    let tree_op = match op {
+        TreeOpWire::Create {
+            dev,
+            inode,
+            path,
+            kind,
+            mode,
+        } => TreeOp::Create {
+            inode: InodeRef::new(dev, inode),
+            path: std::path::PathBuf::from(path),
+            kind: convert_kind(kind),
+            mode,
+        },
+        TreeOpWire::Unlink { .. } => unreachable!("handled above"),
+        TreeOpWire::Rename {
+            from,
+            to,
+            dev,
+            inode,
+        } => TreeOp::Rename {
+            from: std::path::PathBuf::from(from),
+            to: std::path::PathBuf::from(to),
+            inode: InodeRef::new(dev, inode),
+        },
+        TreeOpWire::Link {
+            source_dev,
+            source_inode,
+            target,
+        } => TreeOp::Link {
+            source: InodeRef::new(source_dev, source_inode),
+            target: std::path::PathBuf::from(target),
+        },
+        TreeOpWire::Symlink { target, path } => TreeOp::Symlink {
+            target,
+            path: std::path::PathBuf::from(path),
+        },
+    };
+
+    let ts = crate::server::next_ts();
+    let event = CaptureEvent {
+        id: EventId(0),
+        command: CommandId { session, seq },
+        ts,
+        partial: false,
+        kind: CaptureEventKind::TreeOp(tree_op),
+    };
+    index
+        .put_event(&event)
+        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event (tree): {e}"))))?;
+    Ok(())
 }
 
 struct CapturedPreImageArgs {
@@ -557,20 +658,53 @@ fn handle_captured_pre_image(
         .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
 
     if args.is_delete {
-        let unlink_ev = CaptureEvent {
-            id: EventId(0),
-            command,
-            ts,
-            partial: false,
-            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
-                inode: inode_ref,
-                path: path_buf,
-            }),
-        };
-        index.put_event(&unlink_ev).map_err(|e| {
-            HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
-        })?;
+        journal_unlink_idempotent(index, command, ts, inode_ref, path_buf)?;
     }
+    Ok(())
+}
+
+/// Journal a `TreeOp::Unlink` exactly once per `(command, inode, path)`.
+/// Both the CapturedPreImage(is_delete=true) handler AND the dir-diff
+/// path on the helper side can produce an Unlink for the same target;
+/// kqueue's per-event delivery order isn't deterministic enough to
+/// dedupe on the helper. Dedupe here so the planner sees one Unlink
+/// per logical mutation — otherwise plan() emits two RecreatePath
+/// nodes and the second hits ConflictPhantom at undo time (the smoke
+/// regression surfaced this).
+fn journal_unlink_idempotent(
+    index: &Index,
+    command: CommandId,
+    ts: shit_planner::TimePoint,
+    inode_ref: InodeRef,
+    path: std::path::PathBuf,
+) -> Result<(), HelperLinkError> {
+    use shit_planner::PlannerStore;
+    let already = index
+        .events_for_command(command)
+        .into_iter()
+        .any(|e| {
+            matches!(
+                &e.kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path })
+                    if *inode == inode_ref && existing_path == &path
+            )
+        });
+    if already {
+        return Ok(());
+    }
+    let unlink_ev = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts,
+        partial: false,
+        kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode: inode_ref,
+            path,
+        }),
+    };
+    index.put_event(&unlink_ev).map_err(|e| {
+        HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
+    })?;
     Ok(())
 }
 
