@@ -19,7 +19,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use shit_planner::events::{CaptureEvent, CaptureEventKind, CommandId, EventId, SystemdScope};
-use shit_planner::{ServiceState, parse_launchctl_print, parse_systemctl_show};
+use shit_planner::{
+    ServiceState, parse_freebsd_service, parse_launchctl_print, parse_systemctl_show,
+};
 use shit_proto::{SvcEventReq, SvcScopeWire, SvcToolWire};
 use shit_store::Index;
 
@@ -134,6 +136,7 @@ fn parse_state(tool: SvcToolWire, raw: &str) -> ServiceState {
     match tool {
         SvcToolWire::Systemctl => parse_systemctl_show(raw),
         SvcToolWire::Launchctl => parse_launchctl_print(raw),
+        SvcToolWire::Service => parse_freebsd_service(raw),
     }
 }
 
@@ -269,6 +272,7 @@ fn wire_to_planner_scope(w: SvcScopeWire) -> SystemdScope {
         SvcScopeWire::System => SystemdScope::System,
         SvcScopeWire::LaunchdGui => SystemdScope::LaunchdGui,
         SvcScopeWire::LaunchdSystem => SystemdScope::LaunchdSystem,
+        SvcScopeWire::RcBase => SystemdScope::RcBase,
     }
 }
 
