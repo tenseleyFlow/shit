@@ -92,11 +92,14 @@ fn sysctl_array<T: Copy>(mib: &mut [libc::c_int]) -> io::Result<Vec<T>> {
         return Ok(Vec::new());
     }
     let n = size / mem::size_of::<T>();
-    let mut buf: Vec<T> = Vec::with_capacity(n);
-    // SAFETY: cap is `n`, len is set to `n` after the sysctl writes
-    // exactly `n * sizeof(T)` bytes. The kernel may write fewer (if
-    // procs exit between the two calls), in which case we truncate
-    // below using the kernel-updated `size`.
+    // MaybeUninit avoids clippy::uninit_vec; the kernel fills the
+    // buffer in the next sysctl call. T: Copy ⇒ no Drop, so the
+    // in-place reinterpretation below is sound after the kernel
+    // writes its bytes.
+    let mut buf: Vec<mem::MaybeUninit<T>> = Vec::with_capacity(n);
+    // SAFETY: cap is `n`; set_len(n) on a MaybeUninit Vec is always
+    // valid because MaybeUninit has no Drop and represents
+    // possibly-uninitialized storage by design.
     unsafe { buf.set_len(n) };
     let r = unsafe {
         libc::sysctl(
@@ -112,6 +115,15 @@ fn sysctl_array<T: Copy>(mib: &mut [libc::c_int]) -> io::Result<Vec<T>> {
         return Err(io::Error::last_os_error());
     }
     let actual = size / mem::size_of::<T>();
+    // SAFETY: the kernel wrote exactly `size` bytes = `actual` Ts
+    // into the buffer. The remainder (if any) stays uninitialized
+    // and gets sliced off via truncate. T: Copy ⇒ no Drop, so
+    // discarding uninit-tail elements is sound. Cast preserves
+    // allocation; we move ownership via ManuallyDrop+from_raw_parts.
+    let mut buf: Vec<T> = unsafe {
+        let mut v = mem::ManuallyDrop::new(buf);
+        Vec::from_raw_parts(v.as_mut_ptr() as *mut T, v.len(), v.capacity())
+    };
     buf.truncate(actual);
     Ok(buf)
 }
