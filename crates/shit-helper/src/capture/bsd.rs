@@ -106,7 +106,6 @@ struct PumpState {
     fd_to_command: HashMap<RawFd, CommandId>,
     staging_dir: PathBuf,
     conn: Arc<Conn>,
-    seq_counter: u64,
 }
 
 impl PumpState {
@@ -116,17 +115,7 @@ impl PumpState {
             fd_to_command: HashMap::new(),
             staging_dir,
             conn,
-            seq_counter: 0,
         }
-    }
-
-    /// Next monotonically-increasing seq for the wire's `seq` field.
-    /// Helper-local; not the daemon's command_seq (which is the
-    /// CommandId's seq). This is a per-event sequence so the daemon
-    /// can de-duplicate retransmits if we ever add them.
-    fn next_seq(&mut self) -> u64 {
-        self.seq_counter = self.seq_counter.wrapping_add(1);
-        self.seq_counter
     }
 
     fn attach(&mut self, kq: &KqueueFd, command: CommandId, root_path: &Path) {
@@ -195,21 +184,30 @@ impl PumpState {
             tracing::trace!(fd, ?kind, "vnode event for untracked fd; dropping");
             return;
         };
-        // Compute helper-local seq before we mutably borrow `ws` so the
-        // borrow-checker doesn't see two `&mut self` borrows alive at once.
-        let seq = self.next_seq();
         let Some(ws) = self.watches.get_mut(&command) else {
             // fd_to_command had us, but the watch state is gone —
             // race with detach. Drop.
             return;
         };
-        let (dev, inode) = match fstat_dev_inode(fd) {
+        // register_subtree opens both directories and files. A delete
+        // *inside* a directory delivers NOTE_DELETE on the file fd, but
+        // NOTE_WRITE also fires on the parent dir fd (its contents
+        // changed). pread(2) is invalid on a directory, so we filter
+        // here to regular files only. The dir's NOTE_WRITE is fine —
+        // it just means "someone touched the dir," which we may use
+        // later for tree-mutation TreeOps but is not a pre-image
+        // capture trigger.
+        let (dev, inode, file_type) = match fstat_dev_inode_kind(fd) {
             Some(t) => t,
             None => {
                 tracing::warn!(fd, "fstat failed; skipping capture");
                 return;
             }
         };
+        if file_type != FileType::Regular {
+            tracing::trace!(fd, ?kind, ?file_type, "vnode event on non-file; skipping");
+            return;
+        }
         if !should_capture_dedupe(&ws.dedupe, (dev, inode)) {
             tracing::trace!(fd, dev, inode, "dedupe hit; skipping recapture");
             return;
@@ -249,9 +247,13 @@ impl PumpState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        // Wire's `seq` field is the *command's* seq — that's the FK
+        // the daemon uses to attach the event to the originating
+        // PreExec'd command (the helper-local seq_counter we had here
+        // before tripped a sqlite FK constraint on the daemon side).
         let resp = HelperResponse::CapturedPreImage {
             session: command.session,
-            seq,
+            seq: command.seq,
             dev,
             inode,
             path: path.as_deref().map(path_to_string),
@@ -304,14 +306,29 @@ fn tracked_fds(_subtree: &TrackedSubtree) -> Vec<RawFd> {
     out
 }
 
-fn fstat_dev_inode(fd: RawFd) -> Option<(u64, u64)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileType {
+    Regular,
+    Directory,
+    Other,
+}
+
+/// fstat that also returns the file kind. register_subtree opens both
+/// directories and files; only Regular files are valid pre-image
+/// capture targets (pread on a directory returns EISDIR).
+fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: fd is expected valid; st is writable.
     let rc = unsafe { libc::fstat(fd, &mut st) };
     if rc != 0 {
         return None;
     }
-    Some((st.st_dev as u64, st.st_ino as u64))
+    let kind = match (st.st_mode as libc::mode_t) & libc::S_IFMT {
+        libc::S_IFREG => FileType::Regular,
+        libc::S_IFDIR => FileType::Directory,
+        _ => FileType::Other,
+    };
+    Some((st.st_dev as u64, st.st_ino as u64, kind))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -519,13 +536,17 @@ mod tests {
     }
 
     #[test]
-    fn fstat_dev_inode_works_on_open_file() {
+    fn fstat_returns_regular_for_open_file_and_directory_for_open_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("probe");
         std::fs::write(&path, b"x").unwrap();
         let f = std::fs::File::open(&path).unwrap();
-        let (dev, inode) = fstat_dev_inode(f.as_raw_fd()).expect("fstat ok");
+        let (dev, inode, kind) = fstat_dev_inode_kind(f.as_raw_fd()).expect("fstat ok");
         assert!(dev > 0 || inode > 0);
+        assert_eq!(kind, FileType::Regular);
+        let d = std::fs::File::open(dir.path()).unwrap();
+        let (_, _, dir_kind) = fstat_dev_inode_kind(d.as_raw_fd()).expect("fstat ok");
+        assert_eq!(dir_kind, FileType::Directory);
     }
 
     #[test]
