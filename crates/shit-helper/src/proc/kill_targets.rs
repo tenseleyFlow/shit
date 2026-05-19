@@ -19,6 +19,15 @@ pub const SHIT_JOB_TABLE_ENV: &str = "SHIT_JOB_TABLE";
 
 pub fn resolve_job_spec(spec: &str) -> Option<u32> {
     let table = std::env::var(SHIT_JOB_TABLE_ENV).ok()?;
+    resolve_job_spec_in(&table, spec)
+}
+
+/// Pure resolver — given an explicit `SHIT_JOB_TABLE` body, look up
+/// the pid for `spec`. Split out so the unit tests don't race on the
+/// process-global env var (cargo test runs tests in parallel; one
+/// test setting and another clearing the env was a flaky-on-Linux
+/// failure mode the macOS scheduler happened not to expose).
+fn resolve_job_spec_in(table: &str, spec: &str) -> Option<u32> {
     let key = spec.strip_prefix('%').unwrap_or(spec);
     for entry in table.split(',') {
         let (k, v) = entry.split_once(':')?;
@@ -208,18 +217,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_spec_resolves_from_env() {
-        unsafe { std::env::set_var(SHIT_JOB_TABLE_ENV, "1:1234,2:5678,+:5678,-:1234") };
-        assert_eq!(resolve_job_spec("%1"), Some(1234));
-        assert_eq!(resolve_job_spec("%+"), Some(5678));
-        assert_eq!(resolve_job_spec("%-"), Some(1234));
-        assert_eq!(resolve_job_spec("%99"), None);
-        unsafe { std::env::remove_var(SHIT_JOB_TABLE_ENV) };
+    fn job_spec_resolves_from_table() {
+        let table = "1:1234,2:5678,+:5678,-:1234";
+        assert_eq!(resolve_job_spec_in(table, "%1"), Some(1234));
+        assert_eq!(resolve_job_spec_in(table, "%+"), Some(5678));
+        assert_eq!(resolve_job_spec_in(table, "%-"), Some(1234));
+        assert_eq!(resolve_job_spec_in(table, "%99"), None);
     }
 
     #[test]
-    fn job_spec_no_table_is_none() {
-        unsafe { std::env::remove_var(SHIT_JOB_TABLE_ENV) };
-        assert_eq!(resolve_job_spec("%1"), None);
+    fn job_spec_empty_table_is_none() {
+        assert_eq!(resolve_job_spec_in("", "%1"), None);
     }
 }
