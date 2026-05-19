@@ -498,7 +498,15 @@ fn dispatch_response(
             ts_unix_nanos,
         } => {
             if let Err(e) = handle_metadata_change(
-                session, seq, dev, inode, path, before, after, ts_unix_nanos, index,
+                session,
+                seq,
+                dev,
+                inode,
+                path,
+                before,
+                after,
+                ts_unix_nanos,
+                index,
             ) {
                 tracing::error!(
                     error = %e,
@@ -602,9 +610,9 @@ fn handle_tree_mutation(
         partial: false,
         kind: CaptureEventKind::TreeOp(tree_op),
     };
-    index
-        .put_event(&event)
-        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event (tree): {e}"))))?;
+    index.put_event(&event).map_err(|e| {
+        HelperLinkError::Io(std::io::Error::other(format!("put_event (tree): {e}")))
+    })?;
     Ok(())
 }
 
@@ -750,16 +758,13 @@ fn journal_unlink_idempotent(
     path: std::path::PathBuf,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::PlannerStore;
-    let already = index
-        .events_for_command(command)
-        .into_iter()
-        .any(|e| {
-            matches!(
-                &e.kind,
-                CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path })
-                    if *inode == inode_ref && existing_path == &path
-            )
-        });
+    let already = index.events_for_command(command).into_iter().any(|e| {
+        matches!(
+            &e.kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path })
+                if *inode == inode_ref && existing_path == &path
+        )
+    });
     if already {
         return Ok(());
     }

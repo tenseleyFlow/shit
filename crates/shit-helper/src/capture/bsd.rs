@@ -352,7 +352,10 @@ impl PumpState {
             is_delete,
             fd_sent_via_scm: true,
         };
-        if let Err(e) = self.conn.send_response_with_fd(&resp, staging_fd.as_raw_fd()) {
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+        {
             tracing::warn!(error = %e, "send_response_with_fd failed");
         }
         // Mark as captured. Don't insert a NEW key — we used or_insert

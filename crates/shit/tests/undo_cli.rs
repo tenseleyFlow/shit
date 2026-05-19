@@ -33,7 +33,7 @@ fn run_with_dead_ctl(args: &[&str]) -> std::process::Output {
         .args(&all_args)
         .output()
         .expect("spawn shit")
-    }
+}
 
 fn assert_daemon_unavailable(out: &std::process::Output) {
     let stderr = String::from_utf8_lossy(&out.stderr);

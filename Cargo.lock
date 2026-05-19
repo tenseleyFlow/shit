@@ -1743,6 +1743,7 @@ name = "shit-preload-shim"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "shit-proto",
 ]
 
 [[package]]

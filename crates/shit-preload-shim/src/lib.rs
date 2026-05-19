@@ -139,7 +139,14 @@ mod next {
         unsafe {
             std::mem::transmute::<
                 usize,
-                unsafe extern "C" fn(*mut c_void, size_t, c_int, c_int, c_int, off_t) -> *mut c_void,
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    size_t,
+                    c_int,
+                    c_int,
+                    c_int,
+                    off_t,
+                ) -> *mut c_void,
             >(addr)
         }
     }
@@ -240,8 +247,8 @@ mod policy {
             arg: arg.to_string(),
             ts_unix_nanos: now,
         };
-        let frame = encode_frame(&note)
-            .map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
+        let frame =
+            encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
         stream.write_all(&frame)?;
 
         // Best-effort ack read. We don't actually act on the ack today
@@ -307,9 +314,7 @@ mod interposers {
     /// `path` must be a valid C string.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
-        let writes = (flags & O_WRONLY) != 0
-            || (flags & O_RDWR) != 0
-            || (flags & O_TRUNC) != 0;
+        let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
         if writes {
             policy::notify_pre_mutation("open", &cstr_to_string(path));
         }
@@ -485,14 +490,7 @@ mod tests {
     #[test]
     fn pwrite_to_bogus_fd_fails() {
         let buf = b"hello";
-        let r = unsafe {
-            super::interposers::pwrite(
-                99_999,
-                buf.as_ptr().cast(),
-                buf.len(),
-                0,
-            )
-        };
+        let r = unsafe { super::interposers::pwrite(99_999, buf.as_ptr().cast(), buf.len(), 0) };
         assert!(r < 0);
     }
 

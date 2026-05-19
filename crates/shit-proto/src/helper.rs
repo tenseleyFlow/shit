@@ -652,8 +652,7 @@ mod tests {
             ts_unix_nanos: 1_700_000_000_200_000_000,
         };
         let encoded = crate::frame::encode_frame(&ev).expect("encode");
-        let decoded: HelperResponse =
-            crate::frame::decode_frame(&encoded).expect("decode");
+        let decoded: HelperResponse = crate::frame::decode_frame(&encoded).expect("decode");
         assert_eq!(decoded, ev);
     }
 
@@ -672,8 +671,7 @@ mod tests {
             ts_unix_nanos: 1_700_000_000_000_000_000,
         };
         let encoded = crate::frame::encode_frame(&ev).expect("encode");
-        let decoded: HelperResponse =
-            crate::frame::decode_frame(&encoded).expect("decode");
+        let decoded: HelperResponse = crate::frame::decode_frame(&encoded).expect("decode");
         assert_eq!(decoded, ev);
     }
 

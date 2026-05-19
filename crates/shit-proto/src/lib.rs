@@ -37,13 +37,12 @@ pub use ctl::{
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
 };
-pub use shim::{ShimAck, ShimNotification};
 pub use helper::{
     AuthDecision, AuthEventKind, FileKindWire, FileMetadataWire, HELPER_PATH_HINT_MAX,
-    HELPER_PROTOCOL_VERSION, HelperCaps, TreeOpWire,
-    HelperProtoError, HelperRequest, HelperResponse, MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome,
-    validate_outgoing,
+    HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest, HelperResponse,
+    MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, TreeOpWire, validate_outgoing,
 };
+pub use shim::{ShimAck, ShimNotification};
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
