@@ -24,6 +24,13 @@ use shit_proto::{
     encode_frame,
 };
 
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+pub mod freebsd;
 pub mod launchd;
 pub mod systemd;
 
@@ -43,6 +50,39 @@ fn inspector_for(t: SvcToolWire) -> Box<dyn SvcInspector> {
     match t {
         SvcToolWire::Systemctl => Box::new(systemd::SystemdInspector),
         SvcToolWire::Launchctl => Box::new(launchd::LaunchdInspector),
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        SvcToolWire::Service => Box::new(freebsd::ServiceInspector),
+        #[cfg(not(any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
+        SvcToolWire::Service => Box::new(UnsupportedSvcInspector(SvcToolWire::Service)),
+    }
+}
+
+/// Stub inspector used when the tool isn't supported on the current
+/// platform (e.g. `service(8)` on Linux). The hook wrapper should
+/// gate before invocation, but if it gets here we return a clear
+/// error rather than a confusing successful empty state.
+struct UnsupportedSvcInspector(SvcToolWire);
+
+#[allow(dead_code)]
+impl SvcInspector for UnsupportedSvcInspector {
+    fn tool(&self) -> SvcToolWire {
+        self.0
+    }
+    fn collect_state(&self, _scope: SvcScopeWire, _unit: &str) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!(
+            "svc tool {:?} not supported on this platform",
+            self.0
+        ))
     }
 }
 
@@ -136,8 +176,9 @@ fn parse_scope(s: &str) -> anyhow::Result<SvcScopeWire> {
         "system" => Ok(SvcScopeWire::System),
         "launchd-gui" => Ok(SvcScopeWire::LaunchdGui),
         "launchd-system" => Ok(SvcScopeWire::LaunchdSystem),
+        "rc-base" => Ok(SvcScopeWire::RcBase),
         other => Err(anyhow::anyhow!(
-            "unknown scope: {other:?} (expected user|system|launchd-gui|launchd-system)"
+            "unknown scope: {other:?} (expected user|system|launchd-gui|launchd-system|rc-base)"
         )),
     }
 }

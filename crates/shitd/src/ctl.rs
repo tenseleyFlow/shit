@@ -501,6 +501,7 @@ impl shit_planner::BlobReader for BlobReaderShim<'_> {
 struct MultiTierExecutor<'a> {
     file_executor: shit_planner::FileExecutor<'a, BlobReaderShim<'a>>,
     package_executor: shit_planner::executors::PackageExecutor<PrivilegedPkgRunner>,
+    service_executor: shit_planner::executors::ServiceExecutor<PrivilegedSvcRunner>,
 }
 
 /// PkgRunner that prefixes `doas` on non-Linux platforms where the
@@ -552,9 +553,56 @@ impl shit_planner::executors::PkgRunner for PrivilegedPkgRunner {
     }
 }
 
+/// Same shape as [`PrivilegedPkgRunner`] for `service(8)` invocations on
+/// FreeBSD. Looks up `doas`/`sudo` at runtime; falls back to a direct
+/// invocation if neither is present (works when shitd happens to be
+/// root). `SHIT_DURING_UNDO=1` short-circuits the helper's svc-event
+/// hook on re-entry.
+struct PrivilegedSvcRunner;
+
+impl shit_planner::executors::SvcRunner for PrivilegedSvcRunner {
+    fn run(&self, argv: &[String]) -> Result<(), String> {
+        let (cmd, args) = match argv.split_first() {
+            Some(v) => v,
+            None => return Err("empty argv".into()),
+        };
+        let escalator = [
+            "/usr/local/bin/doas",
+            "/usr/local/bin/sudo",
+            "/usr/bin/sudo",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file());
+        let mut command = match escalator {
+            Some(e) => {
+                let mut c = std::process::Command::new(e);
+                c.arg(cmd);
+                c.args(args);
+                c
+            }
+            None => {
+                let mut c = std::process::Command::new(cmd);
+                c.args(args);
+                c
+            }
+        };
+        let status = command
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+}
+
 impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
     fn supports(&self, op: &shit_planner::InverseOp) -> bool {
-        self.file_executor.supports(op) || self.package_executor.supports(op)
+        self.file_executor.supports(op)
+            || self.package_executor.supports(op)
+            || self.service_executor.supports(op)
     }
 
     fn execute(
@@ -567,6 +615,8 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             self.file_executor.execute(op, dry_run, policy)
         } else if self.package_executor.supports(op) {
             self.package_executor.execute(op, dry_run, policy)
+        } else if self.service_executor.supports(op) {
+            self.service_executor.execute(op, dry_run, policy)
         } else {
             shit_planner::ExecutionOutcome::Failed {
                 err: format!("no executor wired for tier {:?}", op.tier()),
@@ -619,6 +669,7 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
     let executor = MultiTierExecutor {
         file_executor: FileExecutor::new(&reader),
         package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
+        service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
     };
 
     let mut commands_attempted = 0u32;

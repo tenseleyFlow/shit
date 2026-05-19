@@ -65,8 +65,9 @@ pub use probe::{ProbeStat, StateProbe};
 pub use probe_live::{LiveStateProbe, hash_file};
 pub use proc::{KillCommand, KillTarget, parse_kill, parse_pattern_kill};
 pub use services::{
-    LAUNCHCTL_MUTATING_VERBS, SYSTEMCTL_MUTATING_VERBS, is_launchctl_mutating,
-    is_systemctl_mutating, parse_launchctl_print, parse_systemctl_show,
+    LAUNCHCTL_MUTATING_VERBS, SERVICE_MUTATING_VERBS, SYSTEMCTL_MUTATING_VERBS,
+    is_launchctl_mutating, is_service_mutating, is_systemctl_mutating, parse_freebsd_service,
+    parse_launchctl_print, parse_systemctl_show,
 };
 pub use store::PlannerStore;
 pub use time::{SeqRange, TimePoint, TimeRange};

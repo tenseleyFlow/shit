@@ -365,8 +365,14 @@ fn pkg_argv(
     changed: &[(&String, &String)],
 ) -> Vec<Vec<String>> {
     let mut out = Vec::new();
+    // Absolute path: `doas pkg ...` runs with a reduced PATH that
+    // typically omits /usr/sbin, so a bare "pkg" fails with "command
+    // not found". /usr/sbin/pkg is the base-system bootstrap; once
+    // pkg(8) installs itself the real binary is at /usr/local/sbin/pkg
+    // but /usr/sbin/pkg remains as a wrapper.
+    let pkg = "/usr/sbin/pkg";
     if !installed.is_empty() {
-        let mut argv = vec!["pkg".into(), "delete".into(), "-y".into()];
+        let mut argv = vec![pkg.into(), "delete".into(), "-y".into()];
         for name in installed {
             argv.push((*name).clone());
         }
@@ -374,7 +380,7 @@ fn pkg_argv(
     }
     for (name, version) in removed.iter().chain(changed.iter()) {
         out.push(vec![
-            "pkg".into(),
+            pkg.into(),
             "install".into(),
             "-y".into(),
             format!("{name}-{version}"),
@@ -486,7 +492,7 @@ mod tests {
             &after,
             None,
         );
-        assert_eq!(argv[0][0], "pkg");
+        assert_eq!(argv[0][0], "/usr/sbin/pkg");
         assert_eq!(argv[0][1], "delete");
     }
 

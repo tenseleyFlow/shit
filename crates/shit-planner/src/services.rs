@@ -200,6 +200,72 @@ pub fn parse_launchctl_print(text: &str) -> ServiceState {
     }
 }
 
+/// FreeBSD `service(8)` mutating subcommands. The rc.d framework
+/// accepts `start`, `stop`, `restart`, `reload`, plus `one*` variants
+/// that bypass the `<name>_enable` rc.conf gate. Capture all of them.
+pub const SERVICE_MUTATING_VERBS: &[&str] = &[
+    "start",
+    "stop",
+    "restart",
+    "reload",
+    "onestart",
+    "onestop",
+    "onerestart",
+    "forcestart",
+    "forcestop",
+    "forcerestart",
+    "quietstart",
+    "quietstop",
+    "quietrestart",
+    "enable",
+    "disable",
+];
+
+/// True when the given FreeBSD `service(8)` verb mutates state.
+pub fn is_service_mutating(verb: &str) -> bool {
+    SERVICE_MUTATING_VERBS.contains(&verb)
+}
+
+/// Parse the normalized output produced by
+/// `crates/shit-helper/src/svc/freebsd.rs::ServiceInspector::collect_state`.
+///
+/// The inspector emits a stable three-line `KEY=VALUE` block:
+///
+/// ```text
+/// ActiveState=<running|stopped|unknown>
+/// ScriptPath=/etc/rc.d/<unit>
+/// EnabledFlag=<YES|NO|UNKNOWN>
+/// ```
+///
+/// `service(8)` has no concept of "masked" — that's a systemd-ism —
+/// so `masked` is always false. `raw` holds the verbatim block for
+/// `shit show` to render.
+pub fn parse_freebsd_service(text: &str) -> ServiceState {
+    let mut active_state: Option<&str> = None;
+    let mut enabled_flag: Option<&str> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            match k {
+                "ActiveState" => active_state = Some(v.trim()),
+                "EnabledFlag" => enabled_flag = Some(v.trim()),
+                _ => {}
+            }
+        }
+    }
+    let active = matches!(active_state, Some("running"));
+    let enabled = matches!(enabled_flag, Some("YES"));
+    ServiceState {
+        active,
+        enabled,
+        masked: false,
+        raw: text.trim().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +405,62 @@ state = 1234
         let s = parse_launchctl_print("");
         assert!(!s.active);
         assert!(!s.enabled);
+    }
+
+    #[test]
+    fn service_mutating_classification() {
+        assert!(is_service_mutating("start"));
+        assert!(is_service_mutating("onestart"));
+        assert!(is_service_mutating("restart"));
+        assert!(is_service_mutating("enable"));
+        assert!(!is_service_mutating("status"));
+        assert!(!is_service_mutating("onestatus"));
+        assert!(!is_service_mutating("rcvar"));
+    }
+
+    #[test]
+    fn parse_freebsd_service_running_enabled() {
+        let input = "\
+ActiveState=running
+ScriptPath=/etc/rc.d/cron
+EnabledFlag=YES
+";
+        let s = parse_freebsd_service(input);
+        assert!(s.active);
+        assert!(s.enabled);
+        assert!(!s.masked);
+        assert!(s.raw.contains("ScriptPath=/etc/rc.d/cron"));
+    }
+
+    #[test]
+    fn parse_freebsd_service_stopped_disabled() {
+        let input = "\
+ActiveState=stopped
+ScriptPath=/usr/local/etc/rc.d/foo
+EnabledFlag=NO
+";
+        let s = parse_freebsd_service(input);
+        assert!(!s.active);
+        assert!(!s.enabled);
+    }
+
+    #[test]
+    fn parse_freebsd_service_unknown_treated_as_inactive() {
+        let input = "\
+ActiveState=unknown
+ScriptPath=<unknown>
+EnabledFlag=UNKNOWN
+";
+        let s = parse_freebsd_service(input);
+        assert!(!s.active);
+        assert!(!s.enabled);
+    }
+
+    #[test]
+    fn parse_freebsd_service_empty_defaults_to_inactive_disabled() {
+        let s = parse_freebsd_service("");
+        assert!(!s.active);
+        assert!(!s.enabled);
+        assert!(!s.masked);
     }
 }

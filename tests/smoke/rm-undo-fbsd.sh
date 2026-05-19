@@ -57,7 +57,7 @@ mkdir -p "${SCRATCH}"
 KNOWN_CONTENT="rm-undo-fbsd canary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 FOO="${SCRATCH}/foo.txt"
 printf '%s\n' "${KNOWN_CONTENT}" >"${FOO}"
-EXPECTED_SHA="$(sha256 -q "${FOO}")"
+EXPECTED_SHA="$(/sbin/sha256 -q "${FOO}")"
 smoke_log "wrote ${FOO} sha256=${EXPECTED_SHA}"
 
 SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
@@ -129,7 +129,7 @@ if [ ! -f "${FOO}" ]; then
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_fail "foo.txt was not restored by shit undo"
 fi
-GOT_SHA="$(sha256 -q "${FOO}")"
+GOT_SHA="$(/sbin/sha256 -q "${FOO}")"
 if [ "${GOT_SHA}" != "${EXPECTED_SHA}" ]; then
     smoke_log "expected sha=${EXPECTED_SHA}"
     smoke_log "got      sha=${GOT_SHA}"

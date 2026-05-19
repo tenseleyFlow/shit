@@ -246,6 +246,10 @@ pub enum SystemdScope {
     LaunchdGui,
     /// macOS launchd system domain.
     LaunchdSystem,
+    /// FreeBSD `service(8)` / rc.d framework. No user-scope split:
+    /// scripts live under `/etc/rc.d` (base) or `/usr/local/etc/rc.d`
+    /// (ports) and run system-wide.
+    RcBase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -63,11 +63,11 @@ fi
 # rewrite ported separately — ~50 KB and pure data. If `jot` is
 # already installed, pick a fallback.
 TARGET_PKG="jot"
-if pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
+if /usr/sbin/pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
     smoke_log "${TARGET_PKG} already installed; removing for clean baseline"
-    ${PRIV} pkg delete -y "${TARGET_PKG}" >/dev/null 2>&1 || true
+    ${PRIV} /usr/sbin/pkg delete -y "${TARGET_PKG}" >/dev/null 2>&1 || true
 fi
-if pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
+if /usr/sbin/pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
     smoke_fail "could not establish clean baseline (${TARGET_PKG} still installed after delete)"
 fi
 
@@ -100,8 +100,8 @@ smoke_log "pkg-event pre"
 "${HELPER_BIN}" pkg-event pkg pre --ctl-sock "${SHIT_CTL_SOCK}"
 
 smoke_log "${PRIV} pkg install -y ${TARGET_PKG}"
-${PRIV} pkg install -y "${TARGET_PKG}" >/dev/null 2>&1
-if ! pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
+${PRIV} /usr/sbin/pkg install -y "${TARGET_PKG}" >/dev/null 2>&1
+if ! /usr/sbin/pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
     smoke_fail "pkg install failed; ${TARGET_PKG} not present after install"
 fi
 
@@ -125,7 +125,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 }
 
 # Post-undo: target pkg should be gone.
-if pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
+if /usr/sbin/pkg info -e "${TARGET_PKG}" >/dev/null 2>&1; then
     smoke_log "undo log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_fail "${TARGET_PKG} still installed after undo — package rollback didn't fire"

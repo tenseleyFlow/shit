@@ -127,7 +127,35 @@ pub fn synthesize_argv(
         SystemdScope::LaunchdGui | SystemdScope::LaunchdSystem => {
             launchctl_argv(scope, unit, before, after)
         }
+        SystemdScope::RcBase => service_argv(unit, before, after),
     }
+}
+
+/// FreeBSD `service(8)` argv synthesis. The rc.d framework's verbs
+/// are `start`/`stop`/`restart` for runtime state and
+/// `enable`/`disable` for `<name>_enable` rc.conf gates. There is no
+/// "masked" concept on FreeBSD (the closest equivalent — removing
+/// the script — is out of scope here).
+fn service_argv(unit: &str, before: &ServiceState, after: &ServiceState) -> Vec<Vec<String>> {
+    // Absolute path: `doas service ...` runs with a reduced PATH that
+    // typically omits /usr/sbin, so a bare "service" fails with
+    // "command not found". The executable is at /usr/sbin/service on
+    // FreeBSD/NetBSD/OpenBSD/DragonFly.
+    let mk =
+        |verb: &str| -> Vec<String> { vec!["/usr/sbin/service".into(), unit.into(), verb.into()] };
+    let mut out = Vec::new();
+    // 1. Enabled delta.
+    if before.enabled != after.enabled {
+        // `service <unit> enable|disable` works on FreeBSD ≥ 9 — it
+        // tweaks rc.conf for us. Earlier systems require manual
+        // editing; the executor surfaces the failure if so.
+        out.push(mk(if before.enabled { "enable" } else { "disable" }));
+    }
+    // 2. Active delta.
+    if before.active != after.active {
+        out.push(mk(if before.active { "start" } else { "stop" }));
+    }
+    out
 }
 
 fn systemctl_argv(
@@ -300,6 +328,35 @@ mod tests {
         let s = state(true, true, false);
         let argv = synthesize_argv(SystemdScope::User, "foo.service", &s, &s);
         assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn rc_base_start_reverses_to_stop() {
+        let before = state(false, true, false);
+        let after = state(true, true, false);
+        let argv = synthesize_argv(SystemdScope::RcBase, "cron", &before, &after);
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0], vec!["/usr/sbin/service", "cron", "stop"]);
+    }
+
+    #[test]
+    fn rc_base_stop_reverses_to_start() {
+        let before = state(true, true, false);
+        let after = state(false, true, false);
+        let argv = synthesize_argv(SystemdScope::RcBase, "cron", &before, &after);
+        assert_eq!(argv[0], vec!["/usr/sbin/service", "cron", "start"]);
+    }
+
+    #[test]
+    fn rc_base_enable_and_start_reverses_in_correct_order() {
+        // before: disabled+stopped, after: enabled+running
+        let before = state(false, false, false);
+        let after = state(true, true, false);
+        let argv = synthesize_argv(SystemdScope::RcBase, "cron", &before, &after);
+        assert_eq!(argv.len(), 2);
+        // Enable first (rc.conf gate), then stop.
+        assert!(argv[0].iter().any(|s| s == "disable"));
+        assert!(argv[1].iter().any(|s| s == "stop"));
     }
 
     /// Spy runner.

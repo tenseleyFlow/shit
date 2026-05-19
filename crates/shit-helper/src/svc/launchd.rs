@@ -56,6 +56,11 @@ fn domain_for(scope: SvcScopeWire) -> String {
             format!("gui/{uid}")
         }
         SvcScopeWire::LaunchdSystem | SvcScopeWire::System => "system".to_string(),
+        // Not applicable on macOS; route to system as the best-effort
+        // closest match. The launchd inspector caller is only ever
+        // dispatched from a `launchctl` invocation, so RcBase
+        // shouldn't get here in practice.
+        SvcScopeWire::RcBase => "system".to_string(),
     }
 }
 
