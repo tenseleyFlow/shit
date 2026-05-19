@@ -270,12 +270,18 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::socketpair;
+    use crate::ipc::{connected_pair_via_path, socketpair};
     use std::thread;
 
     #[test]
     fn handshake_round_trip_via_socketpair() {
-        let (client, server) = socketpair().unwrap();
+        // Use a real listen/connect/accept pair instead of socketpair():
+        // FreeBSD's getpeereid(2) returns ENOTCONN on socketpair-created
+        // pairs (peer_cred has a fallback for that case), but stream
+        // send/recv across threads on socketpair fds also exhibits ENOTCONN
+        // on FreeBSD — accept()-derived sockets behave correctly. This
+        // exercises the production transport on every OS.
+        let (client, server) = connected_pair_via_path().unwrap();
         let expected_pid = std::process::id();
         let expected_uid = current_uid();
 
@@ -293,7 +299,7 @@ mod tests {
 
     #[test]
     fn handshake_caps_intersect_with_helper_local() {
-        let (client, server) = socketpair().unwrap();
+        let (client, server) = connected_pair_via_path().unwrap();
         let expected_pid = std::process::id();
         let expected_uid = current_uid();
         let helper_local = HelperCaps {

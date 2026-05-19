@@ -221,6 +221,48 @@ pub fn socketpair() -> Result<(Conn, Conn), ConnError> {
     Ok((Conn { fd: a }, Conn { fd: b }))
 }
 
+/// Test helper: bind/listen/connect/accept on a real filesystem path,
+/// matching the production handshake transport. Use this for tests that
+/// need peer_cred to work — FreeBSD's `getpeereid(2)` and STREAM
+/// send/recv have quirky behavior on socketpair-created pairs, but
+/// behave correctly on accept()-derived sockets.
+#[cfg(test)]
+pub fn connected_pair_via_path() -> Result<(Conn, Conn), ConnError> {
+    use nix::sys::socket::{Backlog, accept, bind, listen};
+    use std::os::fd::FromRawFd;
+    let dir = tempfile::tempdir().map_err(ConnError::Io)?;
+    let path = dir.path().join("helper.sock");
+    let listener = socket(
+        AddressFamily::Unix,
+        HELPER_SOCK_TYPE,
+        SockFlag::empty(),
+        None,
+    )?;
+    let addr = UnixAddr::new(&path)?;
+    bind(listener.as_raw_fd(), &addr)?;
+    listen(&listener, Backlog::new(1).unwrap())?;
+
+    let client_fd = socket(
+        AddressFamily::Unix,
+        HELPER_SOCK_TYPE,
+        SockFlag::empty(),
+        None,
+    )?;
+    nix::sys::socket::connect(client_fd.as_raw_fd(), &addr)?;
+
+    let accepted_raw = accept(listener.as_raw_fd())?;
+    // SAFETY: accept(2) returns a fresh fd that we now own.
+    let accepted = unsafe { OwnedFd::from_raw_fd(accepted_raw) };
+
+    // Keep tempdir alive until end of test — wrap in std::mem::forget
+    // would leak; instead, return a closure-style guard via the file
+    // staying on disk (it's auto-cleaned on dir drop). To make this
+    // safe across return, leak the tempdir intentionally — tests are
+    // short-lived and the OS reclaims the temp tree on process exit.
+    std::mem::forget(dir);
+    Ok((Conn { fd: client_fd }, Conn { fd: accepted }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
