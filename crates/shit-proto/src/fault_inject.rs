@@ -37,15 +37,56 @@ use std::sync::OnceLock;
 
 const ENV_VAR: &str = "SHIT_FAULT_INJECT";
 
+/// Canonical list of every wired fault-injection point in the
+/// codebase. Adding a new `maybe_inject(point)` callsite without
+/// registering the name here fires a debug-build panic the first
+/// time the function runs — typos become immediate.
+///
+/// Tests in this module assert this constant matches every active
+/// callsite. Documenting points here is the audit trail S20 wants.
+pub const KNOWN_INJECTION_POINTS: &[&str] = &[
+    // S20.9 — original site.
+    "blob_store.put.before_atomic_write",
+    "blob_store.put.after_atomic_write",
+    // DR-64 — recovery sites.
+    "index.put_event_batch.before_tx",
+    "index.put_event_batch.before_commit",
+    "index.put_event_batch.after_commit",
+    "gc.compact_paths.before_delete",
+    "gc.compact_paths.after_delete",
+    "orchestrator.run.before_op",
+    "orchestrator.run.after_op",
+    "orchestrator.run_parallel.between_cohorts",
+    "helper.handshake.before_ack_send",
+    "helper.handshake.after_ack_send",
+    // Used by env-path tests in this module.
+    "panicky.point",
+];
+
+/// Returns `true` when `point` is documented in
+/// [`KNOWN_INJECTION_POINTS`]. Used by [`maybe_inject`] to catch
+/// typos in debug builds.
+pub fn is_known_point(point: &str) -> bool {
+    KNOWN_INJECTION_POINTS.contains(&point)
+}
+
 /// Trigger a panic if `point` matches an entry in `$SHIT_FAULT_INJECT`.
 /// No-op in release builds.
 ///
 /// Returns normally if (a) we're a release build, or (b) the env var
 /// doesn't list this point name. Panics otherwise.
+///
+/// In debug builds, also asserts that `point` is registered in
+/// [`KNOWN_INJECTION_POINTS`] — an unregistered name is a typo
+/// (or a new site that forgot to update the registry).
 pub fn maybe_inject(point: &'static str) {
     if !cfg!(debug_assertions) {
         return;
     }
+    debug_assert!(
+        is_known_point(point),
+        "unregistered fault-injection point: {point:?} (add to KNOWN_INJECTION_POINTS)"
+    );
     let points = points();
     if points.iter().any(|p| p == point) {
         panic!("SHIT_FAULT_INJECT triggered at {point}");
@@ -144,6 +185,60 @@ mod tests {
         assert!(would_inject_in(&points, "d.e.f"));
         assert!(!would_inject_in(&points, "a.b"));
         assert!(!would_inject_in(&points, "a.b.c.d"));
+    }
+
+    #[test]
+    fn known_injection_points_includes_dr64_sites() {
+        // Audit assertion: every DR-64 site is documented in the
+        // registry. If a callsite is removed, this list shrinks; if
+        // a callsite is added without registration, maybe_inject's
+        // debug_assert fires.
+        let expected = [
+            "blob_store.put.before_atomic_write",
+            "blob_store.put.after_atomic_write",
+            "index.put_event_batch.before_tx",
+            "index.put_event_batch.before_commit",
+            "index.put_event_batch.after_commit",
+            "gc.compact_paths.before_delete",
+            "gc.compact_paths.after_delete",
+            "orchestrator.run.before_op",
+            "orchestrator.run.after_op",
+            "orchestrator.run_parallel.between_cohorts",
+            "helper.handshake.before_ack_send",
+            "helper.handshake.after_ack_send",
+        ];
+        for site in expected {
+            assert!(
+                is_known_point(site),
+                "DR-64 site {site:?} missing from KNOWN_INJECTION_POINTS"
+            );
+        }
+    }
+
+    #[test]
+    fn known_points_have_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for p in KNOWN_INJECTION_POINTS {
+            assert!(seen.insert(*p), "duplicate injection point: {p:?}");
+        }
+    }
+
+    #[test]
+    fn known_points_use_dotted_snake_case() {
+        for p in KNOWN_INJECTION_POINTS {
+            assert!(!p.is_empty(), "empty point name");
+            assert!(
+                p.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_'),
+                "{p:?} violates the dotted-snake naming convention"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_point_is_not_in_registry() {
+        assert!(!is_known_point("totally.fake.site"));
+        assert!(!is_known_point(""));
     }
 
     // -- env-path integration test, isolated --
