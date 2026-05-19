@@ -94,6 +94,7 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         | InverseOp::GhReverse { .. }
         | InverseOp::AwsReverse { .. }
         | InverseOp::TerraformReverse { .. }
+        | InverseOp::ContainerRestore { .. }
         | InverseOp::DbNote { .. } => {}
     }
     out

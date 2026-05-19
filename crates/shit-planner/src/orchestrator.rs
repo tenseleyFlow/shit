@@ -390,6 +390,7 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             | InverseOp::GhReverse { .. }
             | InverseOp::AwsReverse { .. }
             | InverseOp::TerraformReverse { .. }
+            | InverseOp::ContainerRestore { .. }
             | InverseOp::DbNote { .. } => None,
         }
     }
