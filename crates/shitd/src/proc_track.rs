@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId, ProcessOpKind};
+use shit_planner::events::{CaptureEvent, CaptureEventKind, CommandId, EventId, ProcessOpKind};
 use shit_proto::{ProcEventReq, ProcSnapshot, ProcToolWire};
 use shit_store::Index;
 
@@ -23,10 +23,21 @@ use crate::active_commands::ActiveCommands;
 
 pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 
+/// Pid-based stash key — fallback for orphans / self-spawned tests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProcKey {
     pub tool: ProcToolWire,
     pub pid: u32,
+}
+
+/// Command-based stash key — used when ancestry resolves to an
+/// active command. The kill/pkill/killall wrappers fork the helper
+/// twice (pre + post) with distinct pids; the resolved command is
+/// the only stable pairing key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProcCommandKey {
+    pub command: CommandId,
+    pub tool: ProcToolWire,
 }
 
 #[derive(Debug, Clone)]
@@ -37,33 +48,48 @@ pub struct ProcPre {
 }
 
 pub struct ProcPreStash {
-    inner: Mutex<HashMap<ProcKey, ProcPre>>,
+    by_command: Mutex<HashMap<ProcCommandKey, ProcPre>>,
+    by_pid: Mutex<HashMap<ProcKey, ProcPre>>,
 }
 
 impl ProcPreStash {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            by_command: Mutex::new(HashMap::new()),
+            by_pid: Mutex::new(HashMap::new()),
         }
     }
-    pub fn insert(&self, key: ProcKey, pre: ProcPre) {
-        self.inner.lock().unwrap().insert(key, pre);
+    pub fn insert_by_command(&self, key: ProcCommandKey, pre: ProcPre) {
+        self.by_command.lock().unwrap().insert(key, pre);
     }
-    pub fn take(&self, key: &ProcKey) -> Option<ProcPre> {
-        self.inner.lock().unwrap().remove(key)
+    pub fn take_by_command(&self, key: &ProcCommandKey) -> Option<ProcPre> {
+        self.by_command.lock().unwrap().remove(key)
+    }
+    pub fn insert_by_pid(&self, key: ProcKey, pre: ProcPre) {
+        self.by_pid.lock().unwrap().insert(key, pre);
+    }
+    pub fn take_by_pid(&self, key: &ProcKey) -> Option<ProcPre> {
+        self.by_pid.lock().unwrap().remove(key)
     }
     pub fn sweep_expired(&self) -> usize {
-        let mut g = self.inner.lock().unwrap();
         let cutoff = Instant::now()
             .checked_sub(PRE_STASH_TTL)
             .unwrap_or_else(Instant::now);
+        let mut evicted = 0;
+        let mut g = self.by_command.lock().unwrap();
         let before = g.len();
         g.retain(|_, e| e.ts >= cutoff);
-        before - g.len()
+        evicted += before - g.len();
+        drop(g);
+        let mut g = self.by_pid.lock().unwrap();
+        let before = g.len();
+        g.retain(|_, e| e.ts >= cutoff);
+        evicted += before - g.len();
+        evicted
     }
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.by_command.lock().unwrap().len() + self.by_pid.lock().unwrap().len()
     }
 }
 
@@ -97,30 +123,45 @@ pub fn handle(
     active: &ActiveCommands,
     index: &Index,
 ) -> PostOutcome {
-    let key = ProcKey {
+    let pid_key = ProcKey {
         tool: req.tool,
         pid: req.pid,
     };
+    let cmd_key = active
+        .resolve_by_descendant(req.pid)
+        .map(|c| ProcCommandKey {
+            command: c,
+            tool: req.tool,
+        });
     match req.phase {
         shit_proto::PkgPhase::Pre => {
             tracing::debug!(
                 tool = req.tool.as_str(),
                 pid = req.pid,
                 target_count = req.targets.len(),
+                command = ?cmd_key.as_ref().map(|k| k.command),
                 "proc-pre stashed"
             );
-            stash.insert(
-                key,
-                ProcPre {
-                    targets: req.targets,
-                    argv: req.target_argv,
-                    ts: Instant::now(),
-                },
-            );
+            let pre = ProcPre {
+                targets: req.targets,
+                argv: req.target_argv,
+                ts: Instant::now(),
+            };
+            if let Some(k) = cmd_key {
+                stash.insert_by_command(k, pre);
+            } else {
+                stash.insert_by_pid(pid_key, pre);
+            }
             PostOutcome::Orphan
         }
         shit_proto::PkgPhase::Post => {
-            let Some(pre) = stash.take(&key) else {
+            let pre = match cmd_key.as_ref() {
+                Some(k) => stash
+                    .take_by_command(k)
+                    .or_else(|| stash.take_by_pid(&pid_key)),
+                None => stash.take_by_pid(&pid_key),
+            };
+            let Some(pre) = pre else {
                 tracing::warn!(
                     tool = req.tool.as_str(),
                     pid = req.pid,
@@ -148,12 +189,12 @@ pub fn handle(
                 .iter()
                 .filter(|o| matches!(o, TargetOutcome::Killed(_)))
                 .count();
-            // DR-53: resolve once per Post and journal one
-            // ProcessOp per killed target. Survived targets aren't
-            // journaled — the user's command didn't actually mutate
-            // their state.
+            // DR-53: journal one ProcessOp per killed target,
+            // attributed to the active command we resolved at
+            // stash-lookup time. Survived targets aren't journaled —
+            // the user's command didn't actually mutate their state.
             if killed_count > 0
-                && let Some(command) = active.resolve_by_descendant(req.pid)
+                && let Some(command) = cmd_key.as_ref().map(|k| k.command)
             {
                 let signal = parse_signal_from_argv(&pre.argv);
                 for outcome in &outcomes {
@@ -449,19 +490,16 @@ mod tests {
             tool: ProcToolWire::Kill,
             pid: 42,
         };
-        {
-            let mut g = stash.inner.lock().unwrap();
-            g.insert(
-                key,
-                ProcPre {
-                    targets: vec![],
-                    argv: vec![],
-                    ts: Instant::now()
-                        .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
-                        .expect("clock subtraction"),
-                },
-            );
-        }
+        stash.insert_by_pid(
+            key,
+            ProcPre {
+                targets: vec![],
+                argv: vec![],
+                ts: Instant::now()
+                    .checked_sub(PRE_STASH_TTL + Duration::from_secs(1))
+                    .expect("clock subtraction"),
+            },
+        );
         assert_eq!(stash.sweep_expired(), 1);
         assert_eq!(stash.len(), 0);
     }
