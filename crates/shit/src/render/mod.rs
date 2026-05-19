@@ -31,7 +31,7 @@ pub use db::render as render_db;
 #[allow(unused_imports)]
 pub use env_diff::{RedactionDisplay, render as render_env_diff};
 #[allow(unused_imports)]
-pub use git::{GitRestoreGroup, detect_git_restores};
+pub use git::{BlobByPath, GitRestoreGroup, detect_git_restores, detect_git_restores_enriched};
 #[allow(unused_imports)]
 pub use json::{JsonError, write_json};
 #[allow(unused_imports)]
