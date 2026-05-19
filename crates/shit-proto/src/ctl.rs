@@ -202,6 +202,9 @@ pub struct PkgManagerParseError(pub String);
 pub enum SvcToolWire {
     Systemctl,
     Launchctl,
+    /// FreeBSD's `service(8)` — wrapper around `/etc/rc.d/*` scripts.
+    /// S29.6.
+    Service,
 }
 
 impl SvcToolWire {
@@ -209,6 +212,7 @@ impl SvcToolWire {
         match self {
             Self::Systemctl => "systemctl",
             Self::Launchctl => "launchctl",
+            Self::Service => "service",
         }
     }
 }
@@ -219,6 +223,7 @@ impl std::str::FromStr for SvcToolWire {
         match s {
             "systemctl" => Ok(Self::Systemctl),
             "launchctl" => Ok(Self::Launchctl),
+            "service" => Ok(Self::Service),
             other => Err(SvcToolParseError(other.to_string())),
         }
     }
@@ -236,6 +241,10 @@ pub enum SvcScopeWire {
     System,
     LaunchdGui,
     LaunchdSystem,
+    /// FreeBSD's rc(8) base-system scope. There's no per-user
+    /// equivalent in stock FreeBSD; user-spawned daemons typically
+    /// run under their own session-tooling. S29.6.
+    RcBase,
 }
 
 impl SvcScopeWire {
@@ -245,6 +254,7 @@ impl SvcScopeWire {
             Self::System => "system",
             Self::LaunchdGui => "launchd-gui",
             Self::LaunchdSystem => "launchd-system",
+            Self::RcBase => "rc-base",
         }
     }
 }
