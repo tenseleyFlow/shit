@@ -11,7 +11,10 @@
 // CLI subcommand and the daemon ctl-handler is DR-CR-06.
 #![allow(dead_code)]
 
+pub mod gh;
 pub mod kubectl;
 
+#[allow(unused_imports)]
+pub use gh::{GhVerb, classify_gh_argv};
 #[allow(unused_imports)]
 pub use kubectl::{KubectlVerb, classify_kubectl_argv};

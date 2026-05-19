@@ -14,6 +14,7 @@ pub mod db;
 pub mod descriptor;
 pub mod env;
 pub mod file;
+pub mod gh;
 pub mod kubectl;
 pub mod network;
 pub mod package;
@@ -27,6 +28,7 @@ pub use db::{
 pub use descriptor::{DescRunner, DescriptorExecutor, SystemDescRunner};
 pub use env::{EnvExecutor, SnippetSink, StringSnippetSink};
 pub use file::FileExecutor;
+pub use gh::{GhExecutor, GhRunner, SystemGhRunner};
 pub use kubectl::{KubectlExecutor, KubectlRunner, SystemKubectlRunner};
 pub use network::{NetRunner, NetworkExecutor, SystemNetRunner};
 pub use package::{PackageExecutor, PkgRunner, SystemPkgRunner};
