@@ -22,6 +22,7 @@ pub mod network;
 pub mod package;
 pub mod process;
 pub mod services;
+pub mod shell_state;
 pub mod terraform;
 
 pub use aws::{AwsExecutor, AwsRunner, SystemAwsRunner};
@@ -42,4 +43,5 @@ pub use process::{
     VecSuggestionSink, render_snippet as render_process_snippet,
 };
 pub use services::{ServiceExecutor, SvcRunner, SystemSvcRunner};
+pub use shell_state::{ShellStateExecutor, ShellStateRunner, ShellTarget, SystemShellStateRunner};
 pub use terraform::{SystemTerraformRunner, TerraformExecutor, TerraformRunner};
