@@ -33,6 +33,45 @@ use crate::probe::StateProbe;
 /// knob).
 pub const DEFAULT_COHORT_PARALLELISM: usize = 4;
 
+/// DR-17 helper: compile a list of glob patterns (`shit undo --paths
+/// '/etc/**' --paths '/var/log/**'`) into the
+/// [`globset::GlobSet`] the orchestrator's `with_paths_filter`
+/// expects.
+///
+/// Returns:
+/// - `Ok(None)` when `patterns` is empty — caller passes that to
+///   `with_paths_filter` to clear the filter.
+/// - `Ok(Some(set))` when at least one pattern compiled.
+/// - `Err` when a pattern is malformed; the error names the bad
+///   pattern so the CLI can render it back to the user.
+pub fn compile_paths_filter(patterns: &[String]) -> Result<Option<globset::GlobSet>, PathsFilterError> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pat in patterns {
+        let glob = globset::Glob::new(pat).map_err(|e| PathsFilterError {
+            pattern: pat.clone(),
+            source: e,
+        })?;
+        builder.add(glob);
+    }
+    let set = builder.build().map_err(|e| PathsFilterError {
+        pattern: patterns.join(", "),
+        source: e,
+    })?;
+    Ok(Some(set))
+}
+
+/// Compilation failure for a `--paths` pattern.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid --paths pattern `{pattern}`: {source}")]
+pub struct PathsFilterError {
+    pub pattern: String,
+    #[source]
+    pub source: globset::Error,
+}
+
 /// Group plan-node indices by cohort, preserving cohort order. The
 /// planner emits cohorts in non-decreasing order, so the result here
 /// is the natural traversal sequence for `run_parallel`.
@@ -715,5 +754,142 @@ mod tests {
         assert_eq!(r.records[0].outcome_kind, OutcomeKind::Applied);
         assert_eq!(std::fs::read(&target).unwrap(), b"captured");
         assert!(r.fully_applied());
+    }
+
+    // -----------------------------------------------------------------
+    // DR-17: compile_paths_filter helper
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn compile_paths_filter_empty_returns_none() {
+        let r = compile_paths_filter(&[]).unwrap();
+        assert!(r.is_none(), "empty patterns clear the filter");
+    }
+
+    #[test]
+    fn compile_paths_filter_single_pattern_matches_expected_paths() {
+        let r = compile_paths_filter(&["/etc/**".to_string()]).unwrap().unwrap();
+        assert!(r.is_match("/etc/nginx/nginx.conf"));
+        assert!(r.is_match("/etc/passwd"));
+        assert!(!r.is_match("/var/log/syslog"));
+    }
+
+    #[test]
+    fn compile_paths_filter_multiple_patterns_are_unioned() {
+        let r = compile_paths_filter(&[
+            "/etc/**".to_string(),
+            "/var/log/**".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(r.is_match("/etc/passwd"));
+        assert!(r.is_match("/var/log/syslog"));
+        assert!(!r.is_match("/tmp/foo"));
+    }
+
+    #[test]
+    fn compile_paths_filter_rejects_malformed_pattern() {
+        // Unclosed character class.
+        let err = compile_paths_filter(&["/[unclosed".to_string()]).unwrap_err();
+        assert_eq!(err.pattern, "/[unclosed");
+    }
+
+    #[test]
+    fn compile_paths_filter_then_orchestrator_skips_filtered_op() {
+        // End-to-end: compile a filter that EXCLUDES /tmp/excluded
+        // and confirm a RestoreContent op for it lands as Skipped
+        // in the report.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let included = tmpdir.path().join("kept");
+        let excluded = tmpdir.path().join("dropped");
+        std::fs::write(&included, b"current").unwrap();
+        std::fs::write(&excluded, b"current").unwrap();
+        let mut reader = InMemoryBlobReader::new();
+        let blob = BlobHash::from_bytes([0x11; 32]);
+        reader.insert(blob, b"restored".to_vec());
+        let exec = FileExecutor::new(&reader);
+        // Probe must report both paths exist so the orchestrator's
+        // precondition check doesn't fire `Conflict::Missing`.
+        let mut probe = InMemoryProbe::new();
+        for (path, ino) in [(&included, 1), (&excluded, 2)] {
+            probe.by_path.insert(
+                path.clone(),
+                (
+                    ProbeStat {
+                        inode: InodeRef::new(1, ino),
+                        meta: FileMetadata {
+                            mode: 0o100644,
+                            uid: 1000,
+                            gid: 1000,
+                            size: 7,
+                            mtime_unix_nanos: 0,
+                            xattrs: Default::default(),
+                            acl: None,
+                        },
+                    },
+                    None,
+                ),
+            );
+        }
+        // Filter that matches only `included`'s basename via `**`.
+        let pat = format!("**/{}", included.file_name().unwrap().display());
+        let filter = compile_paths_filter(&[pat]).unwrap();
+        let orc = Orchestrator::new(&exec, &probe).with_paths_filter(filter);
+        let plan = UndoPlan {
+            command: CommandRecord {
+                command: CommandId {
+                    session: Uuid::nil(),
+                    seq: 1,
+                },
+                cmd_string: None,
+                cwd: PathBuf::from("/"),
+                pid: 0,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: Some(TimePoint::new(1, 1000)),
+                exit_code: Some(0),
+                event_ids: vec![],
+            },
+            nodes: vec![
+                PlanNode {
+                    op: InverseOp::RestoreContent {
+                        inode: InodeRef::new(1, 1),
+                        path: included.clone(),
+                        blob,
+                    },
+                    cohort: 0,
+                    conflict: None,
+                },
+                PlanNode {
+                    op: InverseOp::RestoreContent {
+                        inode: InodeRef::new(1, 2),
+                        path: excluded.clone(),
+                        blob,
+                    },
+                    cohort: 0,
+                    conflict: None,
+                },
+            ],
+            warnings: vec![],
+        };
+        let r = orc.run(&plan, false, ConflictPolicy::Skip);
+        assert_eq!(r.records.len(), 2);
+        // Order matches plan order.
+        let outcomes: Vec<_> = r.records.iter().map(|rec| rec.outcome_kind).collect();
+        // First (included) applied; second (excluded) skipped.
+        assert_eq!(outcomes[0], OutcomeKind::Applied);
+        assert_eq!(outcomes[1], OutcomeKind::Skipped);
+        // Filter message ends up in the skip detail.
+        assert!(
+            r.records[1]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("filtered")),
+            "got: {:?}",
+            r.records[1].detail
+        );
+        assert_eq!(std::fs::read(&included).unwrap(), b"restored");
+        // Excluded file was not touched.
+        assert_eq!(std::fs::read(&excluded).unwrap(), b"current");
     }
 }
