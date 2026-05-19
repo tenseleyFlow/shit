@@ -28,7 +28,18 @@ impl super::PkgInspector for PkgInspector {
         PkgManagerWire::Pkg
     }
     fn collect_state(&self) -> anyhow::Result<BTreeMap<String, String>> {
-        let out = Command::new("pkg").args(["query", "%n %v"]).output()?;
+        // Absolute path: the helper inherits the daemon's PATH, which
+        // commonly lacks /usr/sbin/local on the SSH-non-interactive
+        // and systemd-spawned paths. `pkg` lives at /usr/sbin/pkg on
+        // FreeBSD ≥ 11 (the base bootstrap) and /usr/local/sbin/pkg
+        // once pkg(8) installs itself — both work, prefer base path
+        // for predictability.
+        let pkg_path = ["/usr/sbin/pkg", "/usr/local/sbin/pkg"]
+            .iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .copied()
+            .unwrap_or("pkg");
+        let out = Command::new(pkg_path).args(["query", "%n %v"]).output()?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
                 "pkg query exited {:?}: {}",
