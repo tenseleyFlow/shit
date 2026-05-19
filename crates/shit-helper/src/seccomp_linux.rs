@@ -58,7 +58,7 @@ pub fn build_filter() -> Result<SeccompFilter, SeccompError> {
     };
 
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    for syscall in ALLOWED_SYSCALLS {
+    for syscall in ALLOWED_SYSCALLS.iter().chain(ALLOWED_SYSCALLS_ARCH.iter()) {
         rules.insert(*syscall, vec![]);
     }
     SeccompFilter::new(
@@ -90,9 +90,11 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_pread64,    // file read via dup'd fd in capture/linux::read_pre_image
     libc::SYS_dup,        // capture/linux::read_pre_image dup's fd
     libc::SYS_dup3,       // glibc dup variant
-    libc::SYS_pipe2,      // pipes for internal tokio signal/wake paths
-    libc::SYS_readlink,   // /proc/<pid>/cwd resolution
-    libc::SYS_readlinkat, // glibc variant
+    libc::SYS_pipe2, // pipes for internal tokio signal/wake paths
+    // SYS_readlink is x86_64-only; aarch64 dropped the bare form in
+    // favor of readlinkat. Always allow readlinkat; conditionally
+    // allow readlink below.
+    libc::SYS_readlinkat,
     libc::SYS_lseek,      // File reads sometimes seek
     libc::SYS_ftruncate,  // staging file ops
     libc::SYS_fsync,      // staging file durability (we removed but be defensive)
@@ -119,10 +121,11 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_epoll_create1,
     libc::SYS_epoll_ctl,
     libc::SYS_epoll_pwait,
-    // tokio's mio backend uses bare epoll_wait on some kernel/glibc
-    // pairings (it falls back when epoll_pwait2 isn't available).
-    // Surfaced by L01 chunk 5: syscall=232 SIGSYS on hasu (kernel 7.0.8).
-    libc::SYS_epoll_wait,
+    // SYS_epoll_wait (the bare, non-`p` variant) is x86_64-only;
+    // aarch64 dropped it. Conditionally allowed below — tokio's
+    // mio backend uses it on x86_64 kernel/glibc pairings where
+    // epoll_pwait2 isn't available (surfaced by L01 chunk 5 on
+    // hasu, syscall=232 SIGSYS).
     libc::SYS_eventfd2,
     libc::SYS_futex,
     libc::SYS_rt_sigprocmask,
@@ -149,6 +152,18 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_perf_event_open,
 ];
 
+/// x86_64-only syscalls. aarch64's Linux ABI dropped these in favor
+/// of newer variants we already allow above (readlinkat, epoll_pwait).
+/// The two slices are concatenated in [`build_filter`].
+#[cfg(target_arch = "x86_64")]
+const ALLOWED_SYSCALLS_ARCH: &[i64] = &[
+    libc::SYS_readlink,
+    libc::SYS_epoll_wait,
+];
+
+#[cfg(not(target_arch = "x86_64"))]
+const ALLOWED_SYSCALLS_ARCH: &[i64] = &[];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,7 +177,7 @@ mod tests {
     #[test]
     fn allowlist_has_no_dupes() {
         let mut seen = std::collections::HashSet::new();
-        for s in ALLOWED_SYSCALLS {
+        for s in ALLOWED_SYSCALLS.iter().chain(ALLOWED_SYSCALLS_ARCH.iter()) {
             assert!(seen.insert(*s), "duplicate syscall {s}");
         }
     }
