@@ -44,6 +44,11 @@ pub enum ShellSyntax {
     Posix,
     /// `set -x KEY value` — fish's standard form.
     Fish,
+    /// `KEY='value' KEY='value' ...` — single-line prefix form for
+    /// inline `eval` use. The shell wrapper functions (the auto-
+    /// inject path landed by `shit hooks install`) prepend this to
+    /// the user's command via `eval "$prefix command ..."`.
+    Prefix,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -89,6 +94,7 @@ pub fn run(args: AutoInjectArgs) -> Result<(), CliError> {
         match args.shell {
             ShellSyntax::Posix => render_posix(&assignments),
             ShellSyntax::Fish => render_fish(&assignments),
+            ShellSyntax::Prefix => render_prefix(&assignments),
         }
     }
     Ok(())
@@ -137,6 +143,14 @@ fn render_fish(assignments: &[(&'static str, String)]) {
     for (k, v) in assignments {
         println!("set -x {k} '{}'", posix_single_quote(v));
     }
+}
+
+fn render_prefix(assignments: &[(&'static str, String)]) {
+    let parts: Vec<String> = assignments
+        .iter()
+        .map(|(k, v)| format!("{k}='{}'", posix_single_quote(v)))
+        .collect();
+    println!("{}", parts.join(" "));
 }
 
 fn render_json(
