@@ -87,20 +87,20 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_fstat,
     libc::SYS_statx, // glibc fs::metadata on modern kernels; pre-image read path
     libc::SYS_openat,
-    libc::SYS_pread64,    // file read via dup'd fd in capture/linux::read_pre_image
-    libc::SYS_dup,        // capture/linux::read_pre_image dup's fd
-    libc::SYS_dup3,       // glibc dup variant
-    libc::SYS_pipe2, // pipes for internal tokio signal/wake paths
+    libc::SYS_pread64, // file read via dup'd fd in capture/linux::read_pre_image
+    libc::SYS_dup,     // capture/linux::read_pre_image dup's fd
+    libc::SYS_dup3,    // glibc dup variant
+    libc::SYS_pipe2,   // pipes for internal tokio signal/wake paths
     // SYS_readlink is x86_64-only; aarch64 dropped the bare form in
     // favor of readlinkat. Always allow readlinkat; conditionally
     // allow readlink below.
     libc::SYS_readlinkat,
-    libc::SYS_lseek,      // File reads sometimes seek
-    libc::SYS_ftruncate,  // staging file ops
-    libc::SYS_fsync,      // staging file durability (we removed but be defensive)
-    libc::SYS_unlinkat,   // staging cleanup
-    libc::SYS_mkdirat,    // create_dir_all uses mkdirat
-    libc::SYS_renameat2,  // staging atomic rename if used
+    libc::SYS_lseek,     // File reads sometimes seek
+    libc::SYS_ftruncate, // staging file ops
+    libc::SYS_fsync,     // staging file durability (we removed but be defensive)
+    libc::SYS_unlinkat,  // staging cleanup
+    libc::SYS_mkdirat,   // create_dir_all uses mkdirat
+    libc::SYS_renameat2, // staging atomic rename if used
     libc::SYS_fcntl,
     libc::SYS_mmap,
     libc::SYS_munmap,
@@ -156,10 +156,7 @@ const ALLOWED_SYSCALLS: &[i64] = &[
 /// of newer variants we already allow above (readlinkat, epoll_pwait).
 /// The two slices are concatenated in [`build_filter`].
 #[cfg(target_arch = "x86_64")]
-const ALLOWED_SYSCALLS_ARCH: &[i64] = &[
-    libc::SYS_readlink,
-    libc::SYS_epoll_wait,
-];
+const ALLOWED_SYSCALLS_ARCH: &[i64] = &[libc::SYS_readlink, libc::SYS_epoll_wait];
 
 #[cfg(not(target_arch = "x86_64"))]
 const ALLOWED_SYSCALLS_ARCH: &[i64] = &[];
