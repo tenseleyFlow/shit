@@ -726,6 +726,7 @@ mod tests {
     ///   * confirm (dev, inode) match what the BPF event reported,
     ///   * read pre-image bytes,
     ///   * stage them and try to send the response.
+    ///
     /// We can't easily assert the send (no daemon listening), but we
     /// CAN assert the dedupe map flipped to `invalidated=true` —
     /// proof the unlink path executed end-to-end.
