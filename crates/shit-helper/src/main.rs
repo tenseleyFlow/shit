@@ -783,24 +783,32 @@ fn pick_bsd_tier() -> CaptureTier {
 }
 
 /// Bundles the long-lived state for the eBPF-LSM tier (L04). Held
-/// by the request loop so WatchTree / UnwatchTree can update the
-/// tree-map; held to the helper's exit so the reader thread can be
-/// joined cleanly.
+/// in the run loop's outer scope so the reader/loader stay alive
+/// for the helper's lifetime. The request loop receives a
+/// [`LsmDispatch`] clone for WatchTree/UnwatchTree handling — the
+/// reader/loader fields don't cross the `spawn_blocking` boundary.
 #[cfg(target_os = "linux")]
 struct LsmCaptureState {
-    /// Process-tree tracking for pid → CommandId resolution. Same
-    /// type fanotify uses; here it's keyed only by the LSM reader.
-    tree: Arc<std::sync::Mutex<fanotify::tree::TreeMap>>,
-    /// Shared with the LsmReader's sink. Wraps the same
-    /// `LinuxCaptureRuntime` that the request loop notifies via
-    /// `on_watch_tree`/`on_unwatch_tree`.
-    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
     /// Reader thread handle. Dropped on shutdown — `LsmReader::drop`
     /// stops the reader and joins.
     _reader: ebpf::LsmReader,
     /// Held to keep the BPF programs attached for the helper's
     /// lifetime. Dropping detaches.
     _loader: ebpf::EbpfLoader,
+    /// Clone-able dispatch handle for the request loop.
+    dispatch: LsmDispatch,
+}
+
+/// Send + Clone snapshot of the eBPF-LSM tier's runtime hooks. Goes
+/// into the synchronous request loop via [`request_loop`].
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct LsmDispatch {
+    /// Process-tree tracking for pid → CommandId resolution.
+    tree: Arc<std::sync::Mutex<fanotify::tree::TreeMap>>,
+    /// Shared with the LsmReader's sink. WatchTree/UnwatchTree
+    /// notify the same runtime instance the BPF events feed.
+    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
 }
 
 /// Load the eBPF-LSM unlink program, take its ringbuf, and spawn
@@ -847,10 +855,12 @@ fn boot_ebpf_lsm(
 
     tracing::info!("ebpf-lsm reader spawned");
     Ok(LsmCaptureState {
-        tree,
-        runtime,
         _reader: reader,
         _loader: loader,
+        dispatch: LsmDispatch {
+            tree,
+            runtime,
+        },
     })
 }
 
@@ -1076,11 +1086,15 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         target_os = "dragonfly",
     ))]
     let request_bsd_capture = bsd_capture.clone();
+    #[cfg(target_os = "linux")]
+    let request_lsm = lsm_state.as_ref().map(|s| s.dispatch.clone());
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
             #[cfg(target_os = "linux")]
             request_state,
+            #[cfg(target_os = "linux")]
+            request_lsm,
             #[cfg(any(
                 target_os = "freebsd",
                 target_os = "netbsd",
@@ -1112,6 +1126,11 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     drop(fanotify_state);
+    // L04: dropping `lsm_state` detaches the BPF program (via
+    // `EbpfLoader::Drop`) and joins the reader thread (via
+    // `LsmReader::Drop`). No explicit shutdown call needed.
+    #[cfg(target_os = "linux")]
+    drop(lsm_state);
 
     // S24.B — wind down the BSD capture pump. Best-effort; the JoinHandle
     // was dropped at spawn time so we can't wait on it, but Drop on
@@ -1143,6 +1162,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 fn request_loop(
     conn: Arc<ipc::Conn>,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
+    #[cfg(target_os = "linux")] lsm_state: Option<LsmDispatch>,
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
