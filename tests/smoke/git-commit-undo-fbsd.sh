@@ -170,40 +170,30 @@ if [ "${POST_UNDO_HEAD}" != "${PRIOR_HEAD}" ]; then
 fi
 smoke_log "HEAD restored: ${POST_UNDO_HEAD} == ${PRIOR_HEAD}"
 
-# Assertion 2: README.md content restored byte-identical.
+# Assertion 2: README.md working tree byte-equal to its STAGED form.
+# `git commit` doesn't write to README.md — it only reads it and
+# writes objects/refs under .git/. So undoing the commit must leave
+# README.md unchanged from its pre-commit (already-staged) state.
 POST_UNDO_README_SHA="$(/sbin/sha256 -q "${REPO}/README.md")"
-if [ "${POST_UNDO_README_SHA}" != "${PRIOR_README_SHA}" ]; then
-    smoke_log "README.md sha256 mismatch: expected=${PRIOR_README_SHA} got=${POST_UNDO_README_SHA}"
+if [ "${POST_UNDO_README_SHA}" != "${STAGED_SHA}" ]; then
+    smoke_log "README.md sha256 mismatch: expected=${STAGED_SHA} got=${POST_UNDO_README_SHA}"
     smoke_log "README.md content (current):"
     sed 's/^/    /' "${REPO}/README.md" >&2 || true
-    smoke_fail "working tree not restored — README.md content differs from pre-commit"
+    smoke_fail "working tree perturbed — README.md content changed by undo (it shouldn't have)"
 fi
-smoke_log "working tree restored: README.md sha256 matches"
+smoke_log "working tree intact: README.md sha256 == staged content"
 
-# Assertion 3: `git status --porcelain` shows the working tree
-# matches the index AND the index matches HEAD. After undo, we
-# expect: README.md is "modified but not staged" (pre-commit had
-# staged changes, but the FILE on disk == staged content was
-# part of the workload — restore reverts the file too). So the
-# tree is clean, no staged or unstaged changes.
-#
-# Actually subtle: the smoke staged the modification BEFORE
-# PreExec. So the pre-commit working tree had a STAGED change.
-# After commit, .git/index points to the new tree. After undo,
-# .git/index should point to the old tree (no staged changes),
-# AND the working tree should show README.md modified.
-#
-# Wait — the smoke restores README.md byte-identical to its
-# "initial content" form. That's the anchor-commit form, NOT the
-# staged-pre-commit form. So post-undo, README.md == HEAD content
-# → clean tree.
+# Assertion 3: `git status --porcelain` shows the staged change is
+# back (README.md staged but not yet committed). Pre-commit state
+# was: README.md modified+staged, HEAD at anchor. Post-undo should
+# match that exactly.
 STATUS="$(git_invoke -C "${REPO}" status --porcelain || true)"
-if [ -n "${STATUS}" ]; then
-    smoke_log "git status not clean:"
-    echo "${STATUS}" | sed 's/^/    /' >&2
-    smoke_fail "post-undo git status is not clean (working tree + index out of sync with HEAD)"
+EXPECTED_STATUS="M  README.md"
+if [ "${STATUS}" != "${EXPECTED_STATUS}" ]; then
+    smoke_log "git status mismatch: expected='${EXPECTED_STATUS}' got='${STATUS}'"
+    smoke_fail "post-undo git status doesn't match pre-commit staged state"
 fi
-smoke_log "git status: clean"
+smoke_log "git status: ${STATUS} (matches pre-commit staged state)"
 
 smoke_log "session close"
 "${SHIT_BIN}" hook-send session-close \
