@@ -932,28 +932,25 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
-    // B05 Phase C (deferred) — Capsicum default-on is gated behind a
-    // remaining wire-format change. The dir-fd-relative walker
-    // (Phase A) + slash_fd bootstrap (Phase B) + sysctl cwd resolver
-    // (Phase B.4) are all in place, but resolve_pid_cwd under
-    // cap_enter currently fails: KERN_PROC_CWD lacks CTLFLAG_CAPRD in
-    // the FreeBSD 14 kernel (the sprint file's assumption that it's
-    // capsicum-whitelisted was wrong). Fix path: extend HelperRequest::
-    // WatchTree to carry the cwd path from daemon (which already
-    // receives it from the shell hook) so the helper doesn't have to
-    // resolve cross-pid sysctl under cap_enter. Until that lands,
-    // keep cap_enter as SHIT_CAPSICUM=1 opt-in.
+    // B05 Phase C — Capsicum capability mode default-on. Opt out via
+    // `SHIT_CAPSICUM=0`. Requires slash_fd (pre-cap_enter `/` open)
+    // for runtime watch-root opens, and WatchTree.cwd_path (B05.10)
+    // to avoid cross-pid sysctl(KERN_PROC_CWD) which isn't capsicum-
+    // whitelisted in FreeBSD 14.
     #[cfg(target_os = "freebsd")]
-    if std::env::var("SHIT_CAPSICUM").as_deref() == Ok("1") {
-        if slash_fd.is_some() {
+    {
+        let opt_out = std::env::var("SHIT_CAPSICUM").as_deref() == Ok("0");
+        if !opt_out && slash_fd.is_some() {
             match capsicum_bsd::enter_capability_mode() {
                 Ok(()) => {
-                    tracing::info!("entered Capsicum capability mode (SHIT_CAPSICUM=1)");
+                    tracing::info!("entered Capsicum capability mode (default-on)");
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
                 }
             }
+        } else if opt_out {
+            tracing::info!("SHIT_CAPSICUM=0 — Capsicum capability mode disabled");
         } else {
             tracing::warn!("slash_fd unavailable — skipping cap_enter to avoid bricking the helper");
         }
@@ -1074,6 +1071,7 @@ fn request_loop(
                 session,
                 command_seq,
                 shell_kind: _,
+                cwd_path,
             } => {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
@@ -1145,11 +1143,12 @@ fn request_loop(
                     target_os = "dragonfly",
                 ))]
                 if let Some(ctrl) = &bsd_capture {
-                    ctrl.on_watch_tree(session, command_seq, root_pid);
+                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
                     tracing::info!(
                         %session,
                         command_seq,
                         root_pid,
+                        cwd_path = %cwd_path,
                         "watch_tree dispatched to bsd capture"
                     );
                 } else {
@@ -1167,7 +1166,13 @@ fn request_loop(
                     target_os = "dragonfly",
                 )))]
                 {
-                    let _ = (root_pid, session, command_seq);
+                    let _ = (root_pid, session, command_seq, &cwd_path);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // L01 fanotify path uses /proc/<pid>/cwd readlink;
+                    // cwd_path is BSD-only at the helper layer today.
+                    let _ = &cwd_path;
                 }
             }
             HelperRequest::UnwatchTree {

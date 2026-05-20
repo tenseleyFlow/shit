@@ -130,6 +130,7 @@ pub fn run(kind: HookSendKind) -> Result<()> {
             sock,
         } => {
             let (cwd_dev, cwd_inode) = stat_cwd(&cwd).unwrap_or((0, 0));
+            let cwd_path = cwd.to_string_lossy().into_owned();
             (
                 HookMessage::PreExec {
                     session,
@@ -137,6 +138,7 @@ pub fn run(kind: HookSendKind) -> Result<()> {
                     pid,
                     cwd_inode,
                     cwd_dev,
+                    cwd_path,
                     ts_unix_nanos: ts_now(),
                     shell_kind: shell,
                     depth,

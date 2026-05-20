@@ -126,6 +126,10 @@ struct PumpState {
     watches: BTreeMap<CommandId, WatchState>,
     fd_to_command: HashMap<RawFd, CommandId>,
     staging_dir: PathBuf,
+    /// B05 Phase C: pre-cap_enter `O_DIRECTORY` open of `staging_dir`.
+    /// `write_to_staging` uses `openat(staging_dir_fd, name, ...)`
+    /// instead of absolute opens so it works under capability mode.
+    staging_dir_fd: Arc<OwnedFd>,
     conn: Arc<Conn>,
     /// S29.2 — kept here so `handle_dir_change` can register fresh
     /// kqueue watches via `TrackedSubtree::add_path` when a new entry
@@ -142,6 +146,7 @@ struct PumpState {
 impl PumpState {
     fn new(
         staging_dir: PathBuf,
+        staging_dir_fd: Arc<OwnedFd>,
         conn: Arc<Conn>,
         kq: Arc<KqueueFd>,
         slash_fd: Option<Arc<OwnedFd>>,
@@ -150,6 +155,7 @@ impl PumpState {
             watches: BTreeMap::new(),
             fd_to_command: HashMap::new(),
             staging_dir,
+            staging_dir_fd,
             conn,
             kq,
             slash_fd,
@@ -200,7 +206,7 @@ impl PumpState {
             let Some(dir_path) = subtree.path_for_fd(raw).map(|p| p.to_path_buf()) else {
                 continue;
             };
-            let entries = read_dir_entries(&dir_path).unwrap_or_default();
+            let entries = read_dir_entries(raw).unwrap_or_default();
             dir_baselines.insert(
                 raw,
                 DirBaseline {
@@ -335,7 +341,7 @@ impl PumpState {
         };
         // Stage the bytes into a temp file under staging_dir, then
         // attach the fd via SCM_RIGHTS.
-        let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
+        let staging_fd = match write_to_staging(self.staging_dir_fd.as_raw_fd(), &bytes) {
             Ok(fd) => fd,
             Err(e) => {
                 tracing::warn!(error = %e, "staging write failed; skipping capture");
@@ -416,7 +422,7 @@ impl PumpState {
             return;
         };
         let dir_path = baseline.path.clone();
-        let current = match read_dir_entries(&dir_path) {
+        let current = match read_dir_entries(fd) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(fd, error = %e, "read_dir_entries failed");
@@ -684,8 +690,12 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
     })
 }
 
-fn write_to_staging(dir: &Path, bytes: &[u8]) -> std::io::Result<OwnedFd> {
-    use std::io::Write;
+/// B05 Phase C: write `bytes` to a freshly-named file inside the
+/// staging directory, then return a read-only fd for the SCM_RIGHTS
+/// send. Uses `openat(staging_dir_fd, name, ...)` (works under
+/// cap_enter) rather than absolute `OpenOptions::open(path)`. The
+/// caller passes the pre-cap_enter-opened staging dir fd.
+fn write_to_staging(staging_dir_fd: RawFd, bytes: &[u8]) -> std::io::Result<OwnedFd> {
     let name = format!(
         "{}-{}",
         std::process::id(),
@@ -694,20 +704,48 @@ fn write_to_staging(dir: &Path, bytes: &[u8]) -> std::io::Result<OwnedFd> {
             .map(|d| d.as_nanos())
             .unwrap_or(0),
     );
-    let path = dir.join(&name);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "staging name NUL"))?;
+
+    // Open writeable, create+excl. Mode 0o600 — only this uid can
+    // read pre-image content.
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // SAFETY: staging_dir_fd alive per caller; name_c is NUL-terminated.
+    let wfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), flags, 0o600) };
+    if wfd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    // Reopen read-only for the SCM_RIGHTS send; the file lives on
-    // disk until the daemon ingests + unlinks.
-    let f = std::fs::OpenOptions::new().read(true).open(&path)?;
-    // SAFETY: we just opened f; consume it into an OwnedFd.
-    Ok(f.into())
+    // Write payload. We close wfd before reopening read-only.
+    let to_write = bytes.len();
+    let mut written = 0usize;
+    while written < to_write {
+        let rc = unsafe {
+            libc::write(
+                wfd,
+                bytes.as_ptr().add(written) as *const _,
+                (to_write - written) as libc::size_t,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(wfd) };
+            return Err(err);
+        }
+        written += rc as usize;
+    }
+    // fsync so the daemon sees a fully-on-disk file when it ingests.
+    unsafe { libc::fsync(wfd) };
+    unsafe { libc::close(wfd) };
+
+    // Reopen read-only for the SCM_RIGHTS send.
+    let rflags = libc::O_RDONLY | libc::O_CLOEXEC;
+    let rfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), rflags, 0) };
+    if rfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: rfd is a fresh kernel-allocated fd we now own.
+    use std::os::fd::FromRawFd;
+    Ok(unsafe { OwnedFd::from_raw_fd(rfd) })
 }
 
 fn blake3_of(bytes: &[u8]) -> [u8; 32] {
@@ -720,20 +758,66 @@ fn path_to_string(p: &Path) -> String {
     String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
 }
 
-/// Read a directory's immediate child entries, returning a map of
-/// `name → (dev, inode)`. Symlinks are recorded as their own inode
-/// (not the link target's). Errors are swallowed — partial baselines
-/// are preferred to no baseline.
-fn read_dir_entries(dir: &Path) -> std::io::Result<BTreeMap<std::ffi::OsString, (u64, u64)>> {
-    use std::os::unix::fs::MetadataExt;
+/// Read a directory's immediate child entries via a tracked dir fd,
+/// returning `name → (dev, inode)`. Symlinks recorded as their own
+/// inode (not the link target's). Errors swallowed.
+///
+/// B05 Phase C: uses fdopendir + fstatat against `dir_fd` rather
+/// than absolute-path `std::fs::read_dir`, so it works under
+/// `cap_enter(2)`. The caller already holds `dir_fd` as a tracked
+/// kqueue watch fd (we dup before fdopendir to avoid losing the
+/// original reference).
+fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsString, (u64, u64)>> {
     let mut out = BTreeMap::new();
-    for entry in std::fs::read_dir(dir)?.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        // symlink_metadata would be more correct for symlinks, but
-        // entry.metadata() already does the right thing — std uses
-        // lstat for `read_dir` entries on Unix.
-        out.insert(entry.file_name(), (meta.dev(), meta.ino()));
+    // SAFETY: dir_fd is alive (caller holds the OwnedFd in
+    // TrackedSubtree). dup returns a fresh fd we own; fdopendir
+    // takes it under DIR* control.
+    let dup_fd = unsafe { libc::dup(dir_fd) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    let dir = unsafe { libc::fdopendir(dup_fd) };
+    if dir.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        return Err(err);
+    }
+    loop {
+        let entry_ptr = unsafe { libc::readdir(dir) };
+        if entry_ptr.is_null() {
+            break;
+        }
+        let entry = unsafe { &*entry_ptr };
+        let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
+        let name_bytes = unsafe {
+            std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len)
+        };
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        // fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW) to get dev+inode
+        // without following symlinks. NOFOLLOW matches the
+        // symlink_metadata semantics the absolute-path version had.
+        let name_c = match std::ffi::CString::new(name_bytes) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd,
+                name_c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            continue;
+        }
+        let name_os = std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name_bytes));
+        out.insert(name_os, (st.st_dev as u64, st.st_ino));
+    }
+    unsafe { libc::closedir(dir) };
     Ok(out)
 }
 
@@ -767,17 +851,26 @@ pub struct CaptureControl {
 }
 
 impl CaptureControl {
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32) {
-        let path = match super::cwd::resolve_pid_cwd(root_pid) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    %session,
-                    command_seq,
-                    root_pid,
-                    "could not resolve root_pid cwd; watch dropped",
-                );
-                return;
+    /// B05.10: caller provides `cwd_path` directly (forwarded from the
+    /// shell hook via WatchTree). Empty string falls back to the
+    /// legacy sysctl(KERN_PROC_CWD) resolver for the helper's-own-pid
+    /// path; cross-pid resolves are blocked under cap_enter so that
+    /// path effectively requires `cwd_path` to be non-empty.
+    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32, cwd_path: &str) {
+        let path = if !cwd_path.is_empty() {
+            PathBuf::from(cwd_path)
+        } else {
+            match super::cwd::resolve_pid_cwd(root_pid) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        "could not resolve root_pid cwd and no cwd_path provided; watch dropped",
+                    );
+                    return;
+                }
             }
         };
         let _ = self.tx.try_send(ControlMsg::Attach {
@@ -813,6 +906,23 @@ pub fn spawn(
     slash_fd: Option<Arc<OwnedFd>>,
 ) -> std::io::Result<(CaptureControl, JoinHandle<()>)> {
     std::fs::create_dir_all(&staging_dir)?;
+    // B05 Phase C: pre-open the staging dir as O_DIRECTORY so
+    // write_to_staging can use openat under cap_enter.
+    let staging_dir_fd = {
+        use std::os::fd::FromRawFd;
+        let cpath = std::ffi::CString::new(staging_dir.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "staging path NUL"))?;
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
+    };
     // Single shared kqueue: the drain thread reads events, the pump
     // thread calls `register_subtree` to add new fd watches. Both
     // operations on the same fd are thread-safe at the kernel level.
@@ -821,7 +931,17 @@ pub fn spawn(
     let (ctrl_tx, ctrl_rx) = sync_channel::<ControlMsg>(64);
     let handle = std::thread::Builder::new()
         .name("shit-bsd-capture-pump".to_string())
-        .spawn(move || pump(kq, drain_session, conn, staging_dir, ctrl_rx, slash_fd))?;
+        .spawn(move || {
+            pump(
+                kq,
+                drain_session,
+                conn,
+                staging_dir,
+                staging_dir_fd,
+                ctrl_rx,
+                slash_fd,
+            )
+        })?;
     Ok((CaptureControl { tx: ctrl_tx }, handle))
 }
 
@@ -830,10 +950,11 @@ fn pump(
     drain_session: DrainSession,
     conn: Arc<Conn>,
     staging_dir: PathBuf,
+    staging_dir_fd: Arc<OwnedFd>,
     ctrl_rx: Receiver<ControlMsg>,
     slash_fd: Option<Arc<OwnedFd>>,
 ) {
-    let mut state = PumpState::new(staging_dir, conn, Arc::clone(&kq), slash_fd);
+    let mut state = PumpState::new(staging_dir, staging_dir_fd, conn, Arc::clone(&kq), slash_fd);
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
@@ -896,7 +1017,20 @@ mod tests {
         use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"staging-round-trip";
-        let fd = write_to_staging(dir.path(), bytes).unwrap();
+        // Open the staging dir as O_DIRECTORY for the new openat-based API.
+        let staging_fd = {
+            use std::os::fd::FromRawFd;
+            let cpath = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(raw >= 0);
+            unsafe { OwnedFd::from_raw_fd(raw) }
+        };
+        let fd = write_to_staging(staging_fd.as_raw_fd(), bytes).unwrap();
         let mut f = std::fs::File::from(fd);
         let mut out = Vec::new();
         f.read_to_end(&mut out).unwrap();
@@ -958,7 +1092,22 @@ mod tests {
         let (conn_a, _conn_b) = crate::ipc::socketpair().expect("socketpair");
         let dir = tempfile::tempdir().unwrap();
         let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
-        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a), kq, None);
+        // Open staging dir for the fd. Test only needs it to exist;
+        // handle_vnode-ghost-fd path doesn't actually write.
+        let staging_fd = {
+            use std::os::fd::FromRawFd;
+            let cpath = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(raw >= 0);
+            Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        let mut state =
+            PumpState::new(dir.path().to_path_buf(), staging_fd, Arc::new(conn_a), kq, None);
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,

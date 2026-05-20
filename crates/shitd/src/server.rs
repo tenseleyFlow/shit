@@ -160,6 +160,7 @@ fn handle(
             pid,
             cwd_inode,
             cwd_dev,
+            cwd_path,
             shell_kind,
             ..
         } => {
@@ -170,6 +171,7 @@ fn handle(
                 pid,
                 cwd_dev,
                 cwd_inode,
+                cwd_path = cwd_path.as_str(),
                 shell = shell_kind.as_str(),
                 "pre-exec"
             );
@@ -183,7 +185,7 @@ fn handle(
             let cmd = CommandRecord {
                 command,
                 cmd_string: None,
-                cwd: PathBuf::from("/"),
+                cwd: PathBuf::from(cwd_path),
                 pid: *pid,
                 shell_kind: *shell_kind,
                 started_at: ts,
@@ -197,6 +199,8 @@ fn handle(
             // S24.C: tell the privileged helper to start watching the
             // command's process tree. The kqueue producer (FreeBSD)
             // and the fanotify producer (Linux) both consume this.
+            // B05.10: forward cwd_path so the helper doesn't need
+            // cross-pid sysctl(KERN_PROC_CWD) (blocked under cap_enter).
             if let Some(link) = helper_link {
                 let req = shit_proto::HelperRequest::WatchTree {
                     root_pid: *pid,
@@ -204,6 +208,7 @@ fn handle(
                     session: command.session,
                     command_seq: command.seq,
                     shell_kind: *shell_kind,
+                    cwd_path: cwd_path.clone(),
                 };
                 if let Err(e) = link.send_request(&req) {
                     warn!(err = %e, "WatchTree dispatch to helper failed");
