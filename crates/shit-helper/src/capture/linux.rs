@@ -44,6 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -248,6 +249,166 @@ impl LinuxCaptureRuntime {
             "CapturedPreImage sent",
         );
     }
+
+    /// L04 — handler for `lsm/inode_unlink` events delivered by the
+    /// eBPF ringbuf reader. Unlike the fanotify producer, the LSM
+    /// hook does NOT hand us a kernel-provided fd. We have:
+    ///
+    ///   * `(dev, inode)` of the about-to-be-unlinked file,
+    ///   * `parent_inode` of its containing directory,
+    ///   * the basename (NAME_MAX bytes max),
+    ///   * the pid that issued the unlink.
+    ///
+    /// Race protocol: open `/proc/<pid>/cwd/<basename>` with O_RDONLY,
+    /// fstat to verify (dev, inode) matches what BPF told us — defends
+    /// against the cwd-moved-since-LSM-fire case. If win:
+    ///
+    ///   * Read pre-image bytes, blake3, write to staging, send
+    ///     CapturedPreImage with the staging fd — same as fanotify.
+    ///
+    /// If loss (open returned ENOENT, or fstat (dev, inode) mismatch):
+    ///
+    ///   * Send a marker CapturedPreImage with `stored_bytes = 0` and
+    ///     `fd_sent_via_scm = false`. The daemon journals the unlink
+    ///     and looks for a prior pre-image blob for the same
+    ///     (dev, inode) to use as the restoration source.
+    ///
+    /// Dedupe: this method bypasses the dedupe map's "already
+    /// captured" gate (Delete events always emit) so the daemon sees
+    /// the unlink. After emission the dedupe entry is marked
+    /// `invalidated=true` so a subsequent reuse of the inode (e.g.
+    /// rm-then-recreate) re-captures.
+    pub fn handle_lsm_unlink(&mut self, ev: &LsmUnlinkView<'_>) {
+        let ws = self.watches.entry(ev.command).or_default();
+
+        // Construct the race candidate. `/proc/<pid>/cwd` is a symlink
+        // managed by the kernel — for a live pid it resolves to the
+        // current cwd. The basename is the unlink target as the
+        // kernel saw it in the dentry. For `cd /tmp && rm foo.txt`,
+        // this resolves to `/tmp/foo.txt` deterministically.
+        let candidate_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
+
+        // Race window: between this open() and vfs_unlink completing
+        // its d_drop. The LSM hook fires synchronously before the
+        // unlink proceeds, but it returns 0 immediately, so by the
+        // time we get here the kernel may already be a few µs into
+        // vfs_unlink's teardown. Win rate on idle systems: high.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate_path);
+
+        let (race_fd, race_dev, race_inode, file_type) = match opened {
+            Ok(f) => {
+                let fd = f.as_raw_fd();
+                match fstat_dev_inode_kind(fd) {
+                    Some((d, i, k)) => (Some(f), d, i, k),
+                    None => (Some(f), 0, 0, FileType::Other),
+                }
+            }
+            Err(_) => (None, 0, 0, FileType::Other),
+        };
+
+        // Validate the race-win matches what BPF told us. Tight
+        // sanity-check — protects against:
+        //   - cwd moved between LSM fire and userspace race
+        //   - basename reused by a different inode in the same dir
+        //     between LSM fire and our open
+        //   - O_NOFOLLOW caught a symlink (file_type != Regular)
+        let race_won =
+            race_fd.is_some() && race_dev == ev.dev && race_inode == ev.inode
+                && file_type == FileType::Regular;
+
+        let (stored_bytes, blob_hash, staging_fd, meta_wire) = if race_won {
+            let fd = race_fd.as_ref().unwrap().as_raw_fd();
+            match (read_pre_image(fd), fstat_meta(fd)) {
+                (Ok(bytes), Some(meta)) => {
+                    let hash = blake3_of(&bytes);
+                    match write_to_staging(&self.staging_dir, &bytes) {
+                        Ok(staging) => (bytes.len() as u64, hash, Some(staging), Some(meta)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "lsm staging write failed");
+                            (0, [0u8; 32], None, None)
+                        }
+                    }
+                }
+                (Err(e), _) => {
+                    tracing::warn!(error = %e, "lsm pre-image read failed");
+                    (0, [0u8; 32], None, None)
+                }
+                (Ok(_), None) => (0, [0u8; 32], None, None),
+            }
+        } else {
+            tracing::info!(
+                pid = ev.pid,
+                dev = ev.dev,
+                inode = ev.inode,
+                basename = ev.basename,
+                "lsm unlink race lost — marker-only CapturedPreImage"
+            );
+            (0, [0u8; 32], None, None)
+        };
+
+        // Build wire. If we lost the race, `meta_wire` is None — set
+        // mode/uid/gid/mtime to 0; the daemon's Delete-restore path
+        // does not rely on these for marker-only events.
+        let resp = HelperResponse::CapturedPreImage {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            dev: ev.dev,
+            inode: ev.inode,
+            path: Some(candidate_path.clone()),
+            blob_hash,
+            stored_bytes,
+            post_content_hash: None,
+            mode: meta_wire.map(|m| m.mode).unwrap_or(0),
+            uid: meta_wire.map(|m| m.uid).unwrap_or(0),
+            gid: meta_wire.map(|m| m.gid).unwrap_or(0),
+            mtime_unix_nanos: meta_wire.map(|m| m.mtime_unix_nanos).unwrap_or(0),
+            is_delete: true,
+            fd_sent_via_scm: staging_fd.is_some(),
+        };
+
+        let send_result = if let Some(ref fd) = staging_fd {
+            self.conn.send_response_with_fd(&resp, fd.as_raw_fd())
+        } else {
+            self.conn.send_response(&resp)
+        };
+        if let Err(e) = send_result {
+            tracing::warn!(error = %e, "lsm send_response failed");
+        }
+
+        // Mark dedupe invalidated regardless of race outcome — the
+        // unlink happened, so any subsequent reuse of (dev, inode)
+        // should re-capture.
+        ws.dedupe
+            .insert((ev.dev, ev.inode), DedupeEntry { invalidated: true });
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev = ev.dev,
+            inode = ev.inode,
+            race_won,
+            stored_bytes,
+            basename = ev.basename,
+            "lsm-unlink CapturedPreImage sent",
+        );
+    }
+}
+
+/// View into an `lsm/inode_unlink` event as the BPF ringbuf reader
+/// sees it. Borrows the basename from the decoded record; the
+/// reader thread holds the storage for the duration of the dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmUnlinkView<'a> {
+    pub command: CommandId,
+    pub pid: u32,
+    pub dev: u64,
+    pub inode: u64,
+    pub parent_inode: u64,
+    pub basename: &'a str,
 }
 
 /// Decide whether the producer should emit a pre-image capture for
