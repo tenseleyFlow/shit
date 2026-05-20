@@ -138,6 +138,41 @@ pub trait LsmEventSink: Send + Sync + 'static {
     fn on_unlink(&self, ev: &UnlinkEvent);
 }
 
+/// Production sink — bridges decoded BPF events into the
+/// [`crate::capture::linux::LinuxCaptureRuntime`]. Resolves the
+/// event's `pid` to a tracked [`shit_planner::events::CommandId`] via
+/// the shared `TreeMap` (same one fanotify uses), then dispatches to
+/// `handle_lsm_unlink`.
+///
+/// Untracked pids are silently dropped — same policy as fanotify's
+/// per-event ALLOW-without-capture path.
+#[cfg(target_os = "linux")]
+pub struct LinuxCaptureSink {
+    pub runtime: std::sync::Arc<std::sync::Mutex<crate::capture::linux::LinuxCaptureRuntime>>,
+    pub tree: std::sync::Arc<std::sync::Mutex<crate::fanotify::tree::TreeMap>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LsmEventSink for LinuxCaptureSink {
+    fn on_unlink(&self, ev: &UnlinkEvent) {
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+            tracing::trace!(pid, "untracked pid; dropping lsm unlink event");
+            return;
+        };
+        let basename_cow = ev.basename_str();
+        let view = crate::capture::linux::LsmUnlinkView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            parent_inode: ev.parent_inode,
+            basename: &basename_cow,
+        };
+        self.runtime.lock().unwrap().handle_lsm_unlink(&view);
+    }
+}
+
 /// Stub sink — logs each event at info-level. Useful for the manual
 /// smoke (step 4 of the sprint implementation order: "load the
 /// program, `rm` a file, see the log line").
