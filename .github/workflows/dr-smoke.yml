@@ -359,16 +359,20 @@ jobs:
               # its PASS line BEFORE arming the safety-net. So we
               # treat 137 + "PASS:" in stdout as success.
               passlog="$(mktemp /tmp/smoke-out.XXXXXX)"
-              # No `| tee` here — the action's driver shell on the VM
-              # is sh, which doesn't have $PIPESTATUS. Write smoke
-              # output to a file, capture rc directly, then cat the
-              # file for log visibility.
+              rc_file="$(mktemp /tmp/smoke-rc.XXXXXX)"
+              # Sh-portable live output + rc capture: subshell writes
+              # rc to a sidecar file; outer pipe streams to tee for
+              # live visibility. The subshell's own exit code (from
+              # `echo`) is always 0, which we discard.
               set +e
-              /usr/bin/timeout --signal=TERM --kill-after=10 300 \
-                bash "tests/smoke/$smoke" > "$passlog" 2>&1
-              rc=$?
+              (
+                /usr/bin/timeout --signal=TERM --kill-after=10 300 \
+                  bash "tests/smoke/$smoke"
+                echo $? > "$rc_file"
+              ) 2>&1 | tee "$passlog"
               set -e
-              cat "$passlog"
+              rc=$(cat "$rc_file" 2>/dev/null || echo 1)
+              rm -f "$rc_file"
               case "$rc" in
                 0)    echo "  PASS: $smoke" ;;
                 124)  echo "  FAIL: $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
