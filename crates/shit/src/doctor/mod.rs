@@ -268,7 +268,7 @@ fn render_table(rows: &[Row], report: &DoctorReport) {
         target_os = "openbsd",
         target_os = "dragonfly",
     ))]
-    if let Some(bsd) = _report.bsd.as_ref() {
+    if let Some(bsd) = report.bsd.as_ref() {
         print_bsd_tier(bsd);
     }
     print_mount_table(rows);
