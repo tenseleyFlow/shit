@@ -75,23 +75,21 @@ if [ "${PRE_ACTIVE}" != "running" ]; then
     sleep 1
 fi
 
-cleanup() {
-    local rc=$?
-    smoke_stop_shitd 2>/dev/null || true
+restore_cron_if_needed() {
     # Defensive restore — only when undo failed to restart cron.
+    # Called explicitly at end of script body (NOT via trap) to
+    # avoid the bash post-trap exit hang we observed on the
+    # cross-platform-actions FreeBSD VM. Crash-path cleanup falls
+    # back to lib.sh's smoke_cleanup, which already calls
+    # smoke_stop_shitd and exits cleanly on the same VM (it doesn't
+    # override the EXIT trap so it doesn't trigger the hang).
     if ! pgrep -q "${TARGET_UNIT}"; then
         ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start </dev/null >/dev/null 2>&1 || true
     fi
-    # Explicit `exit` is load-bearing under the cross-platform-actions
-    # FreeBSD VM. Without it, bash's post-trap shutdown hangs for the
-    # full `timeout 300` window even though every child is already
-    # reaped. Diagnostic instrumentation in an earlier B04 iteration
-    # confirmed the cleanup body completes in ~5s and the hang is
-    # purely bash's exit sequence. Forcing exit here bypasses
-    # whatever bash-internal cleanup step is slow on that VM.
-    exit "${rc}"
 }
-trap cleanup EXIT
+# Intentionally NO `trap` here — lib.sh's default smoke_cleanup
+# handles crash paths. Happy path runs restore_cron_if_needed +
+# smoke_stop_shitd explicitly at the end of the script body.
 
 smoke_start_shitd
 
@@ -161,3 +159,10 @@ smoke_log "session close"
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
+
+# Happy-path cleanup runs explicitly here (no trap). See the
+# `restore_cron_if_needed` definition above for why we avoid the
+# trap path on this smoke.
+restore_cron_if_needed
+smoke_stop_shitd
+exit 0
