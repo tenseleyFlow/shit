@@ -169,12 +169,11 @@ fn main() {
     while Instant::now() < deadline {
         while let Some(rec) = ring.next() {
             events_seen += 1;
-            // The first event we'd love to verify, but we don't have
-            // the userspace decode yet (Task #80). Confirm only that
-            // the record is the size of struct shit_unlink_event
-            // (header + dev + inode = 32 + 16 = 48 bytes).
+            // shit_unlink_event = header (40B) + dev (8B) + inode (8B) = 56 B.
+            // ringbuf records are 8-byte aligned with no userspace
+            // padding (we wrote 56 B, we get 56 B back).
             if events_seen == 1 {
-                println!("[lsm-smoke] first event size = {} bytes", rec.len());
+                println!("[lsm-smoke] first event size = {} bytes (expect 56)", rec.len());
             }
         }
         heartbeat.store(now_ms(), Ordering::Release);
