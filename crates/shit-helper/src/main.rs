@@ -1143,14 +1143,14 @@ fn request_loop(
                     {
                         g.on_unwatch_tree(cmd);
                     }
-                    if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd) {
-                        if let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path) {
-                            tracing::warn!(
-                                err = %e,
-                                path = %path.display(),
-                                "unmark_dir_for_capture failed (continuing)"
-                            );
-                        }
+                    if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd)
+                        && let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path)
+                    {
+                        tracing::warn!(
+                            err = %e,
+                            path = %path.display(),
+                            "unmark_dir_for_capture failed (continuing)"
+                        );
                     }
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 }

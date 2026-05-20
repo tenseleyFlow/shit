@@ -93,10 +93,10 @@ mod linux {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if let Some(p) = pgrp_from_stat(&stat) {
-                if p == pgid {
-                    out.push(pid);
-                }
+            if let Some(p) = pgrp_from_stat(&stat)
+                && p == pgid
+            {
+                out.push(pid);
             }
         }
         Some(out)
@@ -131,10 +131,10 @@ mod linux {
             if !comm.contains(pattern) && !cmdline_str.contains(pattern) {
                 continue;
             }
-            if let Some(uid) = user_filter {
-                if uid_from_status(pid) != Some(uid) {
-                    continue;
-                }
+            if let Some(uid) = user_filter
+                && uid_from_status(pid) != Some(uid)
+            {
+                continue;
             }
             if let Some(g) = group_filter {
                 let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
