@@ -29,10 +29,10 @@ TARGET="${1:-}"
 
 # Discover the unwrapped clang. Pinning to a specific store path
 # isn't portable across nix-store reflows; resolve at runtime.
-UNWRAPPED_CLANG="$(find /nix/store -maxdepth 4 -path '*clang-21*/bin/clang' -type f 2>/dev/null | head -1)"
+UNWRAPPED_CLANG="$(find /nix/store -maxdepth 4 -path '*clang-21*/bin/clang' 2>/dev/null | head -1)"
 if [ -z "${UNWRAPPED_CLANG}" ]; then
     # Fallback: any major-version unwrapped clang.
-    UNWRAPPED_CLANG="$(find /nix/store -maxdepth 4 -path '*clang-2*/bin/clang' -type f 2>/dev/null | head -1)"
+    UNWRAPPED_CLANG="$(find /nix/store -maxdepth 4 -path '*clang-2*/bin/clang' 2>/dev/null | head -1)"
 fi
 if [ -z "${UNWRAPPED_CLANG}" ]; then
     echo "build-bpf: no clang-unwrapped found in /nix/store" >&2
