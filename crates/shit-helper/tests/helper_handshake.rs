@@ -26,9 +26,18 @@ use shit_proto::{
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 
-#[cfg(target_os = "linux")]
+// W01.B.fix-framing: match shit-helper/src/ipc.rs and
+// shitd/src/helper_link.rs — SEQPACKET on every supported platform
+// except macOS.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
 const HELPER_SOCK_TYPE: SockType = SockType::SeqPacket;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const HELPER_SOCK_TYPE: SockType = SockType::Stream;
 
 #[test]
