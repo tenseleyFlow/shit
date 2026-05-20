@@ -405,9 +405,8 @@ fn unlink_inner(path: &Path) -> Result<(), String> {
     if meta.file_type().is_dir() {
         match fs::remove_dir(path) {
             Ok(()) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY as i32) => {
-                fs::remove_dir_all(path)
-                    .map_err(|e2| format!("rmdir-recursive {path:?}: {e2}"))
+            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {
+                fs::remove_dir_all(path).map_err(|e2| format!("rmdir-recursive {path:?}: {e2}"))
             }
             Err(e) => Err(format!("rmdir {path:?}: {e}")),
         }

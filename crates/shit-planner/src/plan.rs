@@ -70,8 +70,7 @@ pub fn plan(
     //      within one command; the captured FilePreImage is of an
     //      already-gone file). No user-meaningful change to undo.
     //      Skip all three inverses entirely.
-    let (atomic_replace_paths, transient_paths) =
-        classify_replace_paths(&live, probe);
+    let (atomic_replace_paths, transient_paths) = classify_replace_paths(&live, probe);
 
     for ev in &live {
         // W01.B.fix-rename-coalescing: skip the entire event if the
@@ -286,9 +285,7 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => {
-            emit_for_tree_op(op, probe, atomic_replace_paths, nodes)
-        }
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, atomic_replace_paths, nodes),
         CaptureEventKind::EnvDiff {
             added,
             removed,
@@ -1058,16 +1055,31 @@ mod tests {
 
         // Expect ONLY RestoreContent + RestoreMetadata (from FilePreImage).
         // NO Unlink (from Create) and NO RecreatePath (from Unlink).
-        let has_restore_content = p.nodes.iter().any(|n| matches!(n.op, InverseOp::RestoreContent { .. }));
-        let has_restore_metadata = p.nodes.iter().any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. }));
+        let has_restore_content = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::RestoreContent { .. }));
+        let has_restore_metadata = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. }));
         let has_unlink = p.nodes.iter().any(|n| matches!(&n.op, InverseOp::Unlink { path: p } if p == &PathBuf::from("/tmp/atomic-replace")));
         let has_recreate = p.nodes.iter().any(|n| matches!(&n.op, InverseOp::RecreatePath { path: p, .. } if p == &PathBuf::from("/tmp/atomic-replace")));
 
         assert!(has_restore_content, "RestoreContent inverse missing");
         assert!(has_restore_metadata, "RestoreMetadata inverse missing");
-        assert!(!has_unlink, "atomic-replace path should NOT get a Unlink inverse");
-        assert!(!has_recreate, "atomic-replace path should NOT get a RecreatePath inverse");
-        assert!(!p.has_blocking_conflicts(), "plan should not have blocking conflicts");
+        assert!(
+            !has_unlink,
+            "atomic-replace path should NOT get a Unlink inverse"
+        );
+        assert!(
+            !has_recreate,
+            "atomic-replace path should NOT get a RecreatePath inverse"
+        );
+        assert!(
+            !p.has_blocking_conflicts(),
+            "plan should not have blocking conflicts"
+        );
     }
 
     #[test]
@@ -1129,13 +1141,15 @@ mod tests {
         let nodes_for_path: Vec<_> = p
             .nodes
             .iter()
-            .filter(|n| matches!(&n.op,
-                InverseOp::RestoreContent { path: p, .. }
-                | InverseOp::RestoreMetadata { path: p, .. }
-                | InverseOp::Unlink { path: p }
-                | InverseOp::RecreatePath { path: p, .. }
-                if p == &PathBuf::from("/tmp/git/index.lock")
-            ))
+            .filter(|n| {
+                matches!(&n.op,
+                    InverseOp::RestoreContent { path: p, .. }
+                    | InverseOp::RestoreMetadata { path: p, .. }
+                    | InverseOp::Unlink { path: p }
+                    | InverseOp::RecreatePath { path: p, .. }
+                    if p == &PathBuf::from("/tmp/git/index.lock")
+                )
+            })
             .collect();
         assert!(
             nodes_for_path.is_empty(),
@@ -1187,10 +1201,12 @@ mod tests {
         let nodes_for_path: Vec<_> = p
             .nodes
             .iter()
-            .filter(|n| matches!(&n.op,
-                InverseOp::Unlink { path: p } | InverseOp::RecreatePath { path: p, .. }
-                if p == &PathBuf::from("/tmp/git/index.lock")
-            ))
+            .filter(|n| {
+                matches!(&n.op,
+                    InverseOp::Unlink { path: p } | InverseOp::RecreatePath { path: p, .. }
+                    if p == &PathBuf::from("/tmp/git/index.lock")
+                )
+            })
             .collect();
         assert!(
             nodes_for_path.is_empty(),
