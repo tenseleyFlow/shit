@@ -718,4 +718,82 @@ mod tests {
         assert!(rt.watches.contains_key(&cmd));
         assert!(rt.watches.get(&cmd).unwrap().dedupe.is_empty());
     }
+
+    /// L04 — `handle_lsm_unlink` with a real-on-disk file (not yet
+    /// unlinked at call time, simulating the "race won" case where the
+    /// LSM hook fires before vfs_unlink completes). The handler should:
+    ///   * open `/proc/<self>/cwd/<basename>`,
+    ///   * confirm (dev, inode) match what the BPF event reported,
+    ///   * read pre-image bytes,
+    ///   * stage them and try to send the response.
+    /// We can't easily assert the send (no daemon listening), but we
+    /// CAN assert the dedupe map flipped to `invalidated=true` —
+    /// proof the unlink path executed end-to-end.
+    #[test]
+    fn lsm_unlink_race_win_invalidates_dedupe() {
+        let (mut rt, dir, _staging) = fresh_runtime();
+        let cmd = ghost_cmd();
+
+        // Create a real file in the test cwd so /proc/<self>/cwd/<name>
+        // resolves. Use tempdir and chdir for hermetic isolation.
+        let basename = "race-win-probe.txt";
+        let path = dir.path().join(basename);
+        std::fs::write(&path, b"pre-image-contents").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        let (dev, inode, _) = fstat_dev_inode_kind(f.as_raw_fd()).unwrap();
+        drop(f);
+
+        // Change cwd to dir so /proc/<self>/cwd/<basename> resolves
+        // to our probe file. Restore on drop via a guard.
+        struct CwdGuard(PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let _guard = CwdGuard(original);
+
+        let view = LsmUnlinkView {
+            command: cmd,
+            pid: std::process::id(),
+            dev,
+            inode,
+            parent_inode: 0,
+            basename,
+        };
+
+        rt.handle_lsm_unlink(&view);
+
+        let ws = rt.watches.get(&cmd).expect("watch state created");
+        let entry = ws.dedupe.get(&(dev, inode)).expect("dedupe entry exists");
+        assert!(entry.invalidated, "dedupe entry must be invalidated");
+    }
+
+    /// L04 — Race-lost path: pass a basename that doesn't exist under
+    /// /proc/<self>/cwd. Handler should not panic, should mark the
+    /// dedupe entry invalidated all the same, and should still attempt
+    /// to send a marker (which silently fails since no daemon listens
+    /// — that's the warn!() path, not an error to surface).
+    #[test]
+    fn lsm_unlink_race_loss_still_invalidates_dedupe() {
+        let (mut rt, _dir, _staging) = fresh_runtime();
+        let cmd = ghost_cmd();
+
+        let view = LsmUnlinkView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: 0xdead_beef,
+            inode: 0xcafe_babe,
+            parent_inode: 0,
+            basename: "this-file-does-not-exist-anywhere.xyz",
+        };
+
+        rt.handle_lsm_unlink(&view);
+
+        let ws = rt.watches.get(&cmd).expect("watch state created");
+        let entry = ws.dedupe.get(&(0xdead_beef, 0xcafe_babe)).expect("dedupe entry");
+        assert!(entry.invalidated);
+    }
 }
