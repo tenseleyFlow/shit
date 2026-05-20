@@ -317,31 +317,37 @@ jobs:
         run: |
           set +e
           TIER="${{ steps.tier.outputs.tier }}"
-          # LSM-required smokes need the ebpf-lsm tier — fanotify-perm
-          # can't catch unlink/chmod/mkdir/rename. Set SHIT_FORCE_TIER
-          # when the host tier supports it; otherwise these smokes
-          # are reported as SKIP (they hard-fail in the lsm-prereq
-          # check inside the script).
-          if [ "$TIER" = "ebpf-lsm" ]; then
-            export SHIT_FORCE_TIER=ebpf-lsm
-            LSM_SMOKES=(
-              rm-undo-linux.sh
-              chmod-undo-linux.sh
-              mkdir-undo-linux.sh
-              mv-undo-linux.sh
-            )
-          else
-            echo "ebpf-lsm not available on this runner; skipping LSM-only smokes"
-            LSM_SMOKES=()
-          fi
-          # These work on either tier (write-intent open is the
-          # trigger; both fanotify-perm and lsm/file_open catch it).
-          COMMON_SMOKES=(
-            edit-undo-linux.sh
+          # Two smoke groups by tier-dependency:
+          #
+          # - LSM-required: rm/chmod/mkdir/mv/touch-edit. These hard-
+          #   require `bpf` in /sys/kernel/security/lsm and pin
+          #   SHIT_FORCE_TIER=ebpf-lsm internally. They cannot run on
+          #   a kernel whose boot cmdline omits `lsm=...,bpf,...` —
+          #   their own pre-flight rejects loudly with a remediation
+          #   message. Ubuntu 24.04's stock cmdline omits bpf so on
+          #   the GHA hosted runner this group is skipped.
+          #
+          # - Tier-agnostic: edit-undo. Overwrite-of-existing-file
+          #   capture works under either tier (fanotify-perm's
+          #   FAN_OPEN_PERM or LSM's file_open hook).
+          TIER_AGNOSTIC=( edit-undo-linux.sh )
+          LSM_SMOKES=(
+            rm-undo-linux.sh
+            chmod-undo-linux.sh
+            mkdir-undo-linux.sh
+            mv-undo-linux.sh
             touch-edit-undo-linux.sh
           )
+          if [ "$TIER" = "ebpf-lsm" ]; then
+            export SHIT_FORCE_TIER=ebpf-lsm
+            RUN=( "${TIER_AGNOSTIC[@]}" "${LSM_SMOKES[@]}" )
+            echo "Runner has ebpf-lsm functional; running full smoke matrix"
+          else
+            RUN=( "${TIER_AGNOSTIC[@]}" )
+            echo "Runner picks tier=${TIER}; skipping LSM-only smokes (need lsm=bpf in cmdline)"
+          fi
           FAIL=0
-          for s in "${COMMON_SMOKES[@]}" "${LSM_SMOKES[@]}"; do
+          for s in "${RUN[@]}"; do
             echo ""
             echo "===== ${s} ====="
             timeout 300 bash "tests/smoke/${s}"
@@ -358,7 +364,7 @@ jobs:
             echo "${FAIL} smoke(s) failed"
             exit 1
           fi
-          echo "All Linux kernel-capture smokes green"
+          echo "All Linux kernel-capture smokes green (ran ${#RUN[@]} smokes)"
 
       - name: doctor post-check (diagnostic only)
         if: always()
