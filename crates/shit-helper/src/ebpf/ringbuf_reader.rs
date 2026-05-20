@@ -71,6 +71,7 @@ pub mod kind {
     pub const MKDIR: u8 = 3;
     pub const OPEN: u8 = 4;
     pub const CREATE: u8 = 5;
+    pub const RENAME: u8 = 6;
 }
 
 /// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
@@ -265,6 +266,81 @@ impl CreateEvent {
     }
 }
 
+/// `lsm/file_open` event — mirrors `struct shit_open_event`.
+/// BPF pre-filters to write-intent (FMODE_WRITE), so every record
+/// here is a "file is about to be mutated" signal.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenEvent {
+    pub hdr: EventHeader,
+    pub dev: u64,
+    pub inode: u64,
+    pub f_mode: u32,
+    pub f_flags: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<OpenEvent>() == 64);
+
+/// `lsm/inode_rename` event — mirrors `struct shit_rename_event`.
+/// Carries both ends of the rename. `dev`/`inode` are the target's
+/// identity (invariant across rename within a single filesystem).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RenameEvent {
+    pub hdr: EventHeader,
+    pub dev: u64,
+    pub inode: u64,
+    pub old_parent_inode: u64,
+    pub new_parent_inode: u64,
+    pub old_name_len: u32,
+    pub new_name_len: u32,
+    pub old_name: [u8; NAME_BUF_LEN],
+    pub new_name: [u8; NAME_BUF_LEN],
+}
+
+const _: () = assert!(std::mem::size_of::<RenameEvent>() == 592);
+
+impl Default for RenameEvent {
+    fn default() -> Self {
+        Self {
+            hdr: EventHeader::default(),
+            dev: 0,
+            inode: 0,
+            old_parent_inode: 0,
+            new_parent_inode: 0,
+            old_name_len: 0,
+            new_name_len: 0,
+            old_name: [0; NAME_BUF_LEN],
+            new_name: [0; NAME_BUF_LEN],
+        }
+    }
+}
+
+impl std::fmt::Debug for RenameEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenameEvent")
+            .field("hdr", &self.hdr)
+            .field("dev", &self.dev)
+            .field("inode", &self.inode)
+            .field("old_parent_inode", &self.old_parent_inode)
+            .field("new_parent_inode", &self.new_parent_inode)
+            .field("old_name", &self.old_basename_str())
+            .field("new_name", &self.new_basename_str())
+            .finish()
+    }
+}
+
+impl RenameEvent {
+    pub fn old_basename_str(&self) -> std::borrow::Cow<'_, str> {
+        let len = (self.old_name_len as usize).min(NAME_BUF_LEN);
+        String::from_utf8_lossy(&self.old_name[..len])
+    }
+    pub fn new_basename_str(&self) -> std::borrow::Cow<'_, str> {
+        let len = (self.new_name_len as usize).min(NAME_BUF_LEN);
+        String::from_utf8_lossy(&self.new_name[..len])
+    }
+}
+
 /// Sink trait for decoded LSM events. The phase-2-chunk-2 stub
 /// implementation just logs; the production sink wires events into
 /// [`crate::capture::linux::LinuxCaptureRuntime`].
@@ -279,6 +355,8 @@ pub trait LsmEventSink: Send + Sync + 'static {
     fn on_setattr(&self, _ev: &SetattrEvent) {}
     fn on_mkdir(&self, _ev: &MkdirEvent) {}
     fn on_create(&self, _ev: &CreateEvent) {}
+    fn on_open(&self, _ev: &OpenEvent) {}
+    fn on_rename(&self, _ev: &RenameEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
@@ -374,6 +452,44 @@ impl LsmEventSink for LinuxCaptureSink {
         };
         self.runtime.lock().unwrap().handle_lsm_create(&view);
     }
+
+    fn on_open(&self, ev: &OpenEvent) {
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+            tracing::trace!(pid, "untracked pid; dropping lsm open event");
+            return;
+        };
+        let view = crate::capture::linux::LsmOpenView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            f_mode: ev.f_mode,
+            f_flags: ev.f_flags,
+        };
+        self.runtime.lock().unwrap().handle_lsm_open(&view);
+    }
+
+    fn on_rename(&self, ev: &RenameEvent) {
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+            tracing::trace!(pid, "untracked pid; dropping lsm rename event");
+            return;
+        };
+        let old_basename = ev.old_basename_str();
+        let new_basename = ev.new_basename_str();
+        let view = crate::capture::linux::LsmRenameView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            old_parent_inode: ev.old_parent_inode,
+            new_parent_inode: ev.new_parent_inode,
+            old_basename: &old_basename,
+            new_basename: &new_basename,
+        };
+        self.runtime.lock().unwrap().handle_lsm_rename(&view);
+    }
 }
 
 /// Stub sink — logs each event at info-level. Useful for the manual
@@ -447,6 +563,38 @@ impl LsmEventSink for LoggingSink {
             "lsm event"
         );
     }
+
+    fn on_open(&self, ev: &OpenEvent) {
+        let comm = comm_to_string(&ev.hdr.comm);
+        tracing::info!(
+            kind = "open",
+            pid = ev.hdr.pid,
+            ts_ns = ev.hdr.ts_ns,
+            dev = ev.dev,
+            inode = ev.inode,
+            f_mode = format_args!("{:#x}", ev.f_mode),
+            f_flags = format_args!("{:#x}", ev.f_flags),
+            comm,
+            "lsm event"
+        );
+    }
+
+    fn on_rename(&self, ev: &RenameEvent) {
+        let comm = comm_to_string(&ev.hdr.comm);
+        let old = ev.old_basename_str();
+        let new = ev.new_basename_str();
+        tracing::info!(
+            kind = "rename",
+            pid = ev.hdr.pid,
+            ts_ns = ev.hdr.ts_ns,
+            dev = ev.dev,
+            inode = ev.inode,
+            old_basename = %old,
+            new_basename = %new,
+            comm,
+            "lsm event"
+        );
+    }
 }
 
 /// Convert a `[u8; 16]` `comm` array (NUL-terminated, like
@@ -482,6 +630,16 @@ pub fn decode_mkdir(bytes: &[u8]) -> Option<MkdirEvent> {
 /// Decode a raw ringbuf record as a [`CreateEvent`].
 pub fn decode_create(bytes: &[u8]) -> Option<CreateEvent> {
     decode_event::<CreateEvent>(bytes, kind::CREATE)
+}
+
+/// Decode a raw ringbuf record as an [`OpenEvent`].
+pub fn decode_open(bytes: &[u8]) -> Option<OpenEvent> {
+    decode_event::<OpenEvent>(bytes, kind::OPEN)
+}
+
+/// Decode a raw ringbuf record as a [`RenameEvent`].
+pub fn decode_rename(bytes: &[u8]) -> Option<RenameEvent> {
+    decode_event::<RenameEvent>(bytes, kind::RENAME)
 }
 
 /// Internal helper shared by per-kind decoders. `T` must be `repr(C)`
@@ -620,6 +778,58 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as CreateEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Spawn an open-ringbuf reader. Convenience wrapper for
+    /// `lsm/file_open` (write-intent opens only; BPF pre-filters).
+    pub fn spawn_open(
+        open_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-open",
+            open_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_open(bytes) {
+                    sink.on_open(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as OpenEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Spawn a rename-ringbuf reader. Convenience wrapper for
+    /// `lsm/inode_rename`.
+    pub fn spawn_rename(
+        rename_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-rename",
+            rename_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_rename(bytes) {
+                    sink.on_rename(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as RenameEvent"
                     );
                 }
             }),

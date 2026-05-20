@@ -777,6 +777,164 @@ impl LinuxCaptureRuntime {
             "lsm-create TreeMutation sent + fd stashed in pre_opens",
         );
     }
+
+    /// L04.1 — handler for `lsm/file_open` events (write-intent
+    /// opens only; BPF pre-filtered). Mirrors fanotify-perm's
+    /// OpenWrite path:
+    ///   1. Look up `(dev, inode)` in `pre_opens` (the fd held since
+    ///      WatchTree, or inserted by `handle_lsm_create` for files
+    ///      born mid-session). dup it.
+    ///   2. Read pre-image content from the dup'd fd (the kernel
+    ///      hasn't applied O_TRUNC yet at LSM-hook-fire time, so
+    ///      the file's content is still the pre-overwrite state).
+    ///   3. Dedupe on `(dev, inode)` — first write-open per inode
+    ///      wins, identical to fanotify's policy.
+    ///   4. Emit `CapturedPreImage` (is_delete=false) via
+    ///      SCM_RIGHTS, same wire as the fanotify path.
+    ///
+    /// Files never seen before (not in pre_opens) are dropped
+    /// silently — they were opened without a pre-WatchTree
+    /// existence and no `inode_create` saw their birth. This is the
+    /// race-lost case; future enhancement could race-to-open via
+    /// /proc/<pid>/fd/<n>, but that requires resolving the fd's
+    /// path which BPF doesn't capture in this hook.
+    pub fn handle_lsm_open(&mut self, ev: &LsmOpenView) {
+        let ws = self.watches.entry(ev.command).or_default();
+
+        let ev_dev = kernel_dev_to_userspace(ev.dev);
+
+        // Dedupe: first write-open per (dev, inode) per watch window.
+        if !should_capture_dedupe(&ws.dedupe, (ev_dev, ev.inode)) {
+            tracing::trace!(
+                dev = ev_dev,
+                inode = ev.inode,
+                "lsm open: dedupe hit; skipping"
+            );
+            return;
+        }
+
+        let Some(held_fd) = ws.pre_opens.get(&(ev_dev, ev.inode)) else {
+            tracing::trace!(
+                dev_kernel = ev.dev,
+                dev_userspace = ev_dev,
+                inode = ev.inode,
+                "lsm open: no pre-opened fd; dropping (file not in WatchTree's cwd snapshot)"
+            );
+            return;
+        };
+        let fd = held_fd.as_raw_fd();
+
+        let bytes = match read_pre_image(fd) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "lsm open pre-image read failed");
+                return;
+            }
+        };
+        let meta = match fstat_meta(fd) {
+            Some(m) => m,
+            None => {
+                tracing::warn!("lsm open fstat_meta failed");
+                return;
+            }
+        };
+        let blob_hash = blake3_of(&bytes);
+        let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "lsm open staging write failed");
+                return;
+            }
+        };
+        let path = path_for_kernel_fd(fd);
+
+        let resp = HelperResponse::CapturedPreImage {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            dev: ev_dev,
+            inode: ev.inode,
+            path: path.as_deref().map(path_to_string),
+            blob_hash,
+            stored_bytes: bytes.len() as u64,
+            post_content_hash: None,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+            mtime_unix_nanos: meta.mtime_unix_nanos,
+            is_delete: false,
+            fd_sent_via_scm: true,
+        };
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+        {
+            tracing::warn!(error = %e, "lsm open send_response_with_fd failed");
+        }
+
+        ws.dedupe.insert(
+            (ev_dev, ev.inode),
+            DedupeEntry { invalidated: false },
+        );
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev = ev_dev,
+            inode = ev.inode,
+            f_flags = format_args!("{:#x}", ev.f_flags),
+            bytes = bytes.len(),
+            "lsm-open CapturedPreImage sent",
+        );
+    }
+
+    /// L04.1 — handler for `lsm/inode_rename` events. Emits
+    /// `HelperResponse::TreeMutation { op: Rename { from, to, ... } }`.
+    /// Both paths resolved post-syscall via /proc/<pid>/cwd for the
+    /// flat-tree case; the smoke + L02/L03 don't exercise nested
+    /// renames in v1.
+    pub fn handle_lsm_rename(&mut self, ev: &LsmRenameView<'_>) {
+        let _ws = self.watches.entry(ev.command).or_default();
+
+        let ev_dev = kernel_dev_to_userspace(ev.dev);
+
+        let cwd_link = format!("/proc/{}/cwd", ev.pid);
+        let cwd = match std::fs::read_link(&cwd_link) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(err = %e, pid = ev.pid, "lsm rename: read_link cwd failed");
+                return;
+            }
+        };
+        let from_path = cwd.join(ev.old_basename);
+        let to_path = cwd.join(ev.new_basename);
+
+        let resp = HelperResponse::TreeMutation {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            op: shit_proto::TreeOpWire::Rename {
+                from: path_to_string(&from_path),
+                to: path_to_string(&to_path),
+                dev: ev_dev,
+                inode: ev.inode,
+            },
+            ts_unix_nanos: now_unix_nanos(),
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "lsm rename send_response failed");
+        }
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev = ev_dev,
+            inode = ev.inode,
+            from = %from_path.display(),
+            to = %to_path.display(),
+            "lsm-rename TreeMutation sent",
+        );
+    }
 }
 
 /// Convert the kernel's `dev_t` encoding (`(major << 20) | minor`)
@@ -853,6 +1011,34 @@ pub struct LsmCreateView<'a> {
     pub parent_inode: u64,
     pub mode: u32,
     pub basename: &'a str,
+}
+
+/// L04.1 — View into an `lsm/file_open` event. BPF already filtered
+/// to write-intent (FMODE_WRITE set in `f_mode`); userspace's job is
+/// to look up the file in `pre_opens` and stream its pre-image via
+/// the same wire as fanotify-perm's OpenWrite path.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmOpenView {
+    pub command: CommandId,
+    pub pid: u32,
+    pub dev: u64,
+    pub inode: u64,
+    pub f_mode: u32,
+    pub f_flags: u32,
+}
+
+/// L04.1 — View into an `lsm/inode_rename` event. Carries both
+/// ends of the rename; the (dev, inode) is invariant.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmRenameView<'a> {
+    pub command: CommandId,
+    pub pid: u32,
+    pub dev: u64,
+    pub inode: u64,
+    pub old_parent_inode: u64,
+    pub new_parent_inode: u64,
+    pub old_basename: &'a str,
+    pub new_basename: &'a str,
 }
 
 /// Decide whether the producer should emit a pre-image capture for

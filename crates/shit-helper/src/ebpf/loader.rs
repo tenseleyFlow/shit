@@ -57,12 +57,20 @@ const INODE_MKDIR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_mkdir.bpf.o
 /// L04 — BPF object containing the `lsm/inode_create` LSM hook.
 const INODE_CREATE_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_create.bpf.o");
 
+/// L04.1 — BPF object containing the `lsm/file_open` LSM hook.
+const FILE_OPEN_OBJ: &[u8] = include_bytes!("../../bpf/build/file_open.bpf.o");
+
+/// L04.1 — BPF object containing the `lsm/inode_rename` LSM hook.
+const INODE_RENAME_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_rename.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
 const LSM_HOOK_INODE_SETATTR: &str = "inode_setattr";
 const LSM_HOOK_INODE_MKDIR: &str = "inode_mkdir";
 const LSM_HOOK_INODE_CREATE: &str = "inode_create";
+const LSM_HOOK_FILE_OPEN: &str = "file_open";
+const LSM_HOOK_INODE_RENAME: &str = "inode_rename";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
@@ -71,6 +79,8 @@ const LSM_PROG_INODE_UNLINK: &str = "shit_inode_unlink";
 const LSM_PROG_INODE_SETATTR: &str = "shit_inode_setattr";
 const LSM_PROG_INODE_MKDIR: &str = "shit_inode_mkdir";
 const LSM_PROG_INODE_CREATE: &str = "shit_inode_create";
+const LSM_PROG_FILE_OPEN: &str = "shit_file_open";
+const LSM_PROG_INODE_RENAME: &str = "shit_inode_rename";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
@@ -79,6 +89,8 @@ const RINGBUF_UNLINK_EVENTS: &str = "unlink_events";
 const RINGBUF_SETATTR_EVENTS: &str = "setattr_events";
 const RINGBUF_MKDIR_EVENTS: &str = "mkdir_events";
 const RINGBUF_CREATE_EVENTS: &str = "create_events";
+const RINGBUF_OPEN_EVENTS: &str = "open_events";
+const RINGBUF_RENAME_EVENTS: &str = "rename_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -127,6 +139,8 @@ pub struct EbpfLoader {
     setattr_bpf: Option<aya::Ebpf>,
     mkdir_bpf: Option<aya::Ebpf>,
     create_bpf: Option<aya::Ebpf>,
+    open_bpf: Option<aya::Ebpf>,
+    rename_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -152,6 +166,8 @@ impl EbpfLoader {
             setattr_bpf: None,
             mkdir_bpf: None,
             create_bpf: None,
+            open_bpf: None,
+            rename_bpf: None,
         }
     }
 
@@ -170,6 +186,8 @@ impl EbpfLoader {
             || self.setattr_bpf.is_some()
             || self.mkdir_bpf.is_some()
             || self.create_bpf.is_some()
+            || self.open_bpf.is_some()
+            || self.rename_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -231,12 +249,16 @@ impl EbpfLoader {
         let setattr_was = self.setattr_bpf.take().is_some();
         let mkdir_was = self.mkdir_bpf.take().is_some();
         let create_was = self.create_bpf.take().is_some();
-        if unlink_was || setattr_was || mkdir_was || create_was {
+        let open_was = self.open_bpf.take().is_some();
+        let rename_was = self.rename_bpf.take().is_some();
+        if unlink_was || setattr_was || mkdir_was || create_was || open_was || rename_was {
             tracing::info!(
                 unlink = unlink_was,
                 setattr = setattr_was,
                 mkdir = mkdir_was,
                 create = create_was,
+                open = open_was,
+                rename = rename_was,
                 "ebpf programs detached"
             );
         }
@@ -493,6 +515,122 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    /// L04.1 — Load + attach `lsm/file_open`. Pre-filters to
+    /// write-intent in BPF (FMODE_WRITE), so ringbuf traffic stays
+    /// manageable under heavy read workloads.
+    pub fn load_lsm_open(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.open_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_open: open program already loaded".into(),
+            ));
+        }
+
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        let aligned: Vec<u8> = FILE_OPEN_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(file_open): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_FILE_OPEN)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_FILE_OPEN}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_FILE_OPEN, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_FILE_OPEN}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_FILE_OPEN,
+            prog = LSM_PROG_FILE_OPEN,
+            ringbuf = RINGBUF_OPEN_EVENTS,
+            "ebpf-lsm file_open loaded and attached"
+        );
+        self.open_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04.1 — Take the `open_events` ringbuf.
+    pub fn take_open_ringbuf(
+        &mut self,
+    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.open_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_OPEN_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// L04.1 — Load + attach `lsm/inode_rename`.
+    pub fn load_lsm_rename(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.rename_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_rename: rename program already loaded".into(),
+            ));
+        }
+
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        let aligned: Vec<u8> = INODE_RENAME_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_rename): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_RENAME)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_RENAME}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_INODE_RENAME, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_RENAME}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_INODE_RENAME,
+            prog = LSM_PROG_INODE_RENAME,
+            ringbuf = RINGBUF_RENAME_EVENTS,
+            "ebpf-lsm inode_rename loaded and attached"
+        );
+        self.rename_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04.1 — Take the `rename_events` ringbuf.
+    pub fn take_rename_ringbuf(
+        &mut self,
+    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.rename_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_RENAME_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
     /// L04 — Take the `unlink_events` ringbuf for the userspace
     /// consumer. Returns `None` if the loader isn't loaded yet, or
     /// if the ringbuf has already been taken. The loader retains
@@ -569,6 +707,10 @@ mod tests {
         assert!(INODE_MKDIR_OBJ.len() > 100);
         assert_eq!(&INODE_CREATE_OBJ[..4], b"\x7fELF");
         assert!(INODE_CREATE_OBJ.len() > 100);
+        assert_eq!(&FILE_OPEN_OBJ[..4], b"\x7fELF");
+        assert!(FILE_OPEN_OBJ.len() > 100);
+        assert_eq!(&INODE_RENAME_OBJ[..4], b"\x7fELF");
+        assert!(INODE_RENAME_OBJ.len() > 100);
     }
 
     #[test]
