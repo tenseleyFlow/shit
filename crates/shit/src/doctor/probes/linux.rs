@@ -19,7 +19,9 @@
 //! these primitives end-to-end on Linux (CAP_SYS_ADMIN / CAP_BPF
 //! / CAP_PERFMON live on the helper file, not the doctor caller).
 
-#![cfg(target_os = "linux")]
+// Module-level cfg gate lives on `pub mod linux;` in probes/mod.rs;
+// don't repeat it here — clippy::duplicated_attributes trips on
+// the redundant inner attribute.
 
 use crate::doctor::json::{CallerEffectiveCaps, CapsReport, HelperBinaryCaps, SystemdUnitReport};
 use std::path::{Path, PathBuf};
