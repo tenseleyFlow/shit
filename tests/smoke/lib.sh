@@ -180,7 +180,24 @@ smoke_cleanup() {
     else
         smoke_log "SMOKE_KEEP_TMP=1; tmpdir preserved at ${SHIT_SMOKE_TMP}"
     fi
-    printf '[cleanup %s] rm done; about to exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
+    printf '[cleanup %s] rm done; sampling bash state before exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
+    # === B04.6c FINAL-EXIT INSTRUMENTATION ===
+    # All other smokes hit `exit $rc` here and bash terminates within
+    # ms. For service-restart on cross-platform-actions FBSD, bash
+    # hangs on exit itself. Diff between smokes must be in bash's
+    # tracked-job table or in surviving children.
+    printf '[cleanup %s] jobs -l output:\n' "$(date -u +%H:%M:%S)" >&2
+    jobs -l 2>&1 | sed 's/^/  /' >&2 || true
+    printf '[cleanup %s] children of bash $$=%s:\n' "$(date -u +%H:%M:%S)" "$$" >&2
+    pgrep -P $$ 2>&1 | sed 's/^/  /' >&2 || echo "  (no children)" >&2
+    printf '[cleanup %s] ps -axfo for our session:\n' "$(date -u +%H:%M:%S)" >&2
+    ps -o pid,ppid,pgid,sid,stat,wchan,command -d -j -A 2>&1 \
+        | awk -v sid="$(ps -o sid= -p $$)" 'NR==1 || $4==sid' \
+        | sed 's/^/  /' >&2 || true
+    printf '[cleanup %s] shell options (monitor/huponexit/lastpipe):\n' "$(date -u +%H:%M:%S)" >&2
+    set -o 2>&1 | grep -E 'monitor|huponexit|lastpipe' | sed 's/^/  /' >&2 || true
+    shopt 2>&1 | grep -E 'huponexit|lastpipe|checkjobs' | sed 's/^/  /' >&2 || true
+    printf '[cleanup %s] about to call exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
     exit "${rc}"
 }
 trap smoke_cleanup EXIT
