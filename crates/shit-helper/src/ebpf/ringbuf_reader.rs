@@ -72,6 +72,19 @@ pub mod kind {
     pub const OPEN: u8 = 4;
 }
 
+/// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
+/// BPF program from the kernel's `iattr::ia_valid`; the userspace
+/// consumer masks `new_*` fields on these bits.
+pub mod attr {
+    pub const MODE: u32 = 1 << 0;
+    pub const UID: u32 = 1 << 1;
+    pub const GID: u32 = 1 << 2;
+    pub const SIZE: u32 = 1 << 3;
+    pub const ATIME: u32 = 1 << 4;
+    pub const MTIME: u32 = 1 << 5;
+    pub const CTIME: u32 = 1 << 6;
+}
+
 /// Max basename bytes the BPF program writes into `UnlinkEvent::name`.
 /// Matches `SHIT_NAME_MAX + 1` in `common.h` (NAME_MAX + trailing NUL).
 pub const NAME_BUF_LEN: usize = 256;
@@ -129,20 +142,49 @@ impl UnlinkEvent {
     }
 }
 
+/// `lsm/inode_setattr` event — mirrors `struct shit_setattr_event`.
+/// Captures the (dev, inode) being modified plus old/new values for
+/// mode/uid/gid/size. Userspace masks the `new_*` fields on
+/// `attr_valid` (only the bits set are meaningful).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetattrEvent {
+    pub hdr: EventHeader,
+    pub dev: u64,
+    pub inode: u64,
+    pub attr_valid: u32,
+    pub old_mode: u32,
+    pub old_uid: u32,
+    pub old_gid: u32,
+    pub new_mode: u32,
+    pub new_uid: u32,
+    pub new_gid: u32,
+    pub _pad3: u32,
+    pub old_size: u64,
+    pub new_size: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 104);
+
 /// Sink trait for decoded LSM events. The phase-2-chunk-2 stub
-/// implementation just logs; phase-2-chunk-3 wires this into
+/// implementation just logs; the production sink wires events into
 /// [`crate::capture::linux::LinuxCaptureRuntime`].
+///
+/// Default impls let an implementor that only cares about one event
+/// kind skip the others — used by the unit tests and by future
+/// kinds being added incrementally.
 ///
 /// `Send + Sync + 'static` because the reader thread owns its sink.
 pub trait LsmEventSink: Send + Sync + 'static {
-    fn on_unlink(&self, ev: &UnlinkEvent);
+    fn on_unlink(&self, _ev: &UnlinkEvent) {}
+    fn on_setattr(&self, _ev: &SetattrEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
 /// [`crate::capture::linux::LinuxCaptureRuntime`]. Resolves the
 /// event's `pid` to a tracked [`shit_planner::events::CommandId`] via
 /// the shared `TreeMap` (same one fanotify uses), then dispatches to
-/// `handle_lsm_unlink`.
+/// the appropriate `handle_lsm_*` method.
 ///
 /// Untracked pids are silently dropped — same policy as fanotify's
 /// per-event ALLOW-without-capture path.
@@ -171,6 +213,30 @@ impl LsmEventSink for LinuxCaptureSink {
         };
         self.runtime.lock().unwrap().handle_lsm_unlink(&view);
     }
+
+    fn on_setattr(&self, ev: &SetattrEvent) {
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+            tracing::trace!(pid, "untracked pid; dropping lsm setattr event");
+            return;
+        };
+        let view = crate::capture::linux::LsmSetattrView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            attr_valid: ev.attr_valid,
+            old_mode: ev.old_mode,
+            old_uid: ev.old_uid,
+            old_gid: ev.old_gid,
+            old_size: ev.old_size,
+            new_mode: ev.new_mode,
+            new_uid: ev.new_uid,
+            new_gid: ev.new_gid,
+            new_size: ev.new_size,
+        };
+        self.runtime.lock().unwrap().handle_lsm_setattr(&view);
+    }
 }
 
 /// Stub sink — logs each event at info-level. Useful for the manual
@@ -196,6 +262,22 @@ impl LsmEventSink for LoggingSink {
             "lsm event"
         );
     }
+
+    fn on_setattr(&self, ev: &SetattrEvent) {
+        let comm = comm_to_string(&ev.hdr.comm);
+        tracing::info!(
+            kind = "setattr",
+            pid = ev.hdr.pid,
+            ts_ns = ev.hdr.ts_ns,
+            dev = ev.dev,
+            inode = ev.inode,
+            attr_valid = ev.attr_valid,
+            old_mode = format_args!("{:o}", ev.old_mode),
+            new_mode = format_args!("{:o}", ev.new_mode),
+            comm,
+            "lsm event"
+        );
+    }
 }
 
 /// Convert a `[u8; 16]` `comm` array (NUL-terminated, like
@@ -214,61 +296,124 @@ fn comm_to_string(buf: &[u8; 16]) -> String {
 /// `&[u8]` of unspecified alignment. We copy through a `MaybeUninit`
 /// rather than transmute to avoid any alignment hazard.
 pub fn decode_unlink(bytes: &[u8]) -> Option<UnlinkEvent> {
-    if bytes.len() < std::mem::size_of::<UnlinkEvent>() {
+    decode_event::<UnlinkEvent>(bytes, kind::UNLINK)
+}
+
+/// Decode a raw ringbuf record as a [`SetattrEvent`]. Same shape as
+/// [`decode_unlink`].
+pub fn decode_setattr(bytes: &[u8]) -> Option<SetattrEvent> {
+    decode_event::<SetattrEvent>(bytes, kind::SETATTR)
+}
+
+/// Internal helper shared by per-kind decoders. `T` must be `repr(C)`
+/// with a leading `EventHeader` so byte 0 is the `kind` discriminant.
+fn decode_event<T: Copy>(bytes: &[u8], expected_kind: u8) -> Option<T> {
+    if bytes.len() < std::mem::size_of::<T>() {
         return None;
     }
-    if bytes[0] != kind::UNLINK {
+    if bytes[0] != expected_kind {
         return None;
     }
-    let mut out = std::mem::MaybeUninit::<UnlinkEvent>::uninit();
-    // SAFETY: `out` is properly sized; we write exactly size_of::<UnlinkEvent>
-    // bytes from a slice we've confirmed is at least that long.
+    let mut out = std::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: T is sized, slice is at least size_of::<T> bytes.
     unsafe {
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
             out.as_mut_ptr() as *mut u8,
-            std::mem::size_of::<UnlinkEvent>(),
+            std::mem::size_of::<T>(),
         );
         Some(out.assume_init())
     }
 }
 
-/// Userspace consumer of the L04 LSM ringbufs. Owns one OS thread
-/// that loops on each ringbuf's `next()`. Dispatches via [`LsmEventSink`].
+/// Per-record dispatcher for a given ringbuf. Each ringbuf's record
+/// shape (UnlinkEvent vs SetattrEvent) maps to a different decoder
+/// and sink method via a closure. Constructed once at
+/// LsmReader::spawn time and called once per drained record.
+#[allow(clippy::type_complexity)]
+type RecordHandler =
+    Box<dyn Fn(&[u8], &(dyn LsmEventSink + 'static)) + Send + 'static>;
+
+/// Userspace consumer of a single L04 LSM ringbuf. One OS thread per
+/// LsmReader instance — separate ringbufs (`unlink_events`,
+/// `setattr_events`, ...) each get their own reader. Dispatches via
+/// the provided [`RecordHandler`] closure into the [`LsmEventSink`].
 pub struct LsmReader {
-    /// Toggled to false to ask the reader thread to exit. The reader
-    /// also exits naturally when the ringbuf returns `None`
-    /// forever (i.e. after the loader is dropped and the BPF program
-    /// detached).
     alive: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl LsmReader {
-    /// Spawn the reader thread. Polls the `unlink_events` ringbuf
-    /// with a short sleep between drain passes — aya's blocking
-    /// `RingBufItem` iterator requires the AsyncFd wrapper, which
-    /// pulls tokio runtime context in. The helper's main loop is
-    /// already on a runtime but the BPF detach path needs the reader
-    /// to be runtime-agnostic for graceful shutdown.
-    ///
-    /// `idle_sleep` bounds the latency between an event landing in
-    /// the ringbuf and the userspace race-to-open. Default 250 µs
-    /// matches the "win the race before vfs_unlink completes
-    /// d_drop" budget on idle workloads.
+    /// Spawn an unlink-ringbuf reader. Convenience over
+    /// [`Self::spawn_with_handler`] — wires the unlink decoder.
     pub fn spawn(
         unlink_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
     ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-unlink",
+            unlink_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_unlink(bytes) {
+                    sink.on_unlink(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as UnlinkEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Spawn a setattr-ringbuf reader. Convenience wrapper for
+    /// `lsm/inode_setattr`.
+    pub fn spawn_setattr(
+        setattr_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-setattr",
+            setattr_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_setattr(bytes) {
+                    sink.on_setattr(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as SetattrEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Generic spawn — caller supplies the per-record handler.
+    /// `thread_name` is used for /proc/self/task/*/comm and the
+    /// tracing span label.
+    pub fn spawn_with_handler(
+        thread_name: &'static str,
+        rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        handler: RecordHandler,
+        idle_sleep: Duration,
+    ) -> Self {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_t = Arc::clone(&alive);
         let handle = std::thread::Builder::new()
-            .name("shit-lsm-rb".into())
+            .name(thread_name.into())
             .spawn(move || {
-                reader_thread(unlink_rb, sink, alive_t, idle_sleep);
+                reader_thread(thread_name, rb, sink, handler, alive_t, idle_sleep);
             })
-            .expect("spawn shit-lsm-rb");
+            .expect("spawn lsm reader");
         LsmReader {
             alive,
             handle: Some(handle),
@@ -301,36 +446,26 @@ impl Drop for LsmReader {
 }
 
 fn reader_thread(
-    mut unlink_rb: RingBuf<MapData>,
+    thread_name: &'static str,
+    mut rb: RingBuf<MapData>,
     sink: Arc<dyn LsmEventSink>,
+    handler: RecordHandler,
     alive: Arc<AtomicBool>,
     idle_sleep: Duration,
 ) {
     while alive.load(Ordering::Acquire) {
         let mut drained_this_pass = 0u32;
-        while let Some(rec) = unlink_rb.next() {
-            // RingBufItem derefs to &[u8]; explicit slice to dodge
-            // inference ambiguity between Deref and AsRef impls.
+        while let Some(rec) = rb.next() {
             let slice: &[u8] = &rec[..];
-            if let Some(ev) = decode_unlink(slice) {
-                sink.on_unlink(&ev);
-                drained_this_pass += 1;
-            } else {
-                tracing::warn!(
-                    bytes = slice.len(),
-                    first_byte = slice.first().copied().unwrap_or(0),
-                    "ringbuf record could not be decoded as UnlinkEvent"
-                );
-            }
+            handler(slice, sink.as_ref());
+            drained_this_pass += 1;
             if drained_this_pass >= 1024 {
-                // Cap per-pass drain so the alive-flag check happens
-                // even under pathological event rates.
                 break;
             }
         }
         std::thread::sleep(idle_sleep);
     }
-    tracing::info!("lsm-rb reader exiting");
+    tracing::info!(thread = thread_name, "lsm-rb reader exiting");
 }
 
 #[cfg(test)]
@@ -415,6 +550,54 @@ mod tests {
         ev.name[..3].copy_from_slice(b"foo");
         ev.name_len = 0;
         assert_eq!(ev.basename_str(), "");
+    }
+
+    #[test]
+    fn setattr_event_layout_is_104_bytes() {
+        assert_eq!(std::mem::size_of::<SetattrEvent>(), 104);
+        assert_eq!(std::mem::align_of::<SetattrEvent>(), 8);
+    }
+
+    #[test]
+    fn decode_setattr_round_trips() {
+        let original = SetattrEvent {
+            hdr: EventHeader {
+                kind: kind::SETATTR,
+                _pad: [0; 3],
+                pid: 7777,
+                tgid: 7777,
+                _pad2: 0,
+                ts_ns: 0x1122_3344_5566_7788,
+                comm: *b"chmod\0\0\0\0\0\0\0\0\0\0\0",
+            },
+            dev: 0x802,
+            inode: 12345,
+            attr_valid: attr::MODE,
+            old_mode: 0o100644,
+            old_uid: 1000,
+            old_gid: 1000,
+            new_mode: 0o100755,
+            new_uid: 0,
+            new_gid: 0,
+            _pad3: 0,
+            old_size: 1024,
+            new_size: 0,
+        };
+        let bytes: [u8; 104] = unsafe { std::mem::transmute(original) };
+        let decoded = decode_setattr(&bytes).expect("decode");
+        assert_eq!(decoded.hdr.kind, kind::SETATTR);
+        assert_eq!(decoded.attr_valid, attr::MODE);
+        assert_eq!(decoded.old_mode, 0o100644);
+        assert_eq!(decoded.new_mode, 0o100755);
+        assert_eq!(decoded.dev, 0x802);
+        assert_eq!(decoded.inode, 12345);
+    }
+
+    #[test]
+    fn decode_setattr_rejects_unlink_kind() {
+        let mut bytes = [0u8; 104];
+        bytes[0] = kind::UNLINK;
+        assert!(decode_setattr(&bytes).is_none());
     }
 
     #[test]

@@ -45,20 +45,28 @@ const TRACEPOINT_NAME: &str = "sched_process_exec";
 /// `shit_inode_unlink`, LSM hook = `inode_unlink`.
 const INODE_UNLINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_unlink.bpf.o");
 
+/// L04 — BPF object containing the `lsm/inode_setattr` LSM hook.
+/// Built from `crates/shit-helper/bpf/src/inode_setattr.bpf.c`;
+/// ringbuf map name = `setattr_events`, program function name =
+/// `shit_inode_setattr`, LSM hook = `inode_setattr`.
+const INODE_SETATTR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_setattr.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
+const LSM_HOOK_INODE_SETATTR: &str = "inode_setattr";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
 /// section and the function name agree.
 const LSM_PROG_INODE_UNLINK: &str = "shit_inode_unlink";
+const LSM_PROG_INODE_SETATTR: &str = "shit_inode_setattr";
 
-/// Ringbuf map name. Matches the `unlink_events SEC(".maps")`
-/// definition in inode_unlink.bpf.c. `take_unlink_ringbuf` removes
-/// this map from the Ebpf instance and returns it as an
-/// `aya::maps::RingBuf` for the userspace consumer thread.
+/// Ringbuf map names. `take_*_ringbuf` methods remove the map from
+/// the Ebpf instance and return it as an `aya::maps::RingBuf` for
+/// the userspace consumer threads.
 const RINGBUF_UNLINK_EVENTS: &str = "unlink_events";
+const RINGBUF_SETATTR_EVENTS: &str = "setattr_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -94,11 +102,17 @@ impl ProbeOutcome {
     }
 }
 
-/// The loader. Holds the `aya::Ebpf` instance once loaded; dropping
-/// it auto-detaches every program. We never hold a `LinkId` directly
-/// — the aya `Ebpf` owns the link lifetime, and drop is our detach.
+/// The loader. Holds one `aya::Ebpf` instance per loaded program;
+/// dropping detaches everything. We never hold a `LinkId` directly —
+/// the aya `Ebpf` owns the link lifetime, and drop is our detach.
+///
+/// `bpf` is the legacy tracepoint slot, also used by `load_lsm_unlink`
+/// for the unlink program. `setattr_bpf` is the L04 phase 3 slot for
+/// the setattr program. Each .o ships its own ringbuf so they live
+/// in separate Ebpf instances.
 pub struct EbpfLoader {
     bpf: Option<aya::Ebpf>,
+    setattr_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -110,14 +124,18 @@ impl Default for EbpfLoader {
 impl std::fmt::Debug for EbpfLoader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EbpfLoader")
-            .field("loaded", &self.bpf.is_some())
+            .field("unlink_loaded", &self.bpf.is_some())
+            .field("setattr_loaded", &self.setattr_bpf.is_some())
             .finish()
     }
 }
 
 impl EbpfLoader {
     pub fn new() -> Self {
-        Self { bpf: None }
+        Self {
+            bpf: None,
+            setattr_bpf: None,
+        }
     }
 
     /// Read-only feature + capability probe. Safe to call from any
@@ -129,9 +147,9 @@ impl EbpfLoader {
         }
     }
 
-    /// Whether a program is currently loaded + attached.
+    /// Whether ANY program is currently loaded + attached.
     pub fn is_loaded(&self) -> bool {
-        self.bpf.is_some()
+        self.bpf.is_some() || self.setattr_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -189,8 +207,14 @@ impl EbpfLoader {
     /// cleanup), but this lets the caller force it without dropping
     /// the loader (e.g. for graceful shutdown sequencing).
     pub fn detach(&mut self) {
-        if self.bpf.take().is_some() {
-            tracing::info!("ebpf programs detached");
+        let unlink_was_loaded = self.bpf.take().is_some();
+        let setattr_was_loaded = self.setattr_bpf.take().is_some();
+        if unlink_was_loaded || setattr_was_loaded {
+            tracing::info!(
+                unlink = unlink_was_loaded,
+                setattr = setattr_was_loaded,
+                "ebpf programs detached"
+            );
         }
     }
 
@@ -263,6 +287,72 @@ impl EbpfLoader {
         Ok(())
     }
 
+    /// L04 phase 3 — Load + attach the `lsm/inode_setattr` program.
+    /// Same contract as [`Self::load_lsm_unlink`]: ringbufs
+    /// (dev, inode, old_*, new_*) records on every chmod / chown /
+    /// utimes / truncate. Returns 0 (allow) unconditionally.
+    ///
+    /// One-shot per loader; refuses if already loaded.
+    ///
+    /// **HP-18 sign-off** identical to the unlink program. Verifier
+    /// rejection would break every chmod/chown on the box.
+    pub fn load_lsm_setattr(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.setattr_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_setattr: setattr program already loaded".into(),
+            ));
+        }
+
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        let aligned: Vec<u8> = INODE_SETATTR_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_setattr): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_SETATTR)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_SETATTR}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_INODE_SETATTR, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_SETATTR}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_INODE_SETATTR,
+            prog = LSM_PROG_INODE_SETATTR,
+            ringbuf = RINGBUF_SETATTR_EVENTS,
+            "ebpf-lsm inode_setattr loaded and attached"
+        );
+        self.setattr_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04 phase 3 — Take the `setattr_events` ringbuf. Mirror of
+    /// [`Self::take_unlink_ringbuf`] for the setattr program.
+    pub fn take_setattr_ringbuf(
+        &mut self,
+    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.setattr_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_SETATTR_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
     /// L04 — Take the `unlink_events` ringbuf for the userspace
     /// consumer. Returns `None` if the loader isn't loaded yet, or
     /// if the ringbuf has already been taken. The loader retains
@@ -331,6 +421,10 @@ mod tests {
         // the wrong file.
         assert_eq!(&NOOP_TRACEPOINT_OBJ[..4], b"\x7fELF");
         assert!(NOOP_TRACEPOINT_OBJ.len() > 100);
+        assert_eq!(&INODE_UNLINK_OBJ[..4], b"\x7fELF");
+        assert!(INODE_UNLINK_OBJ.len() > 100);
+        assert_eq!(&INODE_SETATTR_OBJ[..4], b"\x7fELF");
+        assert!(INODE_SETATTR_OBJ.len() > 100);
     }
 
     #[test]

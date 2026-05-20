@@ -498,6 +498,110 @@ impl LinuxCaptureRuntime {
             "lsm-unlink CapturedPreImage sent",
         );
     }
+
+    /// L04 phase 3 — handler for `lsm/inode_setattr` events. Captures
+    /// the pre-change metadata (mode/uid/gid) reported by the BPF
+    /// program. The file content is re-read from the pre-opened fd
+    /// (the chmod doesn't touch content; we capture it for the
+    /// CapturedPreImage wire so the daemon's blob/hash invariants
+    /// hold).
+    ///
+    /// If no pre-opened fd exists for this (dev, inode) we drop the
+    /// event — the daemon refuses CapturedPreImage without an
+    /// SCM_RIGHTS fd, and a race-to-open after the change is too
+    /// late to retrieve the OLD metadata (BPF gave it to us; the
+    /// CONTENT race is what would fail). Future enhancement: send a
+    /// metadata-only variant on the wire.
+    pub fn handle_lsm_setattr(&mut self, ev: &LsmSetattrView) {
+        let ws = self.watches.entry(ev.command).or_default();
+
+        let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
+
+        // Look up — but keep the fd in the table. setattr doesn't
+        // unlink, so subsequent events for the same inode (e.g.
+        // chmod then chmod) should still find the fd.
+        let pre_fd_raw = ws
+            .pre_opens
+            .get(&(ev_dev_userspace, ev.inode))
+            .map(|f| f.as_raw_fd());
+        let Some(fd) = pre_fd_raw else {
+            tracing::info!(
+                pid = ev.pid,
+                dev_kernel = ev.dev,
+                dev_userspace = ev_dev_userspace,
+                inode = ev.inode,
+                "lsm setattr: no pre-opened fd; dropping (race-to-open not viable for metadata-only)"
+            );
+            // Mark dedupe so reuse-after-event re-captures.
+            ws.dedupe
+                .insert((ev_dev_userspace, ev.inode), DedupeEntry { invalidated: false });
+            return;
+        };
+
+        let bytes = match read_pre_image(fd) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "lsm setattr pre-image read failed");
+                return;
+            }
+        };
+        let blob_hash = blake3_of(&bytes);
+        let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "lsm setattr staging write failed");
+                return;
+            }
+        };
+
+        // mtime: post-chmod fstat is fine — chmod doesn't change
+        // mtime; only ctime moves. For utimes we'd need to capture
+        // pre-change atime/mtime in the BPF event; deferred.
+        let meta_mtime = fstat_meta(fd).map(|m| m.mtime_unix_nanos).unwrap_or(0);
+
+        let path = path_for_kernel_fd(fd);
+
+        let resp = HelperResponse::CapturedPreImage {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            dev: ev_dev_userspace,
+            inode: ev.inode,
+            path: path.as_deref().map(path_to_string),
+            blob_hash,
+            stored_bytes: bytes.len() as u64,
+            post_content_hash: None,
+            // Pre-change metadata from the BPF event — these are the
+            // values undo restores to.
+            mode: ev.old_mode,
+            uid: ev.old_uid,
+            gid: ev.old_gid,
+            mtime_unix_nanos: meta_mtime,
+            is_delete: false,
+            fd_sent_via_scm: true,
+        };
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+        {
+            tracing::warn!(error = %e, "lsm setattr send_response_with_fd failed");
+        }
+
+        ws.dedupe
+            .insert((ev_dev_userspace, ev.inode), DedupeEntry { invalidated: false });
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev = ev_dev_userspace,
+            inode = ev.inode,
+            attr_valid = ev.attr_valid,
+            old_mode = format_args!("{:o}", ev.old_mode),
+            new_mode = format_args!("{:o}", ev.new_mode),
+            stored_bytes = bytes.len(),
+            "lsm-setattr CapturedPreImage sent",
+        );
+    }
 }
 
 /// Convert the kernel's `dev_t` encoding (`(major << 20) | minor`)
@@ -526,6 +630,26 @@ pub struct LsmUnlinkView<'a> {
     pub inode: u64,
     pub parent_inode: u64,
     pub basename: &'a str,
+}
+
+/// View into an `lsm/inode_setattr` event as the BPF ringbuf reader
+/// sees it. Old values are pre-change (read from the live inode at
+/// BPF hook time); new values are what the syscall is requesting.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmSetattrView {
+    pub command: CommandId,
+    pub pid: u32,
+    pub dev: u64,
+    pub inode: u64,
+    pub attr_valid: u32,
+    pub old_mode: u32,
+    pub old_uid: u32,
+    pub old_gid: u32,
+    pub old_size: u64,
+    pub new_mode: u32,
+    pub new_uid: u32,
+    pub new_gid: u32,
+    pub new_size: u64,
 }
 
 /// Decide whether the producer should emit a pre-image capture for
