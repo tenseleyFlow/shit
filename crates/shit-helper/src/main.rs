@@ -783,15 +783,16 @@ fn pick_bsd_tier() -> CaptureTier {
 }
 
 /// Bundles the long-lived state for the eBPF-LSM tier (L04). Held
-/// in the run loop's outer scope so the reader/loader stay alive
+/// in the run loop's outer scope so the readers/loader stay alive
 /// for the helper's lifetime. The request loop receives a
 /// [`LsmDispatch`] clone for WatchTree/UnwatchTree handling — the
 /// reader/loader fields don't cross the `spawn_blocking` boundary.
 #[cfg(target_os = "linux")]
 struct LsmCaptureState {
-    /// Reader thread handle. Dropped on shutdown — `LsmReader::drop`
-    /// stops the reader and joins.
-    _reader: ebpf::LsmReader,
+    /// Reader threads. One per ringbuf (`unlink_events`,
+    /// `setattr_events`, ...). Dropped on shutdown — `LsmReader::drop`
+    /// stops each reader and joins.
+    _readers: Vec<ebpf::LsmReader>,
     /// Held to keep the BPF programs attached for the helper's
     /// lifetime. Dropping detaches.
     _loader: ebpf::EbpfLoader,
@@ -825,9 +826,14 @@ fn boot_ebpf_lsm(
     let mut loader = ebpf::EbpfLoader::new();
     loader.load_lsm_unlink()
         .map_err(|e| anyhow::anyhow!("load_lsm_unlink failed: {e}"))?;
-    let ringbuf = loader
+    loader.load_lsm_setattr()
+        .map_err(|e| anyhow::anyhow!("load_lsm_setattr failed: {e}"))?;
+    let unlink_rb = loader
         .take_unlink_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_unlink_ringbuf returned None after successful load"))?;
+    let setattr_rb = loader
+        .take_setattr_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_setattr_ringbuf returned None after successful load"))?;
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
 
@@ -847,15 +853,13 @@ fn boot_ebpf_lsm(
 
     // 250 µs idle sleep — keeps the race-to-open window tight on
     // unlinks. See ringbuf_reader::LsmReader::spawn doc for rationale.
-    let reader = ebpf::LsmReader::spawn(
-        ringbuf,
-        sink,
-        std::time::Duration::from_micros(250),
-    );
+    let idle = std::time::Duration::from_micros(250);
+    let unlink_reader = ebpf::LsmReader::spawn(unlink_rb, Arc::clone(&sink), idle);
+    let setattr_reader = ebpf::LsmReader::spawn_setattr(setattr_rb, Arc::clone(&sink), idle);
 
-    tracing::info!("ebpf-lsm reader spawned");
+    tracing::info!("ebpf-lsm readers spawned: unlink + setattr");
     Ok(LsmCaptureState {
-        _reader: reader,
+        _readers: vec![unlink_reader, setattr_reader],
         _loader: loader,
         dispatch: LsmDispatch {
             tree,
