@@ -243,3 +243,135 @@ jobs:
           path: |
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
+
+  # L07 — Linux kernel-capture matrix. Exercises L02 (rm/edit),
+  # L03 (chmod/mkdir/touch-edit deferred), L04 (eBPF-LSM tier),
+  # and L04.1 (file_open + rename) end-to-end on the runner's
+  # kernel. Pre-flight gates on `shit doctor --json` so a busted
+  # runner image (missing caps, missing LSM=bpf) fails fast with
+  # the operator-readable remediation rather than a timeout.
+  #
+  # Single job, serial smokes — total runtime ~3-5 min, no
+  # parallel-job overhead. Per-smoke timeout 5 min so a hang
+  # surfaces as a labeled failure instead of consuming the whole
+  # 30-min job budget.
+  linux-kernel-capture:
+    name: linux-kernel-capture (L02/L03/L04 smoke matrix)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq python3 sqlite3 libcap2-bin
+
+      - name: build release binaries
+        run: |
+          cargo build --release \
+            -p shit -p shitd -p shit-helper
+
+      - name: setcap helper
+        run: |
+          sudo setcap cap_sys_admin,cap_bpf,cap_perfmon+ep \
+            target/release/shit-helper
+          getcap target/release/shit-helper
+
+      - name: kernel + LSM diagnostics
+        run: |
+          uname -a
+          cat /sys/kernel/security/lsm || echo "lsm file missing"
+          ls -la /sys/kernel/btf/vmlinux || echo "BTF missing"
+
+      - name: doctor pre-flight (JSON)
+        env:
+          SHIT_HELPER_BIN: ${{ github.workspace }}/target/release/shit-helper
+        run: |
+          ./target/release/shit doctor --json > /tmp/doctor.json
+          cat /tmp/doctor.json | jq '.linux'
+          # Gate: tier must be ebpf-lsm OR fanotify-perm (not degraded).
+          jq -e '.linux.runtime_capture == "ebpf-lsm"
+              or .linux.runtime_capture == "fanotify-perm"' /tmp/doctor.json
+          # Helper caps must be present on the binary.
+          jq -e '.linux.capabilities.helper_binary.cap_sys_admin == true
+              and .linux.capabilities.helper_binary.cap_bpf == true
+              and .linux.capabilities.helper_binary.cap_perfmon == true' /tmp/doctor.json
+
+      - name: which tier did doctor pick
+        id: tier
+        env:
+          SHIT_HELPER_BIN: ${{ github.workspace }}/target/release/shit-helper
+        run: |
+          TIER=$(jq -r '.linux.runtime_capture' /tmp/doctor.json)
+          echo "tier=${TIER}" >> "$GITHUB_OUTPUT"
+          echo "Doctor picked tier: ${TIER}"
+
+      - name: run kernel-capture smokes
+        env:
+          SHIT_HELPER_BIN: ${{ github.workspace }}/target/release/shit-helper
+          SHIT_SMOKE_BIN_DIR: ${{ github.workspace }}/target/release
+        run: |
+          set +e
+          TIER="${{ steps.tier.outputs.tier }}"
+          # LSM-required smokes need the ebpf-lsm tier — fanotify-perm
+          # can't catch unlink/chmod/mkdir/rename. Set SHIT_FORCE_TIER
+          # when the host tier supports it; otherwise these smokes
+          # are reported as SKIP (they hard-fail in the lsm-prereq
+          # check inside the script).
+          if [ "$TIER" = "ebpf-lsm" ]; then
+            export SHIT_FORCE_TIER=ebpf-lsm
+            LSM_SMOKES=(
+              rm-undo-linux.sh
+              chmod-undo-linux.sh
+              mkdir-undo-linux.sh
+              mv-undo-linux.sh
+            )
+          else
+            echo "ebpf-lsm not available on this runner; skipping LSM-only smokes"
+            LSM_SMOKES=()
+          fi
+          # These work on either tier (write-intent open is the
+          # trigger; both fanotify-perm and lsm/file_open catch it).
+          COMMON_SMOKES=(
+            edit-undo-linux.sh
+            touch-edit-undo-linux.sh
+          )
+          FAIL=0
+          for s in "${COMMON_SMOKES[@]}" "${LSM_SMOKES[@]}"; do
+            echo ""
+            echo "===== ${s} ====="
+            timeout 300 bash "tests/smoke/${s}"
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "PASS: ${s}"
+            else
+              echo "FAIL: ${s} (rc=${rc})"
+              FAIL=$((FAIL + 1))
+            fi
+          done
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "${FAIL} smoke(s) failed"
+            exit 1
+          fi
+          echo "All Linux kernel-capture smokes green"
+
+      - name: doctor post-check (diagnostic only)
+        if: always()
+        env:
+          SHIT_HELPER_BIN: ${{ github.workspace }}/target/release/shit-helper
+        run: ./target/release/shit doctor --json | jq '.' || true
+
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-kernel-capture-logs
+          path: |
+            /tmp/doctor.json
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
