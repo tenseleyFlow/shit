@@ -77,4 +77,46 @@ struct shit_unlink_event {
     char  name[SHIT_NAME_MAX + 1];
 };
 
+/* `ia_valid` bit set on `struct iattr` for the fields the syscall
+ * wants to change. We mirror the kernel's ATTR_* constants here so
+ * the userspace decoder doesn't have to depend on a kernel header.
+ * Only the ones we care about for undo (mode/uid/gid/utime/size) are
+ * exported; the rest of ATTR_* (KILL_SUID, FILE, etc.) are kernel
+ * internal. */
+#define SHIT_ATTR_MODE  (1 << 0)
+#define SHIT_ATTR_UID   (1 << 1)
+#define SHIT_ATTR_GID   (1 << 2)
+#define SHIT_ATTR_SIZE  (1 << 3)
+#define SHIT_ATTR_ATIME (1 << 4)
+#define SHIT_ATTR_MTIME (1 << 5)
+#define SHIT_ATTR_CTIME (1 << 6)
+
+/* lsm/inode_setattr — `chmod`/`chown`/`utimes`/`truncate`. The hook
+ * fires BEFORE the kernel applies the change. We capture the
+ * pre-change values from `dentry->d_inode` and the requested new
+ * values from `attr`. Userspace journals "old → new" so undo can
+ * replay the inverse.
+ *
+ * `attr_valid` is a bitmask of SHIT_ATTR_* constants indicating which
+ * of the new_* fields are valid for this syscall. For chmod only
+ * MODE is set; for chown UID/GID; for utimes ATIME/MTIME; etc. */
+struct shit_setattr_event {
+    struct shit_event_hdr hdr;
+    __u64 dev;
+    __u64 inode;
+    __u32 attr_valid;
+    /* Old (pre-change) values, read from inode at hook time. */
+    __u32 old_mode;
+    __u32 old_uid;
+    __u32 old_gid;
+    /* New (requested) values, read from iattr. Only those whose bit
+     * in `attr_valid` is set are meaningful. */
+    __u32 new_mode;
+    __u32 new_uid;
+    __u32 new_gid;
+    __u32 _pad3;
+    __u64 old_size;
+    __u64 new_size;
+};
+
 #endif /* SHIT_BPF_COMMON_H */
