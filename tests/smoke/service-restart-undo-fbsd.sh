@@ -160,11 +160,9 @@ smoke_log "session close"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
 
-# === B04.6c BISECTION EXPERIMENT ===
-# Bypass ALL cleanup. Just PASS + exit. If this hangs, the issue is
-# intrinsic to bash exit on the cross-platform-actions FreeBSD-14
-# VM (not anything cleanup is doing). If it exits cleanly, then
-# something in restore_cron_if_needed or smoke_stop_shitd is the
-# culprit and we bisect further.
-echo "[diag $(date -u +%H:%M:%S)] BISECTION: skipping all cleanup; raw exit 0" >&2
+# lib.sh's smoke_cleanup EXIT trap handles teardown
+# (smoke_stop_shitd + tmpdir cleanup). lib.sh was instrumented in
+# this iteration to log every step of smoke_stop_shitd — if we hang
+# again, we'll see exactly which line blocks.
+restore_cron_if_needed
 exit 0

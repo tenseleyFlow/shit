@@ -104,14 +104,40 @@ smoke_start_shitd() {
 }
 
 smoke_stop_shitd() {
+    # === B04.6c INSTRUMENTATION ===
+    # Earlier evidence showed bash hangs forever past "stopping shitd"
+    # for service-restart, while every other smoke completes here in
+    # ~5 sec (SIGTERM ignored, SIGKILL after 5-sec backoff works).
+    # Service-restart appears to be the only smoke where SIGKILL is
+    # also deferred. Log every step so we see exactly which line
+    # blocks.
+    printf '[stop-shitd %s] enter (SHITD_PID=%s)\n' "$(date -u +%H:%M:%S)" "${SHITD_PID:-unset}" >&2
     if [ -n "${SHITD_PID}" ] && kill -0 "${SHITD_PID}" 2>/dev/null; then
-        smoke_log "stopping shitd (pid=${SHITD_PID})"
+        printf '[stop-shitd %s] alive — SIGTERM %s\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
         kill -TERM "${SHITD_PID}" 2>/dev/null || true
-        for _ in $(seq 1 50); do
-            kill -0 "${SHITD_PID}" 2>/dev/null || break
+        local i
+        for i in $(seq 1 50); do
+            kill -0 "${SHITD_PID}" 2>/dev/null || { printf '[stop-shitd %s] gone after SIGTERM (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
             sleep 0.1
         done
-        kill -KILL "${SHITD_PID}" 2>/dev/null || true
+        if kill -0 "${SHITD_PID}" 2>/dev/null; then
+            printf '[stop-shitd %s] still alive after 5 sec — SIGKILL %s\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
+            kill -KILL "${SHITD_PID}" 2>/dev/null || true
+            # Wait briefly for SIGKILL to take effect; sample state.
+            for i in $(seq 1 50); do
+                kill -0 "${SHITD_PID}" 2>/dev/null || { printf '[stop-shitd %s] gone after SIGKILL (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
+                sleep 0.1
+            done
+            if kill -0 "${SHITD_PID}" 2>/dev/null; then
+                printf '[stop-shitd %s] DEFERRED-SIGKILL — process %s alive 5 sec after SIGKILL\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
+                printf '[stop-shitd %s] procstat -k:\n' "$(date -u +%H:%M:%S)" >&2
+                procstat -k "${SHITD_PID}" 2>&1 | sed 's/^/  /' >&2 || true
+                printf '[stop-shitd %s] ps state:\n' "$(date -u +%H:%M:%S)" >&2
+                ps -o pid,stat,wchan,command -p "${SHITD_PID}" 2>&1 | sed 's/^/  /' >&2 || true
+            fi
+        fi
+    else
+        printf '[stop-shitd %s] not alive (kill -0 failed)\n' "$(date -u +%H:%M:%S)" >&2
     fi
     # Reap any orphaned shit-helper subprocesses. shitd spawns
     # shit-helper as a child on handshake; if shitd dies via SIGKILL
@@ -120,8 +146,11 @@ smoke_stop_shitd() {
     # an orphaned helper keeps bash's exit blocked (the SSH session
     # waits for tty-fd-sharing processes). Wait for `wait` to reap
     # the shitd job, then nuke any leftover helpers by name.
+    printf '[stop-shitd %s] before wait\n' "$(date -u +%H:%M:%S)" >&2
     wait "${SHITD_PID}" 2>/dev/null || true
+    printf '[stop-shitd %s] after wait; pkill shit-helper\n' "$(date -u +%H:%M:%S)" >&2
     pkill -f 'target/release/shit-helper' 2>/dev/null || true
+    printf '[stop-shitd %s] return\n' "$(date -u +%H:%M:%S)" >&2
 }
 
 smoke_cleanup() {
