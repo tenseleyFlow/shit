@@ -36,6 +36,7 @@ enum shit_event_kind {
     SHIT_EVT_MKDIR = 3,
     SHIT_EVT_OPEN = 4,
     SHIT_EVT_CREATE = 5,
+    SHIT_EVT_RENAME = 6,
 };
 
 /* Bounded comm length matches kernel's TASK_COMM_LEN. */
@@ -153,6 +154,36 @@ struct shit_create_event {
     __u32 mode;
     __u32 name_len;
     char  name[SHIT_NAME_MAX + 1];
+};
+
+/* lsm/file_open — every `open(2)` / `openat(2)`. The BPF program
+ * pre-filters to write-intent (FMODE_WRITE in `file->f_mode`) so
+ * the ringbuf only carries opens that will mutate the file. We
+ * carry both `f_mode` and `f_flags` so userspace can distinguish
+ * O_TRUNC (will truncate, capture pre-image NOW) from O_APPEND
+ * (will append, content blob still useful). */
+struct shit_open_event {
+    struct shit_event_hdr hdr;
+    __u64 dev;
+    __u64 inode;
+    __u32 f_mode;
+    __u32 f_flags;
+};
+
+/* lsm/inode_rename — `rename(2)` / `renameat2(2)`. Captures
+ * (old_parent_inode, old_basename) -> (new_parent_inode,
+ * new_basename) for both ends. (dev, inode) is invariant across
+ * rename on the same filesystem. */
+struct shit_rename_event {
+    struct shit_event_hdr hdr;
+    __u64 dev;
+    __u64 inode;
+    __u64 old_parent_inode;
+    __u64 new_parent_inode;
+    __u32 old_name_len;
+    __u32 new_name_len;
+    char  old_name[SHIT_NAME_MAX + 1];
+    char  new_name[SHIT_NAME_MAX + 1];
 };
 
 #endif /* SHIT_BPF_COMMON_H */

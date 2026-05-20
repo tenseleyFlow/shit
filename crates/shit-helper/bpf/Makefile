@@ -40,7 +40,7 @@ CFLAGS_LSM   = -O2 -g -Wall -fno-stack-protector -target bpf \
                -I$(INCLUDE_DIR) -I$(BPF_HELPERS_INCLUDE)
 
 # Programs that use the LSM compile profile (vmlinux.h + libbpf).
-LSM_PROGRAMS = inode_unlink inode_setattr inode_mkdir inode_create file_open
+LSM_PROGRAMS = inode_unlink inode_setattr inode_mkdir inode_create inode_rename file_open
 
 # All sources are .bpf.c; outputs are .bpf.o.
 SOURCES = $(wildcard $(SRC_DIR)/*.bpf.c)
