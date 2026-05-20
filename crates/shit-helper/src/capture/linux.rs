@@ -517,6 +517,22 @@ impl LinuxCaptureRuntime {
 
         let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
 
+        // Dedupe — first capture per (dev, inode) wins. Important
+        // for the open(O_WRONLY|O_TRUNC) path: file_open LSM fires
+        // first and captures the pre-truncate content, then
+        // inode_setattr fires for the truncate. Without dedupe both
+        // would journal CapturedPreImage, causing double-restore on
+        // undo. The dedupe entry from file_open's handler suppresses
+        // setattr's duplicate.
+        if !should_capture_dedupe(&ws.dedupe, (ev_dev_userspace, ev.inode)) {
+            tracing::trace!(
+                dev = ev_dev_userspace,
+                inode = ev.inode,
+                "lsm setattr: dedupe hit; skipping (already captured this watch window)"
+            );
+            return;
+        }
+
         // Look up — but keep the fd in the table. setattr doesn't
         // unlink, so subsequent events for the same inode (e.g.
         // chmod then chmod) should still find the fd.
