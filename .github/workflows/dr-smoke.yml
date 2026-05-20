@@ -359,11 +359,16 @@ jobs:
               # its PASS line BEFORE arming the safety-net. So we
               # treat 137 + "PASS:" in stdout as success.
               passlog="$(mktemp /tmp/smoke-out.XXXXXX)"
+              # No `| tee` here — the action's driver shell on the VM
+              # is sh, which doesn't have $PIPESTATUS. Write smoke
+              # output to a file, capture rc directly, then cat the
+              # file for log visibility.
               set +e
               /usr/bin/timeout --signal=TERM --kill-after=10 300 \
-                bash "tests/smoke/$smoke" 2>&1 | tee "$passlog"
-              rc="${PIPESTATUS[0]}"
+                bash "tests/smoke/$smoke" > "$passlog" 2>&1
+              rc=$?
               set -e
+              cat "$passlog"
               case "$rc" in
                 0)    echo "  PASS: $smoke" ;;
                 124)  echo "  FAIL: $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;

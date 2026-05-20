@@ -192,13 +192,27 @@ smoke_cleanup() {
     pgrep -lf 'shit' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
     printf '[cleanup %s] doas processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
     pgrep -lf 'doas' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
-    # Safety-net: if `exit $rc` hangs, force-kill bash in 10 sec. A
-    # backgrounded subshell with setsid escapes bash's tracked-jobs
-    # table, so it can't pin bash itself (which is the whole problem
-    # we're working around).
-    setsid sh -c "sleep 10; kill -KILL $$ 2>/dev/null" </dev/null >/dev/null 2>&1 &
+    # Safety-net: if `exit $rc` hangs (FBSD CI fd-inheritance quirk
+    # we couldn't isolate), force-kill bash in 10 sec. setsid'd into
+    # its own session so it can't pin bash via the tracked-jobs
+    # table. PID-reuse-safe: before killing, verify the PID still
+    # exists AND its command is /usr/local/bin/bash AND its parent
+    # is timeout — otherwise the PID was freed by clean exit and
+    # reused by something else.
+    target_pid=$$
+    target_ppid=$PPID
+    setsid sh -c "
+        sleep 10
+        # Re-check the PID is still our bash before killing.
+        cur_comm=\$(ps -p ${target_pid} -o comm= 2>/dev/null || true)
+        cur_ppid=\$(ps -p ${target_pid} -o ppid= 2>/dev/null | tr -d ' ' || true)
+        if [ \"\${cur_comm}\" = 'bash' ] && [ \"\${cur_ppid}\" = '${target_ppid}' ]; then
+            kill -KILL ${target_pid} 2>/dev/null || true
+        fi
+    " </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
-    printf '[cleanup %s] safety-net kill armed (10 sec); about to exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
+    printf '[cleanup %s] safety-net armed (pid=%d ppid=%d, 10 sec); about to exit %d\n' \
+        "$(date -u +%H:%M:%S)" "${target_pid}" "${target_ppid}" "${rc}" >&2
     exit "${rc}"
 }
 trap smoke_cleanup EXIT
