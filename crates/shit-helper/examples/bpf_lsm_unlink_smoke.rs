@@ -155,13 +155,14 @@ fn main() {
 
     // Self-induced traffic: unlink a known file so we KNOW at least
     // one event should land.
-    let probe_path = std::env::temp_dir().join(format!(
-        "shit-lsm-smoke.{}.probe",
-        std::process::id()
-    ));
+    let probe_path =
+        std::env::temp_dir().join(format!("shit-lsm-smoke.{}.probe", std::process::id()));
     std::fs::write(&probe_path, b"x").expect("write probe");
     std::fs::remove_file(&probe_path).expect("unlink probe");
-    println!("[lsm-smoke] self-induced unlink at {}", probe_path.display());
+    println!(
+        "[lsm-smoke] self-induced unlink at {}",
+        probe_path.display()
+    );
 
     // Drain the ringbuf for ~1 s, counting events.
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -174,7 +175,10 @@ fn main() {
             // = 328 B. ringbuf records are 8-byte aligned with no
             // userspace padding.
             if events_seen == 1 {
-                println!("[lsm-smoke] first event size = {} bytes (expect 328)", rec.len());
+                println!(
+                    "[lsm-smoke] first event size = {} bytes (expect 328)",
+                    rec.len()
+                );
             }
         }
         heartbeat.store(now_ms(), Ordering::Release);

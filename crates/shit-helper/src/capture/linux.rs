@@ -221,10 +221,8 @@ impl LinuxCaptureRuntime {
             // snapshot — the LSM open/setattr handlers will see a
             // miss and drop their events.
             if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
-                ws.pre_snapshots.insert(
-                    (dev, inode),
-                    PreSnapshot { meta, bytes },
-                );
+                ws.pre_snapshots
+                    .insert((dev, inode), PreSnapshot { meta, bytes });
             } else {
                 tracing::trace!(
                     dev,
@@ -412,22 +410,23 @@ impl LinuxCaptureRuntime {
         // the fd — same trick BSD kqueue uses. This is the
         // deterministic capture path; race-to-open is a last-resort
         // fallback for files created mid-session.
-        let (capture_fd_owned, fd_source) = if let Some(fd) = ws.pre_opens.remove(&(ev_dev_userspace, ev.inode)) {
-            (Some(fd), "pre-opened")
-        } else {
-            // Fall back to race-to-open via /proc/<pid>/cwd. The
-            // procfs symlink resolves through the live cwd, so this
-            // works even on rename. Win window: microseconds.
-            let open_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
-            let opened = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&open_path);
-            match opened {
-                Ok(f) => (Some(OwnedFd::from(f)), "race"),
-                Err(_) => (None, "miss"),
-            }
-        };
+        let (capture_fd_owned, fd_source) =
+            if let Some(fd) = ws.pre_opens.remove(&(ev_dev_userspace, ev.inode)) {
+                (Some(fd), "pre-opened")
+            } else {
+                // Fall back to race-to-open via /proc/<pid>/cwd. The
+                // procfs symlink resolves through the live cwd, so this
+                // works even on rename. Win window: microseconds.
+                let open_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
+                let opened = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&open_path);
+                match opened {
+                    Ok(f) => (Some(OwnedFd::from(f)), "race"),
+                    Err(_) => (None, "miss"),
+                }
+            };
 
         let (capture_dev, capture_inode, file_type) = match capture_fd_owned.as_ref() {
             Some(fd) => match fstat_dev_inode_kind(fd.as_raw_fd()) {
@@ -519,8 +518,10 @@ impl LinuxCaptureRuntime {
         // unlink happened, so any subsequent reuse of (dev, inode)
         // should re-capture. Keyed in glibc-encoded dev for symmetry
         // with the fanotify producer's dedupe.
-        ws.dedupe
-            .insert((ev_dev_userspace, ev.inode), DedupeEntry { invalidated: true });
+        ws.dedupe.insert(
+            (ev_dev_userspace, ev.inode),
+            DedupeEntry { invalidated: true },
+        );
 
         tracing::info!(
             session = %ev.command.session,
@@ -588,8 +589,10 @@ impl LinuxCaptureRuntime {
                 "lsm setattr: no pre-opened fd; dropping (race-to-open not viable for metadata-only)"
             );
             // Mark dedupe so reuse-after-event re-captures.
-            ws.dedupe
-                .insert((ev_dev_userspace, ev.inode), DedupeEntry { invalidated: false });
+            ws.dedupe.insert(
+                (ev_dev_userspace, ev.inode),
+                DedupeEntry { invalidated: false },
+            );
             return;
         };
 
@@ -641,8 +644,10 @@ impl LinuxCaptureRuntime {
             tracing::warn!(error = %e, "lsm setattr send_response_with_fd failed");
         }
 
-        ws.dedupe
-            .insert((ev_dev_userspace, ev.inode), DedupeEntry { invalidated: false });
+        ws.dedupe.insert(
+            (ev_dev_userspace, ev.inode),
+            DedupeEntry { invalidated: false },
+        );
 
         tracing::info!(
             session = %ev.command.session,
@@ -822,10 +827,8 @@ impl LinuxCaptureRuntime {
         // handlers will use as pre-image (race-free).
         let fd_raw = f.as_raw_fd();
         if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
-            ws.pre_snapshots.insert(
-                (dev, inode),
-                PreSnapshot { meta, bytes },
-            );
+            ws.pre_snapshots
+                .insert((dev, inode), PreSnapshot { meta, bytes });
         }
         // Stash the fd in pre_opens. Subsequent unlink for this
         // (dev, inode) will hit the table → race_won → pre-image
@@ -932,10 +935,8 @@ impl LinuxCaptureRuntime {
             tracing::warn!(error = %e, "lsm open send_response_with_fd failed");
         }
 
-        ws.dedupe.insert(
-            (ev_dev, ev.inode),
-            DedupeEntry { invalidated: false },
-        );
+        ws.dedupe
+            .insert((ev_dev, ev.inode), DedupeEntry { invalidated: false });
 
         tracing::info!(
             session = %ev.command.session,
@@ -1007,10 +1008,7 @@ impl LinuxCaptureRuntime {
 fn kernel_dev_to_userspace(kdev: u64) -> u64 {
     let major: u64 = kdev >> 20;
     let minor: u64 = kdev & 0xfffff;
-    (minor & 0xff)
-        | ((major & 0xfff) << 8)
-        | ((minor & !0xff) << 12)
-        | ((major & !0xfff) << 32)
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
 /// View into an `lsm/inode_unlink` event as the BPF ringbuf reader

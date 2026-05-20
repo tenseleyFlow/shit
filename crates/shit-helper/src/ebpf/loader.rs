@@ -391,9 +391,7 @@ impl EbpfLoader {
 
     /// L04 phase 3 — Take the `setattr_events` ringbuf. Mirror of
     /// [`Self::take_unlink_ringbuf`] for the setattr program.
-    pub fn take_setattr_ringbuf(
-        &mut self,
-    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+    pub fn take_setattr_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.setattr_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_SETATTR_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
@@ -450,9 +448,7 @@ impl EbpfLoader {
     }
 
     /// L04 phase 4 — Take the `mkdir_events` ringbuf.
-    pub fn take_mkdir_ringbuf(
-        &mut self,
-    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+    pub fn take_mkdir_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.mkdir_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_MKDIR_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
@@ -507,9 +503,7 @@ impl EbpfLoader {
     }
 
     /// L04 phase 5 — Take the `create_events` ringbuf.
-    pub fn take_create_ringbuf(
-        &mut self,
-    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+    pub fn take_create_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.create_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_CREATE_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
@@ -566,9 +560,7 @@ impl EbpfLoader {
     }
 
     /// L04.1 — Take the `open_events` ringbuf.
-    pub fn take_open_ringbuf(
-        &mut self,
-    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+    pub fn take_open_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.open_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_OPEN_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
@@ -623,9 +615,7 @@ impl EbpfLoader {
     }
 
     /// L04.1 — Take the `rename_events` ringbuf.
-    pub fn take_rename_ringbuf(
-        &mut self,
-    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+    pub fn take_rename_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.rename_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_RENAME_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
@@ -637,9 +627,7 @@ impl EbpfLoader {
     /// ownership of the [`aya::Ebpf`] instance so the program stays
     /// attached for the helper's lifetime; the ringbuf is the only
     /// piece that moves to the reader thread.
-    pub fn take_unlink_ringbuf(
-        &mut self,
-    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+    pub fn take_unlink_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_UNLINK_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()

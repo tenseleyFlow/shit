@@ -21,9 +21,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::doctor::json::{
-    CallerEffectiveCaps, CapsReport, HelperBinaryCaps, SystemdUnitReport,
-};
+use crate::doctor::json::{CallerEffectiveCaps, CapsReport, HelperBinaryCaps, SystemdUnitReport};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -134,22 +132,18 @@ pub fn read_systemd_unit() -> SystemdUnitReport {
         };
     }
 
-    let user_unit_active = systemctl_user_stdout(
-        &["is-active", "shit.service"],
-        Duration::from_secs(2),
-    )
-    .map(|s| s.trim() == "active")
-    .unwrap_or(false);
+    let user_unit_active =
+        systemctl_user_stdout(&["is-active", "shit.service"], Duration::from_secs(2))
+            .map(|s| s.trim() == "active")
+            .unwrap_or(false);
 
-    let user_unit_enabled = systemctl_user_stdout(
-        &["is-enabled", "shit.service"],
-        Duration::from_secs(2),
-    )
-    .map(|s| {
-        let t = s.trim();
-        t == "enabled" || t == "static" || t == "alias"
-    })
-    .unwrap_or(false);
+    let user_unit_enabled =
+        systemctl_user_stdout(&["is-enabled", "shit.service"], Duration::from_secs(2))
+            .map(|s| {
+                let t = s.trim();
+                t == "enabled" || t == "static" || t == "alias"
+            })
+            .unwrap_or(false);
 
     SystemdUnitReport {
         user_unit_present,
@@ -191,9 +185,7 @@ pub fn read_caps() -> CapsReport {
     let caller_effective = read_caller_effective_caps();
 
     let setcap_remediation = if helper_binary.readable
-        && !(helper_binary.cap_sys_admin
-            && helper_binary.cap_bpf
-            && helper_binary.cap_perfmon)
+        && !(helper_binary.cap_sys_admin && helper_binary.cap_bpf && helper_binary.cap_perfmon)
     {
         let path = find_helper_bin()
             .map(|p| p.display().to_string())

@@ -365,7 +365,9 @@ fn print_linux_kernel_tier(linux: &json::LinuxReport) {
             ok(h.cap_perfmon)
         );
     } else {
-        println!("helper-caps: ? (helper binary not found via SHIT_HELPER_BIN, FHS paths, or $PATH)");
+        println!(
+            "helper-caps: ? (helper binary not found via SHIT_HELPER_BIN, FHS paths, or $PATH)"
+        );
     }
     let c = &linux.capabilities.caller_effective;
     println!(

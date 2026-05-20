@@ -505,8 +505,7 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 fn run_probe_fanotify() -> anyhow::Result<()> {
     // Init the fanotify fd (FAN_CLASS_PRE_CONTENT).
-    let fd = fanotify::init_pre_content()
-        .map_err(|e| anyhow::anyhow!("init_pre_content: {e}"))?;
+    let fd = fanotify::init_pre_content().map_err(|e| anyhow::anyhow!("init_pre_content: {e}"))?;
 
     // Make a tempdir and mark it. Manual mktemp to avoid the
     // tempfile dev-dep at runtime — keeps the helper binary slim
@@ -520,8 +519,7 @@ fn run_probe_fanotify() -> anyhow::Result<()> {
         std::process::id(),
         nanos
     ));
-    std::fs::create_dir(&dir_path)
-        .map_err(|e| anyhow::anyhow!("mkdir tempdir: {e}"))?;
+    std::fs::create_dir(&dir_path).map_err(|e| anyhow::anyhow!("mkdir tempdir: {e}"))?;
     struct DirGuard(std::path::PathBuf);
     impl Drop for DirGuard {
         fn drop(&mut self) {
@@ -1001,36 +999,42 @@ fn boot_ebpf_lsm(
     excluded_pids: Vec<u32>,
 ) -> anyhow::Result<LsmCaptureState> {
     let mut loader = ebpf::EbpfLoader::new();
-    loader.load_lsm_unlink()
+    loader
+        .load_lsm_unlink()
         .map_err(|e| anyhow::anyhow!("load_lsm_unlink failed: {e}"))?;
-    loader.load_lsm_setattr()
+    loader
+        .load_lsm_setattr()
         .map_err(|e| anyhow::anyhow!("load_lsm_setattr failed: {e}"))?;
-    loader.load_lsm_mkdir()
+    loader
+        .load_lsm_mkdir()
         .map_err(|e| anyhow::anyhow!("load_lsm_mkdir failed: {e}"))?;
-    loader.load_lsm_create()
+    loader
+        .load_lsm_create()
         .map_err(|e| anyhow::anyhow!("load_lsm_create failed: {e}"))?;
-    loader.load_lsm_open()
+    loader
+        .load_lsm_open()
         .map_err(|e| anyhow::anyhow!("load_lsm_open failed: {e}"))?;
-    loader.load_lsm_rename()
+    loader
+        .load_lsm_rename()
         .map_err(|e| anyhow::anyhow!("load_lsm_rename failed: {e}"))?;
-    let unlink_rb = loader
-        .take_unlink_ringbuf()
-        .ok_or_else(|| anyhow::anyhow!("take_unlink_ringbuf returned None after successful load"))?;
-    let setattr_rb = loader
-        .take_setattr_ringbuf()
-        .ok_or_else(|| anyhow::anyhow!("take_setattr_ringbuf returned None after successful load"))?;
+    let unlink_rb = loader.take_unlink_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_unlink_ringbuf returned None after successful load")
+    })?;
+    let setattr_rb = loader.take_setattr_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_setattr_ringbuf returned None after successful load")
+    })?;
     let mkdir_rb = loader
         .take_mkdir_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_mkdir_ringbuf returned None after successful load"))?;
-    let create_rb = loader
-        .take_create_ringbuf()
-        .ok_or_else(|| anyhow::anyhow!("take_create_ringbuf returned None after successful load"))?;
+    let create_rb = loader.take_create_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_create_ringbuf returned None after successful load")
+    })?;
     let open_rb = loader
         .take_open_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_open_ringbuf returned None after successful load"))?;
-    let rename_rb = loader
-        .take_rename_ringbuf()
-        .ok_or_else(|| anyhow::anyhow!("take_rename_ringbuf returned None after successful load"))?;
+    let rename_rb = loader.take_rename_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_rename_ringbuf returned None after successful load")
+    })?;
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
 
@@ -1070,10 +1074,7 @@ fn boot_ebpf_lsm(
             rename_reader,
         ],
         _loader: loader,
-        dispatch: LsmDispatch {
-            tree,
-            runtime,
-        },
+        dispatch: LsmDispatch { tree, runtime },
     })
 }
 
@@ -1111,7 +1112,9 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
         }
         Some("fanotify-perm") => {
             if ebpf_ok && have_fanotify_fd {
-                tracing::info!("SHIT_FORCE_TIER=fanotify-perm — using Fanotify despite ebpf-lsm being available");
+                tracing::info!(
+                    "SHIT_FORCE_TIER=fanotify-perm — using Fanotify despite ebpf-lsm being available"
+                );
                 return CaptureTier::EbpfLsmAvailableButDeferred;
             }
             if have_fanotify_fd {
@@ -1205,24 +1208,29 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         };
 
         // Fanotify branch — current default tier or fallback path.
-        let fanotify_state: Option<fanotify::runtime::FanotifyState> =
-            if matches!(setup.tier, CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred) {
-                setup.fanotify_fd.map(|fd| {
-                    let mut state = fanotify::runtime::FanotifyState::new(fd);
-                    if let Some(rt) = capture_rt.clone() {
-                        state = state.with_capture_runtime(rt);
-                    }
-                    let reader_state = state.clone();
-                    std::thread::Builder::new()
-                        .name("fanotify-reader".into())
-                        .spawn(move || fanotify::runtime::reader_thread(reader_state))
-                        .expect("spawn fanotify reader");
-                    state
-                })
-            } else {
-                tracing::info!(tier = setup.tier.label(), "skipping fanotify reader for this tier");
-                None
-            };
+        let fanotify_state: Option<fanotify::runtime::FanotifyState> = if matches!(
+            setup.tier,
+            CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred
+        ) {
+            setup.fanotify_fd.map(|fd| {
+                let mut state = fanotify::runtime::FanotifyState::new(fd);
+                if let Some(rt) = capture_rt.clone() {
+                    state = state.with_capture_runtime(rt);
+                }
+                let reader_state = state.clone();
+                std::thread::Builder::new()
+                    .name("fanotify-reader".into())
+                    .spawn(move || fanotify::runtime::reader_thread(reader_state))
+                    .expect("spawn fanotify reader");
+                state
+            })
+        } else {
+            tracing::info!(
+                tier = setup.tier.label(),
+                "skipping fanotify reader for this tier"
+            );
+            None
+        };
 
         // eBPF-LSM branch — L04. Load + attach happens here while
         // the helper still has CAP_BPF + CAP_PERFMON (before
@@ -1242,7 +1250,9 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 Err(e) => {
                     tracing::error!(err = %e, "ebpf-lsm load failed; this tier is unusable on this boot");
                     if std::env::var("SHIT_FORCE_TIER").as_deref() == Ok("ebpf-lsm") {
-                        return Err(anyhow::anyhow!("SHIT_FORCE_TIER=ebpf-lsm but load failed: {e}"));
+                        return Err(anyhow::anyhow!(
+                            "SHIT_FORCE_TIER=ebpf-lsm but load failed: {e}"
+                        ));
                     }
                     None
                 }

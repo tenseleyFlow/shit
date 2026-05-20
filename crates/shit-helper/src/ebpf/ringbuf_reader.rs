@@ -708,8 +708,7 @@ fn decode_event<T: Copy>(bytes: &[u8], expected_kind: u8) -> Option<T> {
 /// and sink method via a closure. Constructed once at
 /// LsmReader::spawn time and called once per drained record.
 #[allow(clippy::type_complexity)]
-type RecordHandler =
-    Box<dyn Fn(&[u8], &(dyn LsmEventSink + 'static)) + Send + 'static>;
+type RecordHandler = Box<dyn Fn(&[u8], &(dyn LsmEventSink + 'static)) + Send + 'static>;
 
 /// Userspace consumer of a single L04 LSM ringbuf. One OS thread per
 /// LsmReader instance — separate ringbufs (`unlink_events`,
