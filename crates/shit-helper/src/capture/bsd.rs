@@ -924,16 +924,7 @@ pub fn spawn(
     let (ctrl_tx, ctrl_rx) = sync_channel::<ControlMsg>(64);
     let handle = std::thread::Builder::new()
         .name("shit-bsd-capture-pump".to_string())
-        .spawn(move || {
-            pump(
-                kq,
-                drain_session,
-                conn,
-                staging_dir_fd,
-                ctrl_rx,
-                slash_fd,
-            )
-        })?;
+        .spawn(move || pump(kq, drain_session, conn, staging_dir_fd, ctrl_rx, slash_fd))?;
     Ok((CaptureControl { tx: ctrl_tx }, handle))
 }
 
