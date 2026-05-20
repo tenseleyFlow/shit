@@ -166,6 +166,57 @@ pub struct SetattrEvent {
 
 const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 104);
 
+/// `lsm/inode_mkdir` event — mirrors `struct shit_mkdir_event`.
+/// Captures the parent directory's (dev, inode), the basename of
+/// the about-to-be-created subdirectory, and the umask-applied mode.
+/// The new directory's own (dev, inode) is unknown at hook-time
+/// (the dir doesn't exist yet); userspace stat's the path after the
+/// syscall completes to resolve it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MkdirEvent {
+    pub hdr: EventHeader,
+    pub parent_dev: u64,
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub name_len: u32,
+    pub name: [u8; NAME_BUF_LEN],
+}
+
+const _: () = assert!(std::mem::size_of::<MkdirEvent>() == 320);
+
+impl Default for MkdirEvent {
+    fn default() -> Self {
+        Self {
+            hdr: EventHeader::default(),
+            parent_dev: 0,
+            parent_inode: 0,
+            mode: 0,
+            name_len: 0,
+            name: [0; NAME_BUF_LEN],
+        }
+    }
+}
+
+impl std::fmt::Debug for MkdirEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MkdirEvent")
+            .field("hdr", &self.hdr)
+            .field("parent_dev", &self.parent_dev)
+            .field("parent_inode", &self.parent_inode)
+            .field("mode", &format_args!("{:o}", self.mode))
+            .field("name", &self.basename_str())
+            .finish()
+    }
+}
+
+impl MkdirEvent {
+    pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
+        let len = (self.name_len as usize).min(NAME_BUF_LEN);
+        String::from_utf8_lossy(&self.name[..len])
+    }
+}
+
 /// Sink trait for decoded LSM events. The phase-2-chunk-2 stub
 /// implementation just logs; the production sink wires events into
 /// [`crate::capture::linux::LinuxCaptureRuntime`].
@@ -178,6 +229,7 @@ const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 104);
 pub trait LsmEventSink: Send + Sync + 'static {
     fn on_unlink(&self, _ev: &UnlinkEvent) {}
     fn on_setattr(&self, _ev: &SetattrEvent) {}
+    fn on_mkdir(&self, _ev: &MkdirEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
@@ -237,6 +289,24 @@ impl LsmEventSink for LinuxCaptureSink {
         };
         self.runtime.lock().unwrap().handle_lsm_setattr(&view);
     }
+
+    fn on_mkdir(&self, ev: &MkdirEvent) {
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+            tracing::trace!(pid, "untracked pid; dropping lsm mkdir event");
+            return;
+        };
+        let basename_cow = ev.basename_str();
+        let view = crate::capture::linux::LsmMkdirView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            parent_dev: ev.parent_dev,
+            parent_inode: ev.parent_inode,
+            mode: ev.mode,
+            basename: &basename_cow,
+        };
+        self.runtime.lock().unwrap().handle_lsm_mkdir(&view);
+    }
 }
 
 /// Stub sink — logs each event at info-level. Useful for the manual
@@ -278,6 +348,22 @@ impl LsmEventSink for LoggingSink {
             "lsm event"
         );
     }
+
+    fn on_mkdir(&self, ev: &MkdirEvent) {
+        let comm = comm_to_string(&ev.hdr.comm);
+        let basename = ev.basename_str();
+        tracing::info!(
+            kind = "mkdir",
+            pid = ev.hdr.pid,
+            ts_ns = ev.hdr.ts_ns,
+            parent_dev = ev.parent_dev,
+            parent_inode = ev.parent_inode,
+            mode = format_args!("{:o}", ev.mode),
+            basename = %basename,
+            comm,
+            "lsm event"
+        );
+    }
 }
 
 /// Convert a `[u8; 16]` `comm` array (NUL-terminated, like
@@ -303,6 +389,11 @@ pub fn decode_unlink(bytes: &[u8]) -> Option<UnlinkEvent> {
 /// [`decode_unlink`].
 pub fn decode_setattr(bytes: &[u8]) -> Option<SetattrEvent> {
     decode_event::<SetattrEvent>(bytes, kind::SETATTR)
+}
+
+/// Decode a raw ringbuf record as a [`MkdirEvent`].
+pub fn decode_mkdir(bytes: &[u8]) -> Option<MkdirEvent> {
+    decode_event::<MkdirEvent>(bytes, kind::MKDIR)
 }
 
 /// Internal helper shared by per-kind decoders. `T` must be `repr(C)`
@@ -389,6 +480,32 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as SetattrEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Spawn a mkdir-ringbuf reader. Convenience wrapper for
+    /// `lsm/inode_mkdir`.
+    pub fn spawn_mkdir(
+        mkdir_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-mkdir",
+            mkdir_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_mkdir(bytes) {
+                    sink.on_mkdir(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as MkdirEvent"
                     );
                 }
             }),
@@ -598,6 +715,40 @@ mod tests {
         let mut bytes = [0u8; 104];
         bytes[0] = kind::UNLINK;
         assert!(decode_setattr(&bytes).is_none());
+    }
+
+    #[test]
+    fn mkdir_event_layout_is_320_bytes() {
+        assert_eq!(std::mem::size_of::<MkdirEvent>(), 320);
+        assert_eq!(std::mem::align_of::<MkdirEvent>(), 8);
+    }
+
+    #[test]
+    fn decode_mkdir_round_trips() {
+        let mut name_buf = [0u8; NAME_BUF_LEN];
+        name_buf[..3].copy_from_slice(b"bar");
+        let original = MkdirEvent {
+            hdr: EventHeader {
+                kind: kind::MKDIR,
+                _pad: [0; 3],
+                pid: 999,
+                tgid: 999,
+                _pad2: 0,
+                ts_ns: 0xfedc_ba98_7654_3210,
+                comm: *b"mkdir\0\0\0\0\0\0\0\0\0\0\0",
+            },
+            parent_dev: 0x802,
+            parent_inode: 42,
+            mode: 0o755,
+            name_len: 3,
+            name: name_buf,
+        };
+        let bytes: [u8; 320] = unsafe { std::mem::transmute(original) };
+        let decoded = decode_mkdir(&bytes).expect("decode");
+        assert_eq!(decoded.hdr.kind, kind::MKDIR);
+        assert_eq!(decoded.parent_inode, 42);
+        assert_eq!(decoded.mode, 0o755);
+        assert_eq!(decoded.basename_str(), "bar");
     }
 
     #[test]

@@ -51,22 +51,28 @@ const INODE_UNLINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_unlink.bpf
 /// `shit_inode_setattr`, LSM hook = `inode_setattr`.
 const INODE_SETATTR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_setattr.bpf.o");
 
+/// L04 — BPF object containing the `lsm/inode_mkdir` LSM hook.
+const INODE_MKDIR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_mkdir.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
 const LSM_HOOK_INODE_SETATTR: &str = "inode_setattr";
+const LSM_HOOK_INODE_MKDIR: &str = "inode_mkdir";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
 /// section and the function name agree.
 const LSM_PROG_INODE_UNLINK: &str = "shit_inode_unlink";
 const LSM_PROG_INODE_SETATTR: &str = "shit_inode_setattr";
+const LSM_PROG_INODE_MKDIR: &str = "shit_inode_mkdir";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
 /// the userspace consumer threads.
 const RINGBUF_UNLINK_EVENTS: &str = "unlink_events";
 const RINGBUF_SETATTR_EVENTS: &str = "setattr_events";
+const RINGBUF_MKDIR_EVENTS: &str = "mkdir_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -113,6 +119,7 @@ impl ProbeOutcome {
 pub struct EbpfLoader {
     bpf: Option<aya::Ebpf>,
     setattr_bpf: Option<aya::Ebpf>,
+    mkdir_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -126,6 +133,7 @@ impl std::fmt::Debug for EbpfLoader {
         f.debug_struct("EbpfLoader")
             .field("unlink_loaded", &self.bpf.is_some())
             .field("setattr_loaded", &self.setattr_bpf.is_some())
+            .field("mkdir_loaded", &self.mkdir_bpf.is_some())
             .finish()
     }
 }
@@ -135,6 +143,7 @@ impl EbpfLoader {
         Self {
             bpf: None,
             setattr_bpf: None,
+            mkdir_bpf: None,
         }
     }
 
@@ -149,7 +158,7 @@ impl EbpfLoader {
 
     /// Whether ANY program is currently loaded + attached.
     pub fn is_loaded(&self) -> bool {
-        self.bpf.is_some() || self.setattr_bpf.is_some()
+        self.bpf.is_some() || self.setattr_bpf.is_some() || self.mkdir_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -207,12 +216,14 @@ impl EbpfLoader {
     /// cleanup), but this lets the caller force it without dropping
     /// the loader (e.g. for graceful shutdown sequencing).
     pub fn detach(&mut self) {
-        let unlink_was_loaded = self.bpf.take().is_some();
-        let setattr_was_loaded = self.setattr_bpf.take().is_some();
-        if unlink_was_loaded || setattr_was_loaded {
+        let unlink_was = self.bpf.take().is_some();
+        let setattr_was = self.setattr_bpf.take().is_some();
+        let mkdir_was = self.mkdir_bpf.take().is_some();
+        if unlink_was || setattr_was || mkdir_was {
             tracing::info!(
-                unlink = unlink_was_loaded,
-                setattr = setattr_was_loaded,
+                unlink = unlink_was,
+                setattr = setattr_was,
+                mkdir = mkdir_was,
                 "ebpf programs detached"
             );
         }
@@ -353,6 +364,65 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    /// L04 phase 4 — Load + attach the `lsm/inode_mkdir` program.
+    /// Same contract as [`Self::load_lsm_unlink`]; ringbufs
+    /// `(parent_inode, basename, mode)` for every `mkdir(2)` call.
+    pub fn load_lsm_mkdir(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.mkdir_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_mkdir: mkdir program already loaded".into(),
+            ));
+        }
+
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        let aligned: Vec<u8> = INODE_MKDIR_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_mkdir): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_MKDIR)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_MKDIR}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_INODE_MKDIR, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_MKDIR}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_INODE_MKDIR,
+            prog = LSM_PROG_INODE_MKDIR,
+            ringbuf = RINGBUF_MKDIR_EVENTS,
+            "ebpf-lsm inode_mkdir loaded and attached"
+        );
+        self.mkdir_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04 phase 4 — Take the `mkdir_events` ringbuf.
+    pub fn take_mkdir_ringbuf(
+        &mut self,
+    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.mkdir_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_MKDIR_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
     /// L04 — Take the `unlink_events` ringbuf for the userspace
     /// consumer. Returns `None` if the loader isn't loaded yet, or
     /// if the ringbuf has already been taken. The loader retains
@@ -425,6 +495,8 @@ mod tests {
         assert!(INODE_UNLINK_OBJ.len() > 100);
         assert_eq!(&INODE_SETATTR_OBJ[..4], b"\x7fELF");
         assert!(INODE_SETATTR_OBJ.len() > 100);
+        assert_eq!(&INODE_MKDIR_OBJ[..4], b"\x7fELF");
+        assert!(INODE_MKDIR_OBJ.len() > 100);
     }
 
     #[test]

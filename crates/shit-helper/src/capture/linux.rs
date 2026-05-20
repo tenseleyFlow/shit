@@ -602,6 +602,84 @@ impl LinuxCaptureRuntime {
             "lsm-setattr CapturedPreImage sent",
         );
     }
+
+    /// L04 phase 4 — handler for `lsm/inode_mkdir` events. The LSM
+    /// hook fires BEFORE the dir is created, so we don't yet have a
+    /// (dev, inode) for the new dir. We resolve via stat-after-the-
+    /// syscall: by the time the userspace consumer drains the
+    /// ringbuf (~µs after submit), the kernel has completed mkdir
+    /// and the new dir exists at /proc/<pid>/cwd/<basename>.
+    ///
+    /// Wire: HelperResponse::TreeMutation { op: TreeOpWire::Create
+    /// { kind: Directory, .. } }. No SCM_RIGHTS fd needed — dir
+    /// creation has no content blob.
+    pub fn handle_lsm_mkdir(&mut self, ev: &LsmMkdirView<'_>) {
+        let _ws = self.watches.entry(ev.command).or_default();
+
+        // Resolve the new dir's path. The LSM hook fired with the
+        // dentry's basename; the parent is the cwd of the calling pid
+        // (for `mkdir foo` with no slashes). For `mkdir a/b` cases the
+        // parent isn't cwd; defer those to a follow-up that walks the
+        // dentry's parent chain.
+        let cwd_link = format!("/proc/{}/cwd", ev.pid);
+        let resolved_dir = match std::fs::read_link(&cwd_link) {
+            Ok(cwd) => cwd.join(ev.basename),
+            Err(e) => {
+                tracing::warn!(err = %e, pid = ev.pid, "lsm mkdir: read_link cwd failed");
+                return;
+            }
+        };
+
+        // Stat to grab the (dev, inode) of the freshly-created dir.
+        let (dev, inode) = match std::fs::symlink_metadata(&resolved_dir) {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                if !meta.is_dir() {
+                    tracing::warn!(
+                        path = %resolved_dir.display(),
+                        "lsm mkdir: post-stat is not a dir (race?); dropping"
+                    );
+                    return;
+                }
+                (meta.dev(), meta.ino())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    path = %resolved_dir.display(),
+                    "lsm mkdir: post-stat failed; dropping"
+                );
+                return;
+            }
+        };
+
+        let resp = HelperResponse::TreeMutation {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            op: shit_proto::TreeOpWire::Create {
+                dev,
+                inode,
+                path: path_to_string(&resolved_dir),
+                kind: shit_proto::FileKindWire::Directory,
+                mode: ev.mode,
+            },
+            ts_unix_nanos: now_unix_nanos(),
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "lsm mkdir send_response failed");
+        }
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev,
+            inode,
+            mode = format_args!("{:o}", ev.mode),
+            path = %resolved_dir.display(),
+            "lsm-mkdir TreeMutation sent",
+        );
+    }
 }
 
 /// Convert the kernel's `dev_t` encoding (`(major << 20) | minor`)
@@ -650,6 +728,19 @@ pub struct LsmSetattrView {
     pub new_uid: u32,
     pub new_gid: u32,
     pub new_size: u64,
+}
+
+/// View into an `lsm/inode_mkdir` event. The new directory's own
+/// (dev, inode) is unknown at hook time (it doesn't exist yet);
+/// userspace stats the resolved path post-syscall to fill them in.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmMkdirView<'a> {
+    pub command: CommandId,
+    pub pid: u32,
+    pub parent_dev: u64,
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub basename: &'a str,
 }
 
 /// Decide whether the producer should emit a pre-image capture for
