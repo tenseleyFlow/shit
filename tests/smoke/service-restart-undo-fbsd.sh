@@ -160,9 +160,36 @@ smoke_log "session close"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
 
-# Happy-path cleanup runs explicitly here (no trap). See the
-# `restore_cron_if_needed` definition above for why we avoid the
-# trap path on this smoke.
+# === B04.6a INSTRUMENTATION ===
+# Background watchdog: snapshots ps + procstat -k for THIS bash
+# every 5s. Writes to /tmp/watchdog.log which the workflow uploads
+# on failure. The watchdog kills itself after 4 min so it never
+# pins the shell — bash should exit before then.
+SMOKE_BASH_PID=$$
+(
+    end=$(($(date +%s) + 240))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        printf -- '--- watchdog %s (bash=%s) ---\n' "$(date -u +%H:%M:%S)" "$SMOKE_BASH_PID"
+        ps -axfo pid,ppid,pgid,sid,tty,stat,wchan,command 2>&1 | head -50
+        printf -- '--- procstat -k %s ---\n' "$SMOKE_BASH_PID"
+        procstat -k "$SMOKE_BASH_PID" 2>&1 || echo "  (procstat unavailable or pid gone)"
+        printf -- '--- fstat -p %s ---\n' "$SMOKE_BASH_PID"
+        fstat -p "$SMOKE_BASH_PID" 2>&1 || echo "  (fstat unavailable or pid gone)"
+        sleep 5
+    done
+) >/tmp/watchdog.log 2>&1 &
+WATCHDOG_PID=$!
+disown "$WATCHDOG_PID" 2>/dev/null || true
+echo "[diag $(date -u +%H:%M:%S)] watchdog pid=$WATCHDOG_PID; output → /tmp/watchdog.log" >&2
+
+# Cleanup runs explicitly (no trap). Each step logged with timestamp.
+echo "[diag $(date -u +%H:%M:%S)] entering restore_cron_if_needed" >&2
 restore_cron_if_needed
+echo "[diag $(date -u +%H:%M:%S)] restore_cron_if_needed done; calling smoke_stop_shitd" >&2
 smoke_stop_shitd
+echo "[diag $(date -u +%H:%M:%S)] smoke_stop_shitd done; about to exit 0" >&2
+# Tail of watchdog for inline visibility in CI log; full file uploaded as artifact.
+echo "[diag $(date -u +%H:%M:%S)] watchdog tail at exit time:" >&2
+tail -40 /tmp/watchdog.log 2>&1 | sed 's/^/    /' >&2 || true
+echo "[diag $(date -u +%H:%M:%S)] calling exit 0" >&2
 exit 0

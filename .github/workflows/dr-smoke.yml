@@ -325,6 +325,11 @@ jobs:
             echo "  doctor kqueue_functional: PASS"
             jq -r '.bsd | "  capsicum: \(.capsicum_available)  zfs_datasets: \(.zfs_datasets|length)  runtime_capture: \(.runtime_capture)"' /tmp/doctor.json
 
+            echo "===== environment diagnostics ====="
+            echo "  bash: $(bash --version | head -1)"
+            echo "  uname: $(uname -srm)"
+            echo "  timeout: $(/usr/bin/timeout --version 2>&1 | head -1 || /usr/bin/timeout 2>&1 | head -1 || true)"
+
             echo "===== run smokes ====="
             FAIL_COUNT=0
             SMOKES="rm-undo-fbsd.sh \
@@ -338,14 +343,33 @@ jobs:
                     kill-proc-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
-              # `timeout(1)` is in GNU coreutils which we didn't
-              # install; FreeBSD has /usr/bin/timeout via base. Each
-              # smoke gets 5 min.
-              if /usr/bin/timeout 300 bash "tests/smoke/$smoke"; then
-                echo "  PASS: $smoke"
-              else
-                echo "  FAIL: $smoke"
-                FAIL_COUNT=$((FAIL_COUNT + 1))
+              # Capture timeout's exit code separately so we can
+              # distinguish: 0=success, 124=timeout(1)-killed,
+              # 137=SIGKILL'd, other=smoke explicitly exited.
+              # Don't use `if timeout ...; then` — that loses the
+              # exit code distinction.
+              set +e
+              /usr/bin/timeout --signal=TERM --kill-after=10 300 \
+                bash "tests/smoke/$smoke"
+              rc=$?
+              set -e
+              case "$rc" in
+                0)    echo "  PASS: $smoke" ;;
+                124)  echo "  FAIL: $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                137)  echo "  FAIL: $smoke (timeout(1) killed bash via SIGKILL after --kill-after)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                125)  echo "  FAIL: $smoke (timeout(1) error)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                126)  echo "  FAIL: $smoke (bash not executable)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                127)  echo "  FAIL: $smoke (bash not found)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                *)    echo "  FAIL: $smoke (exit code $rc — smoke or bash exited explicitly)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+              esac
+              # If watchdog ran, dump it. Visible regardless of whether
+              # bash finished cleanup.
+              if [ -f /tmp/watchdog.log ]; then
+                echo "  --- /tmp/watchdog.log (from inside VM) ---"
+                cat /tmp/watchdog.log | sed 's/^/    /'
+                echo "  --- end watchdog.log ---"
+                # Don't carry over to next smoke iteration.
+                rm -f /tmp/watchdog.log
               fi
             done
 
