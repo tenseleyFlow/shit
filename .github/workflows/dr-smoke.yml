@@ -281,7 +281,7 @@ jobs:
           run: |
             set -eu
             echo "===== install deps ====="
-            sudo pkg install -y rust gmake python3 sqlite3 doas jq
+            sudo pkg install -y rust gmake python3 sqlite3 doas jq git
 
             echo "===== configure doas (permit the CI runner user directly) ====="
             # The cross-platform-actions VM runs commands as a user
@@ -344,7 +344,8 @@ jobs:
                     pfctl-add-undo-fbsd.sh \
                     pfctl-flush-undo-fbsd.sh \
                     kill-proc-undo-fbsd.sh \
-                    capsicum-default-on-fbsd.sh"
+                    capsicum-default-on-fbsd.sh \
+                    git-commit-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
