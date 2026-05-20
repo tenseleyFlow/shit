@@ -19,11 +19,18 @@
  * Mitigations identical: CO-RE reads, straight-line code, ringbuf
  * full ↦ drop silently.
  *
- * LSM hook signature (kernel 6.3+):
- *   int inode_mkdir(struct mnt_idmap *idmap,
- *                   struct inode *dir,
+ * LSM hook signature (observed via vmlinux.h BTF on hasu 7.0.8):
+ *   int inode_mkdir(struct inode *dir,
  *                   struct dentry *dentry,
  *                   umode_t mode);
+ *
+ * Note: mkdir does NOT take `struct mnt_idmap *` (unlike inode_setattr
+ * which does, or inode_create which does). The LSM hook table for
+ * this kernel ships only the 3-arg form. A BPF_PROG with the wrong
+ * arg count loads (verifier accepts any LSM signature with matching
+ * types) but reads arg slots offset by one — every field ends up
+ * zero/empty. Verified via `bpftool btf dump file /sys/kernel/btf/
+ * vmlinux format c | grep inode_mkdir`.
  *
  * Verified on hasu (NixOS, kernel 7.0.8).
  */
@@ -44,7 +51,6 @@ struct {
 
 SEC("lsm/inode_mkdir")
 int BPF_PROG(shit_inode_mkdir,
-             struct mnt_idmap *idmap,
              struct inode *dir,
              struct dentry *dentry,
              umode_t mode)
