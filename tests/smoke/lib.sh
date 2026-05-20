@@ -192,6 +192,15 @@ smoke_cleanup() {
     pgrep -lf 'shit' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
     printf '[cleanup %s] doas processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
     pgrep -lf 'doas' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
+    printf '[cleanup %s] cron processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
+    pgrep -lf 'cron' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
+    # If cron is alive, dump ITS open fds — we want to confirm it's
+    # the one holding bash's stdout/stderr pipe (or rule it out).
+    cron_pid=$(pgrep -x cron 2>/dev/null | head -1)
+    if [ -n "${cron_pid}" ]; then
+        printf '[cleanup %s] cron(%s) open fds:\n' "$(date -u +%H:%M:%S)" "${cron_pid}" >&2
+        procstat -f "${cron_pid}" 2>&1 | sed 's/^/  /' >&2 || true
+    fi
     # Safety-net: if `exit $rc` hangs (FBSD CI fd-inheritance quirk
     # we couldn't isolate), force-kill bash in 10 sec. Plain
     # backgrounded subshell — `setsid` isn't in FreeBSD base; using

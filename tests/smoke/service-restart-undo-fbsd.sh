@@ -160,9 +160,15 @@ smoke_log "session close"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
 
-# lib.sh's smoke_cleanup EXIT trap handles teardown
-# (smoke_stop_shitd + tmpdir cleanup). lib.sh was instrumented in
-# this iteration to log every step of smoke_stop_shitd — if we hang
-# again, we'll see exactly which line blocks.
-restore_cron_if_needed
+# Critical for CI-VM-only hang we couldn't reproduce locally: cron
+# (or one of its rc.d daemonize ancestors) keeps bash's stdout/
+# stderr pipe write-end open. The driver `| tee` pipe never EOFs,
+# so the whole driver loop blocks even after bash's exit() syscall.
+# procstat -f showed cron-tied smokes have stdout-pipe refcount 8
+# vs 6 for stateless smokes. Killing cron at cleanup releases the
+# pipe ref and unblocks tee → driver. Test invariant (cron running
+# post-undo) was already asserted above, so this is safe.
+${PRIV} /usr/sbin/service "${TARGET_UNIT}" onestop >/dev/null 2>&1 || true
+${PRIV} pkill -KILL cron 2>/dev/null || true
+
 exit 0
