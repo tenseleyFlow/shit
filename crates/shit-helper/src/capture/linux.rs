@@ -1194,6 +1194,14 @@ fn path_for_kernel_fd(fd: RawFd) -> Option<PathBuf> {
 /// us an fd pre-opened at the moment of the syscall — pread(2) on it
 /// returns the bytes as they existed before the about-to-happen
 /// mutation, even after the file is unlinked.
+///
+/// **Caveat for held fds (L04.1):** `dup(2)` shares the file offset
+/// with the source fd. If the same source fd is used for repeated
+/// `read_pre_image` calls (which is the L04 pre_opens pattern), the
+/// second call would start at EOF and return zero bytes. We `lseek`
+/// the dup back to 0 before reading — the share-the-offset semantic
+/// of dup means this resets the original fd's offset too, which is
+/// what we want for repeated reads.
 fn read_pre_image(fd: RawFd) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     // Stat to size-cap; refuse to capture huge files (the kernel
@@ -1210,11 +1218,19 @@ fn read_pre_image(fd: RawFd) -> std::io::Result<Vec<u8>> {
         ));
     }
     // Use a fresh File handle bound to the fd so we don't move
-    // ownership — the caller owns the fd. dup(2) lets us read without
-    // mutating the kernel's offset.
+    // ownership — the caller owns the fd.
     let dup_fd = unsafe { libc::dup(fd) };
     if dup_fd < 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    // Rewind to start before reading. dup shares the offset with the
+    // source — without this, a held fd that's already been read once
+    // (e.g. by pre_open_tree's snapshot pass) returns zero bytes on
+    // subsequent reads.
+    if unsafe { libc::lseek(dup_fd, 0, libc::SEEK_SET) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        return Err(err);
     }
     let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
     let mut f = std::fs::File::from(owned);
