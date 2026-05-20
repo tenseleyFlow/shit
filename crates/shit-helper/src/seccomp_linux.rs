@@ -120,7 +120,11 @@ pub fn install_filter() -> Result<(), SeccompError> {
 }
 
 /// Build the filter with the production default (`KillProcess`).
-/// Used by tests + audit tooling that don't go through the env var.
+/// Used by unit tests; production goes through `install_filter` which
+/// reads the env var and dispatches to `build_filter_with_action`
+/// directly. `cfg(test)` keeps this from being a dead-code lint
+/// against the release binary.
+#[cfg(test)]
 pub fn build_filter() -> Result<SeccompFilter, SeccompError> {
     build_filter_with_action(SeccompAction::KillProcess)
 }
