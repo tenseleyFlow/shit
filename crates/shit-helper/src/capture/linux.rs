@@ -360,13 +360,20 @@ impl LinuxCaptureRuntime {
             .map(|p| path_to_string(&p))
             .unwrap_or_else(|_| format!("{cwd_link}/{}", ev.basename));
 
+        // BPF reports `dev` in the kernel's `dev_t` encoding
+        // (`(major << 20) | minor`). All userspace stat-derived
+        // (dev, inode) keys in this runtime — including the
+        // pre_opens table — use glibc's encoding (split-bits via
+        // `__gnu_dev_makedev`). Convert before lookup.
+        let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
+
         // Look up pre-opened fd for this (dev, inode). The fd was
         // grabbed at WatchTree time by `pre_open_tree`. Even after
         // vfs_unlink completes, the inode stays alive while we hold
         // the fd — same trick BSD kqueue uses. This is the
         // deterministic capture path; race-to-open is a last-resort
         // fallback for files created mid-session.
-        let (capture_fd_owned, fd_source) = if let Some(fd) = ws.pre_opens.remove(&(ev.dev, ev.inode)) {
+        let (capture_fd_owned, fd_source) = if let Some(fd) = ws.pre_opens.remove(&(ev_dev_userspace, ev.inode)) {
             (Some(fd), "pre-opened")
         } else {
             // Fall back to race-to-open via /proc/<pid>/cwd. The
@@ -398,8 +405,10 @@ impl LinuxCaptureRuntime {
         //   - O_NOFOLLOW caught a symlink (file_type != Regular)
         //   - pre_open_tree captured a stale (dev, inode) — guard
         //     against rare reuse.
+        // `capture_dev` is glibc-encoded (from fstat); compare against
+        // the converted ev_dev_userspace, not the raw kernel dev.
         let race_won = capture_fd_owned.is_some()
-            && capture_dev == ev.dev
+            && capture_dev == ev_dev_userspace
             && capture_inode == ev.inode
             && file_type == FileType::Regular;
         let race_fd = capture_fd_owned;
@@ -442,7 +451,9 @@ impl LinuxCaptureRuntime {
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
             seq: ev.command.seq,
-            dev: ev.dev,
+            // Daemon side compares against PreExec's cwd_dev which is
+            // glibc-encoded; send the converted value.
+            dev: ev_dev_userspace,
             inode: ev.inode,
             path: Some(resolved_path.clone()),
             blob_hash,
@@ -467,15 +478,17 @@ impl LinuxCaptureRuntime {
 
         // Mark dedupe invalidated regardless of race outcome — the
         // unlink happened, so any subsequent reuse of (dev, inode)
-        // should re-capture.
+        // should re-capture. Keyed in glibc-encoded dev for symmetry
+        // with the fanotify producer's dedupe.
         ws.dedupe
-            .insert((ev.dev, ev.inode), DedupeEntry { invalidated: true });
+            .insert((ev_dev_userspace, ev.inode), DedupeEntry { invalidated: true });
 
         tracing::info!(
             session = %ev.command.session,
             seq = ev.command.seq,
             pid = ev.pid,
-            dev = ev.dev,
+            dev_kernel = ev.dev,
+            dev_userspace = ev_dev_userspace,
             inode = ev.inode,
             race_won,
             fd_source,
@@ -485,6 +498,21 @@ impl LinuxCaptureRuntime {
             "lsm-unlink CapturedPreImage sent",
         );
     }
+}
+
+/// Convert the kernel's `dev_t` encoding (`(major << 20) | minor`)
+/// to glibc's userspace encoding (split-bits per `__gnu_dev_makedev`).
+/// All userspace stat() values use the latter; BPF CO-RE reads of
+/// `i_sb->s_dev` produce the former. Without the conversion, the
+/// dedupe map and pre_opens table key mismatch with values fstat
+/// returns elsewhere in the runtime.
+fn kernel_dev_to_userspace(kdev: u64) -> u64 {
+    let major: u64 = kdev >> 20;
+    let minor: u64 = kdev & 0xfffff;
+    (minor & 0xff)
+        | ((major & 0xfff) << 8)
+        | ((minor & !0xff) << 12)
+        | ((major & !0xfff) << 32)
 }
 
 /// View into an `lsm/inode_unlink` event as the BPF ringbuf reader
@@ -856,8 +884,13 @@ mod tests {
 
         rt.handle_lsm_unlink(&view);
 
+        // Dedupe is keyed in glibc-encoded dev; the handler converts
+        // from the view's kernel-encoded dev. Don't bind the test to
+        // a specific encoding — just assert exactly one entry exists
+        // and it's invalidated.
         let ws = rt.watches.get(&cmd).expect("watch state created");
-        let entry = ws.dedupe.get(&(dev, inode)).expect("dedupe entry exists");
+        assert_eq!(ws.dedupe.len(), 1, "exactly one dedupe entry");
+        let entry = ws.dedupe.values().next().unwrap();
         assert!(entry.invalidated, "dedupe entry must be invalidated");
     }
 
@@ -883,7 +916,19 @@ mod tests {
         rt.handle_lsm_unlink(&view);
 
         let ws = rt.watches.get(&cmd).expect("watch state created");
-        let entry = ws.dedupe.get(&(0xdead_beef, 0xcafe_babe)).expect("dedupe entry");
+        assert_eq!(ws.dedupe.len(), 1, "exactly one dedupe entry");
+        let entry = ws.dedupe.values().next().unwrap();
         assert!(entry.invalidated);
+    }
+
+    /// L04 — kernel→glibc dev_t conversion vector. Picked from a real
+    /// hasu observation: kernel `0x800002` (major=8 minor=2) maps to
+    /// glibc `0x802` (== `2050` decimal, as seen on PreExec's cwd_dev
+    /// in the smoke harness log).
+    #[test]
+    fn kernel_dev_to_userspace_matches_observed_vector() {
+        assert_eq!(kernel_dev_to_userspace(0x800002), 0x802);
+        // Identity at major=0: encodings agree.
+        assert_eq!(kernel_dev_to_userspace(42), 42);
     }
 }
