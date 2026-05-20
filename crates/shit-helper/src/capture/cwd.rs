@@ -4,12 +4,11 @@
 //! (S24.B). The capture runtime uses this to figure out which subtree
 //! to register with kqueue when the daemon issues `WatchTree { root_pid, .. }`.
 //!
-//! **Stage 1 (FreeBSD):** shell out to `procstat(1)` from the base
-//! system and parse the `cwd` line. This avoids the
-//! `KERN_PROC_FILEDESC` sysctl FFI dance for the first end-to-end
-//! demo; switching to a pure-sysctl resolver is filed as a follow-up
-//! and lives behind this same `resolve_pid_cwd` API so callers don't
-//! change.
+//! **FreeBSD (B05):** raw `sysctl(KERN_PROC_CWD)` returning a
+//! `struct kinfo_file`. The previous `procstat(1)` shell-out worked
+//! pre-B05 but is blocked under Capsicum capability mode because
+//! `execve(2)` is forbidden. `KERN_PROC_CWD` is on capsicum's
+//! whitelist and works for any pid the caller can otherwise see.
 //!
 //! On NetBSD/OpenBSD/DragonFly we currently return `None`; per the S10
 //! tier doc those BSDs are best-effort and the producer falls back to
@@ -25,12 +24,12 @@
 use std::path::PathBuf;
 
 /// Resolve `pid`'s cwd. Returns `None` when the pid is gone, the
-/// resolver isn't supported on this BSD, or the platform tool failed
-/// in a way that's not actionable.
+/// resolver isn't supported on this BSD, or the platform syscall
+/// failed in a way that's not actionable.
 pub fn resolve_pid_cwd(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "freebsd")]
     {
-        resolve_via_procstat(pid)
+        resolve_via_sysctl_kern_proc_cwd(pid)
     }
     #[cfg(not(target_os = "freebsd"))]
     {
@@ -39,47 +38,83 @@ pub fn resolve_pid_cwd(pid: u32) -> Option<PathBuf> {
     }
 }
 
+/// FreeBSD `sysctl(kern.proc.cwd.<pid>)` returns one or more
+/// `struct kinfo_file` records. The first record is the cwd; its
+/// `kf_path` field is a NUL-terminated absolute path.
+///
+/// Capsicum-compatible: sysctl on KERN_PROC_CWD is whitelisted in
+/// capability mode. No `execve` required.
 #[cfg(target_os = "freebsd")]
-fn resolve_via_procstat(pid: u32) -> Option<PathBuf> {
-    // `procstat -f <pid>` lists every open fd in a fixed column
-    // layout; the row with FD == "cwd" carries the path as the last
-    // whitespace-separated field. Output shape (FreeBSD 14):
-    //   PID COMM       FD T V FLAGS REF OFFSET PRO NAME
-    //   123 sh        cwd v d r--rw---- - -    -  /tmp/foo
-    let out = std::process::Command::new("/usr/bin/procstat")
-        .args(["-f", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+fn resolve_via_sysctl_kern_proc_cwd(pid: u32) -> Option<PathBuf> {
+    // MIB: [CTL_KERN, KERN_PROC, KERN_PROC_CWD, pid]
+    let mib: [libc::c_int; 4] = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_CWD,
+        pid as libc::c_int,
+    ];
+    // First call: probe the required buffer size with a NULL output
+    // pointer. The kernel writes the byte count into len.
+    let mut len: libc::size_t = 0;
+    // SAFETY: mib is a stack-allocated slice we hand a pointer to;
+    // sysctl reads it, writes only into `len`. NULL output pointer is
+    // documented FreeBSD behavior for size queries.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
         return None;
     }
-    parse_procstat_cwd(&out.stdout)
+    let mut buf: Vec<u8> = vec![0; len];
+    // SAFETY: buf has capacity == len; sysctl writes up to len bytes
+    // and updates len to actual written size on success.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    parse_kinfo_file_cwd(&buf)
 }
 
+/// Extract the `kf_path` string from the first `struct kinfo_file`
+/// in `buf`. Kept separate so we can unit-test the parsing logic
+/// without invoking the syscall.
+///
+/// Layout safety: `kinfo_file` has `kf_structsize` as its first
+/// `int` field, telling us the actual record size at runtime. We
+/// use libc's `kinfo_file` struct definition for field access; the
+/// `kf_path` field is a `[c_char; PATH_MAX]` near the end.
 #[cfg(target_os = "freebsd")]
-fn parse_procstat_cwd(stdout: &[u8]) -> Option<PathBuf> {
-    let s = std::str::from_utf8(stdout).ok()?;
-    for line in s.lines().skip(1) {
-        let mut cols = line.split_whitespace();
-        // Skip PID and COMM (which may itself contain spaces — but
-        // procstat doesn't double-quote, so the FD column is reliably
-        // the 3rd whitespace-separated token).
-        let _pid = cols.next()?;
-        let _comm = cols.next()?;
-        let fd = cols.next()?;
-        if fd != "cwd" {
-            continue;
-        }
-        // Re-tokenize the whole line; the path is the *last* field,
-        // and a path with internal whitespace would still survive
-        // because procstat substitutes "-" for any unset field.
-        let path = line.split_whitespace().last()?;
-        if path == "-" {
-            return None;
-        }
-        return Some(PathBuf::from(path));
+fn parse_kinfo_file_cwd(buf: &[u8]) -> Option<PathBuf> {
+    if buf.len() < std::mem::size_of::<libc::kinfo_file>() {
+        return None;
     }
-    None
+    // SAFETY: buf is at least kinfo_file-sized; sysctl returned a
+    // well-formed record. Reading kf_path as a NUL-terminated CStr
+    // is sound because the kernel always writes a terminator.
+    let kif: &libc::kinfo_file = unsafe { &*(buf.as_ptr() as *const libc::kinfo_file) };
+    let cstr = unsafe { std::ffi::CStr::from_ptr(kif.kf_path.as_ptr()) };
+    let path_str = cstr.to_str().ok()?;
+    if path_str.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path_str))
 }
 
 #[cfg(all(test, target_os = "freebsd"))]
@@ -87,36 +122,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_procstat_extracts_cwd_path() {
-        let stdout = b"  PID COMM       FD T V FLAGS    REF  OFFSET PRO NAME\n\
-                       1234 fish      cwd v d -------r-w--- -      -      /tmp/shit-vm-test\n\
-                       1234 fish     root v d -------r-w--- -      -      /\n";
-        assert_eq!(
-            parse_procstat_cwd(stdout),
-            Some(PathBuf::from("/tmp/shit-vm-test"))
-        );
-    }
-
-    #[test]
-    fn parse_procstat_returns_none_when_no_cwd_row() {
-        let stdout = b"  PID COMM       FD T V FLAGS    REF  OFFSET PRO NAME\n\
-                       1234 fish     root v d -------r-w--- -      -      /\n";
-        assert_eq!(parse_procstat_cwd(stdout), None);
-    }
-
-    #[test]
-    fn parse_procstat_returns_none_when_dash() {
-        let stdout = b"  PID COMM       FD T V FLAGS    REF  OFFSET PRO NAME\n\
-                       1234 fish      cwd v d -------r-w--- -      -      -\n";
-        assert_eq!(parse_procstat_cwd(stdout), None);
-    }
-
-    #[test]
     fn resolves_own_cwd() {
-        // The test process is alive; procstat should be able to read
-        // its cwd. We don't assert the specific path (cargo's working
-        // dir varies); we just assert *some* path resolves.
+        // The test process is alive; sysctl should resolve its cwd.
+        // We don't assert the specific path (cargo's working dir
+        // varies); we just assert *some* path resolves.
         let cwd = resolve_pid_cwd(std::process::id());
-        assert!(cwd.is_some(), "expected to resolve own cwd via procstat");
+        assert!(cwd.is_some(), "expected to resolve own cwd via sysctl");
+        let p = cwd.unwrap();
+        assert!(p.is_absolute(), "cwd must be absolute, got {}", p.display());
+    }
+
+    #[test]
+    fn returns_none_for_nonexistent_pid() {
+        // PID 0 (kernel) and very-high PIDs are unlikely to exist as
+        // userspace processes; sysctl returns 0 records.
+        let cwd = resolve_pid_cwd(u32::MAX);
+        assert!(cwd.is_none(), "expected None for nonexistent pid");
     }
 }

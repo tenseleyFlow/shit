@@ -54,7 +54,7 @@ use uuid::Uuid;
 use crate::ipc::Conn;
 use crate::kqueue::{
     DrainEvent, DrainSession, KqueueFd, TrackedSubtree, VnodeEventKind, init as kqueue_init,
-    read_pre_image, register_subtree, spawn_drain,
+    read_pre_image, register_subtree, register_subtree_at, spawn_drain,
 };
 
 /// Default subtree depth — matches `kqueue::vnode::DEFAULT_DEPTH_LIMIT`.
@@ -131,21 +131,37 @@ struct PumpState {
     /// kqueue watches via `TrackedSubtree::add_path` when a new entry
     /// appears in a watched directory.
     kq: Arc<KqueueFd>,
+    /// B05 Phase B — pre-cap_enter `O_DIRECTORY` open of `/`.
+    /// When `Some`, `attach()` opens watch roots via
+    /// `openat(slash_fd, abspath_minus_slash, ...)` so the open
+    /// survives Capsicum capability mode. When `None`, falls back
+    /// to absolute-path `open(...)` (the non-capsicum path).
+    slash_fd: Option<Arc<OwnedFd>>,
 }
 
 impl PumpState {
-    fn new(staging_dir: PathBuf, conn: Arc<Conn>, kq: Arc<KqueueFd>) -> Self {
+    fn new(
+        staging_dir: PathBuf,
+        conn: Arc<Conn>,
+        kq: Arc<KqueueFd>,
+        slash_fd: Option<Arc<OwnedFd>>,
+    ) -> Self {
         Self {
             watches: BTreeMap::new(),
             fd_to_command: HashMap::new(),
             staging_dir,
             conn,
             kq,
+            slash_fd,
         }
     }
 
     fn attach(&mut self, kq: &KqueueFd, command: CommandId, root_path: &Path) {
-        let subtree = match register_subtree(kq, root_path, DEFAULT_DEPTH) {
+        let subtree_result = match &self.slash_fd {
+            Some(slash) => register_subtree_at(kq, slash.as_raw_fd(), root_path, DEFAULT_DEPTH),
+            None => register_subtree(kq, root_path, DEFAULT_DEPTH),
+        };
+        let subtree = match subtree_result {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
@@ -794,6 +810,7 @@ impl CaptureControl {
 pub fn spawn(
     conn: Arc<Conn>,
     staging_dir: PathBuf,
+    slash_fd: Option<Arc<OwnedFd>>,
 ) -> std::io::Result<(CaptureControl, JoinHandle<()>)> {
     std::fs::create_dir_all(&staging_dir)?;
     // Single shared kqueue: the drain thread reads events, the pump
@@ -804,7 +821,7 @@ pub fn spawn(
     let (ctrl_tx, ctrl_rx) = sync_channel::<ControlMsg>(64);
     let handle = std::thread::Builder::new()
         .name("shit-bsd-capture-pump".to_string())
-        .spawn(move || pump(kq, drain_session, conn, staging_dir, ctrl_rx))?;
+        .spawn(move || pump(kq, drain_session, conn, staging_dir, ctrl_rx, slash_fd))?;
     Ok((CaptureControl { tx: ctrl_tx }, handle))
 }
 
@@ -814,8 +831,9 @@ fn pump(
     conn: Arc<Conn>,
     staging_dir: PathBuf,
     ctrl_rx: Receiver<ControlMsg>,
+    slash_fd: Option<Arc<OwnedFd>>,
 ) {
-    let mut state = PumpState::new(staging_dir, conn, Arc::clone(&kq));
+    let mut state = PumpState::new(staging_dir, conn, Arc::clone(&kq), slash_fd);
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
@@ -940,7 +958,7 @@ mod tests {
         let (conn_a, _conn_b) = crate::ipc::socketpair().expect("socketpair");
         let dir = tempfile::tempdir().unwrap();
         let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
-        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a), kq);
+        let mut state = PumpState::new(dir.path().to_path_buf(), Arc::new(conn_a), kq, None);
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,

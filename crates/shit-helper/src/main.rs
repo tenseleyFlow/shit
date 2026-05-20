@@ -874,9 +874,41 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         state
     });
 
+    // B05 Phase B — pre-cap_enter `O_DIRECTORY` open of `/`.
+    // capsicum's `cap_enter(2)` forbids absolute-path opens once
+    // active. We pre-open `/` here and thread the fd through to
+    // capture::bsd::spawn so the kqueue pump can do
+    // `openat(slash_fd, abspath_minus_slash, ...)` for arbitrary
+    // watch roots at runtime. On non-FreeBSD this is a no-op;
+    // the capture runtime sees None and falls back to absolute opens.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    let slash_fd: Option<Arc<std::os::fd::OwnedFd>> = {
+        use std::os::fd::FromRawFd;
+        let cpath = std::ffi::CString::new("/").unwrap();
+        // SAFETY: "/" is a stable, always-present directory; open
+        // with O_DIRECTORY|O_RDONLY|O_CLOEXEC returns a dir fd or -1.
+        let raw =
+            unsafe { libc::open(cpath.as_ptr(), libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            tracing::warn!(
+                err = ?std::io::Error::last_os_error(),
+                "open(/) for slash_fd failed; cap_enter would be unsafe — skipping",
+            );
+            None
+        } else {
+            // SAFETY: raw is a fresh kernel-allocated fd we now own.
+            Some(Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }))
+        }
+    };
+
     // S24.B — BSD kqueue capture runtime. Spawn the pump + drain
-    // threads *before* sandbox entry so any future cap_enter (S24.F)
-    // sees the staging-dir fds already open.
+    // threads *before* sandbox entry so any future cap_enter sees
+    // the staging-dir fds + slash_fd already open.
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -885,7 +917,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     ))]
     let bsd_capture: Option<capture::bsd::CaptureControl> = {
         let staging_dir = cli.state_dir.join("helper-staging");
-        match capture::bsd::spawn(Arc::clone(&conn), staging_dir) {
+        match capture::bsd::spawn(Arc::clone(&conn), staging_dir, slash_fd.clone()) {
             Ok((ctrl, _join)) => {
                 tracing::info!("bsd capture runtime spawned");
                 Some(ctrl)
@@ -900,19 +932,30 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
-    // S24.F — Capsicum capability mode. Off by default because
-    // register_subtree currently opens by absolute path, which
-    // cap_enter forbids. Gated on SHIT_CAPSICUM=1 so we can validate
-    // the call site incrementally before the dir-fd rewrite in S25.
+    // B05 Phase C (deferred) — Capsicum default-on is gated behind a
+    // remaining wire-format change. The dir-fd-relative walker
+    // (Phase A) + slash_fd bootstrap (Phase B) + sysctl cwd resolver
+    // (Phase B.4) are all in place, but resolve_pid_cwd under
+    // cap_enter currently fails: KERN_PROC_CWD lacks CTLFLAG_CAPRD in
+    // the FreeBSD 14 kernel (the sprint file's assumption that it's
+    // capsicum-whitelisted was wrong). Fix path: extend HelperRequest::
+    // WatchTree to carry the cwd path from daemon (which already
+    // receives it from the shell hook) so the helper doesn't have to
+    // resolve cross-pid sysctl under cap_enter. Until that lands,
+    // keep cap_enter as SHIT_CAPSICUM=1 opt-in.
     #[cfg(target_os = "freebsd")]
     if std::env::var("SHIT_CAPSICUM").as_deref() == Ok("1") {
-        match capsicum_bsd::enter_capability_mode() {
-            Ok(()) => {
-                tracing::info!("entered Capsicum capability mode (SHIT_CAPSICUM=1)");
+        if slash_fd.is_some() {
+            match capsicum_bsd::enter_capability_mode() {
+                Ok(()) => {
+                    tracing::info!("entered Capsicum capability mode (SHIT_CAPSICUM=1)");
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
+                }
             }
-            Err(e) => {
-                tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
-            }
+        } else {
+            tracing::warn!("slash_fd unavailable — skipping cap_enter to avoid bricking the helper");
         }
     }
 

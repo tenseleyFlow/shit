@@ -134,17 +134,49 @@ impl TrackedSubtree {
 /// denied entries are silently skipped so a partial tree still
 /// produces a usable subtree.
 ///
-/// B05 Phase A: descendants opened via `openat(parent_fd, name, ...)`
-/// rather than absolute-path `open(...)`. The root itself still opens
-/// absolutely (Phase B will replace with `openat(slash_fd, ...)` once
-/// the slash-fd bootstrap lands; that's the prerequisite for
-/// cap_enter default-on in Phase C).
+/// B05 Phase A: descendants open via `openat(parent_fd, name, ...)`.
+/// B05 Phase B: root opens via [`register_subtree_at`] when a
+/// pre-cap_enter `slash_fd` is available; this variant keeps the
+/// absolute-path root open for back-compat and the unit tests that
+/// pass arbitrary tempdirs.
 pub fn register_subtree(
     kq: &KqueueFd,
     root: &Path,
     depth_limit: usize,
 ) -> Result<TrackedSubtree, KqueueError> {
     let root_fd = open_for_watch(root)?;
+    register_subtree_with_root_fd(kq, root_fd, root, depth_limit)
+}
+
+/// As [`register_subtree`], but opens the root via
+/// `openat(root_dirfd, abspath_minus_slash, ...)` instead of an
+/// absolute `open(...)`. Required after `cap_enter(2)` since
+/// capability mode forbids absolute-path opens system-wide.
+///
+/// `root_dirfd` must be a directory fd that pre-dates `cap_enter` —
+/// typically `slash_fd` (an `O_DIRECTORY` open of `/` from main.rs's
+/// pre-sandbox setup). The root is computed as `abs_root` with its
+/// leading `/` stripped; if `abs_root == "/"`, the slash_fd itself
+/// is duped.
+pub fn register_subtree_at(
+    kq: &KqueueFd,
+    root_dirfd: RawFd,
+    abs_root: &Path,
+    depth_limit: usize,
+) -> Result<TrackedSubtree, KqueueError> {
+    let root_fd = openat_root(root_dirfd, abs_root)?;
+    register_subtree_with_root_fd(kq, root_fd, abs_root, depth_limit)
+}
+
+/// Shared core: given an already-open root fd, fstat it, push as the
+/// first TrackedEntry, recursively register descendants, and submit
+/// the changelist to the kqueue.
+fn register_subtree_with_root_fd(
+    kq: &KqueueFd,
+    root_fd: OwnedFd,
+    root: &Path,
+    depth_limit: usize,
+) -> Result<TrackedSubtree, KqueueError> {
     // fstat the root to learn if it's a directory. fstat works under
     // cap_enter (operation on an fd we own); avoids a second absolute
     // open via symlink_metadata.
@@ -163,6 +195,49 @@ pub fn register_subtree(
     }
     register_entries(kq, &entries)?;
     Ok(TrackedSubtree { entries })
+}
+
+/// Open an absolute path via `openat(root_dirfd, ...)`. `abs_root`
+/// must start with `/`; the leading slash is stripped to form a
+/// path relative to `root_dirfd` (which is expected to be `/` or
+/// a privileged-mount equivalent).
+fn openat_root(root_dirfd: RawFd, abs_root: &Path) -> Result<OwnedFd, KqueueError> {
+    let rel = abs_root.strip_prefix("/").unwrap_or(abs_root);
+    let rel_bytes = rel.as_os_str().as_bytes();
+    // Edge case: abs_root == "/" → rel is empty. dup the dirfd so the
+    // returned fd is independently owned by TrackedSubtree.
+    if rel_bytes.is_empty() {
+        // SAFETY: dup of a borrowed RawFd we don't own; caller guarantees
+        // root_dirfd is alive for the duration of this call.
+        let dup = unsafe { libc::dup(root_dirfd) };
+        if dup < 0 {
+            return Err(KqueueError::Open {
+                path: abs_root.to_path_buf(),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: dup is a fresh kernel-allocated fd we now own.
+        return Ok(unsafe { OwnedFd::from_raw_fd(dup) });
+    }
+    let cpath = CString::new(rel_bytes).map_err(|_| KqueueError::Open {
+        path: abs_root.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte"),
+    })?;
+    // No O_NOFOLLOW on the root open — historically the root open is
+    // willing to traverse symlinks (the daemon may hand us a path
+    // that's itself a symlink target). Descendants use O_NOFOLLOW.
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    // SAFETY: root_dirfd alive per caller contract; cpath is a valid
+    // NUL-terminated C string; openat returns -1/errno on failure.
+    let raw = unsafe { libc::openat(root_dirfd, cpath.as_ptr(), flags, 0) };
+    if raw < 0 {
+        return Err(KqueueError::Open {
+            path: abs_root.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: raw is a fresh kernel-allocated fd we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// Recursively register descendants of `parent_fd`'s directory.
@@ -486,6 +561,38 @@ mod tests {
         let tree = register_subtree(&kq, dir.path(), 1).expect("register");
         // Expect: root, a → 2 entries.
         assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn register_subtree_at_via_slash_dirfd_yields_same_entries() {
+        // B05 Phase B: opening the root via openat against a pre-opened
+        // "/" dir-fd must produce the same TrackedSubtree as the
+        // absolute-path variant.
+        let kq = init().expect("kqueue");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a"), b"a").unwrap();
+        std::fs::write(dir.path().join("b"), b"b").unwrap();
+
+        // Open "/" as the bootstrap dir-fd (mirrors what main.rs will
+        // do pre-cap_enter).
+        let slash = std::ffi::CString::new("/").unwrap();
+        let slash_raw = unsafe { libc::open(slash.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        assert!(slash_raw >= 0, "open / failed: {}", std::io::Error::last_os_error());
+        let slash_fd = unsafe { OwnedFd::from_raw_fd(slash_raw) };
+
+        let tree = register_subtree_at(&kq, slash_fd.as_raw_fd(), dir.path(), 4)
+            .expect("register_subtree_at");
+        // root + 2 files = 3.
+        assert_eq!(tree.len(), 3);
+        // Reverse map still works (entries store absolute paths).
+        let a = dir.path().join("a");
+        let a_fd = tree
+            .entries
+            .iter()
+            .find(|e| e.path == a)
+            .map(|e| e.fd.as_raw_fd())
+            .expect("a tracked");
+        assert_eq!(tree.path_for_fd(a_fd), Some(a.as_path()));
     }
 
     #[test]
