@@ -302,7 +302,7 @@ fn walk_descendants(
         // d_name is a NUL-terminated char array; strlen finds its end.
         let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
         let name_bytes =
-            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len) };
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), name_len) };
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }

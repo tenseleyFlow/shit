@@ -125,10 +125,11 @@ fn should_capture_dedupe(map: &HashMap<(u64, u64), DedupeEntry>, key: (u64, u64)
 struct PumpState {
     watches: BTreeMap<CommandId, WatchState>,
     fd_to_command: HashMap<RawFd, CommandId>,
-    staging_dir: PathBuf,
-    /// B05 Phase C: pre-cap_enter `O_DIRECTORY` open of `staging_dir`.
-    /// `write_to_staging` uses `openat(staging_dir_fd, name, ...)`
+    /// B05 Phase C: pre-cap_enter `O_DIRECTORY` open of the staging
+    /// dir. `write_to_staging` uses `openat(staging_dir_fd, name, ...)`
     /// instead of absolute opens so it works under capability mode.
+    /// (The original `staging_dir: PathBuf` field was removed once
+    /// every staging op switched to the fd-relative API.)
     staging_dir_fd: Arc<OwnedFd>,
     conn: Arc<Conn>,
     /// S29.2 — kept here so `handle_dir_change` can register fresh
@@ -145,7 +146,6 @@ struct PumpState {
 
 impl PumpState {
     fn new(
-        staging_dir: PathBuf,
         staging_dir_fd: Arc<OwnedFd>,
         conn: Arc<Conn>,
         kq: Arc<KqueueFd>,
@@ -154,7 +154,6 @@ impl PumpState {
         Self {
             watches: BTreeMap::new(),
             fd_to_command: HashMap::new(),
-            staging_dir,
             staging_dir_fd,
             conn,
             kq,
@@ -790,7 +789,7 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
         let entry = unsafe { &*entry_ptr };
         let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
         let name_bytes =
-            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len) };
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), name_len) };
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
@@ -930,7 +929,6 @@ pub fn spawn(
                 kq,
                 drain_session,
                 conn,
-                staging_dir,
                 staging_dir_fd,
                 ctrl_rx,
                 slash_fd,
@@ -943,12 +941,11 @@ fn pump(
     kq: Arc<KqueueFd>,
     drain_session: DrainSession,
     conn: Arc<Conn>,
-    staging_dir: PathBuf,
     staging_dir_fd: Arc<OwnedFd>,
     ctrl_rx: Receiver<ControlMsg>,
     slash_fd: Option<Arc<OwnedFd>>,
 ) {
-    let mut state = PumpState::new(staging_dir, staging_dir_fd, conn, Arc::clone(&kq), slash_fd);
+    let mut state = PumpState::new(staging_dir_fd, conn, Arc::clone(&kq), slash_fd);
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
@@ -1100,13 +1097,7 @@ mod tests {
             assert!(raw >= 0);
             Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
         };
-        let mut state = PumpState::new(
-            dir.path().to_path_buf(),
-            staging_fd,
-            Arc::new(conn_a),
-            kq,
-            None,
-        );
+        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), kq, None);
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,
