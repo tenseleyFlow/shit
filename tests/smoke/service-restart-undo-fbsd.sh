@@ -56,12 +56,17 @@ if ! [ -f "/etc/rc.d/${TARGET_UNIT}" ]; then
     smoke_fail "/etc/rc.d/${TARGET_UNIT} missing — unexpected on FreeBSD base"
 fi
 
-# Capture baseline. `service onestatus` reads /var/run/<unit>.pid
-# which is mode 0600 root:wheel — so the unprivileged check
-# false-negatives. Use pgrep instead (same shape as the helper's
-# active-state probe in svc/freebsd.rs).
+# Capture baseline. We need a way to tell "the cron DAEMON is up"
+# that distinguishes from cron's transient job-runner children
+# (e.g. /usr/libexec/atrun every minute, which sets argv[0] to
+# "cron: running job" but keeps p_comm = "cron" — so a plain
+# `pgrep cron` matches both).
+#
+# `service <unit> onestatus` reads /var/run/<unit>.pid which is
+# mode 0600 root:wheel, so use the privileged form. This is the
+# authoritative "is the daemon running?" check.
 unit_running() {
-    pgrep -q "${TARGET_UNIT}"
+    ${PRIV} /usr/sbin/service "${TARGET_UNIT}" onestatus >/dev/null 2>&1
 }
 if unit_running; then
     PRE_ACTIVE="running"
@@ -167,8 +172,14 @@ smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
 # procstat -f showed cron-tied smokes have stdout-pipe refcount 8
 # vs 6 for stateless smokes. Killing cron at cleanup releases the
 # pipe ref and unblocks tee → driver. Test invariant (cron running
-# post-undo) was already asserted above, so this is safe.
+# post-undo) was already asserted above, so this is safe. Iterate
+# since `service stop` doesn't kill cron's "running job" children
+# (e.g. /usr/libexec/atrun), and those may also hold the pipe.
 ${PRIV} /usr/sbin/service "${TARGET_UNIT}" onestop >/dev/null 2>&1 || true
-${PRIV} pkill -KILL cron 2>/dev/null || true
+for _ in 1 2 3 4 5; do
+    pgrep -q cron 2>/dev/null || break
+    ${PRIV} pkill -KILL cron 2>/dev/null || true
+    sleep 0.2
+done
 
 exit 0

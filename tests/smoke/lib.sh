@@ -194,9 +194,13 @@ smoke_cleanup() {
     pgrep -lf 'doas' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
     printf '[cleanup %s] cron processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
     pgrep -lf 'cron' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
-    # If cron is alive, dump ITS open fds — we want to confirm it's
-    # the one holding bash's stdout/stderr pipe (or rule it out).
-    cron_pid=$(pgrep -x cron 2>/dev/null | head -1)
+    # If cron is alive, dump ITS open fds — confirms whether it's
+    # the one holding bash's stdout/stderr pipe. `|| true` matters:
+    # macOS bash 3.2 + `set -e` + `set -o pipefail` aborts the
+    # script on command-substitution-failure-in-assignment when
+    # pgrep finds no match (it pipes to head whose exit-0 normally
+    # papers over the failure, but pipefail surfaces pgrep's exit-1).
+    cron_pid=$(pgrep -x cron 2>/dev/null | head -1 || true)
     if [ -n "${cron_pid}" ]; then
         printf '[cleanup %s] cron(%s) open fds:\n' "$(date -u +%H:%M:%S)" "${cron_pid}" >&2
         procstat -f "${cron_pid}" 2>&1 | sed 's/^/  /' >&2 || true
