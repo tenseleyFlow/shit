@@ -132,60 +132,150 @@ impl TrackedSubtree {
 ///
 /// Symlinks are not followed — we track real inodes only. Permission-
 /// denied entries are silently skipped so a partial tree still
-/// produces a usable subtree. Other I/O errors abort the walk.
+/// produces a usable subtree.
+///
+/// B05 Phase A: descendants opened via `openat(parent_fd, name, ...)`
+/// rather than absolute-path `open(...)`. The root itself still opens
+/// absolutely (Phase B will replace with `openat(slash_fd, ...)` once
+/// the slash-fd bootstrap lands; that's the prerequisite for
+/// cap_enter default-on in Phase C).
 pub fn register_subtree(
     kq: &KqueueFd,
     root: &Path,
     depth_limit: usize,
 ) -> Result<TrackedSubtree, KqueueError> {
-    let mut entries = Vec::new();
-    walk(root, depth_limit, &mut entries)?;
+    let root_fd = open_for_watch(root)?;
+    // fstat the root to learn if it's a directory. fstat works under
+    // cap_enter (operation on an fd we own); avoids a second absolute
+    // open via symlink_metadata.
+    let is_dir = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(root_fd.as_raw_fd(), &mut st) == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
+    };
+    let root_raw = root_fd.as_raw_fd();
+    let mut entries = vec![TrackedEntry {
+        fd: root_fd,
+        path: root.to_path_buf(),
+    }];
+    if is_dir {
+        walk_descendants(root_raw, root, depth_limit, &mut entries);
+    }
     register_entries(kq, &entries)?;
     Ok(TrackedSubtree { entries })
 }
 
-fn walk(
-    path: &Path,
+/// Recursively register descendants of `parent_fd`'s directory.
+///
+/// `parent_fd` is borrowed (the caller retains ownership in the
+/// TrackedSubtree); we `dup(2)` it for `fdopendir` since fdopendir
+/// takes the fd into its own control. Children open via
+/// `openat(parent_fd, name, ...)` so this walk works post-cap_enter
+/// once the root bootstrap lands.
+///
+/// Errors during the walk are best-effort: a single permission-
+/// denied or race-deleted descendant skips that entry but doesn't
+/// abort sibling registration. Matches the original walker's
+/// permissive contract.
+fn walk_descendants(
+    parent_fd: RawFd,
+    parent_path: &Path,
     depth_remaining: usize,
     out: &mut Vec<TrackedEntry>,
-) -> Result<(), KqueueError> {
-    let fd = open_for_watch(path)?;
-    let meta = std::fs::symlink_metadata(path).map_err(|e| KqueueError::Open {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let is_dir = meta.is_dir();
-    out.push(TrackedEntry {
-        fd,
-        path: path.to_path_buf(),
-    });
-    if !is_dir || depth_remaining == 0 {
-        return Ok(());
+) {
+    if depth_remaining == 0 {
+        return;
     }
-    let read_dir = match std::fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
-        Err(e) => {
-            return Err(KqueueError::Open {
-                path: path.to_path_buf(),
-                source: e,
-            });
+    // dup parent_fd so we can give a copy to fdopendir without losing
+    // the caller's reference. closedir releases the dup; the original
+    // parent fd stays alive in the TrackedSubtree.
+    let dup_fd = unsafe { libc::dup(parent_fd) };
+    if dup_fd < 0 {
+        tracing::trace!(
+            parent = %parent_path.display(),
+            err = ?std::io::Error::last_os_error(),
+            "walk_descendants: dup failed",
+        );
+        return;
+    }
+    // SAFETY: dup_fd is a fresh open fd we own; fdopendir takes it
+    // under its control. We never close dup_fd directly — closedir
+    // handles it below.
+    let dir = unsafe { libc::fdopendir(dup_fd) };
+    if dir.is_null() {
+        // fdopendir failed; per the man page, it doesn't close the fd
+        // on failure, so we must.
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        tracing::trace!(
+            parent = %parent_path.display(),
+            err = ?err,
+            "walk_descendants: fdopendir failed",
+        );
+        return;
+    }
+
+    loop {
+        // SAFETY: dir is a valid DIR*; readdir returns NULL at EOF or
+        // on error (which we can't distinguish without errno reset
+        // dance; treat NULL as terminator).
+        let entry_ptr = unsafe { libc::readdir(dir) };
+        if entry_ptr.is_null() {
+            break;
         }
-    };
-    for entry in read_dir.flatten() {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
+        let entry = unsafe { &*entry_ptr };
+        // d_name is a NUL-terminated char array; strlen finds its end.
+        let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
+        let name_bytes = unsafe {
+            std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len)
         };
-        if ft.is_symlink() {
+        if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        // Errors on individual children don't abort the whole walk —
-        // a single permission-denied file in a deep tree shouldn't
-        // wipe out everything we've registered above it.
-        let _ = walk(&entry.path(), depth_remaining - 1, out);
+        // Skip symlinks before we open — O_NOFOLLOW would also catch
+        // them, but a pre-readdir d_type check avoids the openat syscall.
+        if entry.d_type == libc::DT_LNK {
+            continue;
+        }
+        let is_child_dir = entry.d_type == libc::DT_DIR;
+        let name_c = match CString::new(name_bytes) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // openat with O_NOFOLLOW defends against a DT_REG ↦ symlink
+        // race (entry was a file at readdir time, becomes a symlink
+        // before our openat).
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: parent_fd is a valid dir fd; name_c is a valid C
+        // string for the call; openat returns -1/errno on failure.
+        let child_raw = unsafe { libc::openat(parent_fd, name_c.as_ptr(), flags, 0) };
+        if child_raw < 0 {
+            // Skip this descendant; siblings continue. This matches
+            // the original walker's best-effort behavior on permission-
+            // denied / race-deleted / ELOOP.
+            continue;
+        }
+        // SAFETY: child_raw is a fresh kernel-allocated fd we now own.
+        let child_fd = unsafe { OwnedFd::from_raw_fd(child_raw) };
+        let child_raw_for_recurse = child_fd.as_raw_fd();
+        let child_path = parent_path.join(std::ffi::OsStr::from_bytes(name_bytes));
+        out.push(TrackedEntry {
+            fd: child_fd,
+            path: child_path.clone(),
+        });
+        if is_child_dir {
+            walk_descendants(
+                child_raw_for_recurse,
+                &child_path,
+                depth_remaining - 1,
+                out,
+            );
+        }
     }
-    Ok(())
+
+    // closedir closes the dup'd fd and frees the DIR*.
+    // SAFETY: dir is a valid DIR* we got from fdopendir; not closed yet.
+    unsafe { libc::closedir(dir) };
 }
 
 fn open_for_watch(path: &Path) -> Result<OwnedFd, KqueueError> {
@@ -259,21 +349,36 @@ impl TrackedSubtree {
     /// `None` if the open failed (permission-denied, race-deleted,
     /// etc. — non-fatal; the watch silently drops that entry).
     pub fn add_path(&mut self, kq: &KqueueFd, path: &Path) -> Option<RawFd> {
-        let fd = match open_for_watch(path) {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::trace!(path = %path.display(), error = ?e, "add_path open failed");
-                return None;
-            }
-        };
+        // B05 Phase A: open via openat against the parent dir's fd
+        // (which we must already track — callers reach add_path via
+        // a dir-change event on the parent).
+        let parent_path = path.parent()?;
+        let basename = path.file_name()?;
+        let parent_fd = self
+            .entries
+            .iter()
+            .find(|e| e.path == parent_path)
+            .map(|e| e.fd.as_raw_fd())?;
+        let name_c = CString::new(basename.as_bytes()).ok()?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: parent_fd is alive in self.entries; name_c is a
+        // valid NUL-terminated C string for the call.
+        let raw = unsafe { libc::openat(parent_fd, name_c.as_ptr(), flags, 0) };
+        if raw < 0 {
+            tracing::trace!(
+                path = %path.display(),
+                err = ?std::io::Error::last_os_error(),
+                "add_path openat failed",
+            );
+            return None;
+        }
+        // SAFETY: raw is a fresh kernel-allocated fd we now own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let raw = fd.as_raw_fd();
         let entry = TrackedEntry {
             fd,
             path: path.to_path_buf(),
         };
-        // Register one filter against the new fd. We re-use
-        // `register_entries` with a single-element slice to keep the
-        // changelist construction in one place.
         let single = std::slice::from_ref(&entry);
         if let Err(e) = register_entries(kq, single) {
             tracing::warn!(path = %path.display(), error = %e, "add_path kevent register failed");
