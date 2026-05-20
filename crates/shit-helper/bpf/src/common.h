@@ -119,4 +119,22 @@ struct shit_setattr_event {
     __u64 new_size;
 };
 
+/* lsm/inode_mkdir — `mkdir(2)` / `mkdirat(2)`. The LSM hook fires
+ * BEFORE the directory is actually created, so we don't yet have a
+ * (dev, inode) for the new dir — userspace stats the resolved path
+ * after the syscall completes to get those. We capture:
+ *   - parent_inode of the containing directory (from `struct inode
+ *     *dir`),
+ *   - the basename of the new directory (from `struct dentry
+ *     *dentry`'s `d_name`),
+ *   - the umask-applied mode the kernel will assign to it. */
+struct shit_mkdir_event {
+    struct shit_event_hdr hdr;
+    __u64 parent_dev;
+    __u64 parent_inode;
+    __u32 mode;
+    __u32 name_len;
+    char  name[SHIT_NAME_MAX + 1];
+};
+
 #endif /* SHIT_BPF_COMMON_H */
