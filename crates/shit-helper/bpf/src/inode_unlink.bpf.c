@@ -80,6 +80,26 @@ int BPF_PROG(shit_inode_unlink, struct inode *dir, struct dentry *dentry)
     e->inode = BPF_CORE_READ(target, i_ino);
     e->dev = BPF_CORE_READ(target, i_sb, s_dev);
 
+    /* Parent inode lets userspace disambiguate which directory the
+     * unlink happened in — useful when the calling pid has multiple
+     * candidate cwds (chroot, mount namespaces). The `dir` LSM arg
+     * is the parent inode directly. */
+    e->parent_inode = BPF_CORE_READ(dir, i_ino);
+
+    /* Basename via CO-RE on the dentry's qstr. The verifier rejects
+     * unbounded string reads, so we clamp to SHIT_NAME_MAX and use
+     * bpf_core_read_str which writes at most `sz` bytes and returns
+     * the byte count actually written (incl. NUL). */
+    const unsigned char *name_ptr = BPF_CORE_READ(dentry, d_name.name);
+    /* Initialize to 0 in case the str_read fails (returns < 0). */
+    e->name_len = 0;
+    e->_pad3 = 0;
+    long n = bpf_core_read_str(&e->name, sizeof(e->name), name_ptr);
+    if (n > 0) {
+        /* Strip the trailing NUL from the reported length. */
+        e->name_len = (__u32)(n - 1);
+    }
+
     bpf_ringbuf_submit(e, 0);
     return 0;
 }

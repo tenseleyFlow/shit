@@ -52,12 +52,29 @@ struct shit_event_hdr {
     char  comm[SHIT_COMM_LEN];
 };
 
+/* Max bytes captured for a file's basename. Matches kernel NAME_MAX.
+ * Used as the buffer size in `shit_unlink_event::name`. We do NOT
+ * include the trailing NUL count in NAME_MAX; the buffer carries one
+ * extra byte so a NUL-terminated basename always fits. */
+#define SHIT_NAME_MAX 255
+
 /* lsm/inode_unlink — `rm`-style deletes. dev/inode identify the
- * about-to-be-unlinked file. */
+ * about-to-be-unlinked file; (parent_inode, name) are captured so
+ * userspace can race-to-open `/proc/<pid>/cwd/<name>` (or any other
+ * candidate parent) before vfs_unlink completes its d_drop.
+ *
+ * `name_len` is the byte length of the basename (excluding NUL),
+ * clamped to SHIT_NAME_MAX. Set to 0 if the read failed (defensive —
+ * the userspace consumer treats name_len==0 as "name unavailable",
+ * falls back to marker-only handling). */
 struct shit_unlink_event {
     struct shit_event_hdr hdr;
     __u64 dev;
     __u64 inode;
+    __u64 parent_inode;
+    __u32 name_len;
+    __u32 _pad3;
+    char  name[SHIT_NAME_MAX + 1];
 };
 
 #endif /* SHIT_BPF_COMMON_H */
