@@ -781,6 +781,15 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
         unsafe { libc::close(dup_fd) };
         return Err(err);
     }
+    // CRITICAL: dup(2) shares the open file description (including the
+    // file offset) with the source fd. After the attach-time baseline
+    // read, the dir_fd's offset is at EOF. Subsequent read_dir_entries
+    // calls would start from EOF and return nothing — so dir-diff
+    // would miss every new entry. rewinddir resets the shared offset
+    // back to 0. Caught by the freebsd-smoke CI run (amd64) where
+    // mkdir-undo + touch-edit-undo both failed at TreeOpCreate; arm64
+    // shit-fbsd hides this because its fdopendir is more lenient.
+    unsafe { libc::rewinddir(dir) };
     loop {
         let entry_ptr = unsafe { libc::readdir(dir) };
         if entry_ptr.is_null() {
