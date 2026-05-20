@@ -789,9 +789,8 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
         }
         let entry = unsafe { &*entry_ptr };
         let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
-        let name_bytes = unsafe {
-            std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len)
-        };
+        let name_bytes =
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len) };
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
@@ -803,14 +802,8 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
             Err(_) => continue,
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe {
-            libc::fstatat(
-                dir_fd,
-                name_c.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
+        let rc =
+            unsafe { libc::fstatat(dir_fd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
         if rc != 0 {
             continue;
         }
@@ -910,8 +903,9 @@ pub fn spawn(
     // write_to_staging can use openat under cap_enter.
     let staging_dir_fd = {
         use std::os::fd::FromRawFd;
-        let cpath = std::ffi::CString::new(staging_dir.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "staging path NUL"))?;
+        let cpath = std::ffi::CString::new(staging_dir.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "staging path NUL")
+        })?;
         let raw = unsafe {
             libc::open(
                 cpath.as_ptr(),
@@ -1106,8 +1100,13 @@ mod tests {
             assert!(raw >= 0);
             Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
         };
-        let mut state =
-            PumpState::new(dir.path().to_path_buf(), staging_fd, Arc::new(conn_a), kq, None);
+        let mut state = PumpState::new(
+            dir.path().to_path_buf(),
+            staging_fd,
+            Arc::new(conn_a),
+            kq,
+            None,
+        );
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,

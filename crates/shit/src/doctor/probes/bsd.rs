@@ -356,9 +356,15 @@ mod tests {
         // module-level state to avoid env races. We snapshot+restore.
         let prev = std::env::var("SHIT_CAPSICUM").ok();
         unsafe { std::env::set_var("SHIT_CAPSICUM", "0") };
-        assert!(!super::capsicum_default_on(true), "SHIT_CAPSICUM=0 must opt out");
+        assert!(
+            !super::capsicum_default_on(true),
+            "SHIT_CAPSICUM=0 must opt out"
+        );
         unsafe { std::env::remove_var("SHIT_CAPSICUM") };
-        assert!(super::capsicum_default_on(true), "default is on when env unset");
+        assert!(
+            super::capsicum_default_on(true),
+            "default is on when env unset"
+        );
         unsafe { std::env::set_var("SHIT_CAPSICUM", "1") };
         assert!(super::capsicum_default_on(true), "SHIT_CAPSICUM=1 stays on");
         match prev {

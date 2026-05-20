@@ -344,8 +344,7 @@ fn print_bsd_tier(bsd: &json::BsdReport) {
         "capsicum: {}",
         match (bsd.capsicum_available, bsd.capsicum_default_on) {
             (true, true) => "syscall available; helper enters by default",
-            (true, false) =>
-                "syscall available; SHIT_CAPSICUM=0 disables helper sandbox",
+            (true, false) => "syscall available; SHIT_CAPSICUM=0 disables helper sandbox",
             (false, _) => "not available",
         }
     );

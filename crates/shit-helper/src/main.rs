@@ -892,8 +892,12 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         let cpath = std::ffi::CString::new("/").unwrap();
         // SAFETY: "/" is a stable, always-present directory; open
         // with O_DIRECTORY|O_RDONLY|O_CLOEXEC returns a dir fd or -1.
-        let raw =
-            unsafe { libc::open(cpath.as_ptr(), libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC) };
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
         if raw < 0 {
             tracing::warn!(
                 err = ?std::io::Error::last_os_error(),
@@ -952,7 +956,9 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         } else if opt_out {
             tracing::info!("SHIT_CAPSICUM=0 — Capsicum capability mode disabled");
         } else {
-            tracing::warn!("slash_fd unavailable — skipping cap_enter to avoid bricking the helper");
+            tracing::warn!(
+                "slash_fd unavailable — skipping cap_enter to avoid bricking the helper"
+            );
         }
     }
 

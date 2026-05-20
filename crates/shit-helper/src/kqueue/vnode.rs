@@ -301,9 +301,8 @@ fn walk_descendants(
         let entry = unsafe { &*entry_ptr };
         // d_name is a NUL-terminated char array; strlen finds its end.
         let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
-        let name_bytes = unsafe {
-            std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len)
-        };
+        let name_bytes =
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr() as *const u8, name_len) };
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
@@ -339,12 +338,7 @@ fn walk_descendants(
             path: child_path.clone(),
         });
         if is_child_dir {
-            walk_descendants(
-                child_raw_for_recurse,
-                &child_path,
-                depth_remaining - 1,
-                out,
-            );
+            walk_descendants(child_raw_for_recurse, &child_path, depth_remaining - 1, out);
         }
     }
 
@@ -577,7 +571,11 @@ mod tests {
         // do pre-cap_enter).
         let slash = std::ffi::CString::new("/").unwrap();
         let slash_raw = unsafe { libc::open(slash.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-        assert!(slash_raw >= 0, "open / failed: {}", std::io::Error::last_os_error());
+        assert!(
+            slash_raw >= 0,
+            "open / failed: {}",
+            std::io::Error::last_os_error()
+        );
         let slash_fd = unsafe { OwnedFd::from_raw_fd(slash_raw) };
 
         let tree = register_subtree_at(&kq, slash_fd.as_raw_fd(), dir.path(), 4)
