@@ -135,11 +135,12 @@ fn classify_replace_paths(
     }
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
-    for p in creates {
-        if !unlinks.contains(&p) {
+    for p in &creates {
+        if !unlinks.contains(p) {
             continue;
         }
-        // Two transient shapes, one atomic shape:
+        // Three shapes (two transient, one atomic) for paths with BOTH
+        // Create AND Unlink events in the same command:
         //   - Create + Unlink, NO pre-image → pure scratch (e.g.
         //     .git/index.lock that never had prior content). Inverse
         //     is a no-op.
@@ -149,13 +150,32 @@ fn classify_replace_paths(
         //     atomic-replace: restore bytes over the current inode,
         //     suppress Tree-op inverses (which would rmdir/recreate
         //     and conflict with the new inode).
-        if !pre_images.contains(&p) {
-            transient.insert(p);
+        if !pre_images.contains(p) {
+            transient.insert(p.clone());
             continue;
         }
-        if probe.stat(&p).is_some() {
-            atomic.insert(p);
+        if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
         } else {
+            transient.insert(p.clone());
+        }
+    }
+    // Additional transient shape: pure TreeOp::Create whose path is
+    // GONE at undo time. The capture layer's rename pairing on BSD
+    // isn't always able to emit TreeOp::Unlink for the rename source
+    // (kqueue races between the two NOTE_WRITE events on the parent
+    // dir — the source disappearance can get coalesced into the
+    // destination's appearance). Without this rule, the planner emits
+    // an Unlink inverse for a path that's already gone, and the
+    // orchestrator reports ConflictMissing at undo time. Real-world
+    // example: git renames .git/index.lock → .git/index; the pump
+    // captures only Create(index.lock), missing its Unlink. The user's
+    // expectation is the lock path stays gone — same as transient.
+    for p in creates {
+        if unlinks.contains(&p) {
+            continue;
+        }
+        if probe.stat(&p).is_none() {
             transient.insert(p);
         }
     }
@@ -1181,13 +1201,22 @@ mod tests {
 
     #[test]
     fn pure_create_still_gets_unlink_inverse() {
-        // Coalescing should ONLY trigger when all three signatures
-        // (Create + PreImage + Unlink) match. A pure TreeOp::Create
-        // with no PreImage and no Unlink keeps its Unlink inverse.
-        let probe = InMemoryProbe::new();
-        let store = InMemoryStore::new();
+        // Coalescing should ONLY trigger when the path is also gone
+        // at undo time. A pure TreeOp::Create whose path STILL EXISTS
+        // (the command genuinely created something that survived)
+        // keeps its Unlink inverse.
         let inode = InodeRef::new(1, 42);
         let path = PathBuf::from("/tmp/newdir");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let store = InMemoryStore::new();
         let create = CaptureEvent {
             id: EventId(1),
             command: CommandId {
