@@ -76,24 +76,20 @@ if [ "${PRE_ACTIVE}" != "running" ]; then
 fi
 
 cleanup() {
-    # DIAGNOSTIC: log each step so we can see which one hangs in CI.
-    echo "[cleanup $(date -u +%H:%M:%S)] entered, rc=$?" >&2
-    echo "[cleanup $(date -u +%H:%M:%S)] calling smoke_stop_shitd" >&2
+    local rc=$?
     smoke_stop_shitd 2>/dev/null || true
-    echo "[cleanup $(date -u +%H:%M:%S)] smoke_stop_shitd returned" >&2
-    echo "[cleanup $(date -u +%H:%M:%S)] checking pgrep -q ${TARGET_UNIT}" >&2
+    # Defensive restore — only when undo failed to restart cron.
     if ! pgrep -q "${TARGET_UNIT}"; then
-        echo "[cleanup $(date -u +%H:%M:%S)] cron not running; starting" >&2
         ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start </dev/null >/dev/null 2>&1 || true
-        echo "[cleanup $(date -u +%H:%M:%S)] service start returned" >&2
-    else
-        echo "[cleanup $(date -u +%H:%M:%S)] cron already running; skip" >&2
     fi
-    echo "[cleanup $(date -u +%H:%M:%S)] dumping ps -auxd" >&2
-    ps -auxd 2>&1 | tail -30 >&2 || true
-    echo "[cleanup $(date -u +%H:%M:%S)] dumping fstat for current shell" >&2
-    fstat -p $$ 2>&1 | head -20 >&2 || true
-    echo "[cleanup $(date -u +%H:%M:%S)] cleanup returning" >&2
+    # Explicit `exit` is load-bearing under the cross-platform-actions
+    # FreeBSD VM. Without it, bash's post-trap shutdown hangs for the
+    # full `timeout 300` window even though every child is already
+    # reaped. Diagnostic instrumentation in an earlier B04 iteration
+    # confirmed the cleanup body completes in ~5s and the hang is
+    # purely bash's exit sequence. Forcing exit here bypasses
+    # whatever bash-internal cleanup step is slow on that VM.
+    exit "${rc}"
 }
 trap cleanup EXIT
 
