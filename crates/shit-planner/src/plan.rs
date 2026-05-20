@@ -136,7 +136,21 @@ fn classify_replace_paths(
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
     for p in creates {
-        if !unlinks.contains(&p) || !pre_images.contains(&p) {
+        if !unlinks.contains(&p) {
+            continue;
+        }
+        // Two transient shapes, one atomic shape:
+        //   - Create + Unlink, NO pre-image → pure scratch (e.g.
+        //     .git/index.lock that never had prior content). Inverse
+        //     is a no-op.
+        //   - Create + Unlink + pre-image, path GONE at undo → file
+        //     existed, was renamed away, never restored. Same no-op.
+        //   - Create + Unlink + pre-image, path EXISTS at undo →
+        //     atomic-replace: restore bytes over the current inode,
+        //     suppress Tree-op inverses (which would rmdir/recreate
+        //     and conflict with the new inode).
+        if !pre_images.contains(&p) {
+            transient.insert(p);
             continue;
         }
         if probe.stat(&p).is_some() {
@@ -1106,6 +1120,61 @@ mod tests {
         assert!(
             nodes_for_path.is_empty(),
             "transient lock should produce zero inverses, got: {:?}",
+            nodes_for_path.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scratch_file_no_preimage_suppresses_inverses() {
+        // A file created AND unlinked in the same command with NO
+        // pre-image (it never existed before): the inverse is a no-op.
+        // Real-world example: git creates `.git/index.lock` as a
+        // brand-new file then renames it onto `.git/index`. The lock
+        // path itself has no pre-existing content to restore — the
+        // planner used to emit Unlink+RecreatePath, the latter
+        // tripping ConflictMissing because we have no bytes for it.
+        let probe = InMemoryProbe::new(); // path absent at undo
+        let store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 999);
+        let path = PathBuf::from("/tmp/git/index.lock");
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let unlink = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+            }),
+        };
+        let p = plan(dummy_command(), &[create, unlink], &probe, &store);
+        let nodes_for_path: Vec<_> = p
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op,
+                InverseOp::Unlink { path: p } | InverseOp::RecreatePath { path: p, .. }
+                if p == &PathBuf::from("/tmp/git/index.lock")
+            ))
+            .collect();
+        assert!(
+            nodes_for_path.is_empty(),
+            "scratch file with no pre-image should produce zero inverses, got: {:?}",
             nodes_for_path.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
     }
