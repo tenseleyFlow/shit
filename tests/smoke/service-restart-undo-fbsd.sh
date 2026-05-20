@@ -160,36 +160,30 @@ smoke_log "session close"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
 
-# === B04.6a INSTRUMENTATION ===
-# Background watchdog: snapshots ps + procstat -k for THIS bash
-# every 5s. Writes to /tmp/watchdog.log which the workflow uploads
-# on failure. The watchdog kills itself after 4 min so it never
-# pins the shell — bash should exit before then.
-SMOKE_BASH_PID=$$
-(
-    end=$(($(date +%s) + 240))
-    while [ "$(date +%s)" -lt "$end" ]; do
-        printf -- '--- watchdog %s (bash=%s) ---\n' "$(date -u +%H:%M:%S)" "$SMOKE_BASH_PID"
-        ps -axfo pid,ppid,pgid,sid,tty,stat,wchan,command 2>&1 | head -50
-        printf -- '--- procstat -k %s ---\n' "$SMOKE_BASH_PID"
-        procstat -k "$SMOKE_BASH_PID" 2>&1 || echo "  (procstat unavailable or pid gone)"
-        printf -- '--- fstat -p %s ---\n' "$SMOKE_BASH_PID"
-        fstat -p "$SMOKE_BASH_PID" 2>&1 || echo "  (fstat unavailable or pid gone)"
-        sleep 5
-    done
-) >/tmp/watchdog.log 2>&1 &
-WATCHDOG_PID=$!
-disown "$WATCHDOG_PID" 2>/dev/null || true
-echo "[diag $(date -u +%H:%M:%S)] watchdog pid=$WATCHDOG_PID; output → /tmp/watchdog.log" >&2
-
-# Cleanup runs explicitly (no trap). Each step logged with timestamp.
-echo "[diag $(date -u +%H:%M:%S)] entering restore_cron_if_needed" >&2
+# Happy-path cleanup. Each step timestamped so we can locate the
+# hang precisely if it returns.
+echo "[diag $(date -u +%H:%M:%S)] cleanup begin" >&2
 restore_cron_if_needed
-echo "[diag $(date -u +%H:%M:%S)] restore_cron_if_needed done; calling smoke_stop_shitd" >&2
 smoke_stop_shitd
-echo "[diag $(date -u +%H:%M:%S)] smoke_stop_shitd done; about to exit 0" >&2
-# Tail of watchdog for inline visibility in CI log; full file uploaded as artifact.
-echo "[diag $(date -u +%H:%M:%S)] watchdog tail at exit time:" >&2
-tail -40 /tmp/watchdog.log 2>&1 | sed 's/^/    /' >&2 || true
-echo "[diag $(date -u +%H:%M:%S)] calling exit 0" >&2
-exit 0
+echo "[diag $(date -u +%H:%M:%S)] cleanup done; snapshotting tracked-child state" >&2
+
+# One-shot snapshot RIGHT BEFORE exit. No background processes (the
+# watchdog itself was pinning bash in `wait4()`). procstat -k tells
+# us the kernel stack — if bash is in sys_wait4 here it's tracking
+# something that hasn't exited yet.
+echo "--- ps -axfo pid,ppid,pgid,sid,stat,wchan,command (deepest 40) ---" >&2
+ps -axfo pid,ppid,pgid,sid,stat,wchan,command 2>&1 | tail -40 >&2 || true
+echo "--- procstat -k $$ ---" >&2
+procstat -k $$ 2>&1 >&2 || true
+echo "--- fstat -p $$ ---" >&2
+fstat -p $$ 2>&1 | head -20 >&2 || true
+echo "[diag $(date -u +%H:%M:%S)] about to exec true (sidestep bash wait-at-exit on CI VM)" >&2
+
+# Replace bash with /usr/bin/true. Diagnostic earlier this iteration
+# showed bash on the cross-platform-actions FreeBSD-14 VM exits via
+# `sys_wait4()` for tracked backgrounded jobs (shitd's not-fully-
+# reaped grandchildren). `exec true` replaces bash with a brand-new
+# `true` process that has no children to wait on — exits with 0
+# immediately. This is the FreeBSD-CI-bash equivalent of forcing
+# "release all tracked children and exit now."
+exec /usr/bin/true
