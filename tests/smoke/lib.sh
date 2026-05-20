@@ -155,7 +155,9 @@ smoke_stop_shitd() {
 
 smoke_cleanup() {
     local rc=$?
+    printf '[cleanup %s] enter (rc=%d)\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
     smoke_stop_shitd
+    printf '[cleanup %s] smoke_stop_shitd returned; iterating SHIT_SMOKE_PIDS\n' "$(date -u +%H:%M:%S)" >&2
     # Iterate guarded: precondition-skip paths exit before populating
     # the array, and `set -u` would explode on `"${arr[@]}"` then.
     if [ "${#SHIT_SMOKE_PIDS[@]}" -gt 0 ]; then
@@ -163,11 +165,22 @@ smoke_cleanup() {
             kill -KILL "${pid}" 2>/dev/null || true
         done
     fi
+    printf '[cleanup %s] SHIT_SMOKE_PIDS killed; about to rm -rf tmpdir\n' "$(date -u +%H:%M:%S)" >&2
     if [ "${SMOKE_KEEP_TMP:-0}" != "1" ]; then
-        rm -rf "${SHIT_SMOKE_TMP}"
+        # Time-bound the rm so a stuck filesystem (open helper fd, an
+        # active kqueue watch still being torn down) can't block bash
+        # from exiting. If rm doesn't finish in 5 sec, give up — the
+        # CI runner reclaims the FS anyway.
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 5 rm -rf "${SHIT_SMOKE_TMP}" 2>&1 \
+                || printf '[cleanup %s] rm timed-out or errored on %s — leaking tmpdir\n' "$(date -u +%H:%M:%S)" "${SHIT_SMOKE_TMP}" >&2
+        else
+            rm -rf "${SHIT_SMOKE_TMP}"
+        fi
     else
         smoke_log "SMOKE_KEEP_TMP=1; tmpdir preserved at ${SHIT_SMOKE_TMP}"
     fi
+    printf '[cleanup %s] rm done; about to exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
     exit "${rc}"
 }
 trap smoke_cleanup EXIT
