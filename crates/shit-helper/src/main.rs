@@ -281,6 +281,27 @@ enum Mode {
         #[arg(long)]
         daemon_sock: PathBuf,
     },
+    /// L05 — `shit doctor` Linux fanotify functional probe.
+    ///
+    /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
+    /// file, drains one perm event, exits. Output is silent — the
+    /// doctor caller checks only the exit code. Requires the
+    /// helper binary to have CAP_SYS_ADMIN.
+    ///
+    /// Linux-only. Exits non-zero on any failure (init,
+    /// mark, write, drain, timeout).
+    #[command(name = "probe-fanotify")]
+    ProbeFanotify,
+    /// L05 — `shit doctor` Linux eBPF-LSM prerequisite probe.
+    ///
+    /// Runs `EbpfLoader::probe` and exits 0 iff prerequisites
+    /// (kernel ≥5.7, CONFIG_BPF_LSM=y, `bpf` in active LSMs,
+    /// CAP_BPF + CAP_PERFMON) are all met. Does NOT load or
+    /// attach any BPF program — pure capability check.
+    ///
+    /// Linux-only. Exits non-zero on missing prerequisites.
+    #[command(name = "probe-ebpf")]
+    ProbeEbpf,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -472,7 +493,144 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         }
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
+        Mode::ProbeFanotify => run_probe_fanotify(),
+        Mode::ProbeEbpf => run_probe_ebpf(),
     }
+}
+
+/// L05 — fanotify functional probe. Opens a fanotify-perm fd,
+/// marks a tmpdir, writes a probe file, drains one perm event,
+/// responds ALLOW, returns. Output silent; non-zero exit on any
+/// failure. Doctor only checks exit code.
+#[cfg(target_os = "linux")]
+fn run_probe_fanotify() -> anyhow::Result<()> {
+    // Init the fanotify fd (FAN_CLASS_PRE_CONTENT).
+    let fd = fanotify::init_pre_content()
+        .map_err(|e| anyhow::anyhow!("init_pre_content: {e}"))?;
+
+    // Make a tempdir and mark it. We mark the DIR (FAN_MARK_ADD on
+    // the dir's path) with FAN_EVENT_ON_CHILD | FAN_ONLYDIR so any
+    // file open inside fires a perm event.
+    let dir = tempfile::tempdir()?;
+    fanotify::mark::mark_dir_for_capture(&fd, dir.path())
+        .map_err(|e| anyhow::anyhow!("mark_dir_for_capture: {e}"))?;
+
+    // Spawn a child that opens a probe file inside the marked dir.
+    // We can't open it from this process — the fanotify-perm queue
+    // would deadlock (we'd block waiting for ourselves to respond).
+    let probe_path = dir.path().join("probe");
+    let probe_str = probe_path.to_string_lossy().into_owned();
+    let child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("echo x > '{probe_str}'"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn /bin/sh: {e}"))?;
+    let child_pid = child.id();
+
+    // Drain one event with a 1s budget. The event arrives via
+    // read(2) on the fanotify fd. Parse it, respond ALLOW, then
+    // we're done.
+    let raw_fd = fd.as_raw_fd();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut buf = [0u8; std::mem::size_of::<libc::fanotify_event_metadata>() * 4];
+    let mut events_drained = 0u32;
+    while events_drained == 0 && std::time::Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a single valid pollfd; timeout in ms.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if rc <= 0 {
+            continue;
+        }
+        // SAFETY: raw_fd is valid; buf is writable.
+        let n = unsafe { libc::read(raw_fd, buf.as_mut_ptr() as _, buf.len()) };
+        if n <= 0 {
+            continue;
+        }
+        let mut off = 0usize;
+        while off + std::mem::size_of::<libc::fanotify_event_metadata>() <= n as usize {
+            // SAFETY: bytes [off, off+sizeof(metadata)) are valid.
+            let meta: libc::fanotify_event_metadata =
+                unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
+            // ALLOW the syscall and close the kernel-given fd.
+            if (meta.mask & (libc::FAN_OPEN_PERM as u64)) != 0 {
+                let response = libc::fanotify_response {
+                    fd: meta.fd,
+                    response: libc::FAN_ALLOW as u32,
+                };
+                let ptr = &response as *const _ as *const libc::c_void;
+                let sz = std::mem::size_of::<libc::fanotify_response>();
+                // SAFETY: raw_fd is the fanotify fd; ptr/sz describe
+                // one response struct.
+                unsafe { libc::write(raw_fd, ptr, sz) };
+                events_drained += 1;
+            }
+            if meta.fd >= 0 {
+                // SAFETY: fd from the kernel; closing per fanotify API contract.
+                unsafe { libc::close(meta.fd) };
+            }
+            off += meta.event_len as usize;
+        }
+    }
+    // Wait for the child to actually exit (writes succeed once we
+    // ALLOW). 1s should be more than enough.
+    let _ = wait_child(child_pid as i32, std::time::Duration::from_secs(1));
+
+    if events_drained >= 1 {
+        Ok(())
+    } else {
+        anyhow::bail!("no fanotify-perm events drained within 1s budget")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_probe_fanotify() -> anyhow::Result<()> {
+    anyhow::bail!("probe-fanotify is Linux-only")
+}
+
+/// L05 — eBPF-LSM prerequisite probe. Calls the loader's probe
+/// (read-only) and exits 0 iff prerequisites are met.
+#[cfg(target_os = "linux")]
+fn run_probe_ebpf() -> anyhow::Result<()> {
+    let loader = ebpf::EbpfLoader::new();
+    let outcome = loader.probe();
+    if outcome.should_attempt_load() {
+        Ok(())
+    } else {
+        anyhow::bail!("ebpf-lsm prerequisites not met: {}", outcome.diagnose())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_probe_ebpf() -> anyhow::Result<()> {
+    anyhow::bail!("probe-ebpf is Linux-only")
+}
+
+/// Wait for `pid` to exit with a wall-clock deadline. Best-effort;
+/// not a thorough reaper. Used only by the L05 fanotify probe
+/// where we spawned `/bin/sh -c 'echo x > probe'`.
+#[cfg(target_os = "linux")]
+fn wait_child(pid: i32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let mut status = 0i32;
+        // SAFETY: waitpid is well-defined; WNOHANG never blocks.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            return true;
+        }
+        if r < 0 {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Timed out; reap anyway via blocking waitpid would risk a hang.
+    false
 }
 
 /// B03 — `shit doctor` handshake probe.
