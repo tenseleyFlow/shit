@@ -27,7 +27,6 @@ use shit_planner::executor::{ConflictPolicy, ExecutionOutcome, InverseOpExecutor
 use shit_planner::executors::kubectl::{KubectlExecutor, KubectlRunner};
 use shit_planner::inverse::{InverseOp, KubectlOp};
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -61,11 +60,12 @@ fn write_fake_kubectl(
          exit 2\n",
         record = record_file.display(),
     );
-    let mut f = fs::File::create(&path).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
-    let mut perms = f.metadata().unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    // fs::write (open/write/close in one call) so the writeable fd
+    // is closed before the test execs `path`. File::create + write_all
+    // keeps the fd alive until function return and races with exec(2)
+    // on Linux → ETXTBSY ("Text file busy", os error 26).
+    fs::write(&path, body.as_bytes()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 
