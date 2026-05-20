@@ -105,6 +105,7 @@ log_level = "warn"
                 pid: 9876,
                 cwd_inode: 100,
                 cwd_dev: 200,
+                cwd_path: "/tmp/persist_e2e".to_string(),
                 ts_unix_nanos: 2,
                 shell_kind: ShellKind::Bash,
                 depth: 1,

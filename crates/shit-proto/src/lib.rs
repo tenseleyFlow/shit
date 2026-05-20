@@ -63,6 +63,11 @@ pub enum HookMessage {
         pid: u32,
         cwd_inode: u64,
         cwd_dev: u64,
+        /// Absolute cwd path. B05: capsicum-mode helpers can't resolve
+        /// cwd via cross-pid sysctl (`KERN_PROC_CWD` lacks
+        /// `CTLFLAG_CAPRD`), so the shell sends the path explicitly
+        /// and the daemon forwards it via `HelperRequest::WatchTree`.
+        cwd_path: String,
         ts_unix_nanos: u64,
         shell_kind: ShellKind,
         depth: u8,

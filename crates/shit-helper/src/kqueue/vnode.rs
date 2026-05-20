@@ -132,60 +132,219 @@ impl TrackedSubtree {
 ///
 /// Symlinks are not followed — we track real inodes only. Permission-
 /// denied entries are silently skipped so a partial tree still
-/// produces a usable subtree. Other I/O errors abort the walk.
+/// produces a usable subtree.
+///
+/// B05 Phase A: descendants open via `openat(parent_fd, name, ...)`.
+/// B05 Phase B: root opens via [`register_subtree_at`] when a
+/// pre-cap_enter `slash_fd` is available; this variant keeps the
+/// absolute-path root open for back-compat and the unit tests that
+/// pass arbitrary tempdirs.
 pub fn register_subtree(
     kq: &KqueueFd,
     root: &Path,
     depth_limit: usize,
 ) -> Result<TrackedSubtree, KqueueError> {
-    let mut entries = Vec::new();
-    walk(root, depth_limit, &mut entries)?;
+    let root_fd = open_for_watch(root)?;
+    register_subtree_with_root_fd(kq, root_fd, root, depth_limit)
+}
+
+/// As [`register_subtree`], but opens the root via
+/// `openat(root_dirfd, abspath_minus_slash, ...)` instead of an
+/// absolute `open(...)`. Required after `cap_enter(2)` since
+/// capability mode forbids absolute-path opens system-wide.
+///
+/// `root_dirfd` must be a directory fd that pre-dates `cap_enter` —
+/// typically `slash_fd` (an `O_DIRECTORY` open of `/` from main.rs's
+/// pre-sandbox setup). The root is computed as `abs_root` with its
+/// leading `/` stripped; if `abs_root == "/"`, the slash_fd itself
+/// is duped.
+pub fn register_subtree_at(
+    kq: &KqueueFd,
+    root_dirfd: RawFd,
+    abs_root: &Path,
+    depth_limit: usize,
+) -> Result<TrackedSubtree, KqueueError> {
+    let root_fd = openat_root(root_dirfd, abs_root)?;
+    register_subtree_with_root_fd(kq, root_fd, abs_root, depth_limit)
+}
+
+/// Shared core: given an already-open root fd, fstat it, push as the
+/// first TrackedEntry, recursively register descendants, and submit
+/// the changelist to the kqueue.
+fn register_subtree_with_root_fd(
+    kq: &KqueueFd,
+    root_fd: OwnedFd,
+    root: &Path,
+    depth_limit: usize,
+) -> Result<TrackedSubtree, KqueueError> {
+    // fstat the root to learn if it's a directory. fstat works under
+    // cap_enter (operation on an fd we own); avoids a second absolute
+    // open via symlink_metadata.
+    let is_dir = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(root_fd.as_raw_fd(), &mut st) == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
+    };
+    let root_raw = root_fd.as_raw_fd();
+    let mut entries = vec![TrackedEntry {
+        fd: root_fd,
+        path: root.to_path_buf(),
+    }];
+    if is_dir {
+        walk_descendants(root_raw, root, depth_limit, &mut entries);
+    }
     register_entries(kq, &entries)?;
     Ok(TrackedSubtree { entries })
 }
 
-fn walk(
-    path: &Path,
-    depth_remaining: usize,
-    out: &mut Vec<TrackedEntry>,
-) -> Result<(), KqueueError> {
-    let fd = open_for_watch(path)?;
-    let meta = std::fs::symlink_metadata(path).map_err(|e| KqueueError::Open {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let is_dir = meta.is_dir();
-    out.push(TrackedEntry {
-        fd,
-        path: path.to_path_buf(),
-    });
-    if !is_dir || depth_remaining == 0 {
-        return Ok(());
-    }
-    let read_dir = match std::fs::read_dir(path) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
-        Err(e) => {
+/// Open an absolute path via `openat(root_dirfd, ...)`. `abs_root`
+/// must start with `/`; the leading slash is stripped to form a
+/// path relative to `root_dirfd` (which is expected to be `/` or
+/// a privileged-mount equivalent).
+fn openat_root(root_dirfd: RawFd, abs_root: &Path) -> Result<OwnedFd, KqueueError> {
+    let rel = abs_root.strip_prefix("/").unwrap_or(abs_root);
+    let rel_bytes = rel.as_os_str().as_bytes();
+    // Edge case: abs_root == "/" → rel is empty. dup the dirfd so the
+    // returned fd is independently owned by TrackedSubtree.
+    if rel_bytes.is_empty() {
+        // SAFETY: dup of a borrowed RawFd we don't own; caller guarantees
+        // root_dirfd is alive for the duration of this call.
+        let dup = unsafe { libc::dup(root_dirfd) };
+        if dup < 0 {
             return Err(KqueueError::Open {
-                path: path.to_path_buf(),
-                source: e,
+                path: abs_root.to_path_buf(),
+                source: std::io::Error::last_os_error(),
             });
         }
-    };
-    for entry in read_dir.flatten() {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if ft.is_symlink() {
+        // SAFETY: dup is a fresh kernel-allocated fd we now own.
+        return Ok(unsafe { OwnedFd::from_raw_fd(dup) });
+    }
+    let cpath = CString::new(rel_bytes).map_err(|_| KqueueError::Open {
+        path: abs_root.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte"),
+    })?;
+    // No O_NOFOLLOW on the root open — historically the root open is
+    // willing to traverse symlinks (the daemon may hand us a path
+    // that's itself a symlink target). Descendants use O_NOFOLLOW.
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    // SAFETY: root_dirfd alive per caller contract; cpath is a valid
+    // NUL-terminated C string; openat returns -1/errno on failure.
+    let raw = unsafe { libc::openat(root_dirfd, cpath.as_ptr(), flags, 0) };
+    if raw < 0 {
+        return Err(KqueueError::Open {
+            path: abs_root.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: raw is a fresh kernel-allocated fd we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Recursively register descendants of `parent_fd`'s directory.
+///
+/// `parent_fd` is borrowed (the caller retains ownership in the
+/// TrackedSubtree); we `dup(2)` it for `fdopendir` since fdopendir
+/// takes the fd into its own control. Children open via
+/// `openat(parent_fd, name, ...)` so this walk works post-cap_enter
+/// once the root bootstrap lands.
+///
+/// Errors during the walk are best-effort: a single permission-
+/// denied or race-deleted descendant skips that entry but doesn't
+/// abort sibling registration. Matches the original walker's
+/// permissive contract.
+fn walk_descendants(
+    parent_fd: RawFd,
+    parent_path: &Path,
+    depth_remaining: usize,
+    out: &mut Vec<TrackedEntry>,
+) {
+    if depth_remaining == 0 {
+        return;
+    }
+    // dup parent_fd so we can give a copy to fdopendir without losing
+    // the caller's reference. closedir releases the dup; the original
+    // parent fd stays alive in the TrackedSubtree.
+    let dup_fd = unsafe { libc::dup(parent_fd) };
+    if dup_fd < 0 {
+        tracing::trace!(
+            parent = %parent_path.display(),
+            err = ?std::io::Error::last_os_error(),
+            "walk_descendants: dup failed",
+        );
+        return;
+    }
+    // SAFETY: dup_fd is a fresh open fd we own; fdopendir takes it
+    // under its control. We never close dup_fd directly — closedir
+    // handles it below.
+    let dir = unsafe { libc::fdopendir(dup_fd) };
+    if dir.is_null() {
+        // fdopendir failed; per the man page, it doesn't close the fd
+        // on failure, so we must.
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(dup_fd) };
+        tracing::trace!(
+            parent = %parent_path.display(),
+            err = ?err,
+            "walk_descendants: fdopendir failed",
+        );
+        return;
+    }
+
+    loop {
+        // SAFETY: dir is a valid DIR*; readdir returns NULL at EOF or
+        // on error (which we can't distinguish without errno reset
+        // dance; treat NULL as terminator).
+        let entry_ptr = unsafe { libc::readdir(dir) };
+        if entry_ptr.is_null() {
+            break;
+        }
+        let entry = unsafe { &*entry_ptr };
+        // d_name is a NUL-terminated char array; strlen finds its end.
+        let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
+        let name_bytes =
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), name_len) };
+        if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
-        // Errors on individual children don't abort the whole walk —
-        // a single permission-denied file in a deep tree shouldn't
-        // wipe out everything we've registered above it.
-        let _ = walk(&entry.path(), depth_remaining - 1, out);
+        // Skip symlinks before we open — O_NOFOLLOW would also catch
+        // them, but a pre-readdir d_type check avoids the openat syscall.
+        if entry.d_type == libc::DT_LNK {
+            continue;
+        }
+        let is_child_dir = entry.d_type == libc::DT_DIR;
+        let name_c = match CString::new(name_bytes) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // openat with O_NOFOLLOW defends against a DT_REG ↦ symlink
+        // race (entry was a file at readdir time, becomes a symlink
+        // before our openat).
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: parent_fd is a valid dir fd; name_c is a valid C
+        // string for the call; openat returns -1/errno on failure.
+        let child_raw = unsafe { libc::openat(parent_fd, name_c.as_ptr(), flags, 0) };
+        if child_raw < 0 {
+            // Skip this descendant; siblings continue. This matches
+            // the original walker's best-effort behavior on permission-
+            // denied / race-deleted / ELOOP.
+            continue;
+        }
+        // SAFETY: child_raw is a fresh kernel-allocated fd we now own.
+        let child_fd = unsafe { OwnedFd::from_raw_fd(child_raw) };
+        let child_raw_for_recurse = child_fd.as_raw_fd();
+        let child_path = parent_path.join(std::ffi::OsStr::from_bytes(name_bytes));
+        out.push(TrackedEntry {
+            fd: child_fd,
+            path: child_path.clone(),
+        });
+        if is_child_dir {
+            walk_descendants(child_raw_for_recurse, &child_path, depth_remaining - 1, out);
+        }
     }
-    Ok(())
+
+    // closedir closes the dup'd fd and frees the DIR*.
+    // SAFETY: dir is a valid DIR* we got from fdopendir; not closed yet.
+    unsafe { libc::closedir(dir) };
 }
 
 fn open_for_watch(path: &Path) -> Result<OwnedFd, KqueueError> {
@@ -259,21 +418,36 @@ impl TrackedSubtree {
     /// `None` if the open failed (permission-denied, race-deleted,
     /// etc. — non-fatal; the watch silently drops that entry).
     pub fn add_path(&mut self, kq: &KqueueFd, path: &Path) -> Option<RawFd> {
-        let fd = match open_for_watch(path) {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::trace!(path = %path.display(), error = ?e, "add_path open failed");
-                return None;
-            }
-        };
+        // B05 Phase A: open via openat against the parent dir's fd
+        // (which we must already track — callers reach add_path via
+        // a dir-change event on the parent).
+        let parent_path = path.parent()?;
+        let basename = path.file_name()?;
+        let parent_fd = self
+            .entries
+            .iter()
+            .find(|e| e.path == parent_path)
+            .map(|e| e.fd.as_raw_fd())?;
+        let name_c = CString::new(basename.as_bytes()).ok()?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: parent_fd is alive in self.entries; name_c is a
+        // valid NUL-terminated C string for the call.
+        let raw = unsafe { libc::openat(parent_fd, name_c.as_ptr(), flags, 0) };
+        if raw < 0 {
+            tracing::trace!(
+                path = %path.display(),
+                err = ?std::io::Error::last_os_error(),
+                "add_path openat failed",
+            );
+            return None;
+        }
+        // SAFETY: raw is a fresh kernel-allocated fd we now own.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let raw = fd.as_raw_fd();
         let entry = TrackedEntry {
             fd,
             path: path.to_path_buf(),
         };
-        // Register one filter against the new fd. We re-use
-        // `register_entries` with a single-element slice to keep the
-        // changelist construction in one place.
         let single = std::slice::from_ref(&entry);
         if let Err(e) = register_entries(kq, single) {
             tracing::warn!(path = %path.display(), error = %e, "add_path kevent register failed");
@@ -381,6 +555,42 @@ mod tests {
         let tree = register_subtree(&kq, dir.path(), 1).expect("register");
         // Expect: root, a → 2 entries.
         assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn register_subtree_at_via_slash_dirfd_yields_same_entries() {
+        // B05 Phase B: opening the root via openat against a pre-opened
+        // "/" dir-fd must produce the same TrackedSubtree as the
+        // absolute-path variant.
+        let kq = init().expect("kqueue");
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a"), b"a").unwrap();
+        std::fs::write(dir.path().join("b"), b"b").unwrap();
+
+        // Open "/" as the bootstrap dir-fd (mirrors what main.rs will
+        // do pre-cap_enter).
+        let slash = std::ffi::CString::new("/").unwrap();
+        let slash_raw = unsafe { libc::open(slash.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        assert!(
+            slash_raw >= 0,
+            "open / failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let slash_fd = unsafe { OwnedFd::from_raw_fd(slash_raw) };
+
+        let tree = register_subtree_at(&kq, slash_fd.as_raw_fd(), dir.path(), 4)
+            .expect("register_subtree_at");
+        // root + 2 files = 3.
+        assert_eq!(tree.len(), 3);
+        // Reverse map still works (entries store absolute paths).
+        let a = dir.path().join("a");
+        let a_fd = tree
+            .entries
+            .iter()
+            .find(|e| e.path == a)
+            .map(|e| e.fd.as_raw_fd())
+            .expect("a tracked");
+        assert_eq!(tree.path_for_fd(a_fd), Some(a.as_path()));
     }
 
     #[test]

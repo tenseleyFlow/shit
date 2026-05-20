@@ -20,6 +20,7 @@ fn sample_preexec() -> HookMessage {
         pid: 7331,
         cwd_inode: 99_999,
         cwd_dev: 16777220,
+        cwd_path: "/tmp/sample".to_string(),
         ts_unix_nanos: 1_700_000_100_000_000_000,
         shell_kind: ShellKind::Zsh,
         depth: 1,

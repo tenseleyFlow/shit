@@ -154,6 +154,17 @@ pub fn capsicum_available() -> bool {
     false
 }
 
+/// True iff the helper will enter `cap_enter(2)` on startup with
+/// the current environment. B05: capsicum-default-on means
+/// `available && SHIT_CAPSICUM != "0"`. Pure-function on top of
+/// the kernel probe — does NOT spawn the helper.
+pub fn capsicum_default_on(available: bool) -> bool {
+    if !available {
+        return false;
+    }
+    !matches!(std::env::var("SHIT_CAPSICUM").as_deref(), Ok("0"))
+}
+
 /// Enumerate ZFS datasets via `/sbin/zfs list -H -o name`. Empty
 /// Vec if zfs is not installed or no pools are imported. Uses
 /// absolute path to be robust against SSH-non-interactive PATH
@@ -339,6 +350,34 @@ mod tests {
     }
 
     #[cfg(target_os = "freebsd")]
+    #[test]
+    fn capsicum_default_on_respects_env() {
+        // SAFETY: process-wide; tests in this binary run serially per
+        // module-level state to avoid env races. We snapshot+restore.
+        let prev = std::env::var("SHIT_CAPSICUM").ok();
+        unsafe { std::env::set_var("SHIT_CAPSICUM", "0") };
+        assert!(
+            !super::capsicum_default_on(true),
+            "SHIT_CAPSICUM=0 must opt out"
+        );
+        unsafe { std::env::remove_var("SHIT_CAPSICUM") };
+        assert!(
+            super::capsicum_default_on(true),
+            "default is on when env unset"
+        );
+        unsafe { std::env::set_var("SHIT_CAPSICUM", "1") };
+        assert!(super::capsicum_default_on(true), "SHIT_CAPSICUM=1 stays on");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("SHIT_CAPSICUM", v) },
+            None => unsafe { std::env::remove_var("SHIT_CAPSICUM") },
+        }
+    }
+
+    #[test]
+    fn capsicum_default_on_false_when_unavailable() {
+        assert!(!super::capsicum_default_on(false));
+    }
+
     #[test]
     fn capsicum_available_on_freebsd() {
         assert!(capsicum_available(), "cap_getmode syscall absent");

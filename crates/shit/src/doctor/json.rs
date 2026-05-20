@@ -68,6 +68,11 @@ pub struct BsdReport {
     /// in the kernel — doesn't matter whether we're IN cap mode).
     /// FreeBSD-only field; absent (or false) on other BSDs.
     pub capsicum_available: bool,
+    /// True iff the helper will enter `cap_enter(2)` on startup with
+    /// the current environment. B05 default-on: this is true when
+    /// `capsicum_available` is true AND `SHIT_CAPSICUM != "0"`.
+    /// Users can verify sandbox status without spawning the helper.
+    pub capsicum_default_on: bool,
     /// Names of ZFS datasets discovered via `zfs list -H -o name`.
     /// Empty if zfs is not installed or no pools imported.
     pub zfs_datasets: Vec<String>,
@@ -144,6 +149,7 @@ mod tests {
                 runtime_capture: "kqueue-only".into(),
                 kqueue_functional: true,
                 capsicum_available: true,
+                capsicum_default_on: true,
                 zfs_datasets: vec![],
                 helper_handshake: HelperHandshakeReport {
                     ok: false,

@@ -874,9 +874,45 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         state
     });
 
+    // B05 Phase B — pre-cap_enter `O_DIRECTORY` open of `/`.
+    // capsicum's `cap_enter(2)` forbids absolute-path opens once
+    // active. We pre-open `/` here and thread the fd through to
+    // capture::bsd::spawn so the kqueue pump can do
+    // `openat(slash_fd, abspath_minus_slash, ...)` for arbitrary
+    // watch roots at runtime. On non-FreeBSD this is a no-op;
+    // the capture runtime sees None and falls back to absolute opens.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    let slash_fd: Option<Arc<std::os::fd::OwnedFd>> = {
+        use std::os::fd::FromRawFd;
+        let cpath = std::ffi::CString::new("/").unwrap();
+        // SAFETY: "/" is a stable, always-present directory; open
+        // with O_DIRECTORY|O_RDONLY|O_CLOEXEC returns a dir fd or -1.
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            tracing::warn!(
+                err = ?std::io::Error::last_os_error(),
+                "open(/) for slash_fd failed; cap_enter would be unsafe — skipping",
+            );
+            None
+        } else {
+            // SAFETY: raw is a fresh kernel-allocated fd we now own.
+            Some(Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }))
+        }
+    };
+
     // S24.B — BSD kqueue capture runtime. Spawn the pump + drain
-    // threads *before* sandbox entry so any future cap_enter (S24.F)
-    // sees the staging-dir fds already open.
+    // threads *before* sandbox entry so any future cap_enter sees
+    // the staging-dir fds + slash_fd already open.
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -885,7 +921,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     ))]
     let bsd_capture: Option<capture::bsd::CaptureControl> = {
         let staging_dir = cli.state_dir.join("helper-staging");
-        match capture::bsd::spawn(Arc::clone(&conn), staging_dir) {
+        match capture::bsd::spawn(Arc::clone(&conn), staging_dir, slash_fd.clone()) {
             Ok((ctrl, _join)) => {
                 tracing::info!("bsd capture runtime spawned");
                 Some(ctrl)
@@ -900,19 +936,29 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
-    // S24.F — Capsicum capability mode. Off by default because
-    // register_subtree currently opens by absolute path, which
-    // cap_enter forbids. Gated on SHIT_CAPSICUM=1 so we can validate
-    // the call site incrementally before the dir-fd rewrite in S25.
+    // B05 Phase C — Capsicum capability mode default-on. Opt out via
+    // `SHIT_CAPSICUM=0`. Requires slash_fd (pre-cap_enter `/` open)
+    // for runtime watch-root opens, and WatchTree.cwd_path (B05.10)
+    // to avoid cross-pid sysctl(KERN_PROC_CWD) which isn't capsicum-
+    // whitelisted in FreeBSD 14.
     #[cfg(target_os = "freebsd")]
-    if std::env::var("SHIT_CAPSICUM").as_deref() == Ok("1") {
-        match capsicum_bsd::enter_capability_mode() {
-            Ok(()) => {
-                tracing::info!("entered Capsicum capability mode (SHIT_CAPSICUM=1)");
+    {
+        let opt_out = std::env::var("SHIT_CAPSICUM").as_deref() == Ok("0");
+        if !opt_out && slash_fd.is_some() {
+            match capsicum_bsd::enter_capability_mode() {
+                Ok(()) => {
+                    tracing::info!("entered Capsicum capability mode (default-on)");
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
+                }
             }
-            Err(e) => {
-                tracing::warn!(err = %e, "cap_enter failed; continuing without capability mode");
-            }
+        } else if opt_out {
+            tracing::info!("SHIT_CAPSICUM=0 — Capsicum capability mode disabled");
+        } else {
+            tracing::warn!(
+                "slash_fd unavailable — skipping cap_enter to avoid bricking the helper"
+            );
         }
     }
 
@@ -1031,6 +1077,7 @@ fn request_loop(
                 session,
                 command_seq,
                 shell_kind: _,
+                cwd_path,
             } => {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
@@ -1102,11 +1149,12 @@ fn request_loop(
                     target_os = "dragonfly",
                 ))]
                 if let Some(ctrl) = &bsd_capture {
-                    ctrl.on_watch_tree(session, command_seq, root_pid);
+                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
                     tracing::info!(
                         %session,
                         command_seq,
                         root_pid,
+                        cwd_path = %cwd_path,
                         "watch_tree dispatched to bsd capture"
                     );
                 } else {
@@ -1124,7 +1172,13 @@ fn request_loop(
                     target_os = "dragonfly",
                 )))]
                 {
-                    let _ = (root_pid, session, command_seq);
+                    let _ = (root_pid, session, command_seq, &cwd_path);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // L01 fanotify path uses /proc/<pid>/cwd readlink;
+                    // cwd_path is BSD-only at the helper layer today.
+                    let _ = &cwd_path;
                 }
             }
             HelperRequest::UnwatchTree {

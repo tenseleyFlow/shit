@@ -53,5 +53,6 @@ pub use proc::{
 };
 pub use tree::TrackedTree;
 pub use vnode::{
-    DEFAULT_DEPTH_LIMIT, TrackedSubtree, VNODE_FFLAGS, VnodeEventKind, register_subtree, watch_path,
+    DEFAULT_DEPTH_LIMIT, TrackedSubtree, VNODE_FFLAGS, VnodeEventKind, register_subtree,
+    register_subtree_at, watch_path,
 };
