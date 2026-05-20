@@ -67,6 +67,12 @@ pub const MAX_PRE_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 struct WatchState {
     /// `(dev, inode) → DedupeEntry`. First-write-wins per inode.
     dedupe: BTreeMap<(u64, u64), DedupeEntry>,
+    /// Pre-opened fds for files in the watched cwd. Populated by
+    /// `pre_open_tree` at WatchTree time (L04 / Linux mirror of
+    /// BSD `register_subtree`'s open-fd-survives-unlink trick). The
+    /// LSM-unlink handler dups these to read the pre-image after the
+    /// dentry is gone — the inode stays alive while the fd is open.
+    pre_opens: BTreeMap<(u64, u64), OwnedFd>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,11 +135,74 @@ impl LinuxCaptureRuntime {
         self.watches.entry(command).or_default();
     }
 
-    /// Stop watching. Drops the dedupe state; subsequent events for
-    /// this command's pids fall through `handle_event` without
-    /// capture (the TreeMap will have already removed the pid).
+    /// Stop watching. Drops the dedupe state and closes all
+    /// pre-opened fds; subsequent events for this command's pids
+    /// fall through `handle_event` without capture (the TreeMap will
+    /// have already removed the pid).
     pub fn on_unwatch_tree(&mut self, command: CommandId) {
         self.watches.remove(&command);
+    }
+
+    /// L04 — open every regular file under `cwd` (non-recursive in
+    /// v1; matches the smoke's flat-tree assumption) and stash the
+    /// OwnedFds keyed by `(dev, inode)` in this command's WatchState.
+    /// Mirror of `kqueue::register_subtree` — the open fd keeps the
+    /// inode alive after `vfs_unlink` drops the dentry, so the LSM
+    /// unlink handler can `read_pre_image(dup(fd))` after the file
+    /// is "gone".
+    ///
+    /// Best-effort: per-file open errors (EACCES on protected files,
+    /// ELOOP on dangling symlinks) are skipped silently. The walker
+    /// continues so a single denied entry doesn't disable capture
+    /// for the rest.
+    ///
+    /// Caller invariant: must be called BEFORE the watched command's
+    /// preexec returns userspace control. The L04 main.rs WatchTree
+    /// handler does this synchronously between `tree.watch()` and
+    /// returning the response.
+    pub fn pre_open_tree(&mut self, command: CommandId, cwd: &Path) {
+        let ws = self.watches.entry(command).or_default();
+        let dir = match std::fs::read_dir(cwd) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(cwd = %cwd.display(), err = %e, "pre_open_tree: read_dir failed");
+                return;
+            }
+        };
+        let mut opened = 0usize;
+        for ent in dir.flatten() {
+            let path = ent.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            // O_RDONLY + O_NOFOLLOW — never follow a symlink (else
+            // we'd open something outside the watched tree).
+            let f = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let fd = f.as_raw_fd();
+            let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
+                continue;
+            };
+            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+            opened += 1;
+        }
+        tracing::info!(
+            session = %command.session,
+            seq = command.seq,
+            cwd = %cwd.display(),
+            opened,
+            "pre_open_tree complete"
+        );
     }
 
     /// Called by the fanotify reader thread per event. Returns once
@@ -281,50 +350,61 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_unlink(&mut self, ev: &LsmUnlinkView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // Construct the race candidate. `/proc/<pid>/cwd` is a symlink
-        // managed by the kernel — read_link gives us the resolved
-        // cwd, and we join the basename for the file's real path.
-        // We keep BOTH the resolved path (for the CapturedPreImage
-        // wire — daemon needs this to know WHERE the unlinked file
-        // belongs) and the procfs path (for the open(2) call — the
-        // procfs path stays valid even if the cwd was renamed mid-rm).
+        // Resolve the file's real path via /proc/<pid>/cwd → cwd
+        // symlink + basename. Daemon needs the resolved path on the
+        // CapturedPreImage wire to know WHERE the unlinked file
+        // belongs.
         let cwd_link = format!("/proc/{}/cwd", ev.pid);
         let resolved_path = std::fs::read_link(&cwd_link)
             .map(|cwd| cwd.join(ev.basename))
             .map(|p| path_to_string(&p))
             .unwrap_or_else(|_| format!("{cwd_link}/{}", ev.basename));
-        let open_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
 
-        // Race window: between this open() and vfs_unlink completing
-        // its d_drop. The LSM hook fires synchronously before the
-        // unlink proceeds, but it returns 0 immediately, so by the
-        // time we get here the kernel may already be a few µs into
-        // vfs_unlink's teardown. Win rate on idle systems: high.
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&open_path);
-
-        let (race_fd, race_dev, race_inode, file_type) = match opened {
-            Ok(f) => {
-                let fd = f.as_raw_fd();
-                match fstat_dev_inode_kind(fd) {
-                    Some((d, i, k)) => (Some(f), d, i, k),
-                    None => (Some(f), 0, 0, FileType::Other),
-                }
+        // Look up pre-opened fd for this (dev, inode). The fd was
+        // grabbed at WatchTree time by `pre_open_tree`. Even after
+        // vfs_unlink completes, the inode stays alive while we hold
+        // the fd — same trick BSD kqueue uses. This is the
+        // deterministic capture path; race-to-open is a last-resort
+        // fallback for files created mid-session.
+        let (capture_fd_owned, fd_source) = if let Some(fd) = ws.pre_opens.remove(&(ev.dev, ev.inode)) {
+            (Some(fd), "pre-opened")
+        } else {
+            // Fall back to race-to-open via /proc/<pid>/cwd. The
+            // procfs symlink resolves through the live cwd, so this
+            // works even on rename. Win window: microseconds.
+            let open_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
+            let opened = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&open_path);
+            match opened {
+                Ok(f) => (Some(OwnedFd::from(f)), "race"),
+                Err(_) => (None, "miss"),
             }
-            Err(_) => (None, 0, 0, FileType::Other),
         };
 
-        // Validate the race-win matches what BPF told us. Tight
-        // sanity-check — protects against:
+        let (capture_dev, capture_inode, file_type) = match capture_fd_owned.as_ref() {
+            Some(fd) => match fstat_dev_inode_kind(fd.as_raw_fd()) {
+                Some(t) => t,
+                None => (0, 0, FileType::Other),
+            },
+            None => (0, 0, FileType::Other),
+        };
+
+        // Validate the capture-fd matches what BPF told us.
+        // Protects against:
         //   - cwd moved between LSM fire and userspace race
         //   - basename reused by a different inode in the same dir
-        //     between LSM fire and our open
         //   - O_NOFOLLOW caught a symlink (file_type != Regular)
-        let race_won =
-            race_fd.is_some() && race_dev == ev.dev && race_inode == ev.inode
-                && file_type == FileType::Regular;
+        //   - pre_open_tree captured a stale (dev, inode) — guard
+        //     against rare reuse.
+        let race_won = capture_fd_owned.is_some()
+            && capture_dev == ev.dev
+            && capture_inode == ev.inode
+            && file_type == FileType::Regular;
+        let race_fd = capture_fd_owned;
+        // Alias to keep the wire-build block below readable.
+        let _ = (capture_dev, capture_inode);
 
         let (stored_bytes, blob_hash, staging_fd, meta_wire) = if race_won {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
@@ -398,6 +478,7 @@ impl LinuxCaptureRuntime {
             dev = ev.dev,
             inode = ev.inode,
             race_won,
+            fd_source,
             stored_bytes,
             basename = ev.basename,
             path = %resolved_path,

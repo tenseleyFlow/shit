@@ -1272,17 +1272,29 @@ fn request_loop(
                         session,
                         seq: command_seq,
                     };
+                    // L04 — pre-open every regular file in the
+                    // root_pid's cwd. The held OwnedFd keeps the
+                    // inode alive after vfs_unlink, so the LSM
+                    // unlink handler can read the pre-image content
+                    // even though the dentry's gone. Linux mirror of
+                    // BSD's kqueue register_subtree.
+                    let cwd_link = format!("/proc/{root_pid}/cwd");
+                    let pre_open_cwd = std::fs::read_link(&cwd_link).ok();
                     if let Some(rt) = &state.runtime
                         && let Ok(mut g) = rt.lock()
                     {
                         g.on_watch_tree(cmd);
+                        if let Some(cwd) = &pre_open_cwd {
+                            g.pre_open_tree(cmd, cwd);
+                        }
                     }
                     tracing::info!(
                         %session,
                         command_seq,
                         root_pid,
+                        cwd = ?pre_open_cwd,
                         tier = "ebpf-lsm",
-                        "watch_tree registered (no mark; LSM fires globally)"
+                        "watch_tree registered + cwd pre-opened (LSM tier)"
                     );
                 } else {
                     tracing::debug!(
