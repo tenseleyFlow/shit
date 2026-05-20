@@ -73,6 +73,28 @@ struct WatchState {
     /// LSM-unlink handler dups these to read the pre-image after the
     /// dentry is gone — the inode stays alive while the fd is open.
     pre_opens: BTreeMap<(u64, u64), OwnedFd>,
+    /// L04.1 — Pre-image content + metadata snapshot, taken at
+    /// `pre_open_tree` time (or `handle_lsm_create` time for files
+    /// born mid-session). Unlike `pre_opens` (which races against
+    /// `do_truncate` in the `file_open` LSM hook path), this is an
+    /// in-memory copy taken BEFORE any LSM event fires. The
+    /// file_open and inode_setattr handlers read from this snapshot
+    /// instead of dup-and-reading the live fd — race-free.
+    ///
+    /// Sized cap per entry: [`MAX_PRE_IMAGE_BYTES`]. Files larger
+    /// than the cap skip the snapshot (LSM events for them will be
+    /// dropped at handler time — same fail-mode as fanotify's
+    /// over-budget files).
+    pre_snapshots: BTreeMap<(u64, u64), PreSnapshot>,
+}
+
+/// L04.1 — A snapshotted pre-image. Bytes + the stat-meta as it was
+/// at snapshot time (mode/uid/gid/mtime/size). Both go on the wire
+/// in [`HelperResponse::CapturedPreImage`].
+#[derive(Debug, Clone)]
+struct PreSnapshot {
+    meta: StatMeta,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +215,23 @@ impl LinuxCaptureRuntime {
             let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
                 continue;
             };
+            // L04.1 — snapshot bytes + meta BEFORE inserting the fd.
+            // Reads are race-free at this moment (no LSM event has
+            // fired yet). If read fails or file's too large, skip
+            // snapshot — the LSM open/setattr handlers will see a
+            // miss and drop their events.
+            if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
+                ws.pre_snapshots.insert(
+                    (dev, inode),
+                    PreSnapshot { meta, bytes },
+                );
+            } else {
+                tracing::trace!(
+                    dev,
+                    inode,
+                    "pre_open_tree: snapshot skipped (too large or read failed)"
+                );
+            }
             ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
             opened += 1;
         }
@@ -777,6 +816,17 @@ impl LinuxCaptureRuntime {
             return;
         }
 
+        // L04.1 — snapshot the new file's bytes + meta. For a
+        // freshly-created file these are typically empty + the
+        // create mode, but the snapshot is what later file_open
+        // handlers will use as pre-image (race-free).
+        let fd_raw = f.as_raw_fd();
+        if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
+            ws.pre_snapshots.insert(
+                (dev, inode),
+                PreSnapshot { meta, bytes },
+            );
+        }
         // Stash the fd in pre_opens. Subsequent unlink for this
         // (dev, inode) will hit the table → race_won → pre-image
         // capture succeeds even if the file was modified mid-session.
@@ -829,31 +879,22 @@ impl LinuxCaptureRuntime {
             return;
         }
 
-        let Some(held_fd) = ws.pre_opens.get(&(ev_dev, ev.inode)) else {
+        // L04.1 — read pre-image from the in-memory SNAPSHOT, NOT
+        // from the live fd. The live fd would race against
+        // `do_truncate` (which fires immediately after our LSM
+        // hook returns 0) and read zero bytes. The snapshot was
+        // taken at pre_open_tree time, before any LSM event fired.
+        let Some(snap) = ws.pre_snapshots.get(&(ev_dev, ev.inode)).cloned() else {
             tracing::trace!(
                 dev_kernel = ev.dev,
                 dev_userspace = ev_dev,
                 inode = ev.inode,
-                "lsm open: no pre-opened fd; dropping (file not in WatchTree's cwd snapshot)"
+                "lsm open: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
             );
             return;
         };
-        let fd = held_fd.as_raw_fd();
-
-        let bytes = match read_pre_image(fd) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "lsm open pre-image read failed");
-                return;
-            }
-        };
-        let meta = match fstat_meta(fd) {
-            Some(m) => m,
-            None => {
-                tracing::warn!("lsm open fstat_meta failed");
-                return;
-            }
-        };
+        let bytes = snap.bytes;
+        let meta = snap.meta;
         let blob_hash = blake3_of(&bytes);
         let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
             Ok(f) => f,
@@ -862,7 +903,11 @@ impl LinuxCaptureRuntime {
                 return;
             }
         };
-        let path = path_for_kernel_fd(fd);
+        // Path resolution via the still-held pre-opened fd.
+        let path = ws
+            .pre_opens
+            .get(&(ev_dev, ev.inode))
+            .and_then(|f| path_for_kernel_fd(f.as_raw_fd()));
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
