@@ -70,6 +70,7 @@ pub mod kind {
     pub const SETATTR: u8 = 2;
     pub const MKDIR: u8 = 3;
     pub const OPEN: u8 = 4;
+    pub const CREATE: u8 = 5;
 }
 
 /// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
@@ -217,6 +218,53 @@ impl MkdirEvent {
     }
 }
 
+/// `lsm/inode_create` event — mirrors `struct shit_create_event`.
+/// Same shape as [`MkdirEvent`] but discriminates as `kind::CREATE`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CreateEvent {
+    pub hdr: EventHeader,
+    pub parent_dev: u64,
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub name_len: u32,
+    pub name: [u8; NAME_BUF_LEN],
+}
+
+const _: () = assert!(std::mem::size_of::<CreateEvent>() == 320);
+
+impl Default for CreateEvent {
+    fn default() -> Self {
+        Self {
+            hdr: EventHeader::default(),
+            parent_dev: 0,
+            parent_inode: 0,
+            mode: 0,
+            name_len: 0,
+            name: [0; NAME_BUF_LEN],
+        }
+    }
+}
+
+impl std::fmt::Debug for CreateEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateEvent")
+            .field("hdr", &self.hdr)
+            .field("parent_dev", &self.parent_dev)
+            .field("parent_inode", &self.parent_inode)
+            .field("mode", &format_args!("{:o}", self.mode))
+            .field("name", &self.basename_str())
+            .finish()
+    }
+}
+
+impl CreateEvent {
+    pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
+        let len = (self.name_len as usize).min(NAME_BUF_LEN);
+        String::from_utf8_lossy(&self.name[..len])
+    }
+}
+
 /// Sink trait for decoded LSM events. The phase-2-chunk-2 stub
 /// implementation just logs; the production sink wires events into
 /// [`crate::capture::linux::LinuxCaptureRuntime`].
@@ -230,6 +278,7 @@ pub trait LsmEventSink: Send + Sync + 'static {
     fn on_unlink(&self, _ev: &UnlinkEvent) {}
     fn on_setattr(&self, _ev: &SetattrEvent) {}
     fn on_mkdir(&self, _ev: &MkdirEvent) {}
+    fn on_create(&self, _ev: &CreateEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
@@ -307,6 +356,24 @@ impl LsmEventSink for LinuxCaptureSink {
         };
         self.runtime.lock().unwrap().handle_lsm_mkdir(&view);
     }
+
+    fn on_create(&self, ev: &CreateEvent) {
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+            tracing::trace!(pid, "untracked pid; dropping lsm create event");
+            return;
+        };
+        let basename_cow = ev.basename_str();
+        let view = crate::capture::linux::LsmCreateView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            parent_dev: ev.parent_dev,
+            parent_inode: ev.parent_inode,
+            mode: ev.mode,
+            basename: &basename_cow,
+        };
+        self.runtime.lock().unwrap().handle_lsm_create(&view);
+    }
 }
 
 /// Stub sink — logs each event at info-level. Useful for the manual
@@ -364,6 +431,22 @@ impl LsmEventSink for LoggingSink {
             "lsm event"
         );
     }
+
+    fn on_create(&self, ev: &CreateEvent) {
+        let comm = comm_to_string(&ev.hdr.comm);
+        let basename = ev.basename_str();
+        tracing::info!(
+            kind = "create",
+            pid = ev.hdr.pid,
+            ts_ns = ev.hdr.ts_ns,
+            parent_dev = ev.parent_dev,
+            parent_inode = ev.parent_inode,
+            mode = format_args!("{:o}", ev.mode),
+            basename = %basename,
+            comm,
+            "lsm event"
+        );
+    }
 }
 
 /// Convert a `[u8; 16]` `comm` array (NUL-terminated, like
@@ -394,6 +477,11 @@ pub fn decode_setattr(bytes: &[u8]) -> Option<SetattrEvent> {
 /// Decode a raw ringbuf record as a [`MkdirEvent`].
 pub fn decode_mkdir(bytes: &[u8]) -> Option<MkdirEvent> {
     decode_event::<MkdirEvent>(bytes, kind::MKDIR)
+}
+
+/// Decode a raw ringbuf record as a [`CreateEvent`].
+pub fn decode_create(bytes: &[u8]) -> Option<CreateEvent> {
+    decode_event::<CreateEvent>(bytes, kind::CREATE)
 }
 
 /// Internal helper shared by per-kind decoders. `T` must be `repr(C)`
@@ -506,6 +594,32 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as MkdirEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Spawn a create-ringbuf reader. Convenience wrapper for
+    /// `lsm/inode_create`.
+    pub fn spawn_create(
+        create_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-create",
+            create_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_create(bytes) {
+                    sink.on_create(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as CreateEvent"
                     );
                 }
             }),

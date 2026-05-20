@@ -830,6 +830,8 @@ fn boot_ebpf_lsm(
         .map_err(|e| anyhow::anyhow!("load_lsm_setattr failed: {e}"))?;
     loader.load_lsm_mkdir()
         .map_err(|e| anyhow::anyhow!("load_lsm_mkdir failed: {e}"))?;
+    loader.load_lsm_create()
+        .map_err(|e| anyhow::anyhow!("load_lsm_create failed: {e}"))?;
     let unlink_rb = loader
         .take_unlink_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_unlink_ringbuf returned None after successful load"))?;
@@ -839,6 +841,9 @@ fn boot_ebpf_lsm(
     let mkdir_rb = loader
         .take_mkdir_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_mkdir_ringbuf returned None after successful load"))?;
+    let create_rb = loader
+        .take_create_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_create_ringbuf returned None after successful load"))?;
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
 
@@ -862,10 +867,11 @@ fn boot_ebpf_lsm(
     let unlink_reader = ebpf::LsmReader::spawn(unlink_rb, Arc::clone(&sink), idle);
     let setattr_reader = ebpf::LsmReader::spawn_setattr(setattr_rb, Arc::clone(&sink), idle);
     let mkdir_reader = ebpf::LsmReader::spawn_mkdir(mkdir_rb, Arc::clone(&sink), idle);
+    let create_reader = ebpf::LsmReader::spawn_create(create_rb, Arc::clone(&sink), idle);
 
-    tracing::info!("ebpf-lsm readers spawned: unlink + setattr + mkdir");
+    tracing::info!("ebpf-lsm readers spawned: unlink + setattr + mkdir + create");
     Ok(LsmCaptureState {
-        _readers: vec![unlink_reader, setattr_reader, mkdir_reader],
+        _readers: vec![unlink_reader, setattr_reader, mkdir_reader, create_reader],
         _loader: loader,
         dispatch: LsmDispatch {
             tree,

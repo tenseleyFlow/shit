@@ -54,11 +54,15 @@ const INODE_SETATTR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_setattr.b
 /// L04 — BPF object containing the `lsm/inode_mkdir` LSM hook.
 const INODE_MKDIR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_mkdir.bpf.o");
 
+/// L04 — BPF object containing the `lsm/inode_create` LSM hook.
+const INODE_CREATE_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_create.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
 const LSM_HOOK_INODE_SETATTR: &str = "inode_setattr";
 const LSM_HOOK_INODE_MKDIR: &str = "inode_mkdir";
+const LSM_HOOK_INODE_CREATE: &str = "inode_create";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
@@ -66,6 +70,7 @@ const LSM_HOOK_INODE_MKDIR: &str = "inode_mkdir";
 const LSM_PROG_INODE_UNLINK: &str = "shit_inode_unlink";
 const LSM_PROG_INODE_SETATTR: &str = "shit_inode_setattr";
 const LSM_PROG_INODE_MKDIR: &str = "shit_inode_mkdir";
+const LSM_PROG_INODE_CREATE: &str = "shit_inode_create";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
@@ -73,6 +78,7 @@ const LSM_PROG_INODE_MKDIR: &str = "shit_inode_mkdir";
 const RINGBUF_UNLINK_EVENTS: &str = "unlink_events";
 const RINGBUF_SETATTR_EVENTS: &str = "setattr_events";
 const RINGBUF_MKDIR_EVENTS: &str = "mkdir_events";
+const RINGBUF_CREATE_EVENTS: &str = "create_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -120,6 +126,7 @@ pub struct EbpfLoader {
     bpf: Option<aya::Ebpf>,
     setattr_bpf: Option<aya::Ebpf>,
     mkdir_bpf: Option<aya::Ebpf>,
+    create_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -144,6 +151,7 @@ impl EbpfLoader {
             bpf: None,
             setattr_bpf: None,
             mkdir_bpf: None,
+            create_bpf: None,
         }
     }
 
@@ -158,7 +166,10 @@ impl EbpfLoader {
 
     /// Whether ANY program is currently loaded + attached.
     pub fn is_loaded(&self) -> bool {
-        self.bpf.is_some() || self.setattr_bpf.is_some() || self.mkdir_bpf.is_some()
+        self.bpf.is_some()
+            || self.setattr_bpf.is_some()
+            || self.mkdir_bpf.is_some()
+            || self.create_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -219,11 +230,13 @@ impl EbpfLoader {
         let unlink_was = self.bpf.take().is_some();
         let setattr_was = self.setattr_bpf.take().is_some();
         let mkdir_was = self.mkdir_bpf.take().is_some();
-        if unlink_was || setattr_was || mkdir_was {
+        let create_was = self.create_bpf.take().is_some();
+        if unlink_was || setattr_was || mkdir_was || create_was {
             tracing::info!(
                 unlink = unlink_was,
                 setattr = setattr_was,
                 mkdir = mkdir_was,
+                create = create_was,
                 "ebpf programs detached"
             );
         }
@@ -423,6 +436,63 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    /// L04 phase 5 — Load + attach the `lsm/inode_create` program.
+    pub fn load_lsm_create(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.create_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_create: create program already loaded".into(),
+            ));
+        }
+
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        let aligned: Vec<u8> = INODE_CREATE_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_create): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_CREATE)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_CREATE}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_INODE_CREATE, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_CREATE}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_INODE_CREATE,
+            prog = LSM_PROG_INODE_CREATE,
+            ringbuf = RINGBUF_CREATE_EVENTS,
+            "ebpf-lsm inode_create loaded and attached"
+        );
+        self.create_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04 phase 5 — Take the `create_events` ringbuf.
+    pub fn take_create_ringbuf(
+        &mut self,
+    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.create_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_CREATE_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
     /// L04 — Take the `unlink_events` ringbuf for the userspace
     /// consumer. Returns `None` if the loader isn't loaded yet, or
     /// if the ringbuf has already been taken. The loader retains
@@ -497,6 +567,8 @@ mod tests {
         assert!(INODE_SETATTR_OBJ.len() > 100);
         assert_eq!(&INODE_MKDIR_OBJ[..4], b"\x7fELF");
         assert!(INODE_MKDIR_OBJ.len() > 100);
+        assert_eq!(&INODE_CREATE_OBJ[..4], b"\x7fELF");
+        assert!(INODE_CREATE_OBJ.len() > 100);
     }
 
     #[test]

@@ -680,6 +680,103 @@ impl LinuxCaptureRuntime {
             "lsm-mkdir TreeMutation sent",
         );
     }
+
+    /// L04 phase 5 — handler for `lsm/inode_create` events.
+    ///
+    /// Two-fold purpose:
+    ///   1. Emits `HelperResponse::TreeMutation { op: Create {
+    ///      kind: Regular, ... } }` so the daemon can journal the
+    ///      file's birth and reverse it on undo (unlink the file).
+    ///   2. Opens an `O_RDONLY` fd into the freshly-created file
+    ///      and stashes it in `pre_opens` keyed by (dev, inode).
+    ///      This extends the WatchTree-time `pre_open_tree`
+    ///      coverage to files born mid-session — so a subsequent
+    ///      `inode_unlink` for this file can dup the fd and read
+    ///      pre-image content via the open-fd-survives-unlink
+    ///      trick. Without this, `touch foo; rm foo` would lose
+    ///      foo's content because race-to-open is unreliable.
+    pub fn handle_lsm_create(&mut self, ev: &LsmCreateView<'_>) {
+        let ws = self.watches.entry(ev.command).or_default();
+
+        let cwd_link = format!("/proc/{}/cwd", ev.pid);
+        let resolved_path = match std::fs::read_link(&cwd_link) {
+            Ok(cwd) => cwd.join(ev.basename),
+            Err(e) => {
+                tracing::warn!(err = %e, pid = ev.pid, "lsm create: read_link cwd failed");
+                return;
+            }
+        };
+
+        // Open + stat. The kernel completed the create by the time
+        // we run (LSM fired pre-create but returned 0; the syscall
+        // proceeded; ringbuf submit + userspace read happens after
+        // syscall completion).
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&resolved_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    path = %resolved_path.display(),
+                    "lsm create: post-open failed; dropping"
+                );
+                return;
+            }
+        };
+        let (dev, inode, file_type) = match fstat_dev_inode_kind(f.as_raw_fd()) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(path = %resolved_path.display(), "lsm create: fstat failed");
+                return;
+            }
+        };
+        if file_type != FileType::Regular {
+            // O_NOFOLLOW caught a symlink, or something else; skip.
+            tracing::trace!(
+                path = %resolved_path.display(),
+                ?file_type,
+                "lsm create: non-regular post-stat; skipping"
+            );
+            return;
+        }
+
+        let path_str = path_to_string(&resolved_path);
+        let resp = HelperResponse::TreeMutation {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            op: shit_proto::TreeOpWire::Create {
+                dev,
+                inode,
+                path: path_str.clone(),
+                kind: shit_proto::FileKindWire::Regular,
+                mode: ev.mode,
+            },
+            ts_unix_nanos: now_unix_nanos(),
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "lsm create send_response failed");
+            return;
+        }
+
+        // Stash the fd in pre_opens. Subsequent unlink for this
+        // (dev, inode) will hit the table → race_won → pre-image
+        // capture succeeds even if the file was modified mid-session.
+        ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev,
+            inode,
+            mode = format_args!("{:o}", ev.mode),
+            path = path_str,
+            "lsm-create TreeMutation sent + fd stashed in pre_opens",
+        );
+    }
 }
 
 /// Convert the kernel's `dev_t` encoding (`(major << 20) | minor`)
@@ -735,6 +832,21 @@ pub struct LsmSetattrView {
 /// userspace stats the resolved path post-syscall to fill them in.
 #[derive(Debug, Clone, Copy)]
 pub struct LsmMkdirView<'a> {
+    pub command: CommandId,
+    pub pid: u32,
+    pub parent_dev: u64,
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub basename: &'a str,
+}
+
+/// View into an `lsm/inode_create` event. Same shape as
+/// [`LsmMkdirView`] but for regular files — emitted via TreeMutation
+/// with `FileKindWire::Regular` and additionally registers the new
+/// file's `O_RDONLY` fd into `pre_opens` so a subsequent unlink can
+/// capture its pre-image content.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmCreateView<'a> {
     pub command: CommandId,
     pub pid: u32,
     pub parent_dev: u64,
