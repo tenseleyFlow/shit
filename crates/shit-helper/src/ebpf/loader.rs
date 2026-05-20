@@ -39,6 +39,27 @@ const NOOP_TRACEPOINT_SECTION: &str = "noop_tracepoint";
 const TRACEPOINT_CATEGORY: &str = "sched";
 const TRACEPOINT_NAME: &str = "sched_process_exec";
 
+/// L04 — BPF object containing the `lsm/inode_unlink` LSM hook.
+/// Built from `crates/shit-helper/bpf/src/inode_unlink.bpf.c`;
+/// ringbuf map name = `unlink_events`, program function name =
+/// `shit_inode_unlink`, LSM hook = `inode_unlink`.
+const INODE_UNLINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_unlink.bpf.o");
+
+/// LSM hook name (aya prepends `bpf_lsm_` internally to find the
+/// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
+const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
+
+/// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
+/// in the .c. aya looks programs up via this name when both the
+/// section and the function name agree.
+const LSM_PROG_INODE_UNLINK: &str = "shit_inode_unlink";
+
+/// Ringbuf map name. Matches the `unlink_events SEC(".maps")`
+/// definition in inode_unlink.bpf.c. `take_unlink_ringbuf` removes
+/// this map from the Ebpf instance and returns it as an
+/// `aya::maps::RingBuf` for the userspace consumer thread.
+const RINGBUF_UNLINK_EVENTS: &str = "unlink_events";
+
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
 /// the helper whether it's worth invoking `load`.
@@ -169,8 +190,91 @@ impl EbpfLoader {
     /// the loader (e.g. for graceful shutdown sequencing).
     pub fn detach(&mut self) {
         if self.bpf.take().is_some() {
-            tracing::info!("ebpf tracepoint detached");
+            tracing::info!("ebpf programs detached");
         }
+    }
+
+    /// L04 — Load + attach the `lsm/inode_unlink` program. The BPF
+    /// program ringbuf's its (dev, inode, pid, comm, ts_ns) records
+    /// on every unlinkat(2). The userspace consumer
+    /// ([`super::ringbuf_reader`]) takes the ringbuf via
+    /// [`Self::take_unlink_ringbuf`] and feeds events into the
+    /// [`crate::capture::linux::LinuxCaptureRuntime`].
+    ///
+    /// One-shot: refuses if an Ebpf instance is already loaded. The
+    /// helper boot sequence calls this exactly once after the cap
+    /// probe passes.
+    ///
+    /// **HP-18 sign-off:** This is a Linux Security Module hook.
+    /// A verifier rejection on a kernel diff would break every
+    /// unlinkat on the box. Mitigation: the program (a) always
+    /// returns 0 (allow), (b) uses BPF_CORE_READ for every
+    /// kernel-struct field, (c) is straight-line code with no
+    /// loops, and (d) drops events silently when the ringbuf
+    /// fills rather than returning non-zero. See the .bpf.c
+    /// comment block for the full contract.
+    pub fn load_lsm_unlink(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_unlink: another program already loaded".into(),
+            ));
+        }
+
+        // BTF from /sys/kernel/btf/vmlinux — needed for the LSM
+        // hook's attach-by-name resolution.
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        // Heap-align (same dance as the tracepoint path).
+        let aligned: Vec<u8> = INODE_UNLINK_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_unlink): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_UNLINK)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_UNLINK}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_INODE_UNLINK, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_UNLINK}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_INODE_UNLINK,
+            prog = LSM_PROG_INODE_UNLINK,
+            ringbuf = RINGBUF_UNLINK_EVENTS,
+            "ebpf-lsm inode_unlink loaded and attached"
+        );
+        self.bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04 — Take the `unlink_events` ringbuf for the userspace
+    /// consumer. Returns `None` if the loader isn't loaded yet, or
+    /// if the ringbuf has already been taken. The loader retains
+    /// ownership of the [`aya::Ebpf`] instance so the program stays
+    /// attached for the helper's lifetime; the ringbuf is the only
+    /// piece that moves to the reader thread.
+    pub fn take_unlink_ringbuf(
+        &mut self,
+    ) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_UNLINK_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
     }
 }
 
