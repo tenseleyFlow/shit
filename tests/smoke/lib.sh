@@ -125,6 +125,33 @@ smoke_cleanup() {
 }
 trap smoke_cleanup EXIT
 
+# Locate the sqlite3 binary. NixOS doesn't ship sqlite3 at any default
+# user-PATH location; the binary is somewhere under /nix/store/. PATH
+# discovery first, nix-store fallback, env-var override last (operator
+# can set SHIT_SMOKE_SQLITE3 in the runner if neither finds it).
+smoke_resolve_sqlite3() {
+    if [ -n "${SHIT_SMOKE_SQLITE3:-}" ] && [ -x "${SHIT_SMOKE_SQLITE3}" ]; then
+        echo "${SHIT_SMOKE_SQLITE3}"
+        return 0
+    fi
+    if command -v sqlite3 >/dev/null 2>&1; then
+        command -v sqlite3
+        return 0
+    fi
+    # NixOS: pick the first sqlite3 binary in the store. Multiple
+    # generations may coexist; any of them is fine for our read-only
+    # query path.
+    if [ -d /nix/store ]; then
+        local s
+        s="$(find /nix/store -maxdepth 4 -name sqlite3 -type f -executable 2>/dev/null | head -1)"
+        if [ -n "${s}" ]; then
+            echo "${s}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Run a sqlite query against the index db. Returns stdout; non-zero
 # exit means the file doesn't exist yet (the daemon hasn't initialized
 # its db) or the query failed.
@@ -132,7 +159,12 @@ smoke_journal_query() {
     if [ ! -f "${SHIT_INDEX_DB}" ]; then
         return 1
     fi
-    sqlite3 -readonly "${SHIT_INDEX_DB}" "$@"
+    local s
+    s="$(smoke_resolve_sqlite3)" || {
+        smoke_log "WARN: sqlite3 not found on PATH and not in /nix/store"
+        return 1
+    }
+    "${s}" -readonly "${SHIT_INDEX_DB}" "$@"
 }
 
 # Count rows in the events table matching `WHERE <predicate>`. Returns
