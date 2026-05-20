@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "linux",
 ))]
 use crate::doctor::json::HelperHandshakeReport;
 use crate::doctor::json::{DoctorReport, HostInfo, MountReport, SCHEMA_VERSION};
@@ -89,7 +90,7 @@ fn collect() -> (Vec<Row>, DoctorReport) {
         schema_version: SCHEMA_VERSION,
         host: host_info(),
         bsd: collect_bsd(),
-        linux: None,
+        linux: collect_linux(),
         macos: None,
         mounts,
     };
@@ -153,11 +154,49 @@ fn collect_bsd() -> Option<json::BsdReport> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn collect_linux() -> Option<json::LinuxReport> {
+    use crate::doctor::probes::linux;
+
+    let kernel_lsm_list = linux::read_kernel_lsm_list();
+    let capabilities = linux::read_caps();
+    let systemd_user_unit = linux::read_systemd_unit();
+    let fanotify_functional = linux::fanotify_functional();
+    let ebpf_lsm_functional = linux::ebpf_lsm_functional();
+
+    // Stable tier label — picks the highest-functioning tier the
+    // host can sustain. Matches the strings emitted by the helper's
+    // `pick_linux_tier`.
+    let runtime_capture = if ebpf_lsm_functional {
+        "ebpf-lsm".to_string()
+    } else if fanotify_functional {
+        "fanotify-perm".to_string()
+    } else {
+        "degraded".to_string()
+    };
+
+    Some(json::LinuxReport {
+        runtime_capture,
+        fanotify_functional,
+        ebpf_lsm_functional,
+        capabilities,
+        systemd_user_unit,
+        kernel_lsm_list,
+        helper_handshake: probe_helper_handshake(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_linux() -> Option<json::LinuxReport> {
+    None
+}
+
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "linux",
 ))]
 fn probe_helper_handshake() -> HelperHandshakeReport {
     use shit_proto::{CtlRequest, CtlResponse};
@@ -209,16 +248,27 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
 /// Render the table-mode output. Designed to match the pre-B03
 /// byte stream for the BSD / Linux per-platform sections so the
 /// table-mode UX doesn't regress.
-fn render_table(rows: &[Row], _report: &DoctorReport) {
+fn render_table(rows: &[Row], report: &DoctorReport) {
     #[cfg(target_os = "linux")]
-    print_linux_kernel_tier();
+    if let Some(linux) = report.linux.as_ref() {
+        print_linux_kernel_tier(linux);
+    }
+    // Silence the unused-variable warning on non-Linux/non-BSD hosts.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )))]
+    let _ = report;
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
     ))]
-    if let Some(bsd) = _report.bsd.as_ref() {
+    if let Some(bsd) = report.bsd.as_ref() {
         print_bsd_tier(bsd);
     }
     print_mount_table(rows);
@@ -286,7 +336,9 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn print_linux_kernel_tier() {
+fn print_linux_kernel_tier(linux: &json::LinuxReport) {
+    let ok = |b: bool| if b { "✓" } else { "✗" };
+
     match shit_capture::linux_kernel::probe() {
         Ok((version, features)) => {
             println!("kernel:   {version}  ({})", features.tier_label());
@@ -296,23 +348,75 @@ fn print_linux_kernel_tier() {
         }
     }
 
-    let bpf = shit_capture::linux_kernel::probe_bpf_lsm();
-    println!("bpf-lsm:  {}", bpf.diagnose());
+    println!("tier:     {}", linux.runtime_capture);
     println!(
-        "  btf={}  active-lsm-includes-bpf={}  CONFIG_BPF_LSM={}",
-        bpf.btf_available,
-        bpf.bpf_in_active_lsm,
-        match bpf.config_bpf_lsm {
-            Some(true) => "y",
-            Some(false) => "n",
-            None => "unknown",
-        }
+        "fanotify: {}  ebpf-lsm: {}",
+        ok(linux.fanotify_functional),
+        ok(linux.ebpf_lsm_functional)
     );
+
+    // Caps — helper binary on disk vs caller's effective.
+    let h = &linux.capabilities.helper_binary;
+    if h.readable {
+        println!(
+            "helper-caps: cap_sys_admin={} cap_bpf={} cap_perfmon={}",
+            ok(h.cap_sys_admin),
+            ok(h.cap_bpf),
+            ok(h.cap_perfmon)
+        );
+    } else {
+        println!(
+            "helper-caps: ? (helper binary not found via SHIT_HELPER_BIN, FHS paths, or $PATH)"
+        );
+    }
+    let c = &linux.capabilities.caller_effective;
+    println!(
+        "caller-caps: cap_sys_admin={} cap_bpf={} cap_perfmon={}",
+        ok(c.cap_sys_admin),
+        ok(c.cap_bpf),
+        ok(c.cap_perfmon)
+    );
+
+    // LSM active list.
+    if linux.kernel_lsm_list.is_empty() {
+        println!("active-lsms: (unreadable; /sys/kernel/security/lsm missing)");
+    } else {
+        println!("active-lsms: {}", linux.kernel_lsm_list.join(","));
+    }
+
+    // systemd user unit.
+    let u = &linux.systemd_user_unit;
+    if !u.user_manager_reachable {
+        println!("shit.service (user): manager unreachable (XDG_RUNTIME_DIR unset?)");
+    } else {
+        println!(
+            "shit.service (user): present={} active={} enabled={}",
+            ok(u.user_unit_present),
+            ok(u.user_unit_active),
+            ok(u.user_unit_enabled)
+        );
+    }
+
+    // Remediation hints.
+    if let Some(setcap) = &linux.capabilities.setcap_remediation {
+        println!();
+        println!("To grant helper caps:");
+        println!("  {setcap}");
+    }
+    let bpf = shit_capture::linux_kernel::probe_bpf_lsm();
     if let Some(hint) = bpf.cmdline_remediation_hint() {
         println!();
         println!("To enable BPF-LSM:");
         for line in hint.lines() {
             println!("  {line}");
+        }
+    }
+    if u.user_manager_reachable && !u.user_unit_active {
+        println!();
+        println!("To activate the daemon user unit:");
+        println!("  systemctl --user start shit.service");
+        if !u.user_unit_enabled {
+            println!("  systemctl --user enable shit.service");
         }
     }
     println!();

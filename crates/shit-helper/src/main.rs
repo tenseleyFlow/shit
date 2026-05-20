@@ -281,6 +281,27 @@ enum Mode {
         #[arg(long)]
         daemon_sock: PathBuf,
     },
+    /// L05 — `shit doctor` Linux fanotify functional probe.
+    ///
+    /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
+    /// file, drains one perm event, exits. Output is silent — the
+    /// doctor caller checks only the exit code. Requires the
+    /// helper binary to have CAP_SYS_ADMIN.
+    ///
+    /// Linux-only. Exits non-zero on any failure (init,
+    /// mark, write, drain, timeout).
+    #[command(name = "probe-fanotify")]
+    ProbeFanotify,
+    /// L05 — `shit doctor` Linux eBPF-LSM prerequisite probe.
+    ///
+    /// Runs `EbpfLoader::probe` and exits 0 iff prerequisites
+    /// (kernel ≥5.7, CONFIG_BPF_LSM=y, `bpf` in active LSMs,
+    /// CAP_BPF + CAP_PERFMON) are all met. Does NOT load or
+    /// attach any BPF program — pure capability check.
+    ///
+    /// Linux-only. Exits non-zero on missing prerequisites.
+    #[command(name = "probe-ebpf")]
+    ProbeEbpf,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -472,7 +493,160 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         }
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
+        Mode::ProbeFanotify => run_probe_fanotify(),
+        Mode::ProbeEbpf => run_probe_ebpf(),
     }
+}
+
+/// L05 — fanotify functional probe. Opens a fanotify-perm fd,
+/// marks a tmpdir, writes a probe file, drains one perm event,
+/// responds ALLOW, returns. Output silent; non-zero exit on any
+/// failure. Doctor only checks exit code.
+#[cfg(target_os = "linux")]
+fn run_probe_fanotify() -> anyhow::Result<()> {
+    // Init the fanotify fd (FAN_CLASS_PRE_CONTENT).
+    let fd = fanotify::init_pre_content().map_err(|e| anyhow::anyhow!("init_pre_content: {e}"))?;
+
+    // Make a tempdir and mark it. Manual mktemp to avoid the
+    // tempfile dev-dep at runtime — keeps the helper binary slim
+    // for the doctor probe path.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir_path = std::env::temp_dir().join(format!(
+        "shit-doctor-fanotify-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir(&dir_path).map_err(|e| anyhow::anyhow!("mkdir tempdir: {e}"))?;
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = DirGuard(dir_path.clone());
+
+    fanotify::mark::mark_dir_for_capture(&fd, &dir_path)
+        .map_err(|e| anyhow::anyhow!("mark_dir_for_capture: {e}"))?;
+
+    // Spawn a child that opens a probe file inside the marked dir.
+    // We can't open it from this process — the fanotify-perm queue
+    // would deadlock (we'd block waiting for ourselves to respond).
+    let probe_path = dir_path.join("probe");
+    let probe_str = probe_path.to_string_lossy().into_owned();
+    let child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("echo x > '{probe_str}'"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn /bin/sh: {e}"))?;
+    let child_pid = child.id();
+
+    // Drain one event with a 1s budget. The event arrives via
+    // read(2) on the fanotify fd. Parse it, respond ALLOW, then
+    // we're done.
+    let raw_fd = fd.as_raw_fd();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut buf = [0u8; std::mem::size_of::<libc::fanotify_event_metadata>() * 4];
+    let mut events_drained = 0u32;
+    while events_drained == 0 && std::time::Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a single valid pollfd; timeout in ms.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if rc <= 0 {
+            continue;
+        }
+        // SAFETY: raw_fd is valid; buf is writable.
+        let n = unsafe { libc::read(raw_fd, buf.as_mut_ptr() as _, buf.len()) };
+        if n <= 0 {
+            continue;
+        }
+        let mut off = 0usize;
+        while off + std::mem::size_of::<libc::fanotify_event_metadata>() <= n as usize {
+            // SAFETY: bytes [off, off+sizeof(metadata)) are valid.
+            let meta: libc::fanotify_event_metadata =
+                unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
+            // ALLOW the syscall and close the kernel-given fd.
+            if (meta.mask & libc::FAN_OPEN_PERM) != 0 {
+                let response = libc::fanotify_response {
+                    fd: meta.fd,
+                    response: libc::FAN_ALLOW,
+                };
+                let ptr = &response as *const _ as *const libc::c_void;
+                let sz = std::mem::size_of::<libc::fanotify_response>();
+                // SAFETY: raw_fd is the fanotify fd; ptr/sz describe
+                // one response struct.
+                unsafe { libc::write(raw_fd, ptr, sz) };
+                events_drained += 1;
+            }
+            if meta.fd >= 0 {
+                // SAFETY: fd from the kernel; closing per fanotify API contract.
+                unsafe { libc::close(meta.fd) };
+            }
+            off += meta.event_len as usize;
+        }
+    }
+    // Wait for the child to actually exit (writes succeed once we
+    // ALLOW). 1s should be more than enough.
+    let _ = wait_child(child_pid as i32, std::time::Duration::from_secs(1));
+
+    if events_drained >= 1 {
+        Ok(())
+    } else {
+        anyhow::bail!("no fanotify-perm events drained within 1s budget")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_probe_fanotify() -> anyhow::Result<()> {
+    anyhow::bail!("probe-fanotify is Linux-only")
+}
+
+/// L05 — eBPF-LSM prerequisite probe. Calls the loader's probe
+/// (read-only) and exits 0 iff prerequisites are met.
+#[cfg(target_os = "linux")]
+fn run_probe_ebpf() -> anyhow::Result<()> {
+    let loader = ebpf::EbpfLoader::new();
+    let outcome = loader.probe();
+    if outcome.should_attempt_load() {
+        Ok(())
+    } else {
+        anyhow::bail!("ebpf-lsm prerequisites not met: {}", outcome.diagnose())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_probe_ebpf() -> anyhow::Result<()> {
+    anyhow::bail!("probe-ebpf is Linux-only")
+}
+
+/// Wait for `pid` to exit with a wall-clock deadline. Best-effort;
+/// not a thorough reaper. Used only by the L05 fanotify probe
+/// where we spawned `/bin/sh -c 'echo x > probe'`.
+#[cfg(target_os = "linux")]
+fn wait_child(pid: i32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let mut status = 0i32;
+        // SAFETY: waitpid is well-defined; WNOHANG never blocks.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            return true;
+        }
+        if r < 0 {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Timed out; reap anyway via blocking waitpid would risk a hang.
+    false
 }
 
 /// B03 — `shit doctor` handshake probe.
@@ -648,11 +822,18 @@ struct PrivilegedSetup {
 /// Which kernel-tier capture path is in effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureTier {
-    /// Linux fanotify-perm (S08). The shipped tier on Linux today.
+    /// Linux fanotify-perm (S08). The shipped tier on Linux today
+    /// (kernel < 5.7 or when ebpf-lsm prerequisites are missing).
     Fanotify,
+    /// Linux eBPF-LSM (L04). The preferred secondary tier on
+    /// kernel ≥ 5.7 with `lsm=bpf` in /proc/cmdline and the helper
+    /// holding CAP_BPF + CAP_PERFMON. Avoids fanotify's userspace
+    /// roundtrip per event.
+    EbpfLsm,
     /// Linux BPF-LSM (S09). Detected but not yet loaded — stage-1
     /// builds advertise `Fanotify` even when this would be preferred.
-    /// Logged at startup so operators can see what we'd upgrade to.
+    /// L04 retains this only as a debug signal: prerequisites met
+    /// but we chose to *not* load (e.g. `SHIT_FORCE_TIER=fanotify-perm`).
     EbpfLsmAvailableButDeferred,
     /// macOS EndpointSecurity (S07). Reserved.
     EndpointSecurity,
@@ -674,6 +855,7 @@ impl CaptureTier {
     pub fn label(&self) -> &'static str {
         match self {
             CaptureTier::Fanotify => "fanotify-perm (S08)",
+            CaptureTier::EbpfLsm => "ebpf-lsm (L04)",
             CaptureTier::EbpfLsmAvailableButDeferred => {
                 "ebpf-lsm-available (S09 loader deferred; running fanotify)"
             }
@@ -774,33 +956,195 @@ fn pick_bsd_tier() -> CaptureTier {
     CaptureTier::KqueueOnly
 }
 
-/// Decide which kernel-tier the helper *should* use based on the
-/// runtime probe.
+/// Bundles the long-lived state for the eBPF-LSM tier (L04). Held
+/// in the run loop's outer scope so the readers/loader stay alive
+/// for the helper's lifetime. The request loop receives a
+/// [`LsmDispatch`] clone for WatchTree/UnwatchTree handling — the
+/// reader/loader fields don't cross the `spawn_blocking` boundary.
+#[cfg(target_os = "linux")]
+struct LsmCaptureState {
+    /// Reader threads. One per ringbuf (`unlink_events`,
+    /// `setattr_events`, ...). Dropped on shutdown — `LsmReader::drop`
+    /// stops each reader and joins.
+    _readers: Vec<ebpf::LsmReader>,
+    /// Held to keep the BPF programs attached for the helper's
+    /// lifetime. Dropping detaches.
+    _loader: ebpf::EbpfLoader,
+    /// Clone-able dispatch handle for the request loop.
+    dispatch: LsmDispatch,
+}
+
+/// Send + Clone snapshot of the eBPF-LSM tier's runtime hooks. Goes
+/// into the synchronous request loop via [`request_loop`].
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct LsmDispatch {
+    /// Process-tree tracking for pid → CommandId resolution.
+    tree: Arc<std::sync::Mutex<fanotify::tree::TreeMap>>,
+    /// Shared with the LsmReader's sink. WatchTree/UnwatchTree
+    /// notify the same runtime instance the BPF events feed.
+    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
+}
+
+/// Load the eBPF-LSM unlink program, take its ringbuf, and spawn
+/// the userspace reader thread wired to dispatch into the linux
+/// capture runtime. Returns the long-lived state to keep alive.
 ///
-/// Stage 2 of S09: the `EbpfLoader::probe` runs (read-only); when
-/// prerequisites are met we record `EbpfLsmAvailableButDeferred` so
-/// operators see the upgrade path. The actual `load()` always returns
-/// `NotImplemented`, so fanotify remains the only working tier.
+/// Requires CAP_BPF + CAP_PERFMON on the calling process. Call
+/// BEFORE `sandbox::enter` — that's the last point where the helper
+/// has the caps needed for `bpf(2)`.
+#[cfg(target_os = "linux")]
+fn boot_ebpf_lsm(
+    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
+    excluded_pids: Vec<u32>,
+) -> anyhow::Result<LsmCaptureState> {
+    let mut loader = ebpf::EbpfLoader::new();
+    loader
+        .load_lsm_unlink()
+        .map_err(|e| anyhow::anyhow!("load_lsm_unlink failed: {e}"))?;
+    loader
+        .load_lsm_setattr()
+        .map_err(|e| anyhow::anyhow!("load_lsm_setattr failed: {e}"))?;
+    loader
+        .load_lsm_mkdir()
+        .map_err(|e| anyhow::anyhow!("load_lsm_mkdir failed: {e}"))?;
+    loader
+        .load_lsm_create()
+        .map_err(|e| anyhow::anyhow!("load_lsm_create failed: {e}"))?;
+    loader
+        .load_lsm_open()
+        .map_err(|e| anyhow::anyhow!("load_lsm_open failed: {e}"))?;
+    loader
+        .load_lsm_rename()
+        .map_err(|e| anyhow::anyhow!("load_lsm_rename failed: {e}"))?;
+    let unlink_rb = loader.take_unlink_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_unlink_ringbuf returned None after successful load")
+    })?;
+    let setattr_rb = loader.take_setattr_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_setattr_ringbuf returned None after successful load")
+    })?;
+    let mkdir_rb = loader
+        .take_mkdir_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_mkdir_ringbuf returned None after successful load"))?;
+    let create_rb = loader.take_create_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_create_ringbuf returned None after successful load")
+    })?;
+    let open_rb = loader
+        .take_open_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_open_ringbuf returned None after successful load"))?;
+    let rename_rb = loader.take_rename_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_rename_ringbuf returned None after successful load")
+    })?;
+
+    let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
+
+    let sink: Arc<dyn ebpf::LsmEventSink> = match runtime.clone() {
+        Some(rt) => Arc::new(ebpf::ringbuf_reader::LinuxCaptureSink {
+            runtime: rt,
+            tree: Arc::clone(&tree),
+            excluded_pids,
+        }),
+        None => {
+            // No capture runtime (init failed). Fall back to the
+            // logging sink — events get logged but no CapturedPreImage
+            // wire goes out. Better than dropping silently.
+            tracing::warn!("no capture runtime; lsm reader will log-only");
+            Arc::new(ebpf::LoggingSink)
+        }
+    };
+
+    // 250 µs idle sleep — keeps the race-to-open window tight on
+    // unlinks. See ringbuf_reader::LsmReader::spawn doc for rationale.
+    let idle = std::time::Duration::from_micros(250);
+    let unlink_reader = ebpf::LsmReader::spawn(unlink_rb, Arc::clone(&sink), idle);
+    let setattr_reader = ebpf::LsmReader::spawn_setattr(setattr_rb, Arc::clone(&sink), idle);
+    let mkdir_reader = ebpf::LsmReader::spawn_mkdir(mkdir_rb, Arc::clone(&sink), idle);
+    let create_reader = ebpf::LsmReader::spawn_create(create_rb, Arc::clone(&sink), idle);
+    let open_reader = ebpf::LsmReader::spawn_open(open_rb, Arc::clone(&sink), idle);
+    let rename_reader = ebpf::LsmReader::spawn_rename(rename_rb, Arc::clone(&sink), idle);
+
+    tracing::info!("ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename");
+    Ok(LsmCaptureState {
+        _readers: vec![
+            unlink_reader,
+            setattr_reader,
+            mkdir_reader,
+            create_reader,
+            open_reader,
+            rename_reader,
+        ],
+        _loader: loader,
+        dispatch: LsmDispatch { tree, runtime },
+    })
+}
+
+/// Decide which kernel-tier the helper *should* use based on the
+/// runtime probe and any `SHIT_FORCE_TIER` operator override.
+///
+/// L04 promoted the eBPF-LSM tier from "available but deferred" to
+/// "preferred when prerequisites met". The actual program load
+/// happens later (`load_lsm_unlink` in the runtime spawn block); if
+/// that fails we degrade to fanotify or Degraded.
+///
+/// Env overrides (intended for L04 smoke harnesses + CI matrix):
+///   * `SHIT_FORCE_TIER=ebpf-lsm`    — pick EbpfLsm unconditionally.
+///     Caller MUST verify load actually succeeds; the smoke harness
+///     fails fast if not.
+///   * `SHIT_FORCE_TIER=fanotify-perm` — pick Fanotify even when
+///     ebpf-lsm prerequisites are met (regression test for the older
+///     tier on capable kernels).
 #[cfg(target_os = "linux")]
 fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
+    let forced = std::env::var("SHIT_FORCE_TIER").ok();
+
     let loader = ebpf::EbpfLoader::new();
     let outcome = loader.probe();
-    if outcome.should_attempt_load() {
+    let ebpf_ok = outcome.should_attempt_load();
+
+    match forced.as_deref() {
+        Some("ebpf-lsm") => {
+            tracing::info!(
+                kernel = outcome.kernel.diagnose(),
+                forced = true,
+                "SHIT_FORCE_TIER=ebpf-lsm — picking EbpfLsm"
+            );
+            return CaptureTier::EbpfLsm;
+        }
+        Some("fanotify-perm") => {
+            if ebpf_ok && have_fanotify_fd {
+                tracing::info!(
+                    "SHIT_FORCE_TIER=fanotify-perm — using Fanotify despite ebpf-lsm being available"
+                );
+                return CaptureTier::EbpfLsmAvailableButDeferred;
+            }
+            if have_fanotify_fd {
+                return CaptureTier::Fanotify;
+            }
+            return CaptureTier::Degraded;
+        }
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "unrecognized SHIT_FORCE_TIER value; ignoring"
+            );
+        }
+        None => {}
+    }
+
+    if ebpf_ok {
         tracing::info!(
             kernel = outcome.kernel.diagnose(),
             cap_bpf = outcome.caps.cap_bpf,
             cap_perfmon = outcome.caps.cap_perfmon,
-            "ebpf-lsm prerequisites met; loader is stage-2 NotImplemented → fanotify"
+            "ebpf-lsm prerequisites met — picking EbpfLsm"
         );
-        if have_fanotify_fd {
-            return CaptureTier::EbpfLsmAvailableButDeferred;
-        }
-    } else {
-        tracing::info!(
-            diagnosis = outcome.diagnose(),
-            "ebpf-lsm not available; using fanotify if possible"
-        );
+        return CaptureTier::EbpfLsm;
     }
+
+    tracing::info!(
+        diagnosis = outcome.diagnose(),
+        "ebpf-lsm not available; using fanotify if possible"
+    );
     if have_fanotify_fd {
         CaptureTier::Fanotify
     } else {
@@ -840,17 +1184,17 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         "handshake complete"
     );
 
-    // Spawn the fanotify reader thread, if we have a privileged fd.
-    // The thread owns the read+write loop on the kernel fd; the async
-    // side talks to it via the shared `FanotifyState`. Reader exits
-    // when `state.shutdown()` is called (we trigger that below on the
-    // signal-handler shutdown path).
+    // Spawn the kernel-tier reader. Exactly one of fanotify /
+    // ebpf-lsm gets wired per-boot — `pick_linux_tier` already chose
+    // above. The fanotify branch mirrors L01; the ebpf-lsm branch
+    // is L04's promotion path.
     //
-    // L01: when a fanotify fd is available, also boot the
-    // LinuxCaptureRuntime and attach it. The reader thread's
-    // perm-event closure dispatches into it for pre-image capture.
+    // Both readers feed the SAME `LinuxCaptureRuntime` instance. The
+    // unused fd from the other tier (e.g. the fanotify_fd when tier
+    // is EbpfLsm) is left open and harmless — the kernel-side mark
+    // table is empty so no events arrive.
     #[cfg(target_os = "linux")]
-    let fanotify_state: Option<fanotify::runtime::FanotifyState> = setup.fanotify_fd.map(|fd| {
+    let (fanotify_state, lsm_state) = {
         let staging_dir = cli.state_dir.join("helper-staging");
         let capture_rt = match capture::linux::LinuxCaptureRuntime::new(
             staging_dir,
@@ -862,17 +1206,63 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 None
             }
         };
-        let mut state = fanotify::runtime::FanotifyState::new(fd);
-        if let Some(rt) = capture_rt.clone() {
-            state = state.with_capture_runtime(rt);
-        }
-        let reader_state = state.clone();
-        std::thread::Builder::new()
-            .name("fanotify-reader".into())
-            .spawn(move || fanotify::runtime::reader_thread(reader_state))
-            .expect("spawn fanotify reader");
-        state
-    });
+
+        // Fanotify branch — current default tier or fallback path.
+        let fanotify_state: Option<fanotify::runtime::FanotifyState> = if matches!(
+            setup.tier,
+            CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred
+        ) {
+            setup.fanotify_fd.map(|fd| {
+                let mut state = fanotify::runtime::FanotifyState::new(fd);
+                if let Some(rt) = capture_rt.clone() {
+                    state = state.with_capture_runtime(rt);
+                }
+                let reader_state = state.clone();
+                std::thread::Builder::new()
+                    .name("fanotify-reader".into())
+                    .spawn(move || fanotify::runtime::reader_thread(reader_state))
+                    .expect("spawn fanotify reader");
+                state
+            })
+        } else {
+            tracing::info!(
+                tier = setup.tier.label(),
+                "skipping fanotify reader for this tier"
+            );
+            None
+        };
+
+        // eBPF-LSM branch — L04. Load + attach happens here while
+        // the helper still has CAP_BPF + CAP_PERFMON (before
+        // sandbox::enter). The returned state carries both the
+        // tree map (for WatchTree dispatch) and the LsmReader join
+        // handle (for graceful shutdown).
+        let lsm_state: Option<LsmCaptureState> = if matches!(setup.tier, CaptureTier::EbpfLsm) {
+            // Exclude the helper's own pid + the daemon's pid from
+            // LSM event dispatch. Both run as descendants of the
+            // smoke harness (or the user's shell), so their internal
+            // file ops would otherwise be journaled as user-visible
+            // mutations. Daemon's blob-staging rename was the
+            // load-bearing miss surfaced by L04.1.
+            let excluded = vec![std::process::id(), cli.daemon_pid];
+            match boot_ebpf_lsm(capture_rt.clone(), excluded) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    tracing::error!(err = %e, "ebpf-lsm load failed; this tier is unusable on this boot");
+                    if std::env::var("SHIT_FORCE_TIER").as_deref() == Ok("ebpf-lsm") {
+                        return Err(anyhow::anyhow!(
+                            "SHIT_FORCE_TIER=ebpf-lsm but load failed: {e}"
+                        ));
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        (fanotify_state, lsm_state)
+    };
 
     // B05 Phase B — pre-cap_enter `O_DIRECTORY` open of `/`.
     // capsicum's `cap_enter(2)` forbids absolute-path opens once
@@ -972,11 +1362,15 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         target_os = "dragonfly",
     ))]
     let request_bsd_capture = bsd_capture.clone();
+    #[cfg(target_os = "linux")]
+    let request_lsm = lsm_state.as_ref().map(|s| s.dispatch.clone());
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
             #[cfg(target_os = "linux")]
             request_state,
+            #[cfg(target_os = "linux")]
+            request_lsm,
             #[cfg(any(
                 target_os = "freebsd",
                 target_os = "netbsd",
@@ -1008,6 +1402,11 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     drop(fanotify_state);
+    // L04: dropping `lsm_state` detaches the BPF program (via
+    // `EbpfLoader::Drop`) and joins the reader thread (via
+    // `LsmReader::Drop`). No explicit shutdown call needed.
+    #[cfg(target_os = "linux")]
+    drop(lsm_state);
 
     // S24.B — wind down the BSD capture pump. Best-effort; the JoinHandle
     // was dropped at spawn time so we can't wait on it, but Drop on
@@ -1039,6 +1438,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 fn request_loop(
     conn: Arc<ipc::Conn>,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
+    #[cfg(target_os = "linux")] lsm_state: Option<LsmDispatch>,
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -1135,11 +1535,49 @@ fn request_loop(
                             );
                         }
                     }
+                } else if let Some(state) = &lsm_state {
+                    // L04: eBPF-LSM tier. No fanotify mark needed —
+                    // the LSM hook fires globally on every unlinkat.
+                    // We still track the pid tree so events from
+                    // untracked pids are dropped.
+                    state
+                        .tree
+                        .lock()
+                        .unwrap()
+                        .watch(session, command_seq, root_pid as i32);
+                    let cmd = shit_planner::events::CommandId {
+                        session,
+                        seq: command_seq,
+                    };
+                    // L04 — pre-open every regular file in the
+                    // root_pid's cwd. The held OwnedFd keeps the
+                    // inode alive after vfs_unlink, so the LSM
+                    // unlink handler can read the pre-image content
+                    // even though the dentry's gone. Linux mirror of
+                    // BSD's kqueue register_subtree.
+                    let cwd_link = format!("/proc/{root_pid}/cwd");
+                    let pre_open_cwd = std::fs::read_link(&cwd_link).ok();
+                    if let Some(rt) = &state.runtime
+                        && let Ok(mut g) = rt.lock()
+                    {
+                        g.on_watch_tree(cmd);
+                        if let Some(cwd) = &pre_open_cwd {
+                            g.pre_open_tree(cmd, cwd);
+                        }
+                    }
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        cwd = ?pre_open_cwd,
+                        tier = "ebpf-lsm",
+                        "watch_tree registered + cwd pre-opened (LSM tier)"
+                    );
                 } else {
                     tracing::debug!(
                         %session,
                         command_seq,
-                        "watch_tree ignored — no fanotify (degraded)"
+                        "watch_tree ignored — no fanotify or lsm (degraded)"
                     );
                 }
                 #[cfg(any(
@@ -1207,6 +1645,18 @@ fn request_loop(
                         );
                     }
                     tracing::info!(%session, command_seq, "unwatch_tree");
+                } else if let Some(state) = &lsm_state {
+                    state.tree.lock().unwrap().unwatch(session, command_seq);
+                    let cmd = shit_planner::events::CommandId {
+                        session,
+                        seq: command_seq,
+                    };
+                    if let Some(rt) = &state.runtime
+                        && let Ok(mut g) = rt.lock()
+                    {
+                        g.on_unwatch_tree(cmd);
+                    }
+                    tracing::info!(%session, command_seq, tier = "ebpf-lsm", "unwatch_tree");
                 }
                 #[cfg(any(
                     target_os = "freebsd",

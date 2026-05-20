@@ -165,12 +165,14 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_sendto,
     libc::SYS_close,
     libc::SYS_fstat,
-    libc::SYS_statx, // glibc fs::metadata on modern kernels; pre-image read path
+    libc::SYS_statx,      // glibc fs::metadata on modern kernels; pre-image read path
+    libc::SYS_newfstatat, // glibc symlink_metadata (AT_SYMLINK_NOFOLLOW); L04 pre_open_tree
     libc::SYS_openat,
-    libc::SYS_pread64, // file read via dup'd fd in capture/linux::read_pre_image
-    libc::SYS_dup,     // capture/linux::read_pre_image dup's fd
-    libc::SYS_dup3,    // glibc dup variant
-    libc::SYS_pipe2,   // pipes for internal tokio signal/wake paths
+    libc::SYS_getdents64, // glibc fs::read_dir; L04 pre_open_tree walks cwd
+    libc::SYS_pread64,    // file read via dup'd fd in capture/linux::read_pre_image
+    libc::SYS_dup,        // capture/linux::read_pre_image dup's fd
+    libc::SYS_dup3,       // glibc dup variant
+    libc::SYS_pipe2,      // pipes for internal tokio signal/wake paths
     // SYS_readlink is x86_64-only; aarch64 dropped the bare form in
     // favor of readlinkat. Always allow readlinkat; conditionally
     // allow readlink below.

@@ -85,7 +85,11 @@ pub struct BsdReport {
 
 /// Result of spawning `shit-helper handshake-probe --daemon-sock
 /// <path>` and waiting for its one-line JSON reply.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is the "no daemon was probed" value — all-false /
+/// all-None with an empty `error`. Used by [`LinuxReport`]'s
+/// `Default` derive so the schema's neutral state is well-defined.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HelperHandshakeReport {
     /// `true` iff the helper successfully exchanged a Handshake /
     /// HandshakeAck with the daemon at `daemon_sock`.
@@ -104,11 +108,98 @@ pub struct HelperHandshakeReport {
 }
 
 /// Linux-family report. Populated by L05 (the Linux doctor uplift).
-/// Empty here so the JSON envelope stays stable while L05 is in
-/// flight; the schema permits adding fields later without bumping
-/// `schema_version`.
+///
+/// All fields are filled in by `crate::doctor::probes::linux`. A
+/// probe that can't determine its value emits the neutral default
+/// (`false`, empty Vec, `None`) so the JSON envelope still
+/// serializes cleanly even on broken hosts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LinuxReport {}
+pub struct LinuxReport {
+    /// Stable string identifying the active runtime tier. One of
+    /// `"ebpf-lsm"`, `"fanotify-perm"`, `"degraded"`. Matches the
+    /// strings emitted by `shit-helper`'s `pick_linux_tier`.
+    pub runtime_capture: String,
+    /// True iff a live fanotify-perm functional probe succeeded —
+    /// helper opened a fanotify-perm fd, marked a tmpfs path, wrote
+    /// a probe file, drained one perm event in <100ms.
+    pub fanotify_functional: bool,
+    /// True iff the eBPF-LSM prerequisite probe succeeded — kernel
+    /// ≥5.7, CONFIG_BPF_LSM=y, `bpf` in /sys/kernel/security/lsm,
+    /// helper has CAP_BPF + CAP_PERFMON.
+    pub ebpf_lsm_functional: bool,
+    /// Capability state for the helper binary on disk plus the
+    /// caller's own effective caps.
+    pub capabilities: CapsReport,
+    /// systemd --user status for `shit.service`.
+    pub systemd_user_unit: SystemdUnitReport,
+    /// Contents of `/sys/kernel/security/lsm` (comma-split into a
+    /// list). Empty when unreadable.
+    pub kernel_lsm_list: Vec<String>,
+    /// Helper handshake probe — shared with `BsdReport`. Same wire,
+    /// same semantics (helper spawned, daemon handshake exchanged).
+    pub helper_handshake: HelperHandshakeReport,
+}
+
+/// Capability state — split into caller-side (the `shit` CLI's
+/// effective caps via `/proc/self/status`) and helper-binary-side
+/// (file caps via `getcap` shell-out).
+///
+/// Doctor caller and helper binary may have different cap sets.
+/// The helper's file caps are what matter for runtime; the
+/// caller's caps matter for whether the in-process fanotify probe
+/// is viable (CAP_SYS_ADMIN is required).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CapsReport {
+    /// Helper binary file caps from `getcap <helper-path>`.
+    pub helper_binary: HelperBinaryCaps,
+    /// Effective caps of the `shit` doctor process itself.
+    pub caller_effective: CallerEffectiveCaps,
+    /// If any helper-binary cap is missing, the exact `setcap`
+    /// invocation to fix it. `None` when all required caps are
+    /// present.
+    pub setcap_remediation: Option<String>,
+}
+
+/// Caps the helper binary holds as file caps.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HelperBinaryCaps {
+    pub cap_sys_admin: bool,
+    pub cap_bpf: bool,
+    pub cap_perfmon: bool,
+    /// True iff we could resolve a helper-bin path and read its
+    /// file caps. False when the helper isn't installed where we
+    /// can find it (typical fresh-checkout case).
+    pub readable: bool,
+}
+
+/// Effective caps of the calling process (the `shit` CLI). Read
+/// from `/proc/self/status` `CapEff`. Relevant because the in-
+/// process fanotify probe requires CAP_SYS_ADMIN — if the doctor
+/// caller lacks it, the probe is skipped and noted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CallerEffectiveCaps {
+    pub cap_sys_admin: bool,
+    pub cap_bpf: bool,
+    pub cap_perfmon: bool,
+}
+
+/// `systemctl --user is-{active,enabled}` status for the daemon
+/// user unit, plus a present-on-disk check for the unit file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemdUnitReport {
+    /// `~/.config/systemd/user/shit.service` exists.
+    pub user_unit_present: bool,
+    /// `systemctl --user is-active shit.service` returned "active".
+    pub user_unit_active: bool,
+    /// `systemctl --user is-enabled shit.service` returned
+    /// "enabled" or "static".
+    pub user_unit_enabled: bool,
+    /// True iff `systemctl --user` is reachable at all. SSH non-
+    /// interactive sessions may not have `XDG_RUNTIME_DIR` set; in
+    /// that case all the active/enabled bits are false and this
+    /// field tells the operator why.
+    pub user_manager_reachable: bool,
+}
 
 /// macOS-family report. Populated by the future mac campaign.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
