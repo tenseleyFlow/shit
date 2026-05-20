@@ -160,30 +160,11 @@ smoke_log "session close"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
 
-# Happy-path cleanup. Each step timestamped so we can locate the
-# hang precisely if it returns.
-echo "[diag $(date -u +%H:%M:%S)] cleanup begin" >&2
-restore_cron_if_needed
-smoke_stop_shitd
-echo "[diag $(date -u +%H:%M:%S)] cleanup done; snapshotting tracked-child state" >&2
-
-# One-shot snapshot RIGHT BEFORE exit. No background processes (the
-# watchdog itself was pinning bash in `wait4()`). procstat -k tells
-# us the kernel stack — if bash is in sys_wait4 here it's tracking
-# something that hasn't exited yet.
-echo "--- ps -axfo pid,ppid,pgid,sid,stat,wchan,command (deepest 40) ---" >&2
-ps -axfo pid,ppid,pgid,sid,stat,wchan,command 2>&1 | tail -40 >&2 || true
-echo "--- procstat -k $$ ---" >&2
-procstat -k $$ 2>&1 >&2 || true
-echo "--- fstat -p $$ ---" >&2
-fstat -p $$ 2>&1 | head -20 >&2 || true
-echo "[diag $(date -u +%H:%M:%S)] about to exec true (sidestep bash wait-at-exit on CI VM)" >&2
-
-# Replace bash with /usr/bin/true. Diagnostic earlier this iteration
-# showed bash on the cross-platform-actions FreeBSD-14 VM exits via
-# `sys_wait4()` for tracked backgrounded jobs (shitd's not-fully-
-# reaped grandchildren). `exec true` replaces bash with a brand-new
-# `true` process that has no children to wait on — exits with 0
-# immediately. This is the FreeBSD-CI-bash equivalent of forcing
-# "release all tracked children and exit now."
-exec /usr/bin/true
+# === B04.6c BISECTION EXPERIMENT ===
+# Bypass ALL cleanup. Just PASS + exit. If this hangs, the issue is
+# intrinsic to bash exit on the cross-platform-actions FreeBSD-14
+# VM (not anything cleanup is doing). If it exits cleanly, then
+# something in restore_cron_if_needed or smoke_stop_shitd is the
+# culprit and we bisect further.
+echo "[diag $(date -u +%H:%M:%S)] BISECTION: skipping all cleanup; raw exit 0" >&2
+exit 0
