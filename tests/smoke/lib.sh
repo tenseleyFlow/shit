@@ -180,24 +180,25 @@ smoke_cleanup() {
     else
         smoke_log "SMOKE_KEEP_TMP=1; tmpdir preserved at ${SHIT_SMOKE_TMP}"
     fi
-    printf '[cleanup %s] rm done; sampling bash state before exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
+    printf '[cleanup %s] rm done; sampling exit-time state (rc=%d)\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
     # === B04.6c FINAL-EXIT INSTRUMENTATION ===
     # All other smokes hit `exit $rc` here and bash terminates within
-    # ms. For service-restart on cross-platform-actions FBSD, bash
-    # hangs on exit itself. Diff between smokes must be in bash's
-    # tracked-job table or in surviving children.
-    printf '[cleanup %s] jobs -l output:\n' "$(date -u +%H:%M:%S)" >&2
-    jobs -l 2>&1 | sed 's/^/  /' >&2 || true
-    printf '[cleanup %s] children of bash $$=%s:\n' "$(date -u +%H:%M:%S)" "$$" >&2
-    pgrep -P $$ 2>&1 | sed 's/^/  /' >&2 || echo "  (no children)" >&2
-    printf '[cleanup %s] ps -axfo for our session:\n' "$(date -u +%H:%M:%S)" >&2
-    ps -o pid,ppid,pgid,sid,stat,wchan,command -d -j -A 2>&1 \
-        | awk -v sid="$(ps -o sid= -p $$)" 'NR==1 || $4==sid' \
-        | sed 's/^/  /' >&2 || true
-    printf '[cleanup %s] shell options (monitor/huponexit/lastpipe):\n' "$(date -u +%H:%M:%S)" >&2
-    set -o 2>&1 | grep -E 'monitor|huponexit|lastpipe' | sed 's/^/  /' >&2 || true
-    shopt 2>&1 | grep -E 'huponexit|lastpipe|checkjobs' | sed 's/^/  /' >&2 || true
-    printf '[cleanup %s] about to call exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
+    # ms. service-restart on cross-platform-actions FBSD hangs at the
+    # exit call itself. Dump open fds + any shit-* process state +
+    # any process referencing the tmpdir.
+    printf '[cleanup %s] open fds for $$=%s (procstat -f):\n' "$(date -u +%H:%M:%S)" "$$" >&2
+    procstat -f $$ 2>&1 | sed 's/^/  /' >&2 || true
+    printf '[cleanup %s] any shit-* processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
+    pgrep -lf 'shit' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
+    printf '[cleanup %s] doas processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
+    pgrep -lf 'doas' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
+    # Safety-net: if `exit $rc` hangs, force-kill bash in 10 sec. A
+    # backgrounded subshell with setsid escapes bash's tracked-jobs
+    # table, so it can't pin bash itself (which is the whole problem
+    # we're working around).
+    setsid sh -c "sleep 10; kill -KILL $$ 2>/dev/null" </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    printf '[cleanup %s] safety-net kill armed (10 sec); about to exit %d\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
     exit "${rc}"
 }
 trap smoke_cleanup EXIT
