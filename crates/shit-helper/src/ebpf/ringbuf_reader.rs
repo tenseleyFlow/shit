@@ -16,18 +16,22 @@
 //! Wire layout — must stay byte-identical with `bpf/src/common.h`:
 //!
 //! ```text
-//! shit_event_hdr   (40 bytes)
-//!   u8  kind            offset  0
-//!   u8  _pad[3]         offset  1
-//!   u32 pid             offset  4
-//!   u32 tgid            offset  8
-//!   u32 _pad2           offset 12
-//!   u64 ts_ns           offset 16
-//!   u8  comm[16]        offset 24
-//! shit_unlink_event (56 bytes total)
-//!   shit_event_hdr hdr  offset  0
-//!   u64 dev             offset 40
-//!   u64 inode           offset 48
+//! shit_event_hdr     (40 bytes)
+//!   u8  kind              offset  0
+//!   u8  _pad[3]           offset  1
+//!   u32 pid               offset  4
+//!   u32 tgid              offset  8
+//!   u32 _pad2             offset 12
+//!   u64 ts_ns             offset 16
+//!   u8  comm[16]          offset 24
+//! shit_unlink_event  (328 bytes total)
+//!   shit_event_hdr hdr    offset   0
+//!   u64 dev               offset  40
+//!   u64 inode             offset  48
+//!   u64 parent_inode      offset  56
+//!   u32 name_len          offset  64
+//!   u32 _pad3             offset  68
+//!   u8  name[256]         offset  72  (NAME_MAX+1, NUL-terminated)
 //! ```
 //!
 //! Lifetime model: the reader owns a `RingBuf<MapData>` (taken from
@@ -68,16 +72,62 @@ pub mod kind {
     pub const OPEN: u8 = 4;
 }
 
+/// Max basename bytes the BPF program writes into `UnlinkEvent::name`.
+/// Matches `SHIT_NAME_MAX + 1` in `common.h` (NAME_MAX + trailing NUL).
+pub const NAME_BUF_LEN: usize = 256;
+
 /// `lsm/inode_unlink` event — mirrors `struct shit_unlink_event`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy)]
 pub struct UnlinkEvent {
     pub hdr: EventHeader,
     pub dev: u64,
     pub inode: u64,
+    pub parent_inode: u64,
+    pub name_len: u32,
+    pub _pad3: u32,
+    pub name: [u8; NAME_BUF_LEN],
 }
 
-const _: () = assert!(std::mem::size_of::<UnlinkEvent>() == 56);
+const _: () = assert!(std::mem::size_of::<UnlinkEvent>() == 328);
+
+impl Default for UnlinkEvent {
+    fn default() -> Self {
+        Self {
+            hdr: EventHeader::default(),
+            dev: 0,
+            inode: 0,
+            parent_inode: 0,
+            name_len: 0,
+            _pad3: 0,
+            name: [0; NAME_BUF_LEN],
+        }
+    }
+}
+
+impl std::fmt::Debug for UnlinkEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnlinkEvent")
+            .field("hdr", &self.hdr)
+            .field("dev", &self.dev)
+            .field("inode", &self.inode)
+            .field("parent_inode", &self.parent_inode)
+            .field("name_len", &self.name_len)
+            .field("name", &self.basename_str())
+            .finish()
+    }
+}
+
+impl UnlinkEvent {
+    /// Returns the basename as a borrowed `&str`. Defensively clamps
+    /// `name_len` to `NAME_BUF_LEN` so a malformed kernel record can't
+    /// induce an out-of-bounds slice. Returns `""` if the BPF program
+    /// reported `name_len == 0` (str_read failed).
+    pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
+        let len = (self.name_len as usize).min(NAME_BUF_LEN);
+        String::from_utf8_lossy(&self.name[..len])
+    }
+}
 
 /// Sink trait for decoded LSM events. The phase-2-chunk-2 stub
 /// implementation just logs; phase-2-chunk-3 wires this into
@@ -96,6 +146,7 @@ pub struct LoggingSink;
 impl LsmEventSink for LoggingSink {
     fn on_unlink(&self, ev: &UnlinkEvent) {
         let comm = comm_to_string(&ev.hdr.comm);
+        let basename = ev.basename_str();
         tracing::info!(
             kind = "unlink",
             pid = ev.hdr.pid,
@@ -103,6 +154,9 @@ impl LsmEventSink for LoggingSink {
             ts_ns = ev.hdr.ts_ns,
             dev = ev.dev,
             inode = ev.inode,
+            parent_inode = ev.parent_inode,
+            name_len = ev.name_len,
+            basename = %basename,
             comm,
             "lsm event"
         );
@@ -256,13 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn unlink_event_layout_is_56_bytes() {
-        assert_eq!(std::mem::size_of::<UnlinkEvent>(), 56);
+    fn unlink_event_layout_is_328_bytes() {
+        assert_eq!(std::mem::size_of::<UnlinkEvent>(), 328);
         assert_eq!(std::mem::align_of::<UnlinkEvent>(), 8);
     }
 
     #[test]
     fn decode_unlink_round_trips() {
+        let mut name_buf = [0u8; NAME_BUF_LEN];
+        name_buf[..7].copy_from_slice(b"foo.txt");
         let original = UnlinkEvent {
             hdr: EventHeader {
                 kind: kind::UNLINK,
@@ -275,28 +331,55 @@ mod tests {
             },
             dev: 0x00000801,
             inode: 9_876_543,
+            parent_inode: 9_876_540,
+            name_len: 7,
+            _pad3: 0,
+            name: name_buf,
         };
-        let bytes: [u8; 56] = unsafe { std::mem::transmute(original) };
+        let bytes: [u8; 328] = unsafe { std::mem::transmute(original) };
         let decoded = decode_unlink(&bytes).expect("decode");
         assert_eq!(decoded.hdr.kind, kind::UNLINK);
         assert_eq!(decoded.hdr.pid, 12345);
         assert_eq!(decoded.hdr.ts_ns, 0xdead_beef_cafe_babe);
         assert_eq!(decoded.dev, 0x00000801);
         assert_eq!(decoded.inode, 9_876_543);
+        assert_eq!(decoded.parent_inode, 9_876_540);
+        assert_eq!(decoded.name_len, 7);
+        assert_eq!(decoded.basename_str(), "foo.txt");
         assert_eq!(comm_to_string(&decoded.hdr.comm), "rm");
     }
 
     #[test]
     fn decode_unlink_rejects_short_record() {
-        let bytes = [0u8; 32]; // shorter than the 56-byte struct
+        let bytes = [0u8; 32]; // shorter than the 328-byte struct
         assert!(decode_unlink(&bytes).is_none());
     }
 
     #[test]
     fn decode_unlink_rejects_wrong_kind() {
-        let mut bytes = [0u8; 56];
+        let mut bytes = [0u8; 328];
         bytes[0] = kind::OPEN; // not UNLINK
         assert!(decode_unlink(&bytes).is_none());
+    }
+
+    #[test]
+    fn basename_str_clamps_oversize_name_len() {
+        // Defensive: even if BPF reports name_len > NAME_BUF_LEN (it
+        // can't, but be paranoid), basename_str must clamp.
+        let mut ev = UnlinkEvent::default();
+        ev.name[..3].copy_from_slice(b"foo");
+        ev.name_len = (NAME_BUF_LEN as u32) + 999;
+        let s = ev.basename_str();
+        assert_eq!(s.len(), NAME_BUF_LEN);
+        assert!(s.starts_with("foo"));
+    }
+
+    #[test]
+    fn basename_str_zero_len_yields_empty() {
+        let mut ev = UnlinkEvent::default();
+        ev.name[..3].copy_from_slice(b"foo");
+        ev.name_len = 0;
+        assert_eq!(ev.basename_str(), "");
     }
 
     #[test]

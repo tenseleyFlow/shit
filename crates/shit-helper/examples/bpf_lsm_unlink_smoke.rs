@@ -169,11 +169,12 @@ fn main() {
     while Instant::now() < deadline {
         while let Some(rec) = ring.next() {
             events_seen += 1;
-            // shit_unlink_event = header (40B) + dev (8B) + inode (8B) = 56 B.
-            // ringbuf records are 8-byte aligned with no userspace
-            // padding (we wrote 56 B, we get 56 B back).
+            // shit_unlink_event = hdr (40) + dev (8) + inode (8) +
+            // parent_inode (8) + name_len (4) + _pad3 (4) + name[256]
+            // = 328 B. ringbuf records are 8-byte aligned with no
+            // userspace padding.
             if events_seen == 1 {
-                println!("[lsm-smoke] first event size = {} bytes (expect 56)", rec.len());
+                println!("[lsm-smoke] first event size = {} bytes (expect 328)", rec.len());
             }
         }
         heartbeat.store(now_ms(), Ordering::Release);
