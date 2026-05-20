@@ -282,11 +282,18 @@ impl LinuxCaptureRuntime {
         let ws = self.watches.entry(ev.command).or_default();
 
         // Construct the race candidate. `/proc/<pid>/cwd` is a symlink
-        // managed by the kernel — for a live pid it resolves to the
-        // current cwd. The basename is the unlink target as the
-        // kernel saw it in the dentry. For `cd /tmp && rm foo.txt`,
-        // this resolves to `/tmp/foo.txt` deterministically.
-        let candidate_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
+        // managed by the kernel — read_link gives us the resolved
+        // cwd, and we join the basename for the file's real path.
+        // We keep BOTH the resolved path (for the CapturedPreImage
+        // wire — daemon needs this to know WHERE the unlinked file
+        // belongs) and the procfs path (for the open(2) call — the
+        // procfs path stays valid even if the cwd was renamed mid-rm).
+        let cwd_link = format!("/proc/{}/cwd", ev.pid);
+        let resolved_path = std::fs::read_link(&cwd_link)
+            .map(|cwd| cwd.join(ev.basename))
+            .map(|p| path_to_string(&p))
+            .unwrap_or_else(|_| format!("{cwd_link}/{}", ev.basename));
+        let open_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
 
         // Race window: between this open() and vfs_unlink completing
         // its d_drop. The LSM hook fires synchronously before the
@@ -296,7 +303,7 @@ impl LinuxCaptureRuntime {
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(&candidate_path);
+            .open(&open_path);
 
         let (race_fd, race_dev, race_inode, file_type) = match opened {
             Ok(f) => {
@@ -357,7 +364,7 @@ impl LinuxCaptureRuntime {
             seq: ev.command.seq,
             dev: ev.dev,
             inode: ev.inode,
-            path: Some(candidate_path.clone()),
+            path: Some(resolved_path.clone()),
             blob_hash,
             stored_bytes,
             post_content_hash: None,
@@ -393,6 +400,7 @@ impl LinuxCaptureRuntime {
             race_won,
             stored_bytes,
             basename = ev.basename,
+            path = %resolved_path,
             "lsm-unlink CapturedPreImage sent",
         );
     }
