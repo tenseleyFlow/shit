@@ -576,10 +576,10 @@ fn run_probe_fanotify() -> anyhow::Result<()> {
             let meta: libc::fanotify_event_metadata =
                 unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
             // ALLOW the syscall and close the kernel-given fd.
-            if (meta.mask & (libc::FAN_OPEN_PERM as u64)) != 0 {
+            if (meta.mask & libc::FAN_OPEN_PERM) != 0 {
                 let response = libc::fanotify_response {
                     fd: meta.fd,
-                    response: libc::FAN_ALLOW as u32,
+                    response: libc::FAN_ALLOW,
                 };
                 let ptr = &response as *const _ as *const libc::c_void;
                 let sz = std::mem::size_of::<libc::fanotify_response>();
