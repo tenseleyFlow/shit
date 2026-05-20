@@ -35,6 +35,7 @@ enum shit_event_kind {
     SHIT_EVT_SETATTR = 2,
     SHIT_EVT_MKDIR = 3,
     SHIT_EVT_OPEN = 4,
+    SHIT_EVT_CREATE = 5,
 };
 
 /* Bounded comm length matches kernel's TASK_COMM_LEN. */
@@ -129,6 +130,23 @@ struct shit_setattr_event {
  *     *dentry`'s `d_name`),
  *   - the umask-applied mode the kernel will assign to it. */
 struct shit_mkdir_event {
+    struct shit_event_hdr hdr;
+    __u64 parent_dev;
+    __u64 parent_inode;
+    __u32 mode;
+    __u32 name_len;
+    char  name[SHIT_NAME_MAX + 1];
+};
+
+/* lsm/inode_create — `open(2)` with `O_CREAT` (and `creat(2)`,
+ * `mknod(2)` for regular files). Same shape as `shit_mkdir_event`
+ * (we keep them separate for wire clarity / userspace dispatch).
+ * Userspace stats the resolved path post-syscall to fill in
+ * (dev, inode) and also opens an `O_RDONLY` fd into the pre_opens
+ * table — so a subsequent inode_unlink for the same file can
+ * dup that fd and read pre-image content via the
+ * open-fd-survives-unlink trick. */
+struct shit_create_event {
     struct shit_event_hdr hdr;
     __u64 parent_dev;
     __u64 parent_inode;
