@@ -80,7 +80,11 @@ pub struct BsdReport {
 
 /// Result of spawning `shit-helper handshake-probe --daemon-sock
 /// <path>` and waiting for its one-line JSON reply.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is the "no daemon was probed" value — all-false /
+/// all-None with an empty `error`. Used by [`LinuxReport`]'s
+/// `Default` derive so the schema's neutral state is well-defined.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HelperHandshakeReport {
     /// `true` iff the helper successfully exchanged a Handshake /
     /// HandshakeAck with the daemon at `daemon_sock`.

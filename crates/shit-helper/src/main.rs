@@ -508,17 +508,35 @@ fn run_probe_fanotify() -> anyhow::Result<()> {
     let fd = fanotify::init_pre_content()
         .map_err(|e| anyhow::anyhow!("init_pre_content: {e}"))?;
 
-    // Make a tempdir and mark it. We mark the DIR (FAN_MARK_ADD on
-    // the dir's path) with FAN_EVENT_ON_CHILD | FAN_ONLYDIR so any
-    // file open inside fires a perm event.
-    let dir = tempfile::tempdir()?;
-    fanotify::mark::mark_dir_for_capture(&fd, dir.path())
+    // Make a tempdir and mark it. Manual mktemp to avoid the
+    // tempfile dev-dep at runtime — keeps the helper binary slim
+    // for the doctor probe path.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir_path = std::env::temp_dir().join(format!(
+        "shit-doctor-fanotify-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir(&dir_path)
+        .map_err(|e| anyhow::anyhow!("mkdir tempdir: {e}"))?;
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = DirGuard(dir_path.clone());
+
+    fanotify::mark::mark_dir_for_capture(&fd, &dir_path)
         .map_err(|e| anyhow::anyhow!("mark_dir_for_capture: {e}"))?;
 
     // Spawn a child that opens a probe file inside the marked dir.
     // We can't open it from this process — the fanotify-perm queue
     // would deadlock (we'd block waiting for ourselves to respond).
-    let probe_path = dir.path().join("probe");
+    let probe_path = dir_path.join("probe");
     let probe_str = probe_path.to_string_lossy().into_owned();
     let child = std::process::Command::new("/bin/sh")
         .arg("-c")

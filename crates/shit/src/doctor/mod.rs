@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "linux",
 ))]
 use crate::doctor::json::HelperHandshakeReport;
 use crate::doctor::json::{DoctorReport, HostInfo, MountReport, SCHEMA_VERSION};
