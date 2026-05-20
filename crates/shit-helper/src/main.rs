@@ -822,6 +822,7 @@ struct LsmDispatch {
 #[cfg(target_os = "linux")]
 fn boot_ebpf_lsm(
     runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
+    excluded_pids: Vec<u32>,
 ) -> anyhow::Result<LsmCaptureState> {
     let mut loader = ebpf::EbpfLoader::new();
     loader.load_lsm_unlink()
@@ -861,6 +862,7 @@ fn boot_ebpf_lsm(
         Some(rt) => Arc::new(ebpf::ringbuf_reader::LinuxCaptureSink {
             runtime: rt,
             tree: Arc::clone(&tree),
+            excluded_pids,
         }),
         None => {
             // No capture runtime (init failed). Fall back to the
@@ -1052,7 +1054,14 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         // tree map (for WatchTree dispatch) and the LsmReader join
         // handle (for graceful shutdown).
         let lsm_state: Option<LsmCaptureState> = if matches!(setup.tier, CaptureTier::EbpfLsm) {
-            match boot_ebpf_lsm(capture_rt.clone()) {
+            // Exclude the helper's own pid + the daemon's pid from
+            // LSM event dispatch. Both run as descendants of the
+            // smoke harness (or the user's shell), so their internal
+            // file ops would otherwise be journaled as user-visible
+            // mutations. Daemon's blob-staging rename was the
+            // load-bearing miss surfaced by L04.1.
+            let excluded = vec![std::process::id(), cli.daemon_pid];
+            match boot_ebpf_lsm(capture_rt.clone(), excluded) {
                 Ok(state) => Some(state),
                 Err(e) => {
                     tracing::error!(err = %e, "ebpf-lsm load failed; this tier is unusable on this boot");

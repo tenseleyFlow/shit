@@ -367,15 +367,40 @@ pub trait LsmEventSink: Send + Sync + 'static {
 ///
 /// Untracked pids are silently dropped — same policy as fanotify's
 /// per-event ALLOW-without-capture path.
+///
+/// `excluded_pids` is a small set of process IDs whose events MUST
+/// be dropped even if the tree walk says they're tracked. This is
+/// critical for the LSM tier because the daemon and helper run as
+/// descendants of the smoke harness (or whatever shell launched
+/// shit) and their own internal file ops (blob staging rename,
+/// helper-staging writes, etc.) would otherwise be journaled as
+/// user-visible mutations. Fanotify-perm doesn't have this problem
+/// because its marks are scoped to the command's cwd only, but
+/// LSM hooks observe system-wide.
 #[cfg(target_os = "linux")]
 pub struct LinuxCaptureSink {
     pub runtime: std::sync::Arc<std::sync::Mutex<crate::capture::linux::LinuxCaptureRuntime>>,
     pub tree: std::sync::Arc<std::sync::Mutex<crate::fanotify::tree::TreeMap>>,
+    /// PIDs whose LSM events are dropped unconditionally. Typically
+    /// `[helper_self_pid, daemon_pid]`.
+    pub excluded_pids: Vec<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCaptureSink {
+    /// Returns true if events from `pid` should be filtered out
+    /// before tree lookup.
+    fn is_excluded(&self, pid: u32) -> bool {
+        self.excluded_pids.contains(&pid)
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl LsmEventSink for LinuxCaptureSink {
     fn on_unlink(&self, ev: &UnlinkEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
         let pid = ev.hdr.pid as i32;
         let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
             tracing::trace!(pid, "untracked pid; dropping lsm unlink event");
@@ -394,6 +419,9 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_setattr(&self, ev: &SetattrEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
         let pid = ev.hdr.pid as i32;
         let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
             tracing::trace!(pid, "untracked pid; dropping lsm setattr event");
@@ -418,6 +446,9 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_mkdir(&self, ev: &MkdirEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
         let pid = ev.hdr.pid as i32;
         let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
             tracing::trace!(pid, "untracked pid; dropping lsm mkdir event");
@@ -436,6 +467,9 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_create(&self, ev: &CreateEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
         let pid = ev.hdr.pid as i32;
         let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
             tracing::trace!(pid, "untracked pid; dropping lsm create event");
@@ -454,6 +488,9 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_open(&self, ev: &OpenEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
         let pid = ev.hdr.pid as i32;
         let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
             tracing::trace!(pid, "untracked pid; dropping lsm open event");
@@ -471,6 +508,9 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_rename(&self, ev: &RenameEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
         let pid = ev.hdr.pid as i32;
         let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
             tracing::trace!(pid, "untracked pid; dropping lsm rename event");
