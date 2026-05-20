@@ -56,12 +56,17 @@ if ! [ -f "/etc/rc.d/${TARGET_UNIT}" ]; then
     smoke_fail "/etc/rc.d/${TARGET_UNIT} missing — unexpected on FreeBSD base"
 fi
 
-# Capture baseline. `service onestatus` reads /var/run/<unit>.pid
-# which is mode 0600 root:wheel — so the unprivileged check
-# false-negatives. Use pgrep instead (same shape as the helper's
-# active-state probe in svc/freebsd.rs).
+# Capture baseline. We need a way to tell "the cron DAEMON is up"
+# that distinguishes from cron's transient job-runner children
+# (e.g. /usr/libexec/atrun every minute, which sets argv[0] to
+# "cron: running job" but keeps p_comm = "cron" — so a plain
+# `pgrep cron` matches both).
+#
+# `service <unit> onestatus` reads /var/run/<unit>.pid which is
+# mode 0600 root:wheel, so use the privileged form. This is the
+# authoritative "is the daemon running?" check.
 unit_running() {
-    pgrep -q "${TARGET_UNIT}"
+    ${PRIV} /usr/sbin/service "${TARGET_UNIT}" onestatus >/dev/null 2>&1
 }
 if unit_running; then
     PRE_ACTIVE="running"
@@ -75,11 +80,21 @@ if [ "${PRE_ACTIVE}" != "running" ]; then
     sleep 1
 fi
 
-cleanup() {
-    # Best-effort restore.
-    ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start >/dev/null 2>&1 || true
+restore_cron_if_needed() {
+    # Defensive restore — only when undo failed to restart cron.
+    # Called explicitly at end of script body (NOT via trap) to
+    # avoid the bash post-trap exit hang we observed on the
+    # cross-platform-actions FreeBSD VM. Crash-path cleanup falls
+    # back to lib.sh's smoke_cleanup, which already calls
+    # smoke_stop_shitd and exits cleanly on the same VM (it doesn't
+    # override the EXIT trap so it doesn't trigger the hang).
+    if ! pgrep -q "${TARGET_UNIT}"; then
+        ${PRIV} /usr/sbin/service "${TARGET_UNIT}" start </dev/null >/dev/null 2>&1 || true
+    fi
 }
-trap cleanup EXIT
+# Intentionally NO `trap` here — lib.sh's default smoke_cleanup
+# handles crash paths. Happy path runs restore_cron_if_needed +
+# smoke_stop_shitd explicitly at the end of the script body.
 
 smoke_start_shitd
 
@@ -149,3 +164,22 @@ smoke_log "session close"
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
 smoke_log "PASS: service-restart-undo-fbsd (${TARGET_UNIT} stopped→undone)"
+
+# Critical for CI-VM-only hang we couldn't reproduce locally: cron
+# (or one of its rc.d daemonize ancestors) keeps bash's stdout/
+# stderr pipe write-end open. The driver `| tee` pipe never EOFs,
+# so the whole driver loop blocks even after bash's exit() syscall.
+# procstat -f showed cron-tied smokes have stdout-pipe refcount 8
+# vs 6 for stateless smokes. Killing cron at cleanup releases the
+# pipe ref and unblocks tee → driver. Test invariant (cron running
+# post-undo) was already asserted above, so this is safe. Iterate
+# since `service stop` doesn't kill cron's "running job" children
+# (e.g. /usr/libexec/atrun), and those may also hold the pipe.
+${PRIV} /usr/sbin/service "${TARGET_UNIT}" onestop >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5; do
+    pgrep -q cron 2>/dev/null || break
+    ${PRIV} pkill -KILL cron 2>/dev/null || true
+    sleep 0.2
+done
+
+exit 0

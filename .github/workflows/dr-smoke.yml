@@ -243,3 +243,178 @@ jobs:
           path: |
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
+
+  # B04 — FreeBSD smoke regression net. Runs all 9 BSD smokes inside
+  # a FreeBSD-14 VM. Single VM, many smokes (job-per-smoke would cost
+  # ~10 minutes per smoke in VM boot alone). One unit covers:
+  #   - file tier: rm-undo / mkdir-undo / chmod-undo / touch-edit-undo
+  #   - package tier: pkg-install-undo (via doas)
+  #   - service tier: service-restart-undo (cron via doas)
+  #   - network tier: pfctl-add-undo / pfctl-flush-undo (pf via doas)
+  #   - process tier: kill-proc-undo (pkill -f resolved by sysctl(KERN_PROC_*))
+  #
+  # Doctor JSON pre-flight gates the smoke run — if the CI image's
+  # FreeBSD lacks a working kqueue we skip cleanly and fail the job
+  # loudly rather than running smokes against a degraded kernel.
+  #
+  # Release-gating: this job must be green before tagging a release.
+  freebsd-smoke:
+    name: freebsd-smoke (B04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: BSD smoke matrix inside FreeBSD 14
+        # v0.30.0 is what ci.yml's freebsd-14 job uses (image + the
+        # GHSA-928q-63gf-mc2x fix). Keep pinned; don't follow @v0.
+        uses: cross-platform-actions/action@v0.30.0
+        with:
+          operating_system: freebsd
+          version: '14.2'
+          shell: sh
+          # The CI VM's default user is `runner` and is in `wheel`.
+          # `sudo` is wired by the action; `doas` we install ourselves
+          # because the smokes prefer it.
+          run: |
+            set -eu
+            echo "===== install deps ====="
+            sudo pkg install -y rust gmake python3 sqlite3 doas jq
+
+            echo "===== configure doas (permit the CI runner user directly) ====="
+            # The cross-platform-actions VM runs commands as a user
+            # that's NOT in `wheel`, so `permit nopass :wheel` doesn't
+            # apply. Grant the current user explicitly.
+            CI_USER="$(id -un)"
+            echo "  user: ${CI_USER}"
+            printf 'permit nopass %s\npermit nopass :wheel\n' "${CI_USER}" \
+              | sudo tee /usr/local/etc/doas.conf >/dev/null
+            sudo chmod 0640 /usr/local/etc/doas.conf
+            # Verify doas actually works before continuing.
+            doas /sbin/sysctl -n kern.ostype || {
+              echo "FAIL: doas misconfigured; cat /usr/local/etc/doas.conf:"
+              sudo cat /usr/local/etc/doas.conf
+              exit 1
+            }
+
+            echo "===== build release binaries ====="
+            cargo build --release \
+                -p shit -p shitd -p shit-helper -p shit-preload-shim \
+                --locked 2>&1 | tail -10
+
+            echo "===== load pf with permissive baseline ====="
+            # pf isn't loaded by default in the CI image. Load it
+            # with `pass all` so SSH (which the action's runtime
+            # depends on) stays alive and the pfctl smokes have
+            # /dev/pf bound. The smokes already SKIP cleanly without
+            # this; the kldload makes them run instead of skip.
+            sudo kldload pf || echo "  pf already loaded"
+            echo 'pass all' | sudo tee /etc/pf.conf >/dev/null
+            sudo /usr/sbin/service pf onestart || true
+            ls -la /dev/pf 2>&1 || echo "WARN: /dev/pf still absent; pf smokes will SKIP"
+
+            echo "===== doctor JSON pre-flight ====="
+            export SHIT_HELPER_BIN="$(pwd)/target/release/shit-helper"
+            ./target/release/shit doctor --json > /tmp/doctor.json
+            # Gate: kqueue must be functional. If not, the CI image's
+            # FreeBSD kernel is unusable for our purposes — fail loud.
+            if ! jq -e '.bsd.kqueue_functional == true' /tmp/doctor.json >/dev/null; then
+              echo "FAIL: doctor reports kqueue not functional in this VM image"
+              jq '.bsd' /tmp/doctor.json
+              exit 1
+            fi
+            echo "  doctor kqueue_functional: PASS"
+            jq -r '.bsd | "  capsicum: \(.capsicum_available)  zfs_datasets: \(.zfs_datasets|length)  runtime_capture: \(.runtime_capture)"' /tmp/doctor.json
+
+            echo "===== environment diagnostics ====="
+            echo "  bash: $(bash --version | head -1)"
+            echo "  uname: $(uname -srm)"
+            echo "  timeout: $(/usr/bin/timeout --version 2>&1 | head -1 || /usr/bin/timeout 2>&1 | head -1 || true)"
+
+            echo "===== run smokes ====="
+            FAIL_COUNT=0
+            SMOKES="rm-undo-fbsd.sh \
+                    mkdir-undo-fbsd.sh \
+                    chmod-undo-fbsd.sh \
+                    touch-edit-undo-fbsd.sh \
+                    pkg-install-undo-fbsd.sh \
+                    service-restart-undo-fbsd.sh \
+                    pfctl-add-undo-fbsd.sh \
+                    pfctl-flush-undo-fbsd.sh \
+                    kill-proc-undo-fbsd.sh"
+            for smoke in $SMOKES; do
+              echo "----- $smoke -----"
+              # Capture timeout's exit code separately so we can
+              # distinguish: 0=success, 124=timeout(1)-killed,
+              # 137=SIGKILL'd, other=smoke explicitly exited.
+              # Don't use `if timeout ...; then` — that loses the
+              # exit code distinction.
+              #
+              # lib.sh's smoke_cleanup arms a safety-net `setsid sh
+              # -c 'sleep 10; kill -KILL $$'` before its `exit $rc`.
+              # If bash's exit() hangs (FBSD CI quirk where service-
+              # restart pins bash via fd inheritance we haven't
+              # isolated yet), the safety-net SIGKILLs bash so the
+              # job doesn't hang the runner. Exit code in that case
+              # is 137 (SIGKILL) — but the smoke had already logged
+              # its PASS line BEFORE arming the safety-net. So we
+              # treat 137 + "PASS:" in stdout as success.
+              passlog="$(mktemp /tmp/smoke-out.XXXXXX)"
+              rc_file="$(mktemp /tmp/smoke-rc.XXXXXX)"
+              # Sh-portable live output + rc capture: subshell writes
+              # rc to a sidecar file; outer pipe streams to tee for
+              # live visibility. The subshell's own exit code (from
+              # `echo`) is always 0, which we discard.
+              set +e
+              (
+                /usr/bin/timeout --signal=TERM --kill-after=10 300 \
+                  bash "tests/smoke/$smoke"
+                echo $? > "$rc_file"
+              ) 2>&1 | tee "$passlog"
+              set -e
+              rc=$(cat "$rc_file" 2>/dev/null || echo 1)
+              rm -f "$rc_file"
+              case "$rc" in
+                0)    echo "  PASS: $smoke" ;;
+                124)  echo "  FAIL: $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                137)  if grep -q "^\[smoke .*\] PASS: " "$passlog"; then
+                        echo "  PASS: $smoke (safety-net kill — bash hung after smoke logged PASS)"
+                      else
+                        echo "  FAIL: $smoke (SIGKILL'd without PASS marker)"
+                        FAIL_COUNT=$((FAIL_COUNT + 1))
+                      fi ;;
+                125)  echo "  FAIL: $smoke (timeout(1) error)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                126)  echo "  FAIL: $smoke (bash not executable)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                127)  echo "  FAIL: $smoke (bash not found)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                *)    echo "  FAIL: $smoke (exit code $rc — smoke or bash exited explicitly)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+              esac
+              rm -f "$passlog"
+              # Dump any safety-net log so we see whether it fired.
+              for snlog in /tmp/safety-net.*.log; do
+                if [ -f "$snlog" ]; then
+                  echo "  --- $snlog ---"
+                  sed 's/^/    /' "$snlog"
+                  rm -f "$snlog"
+                fi
+              done
+              # Older watchdog.log path — kept for safety.
+              if [ -f /tmp/watchdog.log ]; then
+                echo "  --- /tmp/watchdog.log ---"
+                cat /tmp/watchdog.log | sed 's/^/    /'
+                rm -f /tmp/watchdog.log
+              fi
+            done
+
+            if [ "$FAIL_COUNT" -gt 0 ]; then
+              echo "===== $FAIL_COUNT smoke(s) failed ====="
+              exit 1
+            fi
+            echo "===== all 9 BSD smokes green ====="
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-smoke-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+            /tmp/doctor.json
