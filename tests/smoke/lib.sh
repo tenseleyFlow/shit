@@ -193,23 +193,29 @@ smoke_cleanup() {
     printf '[cleanup %s] doas processes anywhere:\n' "$(date -u +%H:%M:%S)" >&2
     pgrep -lf 'doas' 2>&1 | sed 's/^/  /' >&2 || echo "  (none)" >&2
     # Safety-net: if `exit $rc` hangs (FBSD CI fd-inheritance quirk
-    # we couldn't isolate), force-kill bash in 10 sec. setsid'd into
-    # its own session so it can't pin bash via the tracked-jobs
-    # table. PID-reuse-safe: before killing, verify the PID still
-    # exists AND its command is /usr/local/bin/bash AND its parent
-    # is timeout — otherwise the PID was freed by clean exit and
-    # reused by something else.
+    # we couldn't isolate), force-kill bash in 10 sec. Plain
+    # backgrounded subshell — `setsid` isn't in FreeBSD base; using
+    # it silently fails on the CI VM. The other smokes exit cleanly
+    # with this exact arm pattern, proving the subshell doesn't pin
+    # bash at exit. PID-reuse-safe: re-check PID's comm+ppid before
+    # killing — otherwise the PID was freed by clean exit and reused.
     target_pid=$$
     target_ppid=$PPID
-    setsid sh -c "
+    safety_net_log="/tmp/safety-net.${target_pid}.log"
+    (
         sleep 10
-        # Re-check the PID is still our bash before killing.
-        cur_comm=\$(ps -p ${target_pid} -o comm= 2>/dev/null || true)
-        cur_ppid=\$(ps -p ${target_pid} -o ppid= 2>/dev/null | tr -d ' ' || true)
-        if [ \"\${cur_comm}\" = 'bash' ] && [ \"\${cur_ppid}\" = '${target_ppid}' ]; then
-            kill -KILL ${target_pid} 2>/dev/null || true
-        fi
-    " </dev/null >/dev/null 2>&1 &
+        cur_comm=$(ps -p "${target_pid}" -o comm= 2>/dev/null || true)
+        cur_ppid=$(ps -p "${target_pid}" -o ppid= 2>/dev/null | tr -d ' ' || true)
+        {
+            echo "[safety-net $(date -u +%H:%M:%S)] woke up: comm='${cur_comm}' ppid='${cur_ppid}' (want bash/${target_ppid})"
+            if [ "${cur_comm##*/}" = "bash" ] && [ "${cur_ppid}" = "${target_ppid}" ]; then
+                echo "[safety-net $(date -u +%H:%M:%S)] FIRING SIGKILL on pid=${target_pid}"
+                kill -KILL "${target_pid}" 2>&1
+            else
+                echo "[safety-net $(date -u +%H:%M:%S)] skip — PID's identity changed"
+            fi
+        } >>"${safety_net_log}" 2>&1
+    ) </dev/null >/dev/null 2>&1 &
     disown 2>/dev/null || true
     printf '[cleanup %s] safety-net armed (pid=%d ppid=%d, 10 sec); about to exit %d\n' \
         "$(date -u +%H:%M:%S)" "${target_pid}" "${target_ppid}" "${rc}" >&2

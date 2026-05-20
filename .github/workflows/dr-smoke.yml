@@ -388,13 +388,18 @@ jobs:
                 *)    echo "  FAIL: $smoke (exit code $rc — smoke or bash exited explicitly)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
               esac
               rm -f "$passlog"
-              # If watchdog ran, dump it. Visible regardless of whether
-              # bash finished cleanup.
+              # Dump any safety-net log so we see whether it fired.
+              for snlog in /tmp/safety-net.*.log; do
+                if [ -f "$snlog" ]; then
+                  echo "  --- $snlog ---"
+                  sed 's/^/    /' "$snlog"
+                  rm -f "$snlog"
+                fi
+              done
+              # Older watchdog.log path — kept for safety.
               if [ -f /tmp/watchdog.log ]; then
-                echo "  --- /tmp/watchdog.log (from inside VM) ---"
+                echo "  --- /tmp/watchdog.log ---"
                 cat /tmp/watchdog.log | sed 's/^/    /'
-                echo "  --- end watchdog.log ---"
-                # Don't carry over to next smoke iteration.
                 rm -f /tmp/watchdog.log
               fi
             done
