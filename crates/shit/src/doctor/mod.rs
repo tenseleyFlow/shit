@@ -131,10 +131,13 @@ fn read_os_release() -> String {
 fn collect_bsd() -> Option<json::BsdReport> {
     use crate::doctor::probes::bsd;
 
+    let cap_available = bsd::capsicum_available();
+    let cap_default_on = bsd::capsicum_default_on(cap_available);
     Some(json::BsdReport {
         runtime_capture: bsd::runtime_capture_label(),
         kqueue_functional: bsd::kqueue_functional(),
-        capsicum_available: bsd::capsicum_available(),
+        capsicum_available: cap_available,
+        capsicum_default_on: cap_default_on,
         zfs_datasets: bsd::zfs_datasets(),
         helper_handshake: probe_helper_handshake(),
         preload_shim_installed: bsd::preload_shim_installed(),
@@ -441,10 +444,10 @@ fn print_bsd_tier(bsd: &json::BsdReport) {
     );
     println!(
         "capsicum: {}",
-        if bsd.capsicum_available {
-            "syscall available"
-        } else {
-            "not available"
+        match (bsd.capsicum_available, bsd.capsicum_default_on) {
+            (true, true) => "syscall available; helper enters by default",
+            (true, false) => "syscall available; SHIT_CAPSICUM=0 disables helper sandbox",
+            (false, _) => "not available",
         }
     );
     print!("zfs:      ");

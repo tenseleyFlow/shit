@@ -18,6 +18,7 @@ HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
 self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 basename="$(basename "$0")"
 real=""
+# FHS-standard locations first.
 for cand in "/usr/bin/$basename" "/bin/$basename" "/usr/sbin/$basename"; do
     if [[ -x "$cand" ]]; then
         cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
@@ -27,6 +28,25 @@ for cand in "/usr/bin/$basename" "/bin/$basename" "/usr/sbin/$basename"; do
         fi
     fi
 done
+# Fallback: PATH-based discovery with self filtered out. Catches
+# NixOS (/run/current-system/sw/bin), per-user nix profiles, and
+# any environment where the FHS paths don't exist.
+if [[ -z "$real" ]]; then
+    self_dir="$(dirname "$self_realpath")"
+    filtered_path=""
+    IFS=':' read -ra path_parts <<< "$PATH"
+    for p in "${path_parts[@]}"; do
+        [[ "$p" == "$self_dir" ]] && continue
+        filtered_path="${filtered_path:+$filtered_path:}$p"
+    done
+    cand="$(PATH="$filtered_path" command -v "$basename" 2>/dev/null || true)"
+    if [[ -n "$cand" && -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+        fi
+    fi
+fi
 [[ -z "$real" ]] && { echo "shit-$basename-wrapper: real $basename not found" >&2; exit 127; }
 
 if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then exec "$real" "$@"; fi

@@ -121,6 +121,12 @@ pub enum HelperRequest {
         session: Uuid,
         command_seq: u64,
         shell_kind: ShellKind,
+        /// Absolute cwd path that the helper should watch. B05:
+        /// daemon forwards this from `HookMessage::PreExec::cwd_path`.
+        /// Under Capsicum capability mode the helper can't resolve cwd
+        /// from `root_pid` via sysctl (KERN_PROC_CWD isn't whitelisted),
+        /// so the path arrives pre-resolved.
+        cwd_path: String,
     },
     UnwatchTree {
         session: Uuid,

@@ -29,7 +29,6 @@ use shit_planner::inode::BlobHash;
 use shit_planner::inverse::{ContainerOp, ContainerRuntime, InverseOp};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -96,11 +95,13 @@ exit 2
 "#,
         rec = record_dir.display()
     );
-    let mut f = fs::File::create(&path).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
-    let mut perms = f.metadata().unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    // Use fs::write (open/write/close in one call) instead of
+    // File::create + write_all to ensure the writeable fd is closed
+    // before this function returns. Otherwise exec(2) on `path` races
+    // with the fd lifecycle and trips ETXTBSY on Linux ("Text file
+    // busy", os error 26) when the executor spawns docker.
+    fs::write(&path, body.as_bytes()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
 

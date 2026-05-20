@@ -87,6 +87,10 @@ export SHIT_HELPER_BIN="${HELPER_BIN}"
 # crash. We snapshot 'pfctl -sr' before doing anything.
 BASELINE_RULES="$(${PRIV} /sbin/pfctl -sr 2>/dev/null || true)"
 cleanup() {
+    # MUST call smoke_stop_shitd because we're overriding lib.sh's
+    # EXIT trap. Without it, shitd is orphaned and the CI action's
+    # SSH session waits for its inherited fds to close → 5-min hang.
+    smoke_stop_shitd 2>/dev/null || true
     # Best-effort restore: rewrite a 'pass all' ruleset.
     # The captured BASELINE_RULES may be empty (default); 'pass all'
     # is the equivalent of empty for our purposes.

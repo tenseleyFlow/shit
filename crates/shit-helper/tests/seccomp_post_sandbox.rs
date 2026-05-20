@@ -118,6 +118,10 @@ fn helper_survives_post_sandbox_requests() {
         session: Uuid::new_v7(Timestamp::from_unix_time(0, 0, 0, 0)),
         command_seq: 1,
         shell_kind: ShellKind::Bash,
+        cwd_path: std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default(),
     };
     send_frame(&conn_fd, &encode_frame(&watch).unwrap());
 
