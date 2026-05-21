@@ -21,17 +21,29 @@
  *   - Always returns 0.
  *   - Ringbuf-reserve failures drop the event silently.
  *
- * LSM hook signature (kernel 6.3+):
- *   int inode_setattr(struct mnt_idmap *idmap,
- *                     struct dentry *dentry,
- *                     struct iattr *attr);
+ * LSM hook signature (BPF-callback level, per upstream
+ * include/linux/lsm_hook_defs.h):
+ *   LSM_HOOK(int, 0, inode_setattr, struct dentry *dentry,
+ *                                   struct iattr *attr)
  *
- * On 5.12–6.2 the first arg was `struct user_namespace *mnt_userns`;
- * on pre-5.12 it was absent. We use the 6.3+ signature here — hasu
- * runs 7.0.8 so verifier-attach succeeds. Back-compat for older
- * kernels in a follow-up.
+ * IMPORTANT: this is NOT the same as the C-level
+ * `security_inode_setattr(struct mnt_idmap *idmap, struct dentry
+ * *dentry, struct iattr *attr)` wrapper that callers invoke. The
+ * security_* wrapper takes 3 args (idmap added in 6.3) but it strips
+ * `idmap` before invoking the LSM hook chain. The BPF LSM attach
+ * target `lsm/inode_setattr` is the chain entry, so the callback
+ * receives 2 args. The kernel's BTF for `security_inode_setattr`
+ * reports vlen=3 (matching the C wrapper) -- aya will accept either
+ * declaration at load time, but a 3-arg declaration silently shifts
+ * the register reads: arg0=rdi becomes the dentry pointer (we read
+ * it as idmap), arg1=rsi becomes attr (we read it as dentry, so
+ * `dentry->d_inode` reads at the wrong offset from `attr` and
+ * produces garbage), arg2=rdx is undefined (we read NULL). Issue #21
+ * forensics in .docs/audits/ar00-runner-ops.md.
  *
- * Verified on hasu (NixOS, kernel 7.0.8).
+ * Verified on AR00 runner (Ubuntu 24.04, kernel 6.8.0-117-generic):
+ * 2-arg form reads (dentry=<valid>, attr=<valid>, d_inode=<valid>,
+ * i_ino=<real>, s_dev=<real>); 3-arg form reads garbage.
  */
 
 #include "../include/vmlinux.h"
@@ -75,7 +87,6 @@ static __always_inline __u32 translate_ia_valid(__u32 ia_valid)
 
 SEC("lsm/inode_setattr")
 int BPF_PROG(shit_inode_setattr,
-             struct mnt_idmap *idmap,
              struct dentry *dentry,
              struct iattr *attr)
 {
