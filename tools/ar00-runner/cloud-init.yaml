@@ -99,23 +99,47 @@ write_files:
       GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} lsm=lockdown,landlock,yama,apparmor,bpf,ima,evm"
 
   # rustup install script invocation. We pin to 1.88 (the project's
-  # MSRV per rust-toolchain.toml).
+  # MSRV per rust-toolchain.toml). Installing to /opt/cargo with
+  # /opt/cargo/bin on /etc/environment's PATH means BOTH root and
+  # the runner user pick it up without us needing to symlink into
+  # /usr/local/bin or duplicate the install per-user. The previous
+  # recipe installed to /root/.cargo (mode-700 traversal blocks
+  # non-root) and symlinked into /usr/local/bin -- the symlinks
+  # resolved but the target was inaccessible to the runner user,
+  # so 'cargo' was effectively missing from any GHA job step. See
+  # .docs/audits/ar00-runner-ops.md issue #8.
   - path: /root/install-rustup.sh
     permissions: '0755'
     content: |
       #!/bin/bash
       set -e
+      export CARGO_HOME=/opt/cargo
+      export RUSTUP_HOME=/opt/rustup
+      mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.88 --profile minimal
-      # Make rustup available system-wide (the runner user needs it).
-      ln -sf /root/.cargo/bin/cargo /usr/local/bin/cargo
-      ln -sf /root/.cargo/bin/rustc /usr/local/bin/rustc
-      ln -sf /root/.cargo/bin/rustup /usr/local/bin/rustup
-      # Also install for runner user.
-      sudo -u runner bash -c '
-        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --default-toolchain 1.88 --profile minimal
-      '
+        | sh -s -- -y --default-toolchain 1.88 --profile minimal --no-modify-path
+      # Make CARGO_HOME world-readable + executable so the runner
+      # user (and any future user) can read the toolchain. Cargo
+      # itself doesn't write here at runtime; per-job builds get
+      # their own CARGO_TARGET_DIR.
+      chmod -R go+rX /opt/cargo /opt/rustup
+      # Put cargo on the system path for every login + every
+      # actions-runner job (actions-runner inherits /etc/environment
+      # at service start).
+      cat > /etc/profile.d/cargo.sh <<'SH'
+      export CARGO_HOME=/opt/cargo
+      export RUSTUP_HOME=/opt/rustup
+      export PATH="/opt/cargo/bin:$PATH"
+      SH
+      chmod 644 /etc/profile.d/cargo.sh
+      # /etc/environment is what systemd services (incl. actions-
+      # runner) inherit. PATH there is a simple assignment.
+      if ! grep -q "/opt/cargo/bin" /etc/environment; then
+        sed -i 's|^PATH="|PATH="/opt/cargo/bin:|' /etc/environment \
+          || echo 'PATH="/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' >> /etc/environment
+      fi
+      echo 'CARGO_HOME=/opt/cargo' >> /etc/environment
+      echo 'RUSTUP_HOME=/opt/rustup' >> /etc/environment
 
   # Install gh, kubectl, kind, terraform, helm via official scripts.
   - path: /root/install-tools.sh

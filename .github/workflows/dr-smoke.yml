@@ -267,9 +267,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml at the workspace root pins 1.88; the
-      # snapshot already has rustup 1.88 installed system-wide, so
-      # we skip the dtolnay action (which would clobber the runner's
-      # cargo install on each job).
+      # snapshot has rustup 1.88 installed for the runner user.
+      # The /usr/local/bin/cargo symlink points into /root/.cargo/bin
+      # which the runner can't traverse (mode 700 on /root), so we
+      # prepend /home/runner/.cargo/bin to GITHUB_PATH for this job.
+      # The next snapshot rebuild (AR00.1 refresh) should install
+      # rustup to /opt/cargo with /opt/cargo/bin on /etc/environment's
+      # PATH so this prepend becomes unnecessary; tracked as an
+      # AR00 follow-up in .docs/audits/ar00-runner-ops.md.
+      - name: put runner-user cargo on PATH
+        run: echo "/home/runner/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
 
       - name: install system deps (idempotent on snapshot)
