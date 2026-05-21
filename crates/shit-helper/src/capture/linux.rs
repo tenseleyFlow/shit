@@ -86,6 +86,18 @@ struct WatchState {
     /// dropped at handler time — same fail-mode as fanotify's
     /// over-budget files).
     pre_snapshots: BTreeMap<(u64, u64), PreSnapshot>,
+    /// Watch root absolute path, recorded at `pre_open_tree` time
+    /// (the cwd that the shell's PreExec frame supplied). Used by
+    /// every LSM event handler (unlink/create/mkdir/rename) to
+    /// resolve `(parent_dir + basename)` into an absolute path WITHOUT
+    /// going through `/proc/<pid>/cwd` -- that procfs symlink only
+    /// lives as long as the mutating pid does, and the BPF→ringbuf→
+    /// helper-handler hop is async wrt syscall completion + process
+    /// exit. Issue #22: when the mutating process exited before the
+    /// handler ran, the readlink fell back to a literal
+    /// `/proc/<dead-pid>/cwd/...` string that was journaled and
+    /// then ENOENT'd at undo time.
+    cwd: Option<PathBuf>,
 }
 
 /// L04.1 — A snapshotted pre-image. Bytes + the stat-meta as it was
@@ -184,6 +196,10 @@ impl LinuxCaptureRuntime {
     /// returning the response.
     pub fn pre_open_tree(&mut self, command: CommandId, cwd: &Path) {
         let ws = self.watches.entry(command).or_default();
+        // Record the watch root so LSM handlers can resolve
+        // basename → absolute path without /proc/<pid>/cwd. See
+        // WatchState::cwd docs for the why (Issue #22).
+        ws.cwd = Some(cwd.to_path_buf());
         let dir = match std::fs::read_dir(cwd) {
             Ok(d) => d,
             Err(e) => {
@@ -387,15 +403,24 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_unlink(&mut self, ev: &LsmUnlinkView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // Resolve the file's real path via /proc/<pid>/cwd → cwd
-        // symlink + basename. Daemon needs the resolved path on the
-        // CapturedPreImage wire to know WHERE the unlinked file
-        // belongs.
-        let cwd_link = format!("/proc/{}/cwd", ev.pid);
-        let resolved_path = std::fs::read_link(&cwd_link)
-            .map(|cwd| cwd.join(ev.basename))
-            .map(|p| path_to_string(&p))
-            .unwrap_or_else(|_| format!("{cwd_link}/{}", ev.basename));
+        // Resolve the file's real path. Prefer the watch root recorded
+        // at WatchTree time (canonical, survives the mutating pid's
+        // exit); fall back to readlink(/proc/<pid>/cwd) which works
+        // while the pid is alive but races against the BPF→ringbuf→
+        // handler hop. NEVER fall back to the literal procfs symlink
+        // string -- that's Issue #22: a `/proc/<dead-pid>/cwd/foo`
+        // gets journaled and then ENOENT's at undo time.
+        let resolved_path = resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.basename);
+        let Some(resolved_path) = resolved_path else {
+            tracing::warn!(
+                pid = ev.pid,
+                basename = ev.basename,
+                "lsm unlink: cannot resolve basename to absolute path \
+                 (watch_tree cwd missing AND /proc/<pid>/cwd readlink failed); \
+                 dropping event"
+            );
+            return;
+        };
 
         // BPF reports `dev` in the kernel's `dev_t` encoding
         // (`(major << 20) | minor`). All userspace stat-derived
@@ -414,14 +439,19 @@ impl LinuxCaptureRuntime {
             if let Some(fd) = ws.pre_opens.remove(&(ev_dev_userspace, ev.inode)) {
                 (Some(fd), "pre-opened")
             } else {
-                // Fall back to race-to-open via /proc/<pid>/cwd. The
-                // procfs symlink resolves through the live cwd, so this
-                // works even on rename. Win window: microseconds.
-                let open_path = format!("/proc/{}/cwd/{}", ev.pid, ev.basename);
+                // Fall back to race-to-open via the resolved absolute
+                // path. Win window: microseconds between vfs_unlink
+                // and the file's dentry being torn down -- if we
+                // beat that, the inode is still accessible by path.
+                // We use the already-resolved absolute path (not
+                // /proc/<pid>/cwd/...) so the open works even when
+                // the mutating pid has exited between hook fire and
+                // handler dispatch -- same fix scope as the resolved
+                // path used for the journal entry (Issue #22).
                 let opened = std::fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW)
-                    .open(&open_path);
+                    .open(&resolved_path);
                 match opened {
                     Ok(f) => (Some(OwnedFd::from(f)), "race"),
                     Err(_) => (None, "miss"),
@@ -674,21 +704,30 @@ impl LinuxCaptureRuntime {
     /// { kind: Directory, .. } }. No SCM_RIGHTS fd needed — dir
     /// creation has no content blob.
     pub fn handle_lsm_mkdir(&mut self, ev: &LsmMkdirView<'_>) {
-        let _ws = self.watches.entry(ev.command).or_default();
+        let ws = self.watches.entry(ev.command).or_default();
 
         // Resolve the new dir's path. The LSM hook fired with the
         // dentry's basename; the parent is the cwd of the calling pid
         // (for `mkdir foo` with no slashes). For `mkdir a/b` cases the
         // parent isn't cwd; defer those to a follow-up that walks the
         // dentry's parent chain.
-        let cwd_link = format!("/proc/{}/cwd", ev.pid);
-        let resolved_dir = match std::fs::read_link(&cwd_link) {
-            Ok(cwd) => cwd.join(ev.basename),
-            Err(e) => {
-                tracing::warn!(err = %e, pid = ev.pid, "lsm mkdir: read_link cwd failed");
+        //
+        // resolve_basename_to_path prefers the watch root recorded
+        // at WatchTree time (canonical, survives mutating-pid exit)
+        // and only falls back to readlink(/proc/<pid>/cwd) when the
+        // watch root is missing. Issue #22.
+        let resolved_dir_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.basename) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    basename = ev.basename,
+                    "lsm mkdir: cannot resolve basename to absolute path; dropping event"
+                );
                 return;
             }
         };
+        let resolved_dir = PathBuf::from(&resolved_dir_str);
 
         // Stat to grab the (dev, inode) of the freshly-created dir.
         let (dev, inode) = match std::fs::symlink_metadata(&resolved_dir) {
@@ -758,14 +797,20 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_create(&mut self, ev: &LsmCreateView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        let cwd_link = format!("/proc/{}/cwd", ev.pid);
-        let resolved_path = match std::fs::read_link(&cwd_link) {
-            Ok(cwd) => cwd.join(ev.basename),
-            Err(e) => {
-                tracing::warn!(err = %e, pid = ev.pid, "lsm create: read_link cwd failed");
+        // Issue #22: resolve via watch root, never journal a
+        // /proc/<pid>/cwd/... string.
+        let resolved_path_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.basename) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    basename = ev.basename,
+                    "lsm create: cannot resolve basename to absolute path; dropping event"
+                );
                 return;
             }
         };
+        let resolved_path = PathBuf::from(&resolved_path_str);
 
         // Open + stat. The kernel completed the create by the time
         // we run (LSM fired pre-create but returned 0; the syscall
@@ -956,27 +1001,40 @@ impl LinuxCaptureRuntime {
     /// flat-tree case; the smoke + L02/L03 don't exercise nested
     /// renames in v1.
     pub fn handle_lsm_rename(&mut self, ev: &LsmRenameView<'_>) {
-        let _ws = self.watches.entry(ev.command).or_default();
+        let ws = self.watches.entry(ev.command).or_default();
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
-        let cwd_link = format!("/proc/{}/cwd", ev.pid);
-        let cwd = match std::fs::read_link(&cwd_link) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(err = %e, pid = ev.pid, "lsm rename: read_link cwd failed");
+        // Issue #22: resolve via watch root, not /proc/<pid>/cwd.
+        let from_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.old_basename) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    basename = ev.old_basename,
+                    "lsm rename: cannot resolve old basename to absolute path; dropping event"
+                );
                 return;
             }
         };
-        let from_path = cwd.join(ev.old_basename);
-        let to_path = cwd.join(ev.new_basename);
+        let to_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.new_basename) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    basename = ev.new_basename,
+                    "lsm rename: cannot resolve new basename to absolute path; dropping event"
+                );
+                return;
+            }
+        };
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
             seq: ev.command.seq,
             op: shit_proto::TreeOpWire::Rename {
-                from: path_to_string(&from_path),
-                to: path_to_string(&to_path),
+                from: from_path,
+                to: to_path,
                 dev: ev_dev,
                 inode: ev.inode,
             },
@@ -1009,6 +1067,30 @@ fn kernel_dev_to_userspace(kdev: u64) -> u64 {
     let major: u64 = kdev >> 20;
     let minor: u64 = kdev & 0xfffff;
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// Resolve `basename` to an absolute path under the watch root.
+///
+/// Resolution order:
+///   1. Watch root (`ws.cwd`) recorded at `pre_open_tree` time --
+///      canonical, survives mutating-pid exit.
+///   2. `readlink(/proc/<pid>/cwd)` -- works while the mutating pid
+///      is alive, races against BPF→ringbuf→handler hop on fast
+///      operations (rm, mv) where the syscall returns before our
+///      handler runs and the shell reaps the subprocess promptly.
+///
+/// Returns `None` when both fail. Callers must drop the event;
+/// emitting the literal `/proc/<pid>/cwd/<basename>` string into the
+/// journal is Issue #22 -- it ENOENT's at undo time once the pid
+/// is gone.
+fn resolve_basename_to_path(ws_cwd: Option<&Path>, pid: i32, basename: &str) -> Option<String> {
+    if let Some(cwd) = ws_cwd {
+        return Some(path_to_string(&cwd.join(basename)));
+    }
+    let cwd_link = format!("/proc/{pid}/cwd");
+    std::fs::read_link(&cwd_link)
+        .ok()
+        .map(|cwd| path_to_string(&cwd.join(basename)))
 }
 
 /// View into an `lsm/inode_unlink` event as the BPF ringbuf reader
