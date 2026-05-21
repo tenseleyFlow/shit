@@ -127,16 +127,28 @@ smoke_wait_lsm_ready() {
         return 0
     fi
     local log="${SHIT_SMOKE_TMP}/shitd.log"
-    local marker='readers spawned'
+    # 'pre_open_tree complete' is the helper-side log line that fires
+    # at the END of the WatchTree handler, AFTER the watch root's
+    # contents have been snapshotted into ws.pre_snapshots and fds
+    # stashed in ws.pre_opens. That's what edit-undo and the other
+    # file-content smokes actually need before mutating -- earlier
+    # PR #20 (load BPF + spawn readers BEFORE handshake) means the
+    # 'readers spawned' marker is now reached BEFORE WatchTree even
+    # dispatches; waiting on it alone races pre_open_tree.
+    #
+    # On smokes where pre_open_tree has nothing to do (mkdir, the
+    # created dir doesn't exist yet) the helper still logs the
+    # marker with opened=0, so this is safe across all LSM smokes.
+    local marker='pre_open_tree complete'
     local i
     for i in $(seq 1 60); do
         if grep -q -F "${marker}" "${log}" 2>/dev/null; then
-            smoke_log "lsm readers ready (after ${i}*50ms)"
+            smoke_log "lsm pre_open_tree ready (after ${i}*50ms)"
             return 0
         fi
         sleep 0.05
     done
-    smoke_log "lsm readers ready signal not seen in 3s; proceeding anyway"
+    smoke_log "lsm pre_open_tree ready signal not seen in 3s; proceeding anyway"
     return 1
 }
 
