@@ -1,5 +1,5 @@
 #cloud-config
-# AR00 — Custom GHA self-hosted runner image bootstrap.
+# AR00 -- Custom GHA self-hosted runner image bootstrap.
 #
 # Cloud-init script that takes a stock DigitalOcean ubuntu-24.04
 # droplet and:
@@ -93,7 +93,7 @@ write_files:
   - path: /etc/default/grub.d/99-shit-lsm-bpf.cfg
     permissions: '0644'
     content: |
-      # Added by AR00 cloud-init — enables bpf LSM so shit-helper's
+      # Added by AR00 cloud-init -- enables bpf LSM so shit-helper's
       # eBPF-LSM tier (L04) can attach. Without this, /sys/kernel/
       # security/lsm omits bpf and the helper degrades to fanotify.
       GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} lsm=lockdown,landlock,yama,apparmor,bpf,ima,evm"
@@ -173,7 +173,7 @@ runcmd:
   # 3. Install the per-class CLI tools.
   - bash /root/install-tools.sh
 
-  # 4. Sanity dump — useful in /var/log/cloud-init-output.log.
+  # 4. Sanity dump -- useful in /var/log/cloud-init-output.log.
   - echo "[ar00-cloud-init] tool versions:"
   - which cargo && cargo --version || echo "  cargo missing"
   - which docker && docker --version || echo "  docker missing"
@@ -187,7 +187,7 @@ runcmd:
   - cat /sys/kernel/security/lsm || true
   - echo "[ar00-cloud-init] grub cmdline preview AFTER reboot:"
   - cat /etc/default/grub.d/99-shit-lsm-bpf.cfg
-  - echo "[ar00-cloud-init] DONE — reboot the droplet to activate the new kernel cmdline"
+  - echo "[ar00-cloud-init] DONE; reboot the droplet to activate the new kernel cmdline"
 
 # Reboot ourselves so the operator doesn't have to. After reboot,
 # /sys/kernel/security/lsm should include 'bpf'.

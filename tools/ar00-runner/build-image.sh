@@ -22,7 +22,7 @@
 #
 # Side effects:
 #   - Creates one droplet ($1.50/hour while alive; ~15 min total).
-#   - Creates one snapshot ($0.06/GB/month). 25GB droplet → ~$1.50/mo.
+#   - Creates one snapshot ($0.06/GB/month). 25GB droplet -> ~$1.50/mo.
 #   - Destroys the droplet when done.
 
 set -euo pipefail
@@ -40,6 +40,17 @@ log() { printf '[ar00-build %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 [ -f "${CLOUD_INIT}" ] || { echo "FAIL: ${CLOUD_INIT} missing" >&2; exit 1; }
 command -v doctl >/dev/null || { echo "FAIL: doctl not installed" >&2; exit 1; }
+
+# Pre-flight: cloud-init silently rejects user-data containing any
+# non-ASCII byte (it parses as YAML, which 25.x rejects bytes >0x7F
+# with `unacceptable character #x0080: special characters are not
+# allowed`). Catching this here saves a $0.01 + 15 min round trip.
+if LC_ALL=C grep -qP '[^\x00-\x7F]' "${CLOUD_INIT}"; then
+  echo "FAIL: ${CLOUD_INIT} contains non-ASCII bytes. cloud-init rejects these." >&2
+  echo "  Offending lines:" >&2
+  LC_ALL=C grep -nP '[^\x00-\x7F]' "${CLOUD_INIT}" >&2
+  exit 1
+fi
 
 # Pick the first SSH key. The operator can change this; we default
 # to whatever's first so the script "just works" for a single-user
@@ -65,7 +76,7 @@ cleanup_droplet() {
 }
 
 # Wait for cloud-init to complete + reboot. We poll the droplet's
-# status (should go active → off (during reboot) → active) and then
+# status (should go active -> off (during reboot) -> active) and then
 # wait an extra 60s for the second boot to fully come up.
 log "waiting for cloud-init + reboot (up to 15 min)..."
 DROPLET_IP="$(doctl compute droplet get "${DROPLET_ID}" --format PublicIPv4 --no-header)"
@@ -78,18 +89,50 @@ log "droplet IP: ${DROPLET_IP}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR"
 
 # Phase 1: wait for first-boot cloud-init to finish (it'll trigger
-# the reboot at the end). Up to 10 min — package install can be slow.
+# the reboot at the end). Up to 10 min; package install can be slow.
+# We poll `cloud-init status`, which reports `done` only when ALL
+# datasource parts (vendor-data + user-data) succeeded. A YAML parse
+# failure in user-data shows as status=error here even though
+# /var/lib/cloud/instance/boot-finished still gets written from
+# vendor-data success -- that's the trap we hit on the first attempt.
 log "phase 1: waiting for first-boot cloud-init..."
 for i in $(seq 1 60); do
   sleep 10
-  out=$(ssh ${SSH_OPTS} "root@${DROPLET_IP}" \
-    'test -f /var/lib/cloud/instance/boot-finished && echo done' 2>/dev/null || true)
-  if [ "${out}" = "done" ]; then
-    log "phase 1 done (cloud-init reports boot finished)"
-    break
-  fi
-  log "  cloud-init still running... (attempt $i/60)"
+  status=$(ssh ${SSH_OPTS} "root@${DROPLET_IP}" \
+    'cloud-init status --long 2>/dev/null | head -2' 2>/dev/null || true)
+  state=$(echo "${status}" | grep -E '^status:' | awk '{print $2}')
+  case "${state}" in
+    done)
+      log "phase 1 done (cloud-init status=done)"
+      break
+      ;;
+    error)
+      log "FAIL: cloud-init status=error -- user-data was rejected"
+      ssh ${SSH_OPTS} "root@${DROPLET_IP}" 'cloud-init status --long' 2>&1 | sed 's/^/  /'
+      log "  Inspect with: ssh root@${DROPLET_IP}"
+      log "  Or destroy with: doctl compute droplet delete ${DROPLET_ID}"
+      exit 1
+      ;;
+    *)
+      log "  cloud-init still running... state=${state:-unknown} (attempt $i/60)"
+      ;;
+  esac
 done
+
+# Phase 1.5: assert our user-data actually deposited its marker.
+# Defends against the case where cloud-init reports done but our
+# write_files entry was silently dropped (e.g. embedded non-ASCII).
+log "phase 1.5: verifying our user-data ran..."
+if ! ssh ${SSH_OPTS} "root@${DROPLET_IP}" \
+     'test -f /etc/default/grub.d/99-shit-lsm-bpf.cfg' 2>/dev/null; then
+  log "FAIL: /etc/default/grub.d/99-shit-lsm-bpf.cfg missing -- user-data did not apply"
+  log "  Most likely: cloud-init.yaml contains non-ASCII characters that fail YAML parse."
+  log "  Check: LC_ALL=C grep -nP '[^\\x00-\\x7F]' tools/ar00-runner/cloud-init.yaml"
+  log "  Inspect: ssh root@${DROPLET_IP} 'tail -50 /var/log/cloud-init.log'"
+  log "  Or destroy: doctl compute droplet delete ${DROPLET_ID}"
+  exit 1
+fi
+log "  marker present (OK)"
 
 # Phase 2: cloud-init scheduled a reboot via power_state. Wait for
 # the reboot to happen (SSH goes down) and come back.
@@ -114,7 +157,7 @@ if ! echo "${LSMS}" | grep -q '\bbpf\b'; then
   log "  Or destroy with: doctl compute droplet delete ${DROPLET_ID}"
   exit 1
 fi
-log "  bpf IS in active LSMs ✓"
+log "  bpf IS in active LSMs (OK)"
 
 # Optional: also verify BTF + a few tools.
 log "phase 4: sanity-check tool availability..."
@@ -130,7 +173,7 @@ ssh ${SSH_OPTS} "root@${DROPLET_IP}" '
   echo "jq: $(jq --version 2>/dev/null || echo missing)"
 ' | sed 's/^/  /'
 
-# Power off before snapshotting — DO recommends this for consistent
+# Power off before snapshotting; DO recommends this for consistent
 # disk state in the snapshot.
 log "phase 5: powering off droplet for clean snapshot..."
 doctl compute droplet-action power-off "${DROPLET_ID}" --wait >/dev/null
