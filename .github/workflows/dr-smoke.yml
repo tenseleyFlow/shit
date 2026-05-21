@@ -257,16 +257,25 @@ jobs:
   # 30-min job budget.
   linux-kernel-capture:
     name: linux-kernel-capture (L02/L03/L04 smoke matrix)
-    runs-on: ubuntu-24.04
+    # Self-hosted DO runner provisioned in AR00 with `bpf` in the
+    # active LSMs (stock `ubuntu-24.04` runners boot without it,
+    # which forces L04 to degrade to fanotify-perm and the five
+    # LSM-pinned smokes to refuse). Snapshot ID, registration, and
+    # refresh cadence: see .docs/audits/ar00-runner-ops.md.
+    runs-on: [self-hosted, linux-kernel-capture]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
+      # rust-toolchain.toml at the workspace root pins 1.88; the
+      # snapshot already has rustup 1.88 installed system-wide, so
+      # we skip the dtolnay action (which would clobber the runner's
+      # cargo install on each job).
       - uses: Swatinem/rust-cache@v2
 
-      - name: install system deps
+      - name: install system deps (idempotent on snapshot)
         run: |
-          sudo apt-get update
+          # Snapshot has jq / python3 / sqlite3 / libcap2-bin already.
+          # apt-get install is a no-op cost when packages are present.
           sudo apt-get install -y --no-install-recommends \
             jq python3 sqlite3 libcap2-bin
 

@@ -176,6 +176,21 @@ ssh ${SSH_OPTS} "root@${DROPLET_IP}" '
   echo "jq: $(jq --version 2>/dev/null || echo missing)"
 ' | sed 's/^/  /'
 
+# Strip per-instance state so the snapshot is a clean template, not
+# a replay of this builder's first boot. Without this, every droplet
+# spawned from the snapshot re-runs the original user-data's apt-get
+# install (which then prompts on a kernel-upgrade debconf question
+# under whiptail, hanging cloud-init's runcmd that should be running
+# our NEW user-data's setup-runner.sh). Also apt clean to shrink
+# the snapshot size.
+log "phase 4.5: stripping cloud-init state + cleaning apt..."
+ssh ${SSH_OPTS} "root@${DROPLET_IP}" '
+  cloud-init clean --logs --machine-id 2>&1 | sed "s/^/  cloud-init: /"
+  apt-get clean
+  rm -rf /var/lib/apt/lists/*
+  rm -f /home/runner/.bash_history /root/.bash_history
+' 2>&1 | sed 's/^/  /'
+
 # Power off before snapshotting; DO recommends this for consistent
 # disk state in the snapshot.
 log "phase 5: powering off droplet for clean snapshot..."
