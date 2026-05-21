@@ -410,7 +410,7 @@ impl LinuxCaptureRuntime {
         // handler hop. NEVER fall back to the literal procfs symlink
         // string -- that's Issue #22: a `/proc/<dead-pid>/cwd/foo`
         // gets journaled and then ENOENT's at undo time.
-        let resolved_path = resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.basename);
+        let resolved_path = resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename);
         let Some(resolved_path) = resolved_path else {
             tracing::warn!(
                 pid = ev.pid,
@@ -716,7 +716,7 @@ impl LinuxCaptureRuntime {
         // at WatchTree time (canonical, survives mutating-pid exit)
         // and only falls back to readlink(/proc/<pid>/cwd) when the
         // watch root is missing. Issue #22.
-        let resolved_dir_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.basename) {
+        let resolved_dir_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -799,7 +799,7 @@ impl LinuxCaptureRuntime {
 
         // Issue #22: resolve via watch root, never journal a
         // /proc/<pid>/cwd/... string.
-        let resolved_path_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.basename) {
+        let resolved_path_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -1006,7 +1006,7 @@ impl LinuxCaptureRuntime {
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
         // Issue #22: resolve via watch root, not /proc/<pid>/cwd.
-        let from_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.old_basename) {
+        let from_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.old_basename) {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -1017,7 +1017,7 @@ impl LinuxCaptureRuntime {
                 return;
             }
         };
-        let to_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid, ev.new_basename) {
+        let to_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.new_basename) {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -1050,8 +1050,8 @@ impl LinuxCaptureRuntime {
             pid = ev.pid,
             dev = ev_dev,
             inode = ev.inode,
-            from = %from_path.display(),
-            to = %to_path.display(),
+            from = %from_path,
+            to = %to_path,
             "lsm-rename TreeMutation sent",
         );
     }
@@ -1083,7 +1083,11 @@ fn kernel_dev_to_userspace(kdev: u64) -> u64 {
 /// emitting the literal `/proc/<pid>/cwd/<basename>` string into the
 /// journal is Issue #22 -- it ENOENT's at undo time once the pid
 /// is gone.
-fn resolve_basename_to_path(ws_cwd: Option<&Path>, pid: i32, basename: &str) -> Option<String> {
+///
+/// `pid` accepts `i64` so callers with either `i32` (LsmUnlinkView)
+/// or `u32` (Lsm{Create,Mkdir,Rename,Setattr,Open}View) pid fields
+/// can pass through without explicit casts.
+fn resolve_basename_to_path(ws_cwd: Option<&Path>, pid: i64, basename: &str) -> Option<String> {
     if let Some(cwd) = ws_cwd {
         return Some(path_to_string(&cwd.join(basename)));
     }
