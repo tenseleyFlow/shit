@@ -103,6 +103,43 @@ smoke_start_shitd() {
     smoke_fail "shitd ctl socket never appeared at ${SHIT_CTL_SOCK}"
 }
 
+# Block until the LSM tier's BPF programs are loaded + readers spawned.
+# Required after PreExec on LSM-pinned smokes: the helper's BPF load
+# is asynchronous wrt the daemon's PreExec ack, and on a cold start
+# (no kernel BTF cache, slow I/O) the helper takes ~700-1000 ms to
+# attach all 6 hooks. If the smoke's mutating command runs before
+# the hooks are live, the kernel processes the operation without
+# firing any of our LSM programs and no FilePreImage event is ever
+# captured -- see AR00.5 forensics in .docs/audits/ar00-runner-ops.md.
+#
+# We poll the shitd log for the helper's INFO line
+# "ebpf-lsm readers spawned: ..." which is emitted exactly once after
+# all hooks are attached. Falls back to a 3-second cap so a missed
+# signal doesn't hang the smoke indefinitely (smoke_fail still gets
+# a chance to fire).
+smoke_wait_lsm_ready() {
+    # Only meaningful when LSM is the picked tier. On fanotify-perm
+    # the helper never logs "readers spawned"; the mark install is
+    # done synchronously inside the daemon's PreExec handler so the
+    # post-PreExec wait can be a flat short sleep.
+    if [ "${SHIT_FORCE_TIER:-}" != "ebpf-lsm" ]; then
+        sleep 0.5
+        return 0
+    fi
+    local log="${SHIT_SMOKE_TMP}/shitd.log"
+    local marker='readers spawned'
+    local i
+    for i in $(seq 1 60); do
+        if grep -q -F "${marker}" "${log}" 2>/dev/null; then
+            smoke_log "lsm readers ready (after ${i}*50ms)"
+            return 0
+        fi
+        sleep 0.05
+    done
+    smoke_log "lsm readers ready signal not seen in 3s; proceeding anyway"
+    return 1
+}
+
 smoke_stop_shitd() {
     # === B04.6c INSTRUMENTATION ===
     # Earlier evidence showed bash hangs forever past "stopping shitd"

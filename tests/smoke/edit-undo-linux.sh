@@ -124,11 +124,14 @@ smoke_log "PreExec seq=${SEQ} pid=${PID} cwd=${SCRATCH}"
     --shell bash \
     --sock "${SHIT_HOOK_SOCK}"
 
-# Give the helper time to receive WatchTree and install the fanotify
-# mark. The dispatch is async on the daemon side; 250ms is comfortably
-# longer than the observed dispatch latency (typically <10ms during
-# L01 chunk 5 measurements).
-sleep 0.5
+# Wait for the chosen tier to actually be live. On fanotify-perm
+# the daemon installs the mark synchronously inside the PreExec
+# handler so a short flat sleep is fine. On LSM-bpf the helper's
+# program load is async wrt PreExec and takes ~700-1000 ms cold;
+# the helper logs "readers spawned" once all 6 hooks are attached.
+# smoke_wait_lsm_ready picks the right wait per tier. See AR00.5
+# in .docs/audits/ar00-runner-ops.md.
+smoke_wait_lsm_ready
 
 # Overwrite the file: open O_WRONLY|O_TRUNC, write new bytes,
 # close. `tee` with no -a is exactly that pattern. The open fires

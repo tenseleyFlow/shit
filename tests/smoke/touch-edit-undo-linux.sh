@@ -78,7 +78,9 @@ smoke_log "PreExec seq=1 cwd=${SCRATCH}"
 "${SHIT_BIN}" hook-send pre-exec \
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
-sleep 0.5
+
+# Wait for LSM tier readiness; see AR00.5 in .docs/audits/ar00-runner-ops.md.
+smoke_wait_lsm_ready
 
 NEW_FILE="${SCRATCH}/created_by_smoke.txt"
 touch "${NEW_FILE}"

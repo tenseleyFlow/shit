@@ -144,11 +144,13 @@ smoke_log "PreExec seq=${SEQ} pid=${PID} cwd=${SCRATCH}"
     --shell bash \
     --sock "${SHIT_HOOK_SOCK}"
 
-# Give the helper time to receive WatchTree. The LSM tier doesn't
-# need a fanotify-mark install step but the daemon->helper dispatch
-# is still async; 250ms is comfortably longer than observed dispatch
-# latency.
-sleep 0.5
+# Wait for the LSM tier to actually be live before running rm. The
+# helper's BPF program load is async wrt PreExec; on a cold start
+# (no BTF cache, slow I/O) it takes ~700-1000 ms to attach all 6
+# LSM hooks. The helper logs "readers spawned" once they're all up;
+# smoke_wait_lsm_ready polls for that. See AR00.5 in
+# .docs/audits/ar00-runner-ops.md.
+smoke_wait_lsm_ready
 
 smoke_log "rm ${FOO}"
 rm "${FOO}"

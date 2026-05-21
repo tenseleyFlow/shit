@@ -66,10 +66,8 @@ smoke_log "PreExec seq=1 cwd=${SCRATCH}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-# Wait for WatchTree to land. mkdir doesn't need pre_open_tree fds
-# (the dir doesn't exist yet) but the LSM tier still needs the pid
-# tree-tracking to be set up.
-sleep 0.5
+# Wait for LSM tier readiness; see AR00.5 in .docs/audits/ar00-runner-ops.md.
+smoke_wait_lsm_ready
 
 NEWDIR="${SCRATCH}/created_by_smoke"
 mkdir "${NEWDIR}"
