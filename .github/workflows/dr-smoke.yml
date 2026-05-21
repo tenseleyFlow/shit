@@ -560,7 +560,8 @@ jobs:
               exit 1
             fi
             echo "===== all 10 BSD smokes green ====="
->      - name: upload artifacts on failure
+
+      - name: upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
