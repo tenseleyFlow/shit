@@ -30,9 +30,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
+// W01.B.fix-framing: SEQPACKET on every platform that supports
+// AF_UNIX+SOCK_SEQPACKET (Linux + all BSDs). macOS XNU is the only
+// holdout — it falls back to STREAM. STREAM-on-BSD was a copy-paste
+// from "macOS needs STREAM" and unintentionally pinned BSDs to a
+// transport that coalesces messages, breaking high-rate capture
+// (git commit, etc).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
 const HELPER_SOCK_TYPE: SockType = SockType::SeqPacket;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const HELPER_SOCK_TYPE: SockType = SockType::Stream;
 
 #[derive(Debug, thiserror::Error)]
@@ -156,10 +168,11 @@ fn recv_frame_with_fd_blocking(
         }
     }
     buf.truncate(n);
-    // On STREAM transports the kernel may deliver fewer bytes than the
-    // frame demands; complete the read with plain recv(2) (cmsg already
-    // delivered with the first chunk).
-    #[cfg(not(target_os = "linux"))]
+    // On STREAM transports (macOS only after W01.B.fix-framing) the
+    // kernel may deliver fewer bytes than the frame demands; complete
+    // the read with plain recv(2) (cmsg already delivered with the
+    // first chunk).
+    #[cfg(target_os = "macos")]
     {
         if buf.len() >= 4 {
             let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -342,8 +355,16 @@ fn send_frame_blocking(fd: &OwnedFd, frame: &[u8]) -> Result<(), HelperLinkError
 fn recv_frame_blocking(fd: std::os::fd::RawFd) -> Result<Vec<u8>, HelperLinkError> {
     // Transport-aware (see crates/shit-helper/src/ipc.rs for the same
     // pattern + rationale). SEQPACKET truncates short recvs to the
-    // packet boundary, so we must recv into a full-size buffer.
-    #[cfg(target_os = "linux")]
+    // packet boundary, so we must recv into a full-size buffer. The
+    // cfg gates MUST mirror the HELPER_SOCK_TYPE selection at the
+    // top of this file.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
     {
         let mut buf = vec![0u8; shit_proto::MAX_HELPER_FRAME_SIZE];
         let n = nix::sys::socket::recv(fd, &mut buf, nix::sys::socket::MsgFlags::empty())?;
@@ -353,7 +374,7 @@ fn recv_frame_blocking(fd: std::os::fd::RawFd) -> Result<Vec<u8>, HelperLinkErro
         buf.truncate(n);
         Ok(buf)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let mut header = [0u8; 4];
         recv_exact(fd, &mut header)?;
@@ -375,7 +396,7 @@ fn recv_frame_blocking_owned(fd: &OwnedFd) -> Result<Vec<u8>, HelperLinkError> {
     recv_frame_blocking(fd.as_raw_fd())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn recv_exact(fd: std::os::fd::RawFd, buf: &mut [u8]) -> Result<(), HelperLinkError> {
     let mut got = 0;
     while got < buf.len() {

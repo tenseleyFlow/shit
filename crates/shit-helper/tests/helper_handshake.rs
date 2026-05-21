@@ -26,9 +26,18 @@ use shit_proto::{
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 
-#[cfg(target_os = "linux")]
+// W01.B.fix-framing: match shit-helper/src/ipc.rs and
+// shitd/src/helper_link.rs — SEQPACKET on every supported platform
+// except macOS.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
 const HELPER_SOCK_TYPE: SockType = SockType::SeqPacket;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const HELPER_SOCK_TYPE: SockType = SockType::Stream;
 
 #[test]
@@ -295,10 +304,25 @@ fn send_frame(fd: &std::os::fd::OwnedFd, frame: &[u8]) {
 }
 
 fn recv_frame(fd: &std::os::fd::OwnedFd) -> Vec<u8> {
-    // SEQPACKET (Linux) requires a single full-size recv to avoid
-    // truncating the packet. STREAM (macOS/BSD) allows incremental
-    // reads via the length-prefix header.
-    #[cfg(target_os = "linux")]
+    // SEQPACKET requires a single full-size recv to consume the
+    // packet atomically. STREAM (macOS only — XNU has no SEQPACKET
+    // for AF_UNIX) allows incremental reads via the length prefix.
+    //
+    // **MUST stay in lockstep with HELPER_SOCK_TYPE above.** Earlier
+    // this branch was `target_os = "linux"` only — on FreeBSD where
+    // we'd promoted SOCK_TYPE to SEQPACKET, the short 4-byte header
+    // recv would atomically consume the entire datagram (header +
+    // body), then the body recv would block forever. That hung
+    // `cargo test --workspace` for hours on the freebsd-14 CI VM
+    // before we caught it. Keep these cfg gates aligned with the
+    // SOCK_TYPE selection.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     {
         let mut buf = vec![0u8; shit_proto::MAX_HELPER_FRAME_SIZE];
         let n = nix::sys::socket::recv(
@@ -313,7 +337,7 @@ fn recv_frame(fd: &std::os::fd::OwnedFd) -> Vec<u8> {
         buf.truncate(n);
         buf
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
         let mut header = [0u8; 4];
         recv_exact(fd, &mut header);
@@ -325,7 +349,7 @@ fn recv_frame(fd: &std::os::fd::OwnedFd) -> Vec<u8> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn recv_exact(fd: &std::os::fd::OwnedFd, buf: &mut [u8]) {
     let mut got = 0;
     while got < buf.len() {

@@ -44,6 +44,11 @@ jobs:
   freebsd:
     name: freebsd-14
     runs-on: ubuntu-24.04
+    # Hard ceiling: VM boot + pkg install + clippy + workspace test + release
+    # build fit comfortably under 50min on the cross-platform-actions runner.
+    # Anything past that is a hang — fail-fast instead of burning the GH-Actions
+    # 6h default (we lost 5h to a SEQPACKET/STREAM cfg-gate desync once).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: build + test on FreeBSD 14
