@@ -130,8 +130,8 @@ write_files:
       chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-      apt-get update
-      apt-get install -y gh
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y gh
 
       # kubectl
       curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -147,16 +147,15 @@ write_files:
         | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
       echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
         | tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
-      apt-get update
-      apt-get install -y terraform
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y terraform
 
-      # helm
-      curl -fsSL https://baltocdn.com/helm/signing.asc | gpg --dearmor \
-        | tee /usr/share/keyrings/helm.gpg > /dev/null
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" \
-        | tee /etc/apt/sources.list.d/helm-stable-debian.list
-      apt-get update
-      apt-get install -y helm
+      # helm via the official installer script. The baltocdn apt
+      # repo is finicky (auth/key drift broke the first build attempt
+      # silently); the upstream get-helm-3 script is the canonical
+      # install path and just drops a static binary into /usr/local/bin.
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+        | DEBIAN_FRONTEND=noninteractive bash
 
 # Run the order-sensitive bits: grub update first, then rustup +
 # tools (which need the packages from `packages:` above to be in
