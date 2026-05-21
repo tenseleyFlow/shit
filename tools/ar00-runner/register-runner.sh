@@ -62,7 +62,17 @@ SSH_KEY_FP="$(doctl compute ssh-key list --format FingerPrint --no-header | head
 #      a hardening follow-up).
 #   3. Configures the runner with the minted token.
 #   4. Installs it as a systemd service.
-USER_DATA="$(cat <<EOF
+#
+# We write the user-data to a temp file with __PLACEHOLDER__ tokens,
+# then sed-substitute the live values, and pass `--user-data-file`
+# to doctl. The previous approach (USER_DATA="$(cat <<EOF...EOF)")
+# tripped a bash 3.2 (Apple's stock bash) parser bug where the `)`
+# inside `case` patterns gets miscounted as closing the outer `$()`,
+# silently mangling the heredoc body.
+USER_DATA_FILE="$(mktemp -t ar00-userdata.XXXXXX)"
+trap 'rm -f "${USER_DATA_FILE}"' EXIT
+
+cat > "${USER_DATA_FILE}" <<'EOF'
 #cloud-config
 write_files:
   - path: /home/runner/setup-runner.sh
@@ -75,30 +85,40 @@ write_files:
       mkdir -p actions-runner && cd actions-runner
       # Latest stable runner version. Update periodically; pinning is
       # a hardening follow-up.
-      RUNNER_VERSION=\$(curl -sSf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | tr -d v)
-      ARCH=\$(uname -m)
-      case "\$ARCH" in
+      RUNNER_VERSION=$(curl -sSf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | tr -d v)
+      ARCH=$(uname -m)
+      case "$ARCH" in
         x86_64) RUNNER_ARCH=x64 ;;
         aarch64) RUNNER_ARCH=arm64 ;;
-        *) echo "unsupported arch \$ARCH"; exit 1 ;;
+        *) echo "unsupported arch $ARCH"; exit 1 ;;
       esac
-      curl -o actions-runner.tar.gz -L \\
-        "https://github.com/actions/runner/releases/download/v\${RUNNER_VERSION}/actions-runner-linux-\${RUNNER_ARCH}-\${RUNNER_VERSION}.tar.gz"
+      curl -o actions-runner.tar.gz -L \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
       tar xzf actions-runner.tar.gz
       rm -f actions-runner.tar.gz
-      ./config.sh \\
-        --url https://github.com/${REPO_OWNER}/${REPO_NAME} \\
-        --token "${REG_TOKEN}" \\
-        --name "${RUNNER_NAME}" \\
-        --labels "${RUNNER_LABELS}" \\
-        --unattended \\
+      ./config.sh \
+        --url https://github.com/__REPO_OWNER__/__REPO_NAME__ \
+        --token "__REG_TOKEN__" \
+        --name "__RUNNER_NAME__" \
+        --labels "__RUNNER_LABELS__" \
+        --unattended \
         --replace
       sudo ./svc.sh install runner
       sudo ./svc.sh start
 runcmd:
   - sudo -u runner bash /home/runner/setup-runner.sh
 EOF
-)"
+
+# Substitute placeholders with live values. Using `|` as the sed
+# delimiter so URL-style values don't need escaping.
+sed -i.bak \
+  -e "s|__REPO_OWNER__|${REPO_OWNER}|g" \
+  -e "s|__REPO_NAME__|${REPO_NAME}|g" \
+  -e "s|__REG_TOKEN__|${REG_TOKEN}|g" \
+  -e "s|__RUNNER_NAME__|${RUNNER_NAME}|g" \
+  -e "s|__RUNNER_LABELS__|${RUNNER_LABELS}|g" \
+  "${USER_DATA_FILE}"
+rm -f "${USER_DATA_FILE}.bak"
 
 log "creating runner droplet from snapshot ${SNAPSHOT_ID}..."
 DROPLET_ID="$(doctl compute droplet create "${RUNNER_NAME}" \
@@ -106,7 +126,7 @@ DROPLET_ID="$(doctl compute droplet create "${RUNNER_NAME}" \
   --size "${SIZE}" \
   --region "${REGION}" \
   --ssh-keys "${SSH_KEY_FP}" \
-  --user-data "${USER_DATA}" \
+  --user-data-file "${USER_DATA_FILE}" \
   --wait \
   --format ID --no-header)"
 log "droplet ${DROPLET_ID} created"

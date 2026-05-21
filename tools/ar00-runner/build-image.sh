@@ -45,10 +45,13 @@ command -v doctl >/dev/null || { echo "FAIL: doctl not installed" >&2; exit 1; }
 # non-ASCII byte (it parses as YAML, which 25.x rejects bytes >0x7F
 # with `unacceptable character #x0080: special characters are not
 # allowed`). Catching this here saves a $0.01 + 15 min round trip.
-if LC_ALL=C grep -qP '[^\x00-\x7F]' "${CLOUD_INIT}"; then
-  echo "FAIL: ${CLOUD_INIT} contains non-ASCII bytes. cloud-init rejects these." >&2
-  echo "  Offending lines:" >&2
-  LC_ALL=C grep -nP '[^\x00-\x7F]' "${CLOUD_INIT}" >&2
+# Using `tr` (POSIX, BSD- and GNU-compatible) instead of `grep -P`
+# (GNU-only) so the check works from macOS too.
+nonascii_count=$(LC_ALL=C tr -d '\11\12\15\40-\176' < "${CLOUD_INIT}" | wc -c | tr -d ' ')
+if [ "${nonascii_count}" -gt 0 ]; then
+  echo "FAIL: ${CLOUD_INIT} contains ${nonascii_count} non-ASCII bytes. cloud-init rejects these." >&2
+  echo "  Inspect with:" >&2
+  echo "    LC_ALL=C awk 'NR == FNR { for (i = 1; i <= length(\$0); i++) if (substr(\$0,i,1) ~ /[^[:print:][:space:]]/) printf \"%d:%d: byte %02x\\n\", NR, i, substr(\$0,i,1) }' ${CLOUD_INIT}" >&2
   exit 1
 fi
 
