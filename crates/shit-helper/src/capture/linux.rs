@@ -1033,8 +1033,8 @@ impl LinuxCaptureRuntime {
             session: ev.command.session,
             seq: ev.command.seq,
             op: shit_proto::TreeOpWire::Rename {
-                from: from_path,
-                to: to_path,
+                from: from_path.clone(),
+                to: to_path.clone(),
                 dev: ev_dev,
                 inode: ev.inode,
             },
