@@ -252,6 +252,26 @@ impl LiveBaseline {
         self.by_cwd.write().unwrap().remove(cwd).is_some()
     }
 
+    /// Find the cache entry (across all cwds) that owns a given
+    /// `(dev, inode)` pair. The CapturedPreImage handler uses this
+    /// to swap the helper's post-write blob for the baseline's
+    /// genuine pre-write blob.
+    ///
+    /// O(N) over cached cwds × M entries per cwd. In practice N
+    /// is small (1–2 active dirs per user session) and the by_inode
+    /// HashMap is O(1) per cwd. Fine for v1; revisit if telemetry
+    /// shows we routinely have dozens of cwds cached at once.
+    pub fn get_cwd_for_inode(&self, dev: u64, inode: u64) -> Option<Arc<BaselineCacheEntry>> {
+        let inode_ref = shit_planner::InodeRef::new(dev, inode);
+        let map = self.by_cwd.read().unwrap();
+        for entry in map.values() {
+            if entry.by_inode.read().unwrap().contains_key(&inode_ref) {
+                return Some(Arc::clone(entry));
+            }
+        }
+        None
+    }
+
     pub fn cached_cwd_count(&self) -> usize {
         self.by_cwd.read().unwrap().len()
     }
