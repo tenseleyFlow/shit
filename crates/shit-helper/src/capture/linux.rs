@@ -1587,7 +1587,7 @@ fn resolve_inode_to_path(ws: &WatchState, dev: u64, inode: u64) -> Option<PathBu
     }
     ws.path_to_inode
         .iter()
-        .find(|(_, &v)| v == (dev, inode))
+        .find(|&(_, &v)| v == (dev, inode))
         .map(|(k, _)| k.clone())
 }
 
