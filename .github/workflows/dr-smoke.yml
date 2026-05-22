@@ -257,16 +257,54 @@ jobs:
   # 30-min job budget.
   linux-kernel-capture:
     name: linux-kernel-capture (L02/L03/L04 smoke matrix)
-    runs-on: ubuntu-24.04
+    # Self-hosted DO runner provisioned in AR00 with `bpf` in the
+    # active LSMs (stock `ubuntu-24.04` runners boot without it,
+    # which forces L04 to degrade to fanotify-perm and the five
+    # LSM-pinned smokes to refuse). Snapshot ID, registration, and
+    # refresh cadence: see .docs/audits/ar00-runner-ops.md.
+    runs-on: [self-hosted, linux-kernel-capture]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # AR00 runner state caveats:
+      # 1. The snapshot ships /usr/local/bin/{rustc,cargo,rustup}
+      #    symlinks pointing into /root/.cargo/bin. /root is mode 700
+      #    so the unprivileged runner user gets EACCES on stat() of
+      #    the symlink target -- any tool that probes $PATH for rust
+      #    fails before falling through. Drop the shims so PATH
+      #    lookup proceeds to whatever dtolnay installs below.
+      # 2. The snapshot's per-user rustup at /home/runner/.cargo/bin
+      #    has historically been observed to be missing the rustup
+      #    binary itself (just the dispatch symlinks), and
+      #    Swatinem/rust-cache@v2 caches in ways that can stomp on
+      #    a re-install between runs. Don't depend on the snapshot's
+      #    rustup at all -- let dtolnay/rust-toolchain set up a
+      #    deterministic install per-job, same as every other CI
+      #    job in this workflow.
+      #
+      # Both quirks go away after the next AR00.1 snapshot refresh
+      # (installs rustup to /opt/cargo, world-readable). Tracked in
+      # .docs/audits/ar00-runner-ops.md.
+      - name: clean broken /usr/local rust symlinks
+        run: |
+          sudo rm -f \
+            /usr/local/bin/rustc \
+            /usr/local/bin/cargo \
+            /usr/local/bin/rustup \
+            /usr/local/bin/cargo-clippy \
+            /usr/local/bin/cargo-fmt \
+            /usr/local/bin/cargo-miri \
+            /usr/local/bin/clippy-driver \
+            /usr/local/bin/rls \
+            /usr/local/bin/rust-analyzer
+
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
 
-      - name: install system deps
+      - name: install system deps (idempotent on snapshot)
         run: |
-          sudo apt-get update
+          # Snapshot has jq / python3 / sqlite3 / libcap2-bin already.
+          # apt-get install is a no-op cost when packages are present.
           sudo apt-get install -y --no-install-recommends \
             jq python3 sqlite3 libcap2-bin
 

@@ -124,12 +124,6 @@ smoke_log "PreExec seq=${SEQ} pid=${PID} cwd=${SCRATCH}"
     --shell bash \
     --sock "${SHIT_HOOK_SOCK}"
 
-# Give the helper time to receive WatchTree and install the fanotify
-# mark. The dispatch is async on the daemon side; 250ms is comfortably
-# longer than the observed dispatch latency (typically <10ms during
-# L01 chunk 5 measurements).
-sleep 0.5
-
 # Overwrite the file: open O_WRONLY|O_TRUNC, write new bytes,
 # close. `tee` with no -a is exactly that pattern. The open fires
 # FAN_OPEN_PERM on the parent dir's mark; the helper's runtime

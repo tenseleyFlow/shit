@@ -43,13 +43,26 @@ enum shit_event_kind {
 #define SHIT_COMM_LEN 16
 
 /* Common header at the start of every event. Userspace decodes the
- * kind byte first, then casts to the kind-specific tail. */
+ * kind byte first, then casts to the kind-specific tail.
+ *
+ * parent_pid: the kernel `task->real_parent->tgid` at hook-fire time.
+ * Captured in BPF so userspace can match the event's process tree
+ * against tracked roots WITHOUT a `/proc/<pid>/stat` walk -- short-
+ * lived subprocesses (`rm`, `mv`, `chmod`, `mkdir`, etc.) exit
+ * between the syscall and the userspace ringbuf consume; their
+ * `/proc` entries are then gone and a `/proc`-based ancestry walk
+ * fails. The smoke shell (the WatchTree root_pid) is still alive,
+ * so checking `parent_pid` directly against the tracked root closes
+ * the race for any direct child of the tracked root. Deeper trees
+ * (grandchildren and beyond) still need the slow `/proc` walk as a
+ * fallback, but most CLI tools spawned by a shell are direct
+ * children. */
 struct shit_event_hdr {
     __u8  kind;
     __u8  _pad[3];
     __u32 pid;
     __u32 tgid;
-    __u32 _pad2;
+    __u32 parent_pid;
     __u64 ts_ns;
     char  comm[SHIT_COMM_LEN];
 };
