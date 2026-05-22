@@ -296,8 +296,8 @@ fn wait_watch_ready(p: &PostSend) -> Result<()> {
 
 fn call_ctl(path: &Path, req: &CtlRequest, timeout_ms: u32) -> Result<CtlResponse> {
     use std::io::Write;
-    let mut stream = UnixStream::connect(path)
-        .with_context(|| format!("connect ctl {}", path.display()))?;
+    let mut stream =
+        UnixStream::connect(path).with_context(|| format!("connect ctl {}", path.display()))?;
     // Match the timeout on read/write so a stuck daemon doesn't hang
     // the hook past the caller's intended budget. +250 ms slack to
     // let the daemon respond `timeout` itself rather than us

@@ -150,7 +150,9 @@ async fn handle_client(
             session,
             command_seq,
             timeout_ms,
-        } => handle_wait_watch_ready(session, command_seq, timeout_ms, watch_ready.as_deref()).await,
+        } => {
+            handle_wait_watch_ready(session, command_seq, timeout_ms, watch_ready.as_deref()).await
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;

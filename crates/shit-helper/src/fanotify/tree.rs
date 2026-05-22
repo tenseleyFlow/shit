@@ -110,11 +110,7 @@ impl TreeMap {
     /// a follow-up: deep-tree tracking needs either a BPF map of
     /// active descendants populated via sched_process_fork, or a
     /// bounded ancestor walk inside the BPF program itself.
-    pub fn is_tracked_with_parent(
-        &mut self,
-        pid: i32,
-        parent_pid: i32,
-    ) -> Option<(Uuid, u64)> {
+    pub fn is_tracked_with_parent(&mut self, pid: i32, parent_pid: i32) -> Option<(Uuid, u64)> {
         if let Some(cached) = self.pid_cache.get(&pid) {
             return *cached;
         }

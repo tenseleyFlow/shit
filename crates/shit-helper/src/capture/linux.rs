@@ -726,17 +726,18 @@ impl LinuxCaptureRuntime {
         // at WatchTree time (canonical, survives mutating-pid exit)
         // and only falls back to readlink(/proc/<pid>/cwd) when the
         // watch root is missing. Issue #22.
-        let resolved_dir_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    pid = ev.pid,
-                    basename = ev.basename,
-                    "lsm mkdir: cannot resolve basename to absolute path; dropping event"
-                );
-                return;
-            }
-        };
+        let resolved_dir_str =
+            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        pid = ev.pid,
+                        basename = ev.basename,
+                        "lsm mkdir: cannot resolve basename to absolute path; dropping event"
+                    );
+                    return;
+                }
+            };
         let resolved_dir = PathBuf::from(&resolved_dir_str);
 
         // Stat to grab the (dev, inode) of the freshly-created dir.
@@ -830,17 +831,18 @@ impl LinuxCaptureRuntime {
 
         // Issue #22: resolve via watch root, never journal a
         // /proc/<pid>/cwd/... string.
-        let resolved_path_str = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    pid = ev.pid,
-                    basename = ev.basename,
-                    "lsm create: cannot resolve basename to absolute path; dropping event"
-                );
-                return;
-            }
-        };
+        let resolved_path_str =
+            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        pid = ev.pid,
+                        basename = ev.basename,
+                        "lsm create: cannot resolve basename to absolute path; dropping event"
+                    );
+                    return;
+                }
+            };
         let resolved_path = PathBuf::from(&resolved_path_str);
 
         // Open + stat. The kernel completed the create by the time
@@ -1037,28 +1039,30 @@ impl LinuxCaptureRuntime {
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
         // Issue #22: resolve via watch root, not /proc/<pid>/cwd.
-        let from_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.old_basename) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    pid = ev.pid,
-                    basename = ev.old_basename,
-                    "lsm rename: cannot resolve old basename to absolute path; dropping event"
-                );
-                return;
-            }
-        };
-        let to_path = match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.new_basename) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    pid = ev.pid,
-                    basename = ev.new_basename,
-                    "lsm rename: cannot resolve new basename to absolute path; dropping event"
-                );
-                return;
-            }
-        };
+        let from_path =
+            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.old_basename) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        pid = ev.pid,
+                        basename = ev.old_basename,
+                        "lsm rename: cannot resolve old basename to absolute path; dropping event"
+                    );
+                    return;
+                }
+            };
+        let to_path =
+            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.new_basename) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        pid = ev.pid,
+                        basename = ev.new_basename,
+                        "lsm rename: cannot resolve new basename to absolute path; dropping event"
+                    );
+                    return;
+                }
+            };
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
