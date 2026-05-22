@@ -681,18 +681,30 @@ impl LinuxCaptureRuntime {
 
         // Path: the pre_opens fd is still valid for path recovery
         // (the inode lives until ws is dropped). Use it if present;
-        // fall back to the watch-tree-rooted resolution otherwise.
-        let path = ws
-            .pre_opens
-            .get(&(ev_dev_userspace, ev.inode))
-            .and_then(|f| path_for_kernel_fd(f.as_raw_fd()));
+        // fall back to the path_to_inode reverse lookup. AR01.1: never
+        // emit an empty path -- the daemon journals path:"" which
+        // becomes a ConflictMissing at undo time. Drop the event
+        // instead so the operator gets a tracing breadcrumb naming
+        // the (dev, inode) that escaped both lookups.
+        let path = match resolve_inode_to_path(ws, ev_dev_userspace, ev.inode) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    dev = ev_dev_userspace,
+                    inode = ev.inode,
+                    "lsm setattr: path resolution failed (pre_opens fd + path_to_inode reverse both miss); dropping event"
+                );
+                return;
+            }
+        };
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
             seq: ev.command.seq,
             dev: ev_dev_userspace,
             inode: ev.inode,
-            path: path.as_deref().map(path_to_string),
+            path: Some(path_to_string(&path)),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             post_content_hash: None,
@@ -1030,18 +1042,27 @@ impl LinuxCaptureRuntime {
                 return;
             }
         };
-        // Path resolution via the still-held pre-opened fd.
-        let path = ws
-            .pre_opens
-            .get(&(ev_dev, ev.inode))
-            .and_then(|f| path_for_kernel_fd(f.as_raw_fd()));
+        // Path resolution. AR01.1: never emit an empty path -- see
+        // handle_lsm_setattr for the rationale.
+        let path = match resolve_inode_to_path(ws, ev_dev, ev.inode) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    dev = ev_dev,
+                    inode = ev.inode,
+                    "lsm open: path resolution failed; dropping event"
+                );
+                return;
+            }
+        };
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
             seq: ev.command.seq,
             dev: ev_dev,
             inode: ev.inode,
-            path: path.as_deref().map(path_to_string),
+            path: Some(path_to_string(&path)),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             post_content_hash: None,
@@ -1534,6 +1555,40 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
 fn path_for_kernel_fd(fd: RawFd) -> Option<PathBuf> {
     let link = format!("/proc/self/fd/{fd}");
     std::fs::read_link(&link).ok()
+}
+
+/// AR01.1 — resolve a known `(dev, inode)` to an absolute path. Tries
+/// the procfs fd-symlink first (instant lookup via the still-held
+/// pre_opened fd) and falls back to a reverse iteration over
+/// `ws.path_to_inode` (slower, but path_to_inode is small per
+/// command -- typically <500 entries -- and only one event per
+/// inode hits this fallback per watch window).
+///
+/// Returns `None` only if both lookups miss. Callers should drop the
+/// event in that case -- emitting `CapturedPreImage` with `path=None`
+/// makes the daemon journal an empty-string path which ConflictMissings
+/// at undo time. Better to lose one event with a tracing breadcrumb
+/// than to journal a corrupted one.
+fn resolve_inode_to_path(ws: &WatchState, dev: u64, inode: u64) -> Option<PathBuf> {
+    if let Some(p) = ws
+        .pre_opens
+        .get(&(dev, inode))
+        .and_then(|f| path_for_kernel_fd(f.as_raw_fd()))
+    {
+        // procfs returns paths suffixed with " (deleted)" for unlinked
+        // files. Trim that so the journal stores a real path; the file
+        // may have been re-created at the same path or we may be
+        // capturing a rename-source whose name we want intact.
+        let s = p.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            return Some(PathBuf::from(stripped));
+        }
+        return Some(p);
+    }
+    ws.path_to_inode
+        .iter()
+        .find(|(_, &v)| v == (dev, inode))
+        .map(|(k, _)| k.clone())
 }
 
 /// Read pre-image bytes from the kernel-provided fd. fanotify hands
