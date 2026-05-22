@@ -76,6 +76,29 @@ pub enum CtlRequest {
     /// We execute on the daemon side rather than shipping a serialized
     /// plan because the planner + blob store + index live there already.
     Undo(UndoRequest),
+    /// AR00.5 / task #105 — block the caller (a shell hook
+    /// `shit hook-send pre-exec ...`) until the helper finishes
+    /// setting up capture for this (session, command_seq). The
+    /// daemon awaits a `HelperResponse::WatchTreeReady` matching
+    /// this command. Returns `WatchReady` with `ready=true` on
+    /// success, or `ready=false` with `reason` set on timeout or
+    /// when no helper is connected.
+    ///
+    /// Why this exists at the ctl layer rather than as a synchronous
+    /// reply to the existing UDP PreExec hook: the hook socket is a
+    /// `SOCK_DGRAM` fire-and-forget by design (sub-millisecond hook
+    /// overhead matters); turning it into a request-response would
+    /// touch every existing caller. The ctl path is already
+    /// request-response so it's the natural home for the wait.
+    WaitWatchReady {
+        session: uuid::Uuid,
+        command_seq: u64,
+        /// Cap the wait. The shell hook should pick something large
+        /// enough for cold-start helper (~1-2 s on a slow disk + cold
+        /// BTF cache) but small enough that a hung helper doesn't
+        /// hang the shell forever. Caller responsibility.
+        timeout_ms: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +660,20 @@ pub enum CtlResponse {
     Metrics(MetricsSnapshot),
     /// Reply to `Undo` — execution report.
     UndoReport(UndoReportWire),
+    /// Reply to `WaitWatchReady` (task #105). `ready=true` means the
+    /// helper signaled `WatchTreeReady` for the requested command
+    /// before the caller's timeout expired (or had already done so
+    /// before the wait was issued -- the readiness map persists the
+    /// state). `ready=false` with `reason` set when:
+    ///   - the wait timed out (`reason="timeout"`)
+    ///   - no helper is connected (`reason="no helper"`) — the
+    ///     daemon answers immediately so the shell isn't punished
+    ///     for a degraded-tier setup
+    ///   - the daemon was shutting down (`reason="shutdown"`)
+    WatchReady {
+        ready: bool,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -302,6 +302,23 @@ pub enum HelperResponse {
     Pong {
         nonce: u64,
     },
+    /// AR00.5 / task #105 — helper has finished handling
+    /// `HelperRequest::WatchTree` for this (session, command_seq).
+    /// Specifically:
+    ///   - the kernel-tier reader(s) for this watch are live (BPF
+    ///     programs attached + ringbuf readers spawned on Linux LSM
+    ///     tier, fanotify mark installed on the fanotify-perm tier),
+    ///   - the watch root has been snapshotted into per-CommandId
+    ///     pre-image state (Linux pre_open_tree / BSD register_subtree).
+    /// The daemon uses this as the "capture is genuinely live"
+    /// signal to release any shell-hook PreExec callers waiting on
+    /// `CtlRequest::WaitWatchReady`. Without this, the daemon would
+    /// have to ack PreExec optimistically and the shell would race
+    /// the helper's setup on every cold-start command.
+    WatchTreeReady {
+        session: Uuid,
+        command_seq: u64,
+    },
     /// Helper is about to exit; no further messages will arrive after this.
     ShutdownAck {
         reason: String,
