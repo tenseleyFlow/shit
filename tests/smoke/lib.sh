@@ -130,38 +130,16 @@ smoke_start_shitd() {
 # signal doesn't hang the smoke indefinitely (smoke_fail still gets
 # a chance to fire).
 smoke_wait_lsm_ready() {
-    # Only meaningful when LSM is the picked tier. On fanotify-perm
-    # the helper never logs "readers spawned"; the mark install is
-    # done synchronously inside the daemon's PreExec handler so the
-    # post-PreExec wait can be a flat short sleep.
-    if [ "${SHIT_FORCE_TIER:-}" != "ebpf-lsm" ]; then
-        sleep 0.5
-        return 0
-    fi
-    local log="${SHIT_SMOKE_TMP}/shitd.log"
-    # 'pre_open_tree complete' is the helper-side log line that fires
-    # at the END of the WatchTree handler, AFTER the watch root's
-    # contents have been snapshotted into ws.pre_snapshots and fds
-    # stashed in ws.pre_opens. That's what edit-undo and the other
-    # file-content smokes actually need before mutating -- earlier
-    # PR #20 (load BPF + spawn readers BEFORE handshake) means the
-    # 'readers spawned' marker is now reached BEFORE WatchTree even
-    # dispatches; waiting on it alone races pre_open_tree.
-    #
-    # On smokes where pre_open_tree has nothing to do (mkdir, the
-    # created dir doesn't exist yet) the helper still logs the
-    # marker with opened=0, so this is safe across all LSM smokes.
-    local marker='pre_open_tree complete'
-    local i
-    for i in $(seq 1 60); do
-        if grep -q -F "${marker}" "${log}" 2>/dev/null; then
-            smoke_log "lsm pre_open_tree ready (after ${i}*50ms)"
-            return 0
-        fi
-        sleep 0.05
-    done
-    smoke_log "lsm pre_open_tree ready signal not seen in 3s; proceeding anyway"
-    return 1
+    # No-op. Task #105 makes `shit hook-send pre-exec` block until the
+    # helper has finished WatchTree setup (BPF load + pre_open_tree),
+    # so by the time PreExec returns to the caller, capture is live.
+    # Smokes that called this helper used to log-scrape shitd.log for
+    # readiness markers -- that was concealing a real product race:
+    # any shell hook in the field hits the same problem on a cold
+    # start, not just our smokes. The marker-scraping shim is gone;
+    # if a smoke times out waiting for a CapturedPreImage / TreeOp
+    # event, it's the product's responsibility, not the smoke's.
+    :
 }
 
 smoke_stop_shitd() {
