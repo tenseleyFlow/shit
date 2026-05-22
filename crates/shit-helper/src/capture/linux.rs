@@ -730,25 +730,46 @@ impl LinuxCaptureRuntime {
         let resolved_dir = PathBuf::from(&resolved_dir_str);
 
         // Stat to grab the (dev, inode) of the freshly-created dir.
-        let (dev, inode) = match std::fs::symlink_metadata(&resolved_dir) {
-            Ok(meta) => {
-                use std::os::unix::fs::MetadataExt;
-                if !meta.is_dir() {
-                    tracing::warn!(
-                        path = %resolved_dir.display(),
-                        "lsm mkdir: post-stat is not a dir (race?); dropping"
-                    );
-                    return;
+        //
+        // `security_inode_mkdir` is a PRE-creation LSM hook: it fires
+        // during the permission-check phase of `do_mkdirat`, BEFORE
+        // `vfs_mkdir` publishes the dentry. The userspace ringbuf
+        // reader runs async wrt the syscall, so when the handler
+        // hits `symlink_metadata` the dentry may or may not yet be
+        // visible. The kernel work between hook fire and dentry
+        // visible is bounded (microseconds in the typical path);
+        // retry with a small budget rather than dropping the event.
+        //
+        // If the stat still fails after the retry budget, emit a
+        // marker-only TreeMutation (dev=0, inode=0). The daemon's
+        // undo path resolves the dir via `path` -- it doesn't strictly
+        // need the (dev, inode) tuple, that's only for invariant
+        // checking. Marker-only beats dropping silently.
+        use std::os::unix::fs::MetadataExt;
+        let stat_result = (|| {
+            // Up to 10 ms total: 20 iterations at 0.5 ms each. The
+            // happy path resolves on the first iteration.
+            for _ in 0..20 {
+                match std::fs::symlink_metadata(&resolved_dir) {
+                    Ok(meta) if meta.is_dir() => return Some((meta.dev(), meta.ino())),
+                    Ok(_) => return None, // exists but not a dir; surface
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                    Err(_) => return None,
                 }
-                (meta.dev(), meta.ino())
             }
-            Err(e) => {
+            None
+        })();
+        let (dev, inode) = match stat_result {
+            Some(t) => t,
+            None => {
                 tracing::warn!(
-                    err = %e,
                     path = %resolved_dir.display(),
-                    "lsm mkdir: post-stat failed; dropping"
+                    "lsm mkdir: post-stat not visible within 10ms retry budget; \
+                     emitting marker-only (dev=0, inode=0)"
                 );
-                return;
+                (0, 0)
             }
         };
 
