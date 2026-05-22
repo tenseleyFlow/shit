@@ -144,12 +144,6 @@ smoke_log "PreExec seq=${SEQ} pid=${PID} cwd=${SCRATCH}"
     --shell bash \
     --sock "${SHIT_HOOK_SOCK}"
 
-# Give the helper time to receive WatchTree. The LSM tier doesn't
-# need a fanotify-mark install step but the daemon->helper dispatch
-# is still async; 250ms is comfortably longer than observed dispatch
-# latency.
-sleep 0.5
-
 smoke_log "rm ${FOO}"
 rm "${FOO}"
 

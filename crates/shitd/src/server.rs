@@ -44,6 +44,7 @@ pub async fn serve(
     env_stash: Arc<EnvPreStash>,
     active: Arc<ActiveCommands>,
     helper_link: Option<Arc<HelperLink>>,
+    watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
 ) -> anyhow::Result<()> {
     let env_filter = cfg.env.filter();
     if let Some(parent) = cfg.hook_socket_path.parent() {
@@ -90,7 +91,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index, &env_stash, &env_filter, &active, helper_link.as_deref());
+                                handle(msg, &index, &env_stash, &env_filter, &active, helper_link.as_deref(), watch_ready.as_deref());
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -125,6 +126,7 @@ fn handle(
     env_filter: &shit_planner::EnvFilter,
     active: &ActiveCommands,
     helper_link: Option<&HelperLink>,
+    watch_ready: Option<&crate::watch_ready::WatchReadyMap>,
 ) {
     let session = msg.session();
     let kind = msg.kind();
@@ -246,6 +248,17 @@ fn handle(
                 if let Err(e) = link.send_request(&req) {
                     warn!(err = %e, "UnwatchTree dispatch to helper failed");
                 }
+            }
+            // AR00.5 / task #105 — drop the readiness entry for this
+            // CommandId. If no shell hook is waiting (typical case --
+            // the wait completed before PostExec arrived), this is a
+            // cheap map remove. If one IS waiting (stale shell hook,
+            // racy teardown), its oneshot Receiver gets an Err and
+            // the WaitWatchReady ctl call returns ready=false /
+            // "canceled" -- the shell proceeds without waiting
+            // forever.
+            if let Some(map) = watch_ready {
+                map.forget(CommandId { session, seq: *seq });
             }
         }
         HookMessage::PreExecEnv { seq, env_block, .. } => {

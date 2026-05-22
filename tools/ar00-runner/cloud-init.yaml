@@ -1,0 +1,221 @@
+#cloud-config
+# AR00 -- Custom GHA self-hosted runner image bootstrap.
+#
+# Cloud-init script that takes a stock DigitalOcean ubuntu-24.04
+# droplet and:
+#
+#   1. Patches the kernel boot cmdline to include `bpf` in the
+#      active LSM list (`lsm=lockdown,landlock,yama,apparmor,bpf,
+#      ima,evm`). Stock Ubuntu omits `bpf`, which means our six
+#      LSM-pinned smokes can't run.
+#   2. Installs the baseline toolchain the AR campaign needs:
+#      rustup (1.88), cargo cache deps, jq, sqlite3, python3,
+#      libcap2-bin (for setcap), build-essential, pkg-config,
+#      libsqlite3-dev, libbpf-dev, clang, llvm.
+#   3. Installs the per-class CLI tools that AR02-AR05 exercise:
+#      docker, podman, docker-compose, terraform, kubectl, kind,
+#      gh, helm.
+#   4. Configures docker to be usable by a non-root `runner` user
+#      (group membership; daemon already runs as root via systemd).
+#   5. Creates a `runner` user that will host the GHA runner agent.
+#      The agent itself is registered AFTER the snapshot is taken,
+#      because runner registration tokens are repo-specific +
+#      short-lived (cannot be baked into the image).
+#
+# Usage:
+#   doctl compute droplet create shit-runner-builder \
+#     --image ubuntu-24-04-x64 \
+#     --size s-2vcpu-4gb \
+#     --region nyc3 \
+#     --ssh-keys <fingerprint> \
+#     --user-data-file tools/ar00-runner/cloud-init.yaml \
+#     --wait
+#
+# After the droplet finishes cloud-init (check /var/log/cloud-init-
+# output.log on the droplet), reboot it, verify /sys/kernel/security/
+# lsm contains "bpf", then snapshot:
+#   doctl compute droplet-action snapshot <droplet-id> \
+#     --snapshot-name shit-runner-image-$(date +%Y%m%d) --wait
+#
+# Subsequent runner droplets are spawned from the snapshot and only
+# need the runner-registration step (tools/ar00-runner/register-runner.sh).
+
+# Don't auto-create the default ubuntu user; we want a `runner` user.
+users:
+  - name: runner
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    # SSH key provisioned by doctl --ssh-keys flag is added to root;
+    # mirror it to `runner` so the operator can shell in as runner.
+    ssh_authorized_keys: []
+    lock_passwd: true
+
+package_update: true
+package_upgrade: false  # don't slow boot with full upgrade; baseline image is recent enough
+
+packages:
+  # Build essentials
+  - build-essential
+  - pkg-config
+  - libssl-dev
+  - libsqlite3-dev
+  - libbpf-dev
+  - libcap2-bin
+  - clang
+  - llvm
+  - linux-headers-generic
+  # Tools used by smokes
+  - jq
+  - sqlite3
+  - python3
+  - python3-pip
+  - git
+  - curl
+  - wget
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  # systemd-user for AR06 / future smokes
+  - dbus-user-session
+  # Container runtimes
+  - docker.io
+  - docker-compose-v2
+  - podman
+  # Network tools for L03/AR smokes
+  - nftables
+  - iproute2
+
+write_files:
+  # Patch grub cmdline to enable bpf in active LSMs. The default
+  # Ubuntu 24.04 line is `lsm=lockdown,capability,landlock,yama,
+  # apparmor,ima,evm` (no bpf). We append bpf via GRUB_CMDLINE_LINUX.
+  - path: /etc/default/grub.d/99-shit-lsm-bpf.cfg
+    permissions: '0644'
+    content: |
+      # Added by AR00 cloud-init -- enables bpf LSM so shit-helper's
+      # eBPF-LSM tier (L04) can attach. Without this, /sys/kernel/
+      # security/lsm omits bpf and the helper degrades to fanotify.
+      GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} lsm=lockdown,landlock,yama,apparmor,bpf,ima,evm"
+
+  # rustup install script invocation. We pin to 1.88 (the project's
+  # MSRV per rust-toolchain.toml). Installing to /opt/cargo with
+  # /opt/cargo/bin on /etc/environment's PATH means BOTH root and
+  # the runner user pick it up without us needing to symlink into
+  # /usr/local/bin or duplicate the install per-user. The previous
+  # recipe installed to /root/.cargo (mode-700 traversal blocks
+  # non-root) and symlinked into /usr/local/bin -- the symlinks
+  # resolved but the target was inaccessible to the runner user,
+  # so 'cargo' was effectively missing from any GHA job step. See
+  # .docs/audits/ar00-runner-ops.md issue #8.
+  - path: /root/install-rustup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      export CARGO_HOME=/opt/cargo
+      export RUSTUP_HOME=/opt/rustup
+      mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.88 --profile minimal --no-modify-path
+      # Make CARGO_HOME world-readable + executable so the runner
+      # user (and any future user) can read the toolchain. Cargo
+      # itself doesn't write here at runtime; per-job builds get
+      # their own CARGO_TARGET_DIR.
+      chmod -R go+rX /opt/cargo /opt/rustup
+      # Put cargo on the system path for every login + every
+      # actions-runner job (actions-runner inherits /etc/environment
+      # at service start).
+      cat > /etc/profile.d/cargo.sh <<'SH'
+      export CARGO_HOME=/opt/cargo
+      export RUSTUP_HOME=/opt/rustup
+      export PATH="/opt/cargo/bin:$PATH"
+      SH
+      chmod 644 /etc/profile.d/cargo.sh
+      # /etc/environment is what systemd services (incl. actions-
+      # runner) inherit. PATH there is a simple assignment.
+      if ! grep -q "/opt/cargo/bin" /etc/environment; then
+        sed -i 's|^PATH="|PATH="/opt/cargo/bin:|' /etc/environment \
+          || echo 'PATH="/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' >> /etc/environment
+      fi
+      echo 'CARGO_HOME=/opt/cargo' >> /etc/environment
+      echo 'RUSTUP_HOME=/opt/rustup' >> /etc/environment
+
+  # Install gh, kubectl, kind, terraform, helm via official scripts.
+  - path: /root/install-tools.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      # gh-cli
+      mkdir -p -m 755 /etc/apt/keyrings
+      out=$(mktemp); wget -nv -O$out https://cli.github.com/packages/githubcli-archive-keyring.gpg
+      cat $out | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+      chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y gh
+
+      # kubectl
+      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      rm -f kubectl
+
+      # kind
+      curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+      chmod +x /usr/local/bin/kind
+
+      # terraform
+      wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor \
+        | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+      echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+        | tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y terraform
+
+      # helm via the official installer script. The baltocdn apt
+      # repo is finicky (auth/key drift broke the first build attempt
+      # silently); the upstream get-helm-3 script is the canonical
+      # install path and just drops a static binary into /usr/local/bin.
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+        | DEBIAN_FRONTEND=noninteractive bash
+
+# Run the order-sensitive bits: grub update first, then rustup +
+# tools (which need the packages from `packages:` above to be in
+# place). After cloud-init completes, a manual reboot picks up the
+# new kernel cmdline.
+runcmd:
+  # 1. Apply the grub cmdline change.
+  - update-grub
+  - echo "[ar00-cloud-init] grub updated; reboot to apply lsm=bpf"
+
+  # 2. Install rustup (root + runner user).
+  - bash /root/install-rustup.sh
+
+  # 3. Install the per-class CLI tools.
+  - bash /root/install-tools.sh
+
+  # 4. Sanity dump -- useful in /var/log/cloud-init-output.log.
+  - echo "[ar00-cloud-init] tool versions:"
+  - which cargo && cargo --version || echo "  cargo missing"
+  - which docker && docker --version || echo "  docker missing"
+  - which kubectl && kubectl version --client=true --output=yaml | head -5 || echo "  kubectl missing"
+  - which terraform && terraform --version | head -1 || echo "  terraform missing"
+  - which gh && gh --version | head -1 || echo "  gh missing"
+  - which jq && jq --version || echo "  jq missing"
+  - which helm && helm version --short || echo "  helm missing"
+  - which kind && kind --version || echo "  kind missing"
+  - echo "[ar00-cloud-init] active lsms BEFORE reboot:"
+  - cat /sys/kernel/security/lsm || true
+  - echo "[ar00-cloud-init] grub cmdline preview AFTER reboot:"
+  - cat /etc/default/grub.d/99-shit-lsm-bpf.cfg
+  - echo "[ar00-cloud-init] DONE; reboot the droplet to activate the new kernel cmdline"
+
+# Reboot ourselves so the operator doesn't have to. After reboot,
+# /sys/kernel/security/lsm should include 'bpf'.
+power_state:
+  delay: now
+  mode: reboot
+  message: "AR00 cloud-init done; rebooting to activate lsm=bpf"
+  condition: True

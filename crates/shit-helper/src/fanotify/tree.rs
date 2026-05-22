@@ -87,6 +87,68 @@ impl TreeMap {
         resolved
     }
 
+    /// AR00.5 — like `is_tracked`, but uses a `parent_pid` value
+    /// captured AT BPF-hook-fire time (from the kernel's
+    /// `task->real_parent->tgid`) instead of walking `/proc/<pid>/stat`
+    /// at event-consume time.
+    ///
+    /// Why: the userspace ringbuf reader runs ASYNC wrt the syscall.
+    /// For short-lived subprocesses (rm, mv, chmod, mkdir, etc.)
+    /// the process exits between the kernel hook firing and the
+    /// reader thread consuming -- by then `/proc/<rm-pid>/stat` is
+    /// gone and the `/proc`-walk in `resolve()` returns None,
+    /// dropping the event. The smoke shell (a typical tracked root)
+    /// is still alive though, so matching the event's recorded
+    /// parent_pid against tracked roots closes the race for any
+    /// direct child of a tracked root -- which covers every smoke
+    /// in the matrix and the vast majority of real shell-spawned
+    /// commands.
+    ///
+    /// For pids more than one level deep (grandchildren and beyond)
+    /// the parent_pid alone isn't enough; we still fall back to the
+    /// classic `/proc` walk and may still lose those events. That's
+    /// a follow-up: deep-tree tracking needs either a BPF map of
+    /// active descendants populated via sched_process_fork, or a
+    /// bounded ancestor walk inside the BPF program itself.
+    pub fn is_tracked_with_parent(&mut self, pid: i32, parent_pid: i32) -> Option<(Uuid, u64)> {
+        if let Some(cached) = self.pid_cache.get(&pid) {
+            return *cached;
+        }
+        // First check: is the event's pid itself a tracked root?
+        for ((s, seq), tree) in &self.trees {
+            if pid == tree.root_pid {
+                let resolved = Some((*s, *seq));
+                self.pid_cache.insert(pid, resolved);
+                return resolved;
+            }
+        }
+        // Second check: is the event's parent_pid (from BPF) a
+        // tracked root? Handles the canonical shell-spawns-tool case
+        // even when the tool has already exited.
+        if parent_pid > 0 {
+            for ((s, seq), tree) in &self.trees {
+                if parent_pid == tree.root_pid {
+                    let resolved = Some((*s, *seq));
+                    self.pid_cache.insert(pid, resolved);
+                    if let Some(tree) = self.trees.get_mut(&(*s, *seq)) {
+                        tree.members.insert(pid);
+                    }
+                    return resolved;
+                }
+            }
+        }
+        // Fall back to the /proc-walking resolver. Best-effort: if
+        // the pid has already exited, this returns None.
+        let resolved = self.resolve(pid);
+        self.pid_cache.insert(pid, resolved);
+        if let Some((s, seq)) = resolved
+            && let Some(tree) = self.trees.get_mut(&(s, seq))
+        {
+            tree.members.insert(pid);
+        }
+        resolved
+    }
+
     /// Walk `/proc/<pid>/stat` up the parent chain looking for a
     /// tracked root. Bounded depth so a malicious/cycling proc tree
     /// can't loop us forever (real Linux pid 1 is init; we stop there

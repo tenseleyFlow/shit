@@ -1169,25 +1169,20 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         "connected to daemon ipc socket"
     );
 
-    let outcome =
-        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, setup.caps) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(err = %e, "handshake failed; exiting");
-                return Err(anyhow::anyhow!("handshake failed: {e}"));
-            }
-        };
-    tracing::info!(
-        daemon_pid = outcome.daemon_pid,
-        daemon_uid = outcome.daemon_uid,
-        granted = ?outcome.granted,
-        "handshake complete"
-    );
-
-    // Spawn the kernel-tier reader. Exactly one of fanotify /
-    // ebpf-lsm gets wired per-boot — `pick_linux_tier` already chose
-    // above. The fanotify branch mirrors L01; the ebpf-lsm branch
-    // is L04's promotion path.
+    // Spawn the kernel-tier reader BEFORE the handshake completes.
+    // Once `handshake::perform_helper_side` returns, the daemon is
+    // free to dispatch `WatchTree` / `PreExec` (and on the shell side,
+    // the smoke's mutation may run any moment). If we hadn't loaded
+    // BPF programs / spawned the fanotify reader by then, the kernel
+    // syscall the smoke is exercising fires before its LSM hook is
+    // attached and the event is lost. ~260ms of BPF program loading
+    // landed us with 0 captured events across every L02/L03 smoke
+    // on the linux-kernel-capture matrix; fix is to make
+    // handshake-complete genuinely mean "capture is live".
+    //
+    // Exactly one of fanotify / ebpf-lsm gets wired per-boot —
+    // `pick_linux_tier` already chose above. The fanotify branch
+    // mirrors L01; the ebpf-lsm branch is L04's promotion path.
     //
     // Both readers feed the SAME `LinuxCaptureRuntime` instance. The
     // unused fd from the other tier (e.g. the fanotify_fd when tier
@@ -1263,6 +1258,21 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 
         (fanotify_state, lsm_state)
     };
+
+    let outcome =
+        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, setup.caps) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(err = %e, "handshake failed; exiting");
+                return Err(anyhow::anyhow!("handshake failed: {e}"));
+            }
+        };
+    tracing::info!(
+        daemon_pid = outcome.daemon_pid,
+        daemon_uid = outcome.daemon_uid,
+        granted = ?outcome.granted,
+        "handshake complete"
+    );
 
     // B05 Phase B — pre-cap_enter `O_DIRECTORY` open of `/`.
     // capsicum's `cap_enter(2)` forbids absolute-path opens once
@@ -1617,6 +1627,35 @@ fn request_loop(
                     // L01 fanotify path uses /proc/<pid>/cwd readlink;
                     // cwd_path is BSD-only at the helper layer today.
                     let _ = &cwd_path;
+                }
+                // Task #105: signal to the daemon that THIS specific
+                // (session, command_seq) is fully set up — kernel-tier
+                // reader is live (BPF programs attached on LSM, mark
+                // installed on fanotify-perm, kqueue subtree registered
+                // on BSD) AND the watch root has been snapshotted into
+                // per-CommandId pre-image state. The daemon's
+                // CtlRequest::WaitWatchReady handler awaits this signal
+                // before releasing the shell hook (`shit hook-send
+                // pre-exec`) that triggered the WatchTree, so the
+                // user's command never runs before capture is ready.
+                //
+                // This send is fire-and-forget per the wire contract;
+                // the daemon doesn't ack readiness, it just routes the
+                // signal into its per-command readiness map. If the
+                // send fails (helper-daemon link torn down between the
+                // WatchTree dispatch and now) the shell hook will time
+                // out on its own — the daemon doesn't hang on us.
+                let ready = HelperResponse::WatchTreeReady {
+                    session,
+                    command_seq,
+                };
+                if let Err(e) = conn.send_response(&ready) {
+                    tracing::warn!(
+                        err = %e,
+                        %session,
+                        command_seq,
+                        "WatchTreeReady send failed; shell hook will time out"
+                    );
                 }
             }
             HelperRequest::UnwatchTree {

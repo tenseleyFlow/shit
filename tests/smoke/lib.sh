@@ -73,6 +73,18 @@ smoke_start_shitd() {
     if [ ! -x "${shitd}" ]; then
         smoke_fail "shitd binary missing at ${shitd}"
     fi
+    # Cross-smoke hygiene: a previous smoke can leak a `shit-helper`
+    # subprocess (visible in this smoke's safety-net's pgrep dump as
+    # an "any shit-* processes anywhere" entry). When a stale helper
+    # is alive its BPF LSM programs are still attached to the kernel
+    # hooks; events from THIS smoke's mutation hit BOTH the orphan's
+    # ringbufs (drained by no live reader) and THIS smoke's helper's
+    # ringbufs. Some events apparently get routed to the orphan and
+    # dropped, producing intermittent "timed out waiting for event"
+    # failures on the same commit across reruns. Sweep them here.
+    pkill -f 'target/release/shit-helper' 2>/dev/null || true
+    # Brief settle for the kernel to detach the orphan's BPF links.
+    sleep 0.1
     smoke_log "starting shitd (state=${XDG_STATE_HOME}/shit)"
     # Pin RUST_LOG=debug for the daemon so per-tier handlers' debug
     # breadcrumbs (`net-pre stashed`, `svc-pre stashed`, etc.) land
@@ -102,6 +114,21 @@ smoke_start_shitd() {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/shitd.log" >&2 || true
     smoke_fail "shitd ctl socket never appeared at ${SHIT_CTL_SOCK}"
 }
+
+# Block until the LSM tier's BPF programs are loaded + readers spawned.
+# Required after PreExec on LSM-pinned smokes: the helper's BPF load
+# is asynchronous wrt the daemon's PreExec ack, and on a cold start
+# (no kernel BTF cache, slow I/O) the helper takes ~700-1000 ms to
+# attach all 6 hooks. If the smoke's mutating command runs before
+# the hooks are live, the kernel processes the operation without
+# firing any of our LSM programs and no FilePreImage event is ever
+# captured -- see AR00.5 forensics in .docs/audits/ar00-runner-ops.md.
+#
+# We poll the shitd log for the helper's INFO line
+# "ebpf-lsm readers spawned: ..." which is emitted exactly once after
+# all hooks are attached. Falls back to a 3-second cap so a missed
+# signal doesn't hang the smoke indefinitely (smoke_fail still gets
+# a chance to fire).
 
 smoke_stop_shitd() {
     # === B04.6c INSTRUMENTATION ===
