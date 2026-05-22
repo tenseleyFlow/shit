@@ -266,25 +266,26 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # The snapshot has stale /usr/local/bin/{rustc,cargo,rustup}
-      # symlinks pointing into /root/.cargo/bin -- mode 700 on /root
-      # blocks the runner user from stat'ing them, so any action that
-      # probes rust by walking $PATH (including Swatinem/rust-cache@v2
-      # which calls `rustc -vV` via execSync) fails with EACCES BEFORE
-      # ever reaching /home/runner/.cargo/bin. Two fixes layered:
+      # AR00 runner state caveats:
+      # 1. The snapshot ships /usr/local/bin/{rustc,cargo,rustup}
+      #    symlinks pointing into /root/.cargo/bin. /root is mode 700
+      #    so the unprivileged runner user gets EACCES on stat() of
+      #    the symlink target -- any tool that probes $PATH for rust
+      #    fails before falling through. Drop the shims so PATH
+      #    lookup proceeds to whatever dtolnay installs below.
+      # 2. The snapshot's per-user rustup at /home/runner/.cargo/bin
+      #    has historically been observed to be missing the rustup
+      #    binary itself (just the dispatch symlinks), and
+      #    Swatinem/rust-cache@v2 caches in ways that can stomp on
+      #    a re-install between runs. Don't depend on the snapshot's
+      #    rustup at all -- let dtolnay/rust-toolchain set up a
+      #    deterministic install per-job, same as every other CI
+      #    job in this workflow.
       #
-      # 1. Remove the broken /usr/local/bin shims so $PATH lookup
-      #    falls through to the runner-user's rustup install. Done
-      #    BEFORE the rust-cache action runs.
-      # 2. Prepend /home/runner/.cargo/bin to GITHUB_PATH as well,
-      #    belt-and-suspenders so subsequent steps' shells find rustc
-      #    even on a runner without the broken symlinks.
-      #
-      # Both become unnecessary after the next AR00.1 snapshot
-      # refresh, which installs rustup to /opt/cargo with that on
-      # /etc/environment's PATH. Tracked in
+      # Both quirks go away after the next AR00.1 snapshot refresh
+      # (installs rustup to /opt/cargo, world-readable). Tracked in
       # .docs/audits/ar00-runner-ops.md.
-      - name: clean broken /usr/local rust symlinks + put runner cargo on PATH
+      - name: clean broken /usr/local rust symlinks
         run: |
           sudo rm -f \
             /usr/local/bin/rustc \
@@ -296,8 +297,8 @@ jobs:
             /usr/local/bin/clippy-driver \
             /usr/local/bin/rls \
             /usr/local/bin/rust-analyzer
-          echo "/home/runner/.cargo/bin" >> "$GITHUB_PATH"
 
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
 
       - name: install system deps (idempotent on snapshot)
