@@ -44,7 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -98,7 +98,36 @@ struct WatchState {
     /// `/proc/<dead-pid>/cwd/...` string that was journaled and
     /// then ENOENT'd at undo time.
     cwd: Option<PathBuf>,
+    /// AR01.1.fix-pre-open-tree-recursion — `(dev, inode) → absolute
+    /// path` for every directory visited by `pre_open_tree` (including
+    /// the watch root itself). LSM event handlers look up the
+    /// parent inode here to reconstruct the full path for files
+    /// in subdirectories. Pre-AR01.1 the handlers always joined
+    /// `ws.cwd + basename`, which produced wrong paths like
+    /// `repo/index.lock` for git's `.git/index.lock`.
+    ///
+    /// Populated lazily: `handle_lsm_mkdir` also inserts the new dir's
+    /// (dev, inode) → path so subsequent nested events resolve.
+    dir_paths: BTreeMap<(u64, u64), PathBuf>,
 }
+
+/// AR01.1.fix-pre-open-tree-recursion — bounded recursion depth for
+/// `pre_open_tree`. Matches the BSD `register_subtree` and fanotify
+/// `mark_dir_for_capture` defaults. Real-world load (a fresh
+/// `git init` repo + a few commits): `.git/objects/XX/` is depth 3
+/// from the repo root; depth 8 covers nested workloads (e.g.
+/// `dst/sub1/sub2/.../file` in cp-r) with margin.
+const PRE_OPEN_TREE_DEPTH_LIMIT: usize = 8;
+
+/// AR01.1.fix-pre-open-tree-recursion — soft cap on how many files
+/// `pre_open_tree` will open per command. Each open consumes an fd
+/// + an in-memory snapshot (up to MAX_PRE_IMAGE_BYTES each). The
+/// process rlimit defaults to ~1024 fds on most distros; we leave
+/// headroom for the daemon's own sockets, the BPF ringbuf fds, and
+/// staging tmpfiles. If a tree is larger than this, we log + stop
+/// recursing -- the LSM handlers fall back to live-fd capture for
+/// unsnapshotted files, same fail-mode as a too-large pre-image.
+const PRE_OPEN_TREE_MAX_FILES: usize = 512;
 
 /// L04.1 — A snapshotted pre-image. Bytes + the stat-meta as it was
 /// at snapshot time (mode/uid/gid/mtime/size). Both go on the wire
@@ -177,13 +206,21 @@ impl LinuxCaptureRuntime {
         self.watches.remove(&command);
     }
 
-    /// L04 — open every regular file under `cwd` (non-recursive in
-    /// v1; matches the smoke's flat-tree assumption) and stash the
+    /// L04 — open every regular file under `cwd` and stash the
     /// OwnedFds keyed by `(dev, inode)` in this command's WatchState.
     /// Mirror of `kqueue::register_subtree` — the open fd keeps the
     /// inode alive after `vfs_unlink` drops the dentry, so the LSM
     /// unlink handler can `read_pre_image(dup(fd))` after the file
     /// is "gone".
+    ///
+    /// AR01.1.fix-pre-open-tree-recursion — recurses up to
+    /// [`PRE_OPEN_TREE_DEPTH_LIMIT`] levels, capped at
+    /// [`PRE_OPEN_TREE_MAX_FILES`] opens per command. Stays on the
+    /// same filesystem (same `dev`) as the watch root so we never
+    /// cross a bind mount or a tmpfs sub-mount accidentally. Records
+    /// every visited directory in `ws.dir_paths` so LSM event handlers
+    /// can resolve `(parent_dev, parent_inode, basename)` into an
+    /// absolute path for files in subdirectories.
     ///
     /// Best-effort: per-file open errors (EACCES on protected files,
     /// ELOOP on dangling symlinks) are skipped silently. The walker
@@ -200,60 +237,28 @@ impl LinuxCaptureRuntime {
         // basename → absolute path without /proc/<pid>/cwd. See
         // WatchState::cwd docs for the why (Issue #22).
         ws.cwd = Some(cwd.to_path_buf());
-        let dir = match std::fs::read_dir(cwd) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(cwd = %cwd.display(), err = %e, "pre_open_tree: read_dir failed");
-                return;
-            }
-        };
-        let mut opened = 0usize;
-        for ent in dir.flatten() {
-            let path = ent.path();
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !meta.file_type().is_file() {
-                continue;
-            }
-            // O_RDONLY + O_NOFOLLOW — never follow a symlink (else
-            // we'd open something outside the watched tree).
-            let f = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let fd = f.as_raw_fd();
-            let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
-                continue;
-            };
-            // L04.1 — snapshot bytes + meta BEFORE inserting the fd.
-            // Reads are race-free at this moment (no LSM event has
-            // fired yet). If read fails or file's too large, skip
-            // snapshot — the LSM open/setattr handlers will see a
-            // miss and drop their events.
-            if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
-                ws.pre_snapshots
-                    .insert((dev, inode), PreSnapshot { meta, bytes });
-            } else {
-                tracing::trace!(
-                    dev,
-                    inode,
-                    "pre_open_tree: snapshot skipped (too large or read failed)"
-                );
-            }
-            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
-            opened += 1;
+
+        // Record the watch root itself in dir_paths so events whose
+        // parent_inode == watch-root's inode resolve too.
+        let root_dev_inode = std::fs::metadata(cwd)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+            .unwrap_or((0, 0));
+        if root_dev_inode != (0, 0) {
+            ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
         }
+
+        let mut opened = 0usize;
+        let mut hit_cap = false;
+        pre_open_recurse(ws, cwd, root_dev_inode.0, 0, &mut opened, &mut hit_cap);
+
         tracing::info!(
             session = %command.session,
             seq = command.seq,
             cwd = %cwd.display(),
             opened,
+            dirs = ws.dir_paths.len(),
+            hit_cap,
             "pre_open_tree complete"
         );
     }
@@ -1092,6 +1097,88 @@ impl LinuxCaptureRuntime {
     }
 }
 
+/// AR01.1.fix-pre-open-tree-recursion — recurse `pre_open_tree` into
+/// subdirectories. Caller passes the root's `dev` and we refuse to
+/// descend into entries on a different filesystem (cross-fs traversal
+/// would let us open files outside the user's intent on a watched
+/// repo containing a submodule's tmpfs mount). Symlinks are never
+/// followed; `O_NOFOLLOW` on the open ensures the file we snapshot
+/// is the one we statted.
+fn pre_open_recurse(
+    ws: &mut WatchState,
+    dir: &Path,
+    root_dev: u64,
+    depth: usize,
+    opened: &mut usize,
+    hit_cap: &mut bool,
+) {
+    if depth >= PRE_OPEN_TREE_DEPTH_LIMIT {
+        return;
+    }
+    if *opened >= PRE_OPEN_TREE_MAX_FILES {
+        *hit_cap = true;
+        return;
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), err = %e, "pre_open_tree: read_dir failed");
+            return;
+        }
+    };
+    for ent in read.flatten() {
+        if *opened >= PRE_OPEN_TREE_MAX_FILES {
+            *hit_cap = true;
+            return;
+        }
+        let path = ent.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            // Cross-fs guard: don't recurse into a submount.
+            if meta.dev() != root_dev {
+                continue;
+            }
+            ws.dir_paths.insert((meta.dev(), meta.ino()), path.clone());
+            pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let fd = f.as_raw_fd();
+        let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
+            continue;
+        };
+        if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
+            ws.pre_snapshots
+                .insert((dev, inode), PreSnapshot { meta, bytes });
+        } else {
+            tracing::trace!(
+                dev,
+                inode,
+                "pre_open_tree: snapshot skipped (too large or read failed)"
+            );
+        }
+        ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+        *opened += 1;
+    }
+}
+
 /// Convert the kernel's `dev_t` encoding (`(major << 20) | minor`)
 /// to glibc's userspace encoding (split-bits per `__gnu_dev_makedev`).
 /// All userspace stat() values use the latter; BPF CO-RE reads of
@@ -1639,5 +1726,101 @@ mod tests {
         assert_eq!(kernel_dev_to_userspace(0x800002), 0x802);
         // Identity at major=0: encodings agree.
         assert_eq!(kernel_dev_to_userspace(42), 42);
+    }
+
+    /// AR01.1.fix-pre-open-tree-recursion — `pre_open_tree` must
+    /// recurse into subdirectories so files like `.git/index` get a
+    /// pre-snapshot. Pre-AR01.1 only depth-1 was walked, and every
+    /// nested-dir workload (git, cp -r, etc.) silently lost capture
+    /// for files in subdirs.
+    #[test]
+    fn pre_open_tree_recurses_into_subdirs_and_records_dir_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Mimic a fresh git repo layout.
+        let git = root.join(".git");
+        let objects = git.join("objects");
+        let xx = objects.join("02");
+        std::fs::create_dir_all(&xx).unwrap();
+        std::fs::write(root.join("README.md"), b"top-level").unwrap();
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(git.join("index"), b"index-bytes").unwrap();
+        std::fs::write(xx.join("abc123"), b"blob-bytes").unwrap();
+
+        let mut ws = WatchState {
+            cwd: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let root_dev = std::fs::metadata(root).unwrap().dev();
+        let root_ino = std::fs::metadata(root).unwrap().ino();
+        ws.dir_paths.insert((root_dev, root_ino), root.to_path_buf());
+
+        let mut opened = 0usize;
+        let mut hit_cap = false;
+        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+
+        assert!(!hit_cap, "should not have hit max-files cap");
+        // 4 regular files were created; all should be snapshotted.
+        assert_eq!(opened, 4, "expected 4 files snapshotted, got {opened}");
+        assert_eq!(ws.pre_snapshots.len(), 4, "all files should have pre-snapshots");
+        assert_eq!(ws.pre_opens.len(), 4, "all files should have open fds");
+        // 4 dirs: root, .git, .git/objects, .git/objects/02.
+        // (root was inserted by the caller; pre_open_recurse adds the 3 below.)
+        assert_eq!(
+            ws.dir_paths.len(),
+            4,
+            "expected 4 dirs in dir_paths (root + .git + objects + 02), got {}",
+            ws.dir_paths.len()
+        );
+        // Spot-check: .git/objects/02 should be reachable by (dev, inode).
+        let xx_md = std::fs::metadata(&xx).unwrap();
+        assert_eq!(
+            ws.dir_paths.get(&(xx_md.dev(), xx_md.ino())),
+            Some(&xx),
+            "deepest dir should be registered with its full path"
+        );
+    }
+
+    /// AR01.1.fix-pre-open-tree-recursion — depth cap is enforced.
+    /// Files at depth N+1 should NOT be snapshotted when the cap is N.
+    #[test]
+    fn pre_open_tree_honors_depth_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Build a chain root/d1/d2/d3/.../d10/leaf.txt
+        let mut p = root.to_path_buf();
+        for i in 1..=10 {
+            p.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        let leaf = p.join("leaf.txt");
+        std::fs::write(&leaf, b"deep").unwrap();
+
+        let mut ws = WatchState {
+            cwd: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let root_dev = std::fs::metadata(root).unwrap().dev();
+
+        let mut opened = 0usize;
+        let mut hit_cap = false;
+        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+
+        // Depth limit is 8; leaf.txt is at depth 10. Should not be opened.
+        assert_eq!(
+            opened, 0,
+            "leaf at depth 10 must not be opened under depth-8 cap"
+        );
+        // But the chain of dirs up to depth-8 should be registered.
+        assert!(
+            ws.dir_paths.len() >= 7,
+            "expected at least 7 nested dirs in dir_paths, got {}",
+            ws.dir_paths.len()
+        );
+        assert!(
+            ws.dir_paths.len() <= 9,
+            "must not exceed depth limit; got {} dirs",
+            ws.dir_paths.len()
+        );
     }
 }
