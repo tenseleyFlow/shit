@@ -21,7 +21,7 @@
 //!   u8  _pad[3]           offset  1
 //!   u32 pid               offset  4
 //!   u32 tgid              offset  8
-//!   u32 _pad2             offset 12
+//!   u32 parent_pid        offset 12   (task->real_parent->tgid)
 //!   u64 ts_ns             offset 16
 //!   u8  comm[16]          offset 24
 //! shit_unlink_event  (328 bytes total)
@@ -57,7 +57,10 @@ pub struct EventHeader {
     pub _pad: [u8; 3],
     pub pid: u32,
     pub tgid: u32,
-    pub _pad2: u32,
+    /// Task->real_parent->tgid at hook-fire time. Captured in the BPF
+    /// program so userspace can match against tracked roots without
+    /// a /proc lookup that would fail for already-exited subprocs.
+    pub parent_pid: u32,
     pub ts_ns: u64,
     pub comm: [u8; 16],
 }
@@ -402,7 +405,12 @@ impl LsmEventSink for LinuxCaptureSink {
             return;
         }
         let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
             tracing::trace!(pid, "untracked pid; dropping lsm unlink event");
             return;
         };
@@ -423,7 +431,12 @@ impl LsmEventSink for LinuxCaptureSink {
             return;
         }
         let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
             tracing::trace!(pid, "untracked pid; dropping lsm setattr event");
             return;
         };
@@ -450,7 +463,12 @@ impl LsmEventSink for LinuxCaptureSink {
             return;
         }
         let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
             tracing::trace!(pid, "untracked pid; dropping lsm mkdir event");
             return;
         };
@@ -471,7 +489,12 @@ impl LsmEventSink for LinuxCaptureSink {
             return;
         }
         let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
             tracing::trace!(pid, "untracked pid; dropping lsm create event");
             return;
         };
@@ -492,7 +515,12 @@ impl LsmEventSink for LinuxCaptureSink {
             return;
         }
         let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
             tracing::trace!(pid, "untracked pid; dropping lsm open event");
             return;
         };
@@ -512,7 +540,12 @@ impl LsmEventSink for LinuxCaptureSink {
             return;
         }
         let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self.tree.lock().unwrap().is_tracked(pid) else {
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
             tracing::trace!(pid, "untracked pid; dropping lsm rename event");
             return;
         };

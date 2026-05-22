@@ -103,6 +103,10 @@ int BPF_PROG(shit_inode_setattr,
     e->hdr.tgid = (__u32)(pid_tgid >> 32);
     e->hdr.ts_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(&e->hdr.comm, sizeof(e->hdr.comm));
+    /* AR00.5 ancestry — see inode_unlink.bpf.c for rationale. */
+    struct task_struct *__t = (struct task_struct *)bpf_get_current_task();
+    struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
+    e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
 
     /* Identify the file. */
     struct inode *target = BPF_CORE_READ(dentry, d_inode);

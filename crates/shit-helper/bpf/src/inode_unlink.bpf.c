@@ -73,6 +73,17 @@ int BPF_PROG(shit_inode_unlink, struct inode *dir, struct dentry *dentry)
     e->hdr.tgid = (__u32)(pid_tgid >> 32);
     e->hdr.ts_ns = bpf_ktime_get_ns();
     bpf_get_current_comm(&e->hdr.comm, sizeof(e->hdr.comm));
+    /* AR00.5 ancestry: capture task->real_parent->tgid so userspace
+     * can match against tracked roots without /proc lookup that
+     * fails for already-exited subprocesses. Two-step BPF_CORE_READ
+     * because aya's BTF parser / our bundled libbpf chokes on the
+     * 3-arg variadic form for task_struct field walks (the inner
+     * macro expansion treats the parent pointer as `const void *`
+     * and fails the member-ref check); explicit intermediate
+     * `parent` variable round-trips through bpf_probe_read fine. */
+    struct task_struct *__t = (struct task_struct *)bpf_get_current_task();
+    struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
+    e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
 
     /* Body — read (dev, inode) via CO-RE so the program stays
      * portable across kernels whose struct layouts differ. */
