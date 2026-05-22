@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 
 mod active_commands;
 mod ancestry;
+mod baseline;
 mod config;
 mod crash;
 mod ctl;
