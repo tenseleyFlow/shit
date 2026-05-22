@@ -439,6 +439,31 @@ impl PumpState {
     /// the regular file branch of `handle_vnode`. The kq fd is the
     /// pump's shared `Arc<KqueueFd>` (`self.kq`).
     fn handle_dir_change(&mut self, command: CommandId, fd: RawFd) {
+        // W03.B: drive the diff via a work-queue so newly-discovered
+        // sub-directories can be scanned in the same handler call.
+        // Without this, `cp -r src dst` only registered the top-level
+        // `dst` create and lost every event inside it — S29.2's
+        // original logic only watched new *regular* files, not new
+        // *dirs*, so NOTE_WRITE on the new dir never fired and its
+        // children stayed invisible.
+        let mut to_scan: Vec<RawFd> = vec![fd];
+        while let Some(fd) = to_scan.pop() {
+            self.scan_dir_emit_and_watch_children(command, fd, &mut to_scan);
+        }
+    }
+
+    /// Process one directory's diff, emit Create events, install
+    /// watches for new files AND new dirs, and append any new dir
+    /// fds to `to_scan` so the caller can process them in the same
+    /// invocation. Split out from `handle_dir_change` so the
+    /// recursive case (new dir → its children) can be handled in a
+    /// single drain iteration without re-entering kqueue dispatch.
+    fn scan_dir_emit_and_watch_children(
+        &mut self,
+        command: CommandId,
+        fd: RawFd,
+        to_scan: &mut Vec<RawFd>,
+    ) {
         let Some(ws) = self.watches.get_mut(&command) else {
             return;
         };
@@ -464,15 +489,25 @@ impl PumpState {
         // `fd_to_command`. Subsequent writes/deletes then fire on the
         // tracked fd and the regular-file branch of `handle_vnode`
         // picks them up.
+        //
+        // W03.B: do the same for *new directories*, AND queue them
+        // for an immediate re-scan in this same handler call. Without
+        // the watch + rescan, a `cp -r src dst` loses every event
+        // under dst because NOTE_WRITE never fires on dst (no watch).
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
         let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
+        let mut new_dirs_to_watch: Vec<std::path::PathBuf> = Vec::new();
         for (name, &(dev, inode)) in &current {
             match baseline.entries.get(name) {
                 Some(&prev) if prev == (dev, inode) => {} // unchanged
                 Some(_) | None => {
                     // New entry, or entry with different inode at same name.
                     let child = dir_path.join(name);
-                    let kind = file_kind_for(&child);
+                    // file_kind_AT (not _for): under cap_enter,
+                    // absolute-path stat returns ENOTCAPABLE, falls
+                    // through to Regular, and the dir-watching branch
+                    // below never fires for new dirs. W03.B.
+                    let kind = file_kind_at(fd, name);
                     events.push(shit_proto::TreeOpWire::Create {
                         dev,
                         inode,
@@ -480,8 +515,14 @@ impl PumpState {
                         kind,
                         mode: file_mode_for(&child).unwrap_or(0),
                     });
-                    if matches!(kind, shit_proto::FileKindWire::Regular) {
-                        new_files_to_watch.push(child);
+                    match kind {
+                        shit_proto::FileKindWire::Regular => {
+                            new_files_to_watch.push(child);
+                        }
+                        shit_proto::FileKindWire::Directory => {
+                            new_dirs_to_watch.push(child);
+                        }
+                        _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
                     }
                 }
             }
@@ -527,6 +568,42 @@ impl PumpState {
                     new_fd,
                     "auto-added new file to subtree watch",
                 );
+            }
+        }
+
+        // W03.B — same as above for new directories, plus seed an
+        // EMPTY dir_baseline + queue the new dir's fd for an
+        // immediate rescan. The empty baseline makes the next
+        // scan_dir_emit_and_watch_children call treat everything
+        // currently inside the dir as a fresh addition (which it is
+        // — cp may have already populated it before our watch
+        // installed). The queue iteration is what propagates the
+        // walk deep into a `cp -r` tree.
+        for new_path in new_dirs_to_watch {
+            if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
+                self.fd_to_command.insert(new_fd, command);
+                // S29.3 — meta baseline for the dir too (chmod on a
+                // dir fires NOTE_ATTRIB on it).
+                if let Some(m) = fstat_meta(new_fd) {
+                    ws.meta_baselines.insert(new_fd, m);
+                }
+                // Seed empty dir baseline so the imminent rescan
+                // surfaces every current child as a Create.
+                ws.dir_baselines.insert(
+                    new_fd,
+                    DirBaseline {
+                        path: new_path.clone(),
+                        entries: BTreeMap::new(),
+                    },
+                );
+                tracing::info!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %new_path.display(),
+                    new_fd,
+                    "auto-added new dir to subtree watch + queued rescan",
+                );
+                to_scan.push(new_fd);
             }
         }
 
@@ -957,6 +1034,11 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
 /// Classify a path's `FileKind` for the wire. Errors fall through to
 /// `Regular` — the planner only acts on `Directory`/`Regular`/`Symlink`
 /// distinctly, and Regular is the safe default fallback.
+///
+/// **Under capsicum capability mode (B05) absolute-path
+/// `symlink_metadata` returns `EPERM`/`ENOTCAPABLE` and the fallback
+/// silently classifies dirs as Regular. Use [`file_kind_at`] when
+/// you have a dir fd — that uses cap_enter-safe `fstatat`.**
 fn file_kind_for(path: &Path) -> shit_proto::FileKindWire {
     use shit_proto::FileKindWire as K;
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -974,6 +1056,33 @@ fn file_kind_for(path: &Path) -> shit_proto::FileKindWire {
         // distinction doesn't currently affect undo correctness for
         // the BSD coverage we target. Default to Regular.
         K::Regular
+    }
+}
+
+/// Cap_enter-safe sibling of [`file_kind_for`]. Resolves the child
+/// `name` relative to `dir_fd` via `fstatat(2)` — fd-relative ops
+/// work under capsicum, unlike absolute-path `stat`. W03.B
+/// surfaced this: under default-on cap_enter, `file_kind_for` for
+/// freshly-created dst paths returned `Regular` (the `Err` arm),
+/// which caused S29.2 to treat new dirs as files and miss every
+/// `cp -r` event under dst.
+fn file_kind_at(dir_fd: RawFd, name: &std::ffi::OsStr) -> shit_proto::FileKindWire {
+    use shit_proto::FileKindWire as K;
+    let name_c = match std::ffi::CString::new(name.as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return K::Regular,
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: dir_fd is alive per caller (held in TrackedSubtree);
+    // name_c is NUL-terminated; st is writable.
+    let rc = unsafe { libc::fstatat(dir_fd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return K::Regular;
+    }
+    match (st.st_mode as libc::mode_t) & libc::S_IFMT {
+        libc::S_IFDIR => K::Directory,
+        libc::S_IFLNK => K::Symlink,
+        _ => K::Regular,
     }
 }
 
