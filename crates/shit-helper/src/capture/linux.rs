@@ -109,6 +109,20 @@ struct WatchState {
     /// Populated lazily: `handle_lsm_mkdir` also inserts the new dir's
     /// (dev, inode) → path so subsequent nested events resolve.
     dir_paths: BTreeMap<(u64, u64), PathBuf>,
+    /// AR01.1.fix-rename-target-preimage — reverse of `dir_paths` +
+    /// regular-file paths: `absolute_path → (dev, inode)`. Populated
+    /// by `pre_open_tree` for every opened file and by
+    /// `handle_lsm_create` for files born mid-session.
+    ///
+    /// The `inode_rename` LSM hook can clobber an existing destination
+    /// (think `mv old new` where `new` already exists; or git's
+    /// atomic `.git/index.lock → .git/index` swap). At handler time
+    /// the rename has already completed, so stat'ing the destination
+    /// path returns the NEW inode -- the OLD one is gone. To capture
+    /// the about-to-be-clobbered content as a `FilePreImage`, we look
+    /// up the destination path here PRE-rename-handler-update and find
+    /// the OLD inode, then read its pre-snapshot.
+    path_to_inode: BTreeMap<PathBuf, (u64, u64)>,
 }
 
 /// AR01.1.fix-pre-open-tree-recursion — bounded recursion depth for
@@ -941,6 +955,9 @@ impl LinuxCaptureRuntime {
         // (dev, inode) will hit the table → race_won → pre-image
         // capture succeeds even if the file was modified mid-session.
         ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+        // AR01.1.fix-rename-target-preimage — reverse-index so a
+        // later rename-over-this-path resolves the (dev, inode).
+        ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
 
         tracing::info!(
             session = %ev.command.session,
@@ -1098,6 +1115,70 @@ impl LinuxCaptureRuntime {
             return;
         };
 
+        // AR01.1.fix-rename-target-preimage — if the rename is going
+        // to clobber an existing file (e.g. git's atomic
+        // `.git/index.lock → .git/index`), the OLD destination's
+        // content is destroyed in the swap. Look up the destination
+        // path in our reverse index BEFORE the rename completes (the
+        // lookup uses path_to_inode populated at pre_open_tree time
+        // and on inode_create), find the OLD (dev, inode), and emit a
+        // CapturedPreImage so the daemon journals a FilePreImage +
+        // paired Unlink. Without this step the rename-over loses the
+        // OLD destination's pre-image silently and undo can't restore
+        // the prior content.
+        //
+        // No-clobber renames (creating a fresh name) miss in
+        // path_to_inode; that's the correct behavior -- nothing to
+        // capture.
+        let to_path_buf = PathBuf::from(&to_path);
+        if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path_buf)
+            && let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned()
+        {
+            let bytes = snap.bytes;
+            let meta = snap.meta;
+            let blob_hash = blake3_of(&bytes);
+            match write_to_staging(&self.staging_dir, &bytes) {
+                Ok(staging_fd) => {
+                    let resp = HelperResponse::CapturedPreImage {
+                        session: ev.command.session,
+                        seq: ev.command.seq,
+                        dev: old_dev,
+                        inode: old_inode,
+                        path: Some(to_path.clone()),
+                        blob_hash,
+                        stored_bytes: bytes.len() as u64,
+                        post_content_hash: None,
+                        mode: meta.mode,
+                        uid: meta.uid,
+                        gid: meta.gid,
+                        mtime_unix_nanos: meta.mtime_unix_nanos,
+                        is_delete: true,
+                        fd_sent_via_scm: true,
+                    };
+                    if let Err(e) = self
+                        .conn
+                        .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+                    {
+                        tracing::warn!(error = %e, "lsm rename target-pre-image send_response_with_fd failed");
+                    } else {
+                        tracing::info!(
+                            session = %ev.command.session,
+                            seq = ev.command.seq,
+                            pid = ev.pid,
+                            old_dev,
+                            old_inode,
+                            bytes = bytes.len(),
+                            path = %to_path,
+                            "lsm-rename target pre-image CapturedPreImage sent"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "lsm rename target staging write failed");
+                }
+            }
+        }
+
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
             seq: ev.command.seq,
@@ -1204,6 +1285,9 @@ fn pre_open_recurse(
             );
         }
         ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+        // AR01.1.fix-rename-target-preimage — reverse-index so a
+        // later rename-over-this-path can find the OLD inode.
+        ws.path_to_inode.insert(path.clone(), (dev, inode));
         *opened += 1;
     }
 }
@@ -1839,6 +1923,22 @@ mod tests {
             ws.dir_paths.get(&(xx_md.dev(), xx_md.ino())),
             Some(&xx),
             "deepest dir should be registered with its full path"
+        );
+
+        // AR01.1.fix-rename-target-preimage — every regular file must
+        // be in path_to_inode so a future rename-over-this-path
+        // resolves the OLD (dev, inode).
+        assert_eq!(
+            ws.path_to_inode.len(),
+            4,
+            "every opened file should appear in path_to_inode (4 expected), got {:?}",
+            ws.path_to_inode
+        );
+        let index_md = std::fs::metadata(git.join("index")).unwrap();
+        assert_eq!(
+            ws.path_to_inode.get(&git.join("index")),
+            Some(&(index_md.dev(), index_md.ino())),
+            ".git/index should be reverse-indexed for rename-target lookup"
         );
     }
 
