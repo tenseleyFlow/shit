@@ -268,6 +268,68 @@ pub enum HelperResponse {
         /// buffer to extract the fd.
         fd_sent_via_scm: bool,
     },
+    /// W02.B.live-baseline — one regular file's content snapshot,
+    /// captured at session-open by the helper-side baseline walker
+    /// BEFORE any user command runs in this cwd.
+    ///
+    /// Same on-wire shape as `CapturedPreImage` (blob delivered
+    /// out-of-band via SCM_RIGHTS staging fd; this message carries
+    /// the metadata + integrity hash). The semantic difference is
+    /// daemon-side: instead of inserting a `FilePreImage` event into
+    /// the journal immediately, the daemon stores this in the
+    /// per-cwd `LiveBaseline` cache. On the first subsequent
+    /// `NOTE_WRITE` for this inode within a command, the daemon
+    /// promotes the cached blob into a real `FilePreImage` event
+    /// tied to that command's `CommandId`.
+    ///
+    /// Not tied to a `seq` — baselines pre-date any command. The
+    /// `session` field is the session that triggered the walker;
+    /// the `cwd` field is the path the LiveBaseline cache keys on.
+    BaselineCaptured {
+        session: Uuid,
+        /// Absolute cwd whose baseline this entry belongs to. Daemon
+        /// uses this to find the LiveBaseline cache slot.
+        cwd: String,
+        /// Inode identity at baseline time. Becomes the cache key.
+        dev: u64,
+        inode: u64,
+        /// Absolute path of the file at baseline time.
+        path: String,
+        /// blake3 hash claimed for the staged content. Daemon
+        /// recomputes on ingest and refuses on mismatch — same
+        /// integrity-check contract as `CapturedPreImage`.
+        blob_hash: [u8; 32],
+        /// Bytes the helper wrote to the staging fd.
+        stored_bytes: u64,
+        /// Metadata at baseline time.
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime_unix_nanos: i128,
+        /// Always `true` when this variant is sent — the staging fd
+        /// is attached via SCM_RIGHTS. Mirrors `CapturedPreImage`'s
+        /// flag for decoder symmetry.
+        fd_sent_via_scm: bool,
+    },
+    /// W02.B.live-baseline — helper has finished walking the watched
+    /// cwd's subtree. Daemon flips the `LiveBaseline` cache entry
+    /// for `cwd` from `Pending` to `Ready`. Pre-image promotions
+    /// arriving after this are guaranteed to find their inode in
+    /// the cache (if it existed at session-open).
+    BaselineWalkComplete {
+        session: Uuid,
+        cwd: String,
+        /// Number of `BaselineCaptured` messages emitted during
+        /// the walk. Daemon can sanity-check against its received
+        /// count.
+        file_count: u64,
+        /// `true` when the walker hit a recoverable error mid-walk
+        /// (permission, size cap, depth limit short-circuit). The
+        /// baseline is still usable for the files it did capture;
+        /// promotions for un-baselined inodes fall through to
+        /// layer 3.
+        partial: bool,
+    },
     /// S29.1 — tree-mutation observation (mkdir/rmdir/rename/symlink/link).
     /// One-way: no blob attached; the daemon converts to
     /// `CaptureEventKind::TreeOp(...)` and journals.

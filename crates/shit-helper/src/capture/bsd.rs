@@ -225,6 +225,32 @@ impl PumpState {
                 meta_baselines.insert(raw, m);
             }
         }
+        // W02.B.live-baseline — walk the just-registered subtree
+        // and ship a BaselineCaptured for every regular file. This
+        // is the load-bearing piece that lets `shit undo` reverse
+        // in-place writes on BSD where NOTE_WRITE alone fires too
+        // late to capture pre-content.
+        //
+        // Default-on after the W02.B regression sweep landed 12/12
+        // BSD smokes green. Opt out with `SHIT_BASELINE_PREEXEC=0`
+        // for diagnostics / emergency rollback.
+        if std::env::var("SHIT_BASELINE_PREEXEC").as_deref() != Ok("0") {
+            let (n, partial) = baseline_walk_and_emit(
+                &subtree,
+                &self.conn,
+                self.staging_dir_fd.as_raw_fd(),
+                command.session,
+                root_path,
+            );
+            tracing::info!(
+                %command.session,
+                seq = command.seq,
+                baseline_files = n,
+                baseline_partial = partial,
+                "live-baseline walk emitted",
+            );
+        }
+
         self.watches.insert(
             command,
             WatchState {
@@ -687,6 +713,112 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
     })
+}
+
+/// W02.B.live-baseline step 2b — walk the tracked subtree, ship a
+/// BaselineCaptured message for every regular file, then a
+/// BaselineWalkComplete to tell the daemon the cwd's cache is ready.
+///
+/// Reuses the fds the kqueue walker already opened (via
+/// [`TrackedSubtree::iter_entries`]) — we don't re-open files, just
+/// pread their content through the existing fd. Each regular file
+/// gets staged into the SCM_RIGHTS staging dir, blake3-hashed, and
+/// shipped to the daemon for ingestion into the LiveBaseline cache.
+///
+/// Returns `(file_count, partial)`. `partial == true` means at least
+/// one regular file in the subtree was skipped (read error, stat
+/// failure, staging error, send error). The daemon's promote path
+/// falls back to layer 3 (post-write NOTE_WRITE read, S24.4) for
+/// inodes the baseline missed.
+fn baseline_walk_and_emit(
+    subtree: &TrackedSubtree,
+    conn: &Conn,
+    staging_dir_fd: RawFd,
+    session: uuid::Uuid,
+    cwd_path: &Path,
+) -> (u64, bool) {
+    let mut count = 0u64;
+    let mut partial = false;
+
+    for (fd, path) in subtree.iter_entries() {
+        let Some((dev, inode, kind)) = fstat_dev_inode_kind(fd) else {
+            partial = true;
+            continue;
+        };
+        if kind != FileType::Regular {
+            // Dirs are watched but not baselined — their content is
+            // their entry list, captured separately via S29.1 diff.
+            continue;
+        }
+
+        let bytes = match read_pre_image(fd) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    fd,
+                    error = %e,
+                    path = %path.display(),
+                    "baseline: read_pre_image failed; skipping"
+                );
+                partial = true;
+                continue;
+            }
+        };
+        let meta = match fstat_meta(fd) {
+            Some(m) => m,
+            None => {
+                tracing::debug!(fd, "baseline: fstat_meta failed; skipping");
+                partial = true;
+                continue;
+            }
+        };
+
+        let staging_fd = match write_to_staging(staging_dir_fd, &bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(error = %e, "baseline: write_to_staging failed; skipping");
+                partial = true;
+                continue;
+            }
+        };
+        let blob_hash = blake3_of(&bytes);
+
+        let resp = HelperResponse::BaselineCaptured {
+            session,
+            cwd: path_to_string(cwd_path),
+            dev,
+            inode,
+            path: path_to_string(path),
+            blob_hash,
+            stored_bytes: bytes.len() as u64,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+            mtime_unix_nanos: meta.mtime_unix_nanos,
+            fd_sent_via_scm: true,
+        };
+
+        if let Err(e) = conn.send_response_with_fd(&resp, staging_fd.as_raw_fd()) {
+            tracing::warn!(error = %e, "baseline: send_response_with_fd failed");
+            partial = true;
+            continue;
+        }
+        count += 1;
+    }
+
+    // Walker done. Notify the daemon so it flips this cwd's
+    // BaselineCacheEntry from Pending → Ready.
+    let complete = HelperResponse::BaselineWalkComplete {
+        session,
+        cwd: path_to_string(cwd_path),
+        file_count: count,
+        partial,
+    };
+    if let Err(e) = conn.send_response(&complete) {
+        tracing::warn!(error = %e, "baseline: BaselineWalkComplete send failed");
+    }
+
+    (count, partial)
 }
 
 /// B05 Phase C: write `bytes` to a freshly-named file inside the

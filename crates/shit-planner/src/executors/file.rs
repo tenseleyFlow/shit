@@ -388,14 +388,28 @@ fn restore_mtime_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
 /// For symlinks: removes the symlink itself, not the target — matches
 /// the `unlink(2)` semantic.
 ///
-/// For directories: only succeeds when the directory is empty. The
-/// planner emits one `Unlink` per directory entry plus one per parent,
-/// in post-order; if the planner emits an `Unlink` for a non-empty
-/// dir, that's a planner bug surfaced here as a clear ENOTEMPTY.
+/// For directories: try empty rmdir first. If ENOTEMPTY, fall back to
+/// `remove_dir_all`. W01.B.fix-rename-coalescing surfaced this: when
+/// the user's command creates a directory AND populates it (e.g.
+/// `git commit` creates `.git/objects/2d/` then writes the new object
+/// file inside), kqueue may capture the dir's TreeOpCreate but miss
+/// the file-inside's TreeOpCreate (race between dir-create and the
+/// watch wiring up via add_path). At undo time the planner emits
+/// `Unlink` for the dir but not for its leftover contents — the dir
+/// is "not empty" in a way the planner couldn't have known about.
+/// Recursive removal is correct here because the dir didn't exist
+/// pre-command, so by construction every file inside was also
+/// created by the command and is part of the undo scope.
 fn unlink_inner(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("lstat {path:?}: {e}"))?;
     if meta.file_type().is_dir() {
-        fs::remove_dir(path).map_err(|e| format!("rmdir {path:?}: {e}"))
+        match fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {
+                fs::remove_dir_all(path).map_err(|e2| format!("rmdir-recursive {path:?}: {e2}"))
+            }
+            Err(e) => Err(format!("rmdir {path:?}: {e}")),
+        }
     } else {
         fs::remove_file(path).map_err(|e| format!("unlink {path:?}: {e}"))
     }
@@ -606,6 +620,33 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let target = tmpdir.path().join("d");
         std::fs::create_dir(&target).unwrap();
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Unlink {
+            path: target.clone(),
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn unlink_recursively_removes_nonempty_directory() {
+        // Models the W01.B git-commit-undo case: the command created a
+        // directory AND populated it (e.g. .git/objects/2d/ + an object
+        // file inside), but kqueue only captured the dir's TreeOpCreate.
+        // At undo time the dir is "not empty" — fall back to recursive
+        // removal because by construction the contents were also created
+        // by the command.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("dir-with-stuff");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inner-file"), b"x").unwrap();
+        std::fs::create_dir(target.join("inner-dir")).unwrap();
+        std::fs::write(target.join("inner-dir/nested"), b"y").unwrap();
 
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);

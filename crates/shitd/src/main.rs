@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 
 mod active_commands;
 mod ancestry;
+mod baseline;
 mod config;
 mod crash;
 mod ctl;
@@ -170,6 +171,12 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let blob_store = Arc::new(shit_store::BlobStore::open(&blobs_path)?);
     tracing::info!(path = %blobs_path.display(), "blob store opened");
 
+    // W02.B.live-baseline — per-cwd content snapshot held in memory.
+    // Populated by the helper's BaselineCaptured stream at session
+    // open; consulted by the CapturedPreImage ingest path to swap
+    // post-write content for the genuine pre-content captured here.
+    let live_baseline = Arc::new(baseline::LiveBaseline::new());
+
     // S24.A — spawn shit-helper and start its dispatch loop. Best-
     // effort: if the helper binary isn't discoverable or the
     // handshake fails, the daemon continues in helper-less mode
@@ -214,6 +221,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let dispatch_link = Arc::clone(&link);
                         let dispatch_index = Arc::clone(&index);
                         let dispatch_blob_store = Arc::clone(&blob_store);
+                        let dispatch_baseline = Arc::clone(&live_baseline);
                         let dispatch_shutdown = Arc::clone(&shutdown);
                         let dispatch_watch_ready = Arc::clone(&watch_ready);
                         let handle = tokio::spawn(async move {
@@ -221,6 +229,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                                 dispatch_link,
                                 dispatch_index,
                                 dispatch_blob_store,
+                                dispatch_baseline,
                                 dispatch_shutdown,
                                 dispatch_watch_ready,
                             )

@@ -10,15 +10,24 @@ use nix::sys::socket::{
     UnixAddr, cmsg_space, recv, recvmsg, send, sendmsg, shutdown, socket,
 };
 
-/// Transport choice. macOS XNU does not support `AF_UNIX + SOCK_SEQPACKET`
-/// (only Linux and modern BSD do). We use STREAM everywhere; our
-/// length-prefixed framing in `shit_proto::frame` provides message
-/// boundaries portably, and `SCM_RIGHTS` works on STREAM sockets just
-/// the same. See `.docs/audits/helper-protocol.md` HP-13 for the
-/// rationale tracking.
-#[cfg(target_os = "linux")]
+/// Transport choice. macOS XNU does not support `AF_UNIX + SOCK_SEQPACKET`;
+/// Linux and the BSDs do. The original "STREAM everywhere" choice
+/// (HP-13) was wrong for BSDs: a high-rate burst of `sendmsg`s
+/// coalesces into one daemon-side `recvmsg`, and the per-call
+/// decoder reads only the first frame (lossy). W01 (`git commit
+/// undo`) exposed it. SEQPACKET preserves message boundaries
+/// kernel-side. macOS keeps STREAM and accepts the throughput
+/// limit until S08 adds EndpointSecurity (where the macOS helper
+/// stops needing high-rate captures over the IPC anyway).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
 const HELPER_SOCK_TYPE: SockType = SockType::SeqPacket;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const HELPER_SOCK_TYPE: SockType = SockType::Stream;
 use shit_proto::{
     HelperRequest, HelperResponse, MAX_HELPER_FRAME_SIZE, decode_frame, encode_frame,
@@ -186,9 +195,10 @@ impl Conn {
         }
         buf.truncate(n);
         // STREAM transports may deliver the cmsg with a short read;
-        // SEQPACKET delivers the whole packet atomically. For STREAM,
-        // parse the length prefix and complete the read if needed.
-        #[cfg(not(target_os = "linux"))]
+        // SEQPACKET delivers the whole packet atomically. For STREAM
+        // (macOS only after W01.B.fix-framing), parse the length
+        // prefix and complete the read if needed.
+        #[cfg(target_os = "macos")]
         {
             if buf.len() >= 4 {
                 let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -215,14 +225,24 @@ impl Conn {
 
     fn recv_frame(&self) -> Result<Vec<u8>, ConnError> {
         // Transport-aware:
-        //   - SEQPACKET (Linux): one `recv()` returns the full packet
-        //     atomically. Issuing a short recv would TRUNCATE the rest
-        //     of the kernel packet, so we must read into a full-size
-        //     buffer up-front.
-        //   - STREAM (macOS/BSD): byte stream; we read the 4-byte
-        //     length header first, then the declared body. Partial
-        //     reads OK.
-        #[cfg(target_os = "linux")]
+        //   - SEQPACKET (Linux + all BSDs): one `recv()` returns the
+        //     full packet atomically. Issuing a short recv would
+        //     TRUNCATE the rest of the kernel packet, so we must
+        //     read into a full-size buffer up-front.
+        //   - STREAM (macOS): byte stream; we read the 4-byte length
+        //     header first, then the declared body. Partial reads OK.
+        // The cfg gates MUST mirror the HELPER_SOCK_TYPE selection
+        // exactly — W01.B.fix-framing earlier mis-gated this on
+        // `target_os = "linux"` while the socket type was on
+        // `target_os = "macos"`, which deadlocked FreeBSD handshakes
+        // (SEQPACKET socket + STREAM reader → second recv hangs).
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
         {
             let mut buf = vec![0u8; MAX_HELPER_FRAME_SIZE];
             let n = recv(
@@ -237,7 +257,7 @@ impl Conn {
             Ok(buf)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             let mut header = [0u8; 4];
             self.recv_exact(&mut header)?;
@@ -255,7 +275,7 @@ impl Conn {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     fn recv_exact(&self, buf: &mut [u8]) -> Result<(), ConnError> {
         let mut got = 0;
         while got < buf.len() {
