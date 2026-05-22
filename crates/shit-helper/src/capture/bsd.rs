@@ -225,17 +225,16 @@ impl PumpState {
                 meta_baselines.insert(raw, m);
             }
         }
-        // W02.B.live-baseline step 2b — if the live-baseline feature
-        // is enabled, walk the just-registered subtree and ship a
-        // BaselineCaptured for every regular file. This is the
-        // load-bearing piece that lets `shit undo` reverse in-place
-        // writes on BSD where NOTE_WRITE alone fires too late to
-        // capture pre-content.
+        // W02.B.live-baseline — walk the just-registered subtree
+        // and ship a BaselineCaptured for every regular file. This
+        // is the load-bearing piece that lets `shit undo` reverse
+        // in-place writes on BSD where NOTE_WRITE alone fires too
+        // late to capture pre-content.
         //
-        // Behind `SHIT_BASELINE_PREEXEC=1` for now; gets promoted to
-        // default-on when the daemon-side ingest + planner promote
-        // path lands (steps 3 + 4).
-        if std::env::var("SHIT_BASELINE_PREEXEC").as_deref() == Ok("1") {
+        // Default-on after the W02.B regression sweep landed 12/12
+        // BSD smokes green. Opt out with `SHIT_BASELINE_PREEXEC=0`
+        // for diagnostics / emergency rollback.
+        if std::env::var("SHIT_BASELINE_PREEXEC").as_deref() != Ok("0") {
             let (n, partial) = baseline_walk_and_emit(
                 &subtree,
                 &self.conn,
