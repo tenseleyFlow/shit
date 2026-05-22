@@ -73,6 +73,18 @@ smoke_start_shitd() {
     if [ ! -x "${shitd}" ]; then
         smoke_fail "shitd binary missing at ${shitd}"
     fi
+    # Cross-smoke hygiene: a previous smoke can leak a `shit-helper`
+    # subprocess (visible in this smoke's safety-net's pgrep dump as
+    # an "any shit-* processes anywhere" entry). When a stale helper
+    # is alive its BPF LSM programs are still attached to the kernel
+    # hooks; events from THIS smoke's mutation hit BOTH the orphan's
+    # ringbufs (drained by no live reader) and THIS smoke's helper's
+    # ringbufs. Some events apparently get routed to the orphan and
+    # dropped, producing intermittent "timed out waiting for event"
+    # failures on the same commit across reruns. Sweep them here.
+    pkill -f 'target/release/shit-helper' 2>/dev/null || true
+    # Brief settle for the kernel to detach the orphan's BPF links.
+    sleep 0.1
     smoke_log "starting shitd (state=${XDG_STATE_HOME}/shit)"
     # Pin RUST_LOG=debug for the daemon so per-tier handlers' debug
     # breadcrumbs (`net-pre stashed`, `svc-pre stashed`, etc.) land
