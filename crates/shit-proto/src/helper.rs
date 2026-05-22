@@ -310,6 +310,7 @@ pub enum HelperResponse {
     ///     tier, fanotify mark installed on the fanotify-perm tier),
     ///   - the watch root has been snapshotted into per-CommandId
     ///     pre-image state (Linux pre_open_tree / BSD register_subtree).
+    ///
     /// The daemon uses this as the "capture is genuinely live"
     /// signal to release any shell-hook PreExec callers waiting on
     /// `CtlRequest::WaitWatchReady`. Without this, the daemon would
