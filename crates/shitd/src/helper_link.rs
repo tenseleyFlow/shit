@@ -497,6 +497,28 @@ fn dispatch_response(
             fd_sent_via_scm: _,
         } => {
             let Some(staging) = fd else {
+                // AR01.1.fix-marker-only — when the helper lost the
+                // race to read pre-image bytes (typical for atomic
+                // unlinks like .git/index.lock), it emits a marker
+                // CapturedPreImage with stored_bytes=0, is_delete=true,
+                // and no SCM_RIGHTS fd. The intended semantics (per
+                // capture/linux.rs::handle_lsm_unlink doc): journal the
+                // TreeOp::Unlink only -- the planner falls back to any
+                // prior FilePreImage for the same (dev, inode), and if
+                // none exists treats the shape as a transient lock-file
+                // (W01.B classifier).
+                if stored_bytes == 0 && is_delete {
+                    let command = CommandId { session, seq };
+                    let inode_ref = InodeRef::new(dev, inode);
+                    let path_buf: PathBuf = path.unwrap_or_default().into();
+                    let ts = crate::server::next_ts();
+                    if let Err(e) =
+                        journal_unlink_idempotent(index, command, ts, inode_ref, path_buf)
+                    {
+                        tracing::error!(error = %e, %session, seq, "marker-only Unlink journal failed");
+                    }
+                    return;
+                }
                 tracing::error!(%session, seq, dev, inode, "CapturedPreImage missing SCM_RIGHTS fd");
                 return;
             };
@@ -1186,6 +1208,69 @@ mod tests_dispatch {
             .any(|e| matches!(e.kind, CaptureEventKind::TreeOp(TreeOp::Unlink { .. })));
         assert!(has_pre_image, "missing FilePreImage event: {events:#?}");
         assert!(has_unlink, "missing paired Unlink event: {events:#?}");
+    }
+
+    /// AR01.1.fix-marker-only — when the helper sends `CapturedPreImage`
+    /// with `stored_bytes=0`, `is_delete=true`, and no SCM_RIGHTS fd
+    /// (the unlink-race-lost path used for atomic lock files like
+    /// `.git/index.lock`), the daemon must journal a `TreeOp::Unlink`
+    /// only -- NO `FilePreImage`. Pre-AR01.1 the daemon rejected these
+    /// outright with `CapturedPreImage missing SCM_RIGHTS fd` and the
+    /// unlink never reached the journal, leaving the planner blind to
+    /// the delete.
+    #[test]
+    fn marker_only_unlink_journals_just_treeop() {
+        use shit_planner::{CommandRecord, TimePoint};
+        let store_dir = tempfile::tempdir().unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+
+        let session = Uuid::nil();
+        index
+            .put_session(
+                session,
+                "bash",
+                1234,
+                Some("/dev/null"),
+                TimePoint::new(0, 0),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command: CommandId { session, seq: 1 },
+                cmd_string: Some("git commit".into()),
+                cwd: "/tmp".into(),
+                pid: 5678,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(1, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+
+        let command = CommandId { session, seq: 1 };
+        let inode_ref = InodeRef::new(64, 999);
+        let path_buf: PathBuf = "/tmp/.git/index.lock".into();
+        let ts = crate::server::next_ts();
+        journal_unlink_idempotent(&index, command, ts, inode_ref, path_buf)
+            .expect("marker-only journal");
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "expected 1 Unlink, got {events:#?}");
+        assert!(
+            matches!(
+                events[0].kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink { .. })
+            ),
+            "expected TreeOp::Unlink, got {:#?}",
+            events[0].kind
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, CaptureEventKind::FilePreImage { .. })),
+            "marker-only path must not journal FilePreImage: {events:#?}"
+        );
     }
 
     #[test]
