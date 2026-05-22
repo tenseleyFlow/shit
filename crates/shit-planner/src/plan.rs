@@ -183,11 +183,24 @@ fn classify_replace_paths(
 
 /// Path the event targets (for the event-level skip in the transient
 /// case). Returns `None` for events with no single path (env diffs,
-/// tier ops). The caller's only use is "is this path in the transient
-/// set?" — non-path events fall through naturally.
+/// tier ops, Rename which has two paths, Link which targets an inode
+/// not a path). The caller's only use is "is this path in the
+/// transient set?" — non-path events fall through naturally.
+///
+/// **MUST stay aligned with `emit_for_event`'s match arms.** If an
+/// event kind emits an inverse that targets a path, the skip pass
+/// must be able to see that path here — otherwise inverses leak
+/// through for transient paths and the orchestrator hits
+/// ConflictMissing at undo. W02.B surfaced this for MetadataChange:
+/// vim's swap file gets created + a stat captured + unlinked all
+/// in one command, the classifier correctly flagged it transient,
+/// but the skip pass missed the MetadataChange event so a
+/// RestoreMetadata inverse leaked through and tripped ConflictMissing
+/// because the swap path is gone at undo time.
 fn event_path(ev: &CaptureEvent) -> Option<&PathBuf> {
     match &ev.kind {
         CaptureEventKind::FilePreImage { path, .. } => Some(path),
+        CaptureEventKind::MetadataChange { path, .. } => Some(path),
         CaptureEventKind::TreeOp(TreeOp::Create { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. }) => Some(path),
