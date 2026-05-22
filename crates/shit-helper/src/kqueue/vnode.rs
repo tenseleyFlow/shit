@@ -124,6 +124,21 @@ impl TrackedSubtree {
             .find(|e| e.fd.as_raw_fd() == fd)
             .map(|e| e.path.as_path())
     }
+
+    /// Iterate `(fd, path)` for every tracked entry. Read-only;
+    /// fds are borrowed (not duplicated) — caller must finish using
+    /// them before the subtree drops.
+    ///
+    /// Used by [`crate::capture::bsd::baseline`] to read content
+    /// from every regular file in the watched subtree at PreExec
+    /// time (W02.B.live-baseline). The fds are already open with
+    /// `O_RDONLY` from `register_subtree`'s walk, so the baseline
+    /// reader gets free re-use of the kqueue walker's work.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (RawFd, &Path)> {
+        self.entries
+            .iter()
+            .map(|e| (e.fd.as_raw_fd(), e.path.as_path()))
+    }
 }
 
 /// Walk `root` to `depth_limit`, open every directory and regular
