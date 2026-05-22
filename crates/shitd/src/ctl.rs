@@ -31,6 +31,12 @@ pub struct CtlState {
     pub proc_stash: Arc<ProcPreStash>,
     pub db_stash: Arc<crate::db_track::DbPreStash>,
     pub active: Arc<crate::active_commands::ActiveCommands>,
+    /// AR00.5 / task #105 — per-CommandId readiness rendezvous. Set
+    /// to `None` when no helper is connected (degraded mode); the
+    /// WaitWatchReady handler returns ready=false / "no helper"
+    /// immediately so the shell hook doesn't block on a non-existent
+    /// signal.
+    pub watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -99,6 +105,7 @@ async fn handle_client(
         proc_stash,
         db_stash,
         active,
+        watch_ready,
     } = state;
     let mut buf = vec![0u8; CTL_BUF];
     let n = stream.read(&mut buf).await?;
@@ -139,6 +146,11 @@ async fn handle_client(
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => handle_undo(req, &index, &blob_store),
+        CtlRequest::WaitWatchReady {
+            session,
+            command_seq,
+            timeout_ms,
+        } => handle_wait_watch_ready(session, command_seq, timeout_ms, watch_ready.as_deref()).await,
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -693,6 +705,56 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
                 err: format!("no executor wired for tier {:?}", op.tier()),
             }
         }
+    }
+}
+
+/// AR00.5 / task #105 — handler for `CtlRequest::WaitWatchReady`.
+///
+/// Blocks the calling ctl client (typically `shit hook-send pre-exec`
+/// from a shell PreExec hook) until the helper has signaled
+/// `HelperResponse::WatchTreeReady` for the specified (session,
+/// command_seq) -- which means kernel-tier capture is genuinely set
+/// up and the user's command can safely run without racing the
+/// helper's watch_tree handling.
+///
+/// Returns:
+/// - `WatchReady { ready: true, reason: None }` on success.
+/// - `WatchReady { ready: false, reason: Some("no helper") }` when
+///   no helper is connected (degraded mode); returned immediately
+///   so we don't punish the shell for a degraded daemon.
+/// - `WatchReady { ready: false, reason: Some("timeout") }` when the
+///   caller's `timeout_ms` expires before readiness arrives.
+async fn handle_wait_watch_ready(
+    session: uuid::Uuid,
+    command_seq: u64,
+    timeout_ms: u32,
+    watch_ready: Option<&crate::watch_ready::WatchReadyMap>,
+) -> CtlResponse {
+    let Some(map) = watch_ready else {
+        return CtlResponse::WatchReady {
+            ready: false,
+            reason: Some("no helper".to_string()),
+        };
+    };
+    let cmd = shit_planner::events::CommandId {
+        session,
+        seq: command_seq,
+    };
+    let rx = map.await_ready(cmd);
+    let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(())) => CtlResponse::WatchReady {
+            ready: true,
+            reason: None,
+        },
+        Ok(Err(_canceled)) => CtlResponse::WatchReady {
+            ready: false,
+            reason: Some("canceled".to_string()),
+        },
+        Err(_) => CtlResponse::WatchReady {
+            ready: false,
+            reason: Some("timeout".to_string()),
+        },
     }
 }
 

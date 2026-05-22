@@ -406,6 +406,7 @@ pub async fn dispatch_loop(
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
     shutdown: Arc<tokio::sync::Notify>,
+    watch_ready: Arc<crate::watch_ready::WatchReadyMap>,
 ) -> Result<(), HelperLinkError> {
     tracing::info!("helper dispatch loop started");
     loop {
@@ -417,7 +418,7 @@ pub async fn dispatch_loop(
             r = recv_task => {
                 match r {
                     Ok(Ok((resp, fd))) => {
-                        dispatch_response(resp, fd, &index, &blob_store);
+                        dispatch_response(resp, fd, &index, &blob_store, &watch_ready);
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
                         tracing::warn!("helper exited; dispatch loop terminating");
@@ -446,6 +447,7 @@ fn dispatch_response(
     fd: Option<OwnedFd>,
     index: &Index,
     blob_store: &BlobStore,
+    watch_ready: &crate::watch_ready::WatchReadyMap,
 ) {
     match resp {
         HelperResponse::CapturedPreImage {
@@ -530,10 +532,25 @@ fn dispatch_response(
                 );
             }
         }
+        HelperResponse::WatchTreeReady {
+            session,
+            command_seq,
+        } => {
+            // AR00.5 / task #105 — release any shell hook waiting on
+            // CtlRequest::WaitWatchReady for this command. Drains
+            // pending oneshots and marks the entry Ready so late
+            // waiters complete fast.
+            let cmd = CommandId {
+                session,
+                seq: command_seq,
+            };
+            watch_ready.mark_ready(cmd);
+            tracing::debug!(%session, command_seq, "WatchTreeReady routed");
+        }
         other => {
             tracing::trace!(
                 ?other,
-                "unhandled helper response (S24.A handles CapturedPreImage; S29.1 handles TreeMutation)"
+                "unhandled helper response (S24.A handles CapturedPreImage; S29.1 handles TreeMutation; AR00.5 handles WatchTreeReady)"
             );
         }
     }

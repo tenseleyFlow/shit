@@ -25,6 +25,7 @@ mod stats;
 mod svc_track;
 mod telemetry;
 mod tracing_ring_layer;
+mod watch_ready;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -174,6 +175,15 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // handshake fails, the daemon continues in helper-less mode
     // (shell-hook journaling still works; capture-tier events just
     // won't arrive). Off entirely when `SHIT_HELPER_DISABLED=1`.
+    // AR00.5 / task #105 — per-CommandId readiness rendezvous shared
+    // between the helper dispatch loop (writer) and the ctl
+    // WaitWatchReady handler (reader). Lives even in degraded mode
+    // (then no helper ever marks ready), but we only thread it into
+    // CtlState when a helper is actually connected -- the ctl
+    // handler returns ready=false / "no helper" early without
+    // touching the map in that case.
+    let watch_ready = Arc::new(watch_ready::WatchReadyMap::new());
+
     let (helper_link_arc, helper_dispatch_handle): (
         Option<Arc<helper_link::HelperLink>>,
         Option<tokio::task::JoinHandle<()>>,
@@ -205,12 +215,14 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let dispatch_index = Arc::clone(&index);
                         let dispatch_blob_store = Arc::clone(&blob_store);
                         let dispatch_shutdown = Arc::clone(&shutdown);
+                        let dispatch_watch_ready = Arc::clone(&watch_ready);
                         let handle = tokio::spawn(async move {
                             if let Err(e) = helper_link::dispatch_loop(
                                 dispatch_link,
                                 dispatch_index,
                                 dispatch_blob_store,
                                 dispatch_shutdown,
+                                dispatch_watch_ready,
                             )
                             .await
                             {
@@ -343,6 +355,11 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             proc_stash: Arc::clone(&proc_stash),
             db_stash: Arc::clone(&db_stash),
             active: Arc::clone(&active),
+            // Task #105 — handler only meaningful when a helper is
+            // wired. Pass the map only in that case so the ctl
+            // handler can short-circuit to "no helper" when we're
+            // in degraded mode.
+            watch_ready: helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready)),
         };
         tokio::spawn(async move {
             if let Err(e) = ctl::serve(&cfg, ctl_state).await {
@@ -367,6 +384,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let env_stash_for_server = Arc::clone(&env_stash);
     let active_for_server = Arc::clone(&active);
     let helper_link_for_server = helper_link_arc.clone();
+    // Task #105 — same pattern as ctl_state: only thread the
+    // readiness map when there's a helper, so PostExec's forget()
+    // is a no-op in degraded mode.
+    let watch_ready_for_server = helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready));
     let result = tokio::select! {
         r = server::serve(
             cfg,
@@ -375,6 +396,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             env_stash_for_server,
             active_for_server,
             helper_link_for_server,
+            watch_ready_for_server,
         ) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
