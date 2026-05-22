@@ -1031,41 +1031,17 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
     Ok(out)
 }
 
-/// Classify a path's `FileKind` for the wire. Errors fall through to
-/// `Regular` — the planner only acts on `Directory`/`Regular`/`Symlink`
-/// distinctly, and Regular is the safe default fallback.
-///
-/// **Under capsicum capability mode (B05) absolute-path
-/// `symlink_metadata` returns `EPERM`/`ENOTCAPABLE` and the fallback
-/// silently classifies dirs as Regular. Use [`file_kind_at`] when
-/// you have a dir fd — that uses cap_enter-safe `fstatat`.**
-fn file_kind_for(path: &Path) -> shit_proto::FileKindWire {
-    use shit_proto::FileKindWire as K;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return K::Regular;
-    };
-    let ft = meta.file_type();
-    if ft.is_dir() {
-        K::Directory
-    } else if ft.is_symlink() {
-        K::Symlink
-    } else if ft.is_file() {
-        K::Regular
-    } else {
-        // fifo/socket/block/char — std doesn't distinguish; the
-        // distinction doesn't currently affect undo correctness for
-        // the BSD coverage we target. Default to Regular.
-        K::Regular
-    }
-}
-
-/// Cap_enter-safe sibling of [`file_kind_for`]. Resolves the child
-/// `name` relative to `dir_fd` via `fstatat(2)` — fd-relative ops
+/// Classify a directory child's `FileKind` for the wire via
+/// `fstatat(dir_fd, name, AT_SYMLINK_NOFOLLOW)` — fd-relative ops
 /// work under capsicum, unlike absolute-path `stat`. W03.B
-/// surfaced this: under default-on cap_enter, `file_kind_for` for
-/// freshly-created dst paths returned `Regular` (the `Err` arm),
-/// which caused S29.2 to treat new dirs as files and miss every
-/// `cp -r` event under dst.
+/// surfaced this: under default-on cap_enter, an earlier
+/// absolute-path version returned `ENOTCAPABLE`, fell through to
+/// `Regular`, and caused S29.2 to treat new dirs as files (missing
+/// every `cp -r` event under dst).
+///
+/// Errors fall through to `Regular` — the planner only acts on
+/// `Directory`/`Regular`/`Symlink` distinctly, and `Regular` is
+/// the safe default fallback for fifo/socket/block/char/etc.
 fn file_kind_at(dir_fd: RawFd, name: &std::ffi::OsStr) -> shit_proto::FileKindWire {
     use shit_proto::FileKindWire as K;
     let name_c = match std::ffi::CString::new(name.as_bytes()) {
