@@ -120,13 +120,13 @@ struct WatchState {
 const PRE_OPEN_TREE_DEPTH_LIMIT: usize = 8;
 
 /// AR01.1.fix-pre-open-tree-recursion — soft cap on how many files
-/// `pre_open_tree` will open per command. Each open consumes an fd
-/// + an in-memory snapshot (up to MAX_PRE_IMAGE_BYTES each). The
+/// `pre_open_tree` will open per command. Each open consumes one fd
+/// plus an in-memory snapshot (up to MAX_PRE_IMAGE_BYTES each). The
 /// process rlimit defaults to ~1024 fds on most distros; we leave
 /// headroom for the daemon's own sockets, the BPF ringbuf fds, and
-/// staging tmpfiles. If a tree is larger than this, we log + stop
-/// recursing -- the LSM handlers fall back to live-fd capture for
-/// unsnapshotted files, same fail-mode as a too-large pre-image.
+/// staging tmpfiles. If a tree is larger than this, we log a warning
+/// and stop recursing. LSM handlers then fall back to live-fd capture
+/// for unsnapshotted files (same fail-mode as a too-large pre-image).
 const PRE_OPEN_TREE_MAX_FILES: usize = 512;
 
 /// L04.1 — A snapshotted pre-image. Bytes + the stat-meta as it was
