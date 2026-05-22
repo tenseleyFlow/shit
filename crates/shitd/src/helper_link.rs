@@ -426,6 +426,7 @@ pub async fn dispatch_loop(
     link: Arc<HelperLink>,
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
+    live_baseline: Arc<crate::baseline::LiveBaseline>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<(), HelperLinkError> {
     tracing::info!("helper dispatch loop started");
@@ -438,7 +439,7 @@ pub async fn dispatch_loop(
             r = recv_task => {
                 match r {
                     Ok(Ok((resp, fd))) => {
-                        dispatch_response(resp, fd, &index, &blob_store);
+                        dispatch_response(resp, fd, &index, &blob_store, &live_baseline);
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
                         tracing::warn!("helper exited; dispatch loop terminating");
@@ -467,6 +468,7 @@ fn dispatch_response(
     fd: Option<OwnedFd>,
     index: &Index,
     blob_store: &BlobStore,
+    live_baseline: &crate::baseline::LiveBaseline,
 ) {
     match resp {
         HelperResponse::CapturedPreImage {
@@ -489,6 +491,51 @@ fn dispatch_response(
                 tracing::error!(%session, seq, dev, inode, "CapturedPreImage missing SCM_RIGHTS fd");
                 return;
             };
+            // W02.B.live-baseline — if the LiveBaseline cache has a
+            // clean (un-promoted) entry for this (dev, inode), the
+            // baseline blob IS the genuine pre-image. The helper's
+            // staging fd here carries POST-write content (NOTE_WRITE
+            // fires after the write completes on BSD kqueue). We
+            // take a separate code path that journals FilePreImage
+            // with the baseline blob and discards the helper's
+            // staging — the baseline IS the truth.
+            //
+            // Tradeoff: this path loses `post_content_hash` conflict
+            // detection (which the standard path uses to refuse
+            // restoring over the user's post-undo edits). Acceptable
+            // for v1; baseline-promoted events are the correctness
+            // path for in-place writes that the standard path
+            // couldn't capture at all.
+            let inode_ref = shit_planner::InodeRef::new(dev, inode);
+            let cmd = shit_planner::events::CommandId { session, seq };
+            let baseline_blob = live_baseline
+                .get_cwd_for_inode(dev, inode)
+                .and_then(|cache| cache.promote(inode_ref, cmd));
+            if let Some(blob) = baseline_blob {
+                tracing::info!(
+                    %session, seq, dev, inode,
+                    "promoted live-baseline blob into FilePreImage (pre-write content captured at session-open)"
+                );
+                if let Err(e) = handle_baseline_promoted_pre_image(
+                    session,
+                    seq,
+                    dev,
+                    inode,
+                    path,
+                    blob,
+                    stored_bytes,
+                    mode,
+                    uid,
+                    gid,
+                    mtime_unix_nanos,
+                    is_delete,
+                    index,
+                ) {
+                    tracing::error!(error = %e, %session, seq, "baseline-promoted FilePreImage journal failed");
+                }
+                drop(staging); // close helper's post-write fd; we don't need it
+                return;
+            }
             if let Err(e) = handle_captured_pre_image(
                 CapturedPreImageArgs {
                     session,
@@ -510,6 +557,59 @@ fn dispatch_response(
                 blob_store,
             ) {
                 tracing::error!(error = %e, %session, seq, "failed to journal CapturedPreImage");
+            }
+        }
+        HelperResponse::BaselineCaptured {
+            session,
+            cwd,
+            dev,
+            inode,
+            path,
+            blob_hash,
+            stored_bytes,
+            mode: _,
+            uid: _,
+            gid: _,
+            mtime_unix_nanos: _,
+            fd_sent_via_scm: _,
+        } => {
+            let Some(staging) = fd else {
+                tracing::error!(%session, dev, inode, "BaselineCaptured missing SCM_RIGHTS fd");
+                return;
+            };
+            if let Err(e) = handle_baseline_captured(
+                session,
+                std::path::PathBuf::from(&cwd),
+                dev,
+                inode,
+                std::path::PathBuf::from(&path),
+                blob_hash,
+                stored_bytes,
+                staging,
+                blob_store,
+                live_baseline,
+            ) {
+                tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
+            }
+        }
+        HelperResponse::BaselineWalkComplete {
+            session,
+            cwd,
+            file_count,
+            partial,
+        } => {
+            let cwd_path = std::path::PathBuf::from(&cwd);
+            if let Some(cache) = live_baseline.get_cwd(&cwd_path) {
+                cache.mark_ready();
+                tracing::info!(
+                    %session, cwd, file_count, partial, cached = cache.entry_count(),
+                    "live-baseline walk complete; cache ready"
+                );
+            } else {
+                tracing::warn!(
+                    %session, cwd, file_count, partial,
+                    "BaselineWalkComplete for unknown cwd (no entries arrived?)"
+                );
             }
         }
         HelperResponse::TreeMutation {
@@ -816,6 +916,123 @@ fn journal_unlink_idempotent(
     index.put_event(&unlink_ev).map_err(|e| {
         HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
     })?;
+    Ok(())
+}
+
+/// W02.B.live-baseline step 3 — ingest one BaselineCaptured message.
+/// Reads the staging fd, verifies the blob hash, stores in the
+/// canonical blob store, and inserts a `BaselineEntry` into the
+/// per-cwd `LiveBaseline` cache. Does NOT journal anything — the
+/// baseline is a content snapshot, not a command event. Promotion
+/// to a real `FilePreImage` event happens later via
+/// `CapturedPreImage`'s baseline-swap path.
+#[allow(clippy::too_many_arguments)]
+fn handle_baseline_captured(
+    session: uuid::Uuid,
+    cwd: std::path::PathBuf,
+    dev: u64,
+    inode: u64,
+    path: std::path::PathBuf,
+    blob_hash_claimed: [u8; 32],
+    stored_bytes: u64,
+    staging: OwnedFd,
+    blob_store: &BlobStore,
+    live_baseline: &crate::baseline::LiveBaseline,
+) -> Result<(), HelperLinkError> {
+    let bytes = read_all_from_fd(&staging, stored_bytes as usize)?;
+    let (canonical_hash, stat) = blob_store
+        .put(&bytes)
+        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("blob put: {e}"))))?;
+    let claimed = BlobHash(blob_hash_claimed);
+    if canonical_hash != claimed {
+        return Err(HelperLinkError::Io(std::io::Error::other(format!(
+            "baseline blob hash mismatch: helper claimed {claimed}, daemon computed {canonical_hash}"
+        ))));
+    }
+    // The blob is already content-addressed in the store. Baseline
+    // blobs don't need an index record because they aren't refed by
+    // journal events directly — they're refed by LiveBaseline cache
+    // entries, which manage their own lifecycle. When the cache is
+    // promoted into a FilePreImage, that event's
+    // `handle_captured_pre_image` path records the blob normally.
+    let _ = stat;
+    let inode_ref = InodeRef::new(dev, inode);
+    let entry = crate::baseline::BaselineEntry::new(inode_ref, canonical_hash, stored_bytes);
+    let cache = live_baseline.entry_for_cwd(&cwd);
+    cache.insert(path.clone(), entry);
+    tracing::debug!(
+        %session,
+        dev,
+        inode,
+        path = %path.display(),
+        cwd = %cwd.display(),
+        bytes = stored_bytes,
+        "baseline entry cached"
+    );
+    drop(staging);
+    Ok(())
+}
+
+/// W02.B.live-baseline step 3b — journal a `FilePreImage` event
+/// using a previously-cached baseline blob rather than the helper's
+/// post-write content. Called from the CapturedPreImage handler
+/// when the LiveBaseline cache had a clean entry for this inode.
+#[allow(clippy::too_many_arguments)]
+fn handle_baseline_promoted_pre_image(
+    session: uuid::Uuid,
+    seq: u64,
+    dev: u64,
+    inode: u64,
+    path: Option<String>,
+    blob: BlobHash,
+    stored_bytes: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime_unix_nanos: i128,
+    is_delete: bool,
+    index: &Index,
+) -> Result<(), HelperLinkError> {
+    let command = CommandId { session, seq };
+    let inode_ref = InodeRef::new(dev, inode);
+    let meta = FileMetadata {
+        mode,
+        uid,
+        gid,
+        size: stored_bytes,
+        mtime_unix_nanos,
+        xattrs: BTreeMap::new(),
+        acl: None,
+    };
+    let path_buf: PathBuf = path.clone().unwrap_or_default().into();
+    let ts = crate::server::next_ts();
+
+    let pre_image = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts,
+        partial: false,
+        kind: CaptureEventKind::FilePreImage {
+            inode: inode_ref,
+            path: path_buf.clone(),
+            blob,
+            meta,
+            // No post-content hash on the baseline-promoted path —
+            // we discarded the helper's staging fd. Conflict
+            // detection for "user modified after our capture"
+            // doesn't fire for in-place writes promoted from
+            // baseline. Acceptable v1 tradeoff documented in
+            // .docs/sprints/W/W02.B.live-baseline.md.
+            post_content_hash: None,
+        },
+    };
+    index
+        .put_event(&pre_image)
+        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
+
+    if is_delete {
+        journal_unlink_idempotent(index, command, ts, inode_ref, path_buf)?;
+    }
     Ok(())
 }
 
