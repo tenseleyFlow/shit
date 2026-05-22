@@ -124,15 +124,6 @@ smoke_log "PreExec seq=${SEQ} pid=${PID} cwd=${SCRATCH}"
     --shell bash \
     --sock "${SHIT_HOOK_SOCK}"
 
-# Wait for the chosen tier to actually be live. On fanotify-perm
-# the daemon installs the mark synchronously inside the PreExec
-# handler so a short flat sleep is fine. On LSM-bpf the helper's
-# program load is async wrt PreExec and takes ~700-1000 ms cold;
-# the helper logs "readers spawned" once all 6 hooks are attached.
-# smoke_wait_lsm_ready picks the right wait per tier. See AR00.5
-# in .docs/audits/ar00-runner-ops.md.
-smoke_wait_lsm_ready
-
 # Overwrite the file: open O_WRONLY|O_TRUNC, write new bytes,
 # close. `tee` with no -a is exactly that pattern. The open fires
 # FAN_OPEN_PERM on the parent dir's mark; the helper's runtime

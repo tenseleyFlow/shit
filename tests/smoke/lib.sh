@@ -129,18 +129,6 @@ smoke_start_shitd() {
 # all hooks are attached. Falls back to a 3-second cap so a missed
 # signal doesn't hang the smoke indefinitely (smoke_fail still gets
 # a chance to fire).
-smoke_wait_lsm_ready() {
-    # No-op. Task #105 makes `shit hook-send pre-exec` block until the
-    # helper has finished WatchTree setup (BPF load + pre_open_tree),
-    # so by the time PreExec returns to the caller, capture is live.
-    # Smokes that called this helper used to log-scrape shitd.log for
-    # readiness markers -- that was concealing a real product race:
-    # any shell hook in the field hits the same problem on a cold
-    # start, not just our smokes. The marker-scraping shim is gone;
-    # if a smoke times out waiting for a CapturedPreImage / TreeOp
-    # event, it's the product's responsibility, not the smoke's.
-    :
-}
 
 smoke_stop_shitd() {
     # === B04.6c INSTRUMENTATION ===

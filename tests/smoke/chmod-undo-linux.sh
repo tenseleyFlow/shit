@@ -74,9 +74,6 @@ smoke_log "PreExec seq=1 cwd=${SCRATCH}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-# Wait for LSM tier readiness; see AR00.5 in .docs/audits/ar00-runner-ops.md.
-smoke_wait_lsm_ready
-
 smoke_log "chmod 0755 ${FOO}"
 chmod 0755 "${FOO}"
 POST_MODE="$(python3 -c "import os; print(oct(os.stat('${FOO}').st_mode & 0o777))")"

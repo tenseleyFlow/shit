@@ -66,9 +66,6 @@ smoke_log "PreExec seq=1 cwd=${SCRATCH}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-# Wait for LSM tier readiness; see AR00.5 in .docs/audits/ar00-runner-ops.md.
-smoke_wait_lsm_ready
-
 NEWDIR="${SCRATCH}/created_by_smoke"
 mkdir "${NEWDIR}"
 smoke_log "mkdir ${NEWDIR}"
