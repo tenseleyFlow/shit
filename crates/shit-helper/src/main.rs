@@ -1628,6 +1628,35 @@ fn request_loop(
                     // cwd_path is BSD-only at the helper layer today.
                     let _ = &cwd_path;
                 }
+                // Task #105: signal to the daemon that THIS specific
+                // (session, command_seq) is fully set up — kernel-tier
+                // reader is live (BPF programs attached on LSM, mark
+                // installed on fanotify-perm, kqueue subtree registered
+                // on BSD) AND the watch root has been snapshotted into
+                // per-CommandId pre-image state. The daemon's
+                // CtlRequest::WaitWatchReady handler awaits this signal
+                // before releasing the shell hook (`shit hook-send
+                // pre-exec`) that triggered the WatchTree, so the
+                // user's command never runs before capture is ready.
+                //
+                // This send is fire-and-forget per the wire contract;
+                // the daemon doesn't ack readiness, it just routes the
+                // signal into its per-command readiness map. If the
+                // send fails (helper-daemon link torn down between the
+                // WatchTree dispatch and now) the shell hook will time
+                // out on its own — the daemon doesn't hang on us.
+                let ready = HelperResponse::WatchTreeReady {
+                    session,
+                    command_seq,
+                };
+                if let Err(e) = conn.send_response(&ready) {
+                    tracing::warn!(
+                        err = %e,
+                        %session,
+                        command_seq,
+                        "WatchTreeReady send failed; shell hook will time out"
+                    );
+                }
             }
             HelperRequest::UnwatchTree {
                 session,
