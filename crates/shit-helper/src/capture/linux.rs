@@ -603,20 +603,31 @@ impl LinuxCaptureRuntime {
             return;
         }
 
-        // Look up — but keep the fd in the table. setattr doesn't
-        // unlink, so subsequent events for the same inode (e.g.
-        // chmod then chmod) should still find the fd.
-        let pre_fd_raw = ws
-            .pre_opens
-            .get(&(ev_dev_userspace, ev.inode))
-            .map(|f| f.as_raw_fd());
-        let Some(fd) = pre_fd_raw else {
+        // Read pre-change bytes from the in-memory SNAPSHOT, NOT
+        // from the live fd.
+        //
+        // The previous code did `read_pre_image(pre_opens.get(&key))`
+        // — which reads through the held fd, which sees the file's
+        // CURRENT content. For chmod/chown/utimes that's fine
+        // (content doesn't change). But security_inode_setattr ALSO
+        // fires for O_TRUNC during open(O_WRONLY|O_TRUNC): the BPF
+        // hook submits to the ringbuf, the kernel proceeds to
+        // do_truncate, then the userspace handler runs and reads...
+        // truncated bytes (often 0). file_open's handler would
+        // produce the correct pre-image but it's deduped because
+        // setattr fired first. End result: blob stores 0 bytes;
+        // restore writes 0 bytes; edit-undo's sha256 mismatch.
+        //
+        // Use the pre_snapshot taken at pre_open_tree time — that's
+        // unconditionally the pre-mutation state regardless of what
+        // the setattr is doing. Matches handle_lsm_open's pattern.
+        let Some(snap) = ws.pre_snapshots.get(&(ev_dev_userspace, ev.inode)).cloned() else {
             tracing::info!(
                 pid = ev.pid,
                 dev_kernel = ev.dev,
                 dev_userspace = ev_dev_userspace,
                 inode = ev.inode,
-                "lsm setattr: no pre-opened fd; dropping (race-to-open not viable for metadata-only)"
+                "lsm setattr: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
             );
             // Mark dedupe so reuse-after-event re-captures.
             ws.dedupe.insert(
@@ -625,14 +636,7 @@ impl LinuxCaptureRuntime {
             );
             return;
         };
-
-        let bytes = match read_pre_image(fd) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "lsm setattr pre-image read failed");
-                return;
-            }
-        };
+        let bytes = snap.bytes;
         let blob_hash = blake3_of(&bytes);
         let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
             Ok(f) => f,
@@ -642,12 +646,18 @@ impl LinuxCaptureRuntime {
             }
         };
 
-        // mtime: post-chmod fstat is fine — chmod doesn't change
-        // mtime; only ctime moves. For utimes we'd need to capture
-        // pre-change atime/mtime in the BPF event; deferred.
-        let meta_mtime = fstat_meta(fd).map(|m| m.mtime_unix_nanos).unwrap_or(0);
+        // mtime: from the snapshot, taken at pre_open_tree time. Same
+        // race rationale as the bytes -- the live fd sees CURRENT
+        // mtime which can be post-truncate.
+        let meta_mtime = snap.meta.mtime_unix_nanos;
 
-        let path = path_for_kernel_fd(fd);
+        // Path: the pre_opens fd is still valid for path recovery
+        // (the inode lives until ws is dropped). Use it if present;
+        // fall back to the watch-tree-rooted resolution otherwise.
+        let path = ws
+            .pre_opens
+            .get(&(ev_dev_userspace, ev.inode))
+            .and_then(|f| path_for_kernel_fd(f.as_raw_fd()));
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
