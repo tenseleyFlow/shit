@@ -285,10 +285,7 @@ fn wait_watch_ready(p: &PostSend) -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!(
-                "shit: PreExec wait-watch-ready got unexpected response {:?}",
-                other
-            );
+            eprintln!("shit: PreExec wait-watch-ready got unexpected response {other:?}");
             Ok(())
         }
     }
