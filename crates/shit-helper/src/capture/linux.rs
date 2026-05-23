@@ -915,26 +915,33 @@ impl LinuxCaptureRuntime {
         // we run (LSM fired pre-create but returned 0; the syscall
         // proceeded; ringbuf submit + userspace read happens after
         // syscall completion).
-        let f = match std::fs::OpenOptions::new()
+        //
+        // AR01.2 race: for `touch foo; rm foo` style workloads the
+        // userspace handler may race against an immediate unlink --
+        // by the time we open(O_NOFOLLOW), the dentry is gone and
+        // we get ENOENT. We MUST still journal a TreeOpCreate so the
+        // planner can emit an Unlink inverse; otherwise touch-edit
+        // round-trips leave the freshly-created file on disk
+        // post-undo. Marker-only (dev=0, inode=0) for the race-lost
+        // path; same shape `handle_lsm_mkdir` already uses for its
+        // PRE-creation hook visibility race.
+        let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&resolved_path)
+            .ok();
+
+        let (dev, inode, file_type) = match opened
+            .as_ref()
+            .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()))
         {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    path = %resolved_path.display(),
-                    "lsm create: post-open failed; dropping"
-                );
-                return;
-            }
-        };
-        let (dev, inode, file_type) = match fstat_dev_inode_kind(f.as_raw_fd()) {
             Some(t) => t,
             None => {
-                tracing::warn!(path = %resolved_path.display(), "lsm create: fstat failed");
-                return;
+                tracing::warn!(
+                    path = %resolved_path.display(),
+                    "lsm create: post-open/fstat race lost; emitting marker TreeOpCreate (dev=0, inode=0)"
+                );
+                (0, 0, FileType::Regular)
             }
         };
         if file_type != FileType::Regular {
@@ -965,38 +972,37 @@ impl LinuxCaptureRuntime {
             return;
         }
 
-        // L04.1 — snapshot the new file's bytes + meta. For a
-        // freshly-created file these are typically empty + the
-        // create mode, but the snapshot is what later file_open
-        // handlers will use as pre-image (race-free).
-        let fd_raw = f.as_raw_fd();
-        if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
-            ws.pre_snapshots
-                .insert((dev, inode), PreSnapshot { meta, bytes });
+        // If we won the open race, do the L04.1 snapshot + fd-stash.
+        // If we lost (marker-only above), skip — there's no fd to
+        // stash, no bytes to snapshot, and subsequent open/setattr
+        // handlers for inode=0 won't hit the snapshot cache anyway.
+        if let Some(f) = opened {
+            let fd_raw = f.as_raw_fd();
+            if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
+                ws.pre_snapshots
+                    .insert((dev, inode), PreSnapshot { meta, bytes });
+            }
+            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+            // AR01.1.fix-rename-target-preimage — reverse-index so a
+            // later rename-over-this-path resolves the (dev, inode).
+            ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
+            // AR01.1 follow-up: mark this inode dedupe-captured so the
+            // subsequent file_open (for the first write into this newly-
+            // created file) is suppressed. The pre-snapshot is empty by
+            // definition (file just born), so any FilePreImage emitted
+            // by file_open would either (a) be a useless empty restore,
+            // or (b) race against an imminent rename and journal at the
+            // wrong path (lock files like .git/index.lock get renamed
+            // before file_open's userspace handler resolves /proc/<pid>
+            // /fd/<n>, landing the FilePreImage at the rename DESTINATION
+            // instead of the source). Either way, suppression is correct
+            // -- the TreeOp::Create's inverse Unlink already handles the
+            // mid-session creation under undo. For atomic-rename clobbers,
+            // fix-rename-target-preimage emits the destination's REAL
+            // pre-image via handle_lsm_rename.
+            ws.dedupe
+                .insert((dev, inode), DedupeEntry { invalidated: false });
         }
-        // Stash the fd in pre_opens. Subsequent unlink for this
-        // (dev, inode) will hit the table → race_won → pre-image
-        // capture succeeds even if the file was modified mid-session.
-        ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
-        // AR01.1.fix-rename-target-preimage — reverse-index so a
-        // later rename-over-this-path resolves the (dev, inode).
-        ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
-        // AR01.1 follow-up: mark this inode dedupe-captured so the
-        // subsequent file_open (for the first write into this newly-
-        // created file) is suppressed. The pre-snapshot is empty by
-        // definition (file just born), so any FilePreImage emitted
-        // by file_open would either (a) be a useless empty restore,
-        // or (b) race against an imminent rename and journal at the
-        // wrong path (lock files like .git/index.lock get renamed
-        // before file_open's userspace handler resolves /proc/<pid>
-        // /fd/<n>, landing the FilePreImage at the rename DESTINATION
-        // instead of the source). Either way, suppression is correct
-        // -- the TreeOp::Create's inverse Unlink already handles the
-        // mid-session creation under undo. For atomic-rename clobbers,
-        // fix-rename-target-preimage emits the destination's REAL
-        // pre-image via handle_lsm_rename.
-        ws.dedupe
-            .insert((dev, inode), DedupeEntry { invalidated: false });
 
         tracing::info!(
             session = %ev.command.session,
