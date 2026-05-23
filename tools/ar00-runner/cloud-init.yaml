@@ -71,6 +71,7 @@ packages:
   - python3
   - python3-pip
   - git
+  - vim-nox  # AR01.2 vim-edit-undo smoke needs ex-mode + `set` support; vim-tiny lacks both
   - curl
   - wget
   - ca-certificates
