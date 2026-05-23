@@ -53,8 +53,9 @@ use uuid::Uuid;
 
 use crate::ipc::Conn;
 use crate::kqueue::{
-    DrainEvent, DrainSession, KqueueFd, TrackedSubtree, VnodeEventKind, init as kqueue_init,
-    read_pre_image, register_subtree, register_subtree_at, spawn_drain,
+    DrainEvent, DrainSession, KqueueFd, STREAM_COPY_CAP, TrackedSubtree, VnodeEventKind,
+    init as kqueue_init, register_subtree, register_subtree_at, spawn_drain,
+    stream_copy_to_staging,
 };
 
 /// Default subtree depth — matches `kqueue::vnode::DEFAULT_DEPTH_LIMIT`.
@@ -126,10 +127,11 @@ struct PumpState {
     watches: BTreeMap<CommandId, WatchState>,
     fd_to_command: HashMap<RawFd, CommandId>,
     /// B05 Phase C: pre-cap_enter `O_DIRECTORY` open of the staging
-    /// dir. `write_to_staging` uses `openat(staging_dir_fd, name, ...)`
-    /// instead of absolute opens so it works under capability mode.
-    /// (The original `staging_dir: PathBuf` field was removed once
-    /// every staging op switched to the fd-relative API.)
+    /// dir. `stream_copy_to_staging` uses `openat(staging_dir_fd,
+    /// name, ...)` instead of absolute opens so it works under
+    /// capability mode. (The original `staging_dir: PathBuf` field
+    /// was removed once every staging op switched to the fd-relative
+    /// API.)
     staging_dir_fd: Arc<OwnedFd>,
     conn: Arc<Conn>,
     /// S29.2 — kept here so `handle_dir_change` can register fresh
@@ -345,16 +347,6 @@ impl PumpState {
             return;
         }
         let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
-        // Read pre-image bytes from the tracked fd. For Delete, the
-        // fd survives unlink and pread still returns original bytes
-        // (S23.4's architectural test proves this).
-        let bytes = match read_pre_image(fd) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(fd, error = %e, "read_pre_image failed");
-                return;
-            }
-        };
         // Stat for metadata. After Delete the fstat above already
         // returned valid (dev, inode); same call works for mode/uid/gid/mtime.
         let meta = match fstat_meta(fd) {
@@ -364,17 +356,22 @@ impl PumpState {
                 return;
             }
         };
-        // Stage the bytes into a temp file under staging_dir, then
-        // attach the fd via SCM_RIGHTS.
-        let staging_fd = match write_to_staging(self.staging_dir_fd.as_raw_fd(), &bytes) {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::warn!(error = %e, "staging write failed; skipping capture");
-                return;
-            }
-        };
-        // blake3 the bytes; this is what the daemon will verify.
-        let claimed_hash = blake3_of(&bytes);
+        // W07.A.1: stream the pre-image directly from the tracked fd
+        // into a staging file, blake3-hashing as we go. For Delete,
+        // the fd survives unlink and pread still returns original
+        // bytes (S23.4's architectural test proves this).
+        //
+        // No `Vec<u8>` is materialized — userspace buffer bounded by
+        // STREAM_COPY_CHUNK (64 KiB) regardless of file size. Cap is
+        // STREAM_COPY_CAP (1 GiB this sprint; final policy in A.3).
+        let (staging_fd, claimed_hash, stored_bytes) =
+            match stream_copy_to_staging(fd, self.staging_dir_fd.as_raw_fd(), STREAM_COPY_CAP) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(fd, error = %e, "stream_copy_to_staging failed");
+                    return;
+                }
+            };
         let now_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -390,7 +387,7 @@ impl PumpState {
             inode,
             path: path.as_deref().map(path_to_string),
             blob_hash: claimed_hash,
-            stored_bytes: bytes.len() as u64,
+            stored_bytes,
             post_content_hash: None, // TODO: compute when not Delete
             mode: meta.mode,
             uid: meta.uid,
@@ -420,7 +417,7 @@ impl PumpState {
             dev,
             inode,
             ?kind,
-            bytes = bytes.len(),
+            bytes = stored_bytes,
             now_nanos,
             "CapturedPreImage sent",
         );
@@ -828,19 +825,6 @@ fn baseline_walk_and_emit(
             continue;
         }
 
-        let bytes = match read_pre_image(fd) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(
-                    fd,
-                    error = %e,
-                    path = %path.display(),
-                    "baseline: read_pre_image failed; skipping"
-                );
-                partial = true;
-                continue;
-            }
-        };
         let meta = match fstat_meta(fd) {
             Some(m) => m,
             None => {
@@ -850,15 +834,22 @@ fn baseline_walk_and_emit(
             }
         };
 
-        let staging_fd = match write_to_staging(staging_dir_fd, &bytes) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::debug!(error = %e, "baseline: write_to_staging failed; skipping");
-                partial = true;
-                continue;
-            }
-        };
-        let blob_hash = blake3_of(&bytes);
+        // W07.A.1: stream-copy directly from the tracked fd into a
+        // staging file. No `Vec<u8>` buffer.
+        let (staging_fd, blob_hash, stored_bytes) =
+            match stream_copy_to_staging(fd, staging_dir_fd, STREAM_COPY_CAP) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(
+                        fd,
+                        error = %e,
+                        path = %path.display(),
+                        "baseline: stream_copy_to_staging failed; skipping"
+                    );
+                    partial = true;
+                    continue;
+                }
+            };
 
         let resp = HelperResponse::BaselineCaptured {
             session,
@@ -867,7 +858,7 @@ fn baseline_walk_and_emit(
             inode,
             path: path_to_string(path),
             blob_hash,
-            stored_bytes: bytes.len() as u64,
+            stored_bytes,
             mode: meta.mode,
             uid: meta.uid,
             gid: meta.gid,
@@ -896,70 +887,6 @@ fn baseline_walk_and_emit(
     }
 
     (count, partial)
-}
-
-/// B05 Phase C: write `bytes` to a freshly-named file inside the
-/// staging directory, then return a read-only fd for the SCM_RIGHTS
-/// send. Uses `openat(staging_dir_fd, name, ...)` (works under
-/// cap_enter) rather than absolute `OpenOptions::open(path)`. The
-/// caller passes the pre-cap_enter-opened staging dir fd.
-fn write_to_staging(staging_dir_fd: RawFd, bytes: &[u8]) -> std::io::Result<OwnedFd> {
-    let name = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
-    let name_c = std::ffi::CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "staging name NUL"))?;
-
-    // Open writeable, create+excl. Mode 0o600 — only this uid can
-    // read pre-image content.
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
-    // SAFETY: staging_dir_fd alive per caller; name_c is NUL-terminated.
-    let wfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), flags, 0o600) };
-    if wfd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // Write payload. We close wfd before reopening read-only.
-    let to_write = bytes.len();
-    let mut written = 0usize;
-    while written < to_write {
-        let rc = unsafe {
-            libc::write(
-                wfd,
-                bytes.as_ptr().add(written) as *const _,
-                (to_write - written) as libc::size_t,
-            )
-        };
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            unsafe { libc::close(wfd) };
-            return Err(err);
-        }
-        written += rc as usize;
-    }
-    // fsync so the daemon sees a fully-on-disk file when it ingests.
-    unsafe { libc::fsync(wfd) };
-    unsafe { libc::close(wfd) };
-
-    // Reopen read-only for the SCM_RIGHTS send.
-    let rflags = libc::O_RDONLY | libc::O_CLOEXEC;
-    let rfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), rflags, 0) };
-    if rfd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: rfd is a fresh kernel-allocated fd we now own.
-    use std::os::fd::FromRawFd;
-    Ok(unsafe { OwnedFd::from_raw_fd(rfd) })
-}
-
-fn blake3_of(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(bytes);
-    *hasher.finalize().as_bytes()
 }
 
 fn path_to_string(p: &Path) -> String {
@@ -1125,7 +1052,7 @@ pub fn spawn(
 ) -> std::io::Result<(CaptureControl, JoinHandle<()>)> {
     std::fs::create_dir_all(&staging_dir)?;
     // B05 Phase C: pre-open the staging dir as O_DIRECTORY so
-    // write_to_staging can use openat under cap_enter.
+    // stream_copy_to_staging can use openat under cap_enter.
     let staging_dir_fd = {
         use std::os::fd::FromRawFd;
         let cpath = std::ffi::CString::new(staging_dir.as_os_str().as_bytes()).map_err(|_| {
@@ -1208,42 +1135,6 @@ fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn blake3_of_matches_known_vector() {
-        // Empty input → BLAKE3 of "" = af1349b9f5f9a1a6a0404dea36dcc949...
-        let got = blake3_of(b"");
-        assert_eq!(
-            got[..4],
-            [0xAF, 0x13, 0x49, 0xB9],
-            "blake3('') prefix mismatch",
-        );
-    }
-
-    #[test]
-    fn write_to_staging_round_trips_bytes() {
-        use std::io::Read;
-        let dir = tempfile::tempdir().unwrap();
-        let bytes = b"staging-round-trip";
-        // Open the staging dir as O_DIRECTORY for the new openat-based API.
-        let staging_fd = {
-            use std::os::fd::FromRawFd;
-            let cpath = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
-            let raw = unsafe {
-                libc::open(
-                    cpath.as_ptr(),
-                    libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
-                )
-            };
-            assert!(raw >= 0);
-            unsafe { OwnedFd::from_raw_fd(raw) }
-        };
-        let fd = write_to_staging(staging_fd.as_raw_fd(), bytes).unwrap();
-        let mut f = std::fs::File::from(fd);
-        let mut out = Vec::new();
-        f.read_to_end(&mut out).unwrap();
-        assert_eq!(out.as_slice(), bytes);
-    }
 
     #[test]
     fn fstat_returns_regular_for_open_file_and_directory_for_open_dir() {
