@@ -387,6 +387,13 @@ jobs:
             # is invisible so the OLD file's content can't be
             # captured.
             sed-i-undo-linux.sh
+            # AR01.3 — cp -r bulk creates. Stress-tests the strict
+            # path resolver under racing mkdir+create from per-program
+            # ringbuf reader threads; asserts >= 6 TreeOpCreate
+            # events to surface any resolver-race drops directly
+            # (don't trust the orchestrator's remove_dir_all fallback
+            # to paper over capture-side bugs).
+            cp-r-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
