@@ -118,6 +118,7 @@ fn classify_replace_paths(
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
+    let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
     for ev in events {
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, .. } => {
@@ -129,12 +130,26 @@ fn classify_replace_paths(
             CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }) => {
                 unlinks.insert(path.clone());
             }
+            // AR01.1 follow-up: the Linux LSM `inode_rename` hook is
+            // emitted by the helper as a single TreeOp::Rename plus a
+            // CapturedPreImage(is_delete=true) for the clobbered
+            // destination -- i.e. PreImage + Unlink on the destination
+            // path with NO accompanying Create. The W01.B classifier
+            // (Create + PreImage + Unlink) missed this shape and the
+            // planner fell through to per-event inverses (RestoreContent +
+            // RecreatePath + ReverseRename) which raced ordering at
+            // apply time and intermittently deleted the destination
+            // outright. Treating the rename's destination identically
+            // to a Create for classification purposes closes the gap.
+            CaptureEventKind::TreeOp(TreeOp::Rename { to, .. }) => {
+                rename_destinations.insert(to.clone());
+            }
             _ => {}
         }
     }
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
-    for p in &creates {
+    for p in creates.iter().chain(rename_destinations.iter()) {
         if !unlinks.contains(p) {
             continue;
         }
@@ -658,6 +673,22 @@ fn emit_for_tree_op(
             });
         }
         TreeOp::Rename { from, to, .. } => {
+            // AR01.1 follow-up: if the rename's destination is in
+            // atomic_replace_paths (Rename + PreImage + Unlink + path
+            // present at undo), the FilePreImage's RestoreContent
+            // overwrites the destination with the OLD content -- a
+            // ReverseRename here would race with that and either
+            // un-clobber to the source side (leaving an orphan at
+            // `from`) OR delete the destination outright if the
+            // RestoreContent applies first. The atomic-replace path
+            // doesn't need the rename inverse: the source side is
+            // a transient lock file whose Create + Unlink already
+            // classify as transient (no inverse) and whose path is
+            // gone at undo time anyway. Same suppression principle as
+            // TreeOp::Create above.
+            if atomic_replace_paths.contains(to) {
+                return;
+            }
             // Inverse of `from -> to` is `to -> from`.
             nodes.push(PlanNode {
                 op: InverseOp::Rename {
@@ -1088,6 +1119,109 @@ mod tests {
         assert!(
             !has_recreate,
             "atomic-replace path should NOT get a RecreatePath inverse"
+        );
+        assert!(
+            !p.has_blocking_conflicts(),
+            "plan should not have blocking conflicts"
+        );
+    }
+
+    #[test]
+    fn lsm_rename_target_clobber_coalesces_to_single_restore() {
+        // AR01.1 follow-up — the Linux LSM `inode_rename` hook
+        // produces a different shape than BSD kqueue:
+        //   TreeOp::Rename(.lock -> P)           (existing rename emit)
+        //   FilePreImage of P (OLD inode bytes)  (fix-rename-target-preimage)
+        //   TreeOp::Unlink at P (OLD inode)      (is_delete=true paired)
+        // i.e. PreImage + Unlink on the destination path with NO
+        // Create. The W01.B classifier missed this and the planner
+        // emitted RestoreContent + RecreatePath + ReverseRename, all
+        // three of which raced ordering and intermittently deleted P
+        // outright (PR #29 forensics). Treating the rename's
+        // destination identically to a Create for classification
+        // purposes closes the gap: classify_replace_paths buckets
+        // P as atomic_replace, and the Rename + Unlink inverses get
+        // suppressed.
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let old_inode = InodeRef::new(1, 100);
+        let new_inode = InodeRef::new(1, 200);
+        let dest = PathBuf::from("/tmp/.git/HEAD");
+        let src = PathBuf::from("/tmp/.git/HEAD.lock");
+        // Current on-disk state: NEW inode lives at the destination
+        // (post-rename) and the source path is gone.
+        probe.insert(
+            dest.clone(),
+            ProbeStat {
+                inode: new_inode,
+                meta: meta(60),
+            },
+            None,
+        );
+        let blob = BlobHash::from_bytes([0xDD; 32]);
+        store.put_blob(blob, 42);
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let pre = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: old_inode,
+                path: dest.clone(),
+                blob,
+                meta: meta(50),
+                post_content_hash: None,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: old_inode,
+                path: dest.clone(),
+            }),
+        };
+        let rename = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                inode: new_inode,
+                from: src.clone(),
+                to: dest.clone(),
+            }),
+        };
+        let p = plan(dummy_command(), &[pre, unlink, rename], &probe, &store);
+
+        // Expect ONLY RestoreContent + RestoreMetadata for the dest.
+        // The Unlink and Rename inverses must be suppressed.
+        let has_restore_content = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if path == &dest));
+        let has_recreate = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RecreatePath { path, .. } if path == &dest));
+        let has_reverse_rename = p.nodes.iter().any(
+            |n| matches!(&n.op, InverseOp::Rename { from, to } if from == &dest && to == &src),
+        );
+        assert!(has_restore_content, "RestoreContent inverse missing");
+        assert!(
+            !has_recreate,
+            "rename-destination atomic-replace must NOT emit RecreatePath inverse"
+        );
+        assert!(
+            !has_reverse_rename,
+            "rename-destination atomic-replace must NOT emit ReverseRename inverse"
         );
         assert!(
             !p.has_blocking_conflicts(),
