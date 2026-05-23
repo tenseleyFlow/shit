@@ -429,6 +429,16 @@ impl LinuxCaptureRuntime {
         // `__gnu_dev_makedev`). Convert before lookup.
         let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
 
+        // Mark the dedupe entry invalidated up front, regardless of
+        // whether we successfully journal the event below: the unlink
+        // happened on the kernel side, so any future reuse of this
+        // inode (rm-then-recreate within the same watch window) must
+        // re-capture rather than dedupe against the now-stale entry.
+        ws.dedupe.insert(
+            (ev_dev_userspace, ev.inode),
+            DedupeEntry { invalidated: true },
+        );
+
         // AR01.1.fix-path-via-parent-inode — resolve strictly through
         // the dir-inode map (populated by pre_open_tree recursion + by
         // handle_lsm_mkdir as nested dirs are born). For unlink, the
@@ -576,14 +586,9 @@ impl LinuxCaptureRuntime {
             tracing::warn!(error = %e, "lsm send_response failed");
         }
 
-        // Mark dedupe invalidated regardless of race outcome — the
-        // unlink happened, so any subsequent reuse of (dev, inode)
-        // should re-capture. Keyed in glibc-encoded dev for symmetry
-        // with the fanotify producer's dedupe.
-        ws.dedupe.insert(
-            (ev_dev_userspace, ev.inode),
-            DedupeEntry { invalidated: true },
-        );
+        // (Dedupe already invalidated up-front at handler entry, so
+        // we don't need a second insert here -- both paths agree on
+        // the same key + state.)
 
         tracing::info!(
             session = %ev.command.session,
