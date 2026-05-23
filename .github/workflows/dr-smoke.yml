@@ -375,6 +375,12 @@ jobs:
             mkdir-undo-linux.sh
             mv-undo-linux.sh
             touch-edit-undo-linux.sh
+            # AR01.1 — multi-event workload. Requires LSM because
+            # git's atomic-replace of .git/index via rename is
+            # invisible to fanotify-perm; without the rename event
+            # the index isn't restored and `git status --porcelain`
+            # diverges from the staged state.
+            git-commit-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm

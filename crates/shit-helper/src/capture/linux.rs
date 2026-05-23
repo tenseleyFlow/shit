@@ -44,7 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -98,7 +98,50 @@ struct WatchState {
     /// `/proc/<dead-pid>/cwd/...` string that was journaled and
     /// then ENOENT'd at undo time.
     cwd: Option<PathBuf>,
+    /// AR01.1.fix-pre-open-tree-recursion — `(dev, inode) → absolute
+    /// path` for every directory visited by `pre_open_tree` (including
+    /// the watch root itself). LSM event handlers look up the
+    /// parent inode here to reconstruct the full path for files
+    /// in subdirectories. Pre-AR01.1 the handlers always joined
+    /// `ws.cwd + basename`, which produced wrong paths like
+    /// `repo/index.lock` for git's `.git/index.lock`.
+    ///
+    /// Populated lazily: `handle_lsm_mkdir` also inserts the new dir's
+    /// (dev, inode) → path so subsequent nested events resolve.
+    dir_paths: BTreeMap<(u64, u64), PathBuf>,
+    /// AR01.1.fix-rename-target-preimage — reverse of `dir_paths` +
+    /// regular-file paths: `absolute_path → (dev, inode)`. Populated
+    /// by `pre_open_tree` for every opened file and by
+    /// `handle_lsm_create` for files born mid-session.
+    ///
+    /// The `inode_rename` LSM hook can clobber an existing destination
+    /// (think `mv old new` where `new` already exists; or git's
+    /// atomic `.git/index.lock → .git/index` swap). At handler time
+    /// the rename has already completed, so stat'ing the destination
+    /// path returns the NEW inode -- the OLD one is gone. To capture
+    /// the about-to-be-clobbered content as a `FilePreImage`, we look
+    /// up the destination path here PRE-rename-handler-update and find
+    /// the OLD inode, then read its pre-snapshot.
+    path_to_inode: BTreeMap<PathBuf, (u64, u64)>,
 }
+
+/// AR01.1.fix-pre-open-tree-recursion — bounded recursion depth for
+/// `pre_open_tree`. Matches the BSD `register_subtree` and fanotify
+/// `mark_dir_for_capture` defaults. Real-world load (a fresh
+/// `git init` repo + a few commits): `.git/objects/XX/` is depth 3
+/// from the repo root; depth 8 covers nested workloads (e.g.
+/// `dst/sub1/sub2/.../file` in cp-r) with margin.
+const PRE_OPEN_TREE_DEPTH_LIMIT: usize = 8;
+
+/// AR01.1.fix-pre-open-tree-recursion — soft cap on how many files
+/// `pre_open_tree` will open per command. Each open consumes one fd
+/// plus an in-memory snapshot (up to MAX_PRE_IMAGE_BYTES each). The
+/// process rlimit defaults to ~1024 fds on most distros; we leave
+/// headroom for the daemon's own sockets, the BPF ringbuf fds, and
+/// staging tmpfiles. If a tree is larger than this, we log a warning
+/// and stop recursing. LSM handlers then fall back to live-fd capture
+/// for unsnapshotted files (same fail-mode as a too-large pre-image).
+const PRE_OPEN_TREE_MAX_FILES: usize = 512;
 
 /// L04.1 — A snapshotted pre-image. Bytes + the stat-meta as it was
 /// at snapshot time (mode/uid/gid/mtime/size). Both go on the wire
@@ -177,13 +220,21 @@ impl LinuxCaptureRuntime {
         self.watches.remove(&command);
     }
 
-    /// L04 — open every regular file under `cwd` (non-recursive in
-    /// v1; matches the smoke's flat-tree assumption) and stash the
+    /// L04 — open every regular file under `cwd` and stash the
     /// OwnedFds keyed by `(dev, inode)` in this command's WatchState.
     /// Mirror of `kqueue::register_subtree` — the open fd keeps the
     /// inode alive after `vfs_unlink` drops the dentry, so the LSM
     /// unlink handler can `read_pre_image(dup(fd))` after the file
     /// is "gone".
+    ///
+    /// AR01.1.fix-pre-open-tree-recursion — recurses up to
+    /// [`PRE_OPEN_TREE_DEPTH_LIMIT`] levels, capped at
+    /// [`PRE_OPEN_TREE_MAX_FILES`] opens per command. Stays on the
+    /// same filesystem (same `dev`) as the watch root so we never
+    /// cross a bind mount or a tmpfs sub-mount accidentally. Records
+    /// every visited directory in `ws.dir_paths` so LSM event handlers
+    /// can resolve `(parent_dev, parent_inode, basename)` into an
+    /// absolute path for files in subdirectories.
     ///
     /// Best-effort: per-file open errors (EACCES on protected files,
     /// ELOOP on dangling symlinks) are skipped silently. The walker
@@ -200,60 +251,28 @@ impl LinuxCaptureRuntime {
         // basename → absolute path without /proc/<pid>/cwd. See
         // WatchState::cwd docs for the why (Issue #22).
         ws.cwd = Some(cwd.to_path_buf());
-        let dir = match std::fs::read_dir(cwd) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(cwd = %cwd.display(), err = %e, "pre_open_tree: read_dir failed");
-                return;
-            }
-        };
-        let mut opened = 0usize;
-        for ent in dir.flatten() {
-            let path = ent.path();
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !meta.file_type().is_file() {
-                continue;
-            }
-            // O_RDONLY + O_NOFOLLOW — never follow a symlink (else
-            // we'd open something outside the watched tree).
-            let f = match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let fd = f.as_raw_fd();
-            let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
-                continue;
-            };
-            // L04.1 — snapshot bytes + meta BEFORE inserting the fd.
-            // Reads are race-free at this moment (no LSM event has
-            // fired yet). If read fails or file's too large, skip
-            // snapshot — the LSM open/setattr handlers will see a
-            // miss and drop their events.
-            if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
-                ws.pre_snapshots
-                    .insert((dev, inode), PreSnapshot { meta, bytes });
-            } else {
-                tracing::trace!(
-                    dev,
-                    inode,
-                    "pre_open_tree: snapshot skipped (too large or read failed)"
-                );
-            }
-            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
-            opened += 1;
+
+        // Record the watch root itself in dir_paths so events whose
+        // parent_inode == watch-root's inode resolve too.
+        let root_dev_inode = std::fs::metadata(cwd)
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+            .unwrap_or((0, 0));
+        if root_dev_inode != (0, 0) {
+            ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
         }
+
+        let mut opened = 0usize;
+        let mut hit_cap = false;
+        pre_open_recurse(ws, cwd, root_dev_inode.0, 0, &mut opened, &mut hit_cap);
+
         tracing::info!(
             session = %command.session,
             seq = command.seq,
             cwd = %cwd.display(),
             opened,
+            dirs = ws.dir_paths.len(),
+            hit_cap,
             "pre_open_tree complete"
         );
     }
@@ -403,31 +422,40 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_unlink(&mut self, ev: &LsmUnlinkView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // Resolve the file's real path. Prefer the watch root recorded
-        // at WatchTree time (canonical, survives the mutating pid's
-        // exit); fall back to readlink(/proc/<pid>/cwd) which works
-        // while the pid is alive but races against the BPF→ringbuf→
-        // handler hop. NEVER fall back to the literal procfs symlink
-        // string -- that's Issue #22: a `/proc/<dead-pid>/cwd/foo`
-        // gets journaled and then ENOENT's at undo time.
-        let resolved_path = resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename);
-        let Some(resolved_path) = resolved_path else {
-            tracing::warn!(
-                pid = ev.pid,
-                basename = ev.basename,
-                "lsm unlink: cannot resolve basename to absolute path \
-                 (watch_tree cwd missing AND /proc/<pid>/cwd readlink failed); \
-                 dropping event"
-            );
-            return;
-        };
-
         // BPF reports `dev` in the kernel's `dev_t` encoding
         // (`(major << 20) | minor`). All userspace stat-derived
         // (dev, inode) keys in this runtime — including the
         // pre_opens table — use glibc's encoding (split-bits via
         // `__gnu_dev_makedev`). Convert before lookup.
         let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
+
+        // AR01.1.fix-path-via-parent-inode — resolve through the
+        // dir-inode map first (correct for files in subdirectories;
+        // e.g. `.git/index.lock`). Fall back to the watch-root resolver
+        // for files directly under cwd and as last-ditch when the
+        // parent dir wasn't in pre_open_tree's recursion (e.g. created
+        // mid-session before our mkdir handler ran). NEVER emit the
+        // literal /proc/<pid>/cwd/... string (Issue #22).
+        //
+        // For unlink, the parent's dev == the file's dev (unlink can't
+        // cross filesystems), so reuse the converted file dev.
+        let resolved_path = resolve_via_parent(
+            &ws.dir_paths,
+            ev_dev_userspace,
+            ev.parent_inode,
+            ev.basename,
+        )
+        .or_else(|| resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename));
+        let Some(resolved_path) = resolved_path else {
+            tracing::warn!(
+                pid = ev.pid,
+                basename = ev.basename,
+                "lsm unlink: cannot resolve basename to absolute path \
+                 (dir_paths miss AND watch_tree cwd missing AND /proc/<pid>/cwd readlink failed); \
+                 dropping event"
+            );
+            return;
+        };
 
         // Look up pre-opened fd for this (dev, inode). The fd was
         // grabbed at WatchTree time by `pre_open_tree`. Even after
@@ -653,18 +681,30 @@ impl LinuxCaptureRuntime {
 
         // Path: the pre_opens fd is still valid for path recovery
         // (the inode lives until ws is dropped). Use it if present;
-        // fall back to the watch-tree-rooted resolution otherwise.
-        let path = ws
-            .pre_opens
-            .get(&(ev_dev_userspace, ev.inode))
-            .and_then(|f| path_for_kernel_fd(f.as_raw_fd()));
+        // fall back to the path_to_inode reverse lookup. AR01.1: never
+        // emit an empty path -- the daemon journals path:"" which
+        // becomes a ConflictMissing at undo time. Drop the event
+        // instead so the operator gets a tracing breadcrumb naming
+        // the (dev, inode) that escaped both lookups.
+        let path = match resolve_inode_to_path(ws, ev_dev_userspace, ev.inode) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    dev = ev_dev_userspace,
+                    inode = ev.inode,
+                    "lsm setattr: path resolution failed (pre_opens fd + path_to_inode reverse both miss); dropping event"
+                );
+                return;
+            }
+        };
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
             seq: ev.command.seq,
             dev: ev_dev_userspace,
             inode: ev.inode,
-            path: path.as_deref().map(path_to_string),
+            path: Some(path_to_string(&path)),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             post_content_hash: None,
@@ -716,28 +756,27 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_mkdir(&mut self, ev: &LsmMkdirView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // Resolve the new dir's path. The LSM hook fired with the
-        // dentry's basename; the parent is the cwd of the calling pid
-        // (for `mkdir foo` with no slashes). For `mkdir a/b` cases the
-        // parent isn't cwd; defer those to a follow-up that walks the
-        // dentry's parent chain.
-        //
-        // resolve_basename_to_path prefers the watch root recorded
-        // at WatchTree time (canonical, survives mutating-pid exit)
-        // and only falls back to readlink(/proc/<pid>/cwd) when the
-        // watch root is missing. Issue #22.
-        let resolved_dir_str =
-            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        pid = ev.pid,
-                        basename = ev.basename,
-                        "lsm mkdir: cannot resolve basename to absolute path; dropping event"
-                    );
-                    return;
-                }
-            };
+        // AR01.1.fix-path-via-parent-inode — resolve via the dir map.
+        // Parent_dev arrives in BPF kernel encoding; convert before
+        // lookup. Fall back to the watch-root resolver only when the
+        // parent isn't in dir_paths (would happen if a mid-session
+        // mkdir of an intermediate dir got dropped).
+        let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
+        let resolved_dir_str = resolve_via_parent(
+            &ws.dir_paths,
+            parent_dev_userspace,
+            ev.parent_inode,
+            ev.basename,
+        )
+        .or_else(|| resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename));
+        let Some(resolved_dir_str) = resolved_dir_str else {
+            tracing::warn!(
+                pid = ev.pid,
+                basename = ev.basename,
+                "lsm mkdir: cannot resolve basename to absolute path; dropping event"
+            );
+            return;
+        };
         let resolved_dir = PathBuf::from(&resolved_dir_str);
 
         // Stat to grab the (dev, inode) of the freshly-created dir.
@@ -784,6 +823,16 @@ impl LinuxCaptureRuntime {
             }
         };
 
+        // AR01.1.fix-path-via-parent-inode — register the new dir's
+        // (dev, inode) → path so subsequent nested events (e.g. git's
+        // `.git/objects/02/abc...` create-then-write into the just-
+        // -mkdir'd `02`) resolve correctly. Skip the marker-only case
+        // (dev=0, inode=0); a missing dir_paths entry just means the
+        // fallback resolver gets used, not a hard failure.
+        if dev != 0 {
+            ws.dir_paths.insert((dev, inode), resolved_dir.clone());
+        }
+
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
             seq: ev.command.seq,
@@ -829,20 +878,26 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_create(&mut self, ev: &LsmCreateView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // Issue #22: resolve via watch root, never journal a
-        // /proc/<pid>/cwd/... string.
-        let resolved_path_str =
-            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        pid = ev.pid,
-                        basename = ev.basename,
-                        "lsm create: cannot resolve basename to absolute path; dropping event"
-                    );
-                    return;
-                }
-            };
+        // AR01.1.fix-path-via-parent-inode — try the dir map first so
+        // `.git/index.lock`, `.git/objects/XX/YY...`, etc. resolve
+        // through the parent inode chain. Issue #22 — never journal
+        // the literal /proc/<pid>/cwd/... string.
+        let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
+        let resolved_path_str = resolve_via_parent(
+            &ws.dir_paths,
+            parent_dev_userspace,
+            ev.parent_inode,
+            ev.basename,
+        )
+        .or_else(|| resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename));
+        let Some(resolved_path_str) = resolved_path_str else {
+            tracing::warn!(
+                pid = ev.pid,
+                basename = ev.basename,
+                "lsm create: cannot resolve basename to absolute path; dropping event"
+            );
+            return;
+        };
         let resolved_path = PathBuf::from(&resolved_path_str);
 
         // Open + stat. The kernel completed the create by the time
@@ -912,6 +967,9 @@ impl LinuxCaptureRuntime {
         // (dev, inode) will hit the table → race_won → pre-image
         // capture succeeds even if the file was modified mid-session.
         ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+        // AR01.1.fix-rename-target-preimage — reverse-index so a
+        // later rename-over-this-path resolves the (dev, inode).
+        ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
 
         tracing::info!(
             session = %ev.command.session,
@@ -984,18 +1042,27 @@ impl LinuxCaptureRuntime {
                 return;
             }
         };
-        // Path resolution via the still-held pre-opened fd.
-        let path = ws
-            .pre_opens
-            .get(&(ev_dev, ev.inode))
-            .and_then(|f| path_for_kernel_fd(f.as_raw_fd()));
+        // Path resolution. AR01.1: never emit an empty path -- see
+        // handle_lsm_setattr for the rationale.
+        let path = match resolve_inode_to_path(ws, ev_dev, ev.inode) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    dev = ev_dev,
+                    inode = ev.inode,
+                    "lsm open: path resolution failed; dropping event"
+                );
+                return;
+            }
+        };
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
             seq: ev.command.seq,
             dev: ev_dev,
             inode: ev.inode,
-            path: path.as_deref().map(path_to_string),
+            path: Some(path_to_string(&path)),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             post_content_hash: None,
@@ -1038,31 +1105,100 @@ impl LinuxCaptureRuntime {
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
-        // Issue #22: resolve via watch root, not /proc/<pid>/cwd.
+        // AR01.1.fix-path-via-parent-inode — resolve through the
+        // dir-inode map (so renames inside subdirs like `.git/` resolve
+        // correctly). Rename can't cross filesystems, so both parents
+        // share the same dev as the renamed item -- use ev_dev.
         let from_path =
-            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.old_basename) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        pid = ev.pid,
-                        basename = ev.old_basename,
-                        "lsm rename: cannot resolve old basename to absolute path; dropping event"
-                    );
-                    return;
-                }
-            };
+            resolve_via_parent(&ws.dir_paths, ev_dev, ev.old_parent_inode, ev.old_basename)
+                .or_else(|| {
+                    resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.old_basename)
+                });
+        let Some(from_path) = from_path else {
+            tracing::warn!(
+                pid = ev.pid,
+                basename = ev.old_basename,
+                "lsm rename: cannot resolve old basename to absolute path; dropping event"
+            );
+            return;
+        };
         let to_path =
-            match resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.new_basename) {
-                Some(p) => p,
-                None => {
-                    tracing::warn!(
-                        pid = ev.pid,
-                        basename = ev.new_basename,
-                        "lsm rename: cannot resolve new basename to absolute path; dropping event"
-                    );
-                    return;
+            resolve_via_parent(&ws.dir_paths, ev_dev, ev.new_parent_inode, ev.new_basename)
+                .or_else(|| {
+                    resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.new_basename)
+                });
+        let Some(to_path) = to_path else {
+            tracing::warn!(
+                pid = ev.pid,
+                basename = ev.new_basename,
+                "lsm rename: cannot resolve new basename to absolute path; dropping event"
+            );
+            return;
+        };
+
+        // AR01.1.fix-rename-target-preimage — if the rename is going
+        // to clobber an existing file (e.g. git's atomic
+        // `.git/index.lock → .git/index`), the OLD destination's
+        // content is destroyed in the swap. Look up the destination
+        // path in our reverse index BEFORE the rename completes (the
+        // lookup uses path_to_inode populated at pre_open_tree time
+        // and on inode_create), find the OLD (dev, inode), and emit a
+        // CapturedPreImage so the daemon journals a FilePreImage +
+        // paired Unlink. Without this step the rename-over loses the
+        // OLD destination's pre-image silently and undo can't restore
+        // the prior content.
+        //
+        // No-clobber renames (creating a fresh name) miss in
+        // path_to_inode; that's the correct behavior -- nothing to
+        // capture.
+        let to_path_buf = PathBuf::from(&to_path);
+        if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path_buf)
+            && let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned()
+        {
+            let bytes = snap.bytes;
+            let meta = snap.meta;
+            let blob_hash = blake3_of(&bytes);
+            match write_to_staging(&self.staging_dir, &bytes) {
+                Ok(staging_fd) => {
+                    let resp = HelperResponse::CapturedPreImage {
+                        session: ev.command.session,
+                        seq: ev.command.seq,
+                        dev: old_dev,
+                        inode: old_inode,
+                        path: Some(to_path.clone()),
+                        blob_hash,
+                        stored_bytes: bytes.len() as u64,
+                        post_content_hash: None,
+                        mode: meta.mode,
+                        uid: meta.uid,
+                        gid: meta.gid,
+                        mtime_unix_nanos: meta.mtime_unix_nanos,
+                        is_delete: true,
+                        fd_sent_via_scm: true,
+                    };
+                    if let Err(e) = self
+                        .conn
+                        .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+                    {
+                        tracing::warn!(error = %e, "lsm rename target-pre-image send_response_with_fd failed");
+                    } else {
+                        tracing::info!(
+                            session = %ev.command.session,
+                            seq = ev.command.seq,
+                            pid = ev.pid,
+                            old_dev,
+                            old_inode,
+                            bytes = bytes.len(),
+                            path = %to_path,
+                            "lsm-rename target pre-image CapturedPreImage sent"
+                        );
+                    }
                 }
-            };
+                Err(e) => {
+                    tracing::warn!(error = %e, "lsm rename target staging write failed");
+                }
+            }
+        }
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
@@ -1089,6 +1225,91 @@ impl LinuxCaptureRuntime {
             to = %to_path,
             "lsm-rename TreeMutation sent",
         );
+    }
+}
+
+/// AR01.1.fix-pre-open-tree-recursion — recurse `pre_open_tree` into
+/// subdirectories. Caller passes the root's `dev` and we refuse to
+/// descend into entries on a different filesystem (cross-fs traversal
+/// would let us open files outside the user's intent on a watched
+/// repo containing a submodule's tmpfs mount). Symlinks are never
+/// followed; `O_NOFOLLOW` on the open ensures the file we snapshot
+/// is the one we statted.
+fn pre_open_recurse(
+    ws: &mut WatchState,
+    dir: &Path,
+    root_dev: u64,
+    depth: usize,
+    opened: &mut usize,
+    hit_cap: &mut bool,
+) {
+    if depth >= PRE_OPEN_TREE_DEPTH_LIMIT {
+        return;
+    }
+    if *opened >= PRE_OPEN_TREE_MAX_FILES {
+        *hit_cap = true;
+        return;
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), err = %e, "pre_open_tree: read_dir failed");
+            return;
+        }
+    };
+    for ent in read.flatten() {
+        if *opened >= PRE_OPEN_TREE_MAX_FILES {
+            *hit_cap = true;
+            return;
+        }
+        let path = ent.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            // Cross-fs guard: don't recurse into a submount.
+            if meta.dev() != root_dev {
+                continue;
+            }
+            ws.dir_paths.insert((meta.dev(), meta.ino()), path.clone());
+            pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let fd = f.as_raw_fd();
+        let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
+            continue;
+        };
+        if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
+            ws.pre_snapshots
+                .insert((dev, inode), PreSnapshot { meta, bytes });
+        } else {
+            tracing::trace!(
+                dev,
+                inode,
+                "pre_open_tree: snapshot skipped (too large or read failed)"
+            );
+        }
+        ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+        // AR01.1.fix-rename-target-preimage — reverse-index so a
+        // later rename-over-this-path can find the OLD inode.
+        ws.path_to_inode.insert(path.clone(), (dev, inode));
+        *opened += 1;
     }
 }
 
@@ -1130,6 +1351,33 @@ fn resolve_basename_to_path(ws_cwd: Option<&Path>, pid: i64, basename: &str) -> 
     std::fs::read_link(&cwd_link)
         .ok()
         .map(|cwd| path_to_string(&cwd.join(basename)))
+}
+
+/// AR01.1.fix-path-via-parent-inode — resolve `(parent_dev,
+/// parent_inode, basename)` to an absolute path via the dir map
+/// populated by `pre_open_tree` (and `handle_lsm_mkdir` for dirs
+/// born mid-session). This is the correct resolver for nested-dir
+/// workloads: `resolve_basename_to_path` only knows the watch root
+/// and produces paths like `repo/index.lock` when git's actual
+/// target is `repo/.git/index.lock`.
+///
+/// Returns `None` when the parent isn't in the dir map. Callers
+/// should fall back to [`resolve_basename_to_path`] -- it produces
+/// the right answer for files directly in the watch root and the
+/// wrong answer (but rarely catastrophic) otherwise.
+///
+/// `parent_dev` must already be in glibc encoding -- the same
+/// encoding `pre_open_tree` keyed dir_paths with. BPF callers must
+/// pass `kernel_dev_to_userspace(ev.parent_dev)` (or use the file's
+/// own dev for unlink/rename, since those can't cross filesystems).
+fn resolve_via_parent(
+    ws_dir_paths: &BTreeMap<(u64, u64), PathBuf>,
+    parent_dev: u64,
+    parent_inode: u64,
+    basename: &str,
+) -> Option<String> {
+    let parent = ws_dir_paths.get(&(parent_dev, parent_inode))?;
+    Some(path_to_string(&parent.join(basename)))
 }
 
 /// View into an `lsm/inode_unlink` event as the BPF ringbuf reader
@@ -1307,6 +1555,40 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
 fn path_for_kernel_fd(fd: RawFd) -> Option<PathBuf> {
     let link = format!("/proc/self/fd/{fd}");
     std::fs::read_link(&link).ok()
+}
+
+/// AR01.1 — resolve a known `(dev, inode)` to an absolute path. Tries
+/// the procfs fd-symlink first (instant lookup via the still-held
+/// pre_opened fd) and falls back to a reverse iteration over
+/// `ws.path_to_inode` (slower, but path_to_inode is small per
+/// command -- typically <500 entries -- and only one event per
+/// inode hits this fallback per watch window).
+///
+/// Returns `None` only if both lookups miss. Callers should drop the
+/// event in that case -- emitting `CapturedPreImage` with `path=None`
+/// makes the daemon journal an empty-string path which ConflictMissings
+/// at undo time. Better to lose one event with a tracing breadcrumb
+/// than to journal a corrupted one.
+fn resolve_inode_to_path(ws: &WatchState, dev: u64, inode: u64) -> Option<PathBuf> {
+    if let Some(p) = ws
+        .pre_opens
+        .get(&(dev, inode))
+        .and_then(|f| path_for_kernel_fd(f.as_raw_fd()))
+    {
+        // procfs returns paths suffixed with " (deleted)" for unlinked
+        // files. Trim that so the journal stores a real path; the file
+        // may have been re-created at the same path or we may be
+        // capturing a rename-source whose name we want intact.
+        let s = p.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            return Some(PathBuf::from(stripped));
+        }
+        return Some(p);
+    }
+    ws.path_to_inode
+        .iter()
+        .find(|&(_, &v)| v == (dev, inode))
+        .map(|(k, _)| k.clone())
 }
 
 /// Read pre-image bytes from the kernel-provided fd. fanotify hands
@@ -1639,5 +1921,154 @@ mod tests {
         assert_eq!(kernel_dev_to_userspace(0x800002), 0x802);
         // Identity at major=0: encodings agree.
         assert_eq!(kernel_dev_to_userspace(42), 42);
+    }
+
+    /// AR01.1.fix-pre-open-tree-recursion — `pre_open_tree` must
+    /// recurse into subdirectories so files like `.git/index` get a
+    /// pre-snapshot. Pre-AR01.1 only depth-1 was walked, and every
+    /// nested-dir workload (git, cp -r, etc.) silently lost capture
+    /// for files in subdirs.
+    #[test]
+    fn pre_open_tree_recurses_into_subdirs_and_records_dir_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Mimic a fresh git repo layout.
+        let git = root.join(".git");
+        let objects = git.join("objects");
+        let xx = objects.join("02");
+        std::fs::create_dir_all(&xx).unwrap();
+        std::fs::write(root.join("README.md"), b"top-level").unwrap();
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(git.join("index"), b"index-bytes").unwrap();
+        std::fs::write(xx.join("abc123"), b"blob-bytes").unwrap();
+
+        let mut ws = WatchState {
+            cwd: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let root_dev = std::fs::metadata(root).unwrap().dev();
+        let root_ino = std::fs::metadata(root).unwrap().ino();
+        ws.dir_paths
+            .insert((root_dev, root_ino), root.to_path_buf());
+
+        let mut opened = 0usize;
+        let mut hit_cap = false;
+        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+
+        assert!(!hit_cap, "should not have hit max-files cap");
+        // 4 regular files were created; all should be snapshotted.
+        assert_eq!(opened, 4, "expected 4 files snapshotted, got {opened}");
+        assert_eq!(
+            ws.pre_snapshots.len(),
+            4,
+            "all files should have pre-snapshots"
+        );
+        assert_eq!(ws.pre_opens.len(), 4, "all files should have open fds");
+        // 4 dirs: root, .git, .git/objects, .git/objects/02.
+        // (root was inserted by the caller; pre_open_recurse adds the 3 below.)
+        assert_eq!(
+            ws.dir_paths.len(),
+            4,
+            "expected 4 dirs in dir_paths (root + .git + objects + 02), got {}",
+            ws.dir_paths.len()
+        );
+        // Spot-check: .git/objects/02 should be reachable by (dev, inode).
+        let xx_md = std::fs::metadata(&xx).unwrap();
+        assert_eq!(
+            ws.dir_paths.get(&(xx_md.dev(), xx_md.ino())),
+            Some(&xx),
+            "deepest dir should be registered with its full path"
+        );
+
+        // AR01.1.fix-rename-target-preimage — every regular file must
+        // be in path_to_inode so a future rename-over-this-path
+        // resolves the OLD (dev, inode).
+        assert_eq!(
+            ws.path_to_inode.len(),
+            4,
+            "every opened file should appear in path_to_inode (4 expected), got {:?}",
+            ws.path_to_inode
+        );
+        let index_md = std::fs::metadata(git.join("index")).unwrap();
+        assert_eq!(
+            ws.path_to_inode.get(&git.join("index")),
+            Some(&(index_md.dev(), index_md.ino())),
+            ".git/index should be reverse-indexed for rename-target lookup"
+        );
+    }
+
+    /// AR01.1.fix-path-via-parent-inode — `resolve_via_parent` produces
+    /// the correct nested-dir absolute path, where the prior
+    /// flat-join resolver would have produced `repo/index.lock` for
+    /// git's actual `repo/.git/index.lock`.
+    #[test]
+    fn resolve_via_parent_uses_dir_map() {
+        let mut dir_paths: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+        dir_paths.insert((64, 100), "/tmp/repo".into());
+        dir_paths.insert((64, 200), "/tmp/repo/.git".into());
+        dir_paths.insert((64, 300), "/tmp/repo/.git/objects/02".into());
+
+        // Top-level file: parent is the watch root.
+        assert_eq!(
+            resolve_via_parent(&dir_paths, 64, 100, "README.md").as_deref(),
+            Some("/tmp/repo/README.md")
+        );
+        // Nested under .git/.
+        assert_eq!(
+            resolve_via_parent(&dir_paths, 64, 200, "index.lock").as_deref(),
+            Some("/tmp/repo/.git/index.lock")
+        );
+        // Deeply nested.
+        assert_eq!(
+            resolve_via_parent(&dir_paths, 64, 300, "abc123").as_deref(),
+            Some("/tmp/repo/.git/objects/02/abc123")
+        );
+        // Unknown parent inode → None (caller falls back).
+        assert_eq!(resolve_via_parent(&dir_paths, 64, 999, "missing"), None);
+        // Wrong dev (e.g. submount) → None.
+        assert_eq!(resolve_via_parent(&dir_paths, 65, 100, "README.md"), None);
+    }
+
+    /// AR01.1.fix-pre-open-tree-recursion — depth cap is enforced.
+    /// Files at depth N+1 should NOT be snapshotted when the cap is N.
+    #[test]
+    fn pre_open_tree_honors_depth_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Build a chain root/d1/d2/d3/.../d10/leaf.txt
+        let mut p = root.to_path_buf();
+        for i in 1..=10 {
+            p.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        let leaf = p.join("leaf.txt");
+        std::fs::write(&leaf, b"deep").unwrap();
+
+        let mut ws = WatchState {
+            cwd: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let root_dev = std::fs::metadata(root).unwrap().dev();
+
+        let mut opened = 0usize;
+        let mut hit_cap = false;
+        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+
+        // Depth limit is 8; leaf.txt is at depth 10. Should not be opened.
+        assert_eq!(
+            opened, 0,
+            "leaf at depth 10 must not be opened under depth-8 cap"
+        );
+        // But the chain of dirs up to depth-8 should be registered.
+        assert!(
+            ws.dir_paths.len() >= 7,
+            "expected at least 7 nested dirs in dir_paths, got {}",
+            ws.dir_paths.len()
+        );
+        assert!(
+            ws.dir_paths.len() <= 9,
+            "must not exceed depth limit; got {} dirs",
+            ws.dir_paths.len()
+        );
     }
 }
