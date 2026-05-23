@@ -124,6 +124,34 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  refuse-without-native-delegate:
+    # AR02.5 -- validates the synthesis-fallback branch of the
+    # native-undo-delegation contract: on apt < 3.2 (no native
+    # history-rollback verb), shit undo must apply the synthesized
+    # apt-get remove cleanly, not refuse. ubuntu-24.04 ships
+    # apt 2.7 so the synthesis path is structurally certain here.
+    name: refuse-without-native-delegate smoke (AR02.5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/refuse-without-native-delegate.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refuse-without-native-delegate-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
