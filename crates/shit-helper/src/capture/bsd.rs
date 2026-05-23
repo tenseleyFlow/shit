@@ -537,9 +537,14 @@ impl PumpState {
         // RestoreContent ran before RecreatePath when dir-diff's
         // Unlink got a lower ts than FilePreImage).
         //
-        // The remaining gap — rmdir of the watched root dir itself —
-        // is handled by a dedicated branch in `handle_vnode` for
-        // `(kind=Delete, file_type=Directory)`, not here.
+        // W08: cross-dir `rename(2)` doesn't fire NOTE_DELETE on the
+        // file's fd (the inode isn't unlinked, just reparented) and
+        // NOTE_RENAME is currently a no-op in `handle_vnode`. The
+        // source half of an intra-watch `mv` is therefore silent,
+        // and the planner cannot pair it with the destination Create
+        // to emit a Rename inverse. Documented as W06 territory —
+        // the same cwd-watch-scope expansion that closes `make
+        // install` closes the rename-source-half capture too.
         let _ = &baseline.entries; // kept for the diff above (Create emit)
         // Refresh baseline so subsequent diffs are relative to the
         // post-change state.
