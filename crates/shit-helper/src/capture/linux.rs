@@ -429,30 +429,44 @@ impl LinuxCaptureRuntime {
         // `__gnu_dev_makedev`). Convert before lookup.
         let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
 
-        // AR01.1.fix-path-via-parent-inode — resolve through the
-        // dir-inode map first (correct for files in subdirectories;
-        // e.g. `.git/index.lock`). Fall back to the watch-root resolver
-        // for files directly under cwd and as last-ditch when the
-        // parent dir wasn't in pre_open_tree's recursion (e.g. created
-        // mid-session before our mkdir handler ran). NEVER emit the
-        // literal /proc/<pid>/cwd/... string (Issue #22).
+        // Mark the dedupe entry invalidated up front, regardless of
+        // whether we successfully journal the event below: the unlink
+        // happened on the kernel side, so any future reuse of this
+        // inode (rm-then-recreate within the same watch window) must
+        // re-capture rather than dedupe against the now-stale entry.
+        ws.dedupe.insert(
+            (ev_dev_userspace, ev.inode),
+            DedupeEntry { invalidated: true },
+        );
+
+        // AR01.1.fix-path-via-parent-inode — resolve strictly through
+        // the dir-inode map (populated by pre_open_tree recursion + by
+        // handle_lsm_mkdir as nested dirs are born). For unlink, the
+        // parent's dev == the file's dev (unlink can't cross
+        // filesystems), so reuse the converted file dev.
         //
-        // For unlink, the parent's dev == the file's dev (unlink can't
-        // cross filesystems), so reuse the converted file dev.
-        let resolved_path = resolve_via_parent(
+        // AR01.4 forensics: the watch-root + basename fallback was
+        // ACTIVELY WRONG for nested files when mkdir's userspace handler
+        // raced behind the child's unlink (parent dir_paths entry
+        // not yet populated). The fallback joined `repo/tmp_obj_X`
+        // when the real path was `repo/.git/objects/XX/tmp_obj_X`,
+        // and the planner emitted RecreatePath at the bogus location.
+        // Dropping the event is correct: for top-level files the
+        // resolve_via_parent path hits (the watch root IS in
+        // dir_paths), and for nested files where the parent isn't
+        // in dir_paths the event is unrecoverable. Losing one event
+        // with a tracing breadcrumb beats journaling a corrupted path.
+        let Some(resolved_path) = resolve_via_parent(
             &ws.dir_paths,
             ev_dev_userspace,
             ev.parent_inode,
             ev.basename,
-        )
-        .or_else(|| resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename));
-        let Some(resolved_path) = resolved_path else {
+        ) else {
             tracing::warn!(
                 pid = ev.pid,
+                parent_inode = ev.parent_inode,
                 basename = ev.basename,
-                "lsm unlink: cannot resolve basename to absolute path \
-                 (dir_paths miss AND watch_tree cwd missing AND /proc/<pid>/cwd readlink failed); \
-                 dropping event"
+                "lsm unlink: parent_inode not in dir_paths; dropping event"
             );
             return;
         };
@@ -572,14 +586,9 @@ impl LinuxCaptureRuntime {
             tracing::warn!(error = %e, "lsm send_response failed");
         }
 
-        // Mark dedupe invalidated regardless of race outcome — the
-        // unlink happened, so any subsequent reuse of (dev, inode)
-        // should re-capture. Keyed in glibc-encoded dev for symmetry
-        // with the fanotify producer's dedupe.
-        ws.dedupe.insert(
-            (ev_dev_userspace, ev.inode),
-            DedupeEntry { invalidated: true },
-        );
+        // (Dedupe already invalidated up-front at handler entry, so
+        // we don't need a second insert here -- both paths agree on
+        // the same key + state.)
 
         tracing::info!(
             session = %ev.command.session,
@@ -756,24 +765,24 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_mkdir(&mut self, ev: &LsmMkdirView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // AR01.1.fix-path-via-parent-inode — resolve via the dir map.
-        // Parent_dev arrives in BPF kernel encoding; convert before
-        // lookup. Fall back to the watch-root resolver only when the
-        // parent isn't in dir_paths (would happen if a mid-session
-        // mkdir of an intermediate dir got dropped).
+        // AR01.1.fix-path-via-parent-inode — resolve strictly via the
+        // dir map. Parent_dev arrives in BPF kernel encoding; convert
+        // before lookup. The watch-root + basename fallback was
+        // ACTIVELY WRONG for nested mkdirs (see AR01.4 forensics in
+        // handle_lsm_unlink); drop the event on miss instead.
         let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
-        let resolved_dir_str = resolve_via_parent(
+        let Some(resolved_dir_str) = resolve_via_parent(
             &ws.dir_paths,
             parent_dev_userspace,
             ev.parent_inode,
             ev.basename,
-        )
-        .or_else(|| resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename));
-        let Some(resolved_dir_str) = resolved_dir_str else {
+        ) else {
             tracing::warn!(
                 pid = ev.pid,
+                parent_dev = parent_dev_userspace,
+                parent_inode = ev.parent_inode,
                 basename = ev.basename,
-                "lsm mkdir: cannot resolve basename to absolute path; dropping event"
+                "lsm mkdir: parent_inode not in dir_paths; dropping event"
             );
             return;
         };
@@ -878,23 +887,25 @@ impl LinuxCaptureRuntime {
     pub fn handle_lsm_create(&mut self, ev: &LsmCreateView<'_>) {
         let ws = self.watches.entry(ev.command).or_default();
 
-        // AR01.1.fix-path-via-parent-inode — try the dir map first so
-        // `.git/index.lock`, `.git/objects/XX/YY...`, etc. resolve
-        // through the parent inode chain. Issue #22 — never journal
-        // the literal /proc/<pid>/cwd/... string.
+        // AR01.1.fix-path-via-parent-inode — resolve strictly via the
+        // dir map. AR01.4 forensics: the watch-root + basename fallback
+        // for parent-miss cases produced wrong paths for nested files
+        // (see handle_lsm_unlink for the full incident). Drop on miss
+        // -- the inode + basename are unrecoverable to a real path
+        // without the parent context.
         let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
-        let resolved_path_str = resolve_via_parent(
+        let Some(resolved_path_str) = resolve_via_parent(
             &ws.dir_paths,
             parent_dev_userspace,
             ev.parent_inode,
             ev.basename,
-        )
-        .or_else(|| resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.basename));
-        let Some(resolved_path_str) = resolved_path_str else {
+        ) else {
             tracing::warn!(
                 pid = ev.pid,
+                parent_dev = parent_dev_userspace,
+                parent_inode = ev.parent_inode,
                 basename = ev.basename,
-                "lsm create: cannot resolve basename to absolute path; dropping event"
+                "lsm create: parent_inode not in dir_paths; dropping event"
             );
             return;
         };
@@ -1121,33 +1132,29 @@ impl LinuxCaptureRuntime {
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
-        // AR01.1.fix-path-via-parent-inode — resolve through the
-        // dir-inode map (so renames inside subdirs like `.git/` resolve
-        // correctly). Rename can't cross filesystems, so both parents
-        // share the same dev as the renamed item -- use ev_dev.
-        let from_path =
+        // AR01.1.fix-path-via-parent-inode — resolve strictly via the
+        // dir map. Rename can't cross filesystems, so both parents
+        // share ev_dev. AR01.4 forensics: the watch-root + basename
+        // fallback produced wrong paths for nested files; drop on miss.
+        let Some(from_path) =
             resolve_via_parent(&ws.dir_paths, ev_dev, ev.old_parent_inode, ev.old_basename)
-                .or_else(|| {
-                    resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.old_basename)
-                });
-        let Some(from_path) = from_path else {
+        else {
             tracing::warn!(
                 pid = ev.pid,
+                old_parent_inode = ev.old_parent_inode,
                 basename = ev.old_basename,
-                "lsm rename: cannot resolve old basename to absolute path; dropping event"
+                "lsm rename: old_parent_inode not in dir_paths; dropping event"
             );
             return;
         };
-        let to_path =
+        let Some(to_path) =
             resolve_via_parent(&ws.dir_paths, ev_dev, ev.new_parent_inode, ev.new_basename)
-                .or_else(|| {
-                    resolve_basename_to_path(ws.cwd.as_deref(), ev.pid.into(), ev.new_basename)
-                });
-        let Some(to_path) = to_path else {
+        else {
             tracing::warn!(
                 pid = ev.pid,
+                new_parent_inode = ev.new_parent_inode,
                 basename = ev.new_basename,
-                "lsm rename: cannot resolve new basename to absolute path; dropping event"
+                "lsm rename: new_parent_inode not in dir_paths; dropping event"
             );
             return;
         };
@@ -1341,46 +1348,21 @@ fn kernel_dev_to_userspace(kdev: u64) -> u64 {
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
-/// Resolve `basename` to an absolute path under the watch root.
-///
-/// Resolution order:
-///   1. Watch root (`ws.cwd`) recorded at `pre_open_tree` time --
-///      canonical, survives mutating-pid exit.
-///   2. `readlink(/proc/<pid>/cwd)` -- works while the mutating pid
-///      is alive, races against BPF→ringbuf→handler hop on fast
-///      operations (rm, mv) where the syscall returns before our
-///      handler runs and the shell reaps the subprocess promptly.
-///
-/// Returns `None` when both fail. Callers must drop the event;
-/// emitting the literal `/proc/<pid>/cwd/<basename>` string into the
-/// journal is Issue #22 -- it ENOENT's at undo time once the pid
-/// is gone.
-///
-/// `pid` accepts `i64` so callers with either `i32` (LsmUnlinkView)
-/// or `u32` (Lsm{Create,Mkdir,Rename,Setattr,Open}View) pid fields
-/// can pass through without explicit casts.
-fn resolve_basename_to_path(ws_cwd: Option<&Path>, pid: i64, basename: &str) -> Option<String> {
-    if let Some(cwd) = ws_cwd {
-        return Some(path_to_string(&cwd.join(basename)));
-    }
-    let cwd_link = format!("/proc/{pid}/cwd");
-    std::fs::read_link(&cwd_link)
-        .ok()
-        .map(|cwd| path_to_string(&cwd.join(basename)))
-}
-
-/// AR01.1.fix-path-via-parent-inode — resolve `(parent_dev,
+/// AR01.1.fix-path-via-parent-inode + AR01.4 — resolve `(parent_dev,
 /// parent_inode, basename)` to an absolute path via the dir map
-/// populated by `pre_open_tree` (and `handle_lsm_mkdir` for dirs
-/// born mid-session). This is the correct resolver for nested-dir
-/// workloads: `resolve_basename_to_path` only knows the watch root
-/// and produces paths like `repo/index.lock` when git's actual
-/// target is `repo/.git/index.lock`.
+/// populated by `pre_open_tree` (and `handle_lsm_mkdir` for dirs born
+/// mid-session). This is the ONLY path resolver for LSM events --
+/// the pre-AR01.4 fallback that joined `ws.cwd + basename` when the
+/// parent missed produced ACTIVELY WRONG paths for nested-dir
+/// workloads (sed/git tmp objects under `.git/objects/XX/` came out
+/// as `repo/tmp_obj_X`, and the planner happily emitted RecreatePath
+/// at the bogus location).
 ///
 /// Returns `None` when the parent isn't in the dir map. Callers
-/// should fall back to [`resolve_basename_to_path`] -- it produces
-/// the right answer for files directly in the watch root and the
-/// wrong answer (but rarely catastrophic) otherwise.
+/// MUST drop the event in that case -- emitting at the wrong path
+/// corrupts the journal and causes spurious untracked files post-undo.
+/// The drop is recoverable for transient-lock-pattern workloads (no
+/// inverse needed) and surfaces as a tracing warning for the rest.
 ///
 /// `parent_dev` must already be in glibc encoding -- the same
 /// encoding `pre_open_tree` keyed dir_paths with. BPF callers must
