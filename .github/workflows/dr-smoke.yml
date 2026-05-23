@@ -381,6 +381,12 @@ jobs:
             # the index isn't restored and `git status --porcelain`
             # diverges from the staged state.
             git-commit-undo-linux.sh
+            # AR01.4 — sed -i atomic rename. Exercises the same
+            # inode_rename + fix-rename-target-preimage path as
+            # AR01.1; under fanotify-perm the .lock-target-rename
+            # is invisible so the OLD file's content can't be
+            # captured.
+            sed-i-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
