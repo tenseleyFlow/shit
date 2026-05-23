@@ -529,7 +529,8 @@ jobs:
                     capsicum-default-on-fbsd.sh \
                     git-commit-undo-fbsd.sh \
                     vim-edit-undo-fbsd.sh \
-                    cp-recursive-undo-fbsd.sh"
+                    cp-recursive-undo-fbsd.sh \
+                    sed-inline-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
