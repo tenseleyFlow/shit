@@ -185,6 +185,40 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  dnf-history-undo:
+    # AR02.2 -- validates the dnf native-delegation path: on a Fedora
+    # system, shit undo dispatches to `dnf history undo <id>` instead
+    # of synthesizing `dnf remove`. Skips cleanly on non-dnf systems
+    # (current AR00 runner is Debian-family). AR10.7 tracks adding a
+    # Fedora runner leg.
+    #
+    # Unlike apt-history-rollback (which has the AR02.5 synthesis
+    # counterpart on the same Debian-family runner), AR02.2 has no
+    # synthesis counterpart -- dnf has always had its history verb,
+    # so the runner choice is binary: dnf present (delegation runs)
+    # or absent (skip entirely).
+    name: dnf-history-undo smoke (AR02.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/dnf-history-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnf-history-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
