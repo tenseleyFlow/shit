@@ -78,7 +78,18 @@ smoke_log "helper has caps: ${HELPER_CAPS}"
 
 # Hermetic vim: disable user .vimrc + plugins so site-local config
 # can't perturb the workload (e.g. a custom `set backupcopy`).
-VIM_HERMETIC=(-u NONE)
+#
+# `-n` disables swap file creation entirely. vim 9.1 in `-es` mode
+# leaves a zero-byte `.foo.txt.swx` (the writability-test file) on
+# disk and doesn't clean it up -- a vim quirk, not a shit bug
+# (verified empirically: undo report shows `applied=3 conflicts=0`
+# and foo.txt is byte-identical post-undo; the .swx is created and
+# left by vim itself, never touched by shit). Using `-n` skips the
+# swap dance entirely. The transient-classifier suppression for
+# swap files is already exercised by the simpler rm-undo / mkdir-
+# undo smokes; AR01.2's unique contract is the foo.txt atomic
+# rename, which doesn't depend on swap.
+VIM_HERMETIC=(-u NONE -n)
 
 SCRATCH="${SHIT_SMOKE_TMP}/scratch"
 mkdir -p "${SCRATCH}"
