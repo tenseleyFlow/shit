@@ -152,6 +152,39 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  apt-history-rollback:
+    # AR02.1 -- validates the native-delegation branch of the
+    # native-undo contract: on apt >= 3.2, shit undo dispatches to
+    # `apt-get history-rollback <tx_id>` instead of synthesizing
+    # apt-get remove. Skips cleanly on apt < 3.2 (the AR02.5 leg's
+    # territory). Mutually-exclusive with AR02.5 by apt-version gate;
+    # both should run so whichever leg matches the runner activates.
+    #
+    # Current AR00 runner is ubuntu-24.04 / apt 2.8 so this smoke
+    # always skips today. Written now so it activates automatically
+    # when AR00 gains a debian:trixie or ubuntu:26.04 leg.
+    name: apt-history-rollback smoke (AR02.1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/apt-history-rollback-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apt-history-rollback-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
