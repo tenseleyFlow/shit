@@ -38,24 +38,39 @@
     target_os = "dragonfly",
 ))]
 
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 
-/// Errors surfaced by [`read_pre_image`].
+/// Errors surfaced by [`read_pre_image`] and [`stream_copy_to_staging`].
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("pread(2): {0}")]
     Pread(std::io::Error),
+    #[error("write(2): {0}")]
+    Write(std::io::Error),
+    #[error("openat(2): {0}")]
+    Openat(std::io::Error),
     #[error("fstat(2): {0}")]
     Fstat(std::io::Error),
-    #[error("inode size {0} exceeds in-memory cap (use streaming path)")]
+    #[error("inode size {0} exceeds cap (use streaming path or refuse)")]
     TooLargeForBuffer(u64),
 }
 
 /// Soft cap on in-memory pre-image read size. Files larger than this
-/// should use a streaming path (TODO in S24 — for now, refuse rather
-/// than OOM). 64 MiB matches the project's general "small file"
-/// boundary and is plenty for the rm-undo smoke target.
+/// must use [`stream_copy_to_staging`]. 64 MiB matches the project's
+/// general "small file" boundary; the inline path stays for tiny
+/// files where the per-call allocation is cheaper than the streaming
+/// setup.
 pub const PRE_IMAGE_INLINE_CAP: u64 = 64 * 1024 * 1024;
+
+/// Hard cap on the streaming path's source size. 1 GiB for this
+/// sprint (W07.A.1). The final cap (configurable, surfaced via the
+/// user-visible refusal contract) lands in W07.A.3.
+pub const STREAM_COPY_CAP: u64 = 1024 * 1024 * 1024;
+
+/// Userspace buffer size for the streaming copy. 64 KiB matches
+/// coreutils `cp` and is comfortably below readahead-defeating values
+/// on UFS / ZFS / ext4 / btrfs.
+const STREAM_COPY_CHUNK: usize = 64 * 1024;
 
 /// Read the pre-mutation content of the inode referenced by `fd`.
 ///
@@ -103,6 +118,128 @@ pub fn read_pre_image(fd: RawFd) -> Result<Vec<u8>, CaptureError> {
         offset += n as i64;
     }
     Ok(out)
+}
+
+/// Stream the pre-mutation content of `src_fd` into a fresh staging
+/// file under `staging_dir_fd`, returning an `O_RDONLY` fd ready for
+/// SCM_RIGHTS, the blake3 hash of the data, and the total bytes
+/// copied.
+///
+/// Unlike [`read_pre_image`], this never materializes the file
+/// contents in a userspace `Vec<u8>` — chunks flow src_fd → 64 KiB
+/// userspace buffer → staging_fd, with blake3 incremental hashing
+/// per chunk. Suitable for files up to `cap` (callers should pass
+/// [`STREAM_COPY_CAP`] until the W07.A.3 cap-relax lands).
+///
+/// `src_fd` must be the helper's `O_RDONLY` fd from the subtree walk
+/// (same contract as [`read_pre_image`]). Reads use `pread(2)` so
+/// the fd's seek offset isn't disturbed.
+pub fn stream_copy_to_staging(
+    src_fd: RawFd,
+    staging_dir_fd: RawFd,
+    cap: u64,
+) -> Result<(OwnedFd, [u8; 32], u64), CaptureError> {
+    let size = inode_size(src_fd)?;
+    if size > cap {
+        return Err(CaptureError::TooLargeForBuffer(size));
+    }
+
+    let name = staging_name();
+    let name_c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        CaptureError::Openat(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "staging name NUL",
+        ))
+    })?;
+
+    // Open write handle into staging dir. O_EXCL so we never clobber
+    // a concurrent stream's file; mode 0o600 keeps pre-image content
+    // owner-only.
+    let wflags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // SAFETY: staging_dir_fd alive per caller; name_c is NUL-terminated.
+    let wfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), wflags, 0o600) };
+    if wfd < 0 {
+        return Err(CaptureError::Openat(std::io::Error::last_os_error()));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; STREAM_COPY_CHUNK];
+    let mut offset = 0i64;
+    let target = size as i64;
+
+    while offset < target {
+        let want = ((target - offset) as usize).min(STREAM_COPY_CHUNK);
+        // SAFETY: buf is a writable slice of len >= want; src_fd valid per caller.
+        let n = unsafe { libc::pread(src_fd, buf.as_mut_ptr().cast(), want, offset) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            unsafe { libc::close(wfd) };
+            return Err(CaptureError::Pread(err));
+        }
+        if n == 0 {
+            // File truncated under us between fstat and now. Stop
+            // and ship what we have — symmetric with read_pre_image.
+            break;
+        }
+        let n_usize = n as usize;
+        hasher.update(&buf[..n_usize]);
+
+        let mut written = 0usize;
+        while written < n_usize {
+            // SAFETY: buf valid; wfd valid until we close it below.
+            let wrc = unsafe {
+                libc::write(
+                    wfd,
+                    buf.as_ptr().add(written).cast(),
+                    (n_usize - written) as libc::size_t,
+                )
+            };
+            if wrc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                unsafe { libc::close(wfd) };
+                return Err(CaptureError::Write(err));
+            }
+            written += wrc as usize;
+        }
+        offset += n as i64;
+    }
+
+    // fsync so the daemon's ingest reads a fully-on-disk file.
+    unsafe { libc::fsync(wfd) };
+    unsafe { libc::close(wfd) };
+
+    // Reopen read-only for the SCM_RIGHTS hand-off. Same two-step
+    // pattern as `write_to_staging` in capture/bsd.rs.
+    let rflags = libc::O_RDONLY | libc::O_CLOEXEC;
+    let rfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), rflags, 0) };
+    if rfd < 0 {
+        return Err(CaptureError::Openat(std::io::Error::last_os_error()));
+    }
+
+    use std::os::fd::FromRawFd;
+    let hash = *hasher.finalize().as_bytes();
+    // SAFETY: rfd is a fresh kernel-allocated fd we now own.
+    Ok((unsafe { OwnedFd::from_raw_fd(rfd) }, hash, offset as u64))
+}
+
+/// Unique staging filename. Matches `write_to_staging`'s pattern in
+/// `capture/bsd.rs` (pid + nanos) with a `-stream` suffix so the two
+/// paths never collide in the same staging dir.
+fn staging_name() -> String {
+    format!(
+        "{}-{}-stream",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    )
 }
 
 /// Get the inode's logical size via `fstat(2)`. Used to size the
@@ -230,5 +367,164 @@ mod tests {
         // (Documented limitation; S24 plumbs streaming.)
         // The constant value itself is the more important assertion:
         assert_eq!(PRE_IMAGE_INLINE_CAP, 64 * 1024 * 1024);
+    }
+
+    // ---- W07.A.1: stream_copy_to_staging ----
+
+    /// Open `dir_path` as an `O_DIRECTORY | O_RDONLY` dir fd suitable
+    /// for `openat`. Test-only — production uses the staging dir fd
+    /// already plumbed through `BsdPump`.
+    fn open_dir_fd(dir_path: &std::path::Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir_path.as_os_str().as_bytes()).expect("dir path NUL-free");
+        let flags = libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC;
+        let fd = unsafe { libc::open(c.as_ptr(), flags) };
+        assert!(
+            fd >= 0,
+            "open dir failed: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// Read the entire content of a fd (post-streaming) into a Vec
+    /// via repeated `pread`. Test-only; production never does this.
+    fn read_staging_to_vec(fd: RawFd, expected_len: u64) -> Vec<u8> {
+        let mut out = vec![0u8; expected_len as usize];
+        let mut offset = 0i64;
+        while (offset as u64) < expected_len {
+            let want = expected_len as i64 - offset;
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    out[offset as usize..].as_mut_ptr().cast(),
+                    want as usize,
+                    offset,
+                )
+            };
+            assert!(n > 0, "pread on staging fd: n={n}");
+            offset += n as i64;
+        }
+        out
+    }
+
+    #[test]
+    fn stream_copies_small_file_identically_to_read_pre_image() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("small");
+        let payload = b"hello, streaming pre-image world".repeat(8);
+        std::fs::write(&src, &payload).unwrap();
+        let src_f = std::fs::File::open(&src).unwrap();
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging_dir_fd = open_dir_fd(staging_dir.path());
+
+        let (staging_fd, hash, total) = stream_copy_to_staging(
+            src_f.as_raw_fd(),
+            staging_dir_fd.as_raw_fd(),
+            STREAM_COPY_CAP,
+        )
+        .expect("stream copy");
+
+        assert_eq!(total, payload.len() as u64);
+
+        // Hash matches a known-good blake3 of the same bytes.
+        let expected = *blake3::hash(&payload).as_bytes();
+        assert_eq!(hash, expected, "blake3 mismatch");
+
+        // Round-tripped bytes match.
+        let got = read_staging_to_vec(staging_fd.as_raw_fd(), total);
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn stream_copies_above_inline_cap() {
+        // 100 MiB — bigger than PRE_IMAGE_INLINE_CAP (64 MiB), well
+        // under STREAM_COPY_CAP (1 GiB). Exercises the chunking loop
+        // ~1600 times with 64 KiB chunks. Deterministic bytes so the
+        // expected blake3 is computable on the fly.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("medium");
+        let size = 100 * 1024 * 1024;
+        let mut payload = vec![0u8; size];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add((i >> 8) as u8);
+        }
+        std::fs::write(&src, &payload).unwrap();
+        let src_f = std::fs::File::open(&src).unwrap();
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging_dir_fd = open_dir_fd(staging_dir.path());
+
+        let (staging_fd, hash, total) = stream_copy_to_staging(
+            src_f.as_raw_fd(),
+            staging_dir_fd.as_raw_fd(),
+            STREAM_COPY_CAP,
+        )
+        .expect("stream copy");
+
+        assert_eq!(total, size as u64);
+
+        let expected = *blake3::hash(&payload).as_bytes();
+        assert_eq!(hash, expected, "blake3 mismatch on 100 MiB stream");
+
+        // Verify a sample of the bytes (don't re-hash a 100 MiB vec
+        // here; we already verified via blake3 which is constructive).
+        let got_head = read_staging_to_vec(staging_fd.as_raw_fd(), 64 * 1024);
+        assert_eq!(&got_head, &payload[..64 * 1024]);
+    }
+
+    #[test]
+    fn stream_rejects_above_cap_without_writing() {
+        // Pass a 1 KiB file but cap=512 — function refuses before
+        // opening the staging fd. We verify by checking the staging
+        // dir stays empty.
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("victim");
+        std::fs::write(&src, vec![0u8; 1024]).unwrap();
+        let src_f = std::fs::File::open(&src).unwrap();
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging_dir_fd = open_dir_fd(staging_dir.path());
+
+        let err = stream_copy_to_staging(src_f.as_raw_fd(), staging_dir_fd.as_raw_fd(), 512)
+            .expect_err("cap=512 against 1024-byte file should refuse");
+        match err {
+            CaptureError::TooLargeForBuffer(n) => assert_eq!(n, 1024),
+            other => panic!("expected TooLargeForBuffer, got {other:?}"),
+        }
+
+        // Staging dir should still be empty — no half-staged file.
+        let entries: Vec<_> = std::fs::read_dir(staging_dir.path()).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "staging dir leaked entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn stream_handles_empty_file() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("empty");
+        std::fs::write(&src, b"").unwrap();
+        let src_f = std::fs::File::open(&src).unwrap();
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging_dir_fd = open_dir_fd(staging_dir.path());
+
+        let (_staging_fd, hash, total) = stream_copy_to_staging(
+            src_f.as_raw_fd(),
+            staging_dir_fd.as_raw_fd(),
+            STREAM_COPY_CAP,
+        )
+        .expect("stream copy of empty file");
+
+        assert_eq!(total, 0);
+        assert_eq!(hash, *blake3::hash(b"").as_bytes());
     }
 }

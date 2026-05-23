@@ -40,7 +40,9 @@ pub mod proc;
 pub mod tree;
 pub mod vnode;
 
-pub use capture::{CaptureError, PRE_IMAGE_INLINE_CAP, read_pre_image};
+pub use capture::{
+    CaptureError, PRE_IMAGE_INLINE_CAP, STREAM_COPY_CAP, read_pre_image, stream_copy_to_staging,
+};
 pub use drain::{
     DEFAULT_CAPACITY, DrainError, DrainEvent, DrainHandle, DrainSession, spawn as spawn_drain,
     spawn_default as spawn_drain_default,
