@@ -109,6 +109,24 @@ struct WatchState {
     /// Populated lazily: `handle_lsm_mkdir` also inserts the new dir's
     /// (dev, inode) → path so subsequent nested events resolve.
     dir_paths: BTreeMap<(u64, u64), PathBuf>,
+    /// AR01.3 follow-up: deferred create events whose parent dir
+    /// wasn't yet in `dir_paths` when the handler ran. Per-program
+    /// ringbuf readers run on separate threads serialized via
+    /// `Mutex<runtime>` -- kernel-syscall ordering does NOT guarantee
+    /// userspace dispatch ordering, so under bulk-create workloads
+    /// (cp -r, etc.) handle_lsm_create can win the mutex before
+    /// handle_lsm_mkdir for the same parent. Pre-AR01.3-fix this
+    /// resulted in dropped TreeOpCreate events => files left on disk
+    /// post-undo. The fix queues here, then drains in
+    /// handle_lsm_mkdir's post-stat insert path once the parent
+    /// becomes resolvable.
+    ///
+    /// Keyed by `(parent_dev_userspace, parent_inode)`. Bounded:
+    /// each entry holds the basename + create mode + originating pid;
+    /// max live entries == number of nested files in flight before
+    /// their mkdir handler runs (typically <100 for real workloads).
+    /// Drained at session-close as a safety net.
+    pending_creates: BTreeMap<(u64, u64), Vec<PendingCreate>>,
     /// AR01.1.fix-rename-target-preimage — reverse of `dir_paths` +
     /// regular-file paths: `absolute_path → (dev, inode)`. Populated
     /// by `pre_open_tree` for every opened file and by
@@ -150,6 +168,19 @@ const PRE_OPEN_TREE_MAX_FILES: usize = 512;
 struct PreSnapshot {
     meta: StatMeta,
     bytes: Vec<u8>,
+}
+
+/// AR01.3 follow-up: queued create event waiting for its parent dir
+/// to register in `dir_paths`. Owned-data flavor (basename is `String`)
+/// because we may outlive the BPF ringbuf reader's borrowed buffer.
+#[derive(Debug, Clone)]
+struct PendingCreate {
+    command: CommandId,
+    pid: u32,
+    parent_dev: u64,
+    parent_inode: u64,
+    basename: String,
+    mode: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,7 +247,24 @@ impl LinuxCaptureRuntime {
     /// pre-opened fds; subsequent events for this command's pids
     /// fall through `handle_event` without capture (the TreeMap will
     /// have already removed the pid).
+    ///
+    /// AR01.3 follow-up: any create events still in `pending_creates`
+    /// at session-close never had their parent mkdir resolve. Log
+    /// the unresolved count as a tracing breadcrumb (operator can
+    /// investigate the lost mkdir) and drop them with the rest of
+    /// the WatchState.
     pub fn on_unwatch_tree(&mut self, command: CommandId) {
+        if let Some(ws) = self.watches.get(&command) {
+            let pending = ws.pending_creates.values().map(|v| v.len()).sum::<usize>();
+            if pending > 0 {
+                tracing::warn!(
+                    session = %command.session,
+                    seq = command.seq,
+                    pending,
+                    "unwatch_tree: dropping unresolved pending creates (parent mkdir never landed)"
+                );
+            }
+        }
         self.watches.remove(&command);
     }
 
@@ -836,11 +884,21 @@ impl LinuxCaptureRuntime {
         // (dev, inode) → path so subsequent nested events (e.g. git's
         // `.git/objects/02/abc...` create-then-write into the just-
         // -mkdir'd `02`) resolve correctly. Skip the marker-only case
-        // (dev=0, inode=0); a missing dir_paths entry just means the
-        // fallback resolver gets used, not a hard failure.
-        if dev != 0 {
+        // (dev=0, inode=0); without a real (dev, inode) we can't key
+        // the lookup anyway.
+        //
+        // AR01.3 follow-up: after registering, drain any pending
+        // create events whose parent_inode just became resolvable.
+        // The per-program ringbuf reader race means create handlers
+        // can arrive before their parent's mkdir handler; queue +
+        // drain here ensures every create still gets a TreeOpCreate
+        // journaled.
+        let drained = if dev != 0 {
             ws.dir_paths.insert((dev, inode), resolved_dir.clone());
-        }
+            ws.pending_creates.remove(&(dev, inode)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
@@ -866,8 +924,18 @@ impl LinuxCaptureRuntime {
             inode,
             mode = format_args!("{:o}", ev.mode),
             path = %resolved_dir.display(),
+            drained_pending = drained.len(),
             "lsm-mkdir TreeMutation sent",
         );
+
+        // AR01.3 follow-up: drain any create events that arrived
+        // before this mkdir registered the parent. Each gets a fresh
+        // resolve_via_parent attempt (now guaranteed to hit) and
+        // takes the standard process_lsm_create_resolved path.
+        for pc in drained {
+            let resolved_child = resolved_dir.join(&pc.basename);
+            self.process_lsm_create_resolved(pc.command, pc.pid, resolved_child, pc.mode);
+        }
     }
 
     /// L04 phase 5 — handler for `lsm/inode_create` events.
@@ -894,47 +962,92 @@ impl LinuxCaptureRuntime {
         // -- the inode + basename are unrecoverable to a real path
         // without the parent context.
         let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
-        let Some(resolved_path_str) = resolve_via_parent(
+        let resolved_path_str = match resolve_via_parent(
             &ws.dir_paths,
             parent_dev_userspace,
             ev.parent_inode,
             ev.basename,
-        ) else {
-            tracing::warn!(
-                pid = ev.pid,
-                parent_dev = parent_dev_userspace,
-                parent_inode = ev.parent_inode,
-                basename = ev.basename,
-                "lsm create: parent_inode not in dir_paths; dropping event"
-            );
-            return;
-        };
-        let resolved_path = PathBuf::from(&resolved_path_str);
-
-        // Open + stat. The kernel completed the create by the time
-        // we run (LSM fired pre-create but returned 0; the syscall
-        // proceeded; ringbuf submit + userspace read happens after
-        // syscall completion).
-        let f = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&resolved_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    path = %resolved_path.display(),
-                    "lsm create: post-open failed; dropping"
+        ) {
+            Some(p) => p,
+            None => {
+                // AR01.3 follow-up: per-program ringbuf reader race --
+                // handle_lsm_mkdir for the parent hasn't run yet, so
+                // dir_paths doesn't have the entry. Queue this event;
+                // handle_lsm_mkdir will drain the queue after its
+                // post-stat dir_paths insert. Drop is a last-resort
+                // failure mode (parent mkdir never lands -- session
+                // close drains for safety).
+                tracing::debug!(
+                    pid = ev.pid,
+                    parent_dev = parent_dev_userspace,
+                    parent_inode = ev.parent_inode,
+                    basename = ev.basename,
+                    "lsm create: parent_inode not in dir_paths; queuing for retry"
                 );
+                ws.pending_creates
+                    .entry((parent_dev_userspace, ev.parent_inode))
+                    .or_default()
+                    .push(PendingCreate {
+                        command: ev.command,
+                        pid: ev.pid,
+                        parent_dev: parent_dev_userspace,
+                        parent_inode: ev.parent_inode,
+                        basename: ev.basename.to_string(),
+                        mode: ev.mode,
+                    });
                 return;
             }
         };
-        let (dev, inode, file_type) = match fstat_dev_inode_kind(f.as_raw_fd()) {
+        let resolved_path = PathBuf::from(&resolved_path_str);
+
+        // Note: the `ws` borrow from above goes out of scope at the
+        // call below -- process_lsm_create_resolved re-borrows.
+        self.process_lsm_create_resolved(ev.command, ev.pid, resolved_path, ev.mode);
+    }
+
+    /// AR01.3 follow-up: post-resolve body of `handle_lsm_create`,
+    /// extracted so the `handle_lsm_mkdir` drain path can re-invoke
+    /// it for queued create events whose parent has just registered
+    /// in `dir_paths`.
+    ///
+    /// Open + stat the resolved path (race-loss tolerated via marker-
+    /// only TreeOpCreate), journal the Create event, and on open
+    /// success stash the fd + snapshot + reverse indices + dedupe
+    /// entry. Same semantics as the inline body that lived in
+    /// handle_lsm_create pre-AR01.3.
+    fn process_lsm_create_resolved(
+        &mut self,
+        command: CommandId,
+        pid: u32,
+        resolved_path: PathBuf,
+        mode: u32,
+    ) {
+        // AR01.2 race: for `touch foo; rm foo` style workloads the
+        // userspace handler may race against an immediate unlink --
+        // by the time we open(O_NOFOLLOW), the dentry is gone and
+        // we get ENOENT. We MUST still journal a TreeOpCreate so the
+        // planner can emit an Unlink inverse; otherwise touch-edit
+        // round-trips leave the freshly-created file on disk
+        // post-undo. Marker-only (dev=0, inode=0) for the race-lost
+        // path; same shape `handle_lsm_mkdir` already uses for its
+        // PRE-creation hook visibility race.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&resolved_path)
+            .ok();
+
+        let (dev, inode, file_type) = match opened
+            .as_ref()
+            .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()))
+        {
             Some(t) => t,
             None => {
-                tracing::warn!(path = %resolved_path.display(), "lsm create: fstat failed");
-                return;
+                tracing::warn!(
+                    path = %resolved_path.display(),
+                    "lsm create: post-open/fstat race lost; emitting marker TreeOpCreate (dev=0, inode=0)"
+                );
+                (0, 0, FileType::Regular)
             }
         };
         if file_type != FileType::Regular {
@@ -949,14 +1062,14 @@ impl LinuxCaptureRuntime {
 
         let path_str = path_to_string(&resolved_path);
         let resp = HelperResponse::TreeMutation {
-            session: ev.command.session,
-            seq: ev.command.seq,
+            session: command.session,
+            seq: command.seq,
             op: shit_proto::TreeOpWire::Create {
                 dev,
                 inode,
                 path: path_str.clone(),
                 kind: shit_proto::FileKindWire::Regular,
-                mode: ev.mode,
+                mode,
             },
             ts_unix_nanos: now_unix_nanos(),
         };
@@ -965,46 +1078,35 @@ impl LinuxCaptureRuntime {
             return;
         }
 
-        // L04.1 — snapshot the new file's bytes + meta. For a
-        // freshly-created file these are typically empty + the
-        // create mode, but the snapshot is what later file_open
-        // handlers will use as pre-image (race-free).
-        let fd_raw = f.as_raw_fd();
-        if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
-            ws.pre_snapshots
-                .insert((dev, inode), PreSnapshot { meta, bytes });
+        // If we won the open race, do the L04.1 snapshot + fd-stash.
+        // If we lost (marker-only above), skip — there's no fd to
+        // stash, no bytes to snapshot, and subsequent open/setattr
+        // handlers for inode=0 won't hit the snapshot cache anyway.
+        if let Some(f) = opened {
+            let ws = self.watches.entry(command).or_default();
+            let fd_raw = f.as_raw_fd();
+            if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
+                ws.pre_snapshots
+                    .insert((dev, inode), PreSnapshot { meta, bytes });
+            }
+            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+            // AR01.1.fix-rename-target-preimage — reverse-index so a
+            // later rename-over-this-path resolves the (dev, inode).
+            ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
+            // AR01.1 follow-up: mark this inode dedupe-captured so the
+            // subsequent file_open (for the first write into this newly-
+            // created file) is suppressed.
+            ws.dedupe
+                .insert((dev, inode), DedupeEntry { invalidated: false });
         }
-        // Stash the fd in pre_opens. Subsequent unlink for this
-        // (dev, inode) will hit the table → race_won → pre-image
-        // capture succeeds even if the file was modified mid-session.
-        ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
-        // AR01.1.fix-rename-target-preimage — reverse-index so a
-        // later rename-over-this-path resolves the (dev, inode).
-        ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
-        // AR01.1 follow-up: mark this inode dedupe-captured so the
-        // subsequent file_open (for the first write into this newly-
-        // created file) is suppressed. The pre-snapshot is empty by
-        // definition (file just born), so any FilePreImage emitted
-        // by file_open would either (a) be a useless empty restore,
-        // or (b) race against an imminent rename and journal at the
-        // wrong path (lock files like .git/index.lock get renamed
-        // before file_open's userspace handler resolves /proc/<pid>
-        // /fd/<n>, landing the FilePreImage at the rename DESTINATION
-        // instead of the source). Either way, suppression is correct
-        // -- the TreeOp::Create's inverse Unlink already handles the
-        // mid-session creation under undo. For atomic-rename clobbers,
-        // fix-rename-target-preimage emits the destination's REAL
-        // pre-image via handle_lsm_rename.
-        ws.dedupe
-            .insert((dev, inode), DedupeEntry { invalidated: false });
 
         tracing::info!(
-            session = %ev.command.session,
-            seq = ev.command.seq,
-            pid = ev.pid,
+            session = %command.session,
+            seq = command.seq,
+            pid,
             dev,
             inode,
-            mode = format_args!("{:o}", ev.mode),
+            mode = format_args!("{:o}", mode),
             path = path_str,
             "lsm-create TreeMutation sent + fd stashed in pre_opens",
         );

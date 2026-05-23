@@ -305,8 +305,11 @@ jobs:
         run: |
           # Snapshot has jq / python3 / sqlite3 / libcap2-bin already.
           # apt-get install is a no-op cost when packages are present.
+          # vim-nox: non-X11 vim for AR01.2 (snapshot ships vim-tiny
+          # which lacks the ex-mode `+`-command + `set` features the
+          # smoke needs). Fold into the AR00 snapshot refresh.
           sudo apt-get install -y --no-install-recommends \
-            jq python3 sqlite3 libcap2-bin
+            jq python3 sqlite3 libcap2-bin vim-nox
 
       - name: build release binaries
         run: |
@@ -394,6 +397,11 @@ jobs:
             # (don't trust the orchestrator's remove_dir_all fallback
             # to paper over capture-side bugs).
             cp-r-undo-linux.sh
+            # AR01.2 — vim atomic-rename save dance + transient swap.
+            # Validates the same rename-target-preimage path as AR01.4
+            # under vim's writebackup workflow; classifier must flag
+            # `.foo.txt.swp` / `4913` / `foo.txt~` as transient.
+            vim-edit-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
