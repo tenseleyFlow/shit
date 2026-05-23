@@ -970,6 +970,22 @@ impl LinuxCaptureRuntime {
         // AR01.1.fix-rename-target-preimage — reverse-index so a
         // later rename-over-this-path resolves the (dev, inode).
         ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
+        // AR01.1 follow-up: mark this inode dedupe-captured so the
+        // subsequent file_open (for the first write into this newly-
+        // created file) is suppressed. The pre-snapshot is empty by
+        // definition (file just born), so any FilePreImage emitted
+        // by file_open would either (a) be a useless empty restore,
+        // or (b) race against an imminent rename and journal at the
+        // wrong path (lock files like .git/index.lock get renamed
+        // before file_open's userspace handler resolves /proc/<pid>
+        // /fd/<n>, landing the FilePreImage at the rename DESTINATION
+        // instead of the source). Either way, suppression is correct
+        // -- the TreeOp::Create's inverse Unlink already handles the
+        // mid-session creation under undo. For atomic-rename clobbers,
+        // fix-rename-target-preimage emits the destination's REAL
+        // pre-image via handle_lsm_rename.
+        ws.dedupe
+            .insert((dev, inode), DedupeEntry { invalidated: false });
 
         tracing::info!(
             session = %ev.command.session,
