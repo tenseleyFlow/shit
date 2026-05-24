@@ -156,6 +156,59 @@ mod next {
             >(addr)
         }
     }
+    /// W06.A.1 — `unlinkat(2)`. Modern coreutils (`rm`, `find`, ...)
+    /// prefer the *at variants over the bare `unlink`. Without this,
+    /// LD_PRELOAD'ing the shim against current FreeBSD `rm` produces
+    /// zero notifications.
+    pub fn real_unlinkat() -> unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"unlinkat\0") });
+        unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(c_int, *const c_char, c_int) -> c_int>(
+                addr,
+            )
+        }
+    }
+
+    /// W06.A.1 — `openat(2)`. FreeBSD's `install(1)` uses `openat`,
+    /// not `open`, to create the temp file before atomic-rename.
+    pub fn real_openat() -> unsafe extern "C" fn(c_int, *const c_char, c_int, c_uint) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"openat\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(c_int, *const c_char, c_int, c_uint) -> c_int,
+            >(addr)
+        }
+    }
+
+    /// W06.A.1 — `rename(2)`. `install`'s atomic move into place; also
+    /// the syscall behind `mv` (W08).
+    pub fn real_rename() -> unsafe extern "C" fn(*const c_char, *const c_char) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"rename\0") });
+        unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(*const c_char, *const c_char) -> c_int>(
+                addr,
+            )
+        }
+    }
+
+    /// W06.A.1 — `renameat(2)`. Same as `rename` but with dirfd-relative
+    /// path resolution.
+    pub fn real_renameat()
+    -> unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"renameat\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char) -> c_int,
+            >(addr)
+        }
+    }
+
     /// Return the magic null fn pointer test, used by `disabled()` to
     /// short-circuit when dlsym failed to resolve any symbol. Cheap.
     pub fn is_zero(p: usize) -> bool {
@@ -298,6 +351,7 @@ mod interposers {
     /// `path` must be a valid C string per libc's `unlink(2)` contract.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
+        // W06.A.1 diagnostic — confirms the interposer fired.
         policy::notify_pre_mutation("unlink", &cstr_to_string(path));
         let real = next::real_unlink();
         if next::is_zero(next::as_usize(real)) {
@@ -329,6 +383,88 @@ mod interposers {
             return unsafe { libc::open(path, flags, mode as c_uint) };
         }
         unsafe { real(path, flags, mode) }
+    }
+
+    /// `unlinkat(2)` interposer. W06.A.1 — modern FreeBSD `rm` /
+    /// `find` use `unlinkat` not `unlink`. Without this the shim
+    /// produced zero notifications for typical removals.
+    ///
+    /// # Safety
+    /// `path` must be a valid C string when non-NULL.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flag: c_int) -> c_int {
+        let path_str = cstr_to_string(path);
+        policy::notify_pre_mutation("unlinkat", &path_str);
+        let real = next::real_unlinkat();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::unlinkat(dirfd, path, flag) };
+        }
+        unsafe { real(dirfd, path, flag) }
+    }
+
+    /// `openat(2)` interposer. W06.A.1 — FreeBSD `install(1)` uses
+    /// `openat(AT_FDCWD, temp_path, O_RDWR|O_CREAT|O_EXCL, mode)`
+    /// before the atomic-rename. Notification policy mirrors `open`:
+    /// only on write-mode (`O_WRONLY` / `O_RDWR` / `O_TRUNC`).
+    ///
+    /// # Safety
+    /// `path` must be a valid C string when non-NULL.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn openat(
+        dirfd: c_int,
+        path: *const c_char,
+        flags: c_int,
+        mode: c_uint,
+    ) -> c_int {
+        let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
+        if writes {
+            policy::notify_pre_mutation("openat", &cstr_to_string(path));
+        }
+        let real = next::real_openat();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::openat(dirfd, path, flags, mode as c_uint) };
+        }
+        unsafe { real(dirfd, path, flags, mode) }
+    }
+
+    /// `rename(2)` interposer. W06.A.1 — `install`'s atomic move
+    /// into place; also the syscall behind `mv` (W08).
+    ///
+    /// # Safety
+    /// `from` and `to` must be valid C strings.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
+        // The daemon's `ShimNotification` carries a single `arg`
+        // field; pack `from\tto` so the daemon-side ingest can split
+        // on tab. (W06.A.2 will widen the wire to carry both
+        // independently.)
+        let arg = format!("{}\t{}", cstr_to_string(from), cstr_to_string(to));
+        policy::notify_pre_mutation("rename", &arg);
+        let real = next::real_rename();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::rename(from, to) };
+        }
+        unsafe { real(from, to) }
+    }
+
+    /// `renameat(2)` interposer.
+    ///
+    /// # Safety
+    /// `from` and `to` must be valid C strings.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn renameat(
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+    ) -> c_int {
+        let arg = format!("{}\t{}", cstr_to_string(from), cstr_to_string(to));
+        policy::notify_pre_mutation("renameat", &arg);
+        let real = next::real_renameat();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::renameat(fromfd, from, tofd, to) };
+        }
+        unsafe { real(fromfd, from, tofd, to) }
     }
 
     /// `truncate(2)` interposer.
