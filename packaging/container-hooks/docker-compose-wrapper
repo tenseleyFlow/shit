@@ -25,6 +25,20 @@ fi
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker-compose 2>/dev/null || command -v -- docker-compose)
 [ -n "$real" ] || { echo "shit: real docker-compose not found on PATH" >&2; exit 127; }
 
-# DR-CR-21/26: pre/post hooks via `shit-helper container-event` go
-# here. Stage 1: just exec.
+# DR-CR-53 (AR03.6): pre-capture via `shit-helper container-event`.
+# Routes `docker-compose down` through prepare_compose_down which
+# packs project + compose_file into extras for the daemon-side
+# apply_compose_down to replay via `docker compose up -d`. The v2
+# plugin form (`docker compose down ...`) goes through the docker
+# wrapper, which falls through to classify_compose_argv. Hook-
+# friendly: failure logs and returns 0.
+helper=$(command -v shit-helper 2>/dev/null || true)
+if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
+    echo "shit-hook: docker-compose-wrapper real=${real} helper=${helper:-<not-found>}" >&2
+fi
+if [ -n "$helper" ]; then
+    target_argv=$(printf '%s\n' "$@")
+    "$helper" container-event docker-compose pre --target-argv "$target_argv" || true
+fi
+
 exec "$real" "$@"
