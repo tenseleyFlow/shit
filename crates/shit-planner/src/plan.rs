@@ -28,7 +28,8 @@ use crate::inverse::{
 };
 use crate::probe::StateProbe;
 use crate::store::PlannerStore;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 pub fn plan(
     command: CommandRecord,
@@ -54,8 +55,41 @@ pub fn plan(
     // Reverse-chronological: latest events first.
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.id)));
 
-    for ev in live {
-        emit_for_event(ev, probe, store, &mut nodes, &mut warnings);
+    // W01.B.fix-rename-coalescing — recognize atomic-rename / replace
+    // patterns (git commit, vim :wq, sed -i, etc.) where a single
+    // logical "edit P" produces three events:
+    //   - TreeOp::Create at P (the new inode appears via rename)
+    //   - FilePreImage of P (the OLD inode's bytes, captured before unlink)
+    //   - TreeOp::Unlink at P (the old inode disappears)
+    //
+    // Two semantic flavors of the signature:
+    //   a) ATOMIC REPLACE — path EXISTS at undo time (rename completed,
+    //      different inode lives there). User's mental model is "edit
+    //      P"; inverse is "restore P from FilePreImage blob". Skip the
+    //      Tree-op inverses; keep RestoreContent.
+    //   b) TRANSIENT LOCK — path DOES NOT EXIST at undo time (e.g.
+    //      git's `.git/index.lock` is created, written, renamed-away
+    //      within one command; the captured FilePreImage is of an
+    //      already-gone file). No user-meaningful change to undo.
+    //      Skip all three inverses entirely.
+    let (atomic_replace_paths, transient_paths) = classify_replace_paths(&live, probe);
+
+    for ev in &live {
+        // W01.B.fix-rename-coalescing: skip the entire event if the
+        // path is transient (Create+PreImage+Unlink AND gone at undo).
+        if let Some(p) = event_path(ev)
+            && transient_paths.contains(p)
+        {
+            continue;
+        }
+        emit_for_event(
+            ev,
+            probe,
+            store,
+            &atomic_replace_paths,
+            &mut nodes,
+            &mut warnings,
+        );
     }
 
     // DR-14: partition nodes into cohorts so the orchestrator's
@@ -71,10 +105,131 @@ pub fn plan(
     }
 }
 
+/// Scan events for paths with the Create+PreImage+Unlink signature
+/// and bucket them into:
+///   - `atomic_replace_paths` — path exists at undo time; the
+///     `FilePreImage` inverse restores the original bytes over the
+///     current inode; Tree-op inverses are suppressed.
+///   - `transient_paths` — path does NOT exist at undo time; the
+///     command created+wrote+unlinked it within one logical step
+///     (e.g. a lock file). All inverses are suppressed.
+fn classify_replace_paths(
+    events: &[&CaptureEvent],
+    probe: &dyn StateProbe,
+) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    let mut creates: HashSet<PathBuf> = HashSet::new();
+    let mut unlinks: HashSet<PathBuf> = HashSet::new();
+    let mut pre_images: HashSet<PathBuf> = HashSet::new();
+    let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
+    for ev in events {
+        match &ev.kind {
+            CaptureEventKind::FilePreImage { path, .. } => {
+                pre_images.insert(path.clone());
+            }
+            CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
+                creates.insert(path.clone());
+            }
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }) => {
+                unlinks.insert(path.clone());
+            }
+            // AR01.1 follow-up: the Linux LSM `inode_rename` hook is
+            // emitted by the helper as a single TreeOp::Rename plus a
+            // CapturedPreImage(is_delete=true) for the clobbered
+            // destination -- i.e. PreImage + Unlink on the destination
+            // path with NO accompanying Create. The W01.B classifier
+            // (Create + PreImage + Unlink) missed this shape and the
+            // planner fell through to per-event inverses (RestoreContent +
+            // RecreatePath + ReverseRename) which raced ordering at
+            // apply time and intermittently deleted the destination
+            // outright. Treating the rename's destination identically
+            // to a Create for classification purposes closes the gap.
+            CaptureEventKind::TreeOp(TreeOp::Rename { to, .. }) => {
+                rename_destinations.insert(to.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut atomic = HashSet::new();
+    let mut transient = HashSet::new();
+    for p in creates.iter().chain(rename_destinations.iter()) {
+        if !unlinks.contains(p) {
+            continue;
+        }
+        // Three shapes (two transient, one atomic) for paths with BOTH
+        // Create AND Unlink events in the same command:
+        //   - Create + Unlink, NO pre-image → pure scratch (e.g.
+        //     .git/index.lock that never had prior content). Inverse
+        //     is a no-op.
+        //   - Create + Unlink + pre-image, path GONE at undo → file
+        //     existed, was renamed away, never restored. Same no-op.
+        //   - Create + Unlink + pre-image, path EXISTS at undo →
+        //     atomic-replace: restore bytes over the current inode,
+        //     suppress Tree-op inverses (which would rmdir/recreate
+        //     and conflict with the new inode).
+        if !pre_images.contains(p) {
+            transient.insert(p.clone());
+            continue;
+        }
+        if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
+        } else {
+            transient.insert(p.clone());
+        }
+    }
+    // Additional transient shape: pure TreeOp::Create whose path is
+    // GONE at undo time. The capture layer's rename pairing on BSD
+    // isn't always able to emit TreeOp::Unlink for the rename source
+    // (kqueue races between the two NOTE_WRITE events on the parent
+    // dir — the source disappearance can get coalesced into the
+    // destination's appearance). Without this rule, the planner emits
+    // an Unlink inverse for a path that's already gone, and the
+    // orchestrator reports ConflictMissing at undo time. Real-world
+    // example: git renames .git/index.lock → .git/index; the pump
+    // captures only Create(index.lock), missing its Unlink. The user's
+    // expectation is the lock path stays gone — same as transient.
+    for p in creates {
+        if unlinks.contains(&p) {
+            continue;
+        }
+        if probe.stat(&p).is_none() {
+            transient.insert(p);
+        }
+    }
+    (atomic, transient)
+}
+
+/// Path the event targets (for the event-level skip in the transient
+/// case). Returns `None` for events with no single path (env diffs,
+/// tier ops, Rename which has two paths, Link which targets an inode
+/// not a path). The caller's only use is "is this path in the
+/// transient set?" — non-path events fall through naturally.
+///
+/// **MUST stay aligned with `emit_for_event`'s match arms.** If an
+/// event kind emits an inverse that targets a path, the skip pass
+/// must be able to see that path here — otherwise inverses leak
+/// through for transient paths and the orchestrator hits
+/// ConflictMissing at undo. W02.B surfaced this for MetadataChange:
+/// vim's swap file gets created + a stat captured + unlinked all
+/// in one command, the classifier correctly flagged it transient,
+/// but the skip pass missed the MetadataChange event so a
+/// RestoreMetadata inverse leaked through and tripped ConflictMissing
+/// because the swap path is gone at undo time.
+fn event_path(ev: &CaptureEvent) -> Option<&PathBuf> {
+    match &ev.kind {
+        CaptureEventKind::FilePreImage { path, .. } => Some(path),
+        CaptureEventKind::MetadataChange { path, .. } => Some(path),
+        CaptureEventKind::TreeOp(TreeOp::Create { path, .. })
+        | CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. })
+        | CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. }) => Some(path),
+        _ => None,
+    }
+}
+
 fn emit_for_event(
     ev: &CaptureEvent,
     probe: &dyn StateProbe,
     store: &dyn PlannerStore,
+    atomic_replace_paths: &HashSet<PathBuf>,
     nodes: &mut Vec<PlanNode>,
     warnings: &mut Vec<PlanWarning>,
 ) {
@@ -86,7 +241,22 @@ fn emit_for_event(
             meta,
             post_content_hash,
         } => {
-            let mut conflict = file_path_conflict(path, *inode, probe);
+            // W01.B.fix-rename-coalescing: skip the inode-match check
+            // for atomic-replace paths. The captured inode IS supposed
+            // to differ from what's on disk now — that's the signature.
+            // We still check existence (Missing branch) below by
+            // re-probing.
+            let mut conflict = if atomic_replace_paths.contains(path) {
+                if probe.stat(path).is_none() {
+                    Some(Conflict::Missing {
+                        detail: format!("{} no longer exists", path.display()),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                file_path_conflict(path, *inode, probe)
+            };
             if conflict.is_none() && store.blob_size_hint(*blob).is_none() {
                 conflict = Some(Conflict::Missing {
                     detail: format!("blob {blob} no longer in store (GC'd or evicted)"),
@@ -145,7 +315,7 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, nodes),
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, atomic_replace_paths, nodes),
         CaptureEventKind::EnvDiff {
             added,
             removed,
@@ -379,16 +549,11 @@ fn emit_for_event(
             // event to the executor-side ContainerRestore InverseOp.
             // The helper subcommand already snapshotted state +
             // registered the stash; the planner's job here is purely
-            // to forward the descriptors. The executor (container.rs)
-            // does the docker load / docker volume create + tar
-            // extract / docker network create / docker compose up
-            // dispatch per op variant.
+            // to forward the descriptors.
             //
-            // Rm specifically: stage-1 informational per DR-CR-22 --
-            // the executor returns Skipped with a deferral note until
-            // full inverse synthesis from inspect JSON lands. We still
-            // emit the InverseOp so it surfaces in `shit show` with
-            // the captured config rendered.
+            // Rm specifically: requires_confirmation=true since
+            // DR-CR-22's full inverse synthesis from inspect JSON is
+            // still deferred (stage-1 informational per C04.5).
             nodes.push(PlanNode {
                 op: InverseOp::ContainerRestore {
                     runtime: *runtime,
@@ -485,9 +650,21 @@ fn native_delegation_for(
     }
 }
 
-fn emit_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec<PlanNode>) {
+fn emit_for_tree_op(
+    op: &TreeOp,
+    probe: &dyn StateProbe,
+    atomic_replace_paths: &HashSet<PathBuf>,
+    nodes: &mut Vec<PlanNode>,
+) {
     match op {
         TreeOp::Create { path, .. } => {
+            // W01.B.fix-rename-coalescing: if this path was atomically
+            // replaced (Create + PreImage + Unlink all observed for one
+            // logical edit), the FilePreImage's RestoreContent handles
+            // the full undo. Emitting an Unlink here would race with it.
+            if atomic_replace_paths.contains(path) {
+                return;
+            }
             // The user's command created this path; inverse is unlink.
             // Phantom conflict if the path was *deleted* since capture
             // (an unlink of a non-existent path will succeed-or-noop).
@@ -504,6 +681,11 @@ fn emit_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec<PlanNod
             });
         }
         TreeOp::Unlink { path, .. } => {
+            // W01.B.fix-rename-coalescing: ditto Create's note above —
+            // atomic-replace paths get their inverse from FilePreImage.
+            if atomic_replace_paths.contains(path) {
+                return;
+            }
             // The user's command deleted this path; we want to recreate it.
             // We don't know mode/kind from the unlink alone — those come from
             // a paired FilePreImage / FileMetadata. Recreate with conservative
@@ -522,6 +704,22 @@ fn emit_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec<PlanNod
             });
         }
         TreeOp::Rename { from, to, .. } => {
+            // AR01.1 follow-up: if the rename's destination is in
+            // atomic_replace_paths (Rename + PreImage + Unlink + path
+            // present at undo), the FilePreImage's RestoreContent
+            // overwrites the destination with the OLD content -- a
+            // ReverseRename here would race with that and either
+            // un-clobber to the source side (leaving an orphan at
+            // `from`) OR delete the destination outright if the
+            // RestoreContent applies first. The atomic-replace path
+            // doesn't need the rename inverse: the source side is
+            // a transient lock file whose Create + Unlink already
+            // classify as transient (no inverse) and whose path is
+            // gone at undo time anyway. Same suppression principle as
+            // TreeOp::Create above.
+            if atomic_replace_paths.contains(to) {
+                return;
+            }
             // Inverse of `from -> to` is `to -> from`.
             nodes.push(PlanNode {
                 op: InverseOp::Rename {
@@ -859,6 +1057,377 @@ mod tests {
         assert!(matches!(p.nodes[0].op, InverseOp::RecreatePath { .. }));
         assert!(matches!(p.nodes[1].op, InverseOp::RestoreContent { .. }));
         assert!(matches!(p.nodes[2].op, InverseOp::RestoreMetadata { .. }));
+    }
+
+    #[test]
+    fn atomic_rename_coalesces_to_single_restore() {
+        // W01.B.fix-rename-coalescing — the signature is:
+        //   TreeOp::Create at P (new inode appears via rename)
+        //   FilePreImage of P (OLD inode bytes, captured pre-unlink)
+        //   TreeOp::Unlink at P (old inode disappears)
+        // The user wrote "modify P"; the inverse is just RestoreContent(P).
+        // We must NOT emit Unlink (from Create) or RecreatePath (from
+        // Unlink) for that path — they'd race with RestoreContent and
+        // trip the orchestrator's precondition_conflict.
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let old_inode = InodeRef::new(1, 100);
+        let new_inode = InodeRef::new(1, 200);
+        let path = PathBuf::from("/tmp/atomic-replace");
+        // Current state on disk: the NEW inode lives at the path
+        // (mirrors what's on disk after the user's atomic-rename).
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: new_inode,
+                meta: meta(60),
+            },
+            None,
+        );
+        let blob = BlobHash::from_bytes([0xCC; 32]);
+        store.put_blob(blob, 42);
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: new_inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let pre = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: old_inode,
+                path: path.clone(),
+                blob,
+                meta: meta(50),
+                post_content_hash: None,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: old_inode,
+                path: path.clone(),
+            }),
+        };
+        let p = plan(dummy_command(), &[create, pre, unlink], &probe, &store);
+
+        // Expect ONLY RestoreContent + RestoreMetadata (from FilePreImage).
+        // NO Unlink (from Create) and NO RecreatePath (from Unlink).
+        let has_restore_content = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::RestoreContent { .. }));
+        let has_restore_metadata = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. }));
+        let has_unlink = p.nodes.iter().any(|n| matches!(&n.op, InverseOp::Unlink { path: p } if p == &PathBuf::from("/tmp/atomic-replace")));
+        let has_recreate = p.nodes.iter().any(|n| matches!(&n.op, InverseOp::RecreatePath { path: p, .. } if p == &PathBuf::from("/tmp/atomic-replace")));
+
+        assert!(has_restore_content, "RestoreContent inverse missing");
+        assert!(has_restore_metadata, "RestoreMetadata inverse missing");
+        assert!(
+            !has_unlink,
+            "atomic-replace path should NOT get a Unlink inverse"
+        );
+        assert!(
+            !has_recreate,
+            "atomic-replace path should NOT get a RecreatePath inverse"
+        );
+        assert!(
+            !p.has_blocking_conflicts(),
+            "plan should not have blocking conflicts"
+        );
+    }
+
+    #[test]
+    fn lsm_rename_target_clobber_coalesces_to_single_restore() {
+        // AR01.1 follow-up — the Linux LSM `inode_rename` hook
+        // produces a different shape than BSD kqueue:
+        //   TreeOp::Rename(.lock -> P)           (existing rename emit)
+        //   FilePreImage of P (OLD inode bytes)  (fix-rename-target-preimage)
+        //   TreeOp::Unlink at P (OLD inode)      (is_delete=true paired)
+        // i.e. PreImage + Unlink on the destination path with NO
+        // Create. The W01.B classifier missed this and the planner
+        // emitted RestoreContent + RecreatePath + ReverseRename, all
+        // three of which raced ordering and intermittently deleted P
+        // outright (PR #29 forensics). Treating the rename's
+        // destination identically to a Create for classification
+        // purposes closes the gap: classify_replace_paths buckets
+        // P as atomic_replace, and the Rename + Unlink inverses get
+        // suppressed.
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let old_inode = InodeRef::new(1, 100);
+        let new_inode = InodeRef::new(1, 200);
+        let dest = PathBuf::from("/tmp/.git/HEAD");
+        let src = PathBuf::from("/tmp/.git/HEAD.lock");
+        // Current on-disk state: NEW inode lives at the destination
+        // (post-rename) and the source path is gone.
+        probe.insert(
+            dest.clone(),
+            ProbeStat {
+                inode: new_inode,
+                meta: meta(60),
+            },
+            None,
+        );
+        let blob = BlobHash::from_bytes([0xDD; 32]);
+        store.put_blob(blob, 42);
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let pre = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: old_inode,
+                path: dest.clone(),
+                blob,
+                meta: meta(50),
+                post_content_hash: None,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: old_inode,
+                path: dest.clone(),
+            }),
+        };
+        let rename = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                inode: new_inode,
+                from: src.clone(),
+                to: dest.clone(),
+            }),
+        };
+        let p = plan(dummy_command(), &[pre, unlink, rename], &probe, &store);
+
+        // Expect ONLY RestoreContent + RestoreMetadata for the dest.
+        // The Unlink and Rename inverses must be suppressed.
+        let has_restore_content = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if path == &dest));
+        let has_recreate = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RecreatePath { path, .. } if path == &dest));
+        let has_reverse_rename = p.nodes.iter().any(
+            |n| matches!(&n.op, InverseOp::Rename { from, to } if from == &dest && to == &src),
+        );
+        assert!(has_restore_content, "RestoreContent inverse missing");
+        assert!(
+            !has_recreate,
+            "rename-destination atomic-replace must NOT emit RecreatePath inverse"
+        );
+        assert!(
+            !has_reverse_rename,
+            "rename-destination atomic-replace must NOT emit ReverseRename inverse"
+        );
+        assert!(
+            !p.has_blocking_conflicts(),
+            "plan should not have blocking conflicts"
+        );
+    }
+
+    #[test]
+    fn transient_lock_pattern_suppresses_all_inverses() {
+        // Signature: TreeOp::Create + FilePreImage + TreeOp::Unlink
+        // for one path, AND the path is gone at undo time. Real-world
+        // example: git's `.git/index.lock` — created, written,
+        // renamed-away within one command. The user has no
+        // meaningful state to undo here. We should produce ZERO
+        // inverses for this path.
+        let probe = InMemoryProbe::new(); // NOTE: path NOT inserted.
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 333);
+        let path = PathBuf::from("/tmp/git/index.lock");
+        let blob = BlobHash::from_bytes([0xDD; 32]);
+        store.put_blob(blob, 0);
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let pre = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: path.clone(),
+                blob,
+                meta: meta(50),
+                post_content_hash: None,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+            }),
+        };
+        let p = plan(dummy_command(), &[create, pre, unlink], &probe, &store);
+
+        let nodes_for_path: Vec<_> = p
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(&n.op,
+                    InverseOp::RestoreContent { path: p, .. }
+                    | InverseOp::RestoreMetadata { path: p, .. }
+                    | InverseOp::Unlink { path: p }
+                    | InverseOp::RecreatePath { path: p, .. }
+                    if p == &PathBuf::from("/tmp/git/index.lock")
+                )
+            })
+            .collect();
+        assert!(
+            nodes_for_path.is_empty(),
+            "transient lock should produce zero inverses, got: {:?}",
+            nodes_for_path.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scratch_file_no_preimage_suppresses_inverses() {
+        // A file created AND unlinked in the same command with NO
+        // pre-image (it never existed before): the inverse is a no-op.
+        // Real-world example: git creates `.git/index.lock` as a
+        // brand-new file then renames it onto `.git/index`. The lock
+        // path itself has no pre-existing content to restore — the
+        // planner used to emit Unlink+RecreatePath, the latter
+        // tripping ConflictMissing because we have no bytes for it.
+        let probe = InMemoryProbe::new(); // path absent at undo
+        let store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 999);
+        let path = PathBuf::from("/tmp/git/index.lock");
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let unlink = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+            }),
+        };
+        let p = plan(dummy_command(), &[create, unlink], &probe, &store);
+        let nodes_for_path: Vec<_> = p
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(&n.op,
+                    InverseOp::Unlink { path: p } | InverseOp::RecreatePath { path: p, .. }
+                    if p == &PathBuf::from("/tmp/git/index.lock")
+                )
+            })
+            .collect();
+        assert!(
+            nodes_for_path.is_empty(),
+            "scratch file with no pre-image should produce zero inverses, got: {:?}",
+            nodes_for_path.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pure_create_still_gets_unlink_inverse() {
+        // Coalescing should ONLY trigger when the path is also gone
+        // at undo time. A pure TreeOp::Create whose path STILL EXISTS
+        // (the command genuinely created something that survived)
+        // keeps its Unlink inverse.
+        let inode = InodeRef::new(1, 42);
+        let path = PathBuf::from("/tmp/newdir");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let store = InMemoryStore::new();
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Directory,
+                mode: 0o040755,
+            }),
+        };
+        let p = plan(dummy_command(), &[create], &probe, &store);
+        assert!(matches!(p.nodes[0].op, InverseOp::Unlink { .. }));
     }
 
     #[test]
