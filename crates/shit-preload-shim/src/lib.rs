@@ -336,14 +336,114 @@ mod policy {
     /// here, but `set_read_timeout` on a `UnixStream` gives the same
     /// allow-on-timeout property.
     pub fn notify_pre_mutation(syscall: &'static str, arg: &str) {
+        notify_inner(syscall, arg, None);
+    }
+
+    /// W06.A.4: notify the daemon AND attach a pre-image payload (file
+    /// bytes + metadata) for content-mutating syscalls. The shim
+    /// reads up to [`shit_proto::SHIM_INLINE_PREIMAGE_CAP`] bytes
+    /// from `path` and ships them inline in the notification.
+    ///
+    /// `path` is what gets captured — for path-based syscalls
+    /// (`open`/`openat`/`truncate`) it's the same as the wire arg;
+    /// for `rename`/`renameat` it's the **destination** (which is
+    /// what gets atomically replaced).
+    ///
+    /// Cases where the pre-image will be absent (file doesn't exist,
+    /// exceeds cap, read fails) still ship the notification with
+    /// `pre_image=None`; the daemon decides how to journal it.
+    pub fn notify_pre_mutation_with_content(syscall: &'static str, path: &str) {
+        notify_inner(syscall, path, Some(path));
+    }
+
+    /// W06.A.4 rename/renameat variant: the wire `arg` is `from\tto`
+    /// but the pre-image target is `to` (the destination — rename
+    /// atomically overwrites its content). When `to` doesn't exist
+    /// (clean-prefix install / mv to new path), `pre_image` ends up
+    /// `None` and the planner falls back to ReverseRename. When `to`
+    /// pre-exists (install over an existing file), the captured bytes
+    /// drive a RestoreContent inverse instead.
+    pub fn notify_rename_with_dst_preimage(syscall: &'static str, from: &str, to: &str) {
+        let arg = format!("{from}\t{to}");
+        notify_inner(syscall, &arg, Some(to));
+    }
+
+    /// Recursion guard for the notify path. The pre-image-capture
+    /// branch reads the target file via `libc::open`/`libc::read`,
+    /// which on first-load lookups *does* go through our `open`
+    /// interposer (since the shim's `next::real_open` cache may not
+    /// be primed yet for the first call). Without this guard the
+    /// reentrant `open` would call `try_notify` → open the file
+    /// again → ... and either deadlock the daemon's per-conn task or
+    /// blow the stack. Thread-local because each thread is its own
+    /// independent caller; flipping a process-wide AtomicBool would
+    /// serialize parallel `make -j` callers.
+    thread_local! {
+        static IN_NOTIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn notify_inner(syscall: &'static str, arg: &str, capture_path: Option<&str>) {
         if disabled() {
             return;
         }
-        let _ = try_notify(syscall, arg);
+        if IN_NOTIFY.with(|f| f.replace(true)) {
+            // Re-entrant call (we're already inside notify on this
+            // thread — almost always the pre-image read's `open(2)`
+            // hitting our own interposer). Skip both the notification
+            // AND the pre-image capture; the outer notification covers
+            // the user-visible mutation.
+            return;
+        }
+        let pre_image = capture_path.and_then(capture_pre_image);
+        let _ = try_notify(syscall, arg, pre_image);
+        IN_NOTIFY.with(|f| f.set(false));
     }
 
-    fn try_notify(syscall: &'static str, arg: &str) -> std::io::Result<()> {
-        use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_frame};
+    /// Read `path` into a [`ShimPreImage`] payload, capped at
+    /// [`shit_proto::SHIM_INLINE_PREIMAGE_CAP`]. Returns `None` if the
+    /// path doesn't exist (e.g. `open(O_CREAT|O_EXCL)` against a new
+    /// file), is not a regular file (device nodes, fifos), exceeds
+    /// the inline cap, or the read fails.
+    fn capture_pre_image(path: &str) -> Option<shit_proto::ShimPreImage> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let size = meta.size();
+        if size > shit_proto::SHIM_INLINE_PREIMAGE_CAP {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        // Resolve to an absolute path so the daemon sees the same
+        // identity regardless of the caller's cwd. `canonicalize`
+        // follows symlinks; we'd rather emit the path the user saw,
+        // so fall back to the original string on failure.
+        let resolved = std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| path.to_string());
+        Some(shit_proto::ShimPreImage {
+            path: resolved,
+            dev: meta.dev(),
+            inode: meta.ino(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            size,
+            mtime_unix_nanos: meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128,
+            bytes,
+        })
+    }
+
+    fn try_notify(
+        syscall: &'static str,
+        arg: &str,
+        pre_image: Option<shit_proto::ShimPreImage>,
+    ) -> std::io::Result<()> {
+        use shit_proto::{
+            ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
+        };
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, SystemTime};
@@ -362,14 +462,23 @@ mod policy {
         // SAFETY: shim runs in arbitrary user processes; getpid is a
         // syscall, not an interposer target, so this is safe.
         let pid = unsafe { libc::getpid() } as u32;
+        let has_pre = pre_image.is_some();
         let note = ShimNotification {
             pid,
             syscall: syscall.to_string(),
             arg: arg.to_string(),
             ts_unix_nanos: now,
+            pre_image,
         };
-        let frame =
-            encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
+        // Pre-image notifications can carry up to ~256 KiB of bytes;
+        // small notifications fit MAX_FRAME_SIZE comfortably. Use the
+        // large-frame encoder uniformly — the cap is the only
+        // difference, and the daemon's reader matches.
+        let frame = if has_pre {
+            encode_frame_large(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
+        } else {
+            encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
+        };
         stream.write_all(&frame)?;
 
         // Best-effort ack read. We don't actually act on the ack today
@@ -438,7 +547,11 @@ mod interposers {
     pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
         let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
         if writes {
-            policy::notify_pre_mutation("open", &cstr_to_string(path));
+            // W06.A.4: open(..., O_TRUNC|O_WRONLY|O_RDWR) on an existing
+            // file is the canonical content-overwrite shape (e.g.
+            // `install -m … src dst` where dst already exists). Capture
+            // the pre-image so undo can restore.
+            policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
         }
         let real = next::real_open();
         if next::is_zero(next::as_usize(real)) {
@@ -480,7 +593,9 @@ mod interposers {
     ) -> c_int {
         let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
         if writes {
-            policy::notify_pre_mutation("openat", &cstr_to_string(path));
+            // W06.A.4: same content-overwrite shape as `open` —
+            // capture pre-image bytes when the target exists.
+            policy::notify_pre_mutation_with_content("openat", &cstr_to_string(path));
         }
         let real = next::real_openat();
         if next::is_zero(next::as_usize(real)) {
@@ -496,12 +611,16 @@ mod interposers {
     /// `from` and `to` must be valid C strings.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int {
-        // The daemon's `ShimNotification` carries a single `arg`
-        // field; pack `from\tto` so the daemon-side ingest can split
-        // on tab. (W06.A.2 will widen the wire to carry both
-        // independently.)
-        let arg = format!("{}\t{}", cstr_to_string(from), cstr_to_string(to));
-        policy::notify_pre_mutation("rename", &arg);
+        // W06.A.4: install(1) / mv use rename to atomically replace
+        // the destination's content. Capture pre-image of `to` (when
+        // it exists) so the planner can RestoreContent rather than
+        // ReverseRename (which would leave dst empty + content stuck
+        // at the source tmpfile path).
+        policy::notify_rename_with_dst_preimage(
+            "rename",
+            &cstr_to_string(from),
+            &cstr_to_string(to),
+        );
         let real = next::real_rename();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::rename(from, to) };
@@ -520,8 +639,13 @@ mod interposers {
         tofd: c_int,
         to: *const c_char,
     ) -> c_int {
-        let arg = format!("{}\t{}", cstr_to_string(from), cstr_to_string(to));
-        policy::notify_pre_mutation("renameat", &arg);
+        // W06.A.4: same atomic-replace shape as `rename` — capture
+        // pre-image of the destination.
+        policy::notify_rename_with_dst_preimage(
+            "renameat",
+            &cstr_to_string(from),
+            &cstr_to_string(to),
+        );
         let real = next::real_renameat();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::renameat(fromfd, from, tofd, to) };
@@ -535,7 +659,9 @@ mod interposers {
     /// `path` must be a valid C string.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn truncate(path: *const c_char, len: off_t) -> c_int {
-        policy::notify_pre_mutation("truncate", &cstr_to_string(path));
+        // W06.A.4: truncate(path, 0) before re-writing is a common
+        // overwrite shape; capture pre-image to enable undo.
+        policy::notify_pre_mutation_with_content("truncate", &cstr_to_string(path));
         let real = next::real_truncate();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::truncate(path, len) };
