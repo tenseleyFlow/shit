@@ -54,12 +54,15 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
 /// so the test works after either `cargo build` or `cargo build
 /// --release`.
 fn shim_so_path() -> std::path::PathBuf {
+    // Release paths first — debug builds default to many codegen
+    // units which silently drops `.symver` aliases (see the
+    // fallback-build comment below). Probing release first means
+    // we validate the artifact that actually ships, even when a
+    // stale debug build exists alongside.
     let candidates = [
         // Crate-rooted (default `cargo test -p shit-preload-shim`)
-        "../../target/debug/libshit_preload_shim.so",
         "../../target/release/libshit_preload_shim.so",
         // Workspace-rooted (CI `cargo test --workspace`)
-        "target/debug/libshit_preload_shim.so",
         "target/release/libshit_preload_shim.so",
     ];
     if let Some(p) = candidates
@@ -69,17 +72,28 @@ fn shim_so_path() -> std::path::PathBuf {
     {
         return p.canonicalize().unwrap_or(p);
     }
-    // Fallback: trigger a debug build of the cdylib and re-probe.
+    // Fallback: trigger a RELEASE build of the cdylib and re-probe.
     // `cargo test --workspace` doesn't auto-build cdylib outputs,
-    // so this is the lightest-touch way to guarantee the
-    // artifact exists when the test runs in CI without a prior
-    // explicit `cargo build`.
-    eprintln!("symver test: cdylib not yet built; running `cargo build -p shit-preload-shim`");
+    // so the artifact may not yet exist when this test runs.
+    //
+    // Why `--release` specifically: debug builds default to many
+    // codegen units, which causes the `.symver` directives in
+    // `core::arch::global_asm!` to land in a different codegen
+    // unit than the function they alias. The linker doesn't
+    // associate the alias and the dynsym ends up without
+    // version tags. Release uses `codegen-units = 1` (workspace
+    // setting), keeping the assembly and the function in one
+    // unit so the `.symver` actually sticks. The shim only ever
+    // ships its release artifact, so validating release is the
+    // load-bearing check.
+    eprintln!(
+        "symver test: cdylib not yet built; running `cargo build --release -p shit-preload-shim`"
+    );
     let status = Command::new("cargo")
-        .args(["build", "-p", "shit-preload-shim"])
+        .args(["build", "--release", "-p", "shit-preload-shim"])
         .status()
         .expect("`cargo` must be on PATH");
-    assert!(status.success(), "fallback `cargo build` failed");
+    assert!(status.success(), "fallback `cargo build --release` failed");
     candidates
         .iter()
         .map(std::path::PathBuf::from)
