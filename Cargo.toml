@@ -71,6 +71,16 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 
+# W06.A.2 — preserve `.gnu.version` per-symbol entries on
+# shit-preload-shim. `strip = "symbols"` translates to lld's
+# `--strip-all` which would remove the symbol→version mapping
+# emitted by the `.symver` directives in the shim's lib.rs.
+# Stripping debug info is fine; stripping the version mapping
+# silently disables the LD_PRELOAD substitution against versioned
+# libc symbols (e.g. `open@FBSD_1.0`).
+[profile.release.package.shit-preload-shim]
+strip = "debuginfo"
+
 [profile.dev]
 opt-level = 0
 debug = true
