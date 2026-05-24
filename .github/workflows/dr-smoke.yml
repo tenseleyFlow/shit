@@ -289,6 +289,40 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  docker-network-rm-undo:
+    # AR03.4 -- validates the NetworkRm capture + restore path.
+    # `docker network rm <net>` ships the `docker network inspect`
+    # JSON as captured_config (small, no tarball, no inline-bytes
+    # path); `shit undo` parses the JSON via synthesize_network_create
+    # and runs `docker network create --driver <D> --subnet <S> <name>`
+    # to recreate with the captured IPAM. Asserts the restored
+    # network has the same subnet.
+    name: docker-network-rm-undo smoke (AR03.4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: docker preflight
+        run: |
+          docker version
+          docker info --format '{{.ServerVersion}}'
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/docker-network-rm-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-network-rm-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
