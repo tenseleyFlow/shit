@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use shit_proto::{
     ContainerEventReq, ContainerRuntimeWire, ContainerVerbWire, CtlRequest, CtlResponse,
-    decode_frame, encode_frame,
+    decode_frame, encode_frame_large,
 };
 
 use super::docker::{DockerVerb, classify_docker_argv};
@@ -370,8 +370,14 @@ fn send_event(path: &Path, req: &ContainerEventReq) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(CTL_TIMEOUT))?;
     stream.set_write_timeout(Some(CTL_TIMEOUT))?;
-    let frame = encode_frame(&CtlRequest::ContainerEvent(req.clone()))?;
+    // ContainerEvent carries tarball bytes (alpine ~5 MB, distroless
+    // ~20 MB) — well over MAX_FRAME_SIZE. encode_frame_large uses the
+    // 64 MiB cap that matches our INLINE_TARBALL_MAX_BYTES. The
+    // daemon ctl reader peeks the length prefix first and grows the
+    // buffer when it sees a large frame.
+    let frame = encode_frame_large(&CtlRequest::ContainerEvent(req.clone()))?;
     stream.write_all(&frame)?;
+    // Ack is small; the standard MAX_FRAME_SIZE-sized buffer suffices.
     let mut buf = vec![0u8; 64 * 1024];
     let n = stream.read(&mut buf)?;
     let resp: CtlResponse = decode_frame(&buf[..n])?;
