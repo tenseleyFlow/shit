@@ -295,6 +295,18 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        CaptureEventKind::TerraformOp { op, .. } => {
+            // Same shape as ContainerOp: forward replay would mean
+            // re-running `terraform apply` / `destroy`, which the
+            // user's shell history covers. Informational only.
+            warnings.push(PlanWarning::Informational {
+                tier: InverseTier::Cloud,
+                message: format!(
+                    "terraform op {op:?} captured; `shit redo` does not re-issue \
+                     cloud destructive verbs (re-run the original command if intended)"
+                ),
+            });
+        }
     }
 }
 

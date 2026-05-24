@@ -172,6 +172,21 @@ pub enum CaptureEventKind {
         /// Populated by Rmi (image save) and VolumeRm (volume tar).
         stash_tarball: Option<BlobHash>,
     },
+    /// AR04 PR-A (DR-CR-06 cloud / IaC capture). The helper-side
+    /// cloud-event wrapper (terraform / kubectl / gh / aws) shipped
+    /// a captured pre-state snapshot. The orchestrator maps this to
+    /// the matching `InverseOp::*Reverse` variant at undo time. The
+    /// `runtime` distinguishes which tool (Terraform initially;
+    /// kubectl / gh / aws land in AR04.3 / .4 / .5).
+    TerraformOp {
+        workdir: std::path::PathBuf,
+        op: crate::inverse::TerraformOp,
+        /// Pre-mutation `terraform state pull` output, captured by
+        /// the helper before `apply` / `destroy`. Empty for verbs
+        /// that don't carry a state snapshot (StateRm / Import ride
+        /// the informational-skip path).
+        prior_state: Vec<u8>,
+    },
 }
 
 /// Mirror of [`shit_proto::DbEngineWire`] on the planner side so
