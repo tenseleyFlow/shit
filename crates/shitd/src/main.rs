@@ -379,11 +379,16 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     };
 
     // S24.D.2 — accept loop for the LD_PRELOAD shim's per-process UDS.
+    // W06.A.3 plumbs `Arc<Index>` + `Arc<ActiveCommands>` through so
+    // each notification can be resolved to a `CommandId` and
+    // journaled.
     let shim_handle = {
         let cfg = cfg.clone();
         let shutdown = Arc::clone(&shutdown);
+        let index = Arc::clone(&index);
+        let active = Arc::clone(&active);
         tokio::spawn(async move {
-            if let Err(e) = shim_listener::serve(&cfg, shutdown).await {
+            if let Err(e) = shim_listener::serve(&cfg, shutdown, index, active).await {
                 tracing::error!(err = %e, "shim listener exited");
             }
         })
