@@ -110,9 +110,7 @@ fn shim_exports_all_expected_versioned_symbols() {
 
     let mut missing: Vec<(&str, &str)> = Vec::new();
     for &(name, version) in EXPECTED_VERSIONED_EXPORTS {
-        let found = parsed
-            .iter()
-            .any(|(n, v)| n == name && v == version);
+        let found = parsed.iter().any(|(n, v)| n == name && v == version);
         if !found {
             missing.push((name, version));
         }
