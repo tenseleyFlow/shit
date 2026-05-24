@@ -341,18 +341,29 @@ fn compose_down_reverse_invokes_docker_compose_up() {
 }
 
 #[test]
-fn rm_reverse_inspects_stash_then_returns_skipped() {
-    // `Rm` is stage-1 informational (DR-CR-22): we verify the stash
-    // image exists via `docker image inspect ...` but don't try to
-    // synthesize the full `docker run`. The e2e test confirms the
-    // inspect happens against the stub (returning a non-empty JSON),
-    // then asserts the executor reports Skipped with the deferral.
+fn rm_reverse_inspects_stash_then_runs_synthesized_argv() {
+    // AR10.9 (DR-CR-22): the full `docker run` synthesis path.
+    // Executor verifies the stash image exists via `docker image
+    // inspect`, then walks the captured inspect JSON through
+    // `synthesize_container_run` and execs the produced argv. This
+    // e2e test confirms both calls land on the stub docker and
+    // asserts the executor reports Applied.
     let bin_dir = tempdir().unwrap();
     let record_dir = tempdir().unwrap();
     write_fake_docker(bin_dir.path(), record_dir.path());
 
     let runner = PathInjectingRunner::new(bin_dir.path());
     let executor = ContainerExecutor::new(runner);
+
+    // Minimal-but-valid captured inspect: image + name + env so the
+    // synthesizer emits a real argv (not just `docker run -d --name X`).
+    let inspect = br#"[{
+        "Id": "abc123",
+        "Name": "/web",
+        "Config": {"Image": "nginx:alpine", "Env": ["FOO=bar"]},
+        "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}},
+        "Mounts": []
+    }]"#;
 
     let op = InverseOp::ContainerRestore {
         runtime: ContainerRuntime::Docker,
@@ -361,16 +372,29 @@ fn rm_reverse_inspects_stash_then_returns_skipped() {
             name: Some("web".into()),
             was_running: true,
         },
-        captured_config: b"{}".to_vec(),
+        captured_config: inspect.to_vec(),
         stash_image: Some("shit-stash:abc123:1700000000".into()),
         stash_tarball: None,
         requires_confirmation: true,
     };
 
     match executor.execute(&op, false, ConflictPolicy::Abort) {
-        ExecutionOutcome::Skipped { reason } => {
-            assert!(reason.contains("DR-CR-22"), "got: {reason}");
-        }
-        other => panic!("expected Skipped (deferred), got {other:?}"),
+        ExecutionOutcome::Applied => {}
+        other => panic!("expected Applied, got {other:?}"),
     }
+
+    // Stub recorded the synthesized `docker run` invocation.
+    let argv_run = fs::read_to_string(record_dir.path().join("argv-run")).unwrap();
+    assert!(argv_run.contains("--name"), "argv-run missing --name: {argv_run}");
+    assert!(argv_run.contains("web"), "argv-run missing container name: {argv_run}");
+    // Image should be the stash, not the original.
+    assert!(
+        argv_run.contains("shit-stash:abc123:1700000000"),
+        "argv-run should use stash image: {argv_run}"
+    );
+    assert!(!argv_run.contains("nginx:alpine"), "argv-run leaked original image: {argv_run}");
+    assert!(
+        argv_run.contains("--restart=unless-stopped"),
+        "argv-run missing restart policy: {argv_run}"
+    );
 }
