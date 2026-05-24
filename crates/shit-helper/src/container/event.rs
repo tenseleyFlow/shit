@@ -34,6 +34,7 @@ use shit_proto::{
     decode_frame, encode_frame_large,
 };
 
+use super::compose::{ComposeVerb, classify_compose_argv};
 use super::docker::{DockerVerb, classify_docker_argv};
 use super::podman::{PodmanVerb, classify_podman_argv};
 
@@ -89,18 +90,29 @@ pub async fn run_event(
     }
 
     let (runtime, verb_payload) = match tool {
-        "docker" => match classify_docker_argv(&argv) {
-            Some(v) => (ContainerRuntimeWire::Docker, DockerOrPodman::Docker(v)),
-            None => {
-                tracing::debug!(
-                    ?argv,
-                    "docker argv didn't classify as destructive; skipping"
-                );
-                return Ok(());
+        "docker" => {
+            // Try the docker-verb classifier first (rm/rmi/volume rm/
+            // network rm/stop/kill). If that doesn't match, fall
+            // through to the compose classifier in case the user
+            // invoked the v2 plugin form (`docker compose down ...`)
+            // through the docker-wrapper rather than the
+            // docker-compose standalone wrapper.
+            match classify_docker_argv(&argv) {
+                Some(v) => (ContainerRuntimeWire::Docker, VerbPayload::Docker(v)),
+                None => match classify_compose_argv(&argv) {
+                    Some(v) => (ContainerRuntimeWire::Docker, VerbPayload::Compose(v)),
+                    None => {
+                        tracing::debug!(
+                            ?argv,
+                            "docker argv didn't classify as destructive; skipping"
+                        );
+                        return Ok(());
+                    }
+                },
             }
-        },
+        }
         "podman" => match classify_podman_argv(&argv) {
-            Some(v) => (ContainerRuntimeWire::Podman, DockerOrPodman::Podman(v)),
+            Some(v) => (ContainerRuntimeWire::Podman, VerbPayload::Podman(v)),
             None => {
                 tracing::debug!(
                     ?argv,
@@ -109,14 +121,18 @@ pub async fn run_event(
                 return Ok(());
             }
         },
-        // Compose flows through the docker-compose wrapper and rides
-        // a parallel code path; AR03 PR-B ships docker rmi only.
-        // Compose support lands in a follow-up.
+        "docker-compose" => match classify_compose_argv(&argv) {
+            Some(v) => (ContainerRuntimeWire::Docker, VerbPayload::Compose(v)),
+            None => {
+                tracing::debug!(
+                    ?argv,
+                    "docker-compose argv didn't classify as destructive; skipping"
+                );
+                return Ok(());
+            }
+        },
         other => {
-            tracing::debug!(
-                tool = other,
-                "container-event: unsupported tool (PR-B is docker only)"
-            );
+            tracing::debug!(tool = other, "container-event: unsupported tool");
             return Ok(());
         }
     };
@@ -157,9 +173,10 @@ pub async fn run_event(
     Ok(())
 }
 
-enum DockerOrPodman {
+enum VerbPayload {
     Docker(DockerVerb),
     Podman(PodmanVerb),
+    Compose(ComposeVerb),
 }
 
 struct PreparedEvent {
@@ -177,18 +194,25 @@ struct PreparedEvent {
     extras: BTreeMap<String, String>,
 }
 
-fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: DockerOrPodman) -> Option<PreparedEvent> {
+fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Option<PreparedEvent> {
+    // Compose verbs are a separate enum shape; route them out first
+    // so the docker-verb normalisation below stays uniform.
+    if let VerbPayload::Compose(c) = v {
+        return prepare_compose(tool, c);
+    }
+
     // Both docker and podman share the same verb enum after argv
     // classification; normalise to the docker side.
     let docker_verb: DockerVerb = match v {
-        DockerOrPodman::Docker(d) => d,
-        DockerOrPodman::Podman(p) => match p {
+        VerbPayload::Docker(d) => d,
+        VerbPayload::Podman(p) => match p {
             PodmanVerb::Rm { ids, force } => DockerVerb::Rm { ids, force },
             PodmanVerb::Rmi { images } => DockerVerb::Rmi { images },
             PodmanVerb::VolumeRm { names } => DockerVerb::VolumeRm { names },
             PodmanVerb::NetworkRm { names } => DockerVerb::NetworkRm { names },
             PodmanVerb::StopOrKill { ids, was_kill } => DockerVerb::StopOrKill { ids, was_kill },
         },
+        VerbPayload::Compose(_) => unreachable!("compose handled above"),
     };
 
     match docker_verb {
@@ -558,6 +582,133 @@ fn docker_commit_running_container(tool: &str, id: &str) -> std::io::Result<Stri
     Ok(tag)
 }
 
+/// AR03.6 / DR-CR-53 (`docker compose down` capture path):
+///
+/// The destructive verbs we care about are `down` (with or without
+/// `-v|--volumes`). Up / stop / rm route to follow-ups (Up is a
+/// non-destructive bring-up, Stop is restart-hint, Rm needs per-
+/// service container inspect + commit which mirrors AR10.9 multiplied
+/// across the service set — bigger scope).
+///
+/// For Down: pack the compose-file path + project name into `extras`.
+/// The daemon-side `ContainerExecutor::apply_compose_down` runs
+/// `docker compose -f <file> -p <project> up -d` on restore; compose
+/// reads the file as the source of truth so a vanilla `down` →
+/// `up -d` round-trips cleanly for the happy path. Volume restoration
+/// (when `--volumes` was passed) is scaffolded but not yet wired —
+/// AR03.3's per-volume stash logic would need to apply per-named-volume.
+fn prepare_compose(tool: &str, verb: ComposeVerb) -> Option<PreparedEvent> {
+    match verb {
+        ComposeVerb::Down {
+            files,
+            project_override,
+            with_volumes,
+        } => prepare_compose_down(tool, files, project_override, with_volumes),
+        // Up is restart-hint (the project is starting; no destructive
+        // capture needed — undo of `up` is `down` which the user runs
+        // explicitly). Stop is a restart-hint. Rm needs per-service
+        // inspect + commit (a multiplied AR10.9); deferred.
+        ComposeVerb::Up { .. } | ComposeVerb::Stop { .. } | ComposeVerb::Rm { .. } => {
+            tracing::debug!(
+                ?verb,
+                "container-event: compose verb not destructive in v1 (or deferred)"
+            );
+            None
+        }
+    }
+}
+
+fn prepare_compose_down(
+    tool: &str,
+    files: Vec<String>,
+    project_override: Option<String>,
+    with_volumes: bool,
+) -> Option<PreparedEvent> {
+    // Resolve the compose file. If the user passed -f, honour the
+    // first path (multi-file overlays use the first as the base);
+    // otherwise fall back to docker's default search of
+    // `docker-compose.yml` then `compose.yaml` in cwd.
+    let compose_file = files
+        .into_iter()
+        .next()
+        .or_else(default_compose_file_in_cwd)
+        .or_else(|| Some("docker-compose.yml".to_string()))?;
+
+    // Resolve to absolute path so the daemon-side restore doesn't
+    // depend on cwd at undo time. Best-effort — if canonicalize fails
+    // (file doesn't exist where we think), ship the raw string and
+    // let the executor's apply_compose_down surface the error.
+    let compose_file_abs = std::path::PathBuf::from(&compose_file)
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or(compose_file);
+
+    // Project name: --project-name wins; otherwise docker compose
+    // defaults to the basename of the compose file's parent dir,
+    // lowercased with non-alnum stripped. Compute that here so the
+    // restore uses the same name and addresses the same network /
+    // containers.
+    let project = project_override.unwrap_or_else(|| default_project_name(&compose_file_abs));
+
+    let mut extras = BTreeMap::new();
+    extras.insert("project".into(), project);
+    extras.insert("compose_file".into(), compose_file_abs);
+    extras.insert("with_volumes".into(), with_volumes.to_string());
+    // Services empty → daemon restores all (compose default).
+    // Capturing the resolved per-service list via `docker compose
+    // config --services` would be more authoritative but adds an
+    // extra subprocess; defer to follow-up.
+
+    // No tarball / no stash_image — compose file is the source of
+    // truth. `captured_config` left empty; the spec lives on disk
+    // and the daemon re-reads it on restore.
+    let _ = tool; // compose runtime always = docker engine; bin chosen daemon-side
+    Some(PreparedEvent {
+        verb: ContainerVerbWire::ComposeDown,
+        captured_config: Vec::new(),
+        stash_tarball: None,
+        stash_tarball_bytes: None,
+        stash_image: None,
+        extras,
+    })
+}
+
+/// Search cwd for docker compose's two default file names, in the
+/// order compose itself checks (`compose.yaml` is the newer spec
+/// name; `docker-compose.yml` the legacy). Returns the first one
+/// that exists; None if neither does.
+fn default_compose_file_in_cwd() -> Option<String> {
+    for name in &[
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+    ] {
+        let p = std::path::Path::new(name);
+        if p.exists() {
+            return Some((*name).to_string());
+        }
+    }
+    None
+}
+
+/// Docker compose's default project-name algorithm: take the basename
+/// of the compose file's parent directory, lowercase, strip
+/// non-[a-z0-9_-] chars. Matches `docker compose config | grep name`.
+fn default_project_name(compose_file_abs: &str) -> String {
+    let p = std::path::Path::new(compose_file_abs);
+    let parent = p
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    parent
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
+}
+
 fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
     // PR-B (AR03.3): one event per invocation; multi-name `docker
     // volume rm v1 v2 v3` is a follow-up.
@@ -743,6 +894,64 @@ mod tests {
     }
 
     #[test]
+    fn default_project_name_lowercases_and_filters() {
+        assert_eq!(
+            default_project_name("/srv/MyApp/docker-compose.yml"),
+            "myapp"
+        );
+        assert_eq!(
+            default_project_name("/home/u/My-Project_v2/compose.yaml"),
+            "my-project_v2"
+        );
+        // Path with no parent should fall back to default.
+        assert_eq!(default_project_name("/"), "default");
+    }
+
+    #[test]
+    fn prepare_compose_down_packs_extras_for_explicit_file_and_project() {
+        // Explicit -f + --project-name; canonicalize will fail (file
+        // doesn't exist) and the prepared event ships the raw path —
+        // ensures the warn-fallback shape works.
+        let prepared = prepare_compose_down(
+            "docker-compose",
+            vec!["/nonexistent/path/docker-compose.yml".to_string()],
+            Some("myproject".to_string()),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(prepared.verb, ContainerVerbWire::ComposeDown));
+        assert_eq!(
+            prepared.extras.get("project").map(String::as_str),
+            Some("myproject")
+        );
+        assert_eq!(
+            prepared.extras.get("compose_file").map(String::as_str),
+            Some("/nonexistent/path/docker-compose.yml")
+        );
+        assert_eq!(
+            prepared.extras.get("with_volumes").map(String::as_str),
+            Some("false")
+        );
+        assert!(prepared.captured_config.is_empty());
+        assert!(prepared.stash_tarball.is_none());
+    }
+
+    #[test]
+    fn prepare_compose_down_with_volumes_packs_flag() {
+        let prepared = prepare_compose_down(
+            "docker-compose",
+            vec!["/x/docker-compose.yml".into()],
+            Some("p".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.extras.get("with_volumes").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn prepare_volume_rm_extras_populated_under_docker_unavailable() {
         // Path the docker invocation at a sentinel that's guaranteed
         // not to exist so docker_volume_tar takes the warn-fallback.
@@ -762,7 +971,7 @@ mod tests {
 
     #[test]
     fn prepare_stop_or_kill_returns_none() {
-        let v = DockerOrPodman::Docker(DockerVerb::StopOrKill {
+        let v = VerbPayload::Docker(DockerVerb::StopOrKill {
             ids: vec!["web".into()],
             was_kill: false,
         });
@@ -787,7 +996,7 @@ mod tests {
 
     #[test]
     fn prepare_podman_rm_maps_to_docker_shape() {
-        let v = DockerOrPodman::Podman(PodmanVerb::Rm {
+        let v = VerbPayload::Podman(PodmanVerb::Rm {
             ids: vec!["c1".into()],
             force: false,
         });
