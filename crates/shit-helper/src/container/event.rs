@@ -209,19 +209,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: DockerOrPodman) -> Opti
             })
         }
         DockerVerb::VolumeRm { names } => prepare_volume_rm(tool, names),
-        DockerVerb::NetworkRm { names } => {
-            let mut extras = BTreeMap::new();
-            if let Some(name) = names.first() {
-                extras.insert("name".into(), name.clone());
-            }
-            Some(PreparedEvent {
-                verb: ContainerVerbWire::NetworkRm,
-                captured_config: Vec::new(),
-                stash_tarball: None,
-                stash_tarball_bytes: None,
-                extras,
-            })
-        }
+        DockerVerb::NetworkRm { names } => prepare_network_rm(tool, names),
         // stop/kill are restart-hint events; no destructive content
         // loss, no stash needed. PR-B does not ship them yet.
         DockerVerb::StopOrKill { .. } => None,
@@ -371,6 +359,63 @@ fn inspect_volume_driver(tool: &str, name: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Run `{tool} network inspect <name>` and return the raw JSON bytes
+/// from stdout. Docker emits an array-of-one shape — the planner's
+/// [`synthesize_network_create`] unwraps that.
+fn docker_network_inspect(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
+    let out = Command::new(tool)
+        .args(["network", "inspect", name])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{tool} network inspect {name} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// AR03.4 (DR-CR-26 network-rm path): capture a network's config as
+/// the JSON output of `docker network inspect`. No tarball — the
+/// payload is small (~1-2 KiB) and fits comfortably in the standard
+/// frame. Daemon-side [`ContainerExecutor::apply_network_rm`] parses
+/// the JSON and feeds it through [`synthesize_network_create`] to
+/// rebuild the `docker network create` argv.
+fn prepare_network_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
+    // PR-B (AR03.4): one event per invocation; multi-name `docker
+    // network rm n1 n2` is a follow-up.
+    let name = names.into_iter().next()?;
+
+    let mut extras = BTreeMap::new();
+    extras.insert("name".into(), name.clone());
+
+    match docker_network_inspect(tool, &name) {
+        Ok(json_bytes) => Some(PreparedEvent {
+            verb: ContainerVerbWire::NetworkRm,
+            captured_config: json_bytes,
+            stash_tarball: None,
+            stash_tarball_bytes: None,
+            extras,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                tool,
+                network = %name,
+                err = %e,
+                "container-event: network inspect failed; event will ship without captured_config"
+            );
+            Some(PreparedEvent {
+                verb: ContainerVerbWire::NetworkRm,
+                captured_config: Vec::new(),
+                stash_tarball: None,
+                stash_tarball_bytes: None,
+                extras,
+            })
+        }
     }
 }
 
@@ -549,13 +594,19 @@ mod tests {
     }
 
     #[test]
-    fn prepare_network_rm_packs_first_name() {
-        let v = DockerOrPodman::Docker(DockerVerb::NetworkRm {
-            names: vec!["frontend".into()],
-        });
-        let p = prepare("docker", ContainerRuntimeWire::Docker, v).unwrap();
-        assert!(matches!(p.verb, ContainerVerbWire::NetworkRm));
-        assert_eq!(p.extras.get("name").map(String::as_str), Some("frontend"));
+    fn prepare_network_rm_extras_populated_under_docker_unavailable() {
+        // No docker on PATH → inspect fails → event still ships with
+        // name in extras and empty captured_config (informational
+        // journal entry; undo would refuse cleanly).
+        let tool = "shit-test-no-such-docker-binary";
+        let prepared = prepare_network_rm(tool, vec!["frontend".into()]).unwrap();
+        assert!(matches!(prepared.verb, ContainerVerbWire::NetworkRm));
+        assert_eq!(
+            prepared.extras.get("name").map(String::as_str),
+            Some("frontend")
+        );
+        assert!(prepared.captured_config.is_empty());
+        assert!(prepared.stash_tarball.is_none());
     }
 
     #[test]
