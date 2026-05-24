@@ -52,6 +52,47 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+// W06.A.2 — FreeBSD versioned-symbol export for the LD_PRELOAD
+// interpose surface. FreeBSD base utilities (install, mv, cp, etc.)
+// import libc symbols as e.g. `open@FBSD_1.0`. The rtld resolver
+// binds the PLT to the specific versioned symbol. Our shim's
+// unversioned `open` is not a match, so without this directive
+// rtld falls through to libc's own `open@FBSD_1.0` and the shim
+// is silently inert on every versioned base binary.
+//
+// We can't get the version tag via a `--version-script=` linker
+// arg because rustc auto-generates its own version script for
+// the cdylib output (listing every `#[no_mangle] pub fn` as a
+// global and applying `local: *;` to everything else). Two
+// version scripts to lld → either it rejects the combination or
+// silently drops our tags. The `.symver` directive in inline
+// assembly emits the version tag at object-code level, before
+// rustc's version script is layered on top, so lld preserves it.
+//
+// Each directive of the form `.symver name, name@VERSION` adds
+// a versioned alias for the existing `name` symbol. Both
+// unversioned `name` and `name@VERSION` resolve to the same
+// function body — Linux callers get the unversioned, FreeBSD
+// versioned callers get `name@FBSD_1.0`.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+core::arch::global_asm!(
+    ".symver open, open@FBSD_1.0",
+    ".symver openat, openat@FBSD_1.0",
+    ".symver unlink, unlink@FBSD_1.0",
+    ".symver unlinkat, unlinkat@FBSD_1.0",
+    ".symver rename, rename@FBSD_1.0",
+    ".symver renameat, renameat@FBSD_1.0",
+    ".symver truncate, truncate@FBSD_1.0",
+    ".symver ftruncate, ftruncate@FBSD_1.0",
+    ".symver pwrite, pwrite@FBSD_1.0",
+    ".symver mmap, mmap@FBSD_1.0",
+);
+
 pub mod dispatch;
 pub mod install_config;
 pub mod install_pattern;
