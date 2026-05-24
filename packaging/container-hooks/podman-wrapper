@@ -23,6 +23,18 @@ fi
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v podman 2>/dev/null || command -v -- podman)
 [ -n "$real" ] || { echo "shit: real podman not found on PATH" >&2; exit 127; }
 
-# DR-CR-21/26: pre/post hooks via `shit-helper container-event` go
-# here. Stage 1: just exec.
+# DR-CR-26 (AR03 PR-B / AR03.5): pre-capture via `shit-helper
+# container-event`. Mirrors the docker-wrapper path; classifier on
+# the helper side normalises PodmanVerb → DockerVerb via
+# From<DockerVerb> so the same prepare_* + send_event machinery
+# round-trips for podman. Hook-friendly: failure logs and returns 0.
+helper=$(command -v shit-helper 2>/dev/null || true)
+if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
+    echo "shit-hook: podman-wrapper real=${real} helper=${helper:-<not-found>}" >&2
+fi
+if [ -n "$helper" ]; then
+    target_argv=$(printf '%s\n' "$@")
+    "$helper" container-event podman pre --target-argv "$target_argv" || true
+fi
+
 exec "$real" "$@"

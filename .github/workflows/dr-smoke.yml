@@ -358,6 +358,41 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  podman-rm-undo:
+    # AR03.5 -- cross-runtime delegation proof. Mirrors AR10.9's
+    # docker-rm-undo smoke but uses rootless podman. The helper's
+    # PodmanVerb classifier delegates to DockerVerb's enum shape via
+    # From<DockerVerb>; this smoke proves the same prepare_rm +
+    # synthesize_container_run + apply_rm machinery round-trips
+    # cleanly when the runtime tool name is "podman" instead of
+    # "docker". ubuntu-24.04 hosted runners don't ship podman by
+    # default; we install it from apt.
+    name: podman-rm-undo smoke (AR03.5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install podman + sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y podman sqlite3 python3
+      - name: podman preflight (rootless)
+        run: |
+          podman version
+          podman info --format '{{.Host.OS}}/{{.Host.Arch}} podman-{{.Version.Version}}'
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/podman-rm-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-rm-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
