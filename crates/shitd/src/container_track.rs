@@ -22,7 +22,7 @@ use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::inode::BlobHash;
 use shit_planner::inverse::{ContainerOp, ContainerRuntime};
 use shit_proto::{ContainerEventReq, ContainerRuntimeWire, ContainerVerbWire};
-use shit_store::Index;
+use shit_store::{BlobStore, Index, container_stash};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -37,6 +37,12 @@ pub enum HandleError {
     },
     #[error("journal write failed: {0}")]
     JournalWrite(String),
+    #[error("stash hash mismatch: helper claimed {claimed}, daemon computed {computed}")]
+    StashHashMismatch { claimed: String, computed: String },
+    #[error("blob store write failed: {0}")]
+    BlobWrite(String),
+    #[error("container_stash register failed: {0}")]
+    StashRegister(String),
 }
 
 /// Handle one container-event request: resolve command window,
@@ -46,6 +52,7 @@ pub fn handle(
     req: ContainerEventReq,
     active: &crate::active_commands::ActiveCommands,
     index: &Index,
+    blob_store: &BlobStore,
 ) -> Result<EventId, HandleError> {
     let Some(command) = active.resolve_by_descendant(req.pid) else {
         tracing::warn!(
@@ -60,6 +67,62 @@ pub fn handle(
     let runtime = wire_to_planner_runtime(req.runtime);
     let op = build_container_op(req.verb, &req.extras)?;
     let stash_tarball = req.stash_tarball.map(BlobHash::from_bytes);
+
+    // AR03 PR-B (DR-CR-26 inline-bytes path): if the helper shipped
+    // tarball bytes inline, write them to the blob store and
+    // register the stash. Helper-claimed hash must match what the
+    // blob store computes from the bytes (content-addressed; a
+    // mismatch means corruption between helper and daemon). The
+    // large-image SCM_RIGHTS path is AR10.8 scaffolding -- inline
+    // is the small-image fast path.
+    if let Some(bytes) = req.stash_tarball_bytes.as_ref() {
+        let Some(claimed_hash) = stash_tarball else {
+            return Err(HandleError::BlobWrite(
+                "stash_tarball_bytes shipped without claimed hash".into(),
+            ));
+        };
+        let (canonical_hash, stat) = blob_store
+            .put(bytes)
+            .map_err(|e| HandleError::BlobWrite(e.to_string()))?;
+        if canonical_hash != claimed_hash {
+            return Err(HandleError::StashHashMismatch {
+                claimed: format!("{claimed_hash}"),
+                computed: format!("{canonical_hash}"),
+            });
+        }
+        let stash_name = req
+            .extras
+            .get("image")
+            .or_else(|| req.extras.get("name"))
+            .cloned()
+            .unwrap_or_default();
+        let kind = match req.verb {
+            ContainerVerbWire::Rmi | ContainerVerbWire::Rm => container_stash::StashKind::ImageSave,
+            ContainerVerbWire::VolumeRm => container_stash::StashKind::VolumeTar,
+            // NetworkRm + ComposeDown don't ship tarballs in v1
+            _ => container_stash::StashKind::ImageSave,
+        };
+        container_stash::register(
+            index,
+            container_stash::RegisterRequest {
+                blob_hash: *canonical_hash.as_bytes(),
+                kind,
+                runtime: runtime.as_str(),
+                name: &stash_name,
+                size_bytes: stat.stored_bytes,
+                command: Some(command),
+                note: None,
+            },
+        )
+        .map_err(|e| HandleError::StashRegister(e.to_string()))?;
+        tracing::info!(
+            pid = req.pid,
+            blob_hash = %canonical_hash,
+            stored_bytes = stat.stored_bytes,
+            compressed_bytes = stat.compressed,
+            "container stash bytes ingested + registered"
+        );
+    }
 
     let kind = CaptureEventKind::ContainerOp {
         runtime,

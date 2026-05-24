@@ -37,7 +37,8 @@ pub use ctl::{
     UndoReportWire, UndoRequest,
 };
 pub use frame::{
-    DecodeError, EncodeError, MAX_FRAME_SIZE, WIRE_VERSION, decode_frame, encode_frame,
+    DecodeError, EncodeError, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE, WIRE_VERSION, decode_frame,
+    decode_frame_large, encode_frame, encode_frame_large,
 };
 pub use helper::{
     AuthDecision, AuthEventKind, FileKindWire, FileMetadataWire, HELPER_PATH_HINT_MAX,

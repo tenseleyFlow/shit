@@ -654,6 +654,14 @@ pub struct ContainerEventReq {
     /// 32-byte blake3 of the tarball stashed under
     /// `container_stashes`. Daemon side resolves to a `BlobHash`.
     pub stash_tarball: Option<[u8; 32]>,
+    /// AR03 PR-B (DR-CR-26 inline-bytes path): the raw tarball
+    /// bytes for the verb's stash, when present. Daemon writes to
+    /// the blob store and registers under `stash_tarball`. Inline
+    /// is the small-image fast path (alpine ~5 MB); large images
+    /// route through the AR10.8 tempfile/SCM_RIGHTS path that's
+    /// not yet implemented. `None` when no tarball (NetworkRm) or
+    /// when the helper shipped via the future large-image route.
+    pub stash_tarball_bytes: Option<Vec<u8>>,
     /// Verb-specific descriptors: for Rm/Rmi the target image/name,
     /// for VolumeRm the volume name + optional driver, for
     /// ComposeDown the compose-file path + project name, etc.

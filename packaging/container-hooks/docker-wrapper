@@ -23,6 +23,22 @@ fi
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker 2>/dev/null || command -v -- docker)
 [ -n "$real" ] || { echo "shit: real docker not found on PATH" >&2; exit 127; }
 
-# DR-CR-21/26: pre/post hooks via `shit-helper container-event` go
-# here. Stage 1: just exec.
+# DR-CR-26 (AR03 PR-B): pre-capture via `shit-helper container-event`.
+# The helper classifies the argv, runs `docker save` for destructive
+# image verbs (rmi), and ships the tarball bytes inline to the daemon.
+# Helper is hook-friendly: any failure logs and returns 0, so a torn
+# daemon cannot break `docker`. Best-effort by design.
+helper=$(command -v shit-helper 2>/dev/null || true)
+# Debug breadcrumb (gated on SHIT_HOOK_DEBUG=1) so smokes can see the
+# wrapper's path resolution without enabling shell -x.
+if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
+    echo "shit-hook: docker-wrapper real=${real} helper=${helper:-<not-found>}" >&2
+fi
+if [ -n "$helper" ]; then
+    # Newline-separate the user's argv so the helper can split it
+    # cleanly (NUL is awkward to ship through a CLI string flag).
+    target_argv=$(printf '%s\n' "$@")
+    "$helper" container-event docker pre --target-argv "$target_argv" || true
+fi
+
 exec "$real" "$@"

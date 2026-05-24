@@ -25,6 +25,17 @@ pub const WIRE_VERSION: u8 = 1;
 /// buffer per concurrent connection.
 pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 
+/// Maximum frame size for the large-payload ctl path. Used by
+/// `ContainerEvent` (AR03 PR-B) which inlines tarball bytes (`docker
+/// save <image>`) up to this cap; anything larger routes through the
+/// AR10.8 tempfile / SCM_RIGHTS path. 64 MiB comfortably covers
+/// alpine (~5 MB), distroless (~20 MB), and small app images. The
+/// large path is opt-in per call site so the default `MAX_FRAME_SIZE`
+/// keeps the shell-hook + standard ctl surface tight against memory-
+/// exhaustion attacks; only the ctl handler and the helper's
+/// container-event sender use the larger cap.
+pub const MAX_LARGE_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
     #[error("postcard serialization failed: {0}")]
@@ -53,10 +64,20 @@ pub enum DecodeError {
 /// | u32 BE body_len | u8 wire_version | postcard payload |
 /// ```
 pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> {
+    encode_frame_with_cap(msg, MAX_FRAME_SIZE)
+}
+
+/// Encode with the large-frame cap; see [`MAX_LARGE_FRAME_SIZE`].
+/// Intended for container-event tarball payloads only.
+pub fn encode_frame_large<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> {
+    encode_frame_with_cap(msg, MAX_LARGE_FRAME_SIZE)
+}
+
+fn encode_frame_with_cap<T: Serialize>(msg: &T, cap: usize) -> Result<Vec<u8>, EncodeError> {
     let payload = postcard::to_allocvec(msg)?;
     let body_len = 1 + payload.len();
     let total_len = 4 + body_len;
-    if total_len > MAX_FRAME_SIZE {
+    if total_len > cap {
         return Err(EncodeError::TooLarge { got: total_len });
     }
     let mut frame = Vec::with_capacity(total_len);
@@ -72,10 +93,19 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> {
 
 /// Decode any postcard-deserializable message from a complete frame.
 pub fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeError> {
+    decode_frame_with_cap(buf, MAX_FRAME_SIZE)
+}
+
+/// Decode with the large-frame cap; see [`MAX_LARGE_FRAME_SIZE`].
+pub fn decode_frame_large<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeError> {
+    decode_frame_with_cap(buf, MAX_LARGE_FRAME_SIZE)
+}
+
+fn decode_frame_with_cap<T: DeserializeOwned>(buf: &[u8], cap: usize) -> Result<T, DecodeError> {
     if buf.len() < 5 {
         return Err(DecodeError::Truncated(buf.len()));
     }
-    if buf.len() > MAX_FRAME_SIZE {
+    if buf.len() > cap {
         return Err(DecodeError::TooLarge(buf.len()));
     }
     let declared = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
