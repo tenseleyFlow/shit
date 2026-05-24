@@ -11,10 +11,13 @@
 set -e
 
 # Recursion guard: a docker invocation issued FROM the helper itself
-# (during a shit undo) must NOT re-capture. The executors set
-# SHIT_DURING_UNDO=1.
+# (during a shit undo, or during a capture-time `docker run`/`docker
+# save` sidecar) must NOT re-capture. The executors and the helper's
+# capture path both set SHIT_DURING_UNDO=1. PATH-strip the wrapper's
+# directory and re-resolve so we find the real docker even when the
+# original `command -v` returns the wrapper itself.
 if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
-    real=$(command -v -- docker | grep -v "$(dirname "$0")" | head -n1)
+    real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker 2>/dev/null || command -v -- docker)
     [ -n "$real" ] || { echo "shit: real docker not found on PATH" >&2; exit 127; }
     exec "$real" "$@"
 fi

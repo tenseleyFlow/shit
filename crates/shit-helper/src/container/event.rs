@@ -208,19 +208,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: DockerOrPodman) -> Opti
                 extras,
             })
         }
-        DockerVerb::VolumeRm { names } => {
-            let mut extras = BTreeMap::new();
-            if let Some(name) = names.first() {
-                extras.insert("name".into(), name.clone());
-            }
-            Some(PreparedEvent {
-                verb: ContainerVerbWire::VolumeRm,
-                captured_config: Vec::new(),
-                stash_tarball: None,
-                stash_tarball_bytes: None,
-                extras,
-            })
-        }
+        DockerVerb::VolumeRm { names } => prepare_volume_rm(tool, names),
         DockerVerb::NetworkRm { names } => {
             let mut extras = BTreeMap::new();
             if let Some(name) = names.first() {
@@ -331,6 +319,131 @@ fn docker_save(tool: &str, image: &str) -> std::io::Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// AR03.3 (DR-CR-26 volume-rm path): capture a volume's contents as a
+/// gzipped tar. Spawns a transient busybox container with the volume
+/// mounted read-only at `/src`, runs `tar -C /src -czf - .` and reads
+/// the bytes off stdout. Matches the planner's [`ContainerExecutor::
+/// apply_volume_rm`] inverse path, which extracts these bytes back into
+/// a recreated volume via `docker run --rm -i -v <name>:/data busybox
+/// tar -C /data -xzf -`.
+///
+/// `SHIT_DURING_UNDO=1` is propagated so the transient busybox `docker
+/// run` invocation doesn't re-trigger capture via the wrapper.
+fn docker_volume_tar(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
+    let out = Command::new(tool)
+        .args([
+            "run", "--rm",
+            "-v",
+            // Mount read-only — we're only copying out. The trailing
+            // `:ro` keeps the source pristine in the unlikely event
+            // busybox's tar would touch atimes etc.
+        ])
+        .arg(format!("{name}:/src:ro"))
+        .args(["busybox", "tar", "-C", "/src", "-czf", "-", "."])
+        .env("SHIT_DURING_UNDO", "1")
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{tool} run busybox tar (volume {name}) exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Best-effort `{tool} volume inspect --format='{{.Driver}}' <name>`
+/// to record the volume's driver so the inverse path can recreate it
+/// with the same backing. Returns `None` for the default `local`
+/// driver or when inspect fails (the planner treats `None` as "use
+/// the default").
+fn inspect_volume_driver(tool: &str, name: &str) -> Option<String> {
+    let out = Command::new(tool)
+        .args(["volume", "inspect", "--format", "{{.Driver}}", name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "local" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
+    // PR-B (AR03.3): one event per invocation; multi-name `docker
+    // volume rm v1 v2 v3` is a follow-up.
+    let name = names.into_iter().next()?;
+
+    let driver = inspect_volume_driver(tool, &name);
+
+    let bytes = match docker_volume_tar(tool, &name) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                tool,
+                volume = %name,
+                err = %e,
+                "container-event: volume tar capture failed; event will ship without a stash"
+            );
+            let mut extras = BTreeMap::new();
+            extras.insert("name".into(), name);
+            if let Some(d) = driver {
+                extras.insert("driver".into(), d);
+            }
+            return Some(PreparedEvent {
+                verb: ContainerVerbWire::VolumeRm,
+                captured_config: Vec::new(),
+                stash_tarball: None,
+                stash_tarball_bytes: None,
+                extras,
+            });
+        }
+    };
+
+    if bytes.len() > INLINE_TARBALL_MAX_BYTES {
+        tracing::warn!(
+            tool,
+            volume = %name,
+            bytes = bytes.len(),
+            cap = INLINE_TARBALL_MAX_BYTES,
+            "container-event: volume tar exceeds inline cap (AR10.8 large-image path NYI); shipping without stash"
+        );
+        let mut extras = BTreeMap::new();
+        extras.insert("name".into(), name);
+        if let Some(d) = driver {
+            extras.insert("driver".into(), d);
+        }
+        return Some(PreparedEvent {
+            verb: ContainerVerbWire::VolumeRm,
+            captured_config: Vec::new(),
+            stash_tarball: None,
+            stash_tarball_bytes: None,
+            extras,
+        });
+    }
+
+    let hash = *blake3::hash(&bytes).as_bytes();
+
+    let mut extras = BTreeMap::new();
+    extras.insert("name".into(), name);
+    if let Some(d) = driver {
+        extras.insert("driver".into(), d);
+    }
+
+    Some(PreparedEvent {
+        verb: ContainerVerbWire::VolumeRm,
+        captured_config: Vec::new(),
+        stash_tarball: Some(hash),
+        stash_tarball_bytes: Some(bytes),
+        extras,
+    })
+}
+
 /// Best-effort `{tool} inspect --format='{{.Id}}' <image>` to record
 /// the image's content digest alongside the tag. Returns `None` if
 /// inspect fails — the digest is a hint for the planner, not a
@@ -409,13 +522,21 @@ mod tests {
     }
 
     #[test]
-    fn prepare_volume_rm_packs_first_name() {
-        let v = DockerOrPodman::Docker(DockerVerb::VolumeRm {
-            names: vec!["pgdata".into()],
-        });
-        let p = prepare("docker", ContainerRuntimeWire::Docker, v).unwrap();
-        assert!(matches!(p.verb, ContainerVerbWire::VolumeRm));
-        assert_eq!(p.extras.get("name").map(String::as_str), Some("pgdata"));
+    fn prepare_volume_rm_extras_populated_under_docker_unavailable() {
+        // Path the docker invocation at a sentinel that's guaranteed
+        // not to exist so docker_volume_tar takes the warn-fallback.
+        // Asserts: even when capture fails (no docker, sandbox, etc.)
+        // the event still ships with the volume name in extras so the
+        // daemon can journal an informational entry.
+        let tool = "shit-test-no-such-docker-binary";
+        let prepared = prepare_volume_rm(tool, vec!["pgdata".into()]).unwrap();
+        assert!(matches!(prepared.verb, ContainerVerbWire::VolumeRm));
+        assert_eq!(
+            prepared.extras.get("name").map(String::as_str),
+            Some("pgdata")
+        );
+        assert!(prepared.stash_tarball.is_none());
+        assert!(prepared.stash_tarball_bytes.is_none());
     }
 
     #[test]
