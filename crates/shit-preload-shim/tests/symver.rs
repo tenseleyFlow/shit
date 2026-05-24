@@ -44,15 +44,22 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
 ];
 
 /// Locate the built `.so`. cargo provides `CARGO_BIN_EXE_<name>`
-/// for bin targets but not for cdylibs. We construct the path
-/// from `OUT_DIR` / `target/release` by walking up — this
-/// matches Cargo's standard layout for `cargo test --release`.
+/// for bin targets but not for cdylibs, so we probe Cargo's
+/// standard layout — both debug (workspace `cargo test`) and
+/// release (`cargo test --release`). The version-tagging happens
+/// in both profiles, so either build artifact satisfies the
+/// regression test.
 fn shim_so_path() -> std::path::PathBuf {
-    // Tests run from the crate root with the workspace target dir
-    // typically two parents up. Probe a few likely locations.
+    // Tests run from the crate root in normal `cargo test`, and
+    // from the workspace root in `cargo test --workspace`. Probe
+    // both depth-1 and depth-2 ancestors for either profile.
     let candidates = [
-        "target/release/libshit_preload_shim.so",
+        // Crate-rooted (default `cargo test -p shit-preload-shim`)
+        "../../target/debug/libshit_preload_shim.so",
         "../../target/release/libshit_preload_shim.so",
+        // Workspace-rooted (CI `cargo test --workspace`)
+        "target/debug/libshit_preload_shim.so",
+        "target/release/libshit_preload_shim.so",
     ];
     for c in &candidates {
         let p = std::path::PathBuf::from(c);
@@ -62,7 +69,7 @@ fn shim_so_path() -> std::path::PathBuf {
     }
     panic!(
         "couldn't locate libshit_preload_shim.so; tried: {candidates:?}. \
-         Run `cargo build --release -p shit-preload-shim` first."
+         Run `cargo build -p shit-preload-shim` (or `--release`) first."
     );
 }
 
