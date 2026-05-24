@@ -255,6 +255,40 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  docker-volume-rm-undo:
+    # AR03.3 -- validates the container-runtime VolumeRm capture +
+    # restore path. `docker volume rm <vol>` ships a gzipped tarball
+    # of the volume's contents (`docker run --rm -v vol:/src:ro
+    # busybox tar -czf -`) inline via the AR03.2 large-frame plumbing;
+    # `shit undo` recreates the volume and pipes the tarball back via
+    # `docker run --rm -i ... tar -xzf -`. Asserts byte-identity of a
+    # probe file pre- and post-undo.
+    name: docker-volume-rm-undo smoke (AR03.3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: docker preflight
+        run: |
+          docker version
+          docker info --format '{{.ServerVersion}}'
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/docker-volume-rm-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-volume-rm-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
