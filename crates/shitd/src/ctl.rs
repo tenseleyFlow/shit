@@ -144,6 +144,7 @@ async fn handle_client(
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
+        CtlRequest::ContainerEvent(req) => handle_container_event(req, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => handle_undo(req, &index, &blob_store),
         CtlRequest::WaitWatchReady {
@@ -487,6 +488,22 @@ fn handle_db_event(
 ) -> CtlResponse {
     let _ = crate::db_track::handle(db_stash, req, active, index);
     CtlResponse::DbEventAck
+}
+
+/// Handle one container-event request (DR-CR-26). Single-shot --
+/// the helper has already snapshotted state + registered any stash
+/// before sending; we just journal the descriptors. Always acks
+/// regardless of journaling outcome (the warn-log from
+/// container_track::handle is the operator's failure signal); the
+/// shell-issued container command shouldn't be punished for shit's
+/// downstream issues.
+fn handle_container_event(
+    req: shit_proto::ContainerEventReq,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+) -> CtlResponse {
+    let _ = crate::container_track::handle(req, active, index);
+    CtlResponse::ContainerEventAck
 }
 
 /// Adapt `BlobStore::get` into the planner's `BlobReader` trait.

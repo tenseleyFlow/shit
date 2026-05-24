@@ -68,6 +68,15 @@ pub enum CtlRequest {
     /// Post carries the engine-specific commit/binlog/size delta so
     /// the planner can render a transaction_state hint.
     DbEvent(DbEventReq),
+    /// DR-CR-26 — container-runtime destructive verb captured by
+    /// `shit-helper container-event <tool>`. The helper has already
+    /// run the pre-snapshot (`docker save` / `inspect` / volume tar /
+    /// compose config) and registered any tarball stash in the
+    /// `container_stashes` table; this request carries the descriptors
+    /// the planner needs to emit `CaptureEvent::ContainerOp` into the
+    /// journal. Daemon binds to the most recent open command window
+    /// for the helper's process tree, same shape as `PkgEvent`.
+    ContainerEvent(ContainerEventReq),
     /// One-shot perf-counter snapshot for `shit metrics` (S21.4).
     Metrics,
     /// S24.C — `shit undo` plan-fetch + execute. The daemon walks
@@ -620,6 +629,65 @@ pub struct PkgEventReq {
     pub extras: BTreeMap<String, String>,
 }
 
+/// DR-CR-26 — container destructive verb captured by the helper's
+/// `container-event <tool>` subcommand. The helper has already done
+/// the heavy lifting (run `<tool> inspect` / `<tool> save` / volume
+/// tar / compose config, registered any tarball stash in the
+/// container_stashes table); this wire carries the descriptors the
+/// daemon needs to journal a `CaptureEvent::ContainerOp`.
+///
+/// `runtime` distinguishes docker / podman delegation paths from
+/// docker-compose. `verb` is the destructive verb (rm / rmi /
+/// volume-rm / network-rm / compose-down) the wrapper detected from
+/// argv. `captured_config` carries the JSON/YAML pre-state in the
+/// tool's native format; the executor reads it back unparsed.
+/// `stash_image` is the `shit-stash:<id>:<ts>` tag committed for Rm;
+/// `stash_tarball` is the blake3-keyed tarball blob hash for Rmi /
+/// VolumeRm. Both `None` for ops that don't need a content stash
+/// (network-rm relies on inspect JSON alone).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerEventReq {
+    pub runtime: ContainerRuntimeWire,
+    pub verb: ContainerVerbWire,
+    pub captured_config: Vec<u8>,
+    pub stash_image: Option<String>,
+    /// 32-byte blake3 of the tarball stashed under
+    /// `container_stashes`. Daemon side resolves to a `BlobHash`.
+    pub stash_tarball: Option<[u8; 32]>,
+    /// Verb-specific descriptors: for Rm/Rmi the target image/name,
+    /// for VolumeRm the volume name + optional driver, for
+    /// ComposeDown the compose-file path + project name, etc.
+    /// Free-form so the daemon-side planner can grow new keys
+    /// without bumping the wire.
+    pub extras: BTreeMap<String, String>,
+    pub pid: u32,
+    pub uid: u32,
+}
+
+/// Container runtime (docker engine or podman). Mirrors
+/// [`shit_planner::inverse::ContainerRuntime`] on the wire side so the
+/// proto crate doesn't depend on the planner. `docker compose` and
+/// `podman compose` both flow through here -- the runtime field
+/// identifies which engine owns the compose plugin; the verb field
+/// (set to ComposeDown) distinguishes the op shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerRuntimeWire {
+    Docker,
+    Podman,
+}
+
+/// Container destructive verb the wrapper classified from argv.
+/// Mirrors [`shit_planner::inverse::ContainerOp`] without its
+/// per-variant fields (those travel in `extras`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerVerbWire {
+    Rm,
+    Rmi,
+    VolumeRm,
+    NetworkRm,
+    ComposeDown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CtlResponse {
     Status(DaemonStatus),
@@ -656,6 +724,11 @@ pub enum CtlResponse {
     ProcEventAck,
     /// Reply to `DbEvent` — same shape.
     DbEventAck,
+    /// Reply to `ContainerEvent` (DR-CR-26) — same shape as
+    /// `PkgEventAck`. Fire-and-confirm; the daemon-side journaling
+    /// happens synchronously before the ack, so by ack time the
+    /// `CaptureEvent::ContainerOp` row is in the events table.
+    ContainerEventAck,
     /// Reply to `Metrics` (S21.4).
     Metrics(MetricsSnapshot),
     /// Reply to `Undo` — execution report.
