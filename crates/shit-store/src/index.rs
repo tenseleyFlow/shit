@@ -758,6 +758,16 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: stash_tarball.as_ref(),
             post_content_hash: None,
         },
+        K::TerraformOp { .. } => Denormalized {
+            discriminant: "TerraformOp",
+            dev: None,
+            inode: None,
+            path: None,
+            // prior_state lives in the events row as serialized bytes;
+            // no separate blob to refcount-pin for GC.
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 
