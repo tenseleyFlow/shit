@@ -144,7 +144,9 @@ async fn handle_client(
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
-        CtlRequest::ContainerEvent(req) => handle_container_event(req, &active, &index),
+        CtlRequest::ContainerEvent(req) => {
+            handle_container_event(req, &active, &index, &blob_store)
+        }
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => handle_undo(req, &index, &blob_store),
         CtlRequest::WaitWatchReady {
@@ -490,10 +492,11 @@ fn handle_db_event(
     CtlResponse::DbEventAck
 }
 
-/// Handle one container-event request (DR-CR-26). Single-shot --
-/// the helper has already snapshotted state + registered any stash
-/// before sending; we just journal the descriptors. Always acks
-/// regardless of journaling outcome (the warn-log from
+/// Handle one container-event request (DR-CR-26). PR-B extension:
+/// the request may carry tarball bytes inline (small-image fast
+/// path); the handler writes them to the blob store + registers a
+/// container_stash row BEFORE journaling the ContainerOp event.
+/// Always acks regardless of journaling outcome (the warn-log from
 /// container_track::handle is the operator's failure signal); the
 /// shell-issued container command shouldn't be punished for shit's
 /// downstream issues.
@@ -501,8 +504,9 @@ fn handle_container_event(
     req: shit_proto::ContainerEventReq,
     active: &crate::active_commands::ActiveCommands,
     index: &Index,
+    blob_store: &BlobStore,
 ) -> CtlResponse {
-    let _ = crate::container_track::handle(req, active, index);
+    let _ = crate::container_track::handle(req, active, index, blob_store);
     CtlResponse::ContainerEventAck
 }
 
@@ -534,6 +538,75 @@ struct MultiTierExecutor<'a> {
     package_executor: shit_planner::executors::PackageExecutor<PrivilegedPkgRunner>,
     service_executor: shit_planner::executors::ServiceExecutor<PrivilegedSvcRunner>,
     network_executor: shit_planner::executors::NetworkExecutor<PrivilegedNetRunner>,
+    container_executor: shit_planner::executors::ContainerExecutor<DaemonContainerRunner<'a>>,
+}
+
+/// Container runner used by the daemon-side ContainerExecutor.
+/// Identical to [`shit_planner::SystemContainerRunner`] for the
+/// `docker run` / `docker load` / capture paths (shell out to the
+/// real binary with `SHIT_DURING_UNDO=1`), but `load_stash_tarball`
+/// resolves through the daemon's blob store rather than returning
+/// `None` (the SystemContainerRunner's stub behavior gated on
+/// DR-CR-26's wiring, now landed). Built per-undo-request and
+/// captures a borrow of the blob store.
+struct DaemonContainerRunner<'a> {
+    blob_store: &'a BlobStore,
+}
+
+impl shit_planner::executors::ContainerRunner for DaemonContainerRunner<'_> {
+    fn run(&self, argv: &[String]) -> Result<(), String> {
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let status = std::process::Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+    fn run_with_stdin(&self, argv: &[String], stdin_bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let mut child = std::process::Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(stdin_bytes)
+                .map_err(|e| format!("write stdin to {cmd}: {e}"))?;
+        }
+        let status = child.wait().map_err(|e| format!("wait {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+    fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let out = std::process::Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .output()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("{cmd} exited {:?}", out.status.code()));
+        }
+        Ok(out.stdout)
+    }
+    fn load_stash_tarball(&self, hash: &shit_planner::BlobHash) -> Option<Vec<u8>> {
+        // AR03 PR-B (DR-CR-26): resolve the stash through the
+        // daemon's blob store. `container_track::handle` already
+        // ingested + content-addressed the tarball at capture time,
+        // so the bytes are sitting under this blake3 key.
+        self.blob_store.get(*hash).ok()
+    }
 }
 
 /// PkgRunner that prefixes `doas` on non-Linux platforms where the
@@ -703,6 +776,7 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             || self.package_executor.supports(op)
             || self.service_executor.supports(op)
             || self.network_executor.supports(op)
+            || self.container_executor.supports(op)
     }
 
     fn execute(
@@ -719,6 +793,8 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             self.service_executor.execute(op, dry_run, policy)
         } else if self.network_executor.supports(op) {
             self.network_executor.execute(op, dry_run, policy)
+        } else if self.container_executor.supports(op) {
+            self.container_executor.execute(op, dry_run, policy)
         } else {
             shit_planner::ExecutionOutcome::Failed {
                 err: format!("no executor wired for tier {:?}", op.tier()),
@@ -818,11 +894,13 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
 
     let probe = LiveStateProbe::new();
     let reader = BlobReaderShim { blob_store };
+    let container_runner = DaemonContainerRunner { blob_store };
     let executor = MultiTierExecutor {
         file_executor: FileExecutor::new(&reader),
         package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
         service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
         network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),
+        container_executor: shit_planner::executors::ContainerExecutor::new(container_runner),
     };
 
     let mut commands_attempted = 0u32;
