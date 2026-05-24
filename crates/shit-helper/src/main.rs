@@ -259,6 +259,40 @@ enum Mode {
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
+    /// AR03 PR-B / DR-CR-26 — container destructive verb capture.
+    /// Invoked by the per-tool wrappers in
+    /// `packaging/container-hooks/{docker,podman,docker-compose}-
+    /// wrapper` BEFORE the real tool runs. Pre-phase snapshots state
+    /// (`docker save` for rmi, `docker inspect` for rm/network-rm,
+    /// `docker compose config` for compose-down, volume tar via
+    /// transient busybox for volume-rm), computes blake3, ships
+    /// inline bytes + descriptors over ctl. Daemon writes blob,
+    /// registers container_stash, journals `CaptureEvent::ContainerOp`.
+    ///
+    /// PR-B implements docker rmi only as the canonical AR03.2
+    /// path; rm / volume-rm / network-rm / compose-down ride the
+    /// same subcommand but per-verb capture is filled in incrementally.
+    ///
+    /// `target_argv` is everything the user passed after the tool
+    /// name, newline-separated (`docker rmi alpine` →
+    /// `target_argv="rmi\nalpine"`). The subcommand routes argv
+    /// through the existing `container::docker::classify_docker_argv`.
+    #[command(name = "container-event")]
+    ContainerEvent {
+        /// Container runtime / tool identifier
+        /// (`docker` | `podman` | `docker-compose`).
+        tool: String,
+        /// Phase of the operation (currently only `pre` is
+        /// supported; AR03.x sub-targets add `post` for state
+        /// reconciliation when needed).
+        phase: String,
+        /// User's argv after the tool name, newline-separated.
+        #[arg(long, default_value = "")]
+        target_argv: String,
+        /// Override the daemon ctl-socket path.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
     /// `shit doctor` probe (B03): connect to the daemon, exchange
     /// a Handshake/HandshakeAck, print a one-line JSON result to
     /// stdout, exit. No capture loop, no sandbox, no privileged
@@ -491,6 +525,12 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             )
             .await
         }
+        Mode::ContainerEvent {
+            tool,
+            phase,
+            target_argv,
+            ctl_sock,
+        } => container::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
         Mode::ProbeFanotify => run_probe_fanotify(),
