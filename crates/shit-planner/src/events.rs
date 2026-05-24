@@ -9,6 +9,7 @@
 //! and consumed by the planner.
 
 use crate::inode::{BlobHash, InodeRef};
+use crate::inverse::{ContainerOp, ContainerRuntime};
 use crate::metadata::{FileKind, FileMetadata};
 use crate::time::TimePoint;
 use serde::{Deserialize, Serialize};
@@ -146,6 +147,30 @@ pub enum CaptureEventKind {
         /// Engine-observed transaction state delta. `Unknown` when
         /// the engine probe (DR-56/57) wasn't wired or returned no info.
         transaction_state: DbTxState,
+    },
+    /// DR-CR-26 — container runtime operation captured by the
+    /// `shit-helper container-event` subcommand. Mirrors
+    /// [`crate::inverse::InverseOp::ContainerRestore`]'s shape: the
+    /// planner's match-arm maps this 1:1 to the reverse InverseOp
+    /// with the runtime + op + stash references intact. The capture
+    /// side (helper subcommand) is responsible for the
+    /// `docker inspect` / `docker save` / `docker volume tar` snapshot
+    /// and for registering any tarball stashes in the container_stash
+    /// store BEFORE emitting this event -- by event-ingest time the
+    /// daemon trusts the stash references are valid.
+    ContainerOp {
+        runtime: ContainerRuntime,
+        op: ContainerOp,
+        /// Captured `<tool> inspect` (or compose config) JSON/YAML.
+        /// Serialized as-is from the source tool; the executor's
+        /// reverse path reads it back without re-parsing.
+        captured_config: Vec<u8>,
+        /// `shit-stash:<short-id>:<ts>` tag for the rootfs commit.
+        /// Only populated by Rm (force-remove of a running container).
+        stash_image: Option<String>,
+        /// Blake3-addressed tarball in the container-stash store.
+        /// Populated by Rmi (image save) and VolumeRm (volume tar).
+        stash_tarball: Option<BlobHash>,
     },
 }
 

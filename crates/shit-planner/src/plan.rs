@@ -23,7 +23,9 @@
 
 use crate::events::{CaptureEvent, CaptureEventKind, CommandRecord, PackageManager, TreeOp};
 use crate::inode::InodeRef;
-use crate::inverse::{Conflict, InverseOp, NativeDelegation, PlanNode, PlanWarning, UndoPlan};
+use crate::inverse::{
+    Conflict, ContainerOp, InverseOp, NativeDelegation, PlanNode, PlanWarning, UndoPlan,
+};
 use crate::probe::StateProbe;
 use crate::store::PlannerStore;
 use std::collections::HashSet;
@@ -534,6 +536,35 @@ fn emit_for_event(
                     "{} statements against `{target}` need manual rollback review",
                     engine_label(*engine)
                 ),
+            });
+        }
+        CaptureEventKind::ContainerOp {
+            runtime,
+            op,
+            captured_config,
+            stash_image,
+            stash_tarball,
+        } => {
+            // DR-CR-26: 1:1 mapping from the capture-side ContainerOp
+            // event to the executor-side ContainerRestore InverseOp.
+            // The helper subcommand already snapshotted state +
+            // registered the stash; the planner's job here is purely
+            // to forward the descriptors.
+            //
+            // Rm specifically: requires_confirmation=true since
+            // DR-CR-22's full inverse synthesis from inspect JSON is
+            // still deferred (stage-1 informational per C04.5).
+            nodes.push(PlanNode {
+                op: InverseOp::ContainerRestore {
+                    runtime: *runtime,
+                    op: op.clone(),
+                    captured_config: captured_config.clone(),
+                    stash_image: stash_image.clone(),
+                    stash_tarball: *stash_tarball,
+                    requires_confirmation: matches!(op, ContainerOp::Rm { .. }),
+                },
+                cohort: 0,
+                conflict: None,
             });
         }
     }

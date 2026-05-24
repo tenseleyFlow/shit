@@ -9,6 +9,7 @@ mod active_commands;
 mod ancestry;
 mod baseline;
 mod config;
+mod container_track;
 mod crash;
 mod ctl;
 mod db_track;

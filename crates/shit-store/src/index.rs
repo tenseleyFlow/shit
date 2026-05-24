@@ -747,6 +747,17 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::ContainerOp { stash_tarball, .. } => Denormalized {
+            discriminant: "ContainerOp",
+            dev: None,
+            inode: None,
+            path: None,
+            // The stash blob hash is the load-bearing identifier for
+            // container ops; index it alongside FilePreImage blobs so
+            // GC's blob-refcount sweep keeps it pinned.
+            blob_hash: stash_tarball.as_ref(),
+            post_content_hash: None,
+        },
     }
 }
 
