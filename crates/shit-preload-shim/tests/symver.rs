@@ -44,15 +44,16 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
 ];
 
 /// Locate the built `.so`. cargo provides `CARGO_BIN_EXE_<name>`
-/// for bin targets but not for cdylibs, so we probe Cargo's
-/// standard layout — both debug (workspace `cargo test`) and
-/// release (`cargo test --release`). The version-tagging happens
-/// in both profiles, so either build artifact satisfies the
-/// regression test.
+/// for bin targets but not for cdylibs. `cargo test` builds the
+/// test binary + its rlib dependency but does NOT produce the
+/// cdylib output, so we trigger a `cargo build -p
+/// shit-preload-shim` as a fallback to ensure the artifact
+/// exists before the regression check.
+///
+/// Probes Cargo's standard layout — both debug and release —
+/// so the test works after either `cargo build` or `cargo build
+/// --release`.
 fn shim_so_path() -> std::path::PathBuf {
-    // Tests run from the crate root in normal `cargo test`, and
-    // from the workspace root in `cargo test --workspace`. Probe
-    // both depth-1 and depth-2 ancestors for either profile.
     let candidates = [
         // Crate-rooted (default `cargo test -p shit-preload-shim`)
         "../../target/debug/libshit_preload_shim.so",
@@ -61,16 +62,32 @@ fn shim_so_path() -> std::path::PathBuf {
         "target/debug/libshit_preload_shim.so",
         "target/release/libshit_preload_shim.so",
     ];
-    for c in &candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return p.canonicalize().unwrap_or(p);
-        }
+    if let Some(p) = candidates
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+    {
+        return p.canonicalize().unwrap_or(p);
     }
-    panic!(
-        "couldn't locate libshit_preload_shim.so; tried: {candidates:?}. \
-         Run `cargo build -p shit-preload-shim` (or `--release`) first."
-    );
+    // Fallback: trigger a debug build of the cdylib and re-probe.
+    // `cargo test --workspace` doesn't auto-build cdylib outputs,
+    // so this is the lightest-touch way to guarantee the
+    // artifact exists when the test runs in CI without a prior
+    // explicit `cargo build`.
+    eprintln!("symver test: cdylib not yet built; running `cargo build -p shit-preload-shim`");
+    let status = Command::new("cargo")
+        .args(["build", "-p", "shit-preload-shim"])
+        .status()
+        .expect("`cargo` must be on PATH");
+    assert!(status.success(), "fallback `cargo build` failed");
+    candidates
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .unwrap_or_else(|| {
+            panic!("cdylib still not present after fallback build; tried: {candidates:?}")
+        })
 }
 
 /// Parse `objdump -T` output for `(VERSION) NAME` pairs from
