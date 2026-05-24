@@ -279,6 +279,22 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        CaptureEventKind::ContainerOp { runtime, op, .. } => {
+            // DR-CR-26: forward replay of a container destructive verb
+            // would mean re-running e.g. `docker rmi` -- but the
+            // user's natural shell history already covers re-running
+            // the command if they want to. `shit redo` is informational
+            // only here; the captured config + stash references are
+            // available via `shit show` for inspection.
+            warnings.push(PlanWarning::Informational {
+                tier: InverseTier::Container,
+                message: format!(
+                    "container op {op:?} on {runtime:?} captured; \
+                     `shit redo` does not re-issue container destructive verbs \
+                     (re-run the original command if intended)"
+                ),
+            });
+        }
     }
 }
 
