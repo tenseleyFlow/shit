@@ -133,7 +133,7 @@ pub async fn run_event(
         runtime,
         verb: prepared.verb,
         captured_config: prepared.captured_config,
-        stash_image: None,
+        stash_image: prepared.stash_image,
         stash_tarball: prepared.stash_tarball,
         stash_tarball_bytes: prepared.stash_tarball_bytes,
         extras: prepared.extras,
@@ -167,6 +167,13 @@ struct PreparedEvent {
     captured_config: Vec<u8>,
     stash_tarball: Option<[u8; 32]>,
     stash_tarball_bytes: Option<Vec<u8>>,
+    /// AR10.9 / DR-CR-22: stash-commit image tag for containers that
+    /// were running at capture time. Populated by `prepare_rm` when
+    /// it successfully `docker commit`s the running container. The
+    /// executor uses this tag in the synthesized `docker run`
+    /// instead of the original `.Config.Image` so in-place rootfs
+    /// edits round-trip.
+    stash_image: Option<String>,
     extras: BTreeMap<String, String>,
 }
 
@@ -186,28 +193,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: DockerOrPodman) -> Opti
 
     match docker_verb {
         DockerVerb::Rmi { images } => prepare_rmi(tool, runtime, images),
-        // PR-B ships Rmi only as the canonical AR03.2 path; the other
-        // verbs are wired through to the daemon without a stash so the
-        // event is journaled (informational undo), and per-verb stash
-        // capture lands in follow-ups.
-        DockerVerb::Rm { ids, force } => {
-            let mut extras = BTreeMap::new();
-            // Use the first id as the wire identifier; if the user
-            // passed multiple, the others are still in argv but we
-            // ship one event per invocation in PR-B. Multi-id batching
-            // is a DR follow-up.
-            if let Some(id) = ids.first() {
-                extras.insert("id".into(), id.clone());
-            }
-            extras.insert("was_running".into(), force.to_string());
-            Some(PreparedEvent {
-                verb: ContainerVerbWire::Rm,
-                captured_config: Vec::new(),
-                stash_tarball: None,
-                stash_tarball_bytes: None,
-                extras,
-            })
-        }
+        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force),
         DockerVerb::VolumeRm { names } => prepare_volume_rm(tool, names),
         DockerVerb::NetworkRm { names } => prepare_network_rm(tool, names),
         // stop/kill are restart-hint events; no destructive content
@@ -247,6 +233,7 @@ fn prepare_rmi(
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
+                stash_image: None,
                 extras,
             });
         }
@@ -273,6 +260,7 @@ fn prepare_rmi(
             captured_config: Vec::new(),
             stash_tarball: None,
             stash_tarball_bytes: None,
+            stash_image: None,
             extras,
         });
     }
@@ -290,6 +278,7 @@ fn prepare_rmi(
         captured_config: Vec::new(),
         stash_tarball: Some(hash),
         stash_tarball_bytes: Some(bytes),
+        stash_image: None,
         extras,
     })
 }
@@ -399,6 +388,7 @@ fn prepare_network_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
             captured_config: json_bytes,
             stash_tarball: None,
             stash_tarball_bytes: None,
+            stash_image: None,
             extras,
         }),
         Err(e) => {
@@ -413,10 +403,159 @@ fn prepare_network_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
+                stash_image: None,
                 extras,
             })
         }
     }
+}
+
+/// AR10.9 / DR-CR-22 (`docker rm` capture path):
+///
+/// 1. Run `docker inspect <id>` to capture the full container config
+///    (Config, HostConfig, Mounts, NetworkSettings, etc.) — the
+///    daemon-side executor parses this JSON via `synthesize_container_run`
+///    to rebuild the `docker run` argv.
+/// 2. Detect whether the container was running at capture (`.State.Running`).
+/// 3. If running, `docker commit <id> shit-stash-<short_id>-<ts>` to
+///    preserve any in-place rootfs writes. The synthesized restore uses
+///    this stash image instead of `.Config.Image` so the user's edits
+///    round-trip.
+///
+/// `force` (the `-f` flag on `docker rm`) is the wire-level proxy for
+/// "container may be running"; in reality the container's running
+/// state is whatever inspect reports. We trust inspect over the flag.
+fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEvent> {
+    // PR-B (AR10.9): one event per invocation; multi-id batching is
+    // tracked as DR-CR-52.
+    let id = ids.into_iter().next()?;
+
+    let mut extras = BTreeMap::new();
+    extras.insert("id".into(), id.clone());
+
+    let inspect_json = match docker_container_inspect(tool, &id) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                tool,
+                id = %id,
+                err = %e,
+                "container-event: docker inspect failed; event will ship without captured_config"
+            );
+            extras.insert("was_running".into(), "false".into());
+            return Some(PreparedEvent {
+                verb: ContainerVerbWire::Rm,
+                captured_config: Vec::new(),
+                stash_tarball: None,
+                stash_tarball_bytes: None,
+                stash_image: None,
+                extras,
+            });
+        }
+    };
+
+    let was_running = inspect_is_running(&inspect_json);
+    extras.insert("was_running".into(), was_running.to_string());
+
+    if let Some(name) = inspect_container_name(&inspect_json) {
+        extras.insert("name".into(), name);
+    }
+
+    let stash_image = if was_running {
+        match docker_commit_running_container(tool, &id) {
+            Ok(tag) => Some(tag),
+            Err(e) => {
+                tracing::warn!(
+                    tool,
+                    id = %id,
+                    err = %e,
+                    "container-event: docker commit failed; restore will refuse to lose rootfs writes"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Some(PreparedEvent {
+        verb: ContainerVerbWire::Rm,
+        captured_config: inspect_json,
+        stash_tarball: None,
+        stash_tarball_bytes: None,
+        stash_image,
+        extras,
+    })
+}
+
+/// Run `{tool} inspect <id>` and return the raw JSON bytes. Docker
+/// emits an array-of-one shape — the planner's `apply_rm` unwraps it.
+fn docker_container_inspect(tool: &str, id: &str) -> std::io::Result<Vec<u8>> {
+    let out = Command::new(tool).args(["inspect", id]).output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{tool} inspect {id} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Best-effort extraction of `.State.Running` from inspect JSON.
+/// Returns false on any parse failure — restore then runs from the
+/// original image (acceptable for a stopped container; lossy for a
+/// running one, but if inspect's JSON is malformed there's nothing
+/// the daemon could do anyway).
+fn inspect_is_running(bytes: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let obj = match v {
+        serde_json::Value::Array(arr) => arr.into_iter().next().unwrap_or(serde_json::Value::Null),
+        other => other,
+    };
+    obj.get("State")
+        .and_then(|s| s.get("Running"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Best-effort extraction of `.Name` (stripping the leading `/`
+/// docker prepends).
+fn inspect_container_name(bytes: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = match v {
+        serde_json::Value::Array(arr) => arr.into_iter().next()?,
+        other => other,
+    };
+    obj.get("Name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_start_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Run `{tool} commit <id> shit-stash-<short>-<ts>` to snapshot the
+/// running container's rootfs into a tagged image. The tag includes
+/// a short id prefix + unix timestamp so concurrent commits on
+/// different containers don't collide and the `shit container-stashes
+/// prune` retention path can age them out.
+fn docker_commit_running_container(tool: &str, id: &str) -> std::io::Result<String> {
+    let short = id.chars().take(12).collect::<String>();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tag = format!("shit-stash-{short}-{ts}");
+    let out = Command::new(tool).args(["commit", id, &tag]).output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{tool} commit {id} {tag} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(tag)
 }
 
 fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
@@ -445,6 +584,7 @@ fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
+                stash_image: None,
                 extras,
             });
         }
@@ -468,6 +608,7 @@ fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
             captured_config: Vec::new(),
             stash_tarball: None,
             stash_tarball_bytes: None,
+            stash_image: None,
             extras,
         });
     }
@@ -485,6 +626,7 @@ fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
         captured_config: Vec::new(),
         stash_tarball: Some(hash),
         stash_tarball_bytes: Some(bytes),
+        stash_image: None,
         extras,
     })
 }
@@ -551,19 +693,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_rm_packs_first_id_into_extras() {
-        let v = DockerOrPodman::Docker(DockerVerb::Rm {
-            ids: vec!["abc123".into(), "def456".into()],
-            force: true,
-        });
-        let p = prepare("docker", ContainerRuntimeWire::Docker, v).unwrap();
-        assert!(matches!(p.verb, ContainerVerbWire::Rm));
-        assert_eq!(p.extras.get("id").map(String::as_str), Some("abc123"));
+    fn prepare_rm_extras_populated_under_docker_unavailable() {
+        // No docker on PATH → inspect fails → event still ships with
+        // id in extras (informational journal). was_running falls
+        // back to "false" since we can't observe the real state.
+        let prepared = prepare_rm(
+            "shit-test-no-such-docker-binary",
+            vec!["abc123".into(), "def456".into()],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(prepared.verb, ContainerVerbWire::Rm));
         assert_eq!(
-            p.extras.get("was_running").map(String::as_str),
-            Some("true")
+            prepared.extras.get("id").map(String::as_str),
+            Some("abc123")
         );
-        assert!(p.stash_tarball.is_none());
+        assert_eq!(
+            prepared.extras.get("was_running").map(String::as_str),
+            Some("false")
+        );
+        assert!(prepared.captured_config.is_empty());
+        assert!(prepared.stash_image.is_none());
+    }
+
+    #[test]
+    fn inspect_is_running_handles_array_and_object() {
+        let arr = br#"[{"State":{"Running":true}}]"#;
+        let obj = br#"{"State":{"Running":true}}"#;
+        let stopped = br#"{"State":{"Running":false}}"#;
+        let malformed = b"{not json";
+        let no_state = b"{}";
+        assert!(inspect_is_running(arr));
+        assert!(inspect_is_running(obj));
+        assert!(!inspect_is_running(stopped));
+        assert!(!inspect_is_running(malformed));
+        assert!(!inspect_is_running(no_state));
+    }
+
+    #[test]
+    fn inspect_container_name_strips_leading_slash() {
+        let bytes = br#"[{"Name":"/web-prod"}]"#;
+        assert_eq!(inspect_container_name(bytes).as_deref(), Some("web-prod"));
+    }
+
+    #[test]
+    fn inspect_container_name_missing_returns_none() {
+        assert!(inspect_container_name(b"{}").is_none());
+        assert!(inspect_container_name(br#"{"Name":""}"#).is_none());
     }
 
     #[test]
