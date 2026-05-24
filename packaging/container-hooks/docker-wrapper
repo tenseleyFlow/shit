@@ -29,6 +29,11 @@ real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker 2>/dev/null || command
 # Helper is hook-friendly: any failure logs and returns 0, so a torn
 # daemon cannot break `docker`. Best-effort by design.
 helper=$(command -v shit-helper 2>/dev/null || true)
+# Debug breadcrumb (gated on SHIT_HOOK_DEBUG=1) so smokes can see the
+# wrapper's path resolution without enabling shell -x.
+if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
+    echo "shit-hook: docker-wrapper real=${real} helper=${helper:-<not-found>}" >&2
+fi
 if [ -n "$helper" ]; then
     # Newline-separate the user's argv so the helper can split it
     # cleanly (NUL is awkward to ship through a CLI string flag).

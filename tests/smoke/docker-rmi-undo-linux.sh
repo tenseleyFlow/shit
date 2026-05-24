@@ -104,10 +104,19 @@ smoke_log "PreExec seq=1 pid=${PID}"
     --cwd "$(pwd)" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
 smoke_log "docker rmi ${TARGET_IMAGE} (via wrapper)"
-if ! docker rmi "${TARGET_IMAGE}" >"${SHIT_SMOKE_TMP}/rmi.log" 2>&1; then
+# Wrapper + helper diagnostics: always dump wrapper stderr so we can see
+# whether the helper was invoked, whether it reached the daemon, and
+# whether `docker save` succeeded. Cheap insurance for a path with
+# subtle env-var dependencies.
+export SHIT_HOOK_DEBUG=1
+if ! SHIT_HELPER_LOG=debug docker rmi "${TARGET_IMAGE}" \
+    >"${SHIT_SMOKE_TMP}/rmi.log" 2>&1; then
+    smoke_log "rmi.log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/rmi.log" >&2
     smoke_fail "docker rmi ${TARGET_IMAGE} exited non-zero"
 fi
+smoke_log "rmi.log (informational; rmi succeeded):"
+sed 's/^/    /' "${SHIT_SMOKE_TMP}/rmi.log" >&2
 
 # Confirm the image is actually gone.
 if docker image inspect "${TARGET_IMAGE}" >/dev/null 2>&1; then
