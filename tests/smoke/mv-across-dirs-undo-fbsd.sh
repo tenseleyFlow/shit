@@ -46,9 +46,21 @@ smoke_log "mv: ${MV_BIN}"
 
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
+SHIM_LIB="${SHIT_SMOKE_BIN_DIR}/libshit_preload_shim.so"
 [ -x "${HELPER_BIN}" ] || smoke_fail "shit-helper binary missing at ${HELPER_BIN}"
 [ -x "${SHIT_BIN}" ]   || smoke_fail "shit binary missing at ${SHIT_BIN}"
+[ -f "${SHIM_LIB}" ]   || smoke_fail "shim library missing at ${SHIM_LIB}"
 export SHIT_HELPER_BIN="${HELPER_BIN}"
+
+# W06.A.5: LD_PRELOAD the shim when invoking mv. With W06.A.3
+# shim→journal wiring landed, the rename(2) syscall fires the
+# shim's interposer, which sends a notification to the daemon,
+# which journals a TreeOp::Rename event. The planner can now see
+# both halves of cross-watch renames (cases 2 + 3) and emit the
+# correct Rename inverse. Without LD_PRELOAD here, cases 2/3
+# remain the cwd-watch-scope blind spot documented in W08.B-bsd.
+MV_LD_PRELOAD="${SHIM_LIB}"
+smoke_log "shim: ${MV_LD_PRELOAD}"
 
 # Set up the cwd (watched) and outside (unwatched) locations under
 # a shared parent so they're cleaned up by smoke_cleanup's rm -rf.
@@ -99,7 +111,7 @@ case1() {
         --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}")
     sleep 0.7
 
-    "${MV_BIN}" "${file_pre}" "${file_post}"
+    LD_PRELOAD="${MV_LD_PRELOAD}" "${MV_BIN}" "${file_pre}" "${file_post}"
     sleep 0.3
 
     "${SHIT_BIN}" hook-send post-exec \
@@ -156,7 +168,7 @@ case2() {
         --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}")
     sleep 0.7
 
-    "${MV_BIN}" "${file_pre}" "${file_post}"
+    LD_PRELOAD="${MV_LD_PRELOAD}" "${MV_BIN}" "${file_pre}" "${file_post}"
     sleep 0.3
 
     "${SHIT_BIN}" hook-send post-exec \
@@ -229,7 +241,7 @@ case3() {
         --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}")
     sleep 0.7
 
-    "${MV_BIN}" "${file_pre}" "${file_post}"
+    LD_PRELOAD="${MV_LD_PRELOAD}" "${MV_BIN}" "${file_pre}" "${file_post}"
     sleep 0.3
 
     "${SHIT_BIN}" hook-send post-exec \
@@ -291,23 +303,32 @@ smoke_log "case1 (intra-watch):   ${CASE1_RESULT}"
 smoke_log "case2 (unwatched dst): ${CASE2_RESULT}"
 smoke_log "case3 (unwatched src): ${CASE3_RESULT}"
 
-# Overall verdict: ALL THREE cases surface aspects of the same
-# cwd-watch-scope architectural gap W06 (`make install`) was scoped
-# to close. The trunk-as-of-2026-05-23 baseline:
-#   case1: file not restored (no rename signal in journal)
-#   case2: PARTIAL — file restored, dst-leftover at unwatched path
-#   case3: DATA LOSS — Unlink inverse runs against the moved-in
-#          file because the planner has no provenance for it
+# Overall verdict (post-W06.A.5): with the shim LD_PRELOAD'd into
+# each `mv` invocation, all three cases should now PASS. The shim
+# emits `rename(2)` notifications regardless of watch scope; the
+# daemon (W06.A.3) attributes them to the active command and
+# journals `TreeOp::Rename` events; the planner emits the inverse
+# rename. Cross-watch source/destination becomes visible.
 #
-# The smoke runs all three to document the surface area. It does
-# NOT gate on case1/case2/case3 outcomes — they're EXPECTED to
-# behave the documented "trunk-2026-05-23" way until W06 ships
-# a unified cross-watch-scope solution. Re-evaluate these gates
-# in W06.
-smoke_log "trunk-2026-05-23 expected outcomes:"
-smoke_log "  case1: file-not-restored (cwd-scope rename pairing missing)"
-smoke_log "  case2: PARTIAL (dst leftover at unwatched path)"
-smoke_log "  case3: DATA LOSS (no rename-source provenance)"
-smoke_log "All three close together in W06's cwd-watch-scope expansion."
+# Any FAIL here is a real regression — either:
+#   - shim not loading (PR #40, #42, #44 territory)
+#   - shim → journal wiring broken (PR #47 territory)
+#   - planner doesn't pair the Rename events into an inverse
+declare -A KNOWN
+KNOWN[case1]="${CASE1_RESULT}"
+KNOWN[case2]="${CASE2_RESULT}"
+KNOWN[case3]="${CASE3_RESULT}"
 
-smoke_log "PASS: mv-across-dirs-undo-fbsd (documenting gaps; case1=${CASE1_RESULT}, case2=${CASE2_RESULT}, case3=${CASE3_RESULT})"
+failed_cases=()
+for case_name in case1 case2 case3; do
+    result="${KNOWN[$case_name]}"
+    if [[ "$result" != PASS* ]]; then
+        failed_cases+=("$case_name=$result")
+    fi
+done
+
+if [ "${#failed_cases[@]}" -gt 0 ]; then
+    smoke_fail "regression in cross-watch mv coverage: ${failed_cases[*]}"
+fi
+
+smoke_log "PASS: mv-across-dirs-undo-fbsd (case1=${CASE1_RESULT}, case2=${CASE2_RESULT}, case3=${CASE3_RESULT})"
