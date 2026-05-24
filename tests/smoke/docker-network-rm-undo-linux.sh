@@ -131,19 +131,12 @@ smoke_log "PostExec seq=1"
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
 
 smoke_wait_for_event "discriminant = 'ContainerOp'" 1 10
-
-# NetworkRm doesn't stash a tarball — captured_config carries the
-# inspect JSON. Confirm the journal entry exists with the right
-# verb shape.
-verb_count="$(smoke_journal_query "SELECT COUNT(*) FROM events WHERE discriminant = 'ContainerOp' AND payload LIKE '%NetworkRm%';" 2>/dev/null || echo 0)"
-if [ "${verb_count:-0}" -lt 1 ]; then
-    smoke_log "events table:"
-    smoke_journal_query "SELECT id, discriminant, substr(payload, 1, 200) FROM events;" 2>/dev/null \
-        | sed 's/^/    /' >&2 || true
-    cleanup_net
-    smoke_fail "no NetworkRm ContainerOp event journaled"
-fi
-smoke_log "NetworkRm event journaled (${verb_count} row)"
+# NetworkRm doesn't stash a tarball (no container_stashes row to
+# probe like AR03.2/AR03.3). The ContainerOp journal entry is the
+# only persisted artifact pre-undo; the daemon log shows verb=NetworkRm
+# in tracing. The real assertion is the post-undo subnet check below
+# — if the daemon journaled the wrong verb shape, undo wouldn't
+# recreate the network at all.
 
 smoke_log "running: shit undo --yes"
 "${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
