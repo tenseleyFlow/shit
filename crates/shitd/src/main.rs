@@ -386,9 +386,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         let cfg = cfg.clone();
         let shutdown = Arc::clone(&shutdown);
         let index = Arc::clone(&index);
+        let blob_store = Arc::clone(&blob_store);
         let active = Arc::clone(&active);
         tokio::spawn(async move {
-            if let Err(e) = shim_listener::serve(&cfg, shutdown, index, active).await {
+            if let Err(e) = shim_listener::serve(&cfg, shutdown, index, blob_store, active).await {
                 tracing::error!(err = %e, "shim listener exited");
             }
         })
