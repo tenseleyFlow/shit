@@ -1,22 +1,34 @@
-/* W06.A.2 — minimal version definition for the LD_PRELOAD shim.
+/* W06.A.2 — minimal version definitions for the LD_PRELOAD shim.
  *
  * The `.symver` inline-assembly directives in src/lib.rs tag each
- * libc interposer with `@FBSD_1.0` so FreeBSD base utilities
- * (install, mv, cp, etc.) — which import libc symbols as
- * versioned `open@FBSD_1.0`, `unlink@FBSD_1.0`, etc. — bind their
- * PLT slots to our shim.
+ * libc interposer with the version(s) FreeBSD libc actually
+ * exposes for that symbol. lld refuses to emit a versioned symbol
+ * unless a matching version *definition* exists in
+ * `.gnu.version_d`. This script provides those definitions.
  *
- * lld refuses to emit a symbol tagged `@FBSD_1.0` unless a
- * version *definition* by that name exists in `.gnu.version_d`.
- * This script provides that definition. It deliberately lists NO
- * symbols — rustc auto-generates its own version script
- * (anonymous, with `local: *;`) listing every `#[no_mangle] pub`
- * symbol as global. Lld merges this script with rustc's. If we
- * listed symbols here, lld would error with "anonymous +
- * named version combination" because two version scripts can't
- * have differently-named blocks.
+ * Versions surveyed (FreeBSD 14.4 `objdump -T /lib/libc.so.7`):
+ *   FBSD_1.0  — open, unlink, rename, truncate, ftruncate,
+ *               pwrite, mmap
+ *   FBSD_1.1  — openat, unlinkat, renameat  (the *at variants)
  *
- * The empty body `{ };` just declares the version name. lld then
- * matches the `.symver`-emitted versioned symbols against it.
+ * Note: libc's `openat` ALSO has a `FBSD_1.2` (newer flag-aware
+ * form) but lld errors with "multiple versions for openat" if
+ * we emit two `.symver` directives for the same source symbol —
+ * the conflict appears when the rlib gets linked into a regular
+ * bin (which pulls in interposers as dead-code-but-no_mangle).
+ * FBSD_1.1 covers the overwhelming majority of base-binary
+ * callers; FBSD_1.2-exclusive callers fall through to libc.
+ *
+ * Empty bodies (`{ };`) declare each version name without
+ * listing symbols. rustc auto-generates its own cdylib version
+ * script (anonymous, `local: *;`) listing every `#[no_mangle]
+ * pub` symbol; mixing a named body with an anonymous body
+ * triggers lld's "anonymous + named version combination" error,
+ * so we leave bodies empty here and let the .symver-tagged
+ * symbols match the definitions by name.
+ *
+ * `tests/symver.rs` regression-tests that the built `.so`
+ * actually exports every (symbol, version) pair we expect.
  */
 FBSD_1.0 { };
+FBSD_1.1 { };
