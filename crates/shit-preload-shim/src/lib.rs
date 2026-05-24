@@ -57,8 +57,8 @@
 // import libc symbols as e.g. `open@FBSD_1.0`. The rtld resolver
 // binds the PLT to the specific versioned symbol. Our shim's
 // unversioned `open` is not a match, so without this directive
-// rtld falls through to libc's own `open@FBSD_1.0` and the shim
-// is silently inert on every versioned base binary.
+// rtld falls through to libc's own and the shim is silently inert
+// on every versioned base binary.
 //
 // We can't get the version tag via a `--version-script=` linker
 // arg because rustc auto-generates its own version script for
@@ -69,11 +69,19 @@
 // assembly emits the version tag at object-code level, before
 // rustc's version script is layered on top, so lld preserves it.
 //
-// Each directive of the form `.symver name, name@VERSION` adds
-// a versioned alias for the existing `name` symbol. Both
-// unversioned `name` and `name@VERSION` resolve to the same
-// function body — Linux callers get the unversioned, FreeBSD
-// versioned callers get `name@FBSD_1.0`.
+// **W06.A.2.5 followup:** version each interposer at every
+// version FreeBSD libc actually exposes for it. Surveyed via
+// `objdump -T /lib/libc.so.7` on FreeBSD 14.4. The *at variants
+// live at FBSD_1.1, and `openat` *also* at FBSD_1.2. Tagging
+// only at FBSD_1.0 (the W06.A.2 prototype) left
+// `openat@FBSD_1.1` / `unlinkat@FBSD_1.1` / `renameat@FBSD_1.1`
+// uncovered — modern callers that link to those bypassed the
+// shim. A regression test in `tests/symver.rs` reads the built
+// `.so` and asserts the expected version set.
+//
+// Multiple `.symver` directives per symbol export each version
+// as an alias for the same function body — rtld can substitute
+// for any of them.
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
@@ -81,16 +89,29 @@
     target_os = "dragonfly",
 ))]
 core::arch::global_asm!(
+    // FBSD_1.0 — `open`, `unlink`, `rename`, `truncate`,
+    // `ftruncate`, `pwrite`, `mmap`. All the pre-`*at` syscalls.
     ".symver open, open@FBSD_1.0",
-    ".symver openat, openat@FBSD_1.0",
     ".symver unlink, unlink@FBSD_1.0",
-    ".symver unlinkat, unlinkat@FBSD_1.0",
     ".symver rename, rename@FBSD_1.0",
-    ".symver renameat, renameat@FBSD_1.0",
     ".symver truncate, truncate@FBSD_1.0",
     ".symver ftruncate, ftruncate@FBSD_1.0",
     ".symver pwrite, pwrite@FBSD_1.0",
     ".symver mmap, mmap@FBSD_1.0",
+    // FBSD_1.1 — the *at variants. modern coreutils prefer these.
+    // openat ALSO lives at FBSD_1.2 (libc's newer flag-aware
+    // form), but lld emits "multiple versions for X" if we tag
+    // the same source symbol twice — and the conflict appears
+    // not in the cdylib output but when the rlib gets linked
+    // into the `shit` bin (which pulls in the interposers as
+    // dead-code-but-no_mangle). Picking FBSD_1.1 covers the
+    // overwhelming majority of base-binary callers. If a future
+    // binary surfaces that links to `openat@FBSD_1.2` exclusively,
+    // we extend with a runtime-version-aware fallback (see
+    // W06.A.2 followups).
+    ".symver openat, openat@FBSD_1.1",
+    ".symver unlinkat, unlinkat@FBSD_1.1",
+    ".symver renameat, renameat@FBSD_1.1",
 );
 
 pub mod dispatch;
