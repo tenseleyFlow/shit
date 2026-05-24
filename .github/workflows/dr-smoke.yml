@@ -219,6 +219,42 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  docker-rmi-undo:
+    # AR03.2 -- validates the container-runtime capture pipeline
+    # (DR-CR-26, AR03 PR-B). `docker rmi <image>` ships the tarball
+    # inline via the docker-wrapper hook → shit-helper container-event
+    # → shitd ctl → BlobStore + container_stashes; `shit undo` restores
+    # via `docker load`. Inline-bytes fast path is sized for alpine
+    # (~5 MB); large-image shipping is AR10.8.
+    #
+    # ubuntu-24.04 hosted runners ship docker preinstalled; no extra
+    # setup beyond sqlite + python3.
+    name: docker-rmi-undo smoke (AR03.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: docker preflight
+        run: |
+          docker version
+          docker info --format '{{.ServerVersion}}'
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/docker-rmi-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-rmi-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
