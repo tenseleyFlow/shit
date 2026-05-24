@@ -72,7 +72,8 @@ pub fn plan(
     //      within one command; the captured FilePreImage is of an
     //      already-gone file). No user-meaningful change to undo.
     //      Skip all three inverses entirely.
-    let (atomic_replace_paths, transient_paths) = classify_replace_paths(&live, probe);
+    let (atomic_replace_paths, transient_paths, rename_subsumed_creates) =
+        classify_replace_paths(&live, probe);
 
     for ev in &live {
         // W01.B.fix-rename-coalescing: skip the entire event if the
@@ -87,6 +88,7 @@ pub fn plan(
             probe,
             store,
             &atomic_replace_paths,
+            &rename_subsumed_creates,
             &mut nodes,
             &mut warnings,
         );
@@ -113,10 +115,20 @@ pub fn plan(
 ///   - `transient_paths` — path does NOT exist at undo time; the
 ///     command created+wrote+unlinked it within one logical step
 ///     (e.g. a lock file). All inverses are suppressed.
+///   - `rename_subsumed_creates` — path is the destination of a
+///     Rename AND also has a stand-alone Create at the same path
+///     (no Unlink). This happens on FreeBSD when the LD_PRELOAD
+///     shim (W06.A.3) emits a `TreeOp::Rename` for the mv and the
+///     kqueue dir-diff *also* emits a `TreeOp::Create` for the same
+///     destination — two views of the one logical action. The
+///     Rename inverse already restores the path mapping; emitting
+///     the Create's Unlink inverse on top either races or
+///     overrides it, deleting the file outright. Suppress the
+///     Create's Unlink inverse here.
 fn classify_replace_paths(
     events: &[&CaptureEvent],
     probe: &dyn StateProbe,
-) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+) -> (HashSet<PathBuf>, HashSet<PathBuf>, HashSet<PathBuf>) {
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
@@ -187,15 +199,28 @@ fn classify_replace_paths(
     // example: git renames .git/index.lock → .git/index; the pump
     // captures only Create(index.lock), missing its Unlink. The user's
     // expectation is the lock path stays gone — same as transient.
-    for p in creates {
-        if unlinks.contains(&p) {
+    for p in &creates {
+        if unlinks.contains(p) {
             continue;
         }
-        if probe.stat(&p).is_none() {
-            transient.insert(p);
+        if probe.stat(p).is_none() {
+            transient.insert(p.clone());
         }
     }
-    (atomic, transient)
+    // W06.A.5: Create + Rename(to=path) with NO Unlink → the shim
+    // and the kqueue dir-diff both observed the same mv. Surface
+    // these to suppress the Create's Unlink-inverse; the Rename's
+    // ReverseRename is authoritative.
+    let mut rename_subsumed_creates: HashSet<PathBuf> = HashSet::new();
+    for p in &creates {
+        if unlinks.contains(p) {
+            continue;
+        }
+        if rename_destinations.contains(p) {
+            rename_subsumed_creates.insert(p.clone());
+        }
+    }
+    (atomic, transient, rename_subsumed_creates)
 }
 
 /// Path the event targets (for the event-level skip in the transient
@@ -230,6 +255,7 @@ fn emit_for_event(
     probe: &dyn StateProbe,
     store: &dyn PlannerStore,
     atomic_replace_paths: &HashSet<PathBuf>,
+    rename_subsumed_creates: &HashSet<PathBuf>,
     nodes: &mut Vec<PlanNode>,
     warnings: &mut Vec<PlanWarning>,
 ) {
@@ -315,7 +341,13 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, atomic_replace_paths, nodes),
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(
+            op,
+            probe,
+            atomic_replace_paths,
+            rename_subsumed_creates,
+            nodes,
+        ),
         CaptureEventKind::EnvDiff {
             added,
             removed,
@@ -654,6 +686,7 @@ fn emit_for_tree_op(
     op: &TreeOp,
     probe: &dyn StateProbe,
     atomic_replace_paths: &HashSet<PathBuf>,
+    rename_subsumed_creates: &HashSet<PathBuf>,
     nodes: &mut Vec<PlanNode>,
 ) {
     match op {
@@ -663,6 +696,14 @@ fn emit_for_tree_op(
             // logical edit), the FilePreImage's RestoreContent handles
             // the full undo. Emitting an Unlink here would race with it.
             if atomic_replace_paths.contains(path) {
+                return;
+            }
+            // W06.A.5: a sibling TreeOp::Rename already covers this
+            // destination path. The Rename's ReverseRename moves the
+            // file back to its origin; an Unlink inverse here would
+            // either race and delete the moved-back file or beat the
+            // rename to it and leave the original location empty.
+            if rename_subsumed_creates.contains(path) {
                 return;
             }
             // The user's command created this path; inverse is unlink.
@@ -1428,6 +1469,81 @@ mod tests {
         };
         let p = plan(dummy_command(), &[create], &probe, &store);
         assert!(matches!(p.nodes[0].op, InverseOp::Unlink { .. }));
+    }
+
+    #[test]
+    fn rename_plus_duplicate_create_suppresses_unlink_inverse() {
+        // W06.A.5: on FreeBSD, an LD_PRELOAD'd `mv` fires the shim's
+        // rename interposer (TreeOp::Rename) AND the kqueue dir-diff
+        // observes the new file appearing (TreeOp::Create) — two
+        // views of one logical move. Pre-W06.A.5 the planner emitted
+        // both inverses; ReverseRename moved the file back to src
+        // and the duplicate Unlink then deleted it, leaving src
+        // empty. This test pins the suppression: when Create.path ==
+        // Rename.to and no Unlink fires, drop the Create's Unlink
+        // inverse and let the Rename inverse handle restoration.
+        let dst = PathBuf::from("/tmp/dst/file.txt");
+        let src = PathBuf::from("/tmp/src/file.txt");
+        let inode = InodeRef::new(1, 42);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            dst.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let store = InMemoryStore::new();
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let rename = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: src.clone(),
+                to: dst.clone(),
+                inode,
+            }),
+        };
+        let create = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: dst.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let p = plan(dummy_command(), &[rename, create], &probe, &store);
+        let unlinks_for_dst: Vec<_> = p
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, InverseOp::Unlink { path } if path == &dst))
+            .collect();
+        assert!(
+            unlinks_for_dst.is_empty(),
+            "duplicate Create at rename destination should NOT emit Unlink; got: {:?}",
+            unlinks_for_dst.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+        // The Rename's inverse must still be present (Rename inverse
+        // moves dst → src to undo the user's mv).
+        let has_reverse_rename = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::Rename { from, to } if from == &dst && to == &src));
+        assert!(
+            has_reverse_rename,
+            "Rename inverse missing; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
     }
 
     #[test]
