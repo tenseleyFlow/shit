@@ -14,7 +14,7 @@ set -e
 # (during a shit undo) must NOT re-capture. The executors set
 # SHIT_DURING_UNDO=1.
 if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
-    real=$(command -v -- podman | grep -v "$(dirname "$0")" | head -n1)
+    real=$(PATH="${PATH#*$(dirname "$0"):}" command -v podman 2>/dev/null || command -v -- podman)
     [ -n "$real" ] || { echo "shit: real podman not found on PATH" >&2; exit 127; }
     exec "$real" "$@"
 fi
