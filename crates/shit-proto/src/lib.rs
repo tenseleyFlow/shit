@@ -45,7 +45,7 @@ pub use helper::{
     HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest, HelperResponse,
     MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, TreeOpWire, validate_outgoing,
 };
-pub use shim::{ShimAck, ShimNotification};
+pub use shim::{SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimNotification, ShimPreImage};
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

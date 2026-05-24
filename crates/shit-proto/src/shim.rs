@@ -26,6 +26,42 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Inline pre-image payload for content-mutating syscalls. Carried in
+/// `ShimNotification::pre_image` when the shim was able to read the
+/// file's pre-mutation state. None when:
+///   - the target path doesn't exist (e.g. `open(O_CREAT|O_EXCL)`),
+///   - the file exceeds [`SHIM_INLINE_PREIMAGE_CAP`],
+///   - the read itself failed (permissions, EIO).
+///
+/// W06.A.4 ships inline-only. A streaming SCM_RIGHTS variant for files
+/// over the cap is a follow-up; for now over-cap files log a warning
+/// and we proceed without a pre-image (planner emits a
+/// Conflict::Missing at undo time, surfacing the gap to the user
+/// rather than silently dropping it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimPreImage {
+    /// Resolved (absolute) path the shim read content from. For
+    /// `openat(AT_FDCWD, relpath, ...)` the shim's resolver canonicalizes
+    /// before reading.
+    pub path: String,
+    pub dev: u64,
+    pub inode: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub mtime_unix_nanos: i128,
+    /// File bytes at pre-mutation time. Length == `size`.
+    pub bytes: Vec<u8>,
+}
+
+/// Max inline pre-image size the shim will capture. Above this the
+/// notification ships without `pre_image` and the daemon logs a
+/// telemetry event. 256 KiB covers ~all dotfiles, configs, and
+/// typical script overwrites; anything bigger (databases, binaries)
+/// is the W06.A.4-streaming follow-up's domain.
+pub const SHIM_INLINE_PREIMAGE_CAP: u64 = 256 * 1024;
+
 /// One pre-mutation notification from the shim. Sent once per
 /// interposed call when `SHIT_SHIM_DISABLE` is not set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +83,11 @@ pub struct ShimNotification {
     /// stale-event detection (the shim's send may be delayed under
     /// load).
     pub ts_unix_nanos: u64,
+    /// W06.A.4: inline pre-image for content-mutating syscalls
+    /// (`open(O_TRUNC|O_WRONLY|O_RDWR)`, `openat` ditto, `truncate`).
+    /// `None` for non-content syscalls and for cases listed in
+    /// [`ShimPreImage`]'s docstring.
+    pub pre_image: Option<ShimPreImage>,
 }
 
 /// Ack the daemon sends back. S24.D.2 ships `Allow` only; the broader
@@ -70,9 +111,34 @@ mod tests {
             syscall: "unlink".into(),
             arg: "/tmp/probe".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
+            pre_image: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        assert_eq!(decoded, n);
+    }
+
+    #[test]
+    fn shim_notification_with_pre_image_round_trips() {
+        let n = ShimNotification {
+            pid: 4242,
+            syscall: "open".into(),
+            arg: "/tmp/file.txt".into(),
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+            pre_image: Some(ShimPreImage {
+                path: "/tmp/file.txt".into(),
+                dev: 64,
+                inode: 7777,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 5,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                bytes: b"hello".to_vec(),
+            }),
+        };
+        let frame = crate::frame::encode_frame_large(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
         assert_eq!(decoded, n);
     }
 

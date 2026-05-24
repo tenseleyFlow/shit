@@ -220,6 +220,24 @@ fn classify_replace_paths(
             rename_subsumed_creates.insert(p.clone());
         }
     }
+    // W06.A.4: Rename(to=path) + PreImage(path) with NO Unlink → the
+    // shim captured a pre-image of the rename destination's prior
+    // content. Treat as atomic_replace: the RestoreContent inverse
+    // from the PreImage restores the right bytes, and the Rename's
+    // ReverseRename must be suppressed (it would move the new bytes
+    // back to the tmpfile path instead of restoring the dst). This
+    // is the `install(1)` / `mv` over-existing shape on FreeBSD.
+    for p in &rename_destinations {
+        if unlinks.contains(p) {
+            continue;
+        }
+        if !pre_images.contains(p) {
+            continue;
+        }
+        if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
+        }
+    }
     (atomic, transient, rename_subsumed_creates)
 }
 
@@ -1542,6 +1560,90 @@ mod tests {
         assert!(
             has_reverse_rename,
             "Rename inverse missing; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rename_with_preimage_dest_classifies_as_atomic_replace() {
+        // W06.A.4: install(1) writes a tmpfile then renames it
+        // over an existing destination. The shim emits BOTH a
+        // TreeOp::Rename(from=tmpfile, to=dst) AND a FilePreImage
+        // for `dst` with the old bytes. Without this fix, the
+        // planner emits ReverseRename(dst→tmpfile) + RestoreContent
+        // — the rename moves the new bytes back to the tmpfile path
+        // and leaves dst empty, racing with RestoreContent. The fix
+        // routes the dst path through atomic_replace_paths: the
+        // Rename inverse is suppressed, the FilePreImage's
+        // RestoreContent does all the work.
+        let dst = PathBuf::from("/target/bin/hello");
+        let tmpfile = PathBuf::from("/target/bin/INS@x3p");
+        let inode = InodeRef::new(1, 7777);
+        let blob = BlobHash::from_bytes([0xAB; 32]);
+
+        let mut store = InMemoryStore::new();
+        store.put_blob(blob, 11);
+
+        // Dst exists at undo time (it's the post-rename state,
+        // holding the new bytes).
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            dst.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(11),
+            },
+            None,
+        );
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let rename = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: tmpfile.clone(),
+                to: dst.clone(),
+                inode,
+            }),
+        };
+        let pre_image = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: dst.clone(),
+                blob,
+                meta: meta(11),
+                post_content_hash: None,
+            },
+        };
+        let p = plan(dummy_command(), &[rename, pre_image], &probe, &store);
+
+        // ReverseRename for dst MUST NOT be emitted — it would
+        // race with RestoreContent.
+        let has_reverse_rename = p.nodes.iter().any(
+            |n| matches!(&n.op, InverseOp::Rename { from, to } if from == &dst && to == &tmpfile),
+        );
+        assert!(
+            !has_reverse_rename,
+            "ReverseRename for atomic-replace dst leaked through; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+        // RestoreContent for dst MUST be emitted.
+        let has_restore = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if path == &dst));
+        assert!(
+            has_restore,
+            "RestoreContent missing; nodes: {:?}",
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
     }

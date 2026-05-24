@@ -855,7 +855,8 @@ jobs:
                     sed-inline-undo-fbsd.sh \
                     cargo-build-undo-fbsd.sh \
                     make-install-undo-fbsd.sh \
-                    mv-across-dirs-undo-fbsd.sh"
+                    mv-across-dirs-undo-fbsd.sh \
+                    make-install-overwrite-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
