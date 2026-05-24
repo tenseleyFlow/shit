@@ -11,8 +11,9 @@ use crate::proc_track::ProcPreStash;
 use crate::stats::Stats;
 use crate::svc_track::SvcPreStash;
 use shit_proto::{
-    ConflictPolicyWire, CtlRequest, CtlResponse, DaemonStatus, GcRequest, NetEventReq, PkgEventReq,
-    ProcEventReq, SvcEventReq, UndoReportWire, UndoRequest, decode_frame, encode_frame,
+    ConflictPolicyWire, CtlRequest, CtlResponse, DaemonStatus, GcRequest, MAX_LARGE_FRAME_SIZE,
+    NetEventReq, PkgEventReq, ProcEventReq, SvcEventReq, UndoReportWire, UndoRequest,
+    decode_frame_large, encode_frame,
 };
 use shit_store::{BlobStore, Index};
 
@@ -45,12 +46,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
-
-// S20 audit (F-NEW-1): aligned with the wire-side cap so tier-event
-// messages (NetEvent, ProcEvent, DbEvent) with raw state-dump bytes
-// — iptables-save output, /proc snapshots, SQL statement blobs —
-// can round-trip without being silently dropped at the encoder.
-const CTL_BUF: usize = shit_proto::MAX_FRAME_SIZE;
 
 /// Listen on `cfg.ctl_socket_path`, serving each connection on a task.
 /// `shutdown` is notified to ask the main runtime to exit; the listener
@@ -107,12 +102,35 @@ async fn handle_client(
         active,
         watch_ready,
     } = state;
-    let mut buf = vec![0u8; CTL_BUF];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    // Length-prefix-first read so we can grow the buffer up to
+    // MAX_LARGE_FRAME_SIZE only when a large payload (ContainerEvent
+    // tarball, AR03 PR-B) lands. Standard requests stay bounded by
+    // MAX_FRAME_SIZE; the per-connection memory cost only blows up
+    // for the genuine large-frame path.
+    let mut header = [0u8; 4];
+    if let Err(e) = stream.read_exact(&mut header).await {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Ok(());
+        }
+        return Err(e.into());
+    }
+    let body_len = u32::from_be_bytes(header) as usize;
+    let total_len = 4 + body_len;
+    if total_len > MAX_LARGE_FRAME_SIZE {
+        let frame = encode_frame(&CtlResponse::Error(format!(
+            "frame too large: {total_len} bytes"
+        )))?;
+        stream.write_all(&frame).await?;
         return Ok(());
     }
-    let req: CtlRequest = match decode_frame(&buf[..n]) {
+    let mut buf = vec![0u8; total_len];
+    buf[..4].copy_from_slice(&header);
+    if let Err(e) = stream.read_exact(&mut buf[4..]).await {
+        let frame = encode_frame(&CtlResponse::Error(format!("read body: {e}")))?;
+        stream.write_all(&frame).await?;
+        return Ok(());
+    }
+    let req: CtlRequest = match decode_frame_large(&buf) {
         Ok(r) => r,
         Err(e) => {
             let frame = encode_frame(&CtlResponse::Error(format!("decode: {e}")))?;
