@@ -1,0 +1,22 @@
+/* W06.A.2 — minimal version definition for the LD_PRELOAD shim.
+ *
+ * The `.symver` inline-assembly directives in src/lib.rs tag each
+ * libc interposer with `@FBSD_1.0` so FreeBSD base utilities
+ * (install, mv, cp, etc.) — which import libc symbols as
+ * versioned `open@FBSD_1.0`, `unlink@FBSD_1.0`, etc. — bind their
+ * PLT slots to our shim.
+ *
+ * lld refuses to emit a symbol tagged `@FBSD_1.0` unless a
+ * version *definition* by that name exists in `.gnu.version_d`.
+ * This script provides that definition. It deliberately lists NO
+ * symbols — rustc auto-generates its own version script
+ * (anonymous, with `local: *;`) listing every `#[no_mangle] pub`
+ * symbol as global. Lld merges this script with rustc's. If we
+ * listed symbols here, lld would error with "anonymous +
+ * named version combination" because two version scripts can't
+ * have differently-named blocks.
+ *
+ * The empty body `{ };` just declares the version name. lld then
+ * matches the `.symver`-emitted versioned symbols against it.
+ */
+FBSD_1.0 { };
