@@ -368,16 +368,20 @@ mod policy {
         notify_inner(syscall, &arg, Some(to));
     }
 
-    /// Recursion guard for the notify path. The pre-image-capture
-    /// branch reads the target file via `libc::open`/`libc::read`,
-    /// which on first-load lookups *does* go through our `open`
-    /// interposer (since the shim's `next::real_open` cache may not
-    /// be primed yet for the first call). Without this guard the
-    /// reentrant `open` would call `try_notify` → open the file
-    /// again → ... and either deadlock the daemon's per-conn task or
-    /// blow the stack. Thread-local because each thread is its own
-    /// independent caller; flipping a process-wide AtomicBool would
-    /// serialize parallel `make -j` callers.
+    // Recursion guard for the notify path. The pre-image-capture
+    // branch reads the target file via libc::open / libc::read,
+    // which on first-load lookups *does* go through our `open`
+    // interposer (since the shim's `next::real_open` cache may not
+    // be primed yet for the first call). Without this guard the
+    // reentrant `open` would call try_notify → open the file
+    // again → ... and either deadlock the daemon's per-conn task or
+    // blow the stack. Thread-local because each thread is its own
+    // independent caller; flipping a process-wide AtomicBool would
+    // serialize parallel `make -j` callers.
+    //
+    // (Plain `//` not `///` — rustdoc doesn't generate docs for
+    // items produced by macro invocations, and `-D warnings`
+    // promotes that to an error.)
     thread_local! {
         static IN_NOTIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
