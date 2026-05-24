@@ -323,6 +323,41 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  docker-rm-undo:
+    # AR10.9 / AR03.1 -- the marquee test for full Rm reverse
+    # synthesis (DR-CR-22). `docker rm -f <container>` ships the
+    # `docker inspect` JSON + a `shit-stash-*` commit for the
+    # running rootfs; `shit undo` parses the inspect and runs
+    # `docker run -d` with the synthesized argv. Asserts the
+    # restored container has the same image-source (stash),
+    # env vars, port bindings, volume mounts, restart policy, AND
+    # any in-place rootfs writes the user made before the rm.
+    name: docker-rm-undo smoke (AR10.9 / AR03.1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: docker preflight
+        run: |
+          docker version
+          docker info --format '{{.ServerVersion}}'
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/docker-rm-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-rm-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
