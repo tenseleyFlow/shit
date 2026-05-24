@@ -385,14 +385,23 @@ fn rm_reverse_inspects_stash_then_runs_synthesized_argv() {
 
     // Stub recorded the synthesized `docker run` invocation.
     let argv_run = fs::read_to_string(record_dir.path().join("argv-run")).unwrap();
-    assert!(argv_run.contains("--name"), "argv-run missing --name: {argv_run}");
-    assert!(argv_run.contains("web"), "argv-run missing container name: {argv_run}");
+    assert!(
+        argv_run.contains("--name"),
+        "argv-run missing --name: {argv_run}"
+    );
+    assert!(
+        argv_run.contains("web"),
+        "argv-run missing container name: {argv_run}"
+    );
     // Image should be the stash, not the original.
     assert!(
         argv_run.contains("shit-stash:abc123:1700000000"),
         "argv-run should use stash image: {argv_run}"
     );
-    assert!(!argv_run.contains("nginx:alpine"), "argv-run leaked original image: {argv_run}");
+    assert!(
+        !argv_run.contains("nginx:alpine"),
+        "argv-run leaked original image: {argv_run}"
+    );
     assert!(
         argv_run.contains("--restart=unless-stopped"),
         "argv-run missing restart policy: {argv_run}"
