@@ -165,6 +165,7 @@ async fn handle_client(
         CtlRequest::ContainerEvent(req) => {
             handle_container_event(req, &active, &index, &blob_store)
         }
+        CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => handle_undo(req, &index, &blob_store),
         CtlRequest::WaitWatchReady {
@@ -528,6 +529,15 @@ fn handle_container_event(
     CtlResponse::ContainerEventAck
 }
 
+fn handle_cloud_event(
+    req: shit_proto::CloudEventReq,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+) -> CtlResponse {
+    let _ = crate::cloud_track::handle(req, active, index);
+    CtlResponse::CloudEventAck
+}
+
 /// Adapt `BlobStore::get` into the planner's `BlobReader` trait.
 struct BlobReaderShim<'a> {
     blob_store: &'a BlobStore,
@@ -557,6 +567,64 @@ struct MultiTierExecutor<'a> {
     service_executor: shit_planner::executors::ServiceExecutor<PrivilegedSvcRunner>,
     network_executor: shit_planner::executors::NetworkExecutor<PrivilegedNetRunner>,
     container_executor: shit_planner::executors::ContainerExecutor<DaemonContainerRunner<'a>>,
+    terraform_executor:
+        shit_planner::executors::terraform::TerraformExecutor<DaemonTerraformRunner>,
+}
+
+/// AR04 PR-A: terraform runner used by the daemon-side
+/// TerraformExecutor. Shells out to the real `terraform` binary with
+/// `SHIT_DURING_UNDO=1` (the wrapper short-circuits on re-entry) and
+/// stages the captured `terraform state pull` bytes to a tempfile
+/// the executor passes to `terraform state push`. The tempfile path
+/// lives under the workdir's `.terraform/` if writeable, otherwise
+/// `/tmp/` — terraform's state-push API needs a file path, not a
+/// pipe.
+struct DaemonTerraformRunner;
+
+impl shit_planner::executors::terraform::TerraformRunner for DaemonTerraformRunner {
+    fn run(&self, argv: &[String], workdir: &std::path::Path) -> Result<(), String> {
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let status = std::process::Command::new(cmd)
+            .args(args)
+            .current_dir(workdir)
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+
+    fn stash_bytes(
+        &self,
+        bytes: &[u8],
+        workdir: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
+        use std::io::Write;
+        // Prefer workdir's .terraform/ if it exists + is writable (so
+        // the tempfile sits alongside the real state and any side-
+        // effects stay contained); fall back to /tmp.
+        let dir = {
+            let tf_subdir = workdir.join(".terraform");
+            if tf_subdir.is_dir() {
+                tf_subdir
+            } else {
+                std::env::temp_dir()
+            }
+        };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!("shit-tf-prior-{ts}.tfstate"));
+        let mut f = std::fs::File::create(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write {path:?}: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync {path:?}: {e}"))?;
+        Ok(path)
+    }
 }
 
 /// Container runner used by the daemon-side ContainerExecutor.
@@ -795,6 +863,7 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             || self.service_executor.supports(op)
             || self.network_executor.supports(op)
             || self.container_executor.supports(op)
+            || self.terraform_executor.supports(op)
     }
 
     fn execute(
@@ -813,6 +882,8 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             self.network_executor.execute(op, dry_run, policy)
         } else if self.container_executor.supports(op) {
             self.container_executor.execute(op, dry_run, policy)
+        } else if self.terraform_executor.supports(op) {
+            self.terraform_executor.execute(op, dry_run, policy)
         } else {
             shit_planner::ExecutionOutcome::Failed {
                 err: format!("no executor wired for tier {:?}", op.tier()),
@@ -919,6 +990,9 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
         service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
         network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),
         container_executor: shit_planner::executors::ContainerExecutor::new(container_runner),
+        terraform_executor: shit_planner::executors::terraform::TerraformExecutor::new(
+            DaemonTerraformRunner,
+        ),
     };
 
     let mut commands_attempted = 0u32;
