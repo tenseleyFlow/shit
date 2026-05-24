@@ -151,7 +151,15 @@ impl<R: ContainerRunner> InverseOpExecutor for ContainerExecutor<R> {
                 id,
                 name,
                 was_running,
-            } => self.apply_rm(bin, id, name.as_deref(), *was_running, stash_image, dry_run),
+            } => self.apply_rm(
+                bin,
+                id,
+                name.as_deref(),
+                *was_running,
+                captured_config,
+                stash_image,
+                dry_run,
+            ),
             ContainerOp::Rmi { image, digest } => {
                 self.apply_rmi(bin, image, digest.as_deref(), stash_tarball, dry_run)
             }
@@ -172,35 +180,80 @@ impl<R: ContainerRunner> InverseOpExecutor for ContainerExecutor<R> {
 }
 
 impl<R: ContainerRunner> ContainerExecutor<R> {
+    #[allow(clippy::too_many_arguments)]
     fn apply_rm(
         &self,
         bin: &str,
         id: &str,
         name: Option<&str>,
         was_running: bool,
+        captured_config: &[u8],
         stash_image: &Option<String>,
         dry_run: bool,
     ) -> ExecutionOutcome {
-        // v1: informational. Container rootfs replay from a captured
-        // inspect blob is non-trivial (port maps, network refs, mount
-        // replays, GPU runtime detection). DR-CR-22 covers full
-        // synthesis; for now we verify the stash image exists (so
-        // `shit show` can offer it as the rootfs source) and emit a
-        // skeleton `docker run` skipped-Note.
-        if was_running {
-            let stash = match stash_image {
-                Some(s) => s,
-                None => {
-                    return ExecutionOutcome::Failed {
-                        err: format!(
-                            "{bin} rm reverse: container `{}` was running at capture but no \
-                             stash image was recorded (capture path missed `{bin} commit`)",
-                            name.unwrap_or(id),
-                        ),
-                    };
-                }
+        // AR10.9 (DR-CR-22): full reverse synthesis. Parse the
+        // captured `docker inspect` JSON, optionally substitute the
+        // stash-commit image for a running-at-capture container, and
+        // synthesize a `docker run -d` invocation that round-trips
+        // the common ~15 options.
+        let inspect: serde_json::Value = match serde_json::from_slice(captured_config) {
+            Ok(v) => v,
+            Err(e) => {
+                return ExecutionOutcome::Failed {
+                    err: format!(
+                        "{bin} rm reverse: captured inspect JSON is invalid: {e} \
+                         (container `{}`, id `{id}`)",
+                        name.unwrap_or(id),
+                    ),
+                };
+            }
+        };
+        // `docker inspect <id>` returns an array-of-one; unwrap if so.
+        let obj = match &inspect {
+            serde_json::Value::Array(arr) => {
+                arr.first().cloned().unwrap_or(serde_json::Value::Null)
+            }
+            v => v.clone(),
+        };
+
+        // The user-facing name. If the wire-level name was None
+        // (auto-generated container), recover it from the inspect
+        // blob's `.Name` field (docker reports a leading slash; strip).
+        let restored_name = match name {
+            Some(n) => n.to_string(),
+            None => obj
+                .get("Name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| format!("shit-restored-{id}")),
+        };
+
+        // When the container was running at capture, the user's
+        // rootfs may have diverged from the original image (in-place
+        // edits, written files, etc.). The capture path commits the
+        // running container to `shit-stash:<id>:<ts>` and ships that
+        // tag as `stash_image`. The synthesized `docker run` uses
+        // that image instead of the original `.Config.Image` so the
+        // restored container has the same in-place state.
+        //
+        // Guard: if `was_running` but no stash, refuse cleanly —
+        // running from `.Config.Image` would silently lose any
+        // rootfs writes the user accumulated.
+        if was_running && stash_image.is_none() {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "{bin} rm reverse: container `{restored_name}` was running at \
+                     capture but no stash image was recorded (capture path missed \
+                     `{bin} commit`). Restoring from the original image would lose \
+                     any rootfs writes."
+                ),
             };
-            // Verify the stash image still exists.
+        }
+        if let Some(stash) = stash_image {
+            // Verify the stash image still exists before issuing the run.
+            // A run-against-a-missing-image fails with an opaque
+            // "Unable to find image" — we want to surface the actual
+            // problem (stash GC'd / manually removed) earlier.
             let guard_argv = vec![
                 bin.to_string(),
                 "image".to_string(),
@@ -210,23 +263,47 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
             if let Err(e) = self.runner.capture(&guard_argv) {
                 return ExecutionOutcome::Failed {
                     err: format!(
-                        "{bin} rm reverse: stash image `{stash}` missing ({e}); cannot replay \
-                         running container `{}`",
-                        name.unwrap_or(id),
+                        "{bin} rm reverse: stash image `{stash}` missing ({e}); \
+                         cannot replay container `{restored_name}`"
                     ),
                 };
             }
         }
-        // Reverse is informational in stage 1 — no live exec.
+
+        // Resolve the image source up-front so we can fail cleanly
+        // before invoking the synthesizer if neither stash nor
+        // captured .Config.Image is populated. Running with an empty
+        // image would produce an opaque docker CLI error.
+        let resolved_image = stash_image
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                obj.get("Config")
+                    .and_then(|c| c.get("Image"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            });
+        if resolved_image.is_none() {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "{bin} rm reverse: captured inspect JSON has no resolvable image \
+                     for container `{restored_name}` (neither stash_image nor \
+                     .Config.Image populated)"
+                ),
+            };
+        }
+
+        let argv = synthesize_container_run(bin, &restored_name, &obj, stash_image.as_deref());
+
         if dry_run {
             return ExecutionOutcome::WouldApply;
         }
-        ExecutionOutcome::Skipped {
-            reason: format!(
-                "{bin} rm reverse synthesis is deferred (DR-CR-22). \
-                 Captured inspect JSON is available via `shit show` for `{}` (id `{id}`).",
-                name.unwrap_or(id),
-            ),
+
+        match self.runner.run(&argv) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed {
+                err: format!("{bin} run (rm reverse): {e}"),
+            },
         }
     }
 
@@ -406,6 +483,290 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
             },
         }
     }
+}
+
+/// Pure: from a `docker inspect <container>`-style JSON object,
+/// synthesize the `docker run -d` argv that reproduces it. Returns
+/// the full argv ready for `Command::new(bin).args(&argv[1..])`.
+/// `image_override` lets the caller substitute the original
+/// `.Config.Image` with the stash-commit image when the container
+/// was running at capture time (the commit preserves rootfs changes
+/// the original image doesn't have).
+///
+/// Best-effort — covers the common ~15 options that round-trip the
+/// vast majority of user workloads (name, image, env, ports,
+/// mounts, restart policy, network, working dir, user, hostname,
+/// labels, privileged, read-only, cap-add/drop, entrypoint, cmd).
+/// GPU runtime detection (DR-CR-30), IPC / PID / UTS namespace
+/// modes, and resource limits (--memory / --cpus / --shm-size)
+/// land in v1.x; the captured JSON is always available via `shit
+/// show` for the user to fill in manually.
+///
+/// `name` is the container's user-visible name (the `--name` arg).
+/// Docker assigns auto-names like `friendly_chandrasekhar` if the
+/// user didn't provide one; we honor whatever the inspect blob
+/// reports.
+pub fn synthesize_container_run(
+    bin: &str,
+    name: &str,
+    inspect: &serde_json::Value,
+    image_override: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![bin.to_string(), "run".to_string(), "-d".to_string()];
+
+    argv.push("--name".to_string());
+    argv.push(name.to_string());
+
+    let config = inspect
+        .get("Config")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let host_config = inspect
+        .get("HostConfig")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    // --hostname (best-effort; docker auto-generates from container
+    // id if not set, so we only emit when the captured value is
+    // distinguishable from the auto-generated form).
+    if let Some(hostname) = config.get("Hostname").and_then(|v| v.as_str())
+        && !hostname.is_empty()
+        && !looks_like_auto_hostname(hostname, inspect)
+    {
+        argv.push("--hostname".to_string());
+        argv.push(hostname.to_string());
+    }
+
+    // -u / --user
+    if let Some(user) = config.get("User").and_then(|v| v.as_str())
+        && !user.is_empty()
+    {
+        argv.push("-u".to_string());
+        argv.push(user.to_string());
+    }
+
+    // -w / --workdir
+    if let Some(wd) = config.get("WorkingDir").and_then(|v| v.as_str())
+        && !wd.is_empty()
+    {
+        argv.push("-w".to_string());
+        argv.push(wd.to_string());
+    }
+
+    // -e / --env from .Config.Env (array of "KEY=VALUE" strings).
+    // Docker images bake env vars into their config; the captured
+    // env may include image-default ones. Round-tripping them all is
+    // safe (docker treats explicit -e identical to image-default for
+    // the same key), and filtering against an image's baseline env
+    // would require an extra `docker image inspect` call we'd rather
+    // avoid in the executor.
+    if let Some(envs) = config.get("Env").and_then(|v| v.as_array()) {
+        for e in envs {
+            if let Some(s) = e.as_str() {
+                argv.push("-e".to_string());
+                argv.push(s.to_string());
+            }
+        }
+    }
+
+    // --label from .Config.Labels (object of key→value strings).
+    if let Some(labels) = config.get("Labels").and_then(|v| v.as_object()) {
+        for (k, val) in labels {
+            if let Some(s) = val.as_str() {
+                argv.push("--label".to_string());
+                argv.push(format!("{k}={s}"));
+            }
+        }
+    }
+
+    // -p / --publish from .HostConfig.PortBindings (object of
+    // "<port>/<proto>" → array of { HostIp, HostPort }).
+    if let Some(pbs) = host_config.get("PortBindings").and_then(|v| v.as_object()) {
+        for (container_port_proto, bindings) in pbs {
+            // container_port_proto is "80/tcp" etc. Split off the proto.
+            let (cport, proto) = match container_port_proto.split_once('/') {
+                Some((p, pr)) => (p, pr),
+                None => (container_port_proto.as_str(), "tcp"),
+            };
+            if let Some(arr) = bindings.as_array() {
+                for binding in arr {
+                    let host_ip = binding.get("HostIp").and_then(|v| v.as_str()).unwrap_or("");
+                    let host_port = binding
+                        .get("HostPort")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let spec = if host_ip.is_empty() {
+                        if host_port.is_empty() {
+                            format!("{cport}/{proto}")
+                        } else {
+                            format!("{host_port}:{cport}/{proto}")
+                        }
+                    } else if host_port.is_empty() {
+                        format!("{host_ip}::{cport}/{proto}")
+                    } else {
+                        format!("{host_ip}:{host_port}:{cport}/{proto}")
+                    };
+                    argv.push("-p".to_string());
+                    argv.push(spec);
+                }
+            }
+        }
+    }
+
+    // -v / --volume from .Mounts (array of mount specs). Docker
+    // reports both bind mounts and named volumes here; the Type
+    // field distinguishes them. tmpfs mounts (Type=tmpfs) round-trip
+    // as --tmpfs <dst>.
+    if let Some(mounts) = inspect.get("Mounts").and_then(|v| v.as_array()) {
+        for m in mounts {
+            let typ = m.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+            let dst = m.get("Destination").and_then(|v| v.as_str()).unwrap_or("");
+            let rw = m.get("RW").and_then(|v| v.as_bool()).unwrap_or(true);
+            let mode_suffix = if rw { "" } else { ":ro" };
+            match typ {
+                "volume" => {
+                    let src = m.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+                    if !src.is_empty() && !dst.is_empty() {
+                        argv.push("-v".to_string());
+                        argv.push(format!("{src}:{dst}{mode_suffix}"));
+                    }
+                }
+                "bind" => {
+                    let src = m.get("Source").and_then(|v| v.as_str()).unwrap_or("");
+                    if !src.is_empty() && !dst.is_empty() {
+                        argv.push("-v".to_string());
+                        argv.push(format!("{src}:{dst}{mode_suffix}"));
+                    }
+                }
+                "tmpfs" if !dst.is_empty() => {
+                    argv.push("--tmpfs".to_string());
+                    argv.push(dst.to_string());
+                }
+                _ => {} // unknown mount type; ignore
+            }
+        }
+    }
+
+    // --restart from .HostConfig.RestartPolicy
+    if let Some(rp) = host_config.get("RestartPolicy") {
+        let policy = rp.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+        if !policy.is_empty() && policy != "no" {
+            let spec = match (policy, rp.get("MaximumRetryCount").and_then(|v| v.as_u64())) {
+                ("on-failure", Some(n)) if n > 0 => format!("on-failure:{n}"),
+                (p, _) => p.to_string(),
+            };
+            argv.push(format!("--restart={spec}"));
+        }
+    }
+
+    // --network from .HostConfig.NetworkMode. Docker reports
+    // "default" / "bridge" / "host" / "none" / "<container-name>" /
+    // "<network-name>". We pass through; docker accepts all of
+    // these as --network values. Omit when "default" since that's
+    // docker's implicit choice.
+    if let Some(nm) = host_config.get("NetworkMode").and_then(|v| v.as_str())
+        && !nm.is_empty()
+        && nm != "default"
+    {
+        argv.push("--network".to_string());
+        argv.push(nm.to_string());
+    }
+
+    // --privileged
+    if host_config
+        .get("Privileged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        argv.push("--privileged".to_string());
+    }
+
+    // --read-only (.HostConfig.ReadonlyRootfs)
+    if host_config
+        .get("ReadonlyRootfs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        argv.push("--read-only".to_string());
+    }
+
+    // --cap-add / --cap-drop
+    if let Some(caps) = host_config.get("CapAdd").and_then(|v| v.as_array()) {
+        for c in caps {
+            if let Some(s) = c.as_str() {
+                argv.push("--cap-add".to_string());
+                argv.push(s.to_string());
+            }
+        }
+    }
+    if let Some(caps) = host_config.get("CapDrop").and_then(|v| v.as_array()) {
+        for c in caps {
+            if let Some(s) = c.as_str() {
+                argv.push("--cap-drop".to_string());
+                argv.push(s.to_string());
+            }
+        }
+    }
+
+    // --entrypoint (string form; docker also accepts an array but
+    // the CLI flag takes a single string per docker convention).
+    // Captured Entrypoint is an array; we join with spaces. If the
+    // user's original entrypoint had spaces in a single arg this
+    // round-trips imperfectly — documented limitation.
+    if let Some(ep) = config.get("Entrypoint").and_then(|v| v.as_array())
+        && !ep.is_empty()
+    {
+        let parts: Vec<String> = ep
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !parts.is_empty() {
+            argv.push("--entrypoint".to_string());
+            argv.push(parts.join(" "));
+        }
+    }
+
+    // Image — the FINAL positional before cmd. Use image_override
+    // when present (stash-commit for running containers), else
+    // .Config.Image (the original tag). May be empty if neither is
+    // populated; the caller (apply_rm) detects that and fails
+    // cleanly before issuing the run.
+    let image = image_override
+        .map(String::from)
+        .or_else(|| {
+            config
+                .get("Image")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    argv.push(image);
+
+    // Cmd — array of strings appended verbatim as positional args.
+    if let Some(cmd) = config.get("Cmd").and_then(|v| v.as_array()) {
+        for c in cmd {
+            if let Some(s) = c.as_str() {
+                argv.push(s.to_string());
+            }
+        }
+    }
+
+    argv
+}
+
+/// Docker auto-generates a hostname equal to the first 12 chars of
+/// the container's full SHA-256 ID when the user doesn't pass
+/// --hostname. Skip emitting --hostname if the captured value
+/// matches that pattern, otherwise the restored container gets the
+/// OLD container's id as a hostname which is wrong.
+fn looks_like_auto_hostname(hostname: &str, inspect: &serde_json::Value) -> bool {
+    let Some(id) = inspect.get("Id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    hostname.len() == 12
+        && id.starts_with(hostname)
+        && hostname.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Pure: from a `docker network inspect`-style JSON object, synthesize
@@ -719,9 +1080,9 @@ mod tests {
         }
     }
 
-    // ----- Rm (informational) -----
+    // ----- Rm (AR10.9 / DR-CR-22: full reverse synthesis) -----
 
-    fn rm_op(was_running: bool, stash: Option<&str>) -> InverseOp {
+    fn rm_op_with_inspect(was_running: bool, stash: Option<&str>, inspect: &[u8]) -> InverseOp {
         InverseOp::ContainerRestore {
             runtime: ContainerRuntime::Docker,
             op: ContainerOp::Rm {
@@ -729,31 +1090,58 @@ mod tests {
                 name: Some("web".into()),
                 was_running,
             },
-            captured_config: b"{}".to_vec(),
+            captured_config: inspect.to_vec(),
             stash_image: stash.map(String::from),
             stash_tarball: None,
             requires_confirmation: true,
         }
     }
 
+    fn minimal_inspect() -> Vec<u8> {
+        // Minimal-but-valid inspect: just enough that synthesize
+        // produces an image positional.
+        br#"{
+            "Id": "abc123",
+            "Name": "/web",
+            "Config": {"Image": "nginx:alpine"},
+            "HostConfig": {},
+            "Mounts": []
+        }"#
+        .to_vec()
+    }
+
     #[test]
-    fn rm_running_with_existing_stash_returns_skipped_pending_dr() {
+    fn rm_running_with_existing_stash_runs_synthesized_argv() {
         let runner = SpyRunner::default();
         *runner.canned_inspect.borrow_mut() = b"{\"Id\":\"...\"}".to_vec();
         let exe = ContainerExecutor::new(runner);
         let outcome = exe.execute(
-            &rm_op(true, Some("shit-stash:abc123:1700000000")),
+            &rm_op_with_inspect(
+                true,
+                Some("shit-stash:abc123:1700000000"),
+                &minimal_inspect(),
+            ),
             false,
             ConflictPolicy::Abort,
         );
-        match outcome {
-            ExecutionOutcome::Skipped { reason } => {
-                assert!(reason.contains("DR-CR-22"), "got: {reason}");
-            }
-            other => panic!("expected Skipped (DR deferral), got {other:?}"),
-        }
-        // The stash-existence inspect ran.
-        assert_eq!(exe.runner.calls.borrow()[0].0, "capture");
+        assert!(
+            matches!(outcome, ExecutionOutcome::Applied),
+            "got: {outcome:?}"
+        );
+        let calls = exe.runner.calls.borrow();
+        // First: stash existence check (capture for image inspect).
+        assert_eq!(calls[0].0, "capture");
+        assert!(calls[0].1.contains(&"image".to_string()));
+        // Second: the synthesized docker run.
+        assert_eq!(calls[1].0, "run");
+        let run_argv = &calls[1].1;
+        assert_eq!(run_argv[0], "docker");
+        assert_eq!(run_argv[1], "run");
+        assert_eq!(run_argv[2], "-d");
+        assert!(run_argv.contains(&"--name".into()));
+        assert!(run_argv.contains(&"web".into()));
+        // Image should be the STASH, not the original.
+        assert!(run_argv.contains(&"shit-stash:abc123:1700000000".into()));
     }
 
     #[test]
@@ -762,7 +1150,7 @@ mod tests {
         *runner.inspect_should_fail.borrow_mut() = true;
         let exe = ContainerExecutor::new(runner);
         match exe.execute(
-            &rm_op(true, Some("shit-stash:gone:1700000000")),
+            &rm_op_with_inspect(true, Some("shit-stash:gone:1700000000"), &minimal_inspect()),
             false,
             ConflictPolicy::Abort,
         ) {
@@ -776,10 +1164,389 @@ mod tests {
     #[test]
     fn rm_running_without_recorded_stash_fails() {
         let exe = ContainerExecutor::new(SpyRunner::default());
-        match exe.execute(&rm_op(true, None), false, ConflictPolicy::Abort) {
+        match exe.execute(
+            &rm_op_with_inspect(true, None, &minimal_inspect()),
+            false,
+            ConflictPolicy::Abort,
+        ) {
             ExecutionOutcome::Failed { err } => assert!(err.contains("no stash image")),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rm_stopped_runs_synthesized_argv_from_original_image() {
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        let outcome = exe.execute(
+            &rm_op_with_inspect(false, None, &minimal_inspect()),
+            false,
+            ConflictPolicy::Abort,
+        );
+        assert!(
+            matches!(outcome, ExecutionOutcome::Applied),
+            "got: {outcome:?}"
+        );
+        let calls = exe.runner.calls.borrow();
+        assert_eq!(
+            calls.len(),
+            1,
+            "no stash check needed for stopped container"
+        );
+        let run_argv = &calls[0].1;
+        // Image should be the ORIGINAL, not a stash.
+        assert!(run_argv.contains(&"nginx:alpine".into()));
+        assert!(!run_argv.iter().any(|a| a.starts_with("shit-stash")));
+    }
+
+    #[test]
+    fn rm_invalid_inspect_json_fails_cleanly() {
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        match exe.execute(
+            &rm_op_with_inspect(false, None, b"{not json"),
+            false,
+            ConflictPolicy::Abort,
+        ) {
+            ExecutionOutcome::Failed { err } => assert!(err.contains("invalid")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_dry_run_returns_would_apply_without_executing() {
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        let outcome = exe.execute(
+            &rm_op_with_inspect(false, None, &minimal_inspect()),
+            true,
+            ConflictPolicy::Abort,
+        );
+        assert!(matches!(outcome, ExecutionOutcome::WouldApply));
+        assert!(exe.runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn rm_missing_image_in_inspect_fails_cleanly() {
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        let inspect = br#"{
+            "Id": "x",
+            "Name": "/y",
+            "Config": {},
+            "HostConfig": {},
+            "Mounts": []
+        }"#;
+        match exe.execute(
+            &rm_op_with_inspect(false, None, inspect),
+            false,
+            ConflictPolicy::Abort,
+        ) {
+            ExecutionOutcome::Failed { err } => assert!(err.contains("no resolvable image")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_inspect_array_form_is_unwrapped() {
+        // `docker inspect <id>` returns a single-element JSON array;
+        // executor must unwrap it.
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        let inspect = br#"[{
+            "Id": "abc",
+            "Name": "/web",
+            "Config": {"Image": "alpine:3.20"},
+            "HostConfig": {},
+            "Mounts": []
+        }]"#;
+        let outcome = exe.execute(
+            &rm_op_with_inspect(false, None, inspect),
+            false,
+            ConflictPolicy::Abort,
+        );
+        assert!(
+            matches!(outcome, ExecutionOutcome::Applied),
+            "got: {outcome:?}"
+        );
+        let calls = exe.runner.calls.borrow();
+        assert!(calls[0].1.contains(&"alpine:3.20".into()));
+    }
+
+    // ----- synthesize_container_run unit tests -----
+
+    fn syn(json: &str, image_override: Option<&str>) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        synthesize_container_run("docker", "myapp", &v, image_override)
+    }
+
+    #[test]
+    fn synth_minimal_emits_run_d_name_image() {
+        let argv = syn(
+            r#"{"Config":{"Image":"nginx:alpine"},"HostConfig":{}}"#,
+            None,
+        );
+        assert_eq!(&argv[..5], &["docker", "run", "-d", "--name", "myapp"]);
+        assert!(argv.contains(&"nginx:alpine".into()));
+    }
+
+    #[test]
+    fn synth_image_override_wins() {
+        let argv = syn(
+            r#"{"Config":{"Image":"nginx:alpine"},"HostConfig":{}}"#,
+            Some("shit-stash:abc:123"),
+        );
+        assert!(argv.contains(&"shit-stash:abc:123".into()));
+        assert!(!argv.contains(&"nginx:alpine".into()));
+    }
+
+    #[test]
+    fn synth_env_emits_dash_e_pairs() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x","Env":["FOO=bar","BAZ=qux"]},"HostConfig":{}}"#,
+            None,
+        );
+        let env_pairs: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "-e")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(env_pairs, vec!["FOO=bar", "BAZ=qux"]);
+    }
+
+    #[test]
+    fn synth_port_bindings_render_host_container_proto() {
+        let argv = syn(
+            r#"{
+                "Config":{"Image":"x"},
+                "HostConfig":{
+                    "PortBindings":{
+                        "80/tcp":[{"HostIp":"","HostPort":"8080"}],
+                        "443/tcp":[{"HostIp":"127.0.0.1","HostPort":"8443"}]
+                    }
+                }
+            }"#,
+            None,
+        );
+        let pubs: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "-p")
+            .map(|(_, s)| s)
+            .collect();
+        assert!(pubs.contains(&&"8080:80/tcp".to_string()));
+        assert!(pubs.contains(&&"127.0.0.1:8443:443/tcp".to_string()));
+    }
+
+    #[test]
+    fn synth_named_volume_mount() {
+        let argv = syn(
+            r#"{
+                "Config":{"Image":"x"},
+                "HostConfig":{},
+                "Mounts":[{"Type":"volume","Name":"pgdata","Destination":"/var/lib/postgresql/data","RW":true}]
+            }"#,
+            None,
+        );
+        let vols: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "-v")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(vols, vec!["pgdata:/var/lib/postgresql/data"]);
+    }
+
+    #[test]
+    fn synth_bind_mount_with_ro() {
+        let argv = syn(
+            r#"{
+                "Config":{"Image":"x"},
+                "HostConfig":{},
+                "Mounts":[{"Type":"bind","Source":"/etc/hosts","Destination":"/etc/hosts","RW":false}]
+            }"#,
+            None,
+        );
+        let vols: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "-v")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(vols, vec!["/etc/hosts:/etc/hosts:ro"]);
+    }
+
+    #[test]
+    fn synth_tmpfs_mount_renders_tmpfs_flag() {
+        let argv = syn(
+            r#"{
+                "Config":{"Image":"x"},
+                "HostConfig":{},
+                "Mounts":[{"Type":"tmpfs","Destination":"/run/secrets"}]
+            }"#,
+            None,
+        );
+        let tmpfs: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "--tmpfs")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(tmpfs, vec!["/run/secrets"]);
+    }
+
+    #[test]
+    fn synth_restart_policy_unless_stopped() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"RestartPolicy":{"Name":"unless-stopped"}}}"#,
+            None,
+        );
+        assert!(argv.contains(&"--restart=unless-stopped".to_string()));
+    }
+
+    #[test]
+    fn synth_restart_policy_no_is_omitted() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"RestartPolicy":{"Name":"no"}}}"#,
+            None,
+        );
+        assert!(!argv.iter().any(|s| s.starts_with("--restart")));
+    }
+
+    #[test]
+    fn synth_restart_on_failure_with_retry_count() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":5}}}"#,
+            None,
+        );
+        assert!(argv.contains(&"--restart=on-failure:5".to_string()));
+    }
+
+    #[test]
+    fn synth_network_mode_default_is_omitted() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"NetworkMode":"default"}}"#,
+            None,
+        );
+        assert!(!argv.iter().any(|s| s == "--network"));
+    }
+
+    #[test]
+    fn synth_network_mode_custom_is_emitted() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"NetworkMode":"my-net"}}"#,
+            None,
+        );
+        let nets: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "--network")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(nets, vec!["my-net"]);
+    }
+
+    #[test]
+    fn synth_privileged_and_readonly() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"Privileged":true,"ReadonlyRootfs":true}}"#,
+            None,
+        );
+        assert!(argv.contains(&"--privileged".to_string()));
+        assert!(argv.contains(&"--read-only".to_string()));
+    }
+
+    #[test]
+    fn synth_cap_add_drop() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x"},"HostConfig":{"CapAdd":["NET_ADMIN"],"CapDrop":["ALL"]}}"#,
+            None,
+        );
+        let adds: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "--cap-add")
+            .map(|(_, s)| s)
+            .collect();
+        let drops: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "--cap-drop")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(adds, vec!["NET_ADMIN"]);
+        assert_eq!(drops, vec!["ALL"]);
+    }
+
+    #[test]
+    fn synth_cmd_appended_as_positionals_after_image() {
+        let argv = syn(
+            r#"{"Config":{"Image":"alpine","Cmd":["sh","-c","echo hi"]},"HostConfig":{}}"#,
+            None,
+        );
+        // image at penultimate-ish position, then cmd tokens.
+        let img_idx = argv.iter().position(|s| s == "alpine").unwrap();
+        assert_eq!(&argv[img_idx..], &["alpine", "sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn synth_workdir_user_hostname() {
+        let argv = syn(
+            r#"{
+                "Id":"abc",
+                "Config":{
+                    "Image":"x",
+                    "WorkingDir":"/srv",
+                    "User":"1000:1000",
+                    "Hostname":"my-host"
+                },
+                "HostConfig":{}
+            }"#,
+            None,
+        );
+        assert!(argv.windows(2).any(|w| w == ["-w", "/srv"]));
+        assert!(argv.windows(2).any(|w| w == ["-u", "1000:1000"]));
+        assert!(argv.windows(2).any(|w| w == ["--hostname", "my-host"]));
+    }
+
+    #[test]
+    fn synth_auto_hostname_is_dropped() {
+        // Hostname equal to first 12 chars of Id → auto-generated;
+        // emitting --hostname would carry the OLD container's id
+        // forward, which is wrong.
+        let argv = syn(
+            r#"{
+                "Id":"abcdef0123456789",
+                "Config":{"Image":"x","Hostname":"abcdef012345"},
+                "HostConfig":{}
+            }"#,
+            None,
+        );
+        assert!(!argv.iter().any(|s| s == "--hostname"));
+    }
+
+    #[test]
+    fn synth_labels_emitted_as_key_eq_value() {
+        let argv = syn(
+            r#"{
+                "Config":{"Image":"x","Labels":{"app":"web","env":"prod"}},
+                "HostConfig":{}
+            }"#,
+            None,
+        );
+        let labels: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i > &0 && argv[*i - 1] == "--label")
+            .map(|(_, s)| s)
+            .collect();
+        assert!(labels.contains(&&"app=web".to_string()));
+        assert!(labels.contains(&&"env=prod".to_string()));
+    }
+
+    #[test]
+    fn synth_entrypoint_joined_with_spaces() {
+        let argv = syn(
+            r#"{"Config":{"Image":"x","Entrypoint":["/bin/sh","-c"]},"HostConfig":{}}"#,
+            None,
+        );
+        assert!(argv.windows(2).any(|w| w == ["--entrypoint", "/bin/sh -c"]));
     }
 
     // ----- ComposeDown -----
