@@ -95,13 +95,16 @@ exit 2
 "#,
         rec = record_dir.display()
     );
-    // Use fs::write (open/write/close in one call) instead of
-    // File::create + write_all to ensure the writeable fd is closed
-    // before this function returns. Otherwise exec(2) on `path` races
-    // with the fd lifecycle and trips ETXTBSY on Linux ("Text file
-    // busy", os error 26) when the executor spawns docker.
-    fs::write(&path, body.as_bytes()).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    // Write-then-rename pattern: even with fs::write closing the fd
+    // synchronously, Linux occasionally flakes with ETXTBSY ("Text file
+    // busy", os error 26) when exec(2) lands on `path` immediately
+    // after the close. Writing to a sibling tempname and atomically
+    // renaming guarantees the final inode has never been open for
+    // writing (i_writecount==0) by the time the executor spawns it.
+    let staging = dir.join(".docker.staging");
+    fs::write(&staging, body.as_bytes()).unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&staging, &path).unwrap();
     path
 }
 
