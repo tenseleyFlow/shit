@@ -77,6 +77,16 @@ pub enum CtlRequest {
     /// journal. Daemon binds to the most recent open command window
     /// for the helper's process tree, same shape as `PkgEvent`.
     ContainerEvent(ContainerEventReq),
+    /// AR04 PR-A (DR-CR-06 cloud-event ctl route): the
+    /// helper-side cloud wrapper (terraform / kubectl / gh / aws)
+    /// shipped a captured cloud event. Daemon binds to the most
+    /// recent open command window for the helper's process tree,
+    /// same shape as `ContainerEvent`. The `runtime` field
+    /// distinguishes which tool (Terraform initially; kubectl /
+    /// gh / aws land in AR04.3 / .4 / .5). `prior_state` carries
+    /// the pre-mutation snapshot the executor needs for reverse
+    /// (e.g. `terraform state pull` output).
+    CloudEvent(CloudEventReq),
     /// One-shot perf-counter snapshot for `shit metrics` (S21.4).
     Metrics,
     /// S24.C — `shit undo` plan-fetch + execute. The daemon walks
@@ -696,6 +706,66 @@ pub enum ContainerVerbWire {
     ComposeDown,
 }
 
+/// AR04 PR-A — cloud / IaC tool event ship from the helper wrappers
+/// (terraform / kubectl / gh / aws). The daemon's `cloud_track`
+/// handler resolves `pid` → `CommandId` and journals a
+/// [`shit_planner::CaptureEventKind::TerraformOp`] (or per-runtime
+/// equivalent) which the orchestrator routes to the matching
+/// executor at undo time.
+///
+/// `prior_state` carries the snapshot the executor needs for reverse:
+/// `terraform state pull` output for Terraform, the deleted YAML
+/// for kubectl, the release metadata blob for gh, etc. May be empty
+/// when the verb doesn't carry a state snapshot (e.g. read-only
+/// observation that we still want journaled).
+///
+/// `workdir` is the user's CWD at capture — used by terraform to
+/// pin which `.terraform/` dir the restore should reconcile against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudEventReq {
+    pub runtime: CloudRuntimeWire,
+    pub verb: CloudVerbWire,
+    pub workdir: String,
+    pub prior_state: Vec<u8>,
+    /// Verb-specific descriptors: for Terraform StateRm the resource
+    /// address, for kubectl delete the resource name + namespace,
+    /// for gh release the tag, etc. Free-form so the daemon-side
+    /// planner can grow new keys without bumping the wire.
+    pub extras: BTreeMap<String, String>,
+    pub pid: u32,
+    pub uid: u32,
+}
+
+/// Cloud runtime tool. Initially Terraform only (AR04.1); kubectl /
+/// gh / aws variants land in AR04.3 / .4 / .5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudRuntimeWire {
+    Terraform,
+    Kubectl,
+    Gh,
+    Aws,
+}
+
+/// Cloud destructive verb the wrapper classified from argv.
+/// Mirrors [`shit_planner::inverse::TerraformOp`] et al. without
+/// per-variant fields (those travel in `extras`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudVerbWire {
+    // Terraform
+    TerraformApply,
+    TerraformDestroy,
+    TerraformStateRm,
+    TerraformImport,
+    // Kubectl (AR04.3)
+    KubectlApply,
+    KubectlDelete,
+    // gh (AR04.4)
+    GhReleaseCreate,
+    GhReleaseDelete,
+    // aws (AR04.5 strategy TBD)
+    AwsGeneric,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CtlResponse {
     Status(DaemonStatus),
@@ -737,6 +807,9 @@ pub enum CtlResponse {
     /// happens synchronously before the ack, so by ack time the
     /// `CaptureEvent::ContainerOp` row is in the events table.
     ContainerEventAck,
+    /// Reply to `CloudEvent` (AR04 PR-A) — same shape as
+    /// `ContainerEventAck`.
+    CloudEventAck,
     /// Reply to `Metrics` (S21.4).
     Metrics(MetricsSnapshot),
     /// Reply to `Undo` — execution report.
