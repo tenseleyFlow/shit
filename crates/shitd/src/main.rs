@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 mod active_commands;
 mod ancestry;
 mod baseline;
+mod cloud_track;
 mod config;
 mod container_track;
 mod crash;
