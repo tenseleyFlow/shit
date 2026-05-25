@@ -113,16 +113,63 @@ impl<R: TerraformRunner> InverseOpExecutor for TerraformExecutor<R> {
             TerraformOp::Apply | TerraformOp::Destroy => {}
         }
 
-        if prior_state.is_empty() {
-            return ExecutionOutcome::Skipped {
-                reason: "no prior state captured (was `terraform apply` run with -auto-approve \
-                         outside a shit-hooked shell?)"
-                    .into(),
-            };
-        }
-
         if dry_run {
             return ExecutionOutcome::WouldApply;
+        }
+
+        // AR04.1: dispatch by op direction.
+        // - Apply-reverse → `terraform destroy -auto-approve` in workdir.
+        //   The user did an apply; the inverse is destroy. The captured
+        //   prior_state would tell us "what existed before apply"; for
+        //   the common case where prior_state was empty (no prior apply)
+        //   destroy is the clean inverse. For the case where prior_state
+        //   HAD resources, we'd want a more surgical
+        //   destroy-only-the-new-resources, but that requires plan-diff
+        //   logic we haven't built; v1 documents destroy-all as the
+        //   stage-1 behavior.
+        // - Destroy-reverse → stash captured state + push + apply
+        //   -refresh-only. This is best-effort: state push restores the
+        //   recorded resources to state, but apply -refresh-only does
+        //   NOT recreate world resources from state. The cleanest
+        //   "undo destroy" would be `terraform apply` (re-reads .tf,
+        //   recreates). v1 implements the state-rewind path for
+        //   downstream commands that operate on state; full
+        //   resource-recreate is a v1.x follow-up.
+        match tf_op {
+            TerraformOp::Apply => self.apply_reverse_via_destroy(workdir),
+            TerraformOp::Destroy => self.destroy_reverse_via_state_push(workdir, prior_state),
+            TerraformOp::StateRm | TerraformOp::Import => unreachable!("handled above"),
+        }
+    }
+}
+
+impl<R: TerraformRunner> TerraformExecutor<R> {
+    fn apply_reverse_via_destroy(&self, workdir: &std::path::Path) -> ExecutionOutcome {
+        let argv = vec![
+            "terraform".to_string(),
+            "destroy".to_string(),
+            "-auto-approve".to_string(),
+            "-no-color".to_string(),
+        ];
+        match self.runner.run(&argv, workdir) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed {
+                err: format!("terraform destroy: {e}"),
+            },
+        }
+    }
+
+    fn destroy_reverse_via_state_push(
+        &self,
+        workdir: &std::path::Path,
+        prior_state: &[u8],
+    ) -> ExecutionOutcome {
+        if prior_state.is_empty() {
+            return ExecutionOutcome::Skipped {
+                reason: "no prior state captured for terraform destroy reverse (was the destroy \
+                         run outside a shit-hooked shell?)"
+                    .into(),
+            };
         }
 
         // 1. Stash the captured state to a tempfile.
@@ -207,39 +254,68 @@ mod tests {
         }
     }
 
+    fn destroy_op() -> InverseOp {
+        InverseOp::TerraformReverse {
+            workdir: PathBuf::from("/tmp/tf"),
+            op: TerraformOp::Destroy,
+            prior_state: b"{\"version\": 4}".to_vec(),
+            plan_json: None,
+            requires_confirmation: true,
+        }
+    }
+
     #[test]
-    fn apply_reverse_pushes_state_then_reconciles() {
+    fn apply_reverse_runs_terraform_destroy() {
+        // AR04.1: undo of `terraform apply` is `terraform destroy
+        // -auto-approve`. No state-push needed — the captured
+        // prior_state is ignored for the apply-reverse direction.
         let exe = TerraformExecutor::new(Spy::default());
         let outcome = exe.execute(&apply_op(), false, ConflictPolicy::Abort);
         assert_eq!(outcome, ExecutionOutcome::Applied);
         let runs = exe.runner.runs.borrow();
-        assert_eq!(runs.len(), 2);
-        assert_eq!(
-            runs[0],
-            vec!["terraform", "state", "push", "/tmp/shit-tf-fake.tfstate"]
-        );
-        assert!(runs[1].iter().any(|t| t == "apply"));
-        assert!(runs[1].iter().any(|t| t == "-refresh-only"));
-        assert!(runs[1].iter().any(|t| t == "-auto-approve"));
-        // The stash actually got the captured bytes.
-        let stashed = exe.runner.stashed.borrow();
-        assert_eq!(stashed.len(), 1);
-        assert_eq!(stashed[0], b"{\"version\": 4}");
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].iter().any(|t| t == "destroy"));
+        assert!(runs[0].iter().any(|t| t == "-auto-approve"));
+        // No stash was needed for the destroy path.
+        assert!(exe.runner.stashed.borrow().is_empty());
     }
 
     #[test]
-    fn destroy_reverse_uses_same_state_push_path() {
+    fn apply_reverse_with_empty_prior_state_still_runs_destroy() {
+        // Even when prior_state is empty (no pre-apply state, common
+        // case for a fresh init followed by apply), the destroy path
+        // still works — terraform destroy reads the .tf and the
+        // post-apply state.
         let mut op = apply_op();
-        if let InverseOp::TerraformReverse { op: ref mut k, .. } = op {
-            *k = TerraformOp::Destroy;
+        if let InverseOp::TerraformReverse {
+            prior_state: ref mut s,
+            ..
+        } = op
+        {
+            s.clear();
         }
         let exe = TerraformExecutor::new(Spy::default());
         let outcome = exe.execute(&op, false, ConflictPolicy::Abort);
         assert_eq!(outcome, ExecutionOutcome::Applied);
         let runs = exe.runner.runs.borrow();
+        assert!(runs[0].iter().any(|t| t == "destroy"));
+    }
+
+    #[test]
+    fn destroy_reverse_uses_state_push_path() {
+        // Destroy-reverse keeps the stage-1 state-push + refresh-only
+        // path. Best-effort: state is restored but world resources
+        // are NOT recreated; full apply-reverse is v1.x.
+        let exe = TerraformExecutor::new(Spy::default());
+        let outcome = exe.execute(&destroy_op(), false, ConflictPolicy::Abort);
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        let runs = exe.runner.runs.borrow();
+        assert_eq!(runs.len(), 2);
         assert_eq!(runs[0][0], "terraform");
         assert_eq!(runs[0][1], "state");
         assert_eq!(runs[0][2], "push");
+        assert!(runs[1].iter().any(|t| t == "apply"));
+        assert!(runs[1].iter().any(|t| t == "-refresh-only"));
     }
 
     #[test]
@@ -260,8 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_prior_state_skips() {
-        let mut op = apply_op();
+    fn destroy_reverse_with_empty_prior_state_skips() {
+        // Destroy direction needs the prior state to restore;
+        // without it the path is skipped informationally.
+        let mut op = destroy_op();
         if let InverseOp::TerraformReverse {
             prior_state: ref mut s,
             ..
@@ -280,10 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn stash_failure_surfaces_as_failed() {
+    fn destroy_reverse_stash_failure_surfaces_as_failed() {
         let exe = TerraformExecutor::new(Spy::default());
         *exe.runner.stash_fail.borrow_mut() = true;
-        match exe.execute(&apply_op(), false, ConflictPolicy::Abort) {
+        match exe.execute(&destroy_op(), false, ConflictPolicy::Abort) {
             ExecutionOutcome::Failed { err } => {
                 assert!(err.contains("stash"));
             }
@@ -292,10 +370,10 @@ mod tests {
     }
 
     #[test]
-    fn state_push_failure_aborts_before_reconcile() {
+    fn destroy_reverse_state_push_failure_aborts_before_reconcile() {
         let exe = TerraformExecutor::new(Spy::default());
         *exe.runner.run_fail_on.borrow_mut() = Some(0); // fail first run = state push
-        match exe.execute(&apply_op(), false, ConflictPolicy::Abort) {
+        match exe.execute(&destroy_op(), false, ConflictPolicy::Abort) {
             ExecutionOutcome::Failed { err } => {
                 assert!(err.contains("state push"));
             }

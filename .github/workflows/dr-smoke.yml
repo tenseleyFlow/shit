@@ -425,6 +425,43 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  terraform-apply-undo:
+    # AR04.1 -- validates the cloud / IaC capture + restore path
+    # (DR-CR-06). `terraform apply -auto-approve` ships the captured
+    # pre-state via shit-helper cloud-event; `shit undo` runs
+    # `terraform state push <tempfile>` + `terraform apply
+    # -refresh-only` to rewind. Uses the local_file provider — no
+    # cloud creds. Installs terraform from HashiCorp's apt repo.
+    name: terraform-apply-undo smoke (AR04.1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3 gnupg software-properties-common
+      - name: install terraform from hashicorp apt repo
+        run: |
+          wget -O- https://apt.releases.hashicorp.com/gpg | \
+            sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+            sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update && sudo apt-get install -y terraform
+          terraform -version
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/terraform-apply-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-apply-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04

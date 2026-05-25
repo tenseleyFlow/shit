@@ -12,12 +12,14 @@
 #![allow(dead_code)]
 
 pub mod aws;
+pub mod event;
 pub mod gh;
 pub mod kubectl;
 pub mod terraform;
 
 #[allow(unused_imports)]
 pub use aws::{AwsVerb, classify_aws_argv};
+pub use event::run_event;
 #[allow(unused_imports)]
 pub use gh::{GhVerb, classify_gh_argv};
 #[allow(unused_imports)]

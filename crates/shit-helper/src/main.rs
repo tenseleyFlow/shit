@@ -293,6 +293,35 @@ enum Mode {
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
+    /// AR04 PR-B / DR-CR-06 — cloud / IaC destructive verb capture.
+    /// Invoked by the per-tool wrappers in `packaging/cloud-hooks/
+    /// {terraform,kubectl,gh,aws}-wrapper` BEFORE the real tool runs.
+    /// Pre-phase snapshots state (`terraform state pull` for
+    /// apply/destroy; kubectl/gh/aws verbs land in AR04.3/.4/.5) and
+    /// ships descriptors + prior_state over ctl. Daemon journals
+    /// `CaptureEvent::TerraformOp` (or per-runtime equivalent).
+    ///
+    /// AR04.1 ships Terraform Apply / Destroy. Other runtimes route
+    /// here but the helper returns early until their classifiers +
+    /// capture logic land.
+    ///
+    /// `target_argv` is everything the user passed after the tool
+    /// name, newline-separated (`terraform apply -auto-approve` →
+    /// `target_argv="apply\n-auto-approve"`).
+    #[command(name = "cloud-event")]
+    CloudEvent {
+        /// Cloud tool identifier
+        /// (`terraform` | `kubectl` | `gh` | `aws`).
+        tool: String,
+        /// Phase of the operation (currently only `pre`).
+        phase: String,
+        /// User's argv after the tool name, newline-separated.
+        #[arg(long, default_value = "")]
+        target_argv: String,
+        /// Override the daemon ctl-socket path.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
     /// `shit doctor` probe (B03): connect to the daemon, exchange
     /// a Handshake/HandshakeAck, print a one-line JSON result to
     /// stdout, exit. No capture loop, no sandbox, no privileged
@@ -531,6 +560,12 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             target_argv,
             ctl_sock,
         } => container::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
+        Mode::CloudEvent {
+            tool,
+            phase,
+            target_argv,
+            ctl_sock,
+        } => cloud::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
         Mode::ProbeFanotify => run_probe_fanotify(),
