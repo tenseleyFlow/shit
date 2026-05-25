@@ -37,7 +37,7 @@ use crate::config::ResolvedConfig;
 use shit_planner::TreeOp;
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::inode::InodeRef;
-use shit_planner::metadata::FileMetadata;
+use shit_planner::metadata::{FileKind, FileMetadata};
 use shit_proto::{ShimAck, ShimNotification, ShimPreImage, decode_frame_large, encode_frame};
 use shit_store::{BlobStore, Index};
 use std::collections::BTreeMap;
@@ -189,23 +189,49 @@ fn ingest_notification(
     };
 
     // W06.A.4: content syscalls with attached pre-image take the
-    // FilePreImage path. The TreeOp path is only for unlink.
+    // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
         if let Some(pre) = &note.pre_image {
             if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
                 warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
             }
+            return;
+        }
+        // AR05.1: no pre-image means the file didn't exist when the
+        // shim looked. On in-watch paths the dir-diff Create event
+        // covers this; on OUT-OF-WATCH paths (e.g. `make install
+        // PREFIX=/usr/local`) the kernel-capture tier doesn't see
+        // the create at all — the shim is the only observation
+        // channel. Journal a TreeOp::Create speculatively.
+        //
+        // Inode sentinel (0,0) matches the Unlink path's convention
+        // (line 347) — the executor's TreeOp::Create reverse is just
+        // `unlink <path>` which doesn't need accurate (dev,inode).
+        // mode and kind default to (0o644, Regular) — best-effort
+        // since the shim fires PRE-syscall (the file doesn't exist
+        // yet to stat). For redo / metadata-accurate restore we'd
+        // need a post-syscall notification path; v1 ships the
+        // undo-direction load-bearing journal.
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: crate::server::next_ts(),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(0, 0),
+                path: PathBuf::from(&note.arg),
+                kind: FileKind::Regular,
+                mode: 0o644,
+            }),
+        };
+        if let Err(e) = index.put_event(&event) {
+            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
         } else {
-            // The interposer fired for a content syscall but the
-            // shim couldn't capture bytes (file didn't exist, over
-            // the inline cap, or read errored). Without bytes we
-            // have no inverse to emit; dir-diff covers Create cases,
-            // and the over-cap streaming variant is W06.A.4.1.
             debug!(
                 pid = note.pid,
                 syscall = %note.syscall,
                 arg = %note.arg,
-                "shim notify: content syscall without pre-image (no-op file / over cap / read failed)"
+                "shim notify: journaled fresh-create as TreeOp::Create"
             );
         }
         return;

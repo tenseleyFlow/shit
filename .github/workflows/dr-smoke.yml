@@ -579,6 +579,35 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  make-install-undo:
+    # AR05.1 -- LD_PRELOAD shim validates the cross-watch capture
+    # path. `make install` with PREFIX outside the watched cwd is
+    # invisible to the LSM / fanotify tiers (would need watch
+    # expansion). The shim interposes libc-level mutations and
+    # notifies the daemon over $XDG_RUNTIME_DIR/shit-shim.sock;
+    # `shit undo` reverses from the shim-journal events.
+    name: make-install-undo smoke (AR05.1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/make-install-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: make-install-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
