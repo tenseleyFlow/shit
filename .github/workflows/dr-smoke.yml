@@ -1062,7 +1062,8 @@ jobs:
                     and-chain-undo-fbsd.sh \
                     read-only-cmd-undo-fbsd.sh \
                     chown-undo-fbsd.sh \
-                    background-job-undo-fbsd.sh"
+                    background-job-undo-fbsd.sh \
+                    large-file-overwrite-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
