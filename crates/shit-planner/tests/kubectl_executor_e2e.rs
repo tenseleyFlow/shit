@@ -60,12 +60,17 @@ fn write_fake_kubectl(
          exit 2\n",
         record = record_file.display(),
     );
-    // fs::write (open/write/close in one call) so the writeable fd
-    // is closed before the test execs `path`. File::create + write_all
-    // keeps the fd alive until function return and races with exec(2)
-    // on Linux → ETXTBSY ("Text file busy", os error 26).
-    fs::write(&path, body.as_bytes()).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    // Write-then-rename pattern: even with fs::write closing the fd
+    // synchronously, Linux occasionally flakes with ETXTBSY ("Text
+    // file busy", os error 26) when exec(2) lands on `path`
+    // immediately after the close. Writing to a sibling tempname and
+    // atomically renaming guarantees the final inode has never been
+    // open for writing (i_writecount==0) by the time the executor
+    // spawns it. Matches the fix in container_executor_e2e.rs.
+    let staging = dir.join(".kubectl.staging");
+    fs::write(&staging, body.as_bytes()).unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&staging, &path).unwrap();
     path
 }
 
