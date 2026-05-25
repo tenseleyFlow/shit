@@ -57,10 +57,28 @@ pub struct ShimPreImage {
 
 /// Max inline pre-image size the shim will capture. Above this the
 /// notification ships without `pre_image` and the daemon logs a
-/// telemetry event. 256 KiB covers ~all dotfiles, configs, and
-/// typical script overwrites; anything bigger (databases, binaries)
-/// is the W06.A.4-streaming follow-up's domain.
-pub const SHIM_INLINE_PREIMAGE_CAP: u64 = 256 * 1024;
+/// telemetry event.
+///
+/// **W06.A.4.1 raise (2026-05-25):** 256 KiB → 32 MiB. The original
+/// 256 KiB cap was a defensive choice for W06.A.4's first ship; it
+/// excluded all `make install` of normally-sized binaries and most
+/// archive extracts. 32 MiB sits well below the wire's
+/// [`crate::MAX_LARGE_FRAME_SIZE`] (64 MiB) ceiling, leaves
+/// comfortable headroom for postcard metadata, and covers ~all
+/// realistic cross-watch overwrite targets:
+/// - ELF binaries for typical CLI apps: 1–20 MB.
+/// - Static-linked Go/Rust binaries: 5–30 MB.
+/// - Database files / blobs: usually < 32 MB at the point a
+///   single command overwrites them; larger DBs use partial
+///   pwrite which the live-baseline tier already covers (W02.B).
+///
+/// A truly streaming SCM_RIGHTS-via-fd variant (no ceiling) is
+/// deferred to W06.A.4.2 — needed only if 32 MiB proves tight in
+/// practice. The daemon's `shim_listener` allocates its recv
+/// buffer dynamically from the wire's length prefix, so the
+/// 32 MiB ceiling has no fixed memory cost when smaller payloads
+/// arrive.
+pub const SHIM_INLINE_PREIMAGE_CAP: u64 = 32 * 1024 * 1024;
 
 /// One pre-mutation notification from the shim. Sent once per
 /// interposed call when `SHIT_SHIM_DISABLE` is not set.
