@@ -202,56 +202,37 @@ fn ingest_notification(
         // covers this; on OUT-OF-WATCH paths (e.g. `make install
         // PREFIX=/usr/local`) the kernel-capture tier doesn't see
         // the create at all — the shim is the only observation
-        // channel. Stat post-syscall: if the file now exists, it
-        // was a fresh create the user wants undoable. Journal
-        // TreeOp::Create so undo can unlink it.
-        match std::fs::symlink_metadata(&note.arg) {
-            Ok(meta) => {
-                use std::os::unix::fs::MetadataExt;
-                use std::os::unix::fs::PermissionsExt;
-                let mode = meta.permissions().mode();
-                let inode = InodeRef::new(meta.dev(), meta.ino());
-                let kind = if meta.file_type().is_dir() {
-                    FileKind::Directory
-                } else if meta.file_type().is_symlink() {
-                    FileKind::Symlink
-                } else {
-                    FileKind::Regular
-                };
-                let event = CaptureEvent {
-                    id: EventId(0),
-                    command,
-                    ts: crate::server::next_ts(),
-                    partial: false,
-                    kind: CaptureEventKind::TreeOp(TreeOp::Create {
-                        inode,
-                        path: PathBuf::from(&note.arg),
-                        kind,
-                        mode,
-                    }),
-                };
-                if let Err(e) = index.put_event(&event) {
-                    warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
-                } else {
-                    debug!(
-                        pid = note.pid,
-                        syscall = %note.syscall,
-                        arg = %note.arg,
-                        "shim notify: journaled fresh-create as TreeOp::Create"
-                    );
-                }
-            }
-            Err(_) => {
-                // File doesn't exist even post-syscall — interposer
-                // fired but the operation didn't create anything
-                // (e.g. open(O_RDONLY) on a nonexistent path). Drop.
-                debug!(
-                    pid = note.pid,
-                    syscall = %note.syscall,
-                    arg = %note.arg,
-                    "shim notify: content syscall with no pre-image and no post-file; dropping"
-                );
-            }
+        // channel. Journal a TreeOp::Create speculatively.
+        //
+        // Inode sentinel (0,0) matches the Unlink path's convention
+        // (line 347) — the executor's TreeOp::Create reverse is just
+        // `unlink <path>` which doesn't need accurate (dev,inode).
+        // mode and kind default to (0o644, Regular) — best-effort
+        // since the shim fires PRE-syscall (the file doesn't exist
+        // yet to stat). For redo / metadata-accurate restore we'd
+        // need a post-syscall notification path; v1 ships the
+        // undo-direction load-bearing journal.
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: crate::server::next_ts(),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(0, 0),
+                path: PathBuf::from(&note.arg),
+                kind: FileKind::Regular,
+                mode: 0o644,
+            }),
+        };
+        if let Err(e) = index.put_event(&event) {
+            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
+        } else {
+            debug!(
+                pid = note.pid,
+                syscall = %note.syscall,
+                arg = %note.arg,
+                "shim notify: journaled fresh-create as TreeOp::Create"
+            );
         }
         return;
     }
