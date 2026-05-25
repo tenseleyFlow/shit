@@ -172,12 +172,12 @@ if [ ! -f "${PROBE_FILE}" ]; then
     smoke_fail "probe file ${PROBE_FILE} not recreated by undo — destroy-reverse didn't actually run terraform apply"
 fi
 
-post_state_count="$(SHIT_DURING_UNDO=1 ( cd "${TF_DIR}" && terraform state list 2>/dev/null ) | wc -l | tr -d ' ')"
+post_state_count="$(( cd "${TF_DIR}" && SHIT_DURING_UNDO=1 terraform state list 2>/dev/null ) | wc -l | tr -d ' ')"
 if [ "${post_state_count}" -ne 1 ]; then
     smoke_log "undo log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_log "state list:"
-    SHIT_DURING_UNDO=1 ( cd "${TF_DIR}" && terraform state list 2>/dev/null ) | sed 's/^/    /' >&2
+    ( cd "${TF_DIR}" && SHIT_DURING_UNDO=1 terraform state list 2>/dev/null ) | sed 's/^/    /' >&2
     smoke_fail "expected 1 resource in state post-undo, got ${post_state_count}"
 fi
 smoke_log "post-undo: probe file recreated + state has 1 resource (destroy→undo round-trip confirmed)"
