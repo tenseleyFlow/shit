@@ -30,6 +30,7 @@ use shit_proto::{
     encode_frame,
 };
 
+use super::kubectl::{KubectlVerb, classify_kubectl_argv};
 use super::terraform::{TerraformVerb, classify_terraform_argv};
 
 const CTL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -72,11 +73,21 @@ pub async fn run_event(
                 return Ok(());
             }
         },
-        // AR04.3 / .4 / .5 will route here.
+        "kubectl" => match classify_kubectl_argv(&argv) {
+            Some(v) => prepare_kubectl(v),
+            None => {
+                tracing::debug!(
+                    ?argv,
+                    "kubectl argv didn't classify as destructive; skipping"
+                );
+                return Ok(());
+            }
+        },
+        // AR04.4 / .5 will route here.
         other => {
             tracing::debug!(
                 tool = other,
-                "cloud-event: tool not yet implemented in AR04.1"
+                "cloud-event: tool not yet implemented (AR04.4/.5 will route)"
             );
             return Ok(());
         }
@@ -174,6 +185,173 @@ fn prepare_terraform(verb: TerraformVerb) -> Option<PreparedEvent> {
         prior_state,
         extras,
     })
+}
+
+/// AR04.3 (DR-CR-06 kubectl path): capture `kubectl get -o yaml
+/// <kind>/<name> [-n <namespace>]` before the user's destructive
+/// verb. Pack the captured YAML into prior_state; pack
+/// context+namespace+kind+name into extras so the daemon's
+/// cloud_track can build a typed KubectlOp event.
+///
+/// Verb mapping to wire:
+/// - Delete{kind,name,namespace} → KubectlDelete + extras
+/// - DeleteFile{path}             → KubectlDelete; helper resolves the
+///   file's first resource (multi-doc files are a follow-up)
+/// - ApplyFile{path}              → KubectlApply; same one-resource
+///   simplification
+/// - Scale{kind,name,namespace}   → KubectlApply (reverse pipes the
+///   captured YAML with the pre-scale replica count)
+fn prepare_kubectl(verb: KubectlVerb) -> Option<PreparedEvent> {
+    let (kind, name, namespace, wire_verb) = match &verb {
+        KubectlVerb::Delete {
+            kind,
+            name,
+            namespace,
+        } => (
+            kind.clone(),
+            name.clone(),
+            namespace.clone(),
+            CloudVerbWire::KubectlDelete,
+        ),
+        KubectlVerb::Scale {
+            kind,
+            name,
+            namespace,
+        } => (
+            kind.clone(),
+            name.clone(),
+            namespace.clone(),
+            CloudVerbWire::KubectlApply,
+        ),
+        KubectlVerb::DeleteFile { path } => {
+            let (kind, name, namespace) = first_resource_from_yaml_file(path)?;
+            (kind, name, namespace, CloudVerbWire::KubectlDelete)
+        }
+        KubectlVerb::ApplyFile { path } => {
+            let (kind, name, namespace) = first_resource_from_yaml_file(path)?;
+            (kind, name, namespace, CloudVerbWire::KubectlApply)
+        }
+    };
+
+    // Capture the live YAML before the destructive verb runs.
+    let captured = match kubectl_get_yaml(&kind, &name, namespace.as_deref()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "cloud-event: kubectl get -o yaml failed; event will ship without captured_yaml \
+                 (undo will fail-closed)"
+            );
+            Vec::new()
+        }
+    };
+
+    // Capture the current kube-context too — the executor's guard
+    // refuses to apply if the live context drifted at undo time.
+    let context = kubectl_current_context().unwrap_or_else(|| "<unknown>".to_string());
+
+    let mut extras = BTreeMap::new();
+    extras.insert("kind".into(), kind);
+    extras.insert("name".into(), name);
+    extras.insert("context".into(), context);
+    if let Some(ns) = namespace {
+        extras.insert("namespace".into(), ns);
+    }
+
+    Some(PreparedEvent {
+        runtime: CloudRuntimeWire::Kubectl,
+        verb: wire_verb,
+        prior_state: captured,
+        extras,
+    })
+}
+
+/// Run `kubectl get <kind>/<name> [-n <ns>] -o yaml` and return the
+/// raw YAML bytes.
+fn kubectl_get_yaml(kind: &str, name: &str, namespace: Option<&str>) -> std::io::Result<Vec<u8>> {
+    let resource = format!("{kind}/{name}");
+    let mut cmd = Command::new("kubectl");
+    cmd.args(["get", &resource, "-o", "yaml"]);
+    if let Some(ns) = namespace {
+        cmd.args(["-n", ns]);
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "kubectl get {resource}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Read the current context with `kubectl config current-context`.
+/// Returns None if kubectl is unavailable or the call fails.
+fn kubectl_current_context() -> Option<String> {
+    let out = Command::new("kubectl")
+        .args(["config", "current-context"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Best-effort first-resource extractor for `kubectl apply -f` /
+/// `kubectl delete -f` paths. Multi-document YAML files (separated
+/// by `---`) are a v1.x follow-up — for v1 the helper captures the
+/// FIRST resource only and the planner journal records that.
+/// Returns (kind, name, namespace).
+fn first_resource_from_yaml_file(path: &str) -> Option<(String, String, Option<String>)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    // First doc only — split on YAML doc separator.
+    let first_doc = content.split("\n---").next().unwrap_or(&content);
+    let mut kind = None;
+    let mut name = None;
+    let mut namespace = None;
+    let mut in_metadata = false;
+    for line in first_doc.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("kind:") && kind.is_none() {
+            kind = Some(
+                trimmed["kind:".len()..]
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        }
+        if trimmed.starts_with("metadata:") {
+            in_metadata = true;
+            continue;
+        }
+        if in_metadata {
+            if !line.starts_with(' ') && !trimmed.is_empty() && !trimmed.starts_with('#') {
+                in_metadata = false;
+            } else if trimmed.starts_with("name:") && name.is_none() {
+                name = Some(
+                    trimmed["name:".len()..]
+                        .trim()
+                        .trim_matches('"')
+                        .to_string(),
+                );
+            } else if trimmed.starts_with("namespace:") && namespace.is_none() {
+                namespace = Some(
+                    trimmed["namespace:".len()..]
+                        .trim()
+                        .trim_matches('"')
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Some((kind?, name?, namespace))
 }
 
 /// Run `terraform state pull` in the current dir and return the raw
@@ -276,5 +454,70 @@ mod tests {
             prepared.extras.get("id").map(String::as_str),
             Some("i-0123")
         );
+    }
+
+    #[test]
+    fn prepare_kubectl_delete_packs_kind_name_namespace() {
+        // No kubectl on PATH → captured_yaml is empty (warn-fallback)
+        // but extras still populated from the classifier output.
+        let prepared = prepare_kubectl(KubectlVerb::Delete {
+            kind: "Pod".into(),
+            name: "busybox".into(),
+            namespace: Some("default".into()),
+        })
+        .unwrap();
+        assert!(matches!(prepared.verb, CloudVerbWire::KubectlDelete));
+        assert_eq!(prepared.extras.get("kind").map(String::as_str), Some("Pod"));
+        assert_eq!(
+            prepared.extras.get("name").map(String::as_str),
+            Some("busybox")
+        );
+        assert_eq!(
+            prepared.extras.get("namespace").map(String::as_str),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn prepare_kubectl_scale_maps_to_apply_wire_verb() {
+        // Scale reverse pipes the captured YAML (with pre-scale
+        // replica count) through `kubectl apply -f -`, so wire-side
+        // it's KubectlApply.
+        let prepared = prepare_kubectl(KubectlVerb::Scale {
+            kind: "Deployment".into(),
+            name: "web".into(),
+            namespace: None,
+        })
+        .unwrap();
+        assert!(matches!(prepared.verb, CloudVerbWire::KubectlApply));
+        assert!(!prepared.extras.contains_key("namespace"));
+    }
+
+    #[test]
+    fn first_resource_from_yaml_extracts_kind_name_namespace() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: probe\n  namespace: kube-system\nspec:\n  containers: []\n",
+        )
+        .unwrap();
+        let (kind, name, ns) = first_resource_from_yaml_file(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(kind, "Pod");
+        assert_eq!(name, "probe");
+        assert_eq!(ns.as_deref(), Some("kube-system"));
+    }
+
+    #[test]
+    fn first_resource_from_yaml_handles_missing_namespace() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: probe\n",
+        )
+        .unwrap();
+        let (kind, name, ns) = first_resource_from_yaml_file(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(kind, "ConfigMap");
+        assert_eq!(name, "probe");
+        assert!(ns.is_none());
     }
 }
