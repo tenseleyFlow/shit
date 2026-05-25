@@ -229,6 +229,22 @@ fn ingest_notification(
     }
     // Fall through to journal the TreeOp::Rename below.
 
+    // W09.5: unlink notification with attached pre-image is the
+    // "unlink-then-open(O_CREAT)" shape (tar/cpio/gzip). The shim
+    // captured bytes BEFORE the unlink fired; if a subsequent open
+    // recreates the path with new bytes, the planner classifies
+    // Unlink + PreImage (no Create, no Rename) as atomic_replace
+    // and uses the FilePreImage's RestoreContent inverse instead
+    // of the Unlink's RecreatePath. Journal both events; the
+    // planner picks the right shape.
+    if matches!(note.syscall.as_str(), "unlink" | "unlinkat")
+        && let Some(pre) = &note.pre_image
+        && let Err(e) = ingest_pre_image(command, pre, index, blob_store)
+    {
+        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: unlink pre-image ingest failed");
+    }
+    // Fall through to journal the TreeOp::Unlink below.
+
     let Some(kind) = classify_tree_op(&note.syscall, &note.arg) else {
         // Fd-based content syscalls (ftruncate, pwrite, mmap_shared_w)
         // have no path in the wire payload; they need fd→path resolution
