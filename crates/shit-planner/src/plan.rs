@@ -617,6 +617,33 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        CaptureEventKind::TerraformOp {
+            workdir,
+            op,
+            prior_state,
+        } => {
+            // AR04 PR-A: 1:1 mapping from the capture-side TerraformOp
+            // event to the executor-side TerraformReverse InverseOp.
+            // The helper-side cloud-event wrapper already captured
+            // `terraform state pull` before the user's apply/destroy
+            // ran; the planner just forwards.
+            //
+            // requires_confirmation=true for Apply/Destroy since the
+            // reverse is destructive (state push + apply -refresh-only
+            // can clobber intervening user changes); StateRm/Import
+            // ride the executor's informational-skip path.
+            nodes.push(PlanNode {
+                op: InverseOp::TerraformReverse {
+                    workdir: workdir.clone(),
+                    op: *op,
+                    prior_state: prior_state.clone(),
+                    plan_json: None,
+                    requires_confirmation: true,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
     }
 }
 
