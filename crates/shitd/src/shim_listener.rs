@@ -43,15 +43,19 @@ use shit_store::{BlobStore, Index};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-/// Buffer cap for a single notification frame. With inline pre-images
-/// capped at 256 KiB by `SHIM_INLINE_PREIMAGE_CAP`, plus header +
-/// path strings, 512 KiB has comfortable headroom.
-const SHIM_BUF: usize = 512 * 1024;
+/// Hard ceiling on per-connection allocation. Matches
+/// [`shit_proto::MAX_LARGE_FRAME_SIZE`] so anything the wire encoder
+/// will produce, the daemon can receive. Buffer is allocated
+/// **dynamically** from the wire's u32 length prefix (W06.A.4.1)
+/// — there's no fixed memory cost when most notifications are
+/// small. Connections claiming a length above this ceiling are
+/// rejected before allocation.
+const SHIM_BUF_MAX: usize = shit_proto::MAX_LARGE_FRAME_SIZE;
 
 /// Listen on the shim socket inside `$XDG_RUNTIME_DIR/shit/shim.sock`,
 /// serving each accepted connection on its own tokio task. Returns when
@@ -110,25 +114,68 @@ async fn handle_one(
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; SHIM_BUF];
-    // W06.A.4: a pre-image payload (≤256 KiB) plus header can exceed
-    // a single recv on slow links; loop until the wire-decoder is
-    // happy. Cap iterations so a malicious peer can't pin a thread.
-    let mut total = 0;
-    for _ in 0..16 {
-        let n = stream.read(&mut buf[total..]).await?;
-        if n == 0 {
-            break;
+    // W06.A.4.1: dynamic-allocation buffer. Read the 4-byte u32 BE
+    // length prefix exactly, then allocate a buffer sized to the
+    // declared frame and `read_exact` the body. Wire format:
+    // `| u32 BE body_len | u8 version | postcard payload |`. This
+    // lets us accept pre-images up to
+    // `shit_proto::SHIM_INLINE_PREIMAGE_CAP` (32 MiB) without
+    // pre-allocating per-connection — small notifications cost ~5
+    // bytes of buffer, large ones get exactly what they need.
+    //
+    // `read_exact` (vs the previous read-in-loop) is the right
+    // primitive once we know the target length: it blocks until the
+    // full body arrives or peer closes mid-stream (clean error
+    // signal), and we don't have to worry about per-read kernel
+    // recvspace caps (typical FreeBSD UDS recvspace is 256 KiB,
+    // which silently capped the previous loop at exactly that point).
+    //
+    // Reject early if the declared length exceeds `SHIM_BUF_MAX`
+    // (= wire's `MAX_LARGE_FRAME_SIZE`) so a malicious peer can't
+    // request unbounded allocation.
+    // 10 s upper bound on the read side. The shim's
+    // `set_write_timeout` is 5 s when carrying a pre-image; round-
+    // trip overhead never legitimately exceeds 10 s. Bound here
+    // protects against a malformed/malicious peer that opens a
+    // connection, sends a partial frame, then idles — without this
+    // bound, `read_exact` would park the daemon task indefinitely.
+    let read_deadline = std::time::Duration::from_secs(10);
+    let mut len_buf = [0u8; 4];
+    match tokio::time::timeout(read_deadline, stream.read_exact(&mut len_buf)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            debug!(err = %e, "shim length-prefix read failed (peer hung up early?)");
+            return Ok(());
         }
-        total += n;
-        if decode_frame_large::<ShimNotification>(&buf[..total]).is_ok() {
-            break;
-        }
-        if total == buf.len() {
-            warn!("shim notification exceeded SHIM_BUF");
+        Err(_elapsed) => {
+            debug!("shim length-prefix read timed out after 10s");
             return Ok(());
         }
     }
+    let body_len = u32::from_be_bytes(len_buf) as usize;
+    let frame_total = 4 + body_len;
+    if frame_total > SHIM_BUF_MAX {
+        warn!(
+            declared = frame_total,
+            max = SHIM_BUF_MAX,
+            "shim notification declared length exceeds SHIM_BUF_MAX"
+        );
+        return Ok(());
+    }
+    let mut buf = vec![0u8; frame_total];
+    buf[..4].copy_from_slice(&len_buf);
+    match tokio::time::timeout(read_deadline, stream.read_exact(&mut buf[4..])).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(err = %e, declared = frame_total, "shim body read failed");
+            return Ok(());
+        }
+        Err(_elapsed) => {
+            warn!(declared = frame_total, "shim body read timed out after 10s");
+            return Ok(());
+        }
+    }
+    let total = frame_total;
     if total == 0 {
         return Ok(());
     }
