@@ -379,6 +379,19 @@ mod policy {
         // we'd get without this fix, but at least we tried.
         let from_abs = canonical_path(from);
         let to_abs = canonical_path(to);
+        // W09.8: rename-to-self is a syscall no-op. POSIX
+        // `rename(2)` of a file to itself returns success without
+        // touching anything; the kernel fires no notification.
+        // Synthesizing a Rename+PreImage event pair would drive
+        // the planner's atomic_replace classifier to emit a
+        // RestoreContent that rewrites the file via tmpfile+rename,
+        // churning the inode for zero user-visible benefit. Mirror
+        // the kernel: emit nothing for `mv x x`. After
+        // canonicalization above this also catches `./foo` vs
+        // `foo`, symlink-equal pairs, etc.
+        if from_abs == to_abs {
+            return;
+        }
         let arg = format!("{from_abs}\t{to_abs}");
         notify_inner(syscall, &arg, Some(to));
     }

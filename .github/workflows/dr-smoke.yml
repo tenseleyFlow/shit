@@ -1051,7 +1051,11 @@ jobs:
                     patch-apply-undo-fbsd.sh \
                     sort-inplace-undo-fbsd.sh \
                     split-undo-fbsd.sh \
-                    rsync-incremental-undo-fbsd.sh"
+                    rsync-incremental-undo-fbsd.sh \
+                    xargs-rm-undo-fbsd.sh \
+                    chmod-recursive-undo-fbsd.sh \
+                    mv-noop-undo-fbsd.sh \
+                    dd-notrunc-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
