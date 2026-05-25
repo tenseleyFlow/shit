@@ -95,16 +95,23 @@ exit 2
 "#,
         rec = record_dir.display()
     );
-    // Write-then-rename pattern: even with fs::write closing the fd
-    // synchronously, Linux occasionally flakes with ETXTBSY ("Text file
-    // busy", os error 26) when exec(2) lands on `path` immediately
-    // after the close. Writing to a sibling tempname and atomically
-    // renaming guarantees the final inode has never been open for
-    // writing (i_writecount==0) by the time the executor spawns it.
+    // Write-then-rename-then-fsync-dir: rename guarantees the final
+    // inode never had an O_WRONLY fd (i_writecount==0). On most
+    // filesystems that's enough; on some (notably the ARM CI
+    // runner's overlayfs) the directory entry update can lag behind
+    // the rename return, so exec(2) on the new path still races
+    // with the kernel's dentry cache and trips ETXTBSY. fsync the
+    // parent dir to force the dentry write durable before we exec.
     let staging = dir.join(".docker.staging");
     fs::write(&staging, body.as_bytes()).unwrap();
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
     fs::rename(&staging, &path).unwrap();
+    // fsync the directory — std doesn't expose dirfd-fsync, but
+    // opening the dir read-only and calling sync_all on the File
+    // handle does the same syscall.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     path
 }
 

@@ -60,17 +60,18 @@ fn write_fake_kubectl(
          exit 2\n",
         record = record_file.display(),
     );
-    // Write-then-rename pattern: even with fs::write closing the fd
-    // synchronously, Linux occasionally flakes with ETXTBSY ("Text
-    // file busy", os error 26) when exec(2) lands on `path`
-    // immediately after the close. Writing to a sibling tempname and
-    // atomically renaming guarantees the final inode has never been
-    // open for writing (i_writecount==0) by the time the executor
-    // spawns it. Matches the fix in container_executor_e2e.rs.
+    // Write-then-rename-then-fsync-dir: matches the fix in
+    // container_executor_e2e.rs. Rename alone isn't enough on some
+    // filesystems (notably the ARM CI runner's overlayfs) where the
+    // directory entry update can lag behind the rename return; fsync
+    // the parent dir to force the dentry write durable before exec.
     let staging = dir.join(".kubectl.staging");
     fs::write(&staging, body.as_bytes()).unwrap();
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
     fs::rename(&staging, &path).unwrap();
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     path
 }
 
