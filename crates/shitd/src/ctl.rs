@@ -569,6 +569,64 @@ struct MultiTierExecutor<'a> {
     container_executor: shit_planner::executors::ContainerExecutor<DaemonContainerRunner<'a>>,
     terraform_executor:
         shit_planner::executors::terraform::TerraformExecutor<DaemonTerraformRunner>,
+    kubectl_executor: shit_planner::executors::kubectl::KubectlExecutor<DaemonKubectlRunner>,
+}
+
+/// AR04.3: kubectl runner used by the daemon-side KubectlExecutor.
+/// Shells out with `SHIT_DURING_UNDO=1` so the kubectl-wrapper
+/// short-circuits on re-entry. The reverse path pipes captured
+/// YAML to `kubectl apply -f -` via run_with_stdin.
+struct DaemonKubectlRunner;
+
+impl shit_planner::executors::kubectl::KubectlRunner for DaemonKubectlRunner {
+    fn run(&self, argv: &[String]) -> Result<(), String> {
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let status = std::process::Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .status()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+
+    fn run_with_stdin(&self, argv: &[String], stdin_bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let mut child = std::process::Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(stdin_bytes)
+                .map_err(|e| format!("write stdin to {cmd}: {e}"))?;
+        }
+        let status = child.wait().map_err(|e| format!("wait {cmd}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited {:?}", status.code()))
+        }
+    }
+
+    fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
+        let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let out = std::process::Command::new(cmd)
+            .args(args)
+            .env("SHIT_DURING_UNDO", "1")
+            .output()
+            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("{cmd} exited {:?}", out.status.code()));
+        }
+        Ok(out.stdout)
+    }
 }
 
 /// AR04 PR-A: terraform runner used by the daemon-side
@@ -864,6 +922,7 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             || self.network_executor.supports(op)
             || self.container_executor.supports(op)
             || self.terraform_executor.supports(op)
+            || self.kubectl_executor.supports(op)
     }
 
     fn execute(
@@ -884,6 +943,8 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             self.container_executor.execute(op, dry_run, policy)
         } else if self.terraform_executor.supports(op) {
             self.terraform_executor.execute(op, dry_run, policy)
+        } else if self.kubectl_executor.supports(op) {
+            self.kubectl_executor.execute(op, dry_run, policy)
         } else {
             shit_planner::ExecutionOutcome::Failed {
                 err: format!("no executor wired for tier {:?}", op.tier()),
@@ -992,6 +1053,9 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
         container_executor: shit_planner::executors::ContainerExecutor::new(container_runner),
         terraform_executor: shit_planner::executors::terraform::TerraformExecutor::new(
             DaemonTerraformRunner,
+        ),
+        kubectl_executor: shit_planner::executors::kubectl::KubectlExecutor::new(
+            DaemonKubectlRunner,
         ),
     };
 
