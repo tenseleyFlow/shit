@@ -696,6 +696,22 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        CaptureEventKind::GhOp { op, captured_json } => {
+            // AR04.4: 1:1 mapping from GhOp event → GhReverse inverse
+            // op. Helper captured the resource metadata before the
+            // destructive verb; the executor dispatches per-op
+            // (release delete → re-create with captured tag+body,
+            // issue close → reopen, etc).
+            nodes.push(PlanNode {
+                op: InverseOp::GhReverse {
+                    op: op.clone(),
+                    captured_json: captured_json.clone(),
+                    requires_confirmation: true,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
     }
 }
 

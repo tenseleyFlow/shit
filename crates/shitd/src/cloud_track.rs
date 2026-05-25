@@ -16,7 +16,7 @@
 //! handler just converts wire → planner types and journals.
 
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
-use shit_planner::inverse::{KubectlOp, TerraformOp};
+use shit_planner::inverse::{GhOp, KubectlOp, TerraformOp};
 use shit_proto::{CloudEventReq, CloudRuntimeWire, CloudVerbWire};
 use shit_store::Index;
 use thiserror::Error;
@@ -156,10 +156,42 @@ fn build_event_kind(req: &CloudEventReq) -> Result<CaptureEventKind, HandleError
                 captured_yaml: req.prior_state.clone(),
             })
         }
-        // AR04.4 / .5 land these.
-        (CloudRuntimeWire::Gh, _) | (CloudRuntimeWire::Aws, _) => {
-            Err(HandleError::VerbNotImplemented(req.verb))
+        (CloudRuntimeWire::Gh, verb) => {
+            // AR04.4: pack captured `gh <resource> view --json ...`
+            // into prior_state, resource identifiers into extras.
+            // Helper's prepare_gh populates `tag` for release verbs;
+            // future issue/PR verbs use `number`.
+            let gh_op = match verb {
+                CloudVerbWire::GhReleaseDelete => {
+                    let tag = req
+                        .extras
+                        .get("tag")
+                        .cloned()
+                        .ok_or(HandleError::MissingExtra { verb, key: "tag" })?;
+                    GhOp::ReleaseDelete { tag }
+                }
+                CloudVerbWire::GhReleaseCreate => {
+                    // ReleaseCreate at capture time is rare — the
+                    // user is asking shit to undo a create with a
+                    // delete. We could ship it as ReleaseDelete but
+                    // for v1 stick with the wire's symmetry and
+                    // refuse cleanly until a use case surfaces.
+                    return Err(HandleError::VerbNotImplemented(verb));
+                }
+                _ => {
+                    return Err(HandleError::VerbRuntimeMismatch {
+                        runtime: req.runtime,
+                        verb,
+                    });
+                }
+            };
+            Ok(CaptureEventKind::GhOp {
+                op: gh_op,
+                captured_json: req.prior_state.clone(),
+            })
         }
+        // AR04.5 lands aws.
+        (CloudRuntimeWire::Aws, _) => Err(HandleError::VerbNotImplemented(req.verb)),
     }
 }
 

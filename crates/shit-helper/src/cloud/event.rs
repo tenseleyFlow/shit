@@ -30,6 +30,7 @@ use shit_proto::{
     encode_frame,
 };
 
+use super::gh::{GhVerb, classify_gh_argv};
 use super::kubectl::{KubectlVerb, classify_kubectl_argv};
 use super::terraform::{TerraformVerb, classify_terraform_argv};
 
@@ -83,7 +84,14 @@ pub async fn run_event(
                 return Ok(());
             }
         },
-        // AR04.4 / .5 will route here.
+        "gh" => match classify_gh_argv(&argv) {
+            Some(v) => prepare_gh(v),
+            None => {
+                tracing::debug!(?argv, "gh argv didn't classify as destructive; skipping");
+                return Ok(());
+            }
+        },
+        // AR04.5 (aws) will route here.
         other => {
             tracing::debug!(
                 tool = other,
@@ -354,6 +362,77 @@ fn first_resource_from_yaml_file(path: &str) -> Option<(String, String, Option<S
     Some((kind?, name?, namespace))
 }
 
+/// AR04.4 (DR-CR-06 gh path): capture the resource's pre-state JSON
+/// before the user's destructive verb. For ReleaseDelete: `gh release
+/// view <tag> --json tagName,name,body,isPrerelease,isDraft,assets`
+/// captures everything the executor's `build_reverse` synthesis path
+/// needs to re-create. Other gh verbs (issue/PR close) capture
+/// nothing — the reverse is a stateless reopen.
+fn prepare_gh(verb: GhVerb) -> Option<PreparedEvent> {
+    let (wire_verb, captured, mut extras) = match &verb {
+        GhVerb::ReleaseDelete { tag } => {
+            let captured = match gh_release_view_json(tag) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        tag = %tag,
+                        err = %e,
+                        "cloud-event: gh release view failed; event will ship without captured_json \
+                         (undo will fail-closed)"
+                    );
+                    Vec::new()
+                }
+            };
+            let mut e = BTreeMap::new();
+            e.insert("tag".into(), tag.clone());
+            (CloudVerbWire::GhReleaseDelete, captured, e)
+        }
+        // ReleaseDeleteAsset / IssueClose / PrClose deferred — the
+        // executor surfaces them as Informational anyway. We don't
+        // ship those events to keep the journal clean.
+        _ => {
+            tracing::debug!(
+                ?verb,
+                "cloud-event: gh verb not yet shipped in AR04.4 (informational reverse only)"
+            );
+            return None;
+        }
+    };
+
+    // Stash a redacted source for traceability — useful when we
+    // expand to more verbs.
+    let _ = &mut extras;
+
+    Some(PreparedEvent {
+        runtime: CloudRuntimeWire::Gh,
+        verb: wire_verb,
+        prior_state: captured,
+        extras,
+    })
+}
+
+/// Run `gh release view <tag> --json <fields>` against the auto-
+/// detected repo (gh figures out the slug from the current git
+/// origin) and return the raw JSON bytes. Empty stdout on failure.
+fn gh_release_view_json(tag: &str) -> std::io::Result<Vec<u8>> {
+    let out = Command::new("gh")
+        .args([
+            "release",
+            "view",
+            tag,
+            "--json",
+            "tagName,name,body,isPrerelease,isDraft,targetCommitish,assets",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "gh release view {tag}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
 /// Run `terraform state pull` in the current dir and return the raw
 /// JSON bytes. Empty state file is valid (uninitialised module);
 /// pull still succeeds and emits the empty-state JSON.
@@ -505,6 +584,28 @@ mod tests {
         assert_eq!(kind, "Pod");
         assert_eq!(name, "probe");
         assert_eq!(ns.as_deref(), Some("kube-system"));
+    }
+
+    #[test]
+    fn prepare_gh_release_delete_packs_tag_in_extras() {
+        // No gh on PATH → captured_json empty (warn-fallback), but
+        // tag extras still populated.
+        let prepared = prepare_gh(GhVerb::ReleaseDelete {
+            tag: "v0.0.0-test".into(),
+        })
+        .unwrap();
+        assert!(matches!(prepared.verb, CloudVerbWire::GhReleaseDelete));
+        assert_eq!(
+            prepared.extras.get("tag").map(String::as_str),
+            Some("v0.0.0-test")
+        );
+    }
+
+    #[test]
+    fn prepare_gh_issue_close_returns_none_v1() {
+        // IssueClose's reverse (issue reopen) is stateless — no
+        // capture needed. Helper skips shipping the event in v1.
+        assert!(prepare_gh(GhVerb::IssueClose { number: 42 }).is_none());
     }
 
     #[test]

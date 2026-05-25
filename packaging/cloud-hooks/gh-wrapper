@@ -13,7 +13,7 @@ set -e
 # (during a shit undo) must NOT re-capture. The executors set
 # SHIT_DURING_UNDO=1.
 if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
-    real=$(command -v -- gh | grep -v "$(dirname "$0")" | head -n1)
+    real=$(PATH="${PATH#*$(dirname "$0"):}" command -v gh 2>/dev/null || command -v -- gh)
     [ -n "$real" ] || { echo "shit: real gh not found on PATH" >&2; exit 127; }
     exec "$real" "$@"
 fi
@@ -22,6 +22,18 @@ fi
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v gh 2>/dev/null || command -v -- gh)
 [ -n "$real" ] || { echo "shit: real gh not found on PATH" >&2; exit 127; }
 
-# DR-CR-06: pre/post hooks via `shit-helper cloud-event` go here.
-# Stage 1: just exec.
+# DR-CR-06 (AR04.4): pre-capture via `shit-helper cloud-event`.
+# Helper runs `gh release view <tag> --json ...` for destructive
+# verbs, ships JSON via ctl. Hook-friendly: failure logs and 0.
+# Uses --target-argv= (equals) so clap doesn't parse leading --flag
+# in user argv as a new flag.
+helper=$(command -v shit-helper 2>/dev/null || true)
+if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
+    echo "shit-hook: gh-wrapper real=${real} helper=${helper:-<not-found>}" >&2
+fi
+if [ -n "$helper" ]; then
+    target_argv=$(printf '%s\n' "$@")
+    "$helper" cloud-event gh pre "--target-argv=$target_argv" || true
+fi
+
 exec "$real" "$@"
