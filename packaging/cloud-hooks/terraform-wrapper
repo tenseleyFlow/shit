@@ -33,7 +33,7 @@ if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
 fi
 if [ -n "$helper" ]; then
     target_argv=$(printf '%s\n' "$@")
-    "$helper" cloud-event terraform pre --target-argv "$target_argv" || true
+    "$helper" cloud-event terraform pre "--target-argv=$target_argv" || true
 fi
 
 exec "$real" "$@"

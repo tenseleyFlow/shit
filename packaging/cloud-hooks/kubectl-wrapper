@@ -32,7 +32,12 @@ if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
 fi
 if [ -n "$helper" ]; then
     target_argv=$(printf '%s\n' "$@")
-    "$helper" cloud-event kubectl pre --target-argv "$target_argv" || true
+    # `--target-argv=...` (equals syntax) instead of
+    # `--target-argv "..."` so clap doesn't try to parse a
+    # leading `--flag` in the value as a new flag (happens when
+    # the user passes global flags first, e.g.
+    # `kubectl --context X delete ...`).
+    "$helper" cloud-event kubectl pre "--target-argv=$target_argv" || true
 fi
 
 exec "$real" "$@"
