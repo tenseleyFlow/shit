@@ -150,24 +150,27 @@ smoke_log "running: shit undo --yes"
     smoke_fail "shit undo --yes exited non-zero"
 }
 
-# Post-undo: terraform state should be empty (or back to whatever
-# was captured pre-apply). `terraform state list` returns the
-# resource addresses currently in state; an empty output means we
-# rewound successfully.
+# Post-undo: apply-reverse runs `terraform destroy`, which BOTH:
+#  - empties the state, AND
+#  - deletes the resources from the world (for local_file, that
+#    means removing out.txt from disk).
+# Assert both.
 post_state="$(SHIT_DURING_UNDO=1 cd "${TF_DIR}" && terraform state list 2>/dev/null || true)"
 if [ -n "${post_state}" ]; then
     smoke_log "undo log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_log "terraform state still has resources:"
     printf '  %s\n' "${post_state}" >&2
-    smoke_fail "terraform state was not rewound by undo (state push didn't take)"
+    smoke_fail "terraform destroy didn't clear state (undo dispatch failed)"
 fi
-smoke_log "terraform state is empty post-undo (rewind succeeded)"
+smoke_log "terraform state is empty post-undo"
 
-# Note: -refresh-only doesn't delete resources from the world, only
-# reconciles state. The local_file out.txt may or may not still exist
-# on disk depending on terraform's reconciliation logic; that's the
-# documented v1 behavior. The marquee assertion is the state-rewind.
+if [ -f "${PROBE_FILE}" ]; then
+    smoke_log "undo log:"
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "probe file ${PROBE_FILE} still exists post-undo — destroy didn't remove it"
+fi
+smoke_log "probe file removed post-undo (apply→destroy round-trip confirmed)"
 
 smoke_log "session close"
 "${SHIT_BIN}" hook-send session-close \
