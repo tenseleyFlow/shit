@@ -37,7 +37,7 @@ use crate::config::ResolvedConfig;
 use shit_planner::TreeOp;
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::inode::InodeRef;
-use shit_planner::metadata::FileMetadata;
+use shit_planner::metadata::{FileKind, FileMetadata};
 use shit_proto::{ShimAck, ShimNotification, ShimPreImage, decode_frame_large, encode_frame};
 use shit_store::{BlobStore, Index};
 use std::collections::BTreeMap;
@@ -189,24 +189,69 @@ fn ingest_notification(
     };
 
     // W06.A.4: content syscalls with attached pre-image take the
-    // FilePreImage path. The TreeOp path is only for unlink.
+    // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
         if let Some(pre) = &note.pre_image {
             if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
                 warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
             }
-        } else {
-            // The interposer fired for a content syscall but the
-            // shim couldn't capture bytes (file didn't exist, over
-            // the inline cap, or read errored). Without bytes we
-            // have no inverse to emit; dir-diff covers Create cases,
-            // and the over-cap streaming variant is W06.A.4.1.
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                arg = %note.arg,
-                "shim notify: content syscall without pre-image (no-op file / over cap / read failed)"
-            );
+            return;
+        }
+        // AR05.1: no pre-image means the file didn't exist when the
+        // shim looked. On in-watch paths the dir-diff Create event
+        // covers this; on OUT-OF-WATCH paths (e.g. `make install
+        // PREFIX=/usr/local`) the kernel-capture tier doesn't see
+        // the create at all — the shim is the only observation
+        // channel. Stat post-syscall: if the file now exists, it
+        // was a fresh create the user wants undoable. Journal
+        // TreeOp::Create so undo can unlink it.
+        match std::fs::symlink_metadata(&note.arg) {
+            Ok(meta) => {
+                use std::os::unix::fs::MetadataExt;
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode();
+                let inode = InodeRef::new(meta.dev(), meta.ino());
+                let kind = if meta.file_type().is_dir() {
+                    FileKind::Directory
+                } else if meta.file_type().is_symlink() {
+                    FileKind::Symlink
+                } else {
+                    FileKind::Regular
+                };
+                let event = CaptureEvent {
+                    id: EventId(0),
+                    command,
+                    ts: crate::server::next_ts(),
+                    partial: false,
+                    kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                        inode,
+                        path: PathBuf::from(&note.arg),
+                        kind,
+                        mode,
+                    }),
+                };
+                if let Err(e) = index.put_event(&event) {
+                    warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
+                } else {
+                    debug!(
+                        pid = note.pid,
+                        syscall = %note.syscall,
+                        arg = %note.arg,
+                        "shim notify: journaled fresh-create as TreeOp::Create"
+                    );
+                }
+            }
+            Err(_) => {
+                // File doesn't exist even post-syscall — interposer
+                // fired but the operation didn't create anything
+                // (e.g. open(O_RDONLY) on a nonexistent path). Drop.
+                debug!(
+                    pid = note.pid,
+                    syscall = %note.syscall,
+                    arg = %note.arg,
+                    "shim notify: content syscall with no pre-image and no post-file; dropping"
+                );
+            }
         }
         return;
     }
