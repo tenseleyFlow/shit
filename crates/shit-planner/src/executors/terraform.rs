@@ -182,7 +182,9 @@ impl<R: TerraformRunner> TerraformExecutor<R> {
             }
         };
 
-        // 2. terraform state push <tempfile>
+        // 2. terraform state push <tempfile> — restores the captured
+        //    state. After this, state says "these resources exist"
+        //    but the world (post-destroy) says they don't.
         let push_argv = vec![
             "terraform".to_string(),
             "state".to_string(),
@@ -195,16 +197,22 @@ impl<R: TerraformRunner> TerraformExecutor<R> {
             };
         }
 
-        // 3. terraform apply -refresh-only -auto-approve to reconcile.
-        let reconcile_argv = vec![
+        // 3. terraform apply -auto-approve — terraform sees state has
+        //    resources, world doesn't, plans to RECREATE. This is the
+        //    correct destroy-inverse for the common case. AR04.1's
+        //    earlier implementation used -refresh-only which is WRONG
+        //    for this direction: refresh-only just reconciles state
+        //    attributes from the world, it doesn't recreate world
+        //    resources from state.
+        let recreate_argv = vec![
             "terraform".to_string(),
             "apply".to_string(),
-            "-refresh-only".to_string(),
             "-auto-approve".to_string(),
+            "-no-color".to_string(),
         ];
-        if let Err(e) = self.runner.run(&reconcile_argv, workdir) {
+        if let Err(e) = self.runner.run(&recreate_argv, workdir) {
             return ExecutionOutcome::Failed {
-                err: format!("terraform apply -refresh-only: {e}"),
+                err: format!("terraform apply (destroy-reverse recreate): {e}"),
             };
         }
 
@@ -302,10 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn destroy_reverse_uses_state_push_path() {
-        // Destroy-reverse keeps the stage-1 state-push + refresh-only
-        // path. Best-effort: state is restored but world resources
-        // are NOT recreated; full apply-reverse is v1.x.
+    fn destroy_reverse_pushes_state_then_recreates() {
+        // AR04.2: destroy-reverse pushes the captured state then
+        // runs `terraform apply -auto-approve` (NOT -refresh-only)
+        // so terraform recreates the resources from state.
         let exe = TerraformExecutor::new(Spy::default());
         let outcome = exe.execute(&destroy_op(), false, ConflictPolicy::Abort);
         assert_eq!(outcome, ExecutionOutcome::Applied);
@@ -315,7 +323,11 @@ mod tests {
         assert_eq!(runs[0][1], "state");
         assert_eq!(runs[0][2], "push");
         assert!(runs[1].iter().any(|t| t == "apply"));
-        assert!(runs[1].iter().any(|t| t == "-refresh-only"));
+        assert!(runs[1].iter().any(|t| t == "-auto-approve"));
+        // Crucial: do NOT use -refresh-only — that just reconciles
+        // state attributes from the world; we need to RECREATE
+        // resources because the world is empty post-destroy.
+        assert!(!runs[1].iter().any(|t| t == "-refresh-only"));
     }
 
     #[test]
