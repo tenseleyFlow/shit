@@ -646,6 +646,29 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        CaptureEventKind::KubectlOp {
+            context,
+            namespace,
+            op,
+            captured_yaml,
+        } => {
+            // AR04.3: 1:1 mapping from KubectlOp event → KubectlReverse
+            // inverse op. The helper captured `kubectl get -o yaml`
+            // before the user's destructive verb; the executor pipes
+            // it back via `kubectl apply -f -`. Context guard at
+            // execute time refuses if kube-context drifted.
+            nodes.push(PlanNode {
+                op: InverseOp::KubectlReverse {
+                    context: context.clone(),
+                    namespace: namespace.clone(),
+                    op: op.clone(),
+                    captured_yaml: captured_yaml.clone(),
+                    requires_confirmation: true,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
         CaptureEventKind::TerraformOp {
             workdir,
             op,
