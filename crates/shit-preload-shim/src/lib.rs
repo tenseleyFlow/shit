@@ -364,8 +364,53 @@ mod policy {
     /// pre-exists (install over an existing file), the captured bytes
     /// drive a RestoreContent inverse instead.
     pub fn notify_rename_with_dst_preimage(syscall: &'static str, from: &str, to: &str) {
-        let arg = format!("{from}\t{to}");
+        // W09.7: canonicalize both `from` and `to` so the daemon's
+        // TreeOp::Rename carries absolute paths. Otherwise tools like
+        // `rsync` that call rename(2) with paths relative to their own
+        // cwd produce journal events with relative paths, and the
+        // planner's ReverseRename inverse — applied from `shit undo`'s
+        // cwd, which is typically NOT the same — fails with
+        // ConflictMissing ("rename source 'X' does not exist").
+        //
+        // `from` exists pre-rename so canonicalize works. `to` may not
+        // (clean rename into a new path); fall back to its parent +
+        // basename when canonicalize itself fails. Last resort: the raw
+        // string as the user passed it — undo gets the same conflict
+        // we'd get without this fix, but at least we tried.
+        let from_abs = canonical_path(from);
+        let to_abs = canonical_path(to);
+        let arg = format!("{from_abs}\t{to_abs}");
         notify_inner(syscall, &arg, Some(to));
+    }
+
+    /// Best-effort absolute path resolution. Prefer `canonicalize`
+    /// (resolves symlinks + relative components); fall back to a
+    /// parent-canonicalize + basename join when the path itself
+    /// doesn't yet exist; final fallback is the original string.
+    fn canonical_path(path: &str) -> String {
+        use std::path::{Path, PathBuf};
+        if let Ok(p) = std::fs::canonicalize(path)
+            && let Some(s) = p.to_str()
+        {
+            return s.to_string();
+        }
+        // Path may not exist (rename destination on a fresh path).
+        // Canonicalize the parent and join the basename. Note that
+        // `Path::new("gamma.txt").parent()` returns Some("") — an
+        // empty path — not `Some(".")`. Treat empty as cwd.
+        let p = Path::new(path);
+        let Some(name) = p.file_name() else {
+            return path.to_string();
+        };
+        let parent_in = match p.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+            Some(parent) => parent.to_path_buf(),
+            None => return path.to_string(),
+        };
+        if let Ok(parent_abs) = std::fs::canonicalize(&parent_in) {
+            return parent_abs.join(name).to_string_lossy().into_owned();
+        }
+        path.to_string()
     }
 
     // Recursion guard for the notify path. The pre-image-capture
