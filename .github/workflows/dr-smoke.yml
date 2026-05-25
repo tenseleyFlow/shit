@@ -973,7 +973,11 @@ jobs:
                     ln-symlink-undo-fbsd.sh \
                     shell-redirect-undo-fbsd.sh \
                     awk-inplace-undo-fbsd.sh \
-                    tar-extract-undo-fbsd.sh"
+                    tar-extract-undo-fbsd.sh \
+                    gzip-undo-fbsd.sh \
+                    find-exec-rm-undo-fbsd.sh \
+                    ln-hardlink-undo-fbsd.sh \
+                    cpio-extract-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
