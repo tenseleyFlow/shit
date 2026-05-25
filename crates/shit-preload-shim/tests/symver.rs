@@ -33,6 +33,8 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
     ("ftruncate", "FBSD_1.0"),
     ("pwrite", "FBSD_1.0"),
     ("mmap", "FBSD_1.0"),
+    // W09.10.1 — mkfifo is the only libc version (FBSD_1.0).
+    ("mkfifo", "FBSD_1.0"),
     // *at variants are at FBSD_1.1 in libc. openat also exists
     // at FBSD_1.2 but lld won't let us tag the same source
     // symbol twice (multiple-versions error when rlib links
@@ -41,6 +43,7 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
     ("openat", "FBSD_1.1"),
     ("unlinkat", "FBSD_1.1"),
     ("renameat", "FBSD_1.1"),
+    ("mkfifoat", "FBSD_1.1"),
 ];
 
 /// Locate the built `.so`. cargo provides `CARGO_BIN_EXE_<name>`
