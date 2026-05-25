@@ -38,7 +38,7 @@ if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
 fi
 if [ -n "$helper" ]; then
     target_argv=$(printf '%s\n' "$@")
-    "$helper" container-event docker-compose pre --target-argv "$target_argv" || true
+    "$helper" container-event docker-compose pre "--target-argv=$target_argv" || true
 fi
 
 exec "$real" "$@"

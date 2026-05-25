@@ -16,7 +16,7 @@
 //! handler just converts wire → planner types and journals.
 
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
-use shit_planner::inverse::TerraformOp;
+use shit_planner::inverse::{KubectlOp, TerraformOp};
 use shit_proto::{CloudEventReq, CloudRuntimeWire, CloudVerbWire};
 use shit_store::Index;
 use thiserror::Error;
@@ -32,6 +32,11 @@ pub enum HandleError {
     },
     #[error("cloud verb {0:?} not yet implemented (deferred sub-sprint)")]
     VerbNotImplemented(CloudVerbWire),
+    #[error("missing required extras field for verb {verb:?}: {key}")]
+    MissingExtra {
+        verb: CloudVerbWire,
+        key: &'static str,
+    },
     #[error("journal write failed: {0}")]
     JournalWrite(String),
 }
@@ -110,8 +115,49 @@ fn build_event_kind(req: &CloudEventReq) -> Result<CaptureEventKind, HandleError
                 prior_state: req.prior_state.clone(),
             })
         }
-        // AR04.3 / .4 / .5 land these.
-        (CloudRuntimeWire::Kubectl, _) | (CloudRuntimeWire::Gh, _) | (CloudRuntimeWire::Aws, _) => {
+        (CloudRuntimeWire::Kubectl, verb) => {
+            // AR04.3: pack captured `kubectl get -o yaml` into
+            // prior_state, resource identifiers into extras. Helper-
+            // side prepare_kubectl populates extras consistently
+            // regardless of which classifier verb fired.
+            let kind = req
+                .extras
+                .get("kind")
+                .cloned()
+                .ok_or(HandleError::MissingExtra { verb, key: "kind" })?;
+            let name = req
+                .extras
+                .get("name")
+                .cloned()
+                .ok_or(HandleError::MissingExtra { verb, key: "name" })?;
+            let context = req
+                .extras
+                .get("context")
+                .cloned()
+                .ok_or(HandleError::MissingExtra {
+                    verb,
+                    key: "context",
+                })?;
+            let namespace = req.extras.get("namespace").cloned();
+            let kop = match verb {
+                CloudVerbWire::KubectlDelete => KubectlOp::Delete { kind, name },
+                CloudVerbWire::KubectlApply => KubectlOp::Apply { kind, name },
+                _ => {
+                    return Err(HandleError::VerbRuntimeMismatch {
+                        runtime: req.runtime,
+                        verb,
+                    });
+                }
+            };
+            Ok(CaptureEventKind::KubectlOp {
+                context,
+                namespace,
+                op: kop,
+                captured_yaml: req.prior_state.clone(),
+            })
+        }
+        // AR04.4 / .5 land these.
+        (CloudRuntimeWire::Gh, _) | (CloudRuntimeWire::Aws, _) => {
             Err(HandleError::VerbNotImplemented(req.verb))
         }
     }
@@ -160,12 +206,60 @@ mod tests {
     }
 
     #[test]
-    fn kubectl_returns_not_implemented_until_ar04_3() {
+    fn kubectl_apply_with_extras_builds_event_kind() {
         let mut req = tf_req(CloudVerbWire::KubectlApply);
         req.runtime = CloudRuntimeWire::Kubectl;
+        req.extras.insert("context".into(), "kind-shit-test".into());
+        req.extras.insert("namespace".into(), "default".into());
+        req.extras.insert("kind".into(), "Pod".into());
+        req.extras.insert("name".into(), "busybox".into());
+        req.prior_state = b"apiVersion: v1\nkind: Pod\n...".to_vec();
+        match build_event_kind(&req).unwrap() {
+            CaptureEventKind::KubectlOp {
+                context,
+                namespace,
+                op,
+                captured_yaml,
+            } => {
+                assert_eq!(context, "kind-shit-test");
+                assert_eq!(namespace.as_deref(), Some("default"));
+                assert!(
+                    matches!(op, KubectlOp::Apply { ref kind, ref name } if kind == "Pod" && name == "busybox")
+                );
+                assert!(captured_yaml.starts_with(b"apiVersion: v1"));
+            }
+            other => panic!("expected KubectlOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kubectl_delete_routes_to_kubectl_op_delete() {
+        let mut req = tf_req(CloudVerbWire::KubectlDelete);
+        req.runtime = CloudRuntimeWire::Kubectl;
+        req.extras.insert("context".into(), "kind-shit-test".into());
+        req.extras.insert("kind".into(), "Deployment".into());
+        req.extras.insert("name".into(), "web".into());
+        match build_event_kind(&req).unwrap() {
+            CaptureEventKind::KubectlOp { op, namespace, .. } => {
+                assert!(
+                    matches!(op, KubectlOp::Delete { ref kind, ref name } if kind == "Deployment" && name == "web")
+                );
+                assert!(namespace.is_none());
+            }
+            other => panic!("expected KubectlOp::Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kubectl_missing_context_extra_is_error() {
+        let mut req = tf_req(CloudVerbWire::KubectlApply);
+        req.runtime = CloudRuntimeWire::Kubectl;
+        req.extras.insert("kind".into(), "Pod".into());
+        req.extras.insert("name".into(), "x".into());
+        // context missing
         match build_event_kind(&req) {
-            Err(HandleError::VerbNotImplemented(CloudVerbWire::KubectlApply)) => {}
-            other => panic!("expected VerbNotImplemented, got {other:?}"),
+            Err(HandleError::MissingExtra { key: "context", .. }) => {}
+            other => panic!("expected MissingExtra(context), got {other:?}"),
         }
     }
 

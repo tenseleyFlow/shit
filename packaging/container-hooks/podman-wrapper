@@ -34,7 +34,7 @@ if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
 fi
 if [ -n "$helper" ]; then
     target_argv=$(printf '%s\n' "$@")
-    "$helper" container-event podman pre --target-argv "$target_argv" || true
+    "$helper" container-event podman pre "--target-argv=$target_argv" || true
 fi
 
 exec "$real" "$@"

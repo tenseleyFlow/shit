@@ -768,6 +768,15 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::KubectlOp { .. } => Denormalized {
+            discriminant: "KubectlOp",
+            dev: None,
+            inode: None,
+            path: None,
+            // captured_yaml lives inline in the events row.
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 

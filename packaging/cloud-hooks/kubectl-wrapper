@@ -13,7 +13,7 @@ set -e
 # (during a shit undo) must NOT re-capture. The executors set
 # SHIT_DURING_UNDO=1.
 if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
-    real=$(command -v -- kubectl | grep -v "$(dirname "$0")" | head -n1)
+    real=$(PATH="${PATH#*$(dirname "$0"):}" command -v kubectl 2>/dev/null || command -v -- kubectl)
     [ -n "$real" ] || { echo "shit: real kubectl not found on PATH" >&2; exit 127; }
     exec "$real" "$@"
 fi
@@ -22,6 +22,22 @@ fi
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v kubectl 2>/dev/null || command -v -- kubectl)
 [ -n "$real" ] || { echo "shit: real kubectl not found on PATH" >&2; exit 127; }
 
-# DR-CR-06: pre/post hooks via `shit-helper cloud-event` go here.
-# Stage 1: just exec.
+# DR-CR-06 (AR04.3): pre-capture via `shit-helper cloud-event`. Helper
+# classifies argv, runs `kubectl get -o yaml <kind>/<name>` for
+# destructive verbs, ships captured YAML + identifiers via ctl.
+# Hook-friendly: failure logs and returns 0.
+helper=$(command -v shit-helper 2>/dev/null || true)
+if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
+    echo "shit-hook: kubectl-wrapper real=${real} helper=${helper:-<not-found>}" >&2
+fi
+if [ -n "$helper" ]; then
+    target_argv=$(printf '%s\n' "$@")
+    # `--target-argv=...` (equals syntax) instead of
+    # `--target-argv "..."` so clap doesn't try to parse a
+    # leading `--flag` in the value as a new flag (happens when
+    # the user passes global flags first, e.g.
+    # `kubectl --context X delete ...`).
+    "$helper" cloud-event kubectl pre "--target-argv=$target_argv" || true
+fi
+
 exec "$real" "$@"

@@ -41,7 +41,9 @@ if [ -n "$helper" ]; then
     # Newline-separate the user's argv so the helper can split it
     # cleanly (NUL is awkward to ship through a CLI string flag).
     target_argv=$(printf '%s\n' "$@")
-    "$helper" container-event docker pre --target-argv "$target_argv" || true
+    # `--target-argv=...` equals syntax so clap doesn't try to parse
+    # a leading `--flag` in the value as a new flag.
+    "$helper" container-event docker pre "--target-argv=$target_argv" || true
 fi
 
 exec "$real" "$@"

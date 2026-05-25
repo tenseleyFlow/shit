@@ -187,6 +187,18 @@ pub enum CaptureEventKind {
         /// the informational-skip path).
         prior_state: Vec<u8>,
     },
+    /// AR04.3 (DR-CR-06 kubectl path). Helper-side cloud-event
+    /// captured `kubectl get -o yaml <kind>/<name>` before the
+    /// user's destructive verb (delete / apply over existing /
+    /// scale / rollout); planner maps to
+    /// [`crate::inverse::InverseOp::KubectlReverse`] which pipes
+    /// the captured YAML to `kubectl apply -f -` at undo time.
+    KubectlOp {
+        context: String,
+        namespace: Option<String>,
+        op: crate::inverse::KubectlOp,
+        captured_yaml: Vec<u8>,
+    },
 }
 
 /// Mirror of [`shit_proto::DbEngineWire`] on the planner side so
