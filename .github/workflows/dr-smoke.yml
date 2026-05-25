@@ -932,7 +932,8 @@ jobs:
                     make-install-overwrite-undo-fbsd.sh \
                     ln-symlink-undo-fbsd.sh \
                     shell-redirect-undo-fbsd.sh \
-                    awk-inplace-undo-fbsd.sh"
+                    awk-inplace-undo-fbsd.sh \
+                    tar-extract-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can

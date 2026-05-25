@@ -238,6 +238,35 @@ fn classify_replace_paths(
             atomic.insert(p.clone());
         }
     }
+    // W09.5: Unlink(P) + PreImage(P) with NO Create and NO Rename
+    // AND P exists at undo time → the "unlink-then-create" shape
+    // used by tar / cpio / gzip. The shim captured the pre-image at
+    // unlink time (W09.5 interposer extension), then a subsequent
+    // open(O_CREAT) recreated the path with new bytes — that open's
+    // pre-image capture returned None (file gone) so no Create event
+    // is journaled. Classify as atomic_replace: the FilePreImage's
+    // RestoreContent restores the bytes; the Unlink's RecreatePath
+    // inverse is suppressed (would race with RestoreContent or
+    // create an empty file racing the restore).
+    //
+    // We deliberately do NOT classify the file-gone-at-undo case
+    // here. That's the `rm foo` shape: file unlinked, not recreated.
+    // The user wants RecreatePath(foo) + RestoreContent(foo) + meta
+    // — the existing per-event inverse emission already handles it
+    // correctly (RecreatePath drops an empty file with the right
+    // mode/uid/gid, then RestoreContent overwrites with the captured
+    // bytes). Suppressing those would silently break `rm` undo.
+    for p in &unlinks {
+        if !pre_images.contains(p) {
+            continue;
+        }
+        if creates.contains(p) || rename_destinations.contains(p) {
+            continue;
+        }
+        if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
+        }
+    }
     (atomic, transient, rename_subsumed_creates)
 }
 
@@ -1664,6 +1693,88 @@ mod tests {
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
         // RestoreContent for dst MUST be emitted.
+        let has_restore = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if path == &dst));
+        assert!(
+            has_restore,
+            "RestoreContent missing; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unlink_plus_preimage_path_exists_classifies_as_atomic_replace() {
+        // W09.5: tar / cpio / gzip use unlink(P) then open(P, O_CREAT)
+        // to replace a file's content. The shim captures the
+        // pre-image at unlink time; the subsequent open's pre-image
+        // capture returns None (file already gone) so no Create event
+        // is journaled. At undo time P exists with the NEW bytes.
+        //
+        // The planner must classify this Unlink+PreImage shape as
+        // atomic_replace: suppress the Unlink's RecreatePath (would
+        // race / create empty file), let the FilePreImage's
+        // RestoreContent restore the old bytes.
+        let dst = PathBuf::from("/dst/alpha.txt");
+        let inode = InodeRef::new(1, 7777);
+        let blob = BlobHash::from_bytes([0xAB; 32]);
+
+        let mut store = InMemoryStore::new();
+        store.put_blob(blob, 20);
+
+        // Path exists at undo (post-tar, with new bytes).
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            dst.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(20),
+            },
+            None,
+        );
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let unlink = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: dst.clone(),
+            }),
+        };
+        let pre_image = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(9, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: dst.clone(),
+                blob,
+                meta: meta(20),
+                post_content_hash: None,
+            },
+        };
+        let p = plan(dummy_command(), &[pre_image, unlink], &probe, &store);
+
+        // RecreatePath for dst MUST NOT fire — would race with
+        // RestoreContent and possibly land an empty file.
+        let has_recreate_path = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RecreatePath { path, .. } if path == &dst));
+        assert!(
+            !has_recreate_path,
+            "RecreatePath leaked through for atomic-replace shape; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+        // RestoreContent for dst MUST be present.
         let has_restore = p
             .nodes
             .iter()

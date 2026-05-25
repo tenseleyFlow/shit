@@ -399,7 +399,21 @@ mod policy {
             return;
         }
         let pre_image = capture_path.and_then(capture_pre_image);
-        let _ = try_notify(syscall, arg, pre_image);
+        // W09.5: when the captured pre-image canonicalized `path` AND
+        // the wire arg IS that same path (single-path syscalls like
+        // unlink/open/openat/truncate — but NOT rename whose arg is
+        // `from\tto`), substitute the wire arg with the resolved
+        // absolute path. The daemon's planner matches TreeOp::Unlink
+        // and FilePreImage events by path string equality; if the
+        // FilePreImage carries `/abs/dst/x.txt` but the TreeOp::Unlink
+        // carries `x.txt` (the relative form tar passed), the
+        // atomic_replace classifier never fires and undo races into a
+        // RecreatePath-vs-existing-file phantom conflict.
+        let wire_arg: String = match (&pre_image, capture_path) {
+            (Some(pre), Some(cap)) if cap == arg => pre.path.clone(),
+            _ => arg.to_string(),
+        };
+        let _ = try_notify(syscall, &wire_arg, pre_image);
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -526,8 +540,18 @@ mod interposers {
     /// `path` must be a valid C string per libc's `unlink(2)` contract.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
-        // W06.A.1 diagnostic — confirms the interposer fired.
-        policy::notify_pre_mutation("unlink", &cstr_to_string(path));
+        // W09.5: tar/cpio/gzip use unlink-then-open(O_CREAT) to
+        // replace a file's content rather than the atomic-rename
+        // shape `install` / `mv` use. By the time the shim sees
+        // the subsequent open, the file is already gone and the
+        // open interposer's pre-image capture returns None.
+        // Capture HERE, before the unlink fires — the file still
+        // exists at notify time. The planner's
+        // `classify_replace_paths` recognizes the resulting
+        // Unlink + PreImage shape and emits RestoreContent for the
+        // path's old bytes; the Unlink's RecreatePath inverse is
+        // suppressed in that case.
+        policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(path));
         let real = next::real_unlink();
         if next::is_zero(next::as_usize(real)) {
             // dlsym failed; fall through to libc's wrapper. The libc
@@ -573,7 +597,10 @@ mod interposers {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flag: c_int) -> c_int {
         let path_str = cstr_to_string(path);
-        policy::notify_pre_mutation("unlinkat", &path_str);
+        // W09.5: same shape as `unlink` — capture pre-image bytes
+        // before the unlink, so unlink-then-open(O_CREAT) tools
+        // can be undone.
+        policy::notify_pre_mutation_with_content("unlinkat", &path_str);
         let real = next::real_unlinkat();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::unlinkat(dirfd, path, flag) };
