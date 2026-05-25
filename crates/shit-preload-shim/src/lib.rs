@@ -528,7 +528,28 @@ mod policy {
         // Best-effort `connect(2)` — if the socket doesn't exist (no
         // daemon, daemon down, wrong $XDG_RUNTIME_DIR), bail silently.
         let mut stream = UnixStream::connect(path)?;
-        stream.set_write_timeout(Some(Duration::from_millis(50)))?;
+        // W06.A.4.1: the write timeout must scale with payload size.
+        // The default 50 ms was sized for sub-MAX_FRAME_SIZE (256 KiB)
+        // notifications and would time out partway through a multi-MiB
+        // pre-image-carrying frame — write_all returns Err with only
+        // the first few hundred KiB delivered, and the daemon's
+        // decoder rejects the truncated frame ("frame length mismatch:
+        // header says ..., buffer has ..."), so the inline pre-image
+        // is silently dropped.
+        //
+        // 5s is generous: a local UDS sustains ~1 GB/s, so the
+        // SHIM_INLINE_PREIMAGE_CAP (32 MiB) ships in ~30 ms in the
+        // happy case. The extra slack accommodates a slow daemon
+        // drain (the listener handle_one is async-tokio, may not be
+        // immediately scheduled). For notifications without
+        // pre-image, the original 50 ms stays — those are tiny and a
+        // hung daemon shouldn't pause a user's `unlink` for 5s.
+        let write_timeout = if pre_image.is_some() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(50)
+        };
+        stream.set_write_timeout(Some(write_timeout))?;
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
 
         let now = SystemTime::now()
