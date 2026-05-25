@@ -777,6 +777,15 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::GhOp { .. } => Denormalized {
+            discriminant: "GhOp",
+            dev: None,
+            inode: None,
+            path: None,
+            // captured_json lives inline in the events row.
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 

@@ -316,6 +316,15 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        CaptureEventKind::GhOp { op, .. } => {
+            warnings.push(PlanWarning::Informational {
+                tier: InverseTier::Cloud,
+                message: format!(
+                    "gh op {op:?} captured; `shit redo` does not re-issue cloud \
+                     destructive verbs (re-run the original command if intended)"
+                ),
+            });
+        }
     }
 }
 

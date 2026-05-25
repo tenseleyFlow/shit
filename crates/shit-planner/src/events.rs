@@ -199,6 +199,16 @@ pub enum CaptureEventKind {
         op: crate::inverse::KubectlOp,
         captured_yaml: Vec<u8>,
     },
+    /// AR04.4 (DR-CR-06 gh path). Helper-side cloud-event captured
+    /// `gh release view --json ...` (or analogous) before the
+    /// user's destructive verb. Planner maps to
+    /// [`crate::inverse::InverseOp::GhReverse`] which the executor
+    /// dispatches by op shape (release delete → create, issue
+    /// close → reopen, etc).
+    GhOp {
+        op: crate::inverse::GhOp,
+        captured_json: Vec<u8>,
+    },
 }
 
 /// Mirror of [`shit_proto::DbEngineWire`] on the planner side so
