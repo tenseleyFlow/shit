@@ -211,12 +211,32 @@ fn classify_replace_paths(
     // and the kqueue dir-diff both observed the same mv. Surface
     // these to suppress the Create's Unlink-inverse; the Rename's
     // ReverseRename is authoritative.
+    //
+    // W09.9 extension: directory renames carry their contents.
+    // When `mv srcdir dstdir` runs, the kqueue dir-diff sees:
+    //   1. dstdir appearing in the parent cwd → Create(dstdir)
+    //   2. dstdir/foo.txt, dstdir/bar.txt, ... appearing as entries
+    //      in the newly-watched dstdir → Create(dstdir/foo.txt) etc.
+    // These child Creates' Unlink inverses would race the Rename's
+    // ReverseRename — if Unlinks fire first the children get deleted
+    // BEFORE the directory is renamed back, leaving an empty
+    // restored srcdir (data loss). Suppress any Create whose path
+    // is a strict descendant of a rename destination.
     let mut rename_subsumed_creates: HashSet<PathBuf> = HashSet::new();
     for p in &creates {
         if unlinks.contains(p) {
             continue;
         }
         if rename_destinations.contains(p) {
+            rename_subsumed_creates.insert(p.clone());
+            continue;
+        }
+        // Strict descendant of any rename destination — the dir
+        // rename inverse will carry it along.
+        if rename_destinations
+            .iter()
+            .any(|d| p.starts_with(d) && p != d)
+        {
             rename_subsumed_creates.insert(p.clone());
         }
     }
@@ -1655,6 +1675,138 @@ mod tests {
         assert!(
             has_reverse_rename,
             "Rename inverse missing; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rename_carries_children_via_subsumed_creates() {
+        // W09.9: `mv srcdir dstdir` renames a directory. The kqueue
+        // dir-diff observes the new dir's entries appearing in cwd:
+        //   - Create(dstdir) — the renamed-in dir itself
+        //   - Create(dstdir/foo.txt), Create(dstdir/bar.txt) — the
+        //     contained files (they moved with the dir, but dir-diff
+        //     sees them as fresh entries in the newly-watched dstdir)
+        // Without the W09.9 rule, the children's Unlink inverses race
+        // the Rename's ReverseRename — if Unlinks fire first the
+        // children are deleted, leaving an empty srcdir post-undo
+        // (data loss). The rename_subsumed_creates set must include
+        // strict descendants of every rename destination so child
+        // Unlink inverses are suppressed.
+        let src = PathBuf::from("/w/srcdir");
+        let dst = PathBuf::from("/w/dstdir");
+        let foo = dst.join("foo.txt");
+        let bar = dst.join("bar.txt");
+        let dir_inode = InodeRef::new(1, 100);
+        let foo_inode = InodeRef::new(1, 101);
+        let bar_inode = InodeRef::new(1, 102);
+
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            dst.clone(),
+            ProbeStat {
+                inode: dir_inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        probe.insert(
+            foo.clone(),
+            ProbeStat {
+                inode: foo_inode,
+                meta: meta(10),
+            },
+            None,
+        );
+        probe.insert(
+            bar.clone(),
+            ProbeStat {
+                inode: bar_inode,
+                meta: meta(10),
+            },
+            None,
+        );
+        let store = InMemoryStore::new();
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let rename = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: src.clone(),
+                to: dst.clone(),
+                inode: dir_inode,
+            }),
+        };
+        let create_dir = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: dir_inode,
+                path: dst.clone(),
+                kind: crate::metadata::FileKind::Directory,
+                mode: 0o040755,
+            }),
+        };
+        let create_foo = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: foo_inode,
+                path: foo.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let create_bar = CaptureEvent {
+            id: EventId(4),
+            command: cmd,
+            ts: TimePoint::new(13, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: bar_inode,
+                path: bar.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let p = plan(
+            dummy_command(),
+            &[rename, create_dir, create_foo, create_bar],
+            &probe,
+            &store,
+        );
+
+        // NO Unlink inverse for foo or bar — they're carried by the
+        // dir rename.
+        for child in [&foo, &bar] {
+            let has_unlink = p
+                .nodes
+                .iter()
+                .any(|n| matches!(&n.op, InverseOp::Unlink { path } if path == child));
+            assert!(
+                !has_unlink,
+                "Unlink({}) leaked through; would race ReverseRename — nodes: {:?}",
+                child.display(),
+                p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+            );
+        }
+        // The Rename inverse IS present (rename dstdir → srcdir).
+        let has_reverse_rename = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::Rename { from, to } if from == &dst && to == &src));
+        assert!(
+            has_reverse_rename,
+            "ReverseRename missing — undo can't restore srcdir; nodes: {:?}",
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
     }

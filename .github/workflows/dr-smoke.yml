@@ -1055,7 +1055,11 @@ jobs:
                     xargs-rm-undo-fbsd.sh \
                     chmod-recursive-undo-fbsd.sh \
                     mv-noop-undo-fbsd.sh \
-                    dd-notrunc-undo-fbsd.sh"
+                    dd-notrunc-undo-fbsd.sh \
+                    mv-dir-undo-fbsd.sh \
+                    mkdir-p-undo-fbsd.sh \
+                    bash-c-undo-fbsd.sh \
+                    and-chain-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
