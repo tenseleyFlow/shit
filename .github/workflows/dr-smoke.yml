@@ -498,6 +498,46 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  kubectl-delete-undo:
+    # AR04.3 -- validates kubectl capture + restore via kind cluster.
+    # Helper captures `kubectl get -o yaml <kind>/<name>` before the
+    # delete; `shit undo` pipes the YAML back through `kubectl apply
+    # -f -`. Installs kind + kubectl from official upstream releases
+    # (ubuntu-24.04 hosted runners ship neither by default).
+    name: kubectl-delete-undo smoke (AR04.3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: install kind + kubectl
+        run: |
+          # kind: prebuilt binary, latest stable.
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+          # kubectl: match the cluster's stable channel.
+          curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          kubectl version --client
+      - name: docker preflight
+        run: docker version
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/kubectl-delete-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubectl-delete-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
