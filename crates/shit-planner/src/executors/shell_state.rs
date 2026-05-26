@@ -53,21 +53,72 @@ pub trait ShellStateRunner {
     fn queue_to_precmd(&self, snippet: &str, target: ShellTarget) -> Result<(), String>;
 }
 
-/// Production runner: stage-1 stub that returns an error.
+/// Production runner. AR06.1 / DR-CR-50 — appends the rendered
+/// snippet to a per-session file at
+/// `$XDG_STATE_HOME/shit/precmd-queue/<session-uuid>`. The
+/// bash hook's `__shit_drain_precmd_queue` (in `shell/bash.sh`)
+/// sources + truncates this file on every PROMPT_COMMAND fire,
+/// so the snippet runs exactly once before the next prompt.
+///
+/// Session-uuid keying ensures concurrent shells stay isolated:
+/// shell A's `cd '/etc' && shit undo --apply-shell-state` doesn't
+/// re-cd shell B.
 #[derive(Debug, Default)]
-pub struct SystemShellStateRunner;
+pub struct SystemShellStateRunner {
+    /// UUID of the shell session whose queue to write to.
+    /// Optional — `with_session()` injects it; if absent the
+    /// runner falls back to the error path so the caller learns
+    /// they forgot to plumb it.
+    session: Option<String>,
+}
+
+impl SystemShellStateRunner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the target session UUID. Required before
+    /// `queue_to_precmd` can succeed.
+    pub fn with_session(mut self, session: String) -> Self {
+        self.session = Some(session);
+        self
+    }
+}
 
 impl ShellStateRunner for SystemShellStateRunner {
-    fn queue_to_precmd(&self, _snippet: &str, _target: ShellTarget) -> Result<(), String> {
-        // DR-CR-50: real precmd-queue wiring lives behind the
-        // capture-runtime branch. v1 returns the deferral message;
-        // the executor surfaces it as Failed when the caller asked
-        // for apply.
-        Err(
-            "shell-state apply is gated on DR-30 / DR-CR-50 (precmd-queue runtime); \
-             re-run `shit show` to copy-paste the snippet"
-                .into(),
-        )
+    fn queue_to_precmd(&self, snippet: &str, _target: ShellTarget) -> Result<(), String> {
+        let session = self
+            .session
+            .as_deref()
+            .ok_or("SystemShellStateRunner: no session UUID set; call with_session() first")?;
+        let state_home = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+            .ok_or("neither XDG_STATE_HOME nor HOME is set")?;
+        let queue_dir = state_home.join("shit").join("precmd-queue");
+        std::fs::create_dir_all(&queue_dir)
+            .map_err(|e| format!("create precmd-queue dir {}: {e}", queue_dir.display()))?;
+        let queue_path = queue_dir.join(session);
+        // Append so concurrent `shit undo --apply-shell-state`
+        // invocations don't clobber each other. The hook's drain
+        // sources the file as a single bash unit and truncates;
+        // worst case is two snippets running in the order they
+        // were queued, which is what we want.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&queue_path)
+            .map_err(|e| format!("open precmd-queue file {}: {e}", queue_path.display()))?;
+        f.write_all(snippet.as_bytes())
+            .map_err(|e| format!("write to precmd-queue file: {e}"))?;
+        if !snippet.ends_with('\n') {
+            f.write_all(b"\n")
+                .map_err(|e| format!("write newline to precmd-queue: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -324,10 +375,33 @@ mod tests {
     }
 
     #[test]
-    fn system_runner_returns_deferral_message() {
-        let r = SystemShellStateRunner;
+    fn system_runner_without_session_errors_loud() {
+        let r = SystemShellStateRunner::new();
         let err = r.queue_to_precmd("cd /", ShellTarget::Bash).unwrap_err();
-        assert!(err.contains("DR-30") || err.contains("DR-CR-50"));
+        assert!(err.contains("session"), "got: {err}");
+    }
+
+    #[test]
+    fn system_runner_with_session_writes_to_precmd_queue_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test, only env mutation; restored
+        // implicitly when tmpdir drops cleanly. We don't call any
+        // other test that reads XDG_STATE_HOME concurrently.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+        }
+        let r = SystemShellStateRunner::new().with_session("abc-123".into());
+        r.queue_to_precmd("cd '/home/u'\n", ShellTarget::Bash)
+            .expect("queue_to_precmd");
+        let q = tmp.path().join("shit/precmd-queue/abc-123");
+        let body = std::fs::read_to_string(&q).expect("queue file");
+        assert!(body.contains("cd '/home/u'"));
+        // Append semantics: a second call adds to the same file.
+        r.queue_to_precmd("cd '/tmp'\n", ShellTarget::Bash)
+            .expect("queue_to_precmd 2");
+        let body2 = std::fs::read_to_string(&q).expect("queue file");
+        assert!(body2.contains("cd '/home/u'"));
+        assert!(body2.contains("cd '/tmp'"));
     }
 
     #[test]
