@@ -101,16 +101,38 @@ pub enum CaptureEventKind {
         removed: BTreeMap<String, String>,            // name -> value (pre)
         modified: BTreeMap<String, (String, String)>, // name -> (pre, post)
     },
-    /// AR06.1 — shell-state diff observed across a command (cwd
-    /// change today; future revs will extend with set-opts,
-    /// aliases, function defs once the C06 state.rs diff machinery
-    /// is wired through the hook). The planner maps this to
-    /// `InverseOp::ShellStateRestore` with a pre-rendered
-    /// `cd '<pwd_before>'` bash snippet that the precmd-queue
-    /// runner can source on the next prompt.
+    /// AR06.1 — shell-state diff observed across a command. The
+    /// daemon computes this from the matching `PreExecShellState`
+    /// and `PostExecShellState` HookMessages (see shit-helper
+    /// `shell_state_track`). All four diff fields are optional;
+    /// the daemon emits the event only when at least one is
+    /// non-trivial. Planner maps to `InverseOp::ShellStateRestore`
+    /// with snippets rendered per shell target.
+    ///
+    /// `serde(default)` on the additive fields (opts/aliases/funcs)
+    /// so an older event journaled by the AR06.1-era daemon (pwd-
+    /// only) round-trips cleanly through the v2 planner. Same in
+    /// reverse: new events fed to an old planner just lose the
+    /// extra diff fields.
     ShellStateDiff {
         pwd_before: PathBuf,
         pwd_after: PathBuf,
+        /// AR06.2 — `set -o` option diffs. Each entry is a
+        /// `(name, pre, post)` triple; "on"/"off" for booleans,
+        /// raw string for stringly-typed options (history-size,
+        /// ifs, etc — undo is best-effort for the latter).
+        #[serde(default)]
+        opts: Vec<(String, String, String)>,
+        /// AR06.3 — alias diffs. Each entry is `(name, pre, post)`;
+        /// `pre = None` means "didn't exist before this command",
+        /// `post = None` means "was unset by this command".
+        #[serde(default)]
+        aliases: Vec<(String, Option<String>, Option<String>)>,
+        /// AR06.4 (deferred) — function diffs. Wire-reserved; the
+        /// daemon doesn't populate it yet because the bash hook
+        /// doesn't ship function bodies. Same shape as `aliases`.
+        #[serde(default)]
+        funcs: Vec<(String, Option<String>, Option<String>)>,
     },
     /// Package-manager operation (apt/dpkg/pacman/dnf/brew/pkg).
     PackageOp {
