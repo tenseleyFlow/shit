@@ -596,6 +596,16 @@ fn update_path_history_with_conn(
                 params![path.to_string_lossy(), ts.logical as i64],
             )?;
         }
+        T::SymlinkRemoved { path, .. } => {
+            // W09.16.1 — close the path-history row for the OLD
+            // symlink at this path. A paired Create event for the
+            // NEW symlink at the same path opens a fresh row.
+            conn.execute(
+                "UPDATE paths SET valid_to_logical = ?2
+                 WHERE path = ?1 AND valid_to_logical IS NULL",
+                params![path.to_string_lossy(), ts.logical as i64],
+            )?;
+        }
     }
     Ok(())
 }
@@ -688,6 +698,12 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
                     None,
                     Some(path.to_string_lossy().into_owned()),
                     "TreeOpSymlink",
+                ),
+                T::SymlinkRemoved { path, .. } => (
+                    None,
+                    None,
+                    Some(path.to_string_lossy().into_owned()),
+                    "TreeOpSymlinkRemoved",
                 ),
             };
             Denormalized {
