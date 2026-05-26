@@ -34,10 +34,6 @@
 //!   the probe returns `signature_kind = "unknown"`.
 
 #![cfg(target_os = "macos")]
-// Probe functions land here in M02.2–M02.8; M02.9 wires them into
-// `doctor::mod.rs` and removes this allow. Unit tests already
-// exercise the parsers and the stub.
-#![allow(dead_code)]
 
 use crate::doctor::json::{
     CodesignReport, EndpointSecurityReport, FsEventsProbeReport, SandboxReport, SipReport,
