@@ -807,6 +807,36 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  dir-rename-undo:
+    # DR-CR-54 -- when the shim observes a rename whose source is
+    # a directory, recursively snapshot every regular file in the
+    # subtree and ship as `extra_pre_images`. The daemon journals
+    # each as a FilePreImage event keyed to its original path,
+    # giving the planner enough material to plan content restore
+    # even though the original tree is gone post-rename.
+    # Also exercises the new renameat2 interposer (modern `mv`).
+    name: dir-rename-undo smoke (DR-CR-54)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/dir-rename-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dir-rename-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   set-e-undo:
     # AR06.2 -- set -o errexit / set +o errexit toggling. Captures
     # the opts-only diff path through the ShellStateDiff event and
