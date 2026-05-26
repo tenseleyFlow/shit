@@ -98,6 +98,8 @@ core::arch::global_asm!(
     ".symver ftruncate, ftruncate@FBSD_1.0",
     ".symver pwrite, pwrite@FBSD_1.0",
     ".symver mmap, mmap@FBSD_1.0",
+    // W09.10.1 — mkfifo at FBSD_1.0 (the only version libc exposes).
+    ".symver mkfifo, mkfifo@FBSD_1.0",
     // FBSD_1.1 — the *at variants. modern coreutils prefer these.
     // openat ALSO lives at FBSD_1.2 (libc's newer flag-aware
     // form), but lld emits "multiple versions for X" if we tag
@@ -112,6 +114,8 @@ core::arch::global_asm!(
     ".symver openat, openat@FBSD_1.1",
     ".symver unlinkat, unlinkat@FBSD_1.1",
     ".symver renameat, renameat@FBSD_1.1",
+    // W09.10.1 — mkfifoat (created in FreeBSD 8).
+    ".symver mkfifoat, mkfifoat@FBSD_1.1",
 );
 
 pub mod dispatch;
@@ -141,7 +145,7 @@ mod next {
     //! `RTLD_DEFAULT` would resolve back to our interposer and
     //! infinite-loop on the first call.
 
-    use libc::{c_char, c_int, c_uint, c_void, off_t, size_t, ssize_t};
+    use libc::{c_char, c_int, c_uint, c_void, mode_t, off_t, size_t, ssize_t};
     use std::sync::OnceLock;
 
     /// Look up a symbol via `dlsym(RTLD_NEXT, name)`. Returns 0 if the
@@ -271,6 +275,31 @@ mod next {
         }
     }
 
+    /// W09.10.1 — `mkfifo(2)`. The kqueue NOTE_WRITE on the parent
+    /// directory does NOT fire for FIFO/special-file creation on
+    /// FreeBSD (kernel-side distinction from regular file/dir
+    /// creation), so the helper's dir-diff never observes the new
+    /// entry. The shim picks up the slack in-process.
+    pub fn real_mkfifo() -> unsafe extern "C" fn(*const c_char, mode_t) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"mkfifo\0") });
+        unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(*const c_char, mode_t) -> c_int>(addr)
+        }
+    }
+
+    /// W09.10.1 — `mkfifoat(2)`. Same gap as `mkfifo` but for the
+    /// dirfd-relative variant.
+    pub fn real_mkfifoat() -> unsafe extern "C" fn(c_int, *const c_char, mode_t) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"mkfifoat\0") });
+        unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(c_int, *const c_char, mode_t) -> c_int>(
+                addr,
+            )
+        }
+    }
+
     /// Return the magic null fn pointer test, used by `disabled()` to
     /// short-circuit when dlsym failed to resolve any symbol. Cheap.
     pub fn is_zero(p: usize) -> bool {
@@ -394,6 +423,22 @@ mod policy {
         }
         let arg = format!("{from_abs}\t{to_abs}");
         notify_inner(syscall, &arg, Some(to));
+    }
+
+    /// W09.10.1 — create-only notification (no pre-image). Used by
+    /// `mkfifo` / `mkfifoat`: the path doesn't exist pre-syscall so
+    /// there's nothing to capture; the daemon journals a fresh
+    /// `TreeOp::Create` whose inverse is `unlink <path>`.
+    ///
+    /// Path is canonicalized via the parent-canonicalize + basename
+    /// trick (same as rename's `to` handling) — the file doesn't
+    /// exist yet, so direct canonicalize would fail. This matters
+    /// when callers invoke mkfifo with a relative path; the daemon's
+    /// undo-side executor runs from a different cwd and needs the
+    /// absolute path to find what to unlink.
+    pub fn notify_create(syscall: &'static str, path: &str) {
+        let abs = canonical_path(path);
+        notify_inner(syscall, &abs, None);
     }
 
     /// Best-effort absolute path resolution. Prefer `canonicalize`
@@ -761,6 +806,43 @@ mod interposers {
             return unsafe { libc::renameat(fromfd, from, tofd, to) };
         }
         unsafe { real(fromfd, from, tofd, to) }
+    }
+
+    /// W09.10.1 — `mkfifo(2)` interposer. FreeBSD's kqueue
+    /// `NOTE_WRITE` on the parent directory does NOT fire for FIFO
+    /// (or special-file) creation — the kernel distinguishes
+    /// regular-file/directory adds from FIFO/socket/device adds at
+    /// the vnode op level, and only the former bump the parent's
+    /// content-change indicator. Without an interposer the daemon
+    /// never sees the new entry and undo no-ops. Notify the daemon
+    /// here so it can journal a `TreeOp::Create`; the undo executor
+    /// reverses with `unlink(2)` (works for FIFOs).
+    ///
+    /// # Safety
+    /// `path` must be a valid C string.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn mkfifo(path: *const c_char, mode: mode_t) -> c_int {
+        policy::notify_create("mkfifo", &cstr_to_string(path));
+        let real = next::real_mkfifo();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::mkfifo(path, mode) };
+        }
+        unsafe { real(path, mode) }
+    }
+
+    /// W09.10.1 — `mkfifoat(2)` interposer. Dirfd-relative variant.
+    /// Same NOTE_WRITE gap as `mkfifo`.
+    ///
+    /// # Safety
+    /// `path` must be a valid C string.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn mkfifoat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
+        policy::notify_create("mkfifoat", &cstr_to_string(path));
+        let real = next::real_mkfifoat();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::mkfifoat(dirfd, path, mode) };
+        }
+        unsafe { real(dirfd, path, mode) }
     }
 
     /// `truncate(2)` interposer.

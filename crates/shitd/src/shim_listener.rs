@@ -433,6 +433,26 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 inode,
             }))
         }
+        "mkfifo" | "mkfifoat" => {
+            // W09.10.1 — FreeBSD kqueue NOTE_WRITE on the parent dir
+            // doesn't fire for FIFO/special-file creation, so the
+            // shim is the only observation channel for `mkfifo(1)`
+            // and library callers of `mkfifo(3)`. Journal a fresh
+            // TreeOp::Create whose executor inverse is `unlink`.
+            //
+            // The shim notifies pre-syscall, so the file may not yet
+            // exist at ingest time → inode_of returns None → sentinel
+            // (0,0). The executor's TreeOp::Create reverse only uses
+            // the path, so the sentinel is fine.
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Fifo,
+                mode: 0o644,
+            }))
+        }
         _ => None,
     }
 }
