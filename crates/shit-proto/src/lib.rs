@@ -113,6 +113,29 @@ pub enum HookMessage {
         env_block: Vec<u8>,
         ts_unix_nanos: u64,
     },
+    /// AR06.1 — pre-command shell-state snapshot. Today carries
+    /// `pwd` only; future variants may extend with set-opts /
+    /// aliases / functions (C06 state.rs has the diff machinery
+    /// already; this wire ships the minimal capture for cd-undo).
+    /// Additive: future fields go on a sibling `*ExecShellStateV2`
+    /// variant so old daemons round-trip cleanly.
+    PreExecShellState {
+        session: Uuid,
+        seq: u64,
+        pwd: String,
+        ts_unix_nanos: u64,
+    },
+    /// Companion to [`PreExecShellState`]. Emitted only when the
+    /// shell state has changed across the command (the bash hook
+    /// elides this when `$PWD` is unchanged). Daemon pairs with
+    /// the matching `PreExecShellState` by `(session, seq)` and
+    /// emits a `CaptureEventKind::ShellStateDiff`.
+    PostExecShellState {
+        session: Uuid,
+        seq: u64,
+        pwd: String,
+        ts_unix_nanos: u64,
+    },
     /// Emitted when the shell exits.
     SessionClose { session: Uuid, ts_unix_nanos: u64 },
 }
@@ -125,6 +148,8 @@ impl HookMessage {
             | Self::PostExec { session, .. }
             | Self::PreExecEnv { session, .. }
             | Self::PostExecEnv { session, .. }
+            | Self::PreExecShellState { session, .. }
+            | Self::PostExecShellState { session, .. }
             | Self::SessionClose { session, .. } => *session,
         }
     }
@@ -136,6 +161,8 @@ impl HookMessage {
             Self::PostExec { .. } => "post-exec",
             Self::PreExecEnv { .. } => "pre-exec-env",
             Self::PostExecEnv { .. } => "post-exec-env",
+            Self::PreExecShellState { .. } => "pre-exec-shell-state",
+            Self::PostExecShellState { .. } => "post-exec-shell-state",
             Self::SessionClose { .. } => "session-close",
         }
     }

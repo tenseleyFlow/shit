@@ -151,6 +151,15 @@ pub struct UndoRequest {
     /// Optional glob filters; ops whose path doesn't match are
     /// recorded as skipped. Empty means "no filter."
     pub paths: Vec<String>,
+    /// AR06.1 — opt in to the precmd-queue dispatch for any
+    /// `ShellStateRestore` op in the plan (cd / set-opts /
+    /// aliases / functions). Default false because surprise-
+    /// mutating the user's interactive shell is worse UX than
+    /// printing the snippet for them to source manually.
+    /// `serde(default)` so older daemons reading new client
+    /// envelopes round-trip cleanly (and vice versa).
+    #[serde(default)]
+    pub apply_shell_state: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

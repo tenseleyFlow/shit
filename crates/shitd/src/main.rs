@@ -24,6 +24,7 @@ mod pkg;
 mod proc_track;
 mod redirect_track;
 mod server;
+mod shell_state_track;
 mod shim_listener;
 mod stats;
 mod svc_track;
@@ -288,6 +289,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
 
     let pkg_stash = Arc::new(pkg::PkgPreStash::new());
     let env_stash = Arc::new(env_track::EnvPreStash::new());
+    let shell_state_stash = Arc::new(shell_state_track::ShellStatePreStash::new());
     let svc_stash = Arc::new(svc_track::SvcPreStash::new());
     let net_stash = Arc::new(net_track::NetPreStash::new());
     let proc_stash = Arc::new(proc_track::ProcPreStash::new());
@@ -403,6 +405,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let stats_for_server = Arc::clone(&stats);
     let shutdown_for_server = Arc::clone(&shutdown);
     let env_stash_for_server = Arc::clone(&env_stash);
+    let shell_state_stash_for_server = Arc::clone(&shell_state_stash);
     let active_for_server = Arc::clone(&active);
     let helper_link_for_server = helper_link_arc.clone();
     // Task #105 — same pattern as ctl_state: only thread the
@@ -415,6 +418,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             stats_for_server,
             index,
             env_stash_for_server,
+            shell_state_stash_for_server,
             active_for_server,
             helper_link_for_server,
             watch_ready_for_server,

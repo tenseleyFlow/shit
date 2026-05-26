@@ -108,6 +108,37 @@ pub enum HookSendKind {
         #[arg(long)]
         sock: PathBuf,
     },
+    /// AR06.1 — pre-command shell-state snapshot. Today carries pwd
+    /// only; future revs may extend with set-opts / aliases /
+    /// functions once C06 state.rs is wired. Cheap on the hot path
+    /// (a single env-var read), so the bash hook ships it
+    /// unconditionally.
+    #[command(name = "pre-exec-shell-state")]
+    PreExecShellState {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        seq: u64,
+        #[arg(long)]
+        pwd: String,
+        #[arg(long)]
+        sock: PathBuf,
+    },
+    /// Companion to `PreExecShellState`. Bash post-exec hook calls
+    /// this with the post-command `$PWD`; daemon diffs against the
+    /// stashed pre-pwd and journals a `ShellStateDiff` event only
+    /// when pwd actually changed.
+    #[command(name = "post-exec-shell-state")]
+    PostExecShellState {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        seq: u64,
+        #[arg(long)]
+        pwd: String,
+        #[arg(long)]
+        sock: PathBuf,
+    },
     /// AR06.5 — synchronous pre-stash for shell stream redirects.
     /// The shell hook calls this BEFORE the about-to-run command's
     /// `open(O_TRUNC)` fires; we parse the command line for redirect
@@ -303,6 +334,36 @@ pub fn run(kind: HookSendKind) -> Result<()> {
                 None,
             )
         }
+        HookSendKind::PreExecShellState {
+            session,
+            seq,
+            pwd,
+            sock,
+        } => (
+            HookMessage::PreExecShellState {
+                session,
+                seq,
+                pwd,
+                ts_unix_nanos: ts_now(),
+            },
+            sock,
+            None,
+        ),
+        HookSendKind::PostExecShellState {
+            session,
+            seq,
+            pwd,
+            sock,
+        } => (
+            HookMessage::PostExecShellState {
+                session,
+                seq,
+                pwd,
+                ts_unix_nanos: ts_now(),
+            },
+            sock,
+            None,
+        ),
         HookSendKind::PreExecRedirects { .. } => {
             // Handled by the early-return above; matched here only
             // to keep the match exhaustive without an unreachable!().

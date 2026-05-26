@@ -583,6 +583,15 @@ struct MultiTierExecutor<'a> {
         shit_planner::executors::terraform::TerraformExecutor<DaemonTerraformRunner>,
     kubectl_executor: shit_planner::executors::kubectl::KubectlExecutor<DaemonKubectlRunner>,
     gh_executor: shit_planner::executors::gh::GhExecutor<DaemonGhRunner>,
+    /// AR06.1 — shell-state restore. Always present; informational
+    /// by default (prints the snippet); `apply_shell_state` flips
+    /// it into precmd-queue mode at handle_undo time via a fresh
+    /// constructor (not mutable here because we want one
+    /// MultiTierExecutor per command-undone with the right
+    /// session UUID wired).
+    shell_state_executor: shit_planner::executors::shell_state::ShellStateExecutor<
+        shit_planner::executors::shell_state::SystemShellStateRunner,
+    >,
 }
 
 /// AR04.4: gh runner used by the daemon-side GhExecutor. Shells out
@@ -981,6 +990,7 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             || self.terraform_executor.supports(op)
             || self.kubectl_executor.supports(op)
             || self.gh_executor.supports(op)
+            || self.shell_state_executor.supports(op)
     }
 
     fn execute(
@@ -1005,6 +1015,8 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
             self.kubectl_executor.execute(op, dry_run, policy)
         } else if self.gh_executor.supports(op) {
             self.gh_executor.execute(op, dry_run, policy)
+        } else if self.shell_state_executor.supports(op) {
+            self.shell_state_executor.execute(op, dry_run, policy)
         } else {
             shit_planner::ExecutionOutcome::Failed {
                 err: format!("no executor wired for tier {:?}", op.tier()),
@@ -1106,21 +1118,6 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
 
     let probe = LiveStateProbe::new();
     let reader = BlobReaderShim { blob_store };
-    let container_runner = DaemonContainerRunner { blob_store };
-    let executor = MultiTierExecutor {
-        file_executor: FileExecutor::new(&reader),
-        package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
-        service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
-        network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),
-        container_executor: shit_planner::executors::ContainerExecutor::new(container_runner),
-        terraform_executor: shit_planner::executors::terraform::TerraformExecutor::new(
-            DaemonTerraformRunner,
-        ),
-        kubectl_executor: shit_planner::executors::kubectl::KubectlExecutor::new(
-            DaemonKubectlRunner,
-        ),
-        gh_executor: shit_planner::executors::gh::GhExecutor::new(DaemonGhRunner),
-    };
 
     let mut commands_attempted = 0u32;
     let mut ops_applied = 0u32;
@@ -1136,6 +1133,36 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
         commands_attempted += 1;
         let events = index.events_for_command(cmd.command);
         let undo_plan = plan(cmd.clone(), &events, &probe, index);
+        // AR06.1: per-command executor so the shell-state runner
+        // can be wired with the session-specific precmd-queue
+        // path. Other tier executors are cheap stateless wrappers
+        // (PrivilegedXxxRunner = unit struct), so rebuilding every
+        // iteration is no measurable cost.
+        let mut shell_state_exec = shit_planner::executors::shell_state::ShellStateExecutor::new(
+            shit_planner::executors::shell_state::SystemShellStateRunner::new()
+                .with_session(cmd.command.session.to_string()),
+        );
+        if req.apply_shell_state {
+            shell_state_exec = shell_state_exec
+                .with_apply(shit_planner::executors::shell_state::ShellTarget::Bash);
+        }
+        let executor = MultiTierExecutor {
+            file_executor: FileExecutor::new(&reader),
+            package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
+            service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
+            network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),
+            container_executor: shit_planner::executors::ContainerExecutor::new(
+                DaemonContainerRunner { blob_store },
+            ),
+            terraform_executor: shit_planner::executors::terraform::TerraformExecutor::new(
+                DaemonTerraformRunner,
+            ),
+            kubectl_executor: shit_planner::executors::kubectl::KubectlExecutor::new(
+                DaemonKubectlRunner,
+            ),
+            gh_executor: shit_planner::executors::gh::GhExecutor::new(DaemonGhRunner),
+            shell_state_executor: shell_state_exec,
+        };
         let orch = Orchestrator::new(&executor, &probe).with_paths_filter(paths_filter.clone());
         let report = orch.run(&undo_plan, req.dry_run, policy);
         for rec in &report.records {

@@ -539,6 +539,40 @@ fn emit_for_event(
             });
         }
         CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, class, nodes),
+        CaptureEventKind::ShellStateDiff {
+            pwd_before,
+            pwd_after,
+        } => {
+            // AR06.1 — emit a ShellStateRestore. Snippet is the
+            // canonical bash `cd '<before>'`; quoting follows the
+            // existing snippet renderer used by render_bash. zsh
+            // gets the same body (cd quoting is shell-compatible);
+            // fish lands when the C06 state.rs diff machinery is
+            // wired through the hook.
+            if pwd_before == pwd_after {
+                return; // No-op; defensive.
+            }
+            let pwd_before_str = pwd_before.to_string_lossy();
+            // POSIX single-quote escape: ' -> '\''
+            let escaped = pwd_before_str.replace('\'', "'\\''");
+            let snippet = format!("cd '{escaped}'\n");
+            nodes.push(PlanNode {
+                op: InverseOp::ShellStateRestore {
+                    pwd_before: Some(pwd_before.clone()),
+                    opts_diff: Vec::new(),
+                    aliases_diff: Vec::new(),
+                    funcs_diff: Vec::new(),
+                    snippet_bash: Some(snippet.clone()),
+                    snippet_zsh: Some(snippet),
+                    // fish: no precmd-queue equivalent (per
+                    // existing executor doc); leave None so
+                    // the executor surfaces the deferral.
+                    snippet_fish: None,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
         CaptureEventKind::EnvDiff {
             added,
             removed,

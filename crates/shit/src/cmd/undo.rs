@@ -146,6 +146,7 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
         dry_run: args.dry_run,
         on_conflict: policy_wire,
         paths: args.paths.clone(),
+        apply_shell_state: args.apply_shell_state,
     });
 
     let ctl_path = args
