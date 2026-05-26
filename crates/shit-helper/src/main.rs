@@ -1143,6 +1143,9 @@ fn boot_ebpf_lsm(
     loader
         .load_lsm_rmdir()
         .map_err(|e| anyhow::anyhow!("load_lsm_rmdir failed: {e}"))?;
+    loader
+        .load_lsm_release()
+        .map_err(|e| anyhow::anyhow!("load_lsm_release failed: {e}"))?;
     let unlink_rb = loader.take_unlink_ringbuf().ok_or_else(|| {
         anyhow::anyhow!("take_unlink_ringbuf returned None after successful load")
     })?;
@@ -1170,6 +1173,9 @@ fn boot_ebpf_lsm(
     let rmdir_rb = loader
         .take_rmdir_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_rmdir_ringbuf returned None after successful load"))?;
+    let release_rb = loader.take_release_ringbuf().ok_or_else(|| {
+        anyhow::anyhow!("take_release_ringbuf returned None after successful load")
+    })?;
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
 
@@ -1204,9 +1210,13 @@ fn boot_ebpf_lsm(
     // G03: rmdir uses the same wire shape as unlink but routes via
     // on_rmdir → handle_lsm_unlink with is_directory=true.
     let rmdir_reader = ebpf::LsmReader::spawn_rmdir(rmdir_rb, Arc::clone(&sink), idle);
+    // L04.2: file_release fires at last writable-fd close; the
+    // handler diffs current content against the open-time
+    // snapshot and emits a CapturedPreImage iff they differ.
+    let release_reader = ebpf::LsmReader::spawn_release(release_rb, Arc::clone(&sink), idle);
 
     tracing::info!(
-        "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link + rmdir"
+        "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link + rmdir + release"
     );
     Ok(LsmCaptureState {
         _readers: vec![
@@ -1219,6 +1229,7 @@ fn boot_ebpf_lsm(
             symlink_reader,
             link_reader,
             rmdir_reader,
+            release_reader,
         ],
         _loader: loader,
         dispatch: LsmDispatch { tree, runtime },
