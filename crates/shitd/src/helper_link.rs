@@ -493,6 +493,7 @@ fn dispatch_response(
             uid,
             gid,
             mtime_unix_nanos,
+            xattrs,
             is_delete,
             fd_sent_via_scm: _,
         } => {
@@ -581,6 +582,7 @@ fn dispatch_response(
                     uid,
                     gid,
                     mtime_unix_nanos,
+                    xattrs,
                     is_delete,
                     staging,
                 },
@@ -602,6 +604,7 @@ fn dispatch_response(
             uid: _,
             gid: _,
             mtime_unix_nanos: _,
+            xattrs: _,
             fd_sent_via_scm: _,
         } => {
             let Some(staging) = fd else {
@@ -817,6 +820,7 @@ struct CapturedPreImageArgs {
     uid: u32,
     gid: u32,
     mtime_unix_nanos: i128,
+    xattrs: std::collections::BTreeMap<String, Vec<u8>>,
     is_delete: bool,
     staging: OwnedFd,
 }
@@ -838,7 +842,6 @@ fn handle_metadata_change(
     index: &Index,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::metadata::FileMetadata;
-    use std::collections::BTreeMap;
     fn convert(m: shit_proto::FileMetadataWire) -> FileMetadata {
         FileMetadata {
             mode: m.mode,
@@ -846,7 +849,7 @@ fn handle_metadata_change(
             gid: m.gid,
             size: m.size,
             mtime_unix_nanos: m.mtime_unix_nanos,
-            xattrs: BTreeMap::new(),
+            xattrs: m.xattrs,
             acl: None,
         }
     }
@@ -902,7 +905,7 @@ fn handle_captured_pre_image(
         gid: args.gid,
         size: args.stored_bytes,
         mtime_unix_nanos: args.mtime_unix_nanos,
-        xattrs: BTreeMap::new(),
+        xattrs: args.xattrs,
         acl: None,
     };
     let path_buf: PathBuf = args.path.clone().unwrap_or_default().into();
@@ -1193,6 +1196,7 @@ mod tests_dispatch {
             uid: 1000,
             gid: 1000,
             mtime_unix_nanos: 0,
+            xattrs: std::collections::BTreeMap::new(),
             is_delete: true,
             staging: fd,
         };
@@ -1304,6 +1308,7 @@ mod tests_dispatch {
             uid: 0,
             gid: 0,
             mtime_unix_nanos: 0,
+            xattrs: std::collections::BTreeMap::new(),
             is_delete: false,
             staging: fd,
         };
