@@ -41,5 +41,14 @@ inotify = { version = "0.11", default-features = false }
 # crate is dead-code-imported only.
 aya = "0.13"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreFoundation runloop + string + array types for the FSEvents
+# producer (M01) and, later, the EndpointSecurity client (M03).
+# We declare the FSEvents `extern "C"` surface inline in
+# `src/fsevents.rs` because the API is small (~10 functions) and a
+# vendored binding gives us tighter control than an external crate.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
 [dev-dependencies]
 tempfile = "3.10"
