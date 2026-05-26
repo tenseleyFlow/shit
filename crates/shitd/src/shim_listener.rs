@@ -33,6 +33,7 @@
 //! 100-conn pool) rather than fan-out per process.
 
 use crate::active_commands::ActiveCommands;
+use crate::baseline::LiveBaseline;
 use crate::config::ResolvedConfig;
 use shit_planner::TreeOp;
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
@@ -66,6 +67,7 @@ pub async fn serve(
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
+    live_baseline: Arc<LiveBaseline>,
 ) -> anyhow::Result<()> {
     let sock_path = shim_socket_path(cfg);
     if let Some(parent) = sock_path.parent() {
@@ -88,8 +90,9 @@ pub async fn serve(
                     let index = Arc::clone(&index);
                     let blob_store = Arc::clone(&blob_store);
                     let active = Arc::clone(&active);
+                    let live_baseline = Arc::clone(&live_baseline);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_one(stream, index, blob_store, active).await {
+                        if let Err(e) = handle_one(stream, index, blob_store, active, live_baseline).await {
                             debug!(err = %e, "shim client errored");
                         }
                     });
@@ -113,6 +116,7 @@ async fn handle_one(
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
+    live_baseline: Arc<LiveBaseline>,
 ) -> anyhow::Result<()> {
     // W06.A.4.1: dynamic-allocation buffer. Read the 4-byte u32 BE
     // length prefix exactly, then allocate a buffer sized to the
@@ -213,7 +217,7 @@ async fn handle_one(
     let frame = encode_frame(&ack)?;
     stream.write_all(&frame).await?;
 
-    ingest_notification(&note, resolved, &index, &blob_store);
+    ingest_notification(&note, resolved, &index, &blob_store, &live_baseline);
     Ok(())
 }
 
@@ -225,6 +229,7 @@ fn ingest_notification(
     resolved: Option<shit_planner::events::CommandId>,
     index: &Index,
     blob_store: &BlobStore,
+    live_baseline: &LiveBaseline,
 ) {
     let Some(command) = resolved else {
         // The shim is loaded into a process whose ancestor isn't a
@@ -251,6 +256,25 @@ fn ingest_notification(
         // the create at all — the shim is the only observation
         // channel. Journal a TreeOp::Create speculatively.
         //
+        // W09.12: actually GATE on in-watch-ness. Pre-W09.12 we
+        // journaled unconditionally, so bulk-creators in-watch
+        // (e.g. `python3 -m venv`) produced N shim TreeOp::Create
+        // events alongside N kqueue dir-diff Create events for the
+        // same paths. Undo then emitted 2N inverse unlinks; the
+        // second wave failed with ConflictMissing on every path,
+        // surfacing "N conflicted" in the undo report. Check the
+        // LiveBaseline's cached cwds and suppress when the wire arg
+        // falls inside any of them — kqueue dir-diff is
+        // authoritative there.
+        if live_baseline.path_in_watched_subtree(Path::new(&note.arg)) {
+            debug!(
+                pid = note.pid,
+                syscall = %note.syscall,
+                arg = %note.arg,
+                "shim notify: path is in-watch; defer to kqueue dir-diff"
+            );
+            return;
+        }
         // Inode sentinel (0,0) matches the Unlink path's convention
         // (line 347) — the executor's TreeOp::Create reverse is just
         // `unlink <path>` which doesn't need accurate (dev,inode).
@@ -505,9 +529,12 @@ mod tests {
         let index = Arc::new(Index::open(&idx_path).unwrap());
         let blob_store = fresh_blob_store(tmp.path());
         let active = Arc::new(ActiveCommands::new());
+        let live_baseline = Arc::new(LiveBaseline::new());
         let _accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_one(stream, index, blob_store, active).await.unwrap();
+            handle_one(stream, index, blob_store, active, live_baseline)
+                .await
+                .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
