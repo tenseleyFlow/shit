@@ -1245,6 +1245,10 @@ jobs:
             git-branch-D-packed-undo-linux.sh
             git-checkout-branch-undo-linux.sh
             git-clean-fd-undo-linux.sh
+            # L04.2 — in-place content overwrite via open(O_RDWR)
+            # + write/mmap. Closes the BSD-W06.A.4 mirror gap.
+            write-in-place-undo-linux.sh
+            mmap-write-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm

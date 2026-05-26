@@ -1252,6 +1252,159 @@ impl LinuxCaptureRuntime {
         );
     }
 
+    /// L04.2 — handler for `lsm/file_release` events. Closes the
+    /// in-place-write capture gap.
+    ///
+    /// Fires once per writable last-fd-close (incl. final mmap
+    /// unmap). Flow:
+    ///
+    /// 1. Look up `pre_snapshots[(dev, inode)]`. Miss → drop. The
+    ///    file wasn't in the watch tree at PreExec; outside our
+    ///    undo surface.
+    /// 2. Check dedupe. If another handler (unlink, setattr, open)
+    ///    already captured for this inode in the watch window,
+    ///    skip — that handler's bytes are authoritative.
+    /// 3. Re-hash the file's current bytes via the held
+    ///    `pre_opens` fd. Compare to the snapshot's hash.
+    /// 4. Match → no actual mutation (writable open with no
+    ///    committed changes, common case for tools that probe
+    ///    + don't write). Drop the event silently.
+    /// 5. Differ → emit CapturedPreImage with snapshot bytes +
+    ///    `post_content_hash = Some(current_hash)` for daemon-side
+    ///    conflict detection. Mark dedupe to suppress later
+    ///    releases for the same inode in this watch window.
+    pub fn handle_lsm_release(&mut self, ev: &LsmReleaseView) {
+        let ws = self.watches.entry(ev.command).or_default();
+
+        let ev_dev = kernel_dev_to_userspace(ev.dev);
+
+        // Dedupe: another LSM handler may have already captured
+        // for this (dev, inode) in this watch window. First handler
+        // wins; release defers.
+        if !should_capture_dedupe(&ws.dedupe, (ev_dev, ev.inode)) {
+            tracing::trace!(
+                dev = ev_dev,
+                inode = ev.inode,
+                "lsm release: dedupe hit; skipping"
+            );
+            return;
+        }
+
+        // Snapshot lookup. Miss means the file wasn't in the tree
+        // at pre_open_tree (created mid-session, outside the cwd
+        // tree, or too large for the cap). Either way, nothing to
+        // diff against — drop silently.
+        let Some(snap) = ws.pre_snapshots.get(&(ev_dev, ev.inode)).cloned() else {
+            tracing::trace!(
+                dev_kernel = ev.dev,
+                dev_userspace = ev_dev,
+                inode = ev.inode,
+                "lsm release: no pre-snapshot; dropping"
+            );
+            return;
+        };
+
+        // Need the held fd to re-read the post-state. pre_opens
+        // owns it for the watch window; we borrow.
+        let Some(held_fd) = ws.pre_opens.get(&(ev_dev, ev.inode)) else {
+            tracing::trace!(
+                dev = ev_dev,
+                inode = ev.inode,
+                "lsm release: pre-snapshot present but no held fd; dropping"
+            );
+            return;
+        };
+        let raw_fd = held_fd.as_raw_fd();
+
+        // Read current content. read_pre_image dups + seeks, so
+        // we don't disturb the shared file offset.
+        let current_bytes = match read_pre_image(raw_fd) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    dev = ev_dev,
+                    inode = ev.inode,
+                    error = %e,
+                    "lsm release: read_pre_image failed; dropping"
+                );
+                return;
+            }
+        };
+        let pre_hash = blake3_of(&snap.bytes);
+        let post_hash = blake3_of(&current_bytes);
+        if pre_hash == post_hash {
+            tracing::trace!(
+                dev = ev_dev,
+                inode = ev.inode,
+                "lsm release: content unchanged; no event"
+            );
+            return;
+        }
+
+        // Content changed. Emit pre-image with the open-time
+        // snapshot bytes and the post-state hash.
+        let pre_bytes = snap.bytes;
+        let meta = snap.meta;
+        let staging_fd = match write_to_staging(&self.staging_dir, &pre_bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "lsm release staging write failed");
+                return;
+            }
+        };
+        let path = match resolve_inode_to_path(ws, ev_dev, ev.inode) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pid = ev.pid,
+                    dev = ev_dev,
+                    inode = ev.inode,
+                    "lsm release: path resolution failed; dropping event"
+                );
+                return;
+            }
+        };
+
+        let resp = HelperResponse::CapturedPreImage {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            dev: ev_dev,
+            inode: ev.inode,
+            path: Some(path_to_string(&path)),
+            blob_hash: pre_hash,
+            stored_bytes: pre_bytes.len() as u64,
+            post_content_hash: Some(post_hash),
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
+            mtime_unix_nanos: meta.mtime_unix_nanos,
+            xattrs: meta.xattrs.clone(),
+            is_delete: false,
+            fd_sent_via_scm: true,
+        };
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, staging_fd.as_raw_fd())
+        {
+            tracing::warn!(error = %e, "lsm release send_response_with_fd failed");
+        }
+
+        ws.dedupe
+            .insert((ev_dev, ev.inode), DedupeEntry { invalidated: false });
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev = ev_dev,
+            inode = ev.inode,
+            f_flags = format_args!("{:#x}", ev.f_flags),
+            pre_bytes = pre_bytes.len(),
+            post_bytes = current_bytes.len(),
+            "lsm-release CapturedPreImage sent (content diff)",
+        );
+    }
+
     /// L04.1 — handler for `lsm/inode_rename` events. Emits
     /// `HelperResponse::TreeMutation { op: Rename { from, to, ... } }`.
     /// Both paths resolved post-syscall via /proc/<pid>/cwd for the
@@ -1603,6 +1756,20 @@ pub struct LsmCreateView<'a> {
 /// the same wire as fanotify-perm's OpenWrite path.
 #[derive(Debug, Clone, Copy)]
 pub struct LsmOpenView {
+    pub command: CommandId,
+    pub pid: u32,
+    pub dev: u64,
+    pub inode: u64,
+    pub f_mode: u32,
+    pub f_flags: u32,
+}
+
+/// L04.2 — View into an `lsm/file_release` event. Fires at
+/// last-fd-close of a writable file; the handler diffs current
+/// content against the open-time `pre_snapshot` and emits a
+/// CapturedPreImage iff they differ.
+#[derive(Debug, Clone, Copy)]
+pub struct LsmReleaseView {
     pub command: CommandId,
     pub pid: u32,
     pub dev: u64,
@@ -2239,6 +2406,190 @@ mod tests {
             ws.dir_paths.len() <= 9,
             "must not exceed depth limit; got {} dirs",
             ws.dir_paths.len()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // L04.2 — handle_lsm_release unit tests
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Helper: set up a runtime with a pre_snapshot + pre_opens fd
+    /// for a tempdir-resident file. Returns (rt, dir, staging,
+    /// path, dev_userspace, inode). The view's `dev` field MUST be
+    /// the kernel-encoded form so the handler's
+    /// `kernel_dev_to_userspace` conversion reproduces the key the
+    /// WatchState maps use; the returned `dev_userspace` is for
+    /// asserting against the same map.
+    fn release_test_setup(
+        cmd: CommandId,
+        pre_bytes: &[u8],
+    ) -> (
+        LinuxCaptureRuntime,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        u64,
+        u64,
+    ) {
+        let (mut rt, dir, staging) = fresh_runtime();
+        let path = dir.path().join("probe.txt");
+        std::fs::write(&path, pre_bytes).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        let (dev_userspace, inode, _) = fstat_dev_inode_kind(f.as_raw_fd()).unwrap();
+        let meta = fstat_meta(f.as_raw_fd()).unwrap();
+        let ws = rt.watches.entry(cmd).or_default();
+        ws.cwd = Some(dir.path().to_path_buf());
+        let root_md = std::fs::metadata(dir.path()).unwrap();
+        ws.dir_paths
+            .insert((root_md.dev(), root_md.ino()), dir.path().to_path_buf());
+        ws.pre_snapshots.insert(
+            (dev_userspace, inode),
+            PreSnapshot {
+                meta,
+                bytes: pre_bytes.to_vec(),
+            },
+        );
+        ws.pre_opens
+            .insert((dev_userspace, inode), OwnedFd::from(f));
+        ws.path_to_inode
+            .insert(path.clone(), (dev_userspace, inode));
+        (rt, dir, staging, path, dev_userspace, inode)
+    }
+
+    /// Re-encode a userspace dev as the kernel `(major<<20)|minor`
+    /// form so a LsmReleaseView submitted to `handle_lsm_release`
+    /// round-trips through `kernel_dev_to_userspace` back to the
+    /// userspace key used by WatchState maps.
+    fn userspace_to_kernel_dev(udev: u64) -> u64 {
+        // glibc's encoding: bits 0..7 = minor low, 8..19 = major,
+        // 20..31 = minor high. Recompose major/minor then re-encode
+        // as (major<<20)|minor.
+        let minor = (udev & 0xff) | ((udev >> 12) & 0xffff_ff00);
+        let major = (udev >> 8) & 0xfff;
+        (major << 20) | (minor & 0xfffff)
+    }
+
+    /// L04.2 — happy path: pre-snapshot present, post-write content
+    /// differs → handler runs to completion, marks dedupe entry.
+    #[test]
+    fn handle_lsm_release_emits_on_content_diff() {
+        let cmd = ghost_cmd();
+        let (mut rt, _dir, _staging, path, dev_userspace, inode) =
+            release_test_setup(cmd, b"before-bytes");
+
+        // Mutate in place — no rename, no truncate.
+        std::fs::write(&path, b"after-bytes!").unwrap();
+
+        let view = LsmReleaseView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: userspace_to_kernel_dev(dev_userspace),
+            inode,
+            f_mode: 0x2,    // FMODE_WRITE
+            f_flags: 0o002, // O_RDWR
+        };
+        rt.handle_lsm_release(&view);
+
+        let ws = rt.watches.get(&cmd).expect("watch state");
+        // Dedupe entry inserted, NOT invalidated (it's a content
+        // capture, not a delete).
+        let entry = ws
+            .dedupe
+            .get(&(dev_userspace, inode))
+            .expect("dedupe entry inserted");
+        assert!(
+            !entry.invalidated,
+            "release dedupe entry must not be invalidated"
+        );
+    }
+
+    /// L04.2 — no-change path: pre-snapshot present, content
+    /// unchanged → no dedupe entry, no event.
+    #[test]
+    fn handle_lsm_release_skips_when_unchanged() {
+        let cmd = ghost_cmd();
+        let (mut rt, _dir, _staging, _path, dev_userspace, inode) =
+            release_test_setup(cmd, b"identical-bytes");
+
+        // No write — content matches snapshot.
+
+        let view = LsmReleaseView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: userspace_to_kernel_dev(dev_userspace),
+            inode,
+            f_mode: 0x2,
+            f_flags: 0o002,
+        };
+        rt.handle_lsm_release(&view);
+
+        let ws = rt.watches.get(&cmd).expect("watch state");
+        assert!(
+            !ws.dedupe.contains_key(&(dev_userspace, inode)),
+            "unchanged content must not insert a dedupe entry"
+        );
+    }
+
+    /// L04.2 — dedupe-hit path: another handler already captured for
+    /// this inode → release skips without re-reading.
+    #[test]
+    fn handle_lsm_release_skips_when_already_captured() {
+        let cmd = ghost_cmd();
+        let (mut rt, _dir, _staging, path, dev_userspace, inode) =
+            release_test_setup(cmd, b"original");
+
+        // Mark dedupe as if an earlier handler captured.
+        {
+            let ws = rt.watches.get_mut(&cmd).unwrap();
+            ws.dedupe
+                .insert((dev_userspace, inode), DedupeEntry { invalidated: false });
+        }
+
+        // Mutate content to make sure the early-return is the only
+        // reason no work happens.
+        std::fs::write(&path, b"mutated-but-deduped").unwrap();
+
+        let view = LsmReleaseView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: userspace_to_kernel_dev(dev_userspace),
+            inode,
+            f_mode: 0x2,
+            f_flags: 0o002,
+        };
+        rt.handle_lsm_release(&view);
+
+        let ws = rt.watches.get(&cmd).expect("watch state");
+        // Still exactly one entry; release didn't add a duplicate.
+        assert_eq!(ws.dedupe.len(), 1, "exactly one dedupe entry");
+    }
+
+    /// L04.2 — miss path: file wasn't in pre_open_tree's snapshot
+    /// (created mid-session, outside cwd tree, or oversized) →
+    /// silent drop, no dedupe entry.
+    #[test]
+    fn handle_lsm_release_drops_when_no_snapshot() {
+        let (mut rt, _dir, _staging) = fresh_runtime();
+        let cmd = ghost_cmd();
+
+        let view = LsmReleaseView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: 0xdead_beef,
+            inode: 0xcafe_babe,
+            f_mode: 0x2,
+            f_flags: 0o002,
+        };
+        rt.handle_lsm_release(&view);
+
+        let ws = rt.watches.get(&cmd).expect("watch state created");
+        assert!(
+            ws.dedupe.is_empty(),
+            "no pre-snapshot must produce no dedupe entry"
         );
     }
 }

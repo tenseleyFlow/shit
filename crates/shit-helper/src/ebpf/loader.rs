@@ -85,6 +85,14 @@ const INODE_LINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_link.bpf.o")
 /// directories.
 const INODE_RMDIR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_rmdir.bpf.o");
 
+/// L04.2 — `lsm/file_release` BPF object. Closes the in-place-write
+/// gap: `open(O_RDWR) + write/pwrite/mmap` fires no
+/// unlink/setattr/O_TRUNC hook, so without a release hook the pre-image
+/// captured at pre_open_tree never reaches the journal. The release
+/// hook tells userspace "this writable fd just closed — re-hash and
+/// emit a CapturedPreImage if content changed."
+const FILE_RELEASE_OBJ: &[u8] = include_bytes!("../../bpf/build/file_release.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
@@ -96,6 +104,7 @@ const LSM_HOOK_INODE_RENAME: &str = "inode_rename";
 const LSM_HOOK_INODE_SYMLINK: &str = "inode_symlink";
 const LSM_HOOK_INODE_LINK: &str = "inode_link";
 const LSM_HOOK_INODE_RMDIR: &str = "inode_rmdir";
+const LSM_HOOK_FILE_RELEASE: &str = "file_release";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
@@ -117,6 +126,7 @@ const LSM_PROG_INODE_RENAME: &str = "shit_inode_rename";
 const LSM_PROG_INODE_SYMLINK: &str = "shit_inode_symlink";
 const LSM_PROG_INODE_LINK: &str = "shit_inode_link";
 const LSM_PROG_INODE_RMDIR: &str = "shit_inode_rmdir";
+const LSM_PROG_FILE_RELEASE: &str = "shit_file_release";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
@@ -130,6 +140,7 @@ const RINGBUF_RENAME_EVENTS: &str = "rename_events";
 const RINGBUF_SYMLINK_EVENTS: &str = "symlink_events";
 const RINGBUF_LINK_EVENTS: &str = "link_events";
 const RINGBUF_RMDIR_EVENTS: &str = "rmdir_events";
+const RINGBUF_RELEASE_EVENTS: &str = "release_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -183,6 +194,7 @@ pub struct EbpfLoader {
     symlink_bpf: Option<aya::Ebpf>,
     link_bpf: Option<aya::Ebpf>,
     rmdir_bpf: Option<aya::Ebpf>,
+    release_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -213,6 +225,7 @@ impl EbpfLoader {
             symlink_bpf: None,
             link_bpf: None,
             rmdir_bpf: None,
+            release_bpf: None,
         }
     }
 
@@ -236,6 +249,7 @@ impl EbpfLoader {
             || self.symlink_bpf.is_some()
             || self.link_bpf.is_some()
             || self.rmdir_bpf.is_some()
+            || self.release_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -302,6 +316,7 @@ impl EbpfLoader {
         let symlink_was = self.symlink_bpf.take().is_some();
         let link_was = self.link_bpf.take().is_some();
         let rmdir_was = self.rmdir_bpf.take().is_some();
+        let release_was = self.release_bpf.take().is_some();
         if unlink_was
             || setattr_was
             || mkdir_was
@@ -311,6 +326,7 @@ impl EbpfLoader {
             || symlink_was
             || link_was
             || rmdir_was
+            || release_was
         {
             tracing::info!(
                 unlink = unlink_was,
@@ -322,6 +338,7 @@ impl EbpfLoader {
                 symlink = symlink_was,
                 link = link_was,
                 rmdir = rmdir_was,
+                release = release_was,
                 "ebpf programs detached"
             );
         }
@@ -870,6 +887,61 @@ impl EbpfLoader {
     pub fn take_rmdir_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.rmdir_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_RMDIR_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// L04.2 — Load + attach the `lsm/file_release` program. Closes
+    /// the in-place-write gap: `open(O_RDWR) + write/pwrite/mmap`
+    /// without a rename/unlink/truncate fires no other LSM event, so
+    /// the open-time `pre_snapshot` would never become a journaled
+    /// FilePreImage. The release hook fires once at last-fd-close
+    /// (incl. final mmap unmap); userspace re-hashes and emits a
+    /// CapturedPreImage iff content changed.
+    pub fn load_lsm_release(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.release_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_release: release program already loaded".into(),
+            ));
+        }
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+        let aligned: Vec<u8> = FILE_RELEASE_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(file_release): {e}")))?;
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_FILE_RELEASE)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_FILE_RELEASE}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+        prog.load(LSM_HOOK_FILE_RELEASE, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_FILE_RELEASE}): {e}")))?;
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+        tracing::info!(
+            hook = LSM_HOOK_FILE_RELEASE,
+            prog = LSM_PROG_FILE_RELEASE,
+            ringbuf = RINGBUF_RELEASE_EVENTS,
+            "ebpf-lsm file_release loaded and attached"
+        );
+        self.release_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// L04.2 — Take the `release_events` ringbuf.
+    pub fn take_release_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.release_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_RELEASE_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
     }
 

@@ -76,6 +76,7 @@ pub mod kind {
     pub const CREATE: u8 = 5;
     pub const RENAME: u8 = 6;
     pub const RMDIR: u8 = 7;
+    pub const RELEASE: u8 = 8;
 }
 
 /// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
@@ -285,6 +286,25 @@ pub struct OpenEvent {
 
 const _: () = assert!(std::mem::size_of::<OpenEvent>() == 64);
 
+/// `lsm/file_release` event — same C-struct shape as
+/// [`OpenEvent`], discriminated by `kind::RELEASE`. Fires when the
+/// kernel's struct-file refcount hits zero (last fd close +
+/// last mmap unmap) AND `FMODE_WRITE` was set on the file. The
+/// userspace release-handler diffs the inode's current content
+/// against the open-time `pre_snapshot` and emits a
+/// CapturedPreImage iff they differ.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReleaseEvent {
+    pub hdr: EventHeader,
+    pub dev: u64,
+    pub inode: u64,
+    pub f_mode: u32,
+    pub f_flags: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 64);
+
 /// `lsm/inode_rename` event — mirrors `struct shit_rename_event`.
 /// Carries both ends of the rename. `dev`/`inode` are the target's
 /// identity (invariant across rename within a single filesystem).
@@ -364,6 +384,11 @@ pub trait LsmEventSink: Send + Sync + 'static {
     /// G03 — `inode_rmdir` events. Wire shape is identical to
     /// `UnlinkEvent` (kernel LSM hook signature is the same).
     fn on_rmdir(&self, _ev: &UnlinkEvent) {}
+    /// L04.2 — `file_release` events. Fires at last-fd-close of a
+    /// writable file; the handler diffs current content against
+    /// the open-time snapshot and emits a `CapturedPreImage` iff
+    /// they differ. Closes the in-place-write capture gap.
+    fn on_release(&self, _ev: &ReleaseEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
@@ -460,6 +485,33 @@ impl LsmEventSink for LinuxCaptureSink {
             is_directory: true,
         };
         self.runtime.lock().unwrap().handle_lsm_unlink(&view);
+    }
+
+    fn on_release(&self, ev: &ReleaseEvent) {
+        // L04.2 — writable-fd close. Handler diffs against pre-image
+        // snapshot and emits CapturedPreImage iff content changed.
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
+            tracing::trace!(pid, "untracked pid; dropping lsm release event");
+            return;
+        };
+        let view = crate::capture::linux::LsmReleaseView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            f_mode: ev.f_mode,
+            f_flags: ev.f_flags,
+        };
+        self.runtime.lock().unwrap().handle_lsm_release(&view);
     }
 
     fn on_setattr(&self, ev: &SetattrEvent) {
@@ -733,6 +785,15 @@ pub fn decode_rmdir(bytes: &[u8]) -> Option<UnlinkEvent> {
     decode_event::<UnlinkEvent>(bytes, kind::RMDIR)
 }
 
+/// L04.2 — release events share `OpenEvent`'s C struct shape (same
+/// scalar set: dev, inode, f_mode, f_flags) but tag with
+/// `SHIT_EVT_RELEASE`. The release-handler uses the same fields
+/// open-handler does, just at last-fd-close time instead of
+/// open-time.
+pub fn decode_release(bytes: &[u8]) -> Option<ReleaseEvent> {
+    decode_event::<ReleaseEvent>(bytes, kind::RELEASE)
+}
+
 /// Decode a raw ringbuf record as a [`SetattrEvent`]. Same shape as
 /// [`decode_unlink`].
 pub fn decode_setattr(bytes: &[u8]) -> Option<SetattrEvent> {
@@ -844,6 +905,34 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as UnlinkEvent (rmdir)"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// L04.2 — spawn a file_release ringbuf reader. The BPF
+    /// program pre-filters to writable closes; userspace dispatches
+    /// via `on_release` which routes through `handle_lsm_release`
+    /// for content-diff capture.
+    pub fn spawn_release(
+        release_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-release",
+            release_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_release(bytes) {
+                    sink.on_release(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as ReleaseEvent"
                     );
                 }
             }),
