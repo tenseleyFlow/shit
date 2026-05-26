@@ -1,0 +1,101 @@
+name: perf-bsd
+
+# B07 — BSD perf gates. Runs the B07 bench bins inside a FreeBSD-14
+# VM via cross-platform-actions, then enforces budgets from
+# tools/perf/budgets.toml via the `gate` bin. A budget breach exits
+# the workflow non-zero.
+#
+# Budgets bake in 30% slop for VM jitter (see budgets.toml). When
+# the cross-platform-actions VM is unusually loaded the warmup
+# discards the first iterations, and MAD-based outlier rejection
+# in the harness cleans the tail.
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+    paths:
+      - 'crates/shit-helper/**'
+      - 'crates/shitd/**'
+      - 'crates/shit-capture/src/bsd_probe.rs'
+      - 'crates/shit-proto/**'
+      - 'benches/regression/**'
+      - 'tools/perf/**'
+      - '.github/workflows/perf-bsd.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-bsd-14:
+    name: perf-bsd-14 (B07)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: perf gates inside FreeBSD 14
+        uses: cross-platform-actions/action@v0.30.0
+        with:
+          operating_system: freebsd
+          version: '14.2'
+          shell: sh
+          run: |
+            set -eu
+            echo "===== install deps ====="
+            sudo pkg install -y rust gmake python3 sqlite3 doas
+
+            echo "===== build bench + product bins (release) ====="
+            cargo build --release \
+              -p shit -p shitd -p shit-helper \
+              -p shit-regression-bench \
+              --locked 2>&1 | tail -5
+
+            mkdir -p target/bench
+
+            # Each gate runs its bench, dumps JSON, then runs the
+            # `gate` bin against the JSON. Per the harness, the
+            # bench bins exit 0 even on slow runs — the `gate` bin
+            # is what fails the workflow on a budget breach.
+
+            echo "===== doctor (latency) ====="
+            SHIT_BIN=./target/release/shit \
+              ./target/release/doctor-bench --n 100 \
+              --out target/bench/doctor.json
+            cat target/bench/doctor.json
+            ./target/release/gate --gate doctor \
+              --input target/bench/doctor.json \
+              --budgets tools/perf/budgets.toml
+
+            echo "===== shell-hook (latency) ====="
+            SHITD_BIN=./target/release/shitd \
+              ./target/release/shell-hook-bench --n 200 --batch 100 --warmup 20 \
+              --out target/bench/shell-hook.json
+            cat target/bench/shell-hook.json
+            ./target/release/gate --gate shell-hook \
+              --input target/bench/shell-hook.json \
+              --budgets tools/perf/budgets.toml
+
+            echo "===== hook-helper (latency) ====="
+            SHITD_BIN=./target/release/shitd \
+            SHIT_HELPER_BIN=./target/release/shit-helper \
+              ./target/release/hook-helper-bench --n 100 --warmup 10 \
+              --out target/bench/hook-helper.json
+            cat target/bench/hook-helper.json
+            ./target/release/gate --gate hook-helper \
+              --input target/bench/hook-helper.json \
+              --budgets tools/perf/budgets.toml
+
+            echo "===== kqueue-drain (throughput) ====="
+            ./target/release/kqueue-drain-bench --n 50 --warmup 5 \
+              --out target/bench/kqueue-drain.json
+            cat target/bench/kqueue-drain.json
+            ./target/release/gate --gate kqueue-drain \
+              --input target/bench/kqueue-drain.json \
+              --budgets tools/perf/budgets.toml
+
+      # NOTE: artifact upload of target/bench/*.json would require
+      # syncing files out of the FreeBSD VM. For now the gate log
+      # output (cat <json> + gate verdict) is the durable record.
+      # When we want trend graphs, add `sync_files: vm-to-host` to
+      # the cross-platform-actions step and upload from
+      # ${{ runner.temp }}.
