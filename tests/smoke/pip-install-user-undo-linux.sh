@@ -224,9 +224,17 @@ if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; the
     exit 0
 fi
 
-# Outcome B — loud refusal acceptable
-if [ "${UNDO_RC}" -ne 0 ] && grep -qE "out-of-scope|outside|refus|local|${PKG_NAME}" "${SHIT_SMOKE_TMP}/undo.log"; then
-    smoke_log "OUTCOME B — loud refusal (undo non-zero, log named the out-of-scope path)"
+# Outcome B — loud refusal acceptable. pip's wheel installer does
+# a transactional rename of site-packages itself
+# (site-packages -> ~ite-packages -> back), which arrives at the
+# shim as a rename without a pre-image (the directory's content
+# hash isn't recursively captured). The planner then can't fully
+# reverse that op and surfaces a `conflicted` report row. That's
+# the right signal — non-zero exit + named-conflict count — and
+# satisfies the "loud about what I can't do" contract.
+if [ "${UNDO_RC}" -ne 0 ] \
+    && grep -qE "out-of-scope|outside|refus|conflict|${PKG_NAME}" "${SHIT_SMOKE_TMP}/undo.log"; then
+    smoke_log "OUTCOME B — loud refusal (undo non-zero, log named conflict/out-of-scope)"
     smoke_log "PASS: pip-install-user-undo-linux (Outcome B)"
     exit 0
 fi
