@@ -128,7 +128,10 @@ fn find_helper_bin() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    for abs in ["/usr/local/libexec/shit-helper", "/opt/homebrew/bin/shit-helper"] {
+    for abs in [
+        "/usr/local/libexec/shit-helper",
+        "/opt/homebrew/bin/shit-helper",
+    ] {
         let p = PathBuf::from(abs);
         if p.is_file() {
             return Some(p);
@@ -221,7 +224,10 @@ pub fn probe_codesign_self() -> CodesignReport {
 
     // `codesign -dvv` writes to stderr; non-zero exit is possible
     // on unsigned binaries. Capture output regardless.
-    let dvv = Command::new("codesign").args(["-d", "-vv"]).arg(&bin).output();
+    let dvv = Command::new("codesign")
+        .args(["-d", "-vv"])
+        .arg(&bin)
+        .output();
     let dvv_stderr = match &dvv {
         Ok(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
         Err(_) => String::new(),
@@ -270,7 +276,11 @@ pub fn probe_sip_state() -> SipReport {
     let out = Command::new("csrutil").arg("status").output();
     let stdout = match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => return SipReport { state: "unknown".into() },
+        Err(_) => {
+            return SipReport {
+                state: "unknown".into(),
+            };
+        }
     };
     SipReport {
         state: parse_csrutil_status(&stdout).into(),
@@ -323,9 +333,7 @@ use core_foundation_sys::base::{CFRelease, kCFAllocatorDefault};
 use core_foundation_sys::runloop::{
     CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRun, CFRunLoopStop, kCFRunLoopDefaultMode,
 };
-use core_foundation_sys::string::{
-    CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8,
-};
+use core_foundation_sys::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
 
 #[allow(non_camel_case_types)]
 type FSEventStreamRef = *mut c_void;
@@ -440,7 +448,15 @@ pub fn probe_fsevents_functional() -> FsEventsProbeReport {
 
     let worker = thread::Builder::new()
         .name("shit-doctor-fsevents-probe".into())
-        .spawn(move || worker_main(root_for_worker, ctx_for_worker, rl_for_worker, st_for_worker, ready_tx));
+        .spawn(move || {
+            worker_main(
+                root_for_worker,
+                ctx_for_worker,
+                rl_for_worker,
+                st_for_worker,
+                ready_tx,
+            )
+        });
 
     let worker = match worker {
         Ok(j) => j,
@@ -762,7 +778,10 @@ mod tests {
         // doesn't flake on a stripped image.
         let r = probe_sip_state();
         assert!(
-            matches!(r.state.as_str(), "enabled" | "disabled" | "custom" | "unknown"),
+            matches!(
+                r.state.as_str(),
+                "enabled" | "disabled" | "custom" | "unknown"
+            ),
             "unexpected SIP state: {}",
             r.state
         );
