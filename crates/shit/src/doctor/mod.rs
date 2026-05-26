@@ -269,9 +269,40 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
 
     match resp {
         Ok(CtlResponse::Metrics(m)) => {
+            // B03.A — `helper_link_state` is the load-bearing
+            // signal. `kernel_tier` is sticky-once-set, so a
+            // crashed helper still leaves a non-empty tier and
+            // would make `ok=true` lie. Fall back to the
+            // tier-empty heuristic only when the daemon is so old
+            // that `#[serde(default)]` left the state at
+            // `NeverConnected` despite a populated `kernel_tier`.
+            use shit_proto::HelperLinkState;
             let tier_empty = m.kernel_tier.is_empty();
+            let (ok, error_msg) = match m.helper_link_state {
+                HelperLinkState::Connected => (true, None),
+                HelperLinkState::Disconnected => (
+                    false,
+                    Some(
+                        "helper handshook then exited — capture coverage lost \
+                         until the daemon restarts"
+                            .into(),
+                    ),
+                ),
+                HelperLinkState::NeverConnected => {
+                    if tier_empty {
+                        (
+                            false,
+                            Some("daemon reachable but helper handshake not completed".into()),
+                        )
+                    } else {
+                        // Old-daemon compat: pre-B03.A daemons don't
+                        // emit the state field. Trust kernel_tier.
+                        (true, None)
+                    }
+                }
+            };
             HelperHandshakeReport {
-                ok: !tier_empty,
+                ok,
                 latency_ms,
                 helper_version: None,
                 kernel_tier: if tier_empty {
@@ -279,14 +310,7 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
                 } else {
                     Some(m.kernel_tier)
                 },
-                error: if tier_empty {
-                    Some(
-                        "daemon reachable but kernel_tier empty — helper handshake not completed"
-                            .into(),
-                    )
-                } else {
-                    None
-                },
+                error: error_msg,
             }
         }
         Ok(other) => HelperHandshakeReport {

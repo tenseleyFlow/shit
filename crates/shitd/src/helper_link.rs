@@ -422,6 +422,7 @@ fn recv_exact(fd: std::os::fd::RawFd, buf: &mut [u8]) -> Result<(), HelperLinkEr
 /// Per-event errors are logged but do NOT terminate the loop — the
 /// project's hard-fail policy fires upstream at the helper, not at
 /// the journal-ingest side.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_loop(
     link: Arc<HelperLink>,
     index: Arc<Index>,
@@ -429,6 +430,7 @@ pub async fn dispatch_loop(
     live_baseline: Arc<crate::baseline::LiveBaseline>,
     shutdown: Arc<tokio::sync::Notify>,
     watch_ready: Arc<crate::watch_ready::WatchReadyMap>,
+    stats: Arc<crate::stats::Stats>,
 ) -> Result<(), HelperLinkError> {
     tracing::info!("helper dispatch loop started");
     loop {
@@ -451,14 +453,21 @@ pub async fn dispatch_loop(
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
                         tracing::warn!("helper exited; dispatch loop terminating");
+                        // B03.A: flip the liveness signal so
+                        // `shit doctor` and `shit metrics`
+                        // surface the degraded state instead
+                        // of trusting the sticky `kernel_tier`.
+                        stats.note_helper_disconnected();
                         return Ok(());
                     }
                     Ok(Err(e)) => {
                         tracing::error!(error = %e, "dispatch recv failed; loop terminating");
+                        stats.note_helper_disconnected();
                         return Err(e);
                     }
                     Err(join_err) => {
                         tracing::error!(?join_err, "dispatch recv task panicked");
+                        stats.note_helper_disconnected();
                         return Err(HelperLinkError::HelperExited);
                     }
                 }

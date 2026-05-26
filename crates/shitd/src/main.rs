@@ -222,6 +222,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                             "shit-helper handshake complete"
                         );
                         stats.set_kernel_tier(&link.kernel_tier);
+                        stats.note_helper_connected();
                         let link = Arc::new(link);
                         let dispatch_link = Arc::clone(&link);
                         let dispatch_index = Arc::clone(&index);
@@ -229,6 +230,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let dispatch_baseline = Arc::clone(&live_baseline);
                         let dispatch_shutdown = Arc::clone(&shutdown);
                         let dispatch_watch_ready = Arc::clone(&watch_ready);
+                        let dispatch_stats = Arc::clone(&stats);
                         let handle = tokio::spawn(async move {
                             if let Err(e) = helper_link::dispatch_loop(
                                 dispatch_link,
@@ -237,6 +239,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                                 dispatch_baseline,
                                 dispatch_shutdown,
                                 dispatch_watch_ready,
+                                dispatch_stats,
                             )
                             .await
                             {
