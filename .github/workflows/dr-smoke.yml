@@ -725,6 +725,88 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  cd-undo-zsh:
+    # AR06.6 -- zsh parity for cd-undo. ctl.rs now picks the
+    # snippet target by session shell_kind, so a zsh-tagged
+    # session gets the zsh snippet (cd '...') queued. The body
+    # is sourced under `zsh -c` to verify it actually flips pwd.
+    name: cd-undo-zsh smoke (AR06.6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite + zsh
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 zsh
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/cd-undo-zsh-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-undo-zsh-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  set-e-undo-zsh:
+    # AR06.6 -- zsh's option-restore syntax is `setopt` /
+    # `unsetopt`, not bash's `set ±o`. This pins that the planner
+    # renders the zsh-flavored body AND that sourcing it under
+    # zsh flips errexit back on.
+    name: set-e-undo-zsh smoke (AR06.6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite + zsh
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 zsh
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/set-e-undo-zsh-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: set-e-undo-zsh-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  cd-undo-fish:
+    # AR06.6 -- fish stays informational (DR-30: no safe precmd
+    # equivalent). The executor refuses with the rendered fish
+    # snippet embedded in the skip reason for the user to copy-
+    # paste; this smoke verifies the snippet body is valid fish
+    # by feeding it to `fish -c` and confirming pwd flips.
+    name: cd-undo-fish smoke (AR06.6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite + fish
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 fish
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/cd-undo-fish-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-undo-fish-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   set-e-undo:
     # AR06.2 -- set -o errexit / set +o errexit toggling. Captures
     # the opts-only diff path through the ShellStateDiff event and

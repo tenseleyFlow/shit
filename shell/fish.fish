@@ -43,6 +43,18 @@ function __shit_pre --on-event fish_preexec
         --depth (count $SHLVL >/dev/null; and echo $SHLVL; or echo 1) \
         --sock $_SHIT_SOCK \
         >/dev/null 2>&1
+    # AR06.1 / AR06.6 — pwd-only shell-state snapshot. fish has
+    # no `set -o` (opts always emit as informational comments;
+    # see render_fish) and fish aliases live in the function
+    # namespace alongside user-defined functions, which we don't
+    # yet distinguish — defer to a follow-up. pwd-only is the
+    # load-bearing piece for cd-undo on fish.
+    $_SHIT_BIN hook-send pre-exec-shell-state \
+        --session $_SHIT_SESSION \
+        --seq $_SHIT_SEQ \
+        --pwd $PWD \
+        --sock $_SHIT_SOCK \
+        >/dev/null 2>&1
     if set -q SHIT_TRACK_ENV
         __shit_emit_env | $_SHIT_BIN hook-send pre-exec-env \
             --session $_SHIT_SESSION \
@@ -59,6 +71,12 @@ function __shit_post --on-event fish_postexec
         --session $_SHIT_SESSION \
         --seq $_SHIT_SEQ \
         --exit-code $rc \
+        --sock $_SHIT_SOCK \
+        >/dev/null 2>&1
+    $_SHIT_BIN hook-send post-exec-shell-state \
+        --session $_SHIT_SESSION \
+        --seq $_SHIT_SEQ \
+        --pwd $PWD \
         --sock $_SHIT_SOCK \
         >/dev/null 2>&1
     if set -q SHIT_TRACK_ENV
