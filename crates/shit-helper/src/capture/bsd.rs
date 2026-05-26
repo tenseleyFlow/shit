@@ -96,10 +96,26 @@ struct WatchState {
 struct DirBaseline {
     /// Absolute path of the directory (for emitting child paths).
     path: PathBuf,
-    /// Child name → (dev, inode) at baseline time. We store inode so
-    /// the diff can detect rename-within-dir as
-    /// `Unlink old_name + Create new_name` for the same inode.
-    entries: BTreeMap<std::ffi::OsString, (u64, u64)>,
+    /// Child name → per-entry baseline. We store inode so the diff
+    /// can detect rename-within-dir; the optional symlink_target
+    /// (captured via readlinkat at scan time) lets the diff detect
+    /// `ln -sf newtarget link` and emit a SymlinkRemoved event
+    /// carrying the OLD target so undo can restore it.
+    entries: BTreeMap<std::ffi::OsString, DirEntryBaseline>,
+}
+
+/// W09.16.1 — per-directory-entry baseline. The (dev, inode) pair
+/// detects entry replacement at the same name; `symlink_target`
+/// (populated for symlink entries via readlinkat) lets the dir-diff
+/// emit a `SymlinkRemoved` event carrying the OLD target so undo
+/// can restore it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirEntryBaseline {
+    dev: u64,
+    inode: u64,
+    /// `Some(readlink_value)` if this entry was a symlink at scan
+    /// time. `None` for regular files, dirs, FIFOs, sockets, etc.
+    symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -494,34 +510,64 @@ impl PumpState {
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
         let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
         let mut new_dirs_to_watch: Vec<std::path::PathBuf> = Vec::new();
-        for (name, &(dev, inode)) in &current {
-            match baseline.entries.get(name) {
-                Some(&prev) if prev == (dev, inode) => {} // unchanged
-                Some(_) | None => {
-                    // New entry, or entry with different inode at same name.
-                    let child = dir_path.join(name);
-                    // file_kind_AT (not _for): under cap_enter,
-                    // absolute-path stat returns ENOTCAPABLE, falls
-                    // through to Regular, and the dir-watching branch
-                    // below never fires for new dirs. W03.B.
-                    let kind = file_kind_at(fd, name);
-                    events.push(shit_proto::TreeOpWire::Create {
-                        dev,
-                        inode,
-                        path: path_to_string(&child),
-                        kind,
-                        mode: file_mode_for(&child).unwrap_or(0),
-                    });
-                    match kind {
-                        shit_proto::FileKindWire::Regular => {
-                            new_files_to_watch.push(child);
-                        }
-                        shit_proto::FileKindWire::Directory => {
-                            new_dirs_to_watch.push(child);
-                        }
-                        _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
-                    }
+        for (name, cur_entry) in &current {
+            let prev = baseline.entries.get(name);
+            // Unchanged entry: same (dev, inode) AND (for symlinks)
+            // same target. Symlink target equality is checked because
+            // `ln -sf newtarget link` allocates a NEW inode for the
+            // new symlink, so (dev, inode) already detects the
+            // replacement — but we want to ALSO catch the degenerate
+            // case where the inode happens to land back on the old
+            // one (filesystem reuse with same st_ino under heavy
+            // churn). Cheap to compare.
+            if let Some(p) = prev
+                && p.dev == cur_entry.dev
+                && p.inode == cur_entry.inode
+                && p.symlink_target == cur_entry.symlink_target
+            {
+                continue;
+            }
+            // W09.16.1 — `ln -sf newtarget existing_link`: the OLD
+            // symlink got unlinked (inode freed) and a new symlink
+            // with a different inode took its place at the same
+            // name. Emit `SymlinkRemoved` carrying the OLD target
+            // BEFORE the `Create` for the new symlink — the planner
+            // inverts SymlinkRemoved as `CreateSymlink { target:
+            // old_target, path }` and Create's inverse is Unlink;
+            // reverse-event-order means the new symlink gets
+            // unlinked first, then the old one is recreated.
+            if let Some(p) = prev
+                && let Some(old_target) = &p.symlink_target
+                && (p.dev != cur_entry.dev || p.inode != cur_entry.inode)
+            {
+                let child = dir_path.join(name);
+                events.push(shit_proto::TreeOpWire::SymlinkRemoved {
+                    target: old_target.clone(),
+                    path: path_to_string(&child),
+                });
+            }
+            // New entry, or entry with different inode at same name.
+            let child = dir_path.join(name);
+            // file_kind_AT (not _for): under cap_enter,
+            // absolute-path stat returns ENOTCAPABLE, falls
+            // through to Regular, and the dir-watching branch
+            // below never fires for new dirs. W03.B.
+            let kind = file_kind_at(fd, name);
+            events.push(shit_proto::TreeOpWire::Create {
+                dev: cur_entry.dev,
+                inode: cur_entry.inode,
+                path: path_to_string(&child),
+                kind,
+                mode: file_mode_for(&child).unwrap_or(0),
+            });
+            match kind {
+                shit_proto::FileKindWire::Regular => {
+                    new_files_to_watch.push(child);
                 }
+                shit_proto::FileKindWire::Directory => {
+                    new_dirs_to_watch.push(child);
+                }
+                _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
             }
         }
         // **Intentionally do not emit Unlink for removed entries here.**
@@ -907,7 +953,9 @@ fn path_to_string(p: &Path) -> String {
 /// `cap_enter(2)`. The caller already holds `dir_fd` as a tracked
 /// kqueue watch fd (we dup before fdopendir to avoid losing the
 /// original reference).
-fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsString, (u64, u64)>> {
+fn read_dir_entries(
+    dir_fd: RawFd,
+) -> std::io::Result<BTreeMap<std::ffi::OsString, DirEntryBaseline>> {
     let mut out = BTreeMap::new();
     // SAFETY: dir_fd is alive (caller holds the OwnedFd in
     // TrackedSubtree). dup returns a fresh fd we own; fdopendir
@@ -957,10 +1005,54 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
             continue;
         }
         let name_os = std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name_bytes));
-        out.insert(name_os, (st.st_dev as u64, st.st_ino));
+        // W09.16.1 — for symlinks, capture readlink target so dir-diff
+        // can later detect `ln -sf newtarget link` (same-name +
+        // different-inode + old-kind-was-symlink) and emit
+        // SymlinkRemoved with the OLD target.
+        let symlink_target = if (st.st_mode as libc::mode_t) & libc::S_IFMT == libc::S_IFLNK {
+            readlink_at(dir_fd, &name_c)
+        } else {
+            None
+        };
+        out.insert(
+            name_os,
+            DirEntryBaseline {
+                dev: st.st_dev as u64,
+                inode: st.st_ino,
+                symlink_target,
+            },
+        );
     }
     unsafe { libc::closedir(dir) };
     Ok(out)
+}
+
+/// W09.16.1 — read a symlink target via `readlinkat(2)`, which is
+/// the fd-relative form (capsicum-compatible). Returns the target
+/// string as the kernel returned it (no canonicalization or symlink
+/// chasing), or `None` if the entry isn't a symlink or readlink
+/// fails. Buffer sized to PATH_MAX (1024 on FreeBSD); longer
+/// targets get truncated, which we accept — the smoke surfaces the
+/// limit if it ever becomes a problem.
+fn readlink_at(dir_fd: RawFd, name: &std::ffi::CStr) -> Option<String> {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let n = unsafe {
+        libc::readlinkat(
+            dir_fd,
+            name.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    let n = n as usize;
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    // readlinkat doesn't NUL-terminate; the n bytes are the target.
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
 /// Classify a directory child's `FileKind` for the wire via
