@@ -910,8 +910,21 @@ pub enum CaptureTier {
     /// L04 retains this only as a debug signal: prerequisites met
     /// but we chose to *not* load (e.g. `SHIT_FORCE_TIER=fanotify-perm`).
     EbpfLsmAvailableButDeferred,
-    /// macOS EndpointSecurity (S07). Reserved.
+    /// macOS EndpointSecurity (S07/M03). Pre-mutation AUTH-event
+    /// interception. Requires the
+    /// `com.apple.developer.endpoint-security.client` entitlement on
+    /// a SIP-enforced system; usable ad-hoc on a SIP-disabled dev
+    /// target. M01 ships the FsEventsDegraded fallback; M03 lights
+    /// up this tier.
     EndpointSecurity,
+    /// macOS FSEvents post-hoc (M01). The degraded fallback when ES
+    /// is unavailable (no entitlement, or FDA not granted, or
+    /// ad-hoc-signed dev build on SIP-enforced host). Events arrive
+    /// after the syscall completes, so we cannot capture file
+    /// content pre-images; tree-ops and the post-state are captured
+    /// with `partial = true`. Honest "(degraded)" label flows
+    /// through `shit list`.
+    FsEventsDegraded,
     /// BSD kqueue-only (S10). Post-hoc events; no pre-mutation
     /// blocking. Used when no LD_PRELOAD shim is installed and the
     /// storage substrate isn't ZFS.
@@ -934,7 +947,8 @@ impl CaptureTier {
             CaptureTier::EbpfLsmAvailableButDeferred => {
                 "ebpf-lsm-available (S09 loader deferred; running fanotify)"
             }
-            CaptureTier::EndpointSecurity => "endpoint-security (S07)",
+            CaptureTier::EndpointSecurity => "endpoint-security (S07/M03)",
+            CaptureTier::FsEventsDegraded => "fsevents-degraded (M01 post-hoc)",
             CaptureTier::KqueueOnly => "kqueue-only (S10 post-hoc)",
             CaptureTier::KqueuePreloadShim => "kqueue + LD_PRELOAD shim (S10)",
             CaptureTier::ZfsSnapshot => "zfs-snapshot (S10 coarse pre-mutation)",
@@ -978,17 +992,31 @@ fn privileged_setup() -> PrivilegedSetup {
             tier,
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let tier = pick_macos_tier();
+        tracing::info!(tier = tier.label(), "kernel capture tier picked");
+        PrivilegedSetup {
+            caps: shit_proto::HelperCaps {
+                watch_tree: true,
+                // FSEvents is post-hoc — no syscall-blocking primitive.
+                // M03's EndpointSecurity tier flips this to true.
+                auth_subscribe: false,
+                package_hook: false,
+            },
+            tier,
+        }
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
+        target_os = "macos",
     )))]
     {
-        // macOS path lands in S07. Helper still claims `watch_tree`
-        // since that primitive is best-effort even with no kernel
-        // hooks.
+        // No supported kernel-tier on this OS.
         PrivilegedSetup {
             caps: shit_proto::HelperCaps {
                 watch_tree: true,
@@ -1029,6 +1057,17 @@ fn pick_bsd_tier() -> CaptureTier {
         return CaptureTier::KqueuePreloadShim;
     }
     CaptureTier::KqueueOnly
+}
+
+/// Decide which macOS capture tier to use. M01 always returns
+/// `FsEventsDegraded`. M03 will try `EndpointSecurity` first
+/// (entitlement + FDA probe) and fall back here.
+///
+/// The `partial = true` flag on every captured event downstream is
+/// what flows the "(degraded)" label through `shit list`.
+#[cfg(target_os = "macos")]
+fn pick_macos_tier() -> CaptureTier {
+    CaptureTier::FsEventsDegraded
 }
 
 /// Bundles the long-lived state for the eBPF-LSM tier (L04). Held
