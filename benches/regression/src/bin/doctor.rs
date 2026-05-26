@@ -55,10 +55,8 @@ fn main() -> Result<()> {
         .stderr(Stdio::null())
         .status()?;
     if !probe.success() {
-        anyhow::bail!(
-            "{} doctor --json exited non-zero on warmup; refusing to bench",
-            shit_bin.display()
-        );
+        let bin = shit_bin.display();
+        anyhow::bail!("{bin} doctor --json exited non-zero on warmup; refusing to bench");
     }
 
     let host_os = std::env::consts::OS;

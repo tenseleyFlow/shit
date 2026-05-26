@@ -80,7 +80,8 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    bail!("socket {} not ready within {:?}", path.display(), timeout);
+    let p = path.display();
+    bail!("socket {p} not ready within {timeout:?}");
 }
 
 fn main() -> Result<()> {
@@ -96,7 +97,8 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "target/release/shit-helper".into());
     for (label, p) in [("shitd", &shitd_bin), ("helper", &helper_bin)] {
         if !p.exists() {
-            bail!("{label} binary not found at {}", p.display());
+            let bin = p.display();
+            bail!("{label} binary not found at {bin}");
         }
     }
 

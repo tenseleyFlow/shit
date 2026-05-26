@@ -88,7 +88,7 @@ fn main() -> Result<()> {
 
     let (workload, median_us, p99_us, host_os, host_arch, n_kept) = match parsed {
         BenchJson::Skipped { workload, skipped } => {
-            println!("{}: SKIP ({skipped})", workload);
+            println!("{workload}: SKIP ({skipped})");
             return Ok(());
         }
         BenchJson::Result {
@@ -107,20 +107,15 @@ fn main() -> Result<()> {
         .with_context(|| format!("parse budgets {}", args.budgets.display()))?;
 
     let Some(gate) = budgets.gate.iter().find(|g| g.name == args.gate) else {
+        let gate_name = &args.gate;
+        let budgets_path = args.budgets.display();
         if args.skip_on_missing_gate {
-            println!(
-                "{}: SKIP (no '{}' gate in {})",
-                workload,
-                args.gate,
-                args.budgets.display()
-            );
+            println!("{workload}: SKIP (no '{gate_name}' gate in {budgets_path})");
             return Ok(());
         }
         eprintln!(
-            "{}: gate '{}' not found in {} (use --skip-on-missing-gate to ignore)",
-            workload,
-            args.gate,
-            args.budgets.display()
+            "{workload}: gate '{gate_name}' not found in {budgets_path} \
+             (use --skip-on-missing-gate to ignore)"
         );
         std::process::exit(2);
     };
@@ -130,10 +125,13 @@ fn main() -> Result<()> {
         "throughput" => "throughput",
         _ => "latency",
     };
+    let budget_p50 = gate.p50_us;
+    let budget_p99 = gate.p99_us;
+    let budget_fail = gate.fail_at_p99_us;
     println!(
         "[{kind_label}] {workload} on {host_os}/{host_arch} (n_kept={n_kept}): \
-         p50={median_us}µs p99={p99_us}µs vs budget p50≤{}µs p99≤{}µs fail≤{}µs",
-        gate.p50_us, gate.p99_us, gate.fail_at_p99_us,
+         p50={median_us}µs p99={p99_us}µs vs budget p50≤{budget_p50}µs \
+         p99≤{budget_p99}µs fail≤{budget_fail}µs"
     );
     if !desc.is_empty() {
         println!("  {desc}");
@@ -144,10 +142,7 @@ fn main() -> Result<()> {
     let p99_hard = p99_us > gate.fail_at_p99_us;
 
     if p99_hard {
-        eprintln!(
-            "{workload}: FAIL — p99 {p99_us}µs > 2x-ceiling {}µs",
-            gate.fail_at_p99_us
-        );
+        eprintln!("{workload}: FAIL — p99 {p99_us}µs > 2x-ceiling {budget_fail}µs");
         std::process::exit(1);
     }
     if p50_breach || p99_breach {

@@ -108,11 +108,8 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    bail!(
-        "hook socket {} not ready within {:?}",
-        path.display(),
-        timeout
-    );
+    let p = path.display();
+    bail!("hook socket {p} not ready within {timeout:?}");
 }
 
 fn pre_exec_frame(session: Uuid, seq: u64, cwd: &str) -> Result<Vec<u8>> {
