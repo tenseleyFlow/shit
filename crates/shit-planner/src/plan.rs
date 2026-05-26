@@ -536,7 +536,18 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         // gone it'd ENOENT-cascade. Single-entry dir-Unlinks
         // qualify as orphan even without a cluster of siblings.
         let is_unlink_without_preimage = unlinks.contains(p) && !pre_images.contains(p);
-        if cluster < 2 && !is_unlink_without_preimage {
+        // Ancestor-chain-gone heuristic: when the GRANDPARENT
+        // also doesn't exist, the path lives in a transient
+        // subtree that the user's tool nuked top-down. This
+        // catches pip's `/tmp/pip-build-tracker-X/<hex>` and
+        // `/tmp/pip-ephem-wheel-cache-X/wheels/.../foo.whl`
+        // singletons where the cluster-of-siblings heuristic
+        // misses (one file per deep tmpdir).
+        let grandparent_gone = parent
+            .parent()
+            .map(|gp| !gp.as_os_str().is_empty() && probe.stat(gp).is_none())
+            .unwrap_or(false);
+        if cluster < 2 && !is_unlink_without_preimage && !grandparent_gone {
             continue;
         }
         // Parent has its own create/rename-to event somewhere in
@@ -1368,6 +1379,22 @@ fn emit_for_tree_op(
             if probe.stat(from).is_some() && probe.stat(to).is_none() {
                 return;
             }
+            // DR-CR-54.B — orphan rename inside a transient subtree
+            // (e.g. pip's deep wheel-cache renames inside
+            // `/tmp/pip-ephem-wheel-cache-X/`). Both sides gone AND
+            // the parent of `to` also gone: the inverse rename has
+            // nowhere to put the file. Suppress instead of emitting
+            // a ConflictMissing — the user doesn't care about
+            // build-cache rename residue.
+            if probe.stat(from).is_none()
+                && probe.stat(to).is_none()
+                && to
+                    .parent()
+                    .map(|tp| !tp.as_os_str().is_empty() && probe.stat(tp).is_none())
+                    .unwrap_or(false)
+            {
+                return;
+            }
             // Inverse of `from -> to` is `to -> from`.
             nodes.push(PlanNode {
                 op: InverseOp::Rename {
@@ -1667,7 +1694,19 @@ mod tests {
 
     #[test]
     fn missing_path_yields_missing_conflict() {
-        let probe = InMemoryProbe::new(); // path not inserted
+        // /tmp exists in production; populate it in the probe so
+        // the orphan-parent transient classifier (DR-CR-54.B)
+        // doesn't sweep this path into transient and skip the
+        // Missing-conflict emission.
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            PathBuf::from("/tmp"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let mut store = InMemoryStore::new();
         let blob = BlobHash::from_bytes([0xCD; 32]);
         store.put_blob(blob, 10);
@@ -1740,7 +1779,17 @@ mod tests {
         // Simulate `rm foo`: T1 = FilePreImage, T2 = TreeOp::Unlink.
         // Reverse order should put RecreatePath (from Unlink) before
         // RestoreContent (from FilePreImage).
-        let probe = InMemoryProbe::new();
+        let mut probe = InMemoryProbe::new();
+        // Populate /tmp so the DR-CR-54.B orphan-parent classifier
+        // doesn't sweep this `rm foo` shape into transient.
+        probe.insert(
+            PathBuf::from("/tmp"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let mut store = InMemoryStore::new();
         let inode = InodeRef::new(1, 7);
         let blob = BlobHash::from_bytes([1; 32]);
@@ -2612,11 +2661,21 @@ mod tests {
     #[test]
     fn orphan_parent_single_isolated_stays_missing_conflict() {
         // DR-CR-54.B counter-test — a single isolated captured
-        // path with a missing parent must still emit the
-        // Missing-conflict plan node so the user gets actionable
-        // feedback. Only CLUSTERS (≥2 captures under the same
-        // missing parent) are classified as transient.
-        let probe = InMemoryProbe::new();
+        // path with a missing parent BUT existing grandparent
+        // (the typical `rm /tmp/lonely/file.txt` shape where
+        // /tmp exists) must still emit the Missing-conflict plan
+        // node so the user gets actionable feedback. Only when
+        // the ancestor chain is gone too do we sweep into
+        // transient.
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            PathBuf::from("/tmp"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let mut store = InMemoryStore::new();
         let blob = BlobHash::from_bytes([0xDD; 32]);
         store.put_blob(blob, 5);
