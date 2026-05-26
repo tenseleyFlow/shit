@@ -1160,7 +1160,8 @@ jobs:
                     backup-and-modify-undo-fbsd.sh \
                     rotate-and-touch-undo-fbsd.sh \
                     shell-append-undo-fbsd.sh \
-                    non-ascii-filename-undo-fbsd.sh"
+                    non-ascii-filename-undo-fbsd.sh \
+                    hardlink-rm-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can

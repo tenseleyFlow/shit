@@ -58,6 +58,16 @@ pub enum InverseOp {
     /// from a `TreeOp::Symlink` capture (rare; usually the original creation
     /// is undone via `Unlink`).
     CreateSymlink { target: String, path: PathBuf },
+    /// W09.20 — create a hardlink. Used to undo an `unlink` of a file
+    /// when another live path still aliases the same inode at undo
+    /// time. `source` is the surviving alias (must exist); `target`
+    /// is the path to recreate as a hardlink (must not exist).
+    /// Internally `link(source, target)`. This preserves the
+    /// nlink invariant of the original setup — without it, `rm foo`
+    /// in a `foo↔bar` pair would undo as a fresh-inode copy of foo,
+    /// silently de-aliasing the workspace (breaking `cp -al`,
+    /// `git worktree`-style aliasing, `--link-dest` rsync backups).
+    CreateHardlink { source: PathBuf, target: PathBuf },
     /// Set an environment variable. Note: applied by emitting a shell-side
     /// snippet, not by mutating the live shell process — see S15.
     SetEnv { name: String, value: String },
@@ -513,6 +523,7 @@ impl InverseOp {
             | Self::RecreatePath { path, .. }
             | Self::CreateSymlink { path, .. }
             | Self::FileExtend { path, .. } => Some(path),
+            Self::CreateHardlink { target, .. } => Some(target),
             Self::Rename { to, .. } => Some(to),
             Self::SetEnv { .. }
             | Self::UnsetEnv { .. }
@@ -551,6 +562,7 @@ impl InverseOp {
             | Self::RecreatePath { .. }
             | Self::Rename { .. }
             | Self::CreateSymlink { .. }
+            | Self::CreateHardlink { .. }
             | Self::FileExtend { .. } => InverseTier::Files,
             Self::SetEnv { .. } | Self::UnsetEnv { .. } => InverseTier::Env,
             Self::PackageRollback { .. } => InverseTier::Packages,

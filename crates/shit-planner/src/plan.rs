@@ -99,26 +99,30 @@ pub fn plan(
     //      within one command; the captured FilePreImage is of an
     //      already-gone file). No user-meaningful change to undo.
     //      Skip all three inverses entirely.
-    let (atomic_replace_paths, transient_paths, rename_subsumed_creates) =
-        classify_replace_paths(&live, probe);
+    let class = classify_replace_paths(&live, probe);
 
     for ev in &live {
         // W01.B.fix-rename-coalescing: skip the entire event if the
         // path is transient (Create+PreImage+Unlink AND gone at undo).
         if let Some(p) = event_path(ev)
-            && transient_paths.contains(p)
+            && class.transient_paths.contains(p)
         {
             continue;
         }
-        emit_for_event(
-            ev,
-            probe,
-            store,
-            &atomic_replace_paths,
-            &rename_subsumed_creates,
-            &mut nodes,
-            &mut warnings,
-        );
+        // W09.20: skip the entire event for the LIVE side of a
+        // hardlink-aliased inode. bar in `ln foo bar; rm foo`
+        // generated spurious FilePreImage + Unlink events (kqueue
+        // NOTE_DELETE fires on every fd opened on the inode, not just
+        // the unlinked-name fd), but bar is currently correct on
+        // disk — emit nothing and leave it alone. The dead-side
+        // events (foo) emit one CreateHardlink that aliases foo back
+        // to bar.
+        if let Some(p) = event_path(ev)
+            && class.hardlink_live_paths.contains(p)
+        {
+            continue;
+        }
+        emit_for_event(ev, probe, store, &class, &mut nodes, &mut warnings);
     }
 
     // DR-14: partition nodes into cohorts so the orchestrator's
@@ -134,32 +138,38 @@ pub fn plan(
     }
 }
 
-/// Scan events for paths with the Create+PreImage+Unlink signature
-/// and bucket them into:
-///   - `atomic_replace_paths` — path exists at undo time; the
-///     `FilePreImage` inverse restores the original bytes over the
-///     current inode; Tree-op inverses are suppressed.
-///   - `transient_paths` — path does NOT exist at undo time; the
-///     command created+wrote+unlinked it within one logical step
-///     (e.g. a lock file). All inverses are suppressed.
-///   - `rename_subsumed_creates` — path is the destination of a
-///     Rename AND also has a stand-alone Create at the same path
-///     (no Unlink). This happens on FreeBSD when the LD_PRELOAD
-///     shim (W06.A.3) emits a `TreeOp::Rename` for the mv and the
-///     kqueue dir-diff *also* emits a `TreeOp::Create` for the same
-///     destination — two views of the one logical action. The
-///     Rename inverse already restores the path mapping; emitting
-///     the Create's Unlink inverse on top either races or
-///     overrides it, deleting the file outright. Suppress the
-///     Create's Unlink inverse here.
-fn classify_replace_paths(
-    events: &[&CaptureEvent],
-    probe: &dyn StateProbe,
-) -> (HashSet<PathBuf>, HashSet<PathBuf>, HashSet<PathBuf>) {
+/// Output of [`classify_replace_paths`].
+#[derive(Debug, Default)]
+struct EventClassification {
+    atomic_replace_paths: HashSet<PathBuf>,
+    transient_paths: HashSet<PathBuf>,
+    rename_subsumed_creates: HashSet<PathBuf>,
+    /// W09.20 — paths that share an inode with another path AND
+    /// still exist on disk at undo time. The pre-mutation events for
+    /// these paths are spurious noise from kqueue NOTE_DELETE firing
+    /// on every fd opened on the inode (not just the unlinked-name
+    /// fd). Skip ALL inverses for live aliases — they're correct
+    /// on disk.
+    hardlink_live_paths: HashSet<PathBuf>,
+    /// W09.20 — paths that share an inode with a `hardlink_live_paths`
+    /// entry AND are NOT currently on disk. The unlinked-name half
+    /// of a hardlink pair. Maps each dead path → the surviving alias
+    /// the planner will hardlink it back to. Suppresses the dead
+    /// path's normal RecreatePath/RestoreContent inverses; emits a
+    /// single CreateHardlink instead.
+    hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+}
+
+fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
     let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
+    // W09.20 — collect (dev, inode) → set of paths from Unlink events
+    // so we can detect hardlink groups: same inode appearing under
+    // multiple names.
+    let mut paths_by_inode: std::collections::HashMap<crate::inode::InodeRef, HashSet<PathBuf>> =
+        std::collections::HashMap::new();
     for ev in events {
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, .. } => {
@@ -168,8 +178,23 @@ fn classify_replace_paths(
             CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
                 creates.insert(path.clone());
             }
-            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }) => {
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, inode }) => {
                 unlinks.insert(path.clone());
+                // W09.20 — only index real inodes. The shim's
+                // Unlink path uses (0, 0) as a sentinel (it doesn't
+                // know the inode of the path it intercepted), and
+                // multiple unrelated shim-Unlinks under sentinel
+                // (0, 0) would falsely appear as a "hardlink group"
+                // in the classifier. Real inodes come from the
+                // helper's kqueue NOTE_DELETE flow, which is the
+                // only signal that meaningfully detects hardlink
+                // aliasing.
+                if inode.dev != 0 || inode.inode != 0 {
+                    paths_by_inode
+                        .entry(*inode)
+                        .or_default()
+                        .insert(path.clone());
+                }
             }
             // AR01.1 follow-up: the Linux LSM `inode_rename` hook is
             // emitted by the helper as a single TreeOp::Rename plus a
@@ -314,7 +339,75 @@ fn classify_replace_paths(
             atomic.insert(p.clone());
         }
     }
-    (atomic, transient, rename_subsumed_creates)
+    // W09.20 — hardlink classification. For each (dev, inode) group
+    // with multiple paths (i.e. the original setup had a hardlink
+    // alias), check which paths are alive on disk at undo time:
+    //   - If ≥1 path is alive, the unlinked path was hardlinked to
+    //     it. The dead paths get CreateHardlink inverses pointing
+    //     back to the alive path. The alive path(s) get all their
+    //     inverses skipped — they're correct on disk already.
+    //   - If 0 paths are alive (all aliases were unlinked in the
+    //     same command), don't classify as hardlink — fall through
+    //     to the per-path RecreatePath + RestoreContent logic.
+    //     Restoring inode aliasing in that case is a stage-2
+    //     concern (would need post-RecreatePath link(2) chaining).
+    let mut hardlink_live_paths: HashSet<PathBuf> = HashSet::new();
+    let mut hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
+    for (captured_inode, paths) in &paths_by_inode {
+        if paths.len() < 2 {
+            continue;
+        }
+        // CONSERVATIVE GATE (W09.20.1) — a path qualifies as a live
+        // alias ONLY if its CURRENT lstat inode matches the captured
+        // inode_ref. Without this, ZFS-on-FreeBSD-14.2 (and likely
+        // any FS that aggressively reuses freed st_ino under churn)
+        // makes two unrelated event-time inode collisions look like
+        // a hardlink group. `patch script.sh` surfaces this on CI:
+        // patch's temp+rename sequence produces an Unlink event for
+        // the OLD script.sh inode; if that inode is later reused by
+        // an unrelated tempfile that gets its own Unlink, both
+        // paths land under the same key and the alive-test (just
+        // probe.exists) trips on the new script.sh. The current-
+        // inode equality check pins the classifier to genuine
+        // aliasing — at undo time, a real hardlink survivor still
+        // carries the captured inode; a coincidental reuse won't.
+        let alive_with_matching_inode: Vec<&PathBuf> = paths
+            .iter()
+            .filter(|p| match probe.stat(p) {
+                Some(s) => s.inode == *captured_inode,
+                None => false,
+            })
+            .collect();
+        if alive_with_matching_inode.is_empty() {
+            continue;
+        }
+        let mut alive_sorted: Vec<&PathBuf> = alive_with_matching_inode;
+        alive_sorted.sort();
+        let source = alive_sorted[0].clone();
+        for p in &alive_sorted {
+            hardlink_live_paths.insert((*p).clone());
+        }
+        for p in paths {
+            // Dead = not alive WITH the matching inode. A path that
+            // exists at undo time but with a different inode (the
+            // patch case) is treated as dead-for-this-group, which
+            // means the per-path RecreatePath+RestoreContent logic
+            // owns its undo — exactly what we want.
+            let alive_match = matches!(probe.stat(p), Some(s) if s.inode == *captured_inode);
+            if alive_match {
+                continue;
+            }
+            hardlink_dead_to_source.insert(p.clone(), source.clone());
+        }
+    }
+    EventClassification {
+        atomic_replace_paths: atomic,
+        transient_paths: transient,
+        rename_subsumed_creates,
+        hardlink_live_paths,
+        hardlink_dead_to_source,
+    }
 }
 
 /// Path the event targets (for the event-level skip in the transient
@@ -348,11 +441,11 @@ fn emit_for_event(
     ev: &CaptureEvent,
     probe: &dyn StateProbe,
     store: &dyn PlannerStore,
-    atomic_replace_paths: &HashSet<PathBuf>,
-    rename_subsumed_creates: &HashSet<PathBuf>,
+    class: &EventClassification,
     nodes: &mut Vec<PlanNode>,
     warnings: &mut Vec<PlanWarning>,
 ) {
+    let atomic_replace_paths = &class.atomic_replace_paths;
     match &ev.kind {
         CaptureEventKind::FilePreImage {
             inode,
@@ -361,6 +454,15 @@ fn emit_for_event(
             meta,
             post_content_hash,
         } => {
+            // W09.20 — for the dead side of a hardlink pair, the
+            // surviving alias has the right content already; the
+            // CreateHardlink emitted from the Unlink branch will
+            // re-alias. Skip RestoreContent + RestoreMetadata here
+            // so we don't tmpfile+rename a fresh inode at `path`
+            // (which would defeat the hardlink restoration).
+            if class.hardlink_dead_to_source.contains_key(path) {
+                return;
+            }
             // W01.B.fix-rename-coalescing: skip the inode-match check
             // for atomic-replace paths. The captured inode IS supposed
             // to differ from what's on disk now — that's the signature.
@@ -435,13 +537,7 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => emit_for_tree_op(
-            op,
-            probe,
-            atomic_replace_paths,
-            rename_subsumed_creates,
-            nodes,
-        ),
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, class, nodes),
         CaptureEventKind::EnvDiff {
             added,
             removed,
@@ -845,10 +941,11 @@ fn native_delegation_for(
 fn emit_for_tree_op(
     op: &TreeOp,
     probe: &dyn StateProbe,
-    atomic_replace_paths: &HashSet<PathBuf>,
-    rename_subsumed_creates: &HashSet<PathBuf>,
+    class: &EventClassification,
     nodes: &mut Vec<PlanNode>,
 ) {
+    let atomic_replace_paths = &class.atomic_replace_paths;
+    let rename_subsumed_creates = &class.rename_subsumed_creates;
     match op {
         TreeOp::Create { path, .. } => {
             // W01.B.fix-rename-coalescing: if this path was atomically
@@ -885,6 +982,33 @@ fn emit_for_tree_op(
             // W01.B.fix-rename-coalescing: ditto Create's note above —
             // atomic-replace paths get their inverse from FilePreImage.
             if atomic_replace_paths.contains(path) {
+                return;
+            }
+            // W09.20 — hardlink-aware restoration. If this unlinked
+            // path is part of a hardlink group whose other alias is
+            // alive on disk at undo time, emit a single
+            // `CreateHardlink { source: alive_alias, target: path }`
+            // — preserves the inode aliasing instead of giving the
+            // restored path a fresh inode via RecreatePath/RestoreContent.
+            // The companion FilePreImage's RestoreContent was already
+            // suppressed at the emit_for_event entry above.
+            if let Some(source) = class.hardlink_dead_to_source.get(path) {
+                // Phantom only if the path is currently present (it
+                // should be gone — it's the dead side of the pair).
+                let conflict = probe.stat(path).map(|_| Conflict::Phantom {
+                    detail: format!(
+                        "{} exists now but didn't expect it to; hardlink restore aborted",
+                        path.display()
+                    ),
+                });
+                nodes.push(PlanNode {
+                    op: InverseOp::CreateHardlink {
+                        source: source.clone(),
+                        target: path.clone(),
+                    },
+                    cohort: 0,
+                    conflict,
+                });
                 return;
             }
             // The user's command deleted this path; we want to recreate it.
