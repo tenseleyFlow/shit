@@ -40,6 +40,44 @@ pub struct DoctorReport {
     pub macos: Option<MacReport>,
     /// Cross-platform: COW tier per probed mount point.
     pub mounts: Vec<MountReport>,
+    /// AR07.3 — coverage manifest. What `shit undo` does and does
+    /// not claim to reverse. Cross-platform: `refused_classes` is
+    /// constant per build (the planner refuse-list catalog);
+    /// `covered_classes` may shift per OS as tiers light up.
+    /// `serde(default)` so older `shit doctor --json` consumers
+    /// round-trip clean envelopes from new daemons.
+    #[serde(default)]
+    pub arbitrary_undo_coverage: ArbitraryUndoCoverage,
+}
+
+/// AR07.3 coverage manifest. Tells the user (and CI) what
+/// `shit undo` honestly claims to do.
+///
+/// The catalog of refused classes lives in
+/// [`shit_planner::refuse::CATALOG`] and is enumerated here via
+/// [`shit_planner::refuse::catalog_classes`] so the two never
+/// drift.
+///
+/// `covered_classes` is the inventory of capture-tier-supported
+/// classes shit currently undoes. Sourced from the AR08.1
+/// coverage audit; today it's a hand-curated list per OS. A
+/// future sprint may derive it programmatically from
+/// `InverseTier` + per-class smoke status, but the AR07.3 surface
+/// freezes the contract first.
+///
+/// `coverage_pct` is a rough rollup for the human-facing doctor
+/// summary, computed as `covered / (covered + refused)` rounded
+/// to whole percent. It's a guide, not a contract.
+///
+/// `last_validated_at` is set by CI when it writes a fresh
+/// doctor JSON snapshot; defaults to the empty string when no
+/// validation has been recorded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArbitraryUndoCoverage {
+    pub covered_classes: Vec<String>,
+    pub refused_classes: Vec<String>,
+    pub coverage_pct: u32,
+    pub last_validated_at: String,
 }
 
 /// Host identification — OS family, version, arch. Always present.
@@ -254,6 +292,7 @@ mod tests {
             linux: None,
             macos: None,
             mounts: vec![],
+            arbitrary_undo_coverage: ArbitraryUndoCoverage::default(),
         }
     }
 
@@ -286,6 +325,59 @@ mod tests {
         assert!(r2.bsd.is_some());
         assert!(r2.linux.is_none());
         assert!(r2.macos.is_none());
+    }
+
+    #[test]
+    fn arbitrary_undo_coverage_serializes_with_all_fields() {
+        let mut r = empty_report();
+        r.arbitrary_undo_coverage = ArbitraryUndoCoverage {
+            covered_classes: vec!["fs-content-restore".to_string()],
+            refused_classes: vec!["remote-push".to_string(), "power-state".to_string()],
+            coverage_pct: 33,
+            last_validated_at: "2026-05-26T00:00:00Z".to_string(),
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        // Field present even when other coverage fields are empty.
+        assert!(s.contains("\"arbitrary_undo_coverage\""));
+        assert!(s.contains("\"covered_classes\":[\"fs-content-restore\"]"));
+        assert!(
+            s.contains("\"refused_classes\":[\"remote-push\",\"power-state\"]"),
+            "refused_classes list missing or in unexpected order: {s}"
+        );
+        assert!(s.contains("\"coverage_pct\":33"));
+        assert!(s.contains("\"last_validated_at\":\"2026-05-26T00:00:00Z\""));
+    }
+
+    #[test]
+    fn arbitrary_undo_coverage_default_round_trips_clean() {
+        let r = empty_report();
+        let s = serde_json::to_string(&r).expect("serialize");
+        let r2: DoctorReport = serde_json::from_str(&s).expect("deserialize");
+        assert!(r2.arbitrary_undo_coverage.covered_classes.is_empty());
+        assert!(r2.arbitrary_undo_coverage.refused_classes.is_empty());
+        assert_eq!(r2.arbitrary_undo_coverage.coverage_pct, 0);
+        assert!(r2.arbitrary_undo_coverage.last_validated_at.is_empty());
+    }
+
+    #[test]
+    fn older_envelope_without_coverage_field_round_trips_via_serde_default() {
+        // Forward-compat sanity: an envelope from a build that
+        // predates AR07.3 (no arbitrary_undo_coverage key in the
+        // JSON) deserializes cleanly, populating the field with
+        // ArbitraryUndoCoverage::default(). The schema_version
+        // stays at 1 because the field is additive.
+        let legacy = r#"{
+            "schema_version": 1,
+            "host": {"os":"linux","os_release":"6.5.0","arch":"x86_64"},
+            "bsd": null,
+            "linux": null,
+            "macos": null,
+            "mounts": []
+        }"#;
+        let r: DoctorReport = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(r.schema_version, 1);
+        assert!(r.arbitrary_undo_coverage.covered_classes.is_empty());
+        assert!(r.arbitrary_undo_coverage.refused_classes.is_empty());
     }
 
     #[test]
