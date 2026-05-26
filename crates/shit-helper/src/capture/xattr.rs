@@ -34,15 +34,21 @@ pub fn read_user_xattrs(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
     // fds before cap_enter with rights explicitly carried in. Until
     // then xattr capture is a no-op when capsicum is active; the
     // smoke validates the round-trip with SHIT_CAPSICUM=0.
+    //
+    // NOTE (W09.21 / Linux pre_open_tree interaction): on the L04
+    // tier, pre_open_tree opens every regular file under root_pid's
+    // cwd at PreExec and calls fstat_meta on each fd. Adding
+    // flistxattr to that hot path triggered a helper crash on the
+    // AR00 runner — reproducible "UnwatchTree dispatch failed: EPIPE"
+    // pattern that timed out wait-watch-ready and broke the
+    // edit/rm/chmod/mv-undo-linux smokes. Linux xattr capture
+    // doesn't have a validating smoke yet, and the platform target
+    // for W09.21 is FreeBSD; punt the Linux read to a follow-up.
     #[cfg(target_os = "freebsd")]
     {
         freebsd::read(fd)
     }
-    #[cfg(target_os = "linux")]
-    {
-        linux::read(fd)
-    }
-    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+    #[cfg(not(target_os = "freebsd"))]
     {
         let _ = fd;
         BTreeMap::new()
