@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
     target_os = "openbsd",
     target_os = "dragonfly",
     target_os = "linux",
+    target_os = "macos",
 ))]
 use crate::doctor::json::HelperHandshakeReport;
 use crate::doctor::json::{
@@ -93,7 +94,7 @@ fn collect() -> (Vec<Row>, DoctorReport) {
         host: host_info(),
         bsd: collect_bsd(),
         linux: collect_linux(),
-        macos: None,
+        macos: collect_macos(),
         mounts,
         arbitrary_undo_coverage: collect_arbitrary_undo_coverage(),
     };
@@ -252,12 +253,61 @@ fn collect_linux() -> Option<json::LinuxReport> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn collect_macos() -> Option<json::MacReport> {
+    use crate::doctor::probes::macos;
+
+    let fda = macos::probe_fda();
+    let codesign = macos::probe_codesign_self();
+    let sip = macos::probe_sip_state();
+    let sandbox = macos::probe_sandbox_profile_loaded();
+    let fsevents = macos::probe_fsevents_functional();
+    let mut es = macos::probe_endpoint_security();
+    // Mirror the FDA bool into the ES sub-report so the JSON shape
+    // is consistent for consumers that only look at .macos.endpoint_security.
+    es.fda_granted = matches!(fda, macos::FdaState::Granted);
+    if matches!(fda, macos::FdaState::Indeterminate) {
+        es.notes.push(
+            "FDA indeterminate — Mail.app never used and TCC.db not readable; \
+             grant Full Disk Access to confirm"
+                .to_string(),
+        );
+    }
+
+    // Stable tier label — fsevents-degraded baseline today. M03 will
+    // flip to "endpoint-security" when entitlement_present +
+    // fda_granted + client_can_subscribe all become true.
+    let runtime_capture = if es.entitlement_present && es.fda_granted && es.client_can_subscribe {
+        "endpoint-security".to_string()
+    } else if fsevents.functional {
+        "fsevents-degraded".to_string()
+    } else {
+        "degraded".to_string()
+    };
+
+    Some(json::MacReport {
+        runtime_capture,
+        endpoint_security: es,
+        fsevents,
+        codesign,
+        sip,
+        sandbox,
+        helper_handshake: probe_helper_handshake(),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect_macos() -> Option<json::MacReport> {
+    None
+}
+
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
     target_os = "linux",
+    target_os = "macos",
 ))]
 fn probe_helper_handshake() -> HelperHandshakeReport {
     use shit_proto::{CtlRequest, CtlResponse};
@@ -338,13 +388,15 @@ fn render_table(rows: &[Row], report: &DoctorReport) {
     if let Some(linux) = report.linux.as_ref() {
         print_linux_kernel_tier(linux);
     }
-    // Silence the unused-variable warning on non-Linux/non-BSD hosts.
+    // Silence the unused-variable warning on hosts without a
+    // per-OS table renderer.
     #[cfg(not(any(
         target_os = "linux",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
+        target_os = "macos",
     )))]
     let _ = report;
     #[cfg(any(
@@ -355,6 +407,10 @@ fn render_table(rows: &[Row], report: &DoctorReport) {
     ))]
     if let Some(bsd) = report.bsd.as_ref() {
         print_bsd_tier(bsd);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(mac) = report.macos.as_ref() {
+        print_macos_tier(mac);
     }
     print_mount_table(rows);
 }
@@ -577,6 +633,113 @@ fn print_bsd_tier(bsd: &json::BsdReport) {
         );
     }
     println!();
+}
+
+#[cfg(target_os = "macos")]
+fn print_macos_tier(mac: &json::MacReport) {
+    println!("os:       macos ({})", std::env::consts::ARCH);
+    println!("tier:     {}", mac.runtime_capture);
+    if mac.runtime_capture == "fsevents-degraded" {
+        // Per M02 DoD: warn loudly when degraded.
+        println!(
+            "          WARN: running in degraded mode — no pre-image capture. \
+             Full ES coverage gated on Apple paperwork (see \
+             .docs/audits/apple-entitlement.md)."
+        );
+    }
+    println!(
+        "es:       entitlement={}  fda={}  can_subscribe={}",
+        if mac.endpoint_security.entitlement_present {
+            "yes"
+        } else {
+            "no"
+        },
+        if mac.endpoint_security.fda_granted {
+            "yes"
+        } else {
+            "no"
+        },
+        if mac.endpoint_security.client_can_subscribe {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    for note in &mac.endpoint_security.notes {
+        println!("          {note}");
+    }
+    if !mac.endpoint_security.entitlement_present {
+        println!(
+            "          remediation: install the notarized release build, OR \
+             boot a SIP-disabled dev VM and use an ad-hoc-signed helper for \
+             pre-image capture (see M03 in .docs/sprints/macos/)."
+        );
+    } else if !mac.endpoint_security.fda_granted {
+        println!(
+            "          remediation: System Settings → Privacy & Security → \
+             Full Disk Access → drag `shit-helper` in."
+        );
+        println!(
+            "          open: x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+        );
+    }
+    println!(
+        "fsevents: {}",
+        if mac.fsevents.functional {
+            format!(
+                "functional ({} ms first-event latency)",
+                mac.fsevents.latency_probe_ms
+            )
+        } else {
+            "FAILED".to_string()
+        }
+    );
+    print!("codesign: {}", mac.codesign.signature_kind);
+    if let Some(team_id) = &mac.codesign.team_id {
+        print!(" team_id={team_id}");
+    }
+    if mac.codesign.notarized {
+        print!(" notarized");
+    }
+    if mac.codesign.stapled {
+        print!(" stapled");
+    }
+    println!();
+    if mac.codesign.signature_kind == "unsigned" {
+        println!(
+            "          remediation: `make dev-sign` (ad-hoc sign for local dev), \
+             OR `brew install shit` for a notarized release build."
+        );
+    }
+    println!("sip:      {}", mac.sip.state);
+    println!(
+        "sandbox:  {}",
+        if mac.sandbox.profile_loaded {
+            "loaded (doctor caller sandboxed)"
+        } else {
+            "not loaded (doctor caller is the shit CLI — unsandboxed by design; \
+             helper-side check is M02 follow-up via handshake-probe)"
+        }
+    );
+    print_helper_handshake(&mac.helper_handshake);
+    println!();
+}
+
+#[cfg(target_os = "macos")]
+fn print_helper_handshake(h: &json::HelperHandshakeReport) {
+    print!("helper:   ");
+    if h.ok {
+        println!(
+            "ok ({} ms, tier={})",
+            h.latency_ms,
+            h.kernel_tier.as_deref().unwrap_or("?"),
+        );
+    } else {
+        println!(
+            "FAILED: {}",
+            h.error.as_deref().unwrap_or("(no error message)")
+        );
+    }
 }
 
 #[cfg(any(

@@ -146,4 +146,35 @@ smoke_log "PostExec seq=${SEQ} exit=0"
     --exit-code 0 \
     --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: fsevents-fallback-macos (M01 + M01.A full round-trip)"
+# ─────────────────────────────────────────────────────────────────────
+# Part 3 — M02 doctor uplift (release-gate jq one-liner).
+# ─────────────────────────────────────────────────────────────────────
+
+# Verify the M02 DoD: `shit doctor --json | jq .macos.runtime_capture`
+# returns one of the documented enum values. This is the literal CI
+# release gate from the M02 sprint.
+if ! command -v jq >/dev/null 2>&1; then
+    smoke_log "jq not present; skipping M02 doctor-uplift assertion"
+else
+    if ! "${SHIT_BIN}" doctor --json >"${SHIT_SMOKE_TMP}/doctor.json" 2>&1; then
+        smoke_log "doctor output:"
+        sed 's/^/    /' "${SHIT_SMOKE_TMP}/doctor.json" >&2
+        smoke_fail "shit doctor --json exited non-zero"
+    fi
+    if ! jq -e '.macos.runtime_capture == "endpoint-security" or .macos.runtime_capture == "fsevents-degraded"' \
+            "${SHIT_SMOKE_TMP}/doctor.json" >/dev/null; then
+        smoke_log "doctor.json .macos block:"
+        jq '.macos' "${SHIT_SMOKE_TMP}/doctor.json" | sed 's/^/    /' >&2
+        smoke_fail "doctor JSON .macos.runtime_capture is not one of the M02 enum values"
+    fi
+    smoke_log "shit doctor --json .macos.runtime_capture ✓"
+    # FSEvents probe should be functional on any modern Mac; flag if not.
+    if ! jq -e '.macos.fsevents.functional' "${SHIT_SMOKE_TMP}/doctor.json" >/dev/null; then
+        smoke_log "WARNING: doctor FSEvents probe reported not-functional"
+        jq '.macos.fsevents' "${SHIT_SMOKE_TMP}/doctor.json" | sed 's/^/    /'
+    else
+        smoke_log "shit doctor --json .macos.fsevents.functional ✓"
+    fi
+fi
+
+smoke_log "PASS: fsevents-fallback-macos (M01 + M01.A + M02 doctor uplift)"

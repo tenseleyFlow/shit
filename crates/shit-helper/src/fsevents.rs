@@ -49,8 +49,10 @@
 //! `kFSEventStreamCreateFlagNoDefer + latency=0.0` is critical — without
 //! it FSEvents coalesces events for up to `latency` seconds before
 //! delivering, which unacceptably increases capture latency.
-
-#![cfg(target_os = "macos")]
+//!
+//! Module-level `#[cfg(target_os = "macos")]` lives on `mod fsevents;`
+//! in `main.rs`; the inner `#![cfg(...)]` here was redundant and is
+//! flagged by `clippy::duplicated_attributes` on newer rustc.
 
 use std::ffi::{CStr, c_void};
 use std::os::raw::c_char;

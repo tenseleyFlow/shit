@@ -9,7 +9,7 @@
 //!
 //! - [`bsd`] → [`super::json::BsdReport`] (FreeBSD-focused; B03)
 //! - [`linux`] → [`super::json::LinuxReport`] (L05)
-//! - macOS campaign will add `macos` populating `MacReport`
+//! - [`macos`] → [`super::json::MacReport`] (M02)
 
 #[cfg(any(
     target_os = "freebsd",
@@ -21,3 +21,6 @@ pub mod bsd;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "macos")]
+pub mod macos;

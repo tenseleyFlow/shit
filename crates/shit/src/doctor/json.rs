@@ -239,9 +239,104 @@ pub struct SystemdUnitReport {
     pub user_manager_reachable: bool,
 }
 
-/// macOS-family report. Populated by the future mac campaign.
+/// macOS-family report. Populated by `probes::macos` (M02).
+///
+/// `runtime_capture` is the stable enum string identifying the
+/// active capture tier:
+/// - `"endpoint-security"` — ES tier active (M03; entitled + FDA granted)
+/// - `"fsevents-degraded"` — M01 fallback (no entitlement or no FDA)
+/// - `"unknown"` — could not determine (probe failures)
+///
+/// Each sub-report has its own `Default` so a probe that can't run
+/// (missing tool, EPERM, etc.) emits the neutral value and the
+/// JSON envelope still serializes cleanly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MacReport {}
+pub struct MacReport {
+    pub runtime_capture: String,
+    pub endpoint_security: EndpointSecurityReport,
+    pub fsevents: FsEventsProbeReport,
+    pub codesign: CodesignReport,
+    pub sip: SipReport,
+    pub sandbox: SandboxReport,
+    /// Helper handshake — shared shape with [`BsdReport`] /
+    /// [`LinuxReport`]. Same wire, same semantics.
+    pub helper_handshake: HelperHandshakeReport,
+}
+
+/// EndpointSecurity probe result.
+///
+/// M02 stages this — `entitlement_present` + `client_can_subscribe`
+/// remain false until M03 lands the real ES FFI. The `notes` field
+/// surfaces "M03 not yet implemented" until then.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EndpointSecurityReport {
+    /// True iff `es_new_client` returns SUCCESS (entitlement
+    /// granted by Apple AND embedded in the binary's codesign).
+    pub entitlement_present: bool,
+    /// True iff Full Disk Access has been granted to the helper.
+    /// Detected via stat against known-FDA-protected paths
+    /// (~/Library/Mail/V*/MailData/Envelope Index, with TCC.db
+    /// fallback). EPERM → false; ENOENT-on-all-paths → false
+    /// (indeterminate, conservative); success → true.
+    pub fda_granted: bool,
+    /// True iff the helper can actually subscribe an ES client.
+    /// Encompasses entitlement_present + fda_granted plus any
+    /// sandbox/runtime constraints. M02 stub: always false.
+    pub client_can_subscribe: bool,
+    /// Subscribed event kinds when `client_can_subscribe = true`.
+    /// Empty otherwise.
+    pub subscribed_event_kinds: Vec<String>,
+    /// Probe-internal notes the doctor can surface in table mode
+    /// (e.g. "FDA indeterminate: Mail.app never used; TCC.db fallback
+    /// also unreachable" or "M03 not yet implemented"). Empty in the
+    /// nominal case.
+    pub notes: Vec<String>,
+}
+
+/// FSEvents functional probe result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FsEventsProbeReport {
+    /// True iff the probe successfully started a stream, observed
+    /// one event for a touched file, and tore down — all inside
+    /// the latency budget.
+    pub functional: bool,
+    /// Wall-clock time from FSEventStreamCreate to first event in
+    /// milliseconds. 0 when `functional = false`.
+    pub latency_probe_ms: u32,
+}
+
+/// Codesign verification result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodesignReport {
+    /// Apple Developer Team ID (e.g. `"Q6JHJ53S9C"`). `None` when
+    /// the binary is ad-hoc-signed or unsigned.
+    pub team_id: Option<String>,
+    /// Stable string: `"developer-id-application"`, `"ad-hoc"`,
+    /// `"unsigned"`, or `"unknown"`.
+    pub signature_kind: String,
+    /// True iff the binary is notarized (stapler ticket present).
+    pub notarized: bool,
+    /// True iff the notary ticket is stapled to the binary.
+    pub stapled: bool,
+}
+
+/// SIP (System Integrity Protection) state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SipReport {
+    /// `"enabled"`, `"disabled"`, `"custom"`, or `"unknown"`.
+    pub state: String,
+}
+
+/// Sandbox profile verification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxReport {
+    /// True iff the M01 sandbox profile is actually loaded for
+    /// the helper. Verified via `sandbox_check(pid, ...)`.
+    pub profile_loaded: bool,
+    /// True iff `file-write*` outside the state dir is permitted
+    /// (a regression — the M01 profile should deny this).
+    pub write_allowed_outside_state_dir: bool,
+}
 
 /// One probed mount point. Mirrors the existing table's columns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +473,59 @@ mod tests {
         assert_eq!(r.schema_version, 1);
         assert!(r.arbitrary_undo_coverage.covered_classes.is_empty());
         assert!(r.arbitrary_undo_coverage.refused_classes.is_empty());
+    }
+
+    #[test]
+    fn macos_report_round_trips() {
+        let mut r = empty_report();
+        r.host.os = "macos".into();
+        r.host.os_release = "Darwin 25.4.0".into();
+        r.bsd = None;
+        r.macos = Some(MacReport {
+            runtime_capture: "fsevents-degraded".into(),
+            endpoint_security: EndpointSecurityReport {
+                entitlement_present: false,
+                fda_granted: false,
+                client_can_subscribe: false,
+                subscribed_event_kinds: vec![],
+                notes: vec!["M03 not yet implemented".into()],
+            },
+            fsevents: FsEventsProbeReport {
+                functional: true,
+                latency_probe_ms: 47,
+            },
+            codesign: CodesignReport {
+                team_id: Some("Q6JHJ53S9C".into()),
+                signature_kind: "ad-hoc".into(),
+                notarized: false,
+                stapled: false,
+            },
+            sip: SipReport {
+                state: "enabled".into(),
+            },
+            sandbox: SandboxReport {
+                profile_loaded: true,
+                write_allowed_outside_state_dir: false,
+            },
+            helper_handshake: HelperHandshakeReport {
+                ok: true,
+                latency_ms: 12,
+                helper_version: Some("0.1.0".into()),
+                kernel_tier: Some("fsevents-degraded".into()),
+                error: None,
+            },
+        });
+        let s = serde_json::to_string(&r).expect("serialize");
+        assert!(s.contains("\"runtime_capture\":\"fsevents-degraded\""));
+        assert!(s.contains("\"signature_kind\":\"ad-hoc\""));
+        assert!(s.contains("\"team_id\":\"Q6JHJ53S9C\""));
+        assert!(s.contains("\"state\":\"enabled\""));
+        let r2: DoctorReport = serde_json::from_str(&s).expect("deserialize");
+        let mac = r2.macos.expect("macos report present");
+        assert_eq!(mac.runtime_capture, "fsevents-degraded");
+        assert_eq!(mac.fsevents.latency_probe_ms, 47);
+        assert!(mac.sandbox.profile_loaded);
+        assert!(!mac.sandbox.write_allowed_outside_state_dir);
     }
 
     #[test]

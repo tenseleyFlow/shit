@@ -33,5 +33,13 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreFoundation runloop + string + array types for the macOS FSEvents
+# functional probe in `doctor::probes::macos`. Matches the helper
+# crate's macOS deps (M01.2); the doctor needs an in-process probe
+# that doesn't require the helper-side ES entitlement.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
 [dev-dependencies]
 tempfile = "3.10"

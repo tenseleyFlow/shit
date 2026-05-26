@@ -1679,6 +1679,8 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "core-foundation",
+ "core-foundation-sys",
  "libc",
  "serde",
  "serde_json",

@@ -32,7 +32,9 @@
 //! | `is_root_changed`   | warn-only; the watch root itself was moved/deleted |
 //! | `must_scan_subdirs` | warn-only; full rescan deferred to v1.x |
 
-#![cfg(target_os = "macos")]
+// Module-level `#[cfg(target_os = "macos")]` lives on `pub mod macos;`
+// in `super::mod`; the inner `#![cfg(...)]` is redundant and trips
+// `clippy::duplicated_attributes` on newer rustc.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
@@ -405,12 +407,21 @@ impl PumpState {
         // Post-hoc on the removal: the file is gone, so dev/inode are
         // lost. Emit zeros — the daemon-side executor inverts via
         // path, not by (dev, inode).
+        //
+        // G02 added kind+mode so the planner can synthesize a typed
+        // RecreatePath. FSEvents-degraded has no held fd to fstat
+        // before the unlink commits, so we fall back to the
+        // serde-default values (Regular file / 0o644) the wire spec
+        // documents — matches the pre-G02 hard-coded behavior. M03's
+        // ES path will populate real kind+mode via AUTH_UNLINK pre-stat.
         self.emit_tree_mutation(
             command,
             TreeOpWire::Unlink {
                 dev: 0,
                 inode: 0,
                 path: path.to_string_lossy().into_owned(),
+                kind: FileKindWire::Regular,
+                mode: 0o644,
             },
         );
     }
