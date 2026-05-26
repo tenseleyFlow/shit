@@ -354,26 +354,48 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut hardlink_live_paths: HashSet<PathBuf> = HashSet::new();
     let mut hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf> =
         std::collections::HashMap::new();
-    for paths in paths_by_inode.values() {
+    for (captured_inode, paths) in &paths_by_inode {
         if paths.len() < 2 {
             continue;
         }
-        // Partition by liveness.
-        let alive: Vec<&PathBuf> = paths.iter().filter(|p| probe.exists(p)).collect();
-        if alive.is_empty() {
+        // CONSERVATIVE GATE (W09.20.1) — a path qualifies as a live
+        // alias ONLY if its CURRENT lstat inode matches the captured
+        // inode_ref. Without this, ZFS-on-FreeBSD-14.2 (and likely
+        // any FS that aggressively reuses freed st_ino under churn)
+        // makes two unrelated event-time inode collisions look like
+        // a hardlink group. `patch script.sh` surfaces this on CI:
+        // patch's temp+rename sequence produces an Unlink event for
+        // the OLD script.sh inode; if that inode is later reused by
+        // an unrelated tempfile that gets its own Unlink, both
+        // paths land under the same key and the alive-test (just
+        // probe.exists) trips on the new script.sh. The current-
+        // inode equality check pins the classifier to genuine
+        // aliasing — at undo time, a real hardlink survivor still
+        // carries the captured inode; a coincidental reuse won't.
+        let alive_with_matching_inode: Vec<&PathBuf> = paths
+            .iter()
+            .filter(|p| match probe.stat(p) {
+                Some(s) => s.inode == *captured_inode,
+                None => false,
+            })
+            .collect();
+        if alive_with_matching_inode.is_empty() {
             continue;
         }
-        // Pick the first alive path as the canonical source. With
-        // >2 hardlinks all aliases share an inode anyway; any one
-        // will do. Sort for determinism so plans are reproducible.
-        let mut alive_sorted: Vec<&PathBuf> = alive;
+        let mut alive_sorted: Vec<&PathBuf> = alive_with_matching_inode;
         alive_sorted.sort();
         let source = alive_sorted[0].clone();
         for p in &alive_sorted {
             hardlink_live_paths.insert((*p).clone());
         }
         for p in paths {
-            if probe.exists(p) {
+            // Dead = not alive WITH the matching inode. A path that
+            // exists at undo time but with a different inode (the
+            // patch case) is treated as dead-for-this-group, which
+            // means the per-path RecreatePath+RestoreContent logic
+            // owns its undo — exactly what we want.
+            let alive_match = matches!(probe.stat(p), Some(s) if s.inode == *captured_inode);
+            if alive_match {
                 continue;
             }
             hardlink_dead_to_source.insert(p.clone(), source.clone());
