@@ -776,7 +776,9 @@ impl LinuxCaptureRuntime {
             uid: ev.old_uid,
             gid: ev.old_gid,
             mtime_unix_nanos: meta_mtime,
-            xattrs: crate::capture::xattr::read_user_xattrs(ev.fd),
+            // BPF setattr view has no fd (kernel-event path);
+            // chmod/chown don't change xattrs anyway, so empty.
+            xattrs: std::collections::BTreeMap::new(),
             is_delete: false,
             fd_sent_via_scm: true,
         };
