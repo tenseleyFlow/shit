@@ -391,7 +391,31 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                     })
                 }
             }
-            InverseOp::RecreatePath { path, .. } | InverseOp::CreateSymlink { path, .. } => {
+            InverseOp::RecreatePath { path, kind, .. } => {
+                // G03 — a RecreatePath{Directory} that lands AFTER a
+                // child's RestoreContent has had to mkdir -p this path
+                // already. Treat dir-over-dir as no-conflict; the
+                // executor will chmod the captured mode onto the
+                // existing dir. Any other shape (file/symlink/etc. at
+                // a dir-recreate path, or anything at a non-dir
+                // recreate path) is still a real Phantom conflict.
+                match self.probe.stat(path) {
+                    None => None,
+                    Some(stat) => {
+                        let existing_kind = crate::metadata::FileKind::from_mode(stat.meta.mode);
+                        if matches!(kind, crate::metadata::FileKind::Directory)
+                            && existing_kind == Some(crate::metadata::FileKind::Directory)
+                        {
+                            None
+                        } else {
+                            Some(Conflict::Phantom {
+                                detail: format!("{path:?} already exists; cannot recreate"),
+                            })
+                        }
+                    }
+                }
+            }
+            InverseOp::CreateSymlink { path, .. } => {
                 if self.probe.exists(path) {
                     Some(Conflict::Phantom {
                         detail: format!("{path:?} already exists; cannot recreate"),
