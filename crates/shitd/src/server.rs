@@ -283,20 +283,48 @@ fn handle(
                 index,
             );
         }
-        HookMessage::PreExecShellState { seq, pwd, .. } => {
-            debug!(%session, kind, seq, pwd = %pwd, "pre-exec-shell-state");
+        HookMessage::PreExecShellState {
+            seq,
+            pwd,
+            opts,
+            aliases,
+            ..
+        } => {
+            debug!(
+                %session, kind, seq,
+                pwd = %pwd,
+                n_opts = opts.len(),
+                n_aliases = aliases.len(),
+                "pre-exec-shell-state"
+            );
             crate::shell_state_track::handle_pre(
                 shell_state_stash,
                 CommandId { session, seq: *seq },
                 std::path::PathBuf::from(pwd),
+                opts.clone(),
+                aliases.clone(),
             );
         }
-        HookMessage::PostExecShellState { seq, pwd, .. } => {
-            debug!(%session, kind, seq, pwd = %pwd, "post-exec-shell-state");
+        HookMessage::PostExecShellState {
+            seq,
+            pwd,
+            opts,
+            aliases,
+            ..
+        } => {
+            debug!(
+                %session, kind, seq,
+                pwd = %pwd,
+                n_opts = opts.len(),
+                n_aliases = aliases.len(),
+                "post-exec-shell-state"
+            );
             crate::shell_state_track::handle_post(
                 shell_state_stash,
                 CommandId { session, seq: *seq },
                 std::path::PathBuf::from(pwd),
+                opts.clone(),
+                aliases.clone(),
                 index,
                 ts,
             );
