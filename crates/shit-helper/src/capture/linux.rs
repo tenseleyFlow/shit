@@ -2529,7 +2529,7 @@ mod tests {
 
         let ws = rt.watches.get(&cmd).expect("watch state");
         assert!(
-            ws.dedupe.get(&(dev_userspace, inode)).is_none(),
+            !ws.dedupe.contains_key(&(dev_userspace, inode)),
             "unchanged content must not insert a dedupe entry"
         );
     }
