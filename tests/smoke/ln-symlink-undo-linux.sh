@@ -28,6 +28,25 @@ SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
 [ -x "${SHIT_BIN}" ]   || smoke_fail "shit binary missing at ${SHIT_BIN}"
 export SHIT_HELPER_BIN="${HELPER_BIN}"
 
+# Pre-flight (mirrors chmod-undo-linux.sh): require lsm=bpf + caps.
+if [ ! -r /sys/kernel/security/lsm ]; then
+    smoke_log "SKIP: /sys/kernel/security/lsm unreadable"
+    exit 0
+fi
+ACTIVE_LSMS="$(cat /sys/kernel/security/lsm 2>/dev/null || echo)"
+if ! printf '%s' "${ACTIVE_LSMS}" | grep -q "\bbpf\b"; then
+    smoke_log "SKIP: kernel boot cmdline lacks bpf LSM (active=${ACTIVE_LSMS})"
+    exit 0
+fi
+HELPER_CAPS="$(getcap "${HELPER_BIN}" 2>/dev/null || true)"
+for required in cap_bpf cap_perfmon cap_sys_admin; do
+    if ! printf '%s' "${HELPER_CAPS}" | grep -q "${required}"; then
+        smoke_log "FAIL: helper lacks ${required}; run: sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep ${HELPER_BIN}"
+        exit 1
+    fi
+done
+export SHIT_FORCE_TIER=ebpf-lsm
+
 smoke_start_shitd
 
 SCRATCH="${SHIT_SMOKE_TMP}/scratch"
