@@ -42,6 +42,35 @@ path = "src/bin/baseline.rs"
 name = "compare"
 path = "src/bin/compare.rs"
 
+# B07 — BSD perf gate. Cross-platform binary; the BSD-specific
+# budget lives in tools/perf/budgets.toml.
+[[bin]]
+name = "doctor-bench"
+path = "src/bin/doctor.rs"
+
+# B07 — shell-hook UDS send latency. Spins up a shitd, opens
+# SOCK_DGRAM, times send() per PreExec frame.
+[[bin]]
+name = "shell-hook-bench"
+path = "src/bin/shell_hook.rs"
+
+# B07 — shit-helper pkg-event invocation latency.
+[[bin]]
+name = "hook-helper-bench"
+path = "src/bin/hook_helper.rs"
+
+# B07 — kqueue drain throughput. FreeBSD-only inner; cross-platform
+# stub on other OSes so the workflow can invoke it unconditionally.
+[[bin]]
+name = "kqueue-drain-bench"
+path = "src/bin/kqueue_drain.rs"
+
+# B07 — budget gate. Compares a bench JSON against tools/perf/budgets.toml;
+# exits non-zero on breach.
+[[bin]]
+name = "gate"
+path = "src/bin/gate.rs"
+
 # Linux-only fanotify-perm responder workload. The bin exists on all
 # platforms (builds with an `eprintln!("not Linux") + exit 0` stub)
 # so CI workflows can invoke it unconditionally; the real measurement
@@ -55,6 +84,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# B07 — shell-hook bench needs to construct + encode HookMessage
+# frames and ride the SOCK_DGRAM the daemon listens on. Cheap deps
+# already in the workspace.
+shit-proto = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3.10"
+# B07 — gate bin reads budgets.toml.
+toml = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
@@ -64,3 +101,7 @@ tempfile = "3.10"
 # algorithm `shit-helper`'s LinuxCaptureRuntime uses, so the measured
 # cost reflects the real CAPTURE_TO_ALLOW hot path.
 blake3 = { workspace = true }
+
+# B07 kqueue-drain bench drives EVFILT_VNODE directly via libc.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc = { workspace = true }

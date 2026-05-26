@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# B07 — BSD perf gates. Per-surface latency and throughput budgets
+# the `gate` bin (benches/regression/src/bin/gate.rs) enforces in
+# `.github/workflows/perf-bsd.yml`. A breach exits the workflow
+# non-zero and surfaces the offending metric in the job log.
+#
+# Units:
+#   - p50_us / p99_us / fail_at_p99_us — microseconds (latency
+#     gates). Lower is better.
+#   - p50_min_us / p99_min_us — minimum acceptable per-iter
+#     elapsed for THROUGHPUT-shaped workloads. The bin's iter time
+#     should stay BELOW these or throughput drops; the gate fails
+#     when actual p50/p99 EXCEEDS these (i.e. iter slowed down,
+#     throughput dropped).
+#   - kind = "latency" (default) for latency-style gates;
+#     kind = "throughput" for ones where the per-iter elapsed
+#     corresponds to draining a fixed unit of work.
+#
+# 30% slop bakes in cross-platform-actions FreeBSD VM jitter.
+# Adjust budgets in this file (not silently in the workflow)
+# when a systematic shift is observed across many runs.
+
+[[gate]]
+name = "doctor"
+description = "shit doctor --json total runtime"
+kind = "latency"
+p50_us = 500_000
+p99_us = 1_500_000
+fail_at_p99_us = 2_000_000
+
+[[gate]]
+name = "shell-hook"
+description = "100-frame PreExec burst over SOCK_DGRAM"
+kind = "latency"
+# Per-iter is a 100-frame burst → per-frame ~1µs.
+p50_us = 1_000
+p99_us = 5_000
+fail_at_p99_us = 10_000
+
+[[gate]]
+name = "hook-helper"
+description = "shit-helper pkg-event apt pre invocation"
+kind = "latency"
+p50_us = 20_000
+p99_us = 100_000
+fail_at_p99_us = 200_000
+
+[[gate]]
+name = "kqueue-drain"
+description = "EVFILT_VNODE drain of 64 NOTE_WRITE events"
+kind = "throughput"
+# Throughput-shaped: ~64 events per iter. Drain must stay below
+# these per-iter elapsed times so events/sec stays above the
+# headline budget (15k p50, 10k p99).
+# 64 events / 4000us = 16k ev/sec
+# 64 events / 6400us = 10k ev/sec
+# 64 events / 12800us = 5k ev/sec (2x fail floor)
+p50_us = 4_000
+p99_us = 6_400
+fail_at_p99_us = 12_800

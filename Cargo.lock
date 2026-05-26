@@ -1787,7 +1787,10 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "shit-proto",
  "tempfile",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
