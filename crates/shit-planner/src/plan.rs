@@ -165,6 +165,12 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
     let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
+    // DR-CR-54.B — rename sources. When the shim recursively
+    // pre-imaged a directory rename's subtree, the per-file
+    // FilePreImage events live at paths INSIDE the rename's
+    // `from`. We need those source paths to detect the
+    // dir-rename atomic-replace shape below.
+    let mut rename_sources: HashSet<PathBuf> = HashSet::new();
     // W09.20 — collect (dev, inode) → set of paths from Unlink events
     // so we can detect hardlink groups: same inode appearing under
     // multiple names.
@@ -207,8 +213,9 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             // apply time and intermittently deleted the destination
             // outright. Treating the rename's destination identically
             // to a Create for classification purposes closes the gap.
-            CaptureEventKind::TreeOp(TreeOp::Rename { to, .. }) => {
+            CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
                 rename_destinations.insert(to.clone());
+                rename_sources.insert(from.clone());
             }
             _ => {}
         }
@@ -339,6 +346,233 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             atomic.insert(p.clone());
         }
     }
+    // DR-CR-54.B — directory-rename atomic-replace. When the shim
+    // observes `rename(srcdir, dstdir)` where `srcdir` is a
+    // directory, it recursively captures per-file pre-images for
+    // every regular file in the subtree (DR-CR-54.A). Each
+    // FilePreImage is keyed at its **original** absolute path
+    // under `srcdir/...`. The user's tool (pip, npm, etc.) then
+    // typically:
+    //
+    //   1. opens new files at `srcdir/foo` (TreeOp::Create
+    //      journaled by the shim, no pre-image since the path was
+    //      just freed by the rename),
+    //   2. eventually removes the staging dir at `dstdir`.
+    //
+    // For each such path P (FilePreImage + Create + P descendant
+    // of some rename source AND P exists at undo time), the
+    // per-event inverses would be:
+    //
+    //   - Create's Unlink-inverse → RecreatePath (drops empty
+    //     file with captured mode) → ConflictPhantom because P
+    //     already exists from the new tool's open.
+    //   - FilePreImage's RestoreContent → writes the original
+    //     bytes.
+    //
+    // The right shape is atomic-replace: suppress the Create's
+    // inverse, let RestoreContent overwrite the new content with
+    // the captured original bytes. Same pattern as the W06.A.4
+    // single-file `install(1)`/`mv` case, just driven by a
+    // **dir** rename instead of a same-path rename.
+    for p in &creates {
+        // Skip paths already classified by the earlier loops.
+        if atomic.contains(p) || transient.contains(p) {
+            continue;
+        }
+        if !pre_images.contains(p) {
+            continue;
+        }
+        // Path must be a strict descendant of some rename source.
+        // Equal-path doesn't qualify (that's the W06.A.4 shape,
+        // already handled above).
+        let under_rename_src = rename_sources
+            .iter()
+            .any(|src| p.starts_with(src) && p != src);
+        if !under_rename_src {
+            continue;
+        }
+        if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
+        }
+    }
+
+    // DR-CR-54.B — transient rename-destination subtree.
+    //
+    // pip's overwrite pattern is `rename(site-packages,
+    // ~ite-packages)` to move the OLD content out of the way,
+    // then `mkdir site-packages` + writes for new content, then
+    // recursive removal of `~ite-packages`. By undo time:
+    //   - `site-packages` exists (pip created the new one — this
+    //     is the path the user cares about; the SOURCE side of
+    //     the rename is covered by the DR-CR-54.B classifier
+    //     above, which treats per-file pre-images keyed at
+    //     `site-packages/...` as atomic_replace),
+    //   - `~ite-packages` is gone (pip cleaned up).
+    //
+    // The shim's per-file `unlinkat` captures during pip's
+    // cleanup journal both unlink+pre-image events at
+    // `~ite-packages/...` paths — duplicates of the recursive-
+    // walk pre-images, but at the post-rename path. Their
+    // inverses (RecreatePath + RestoreContent) target
+    // `~ite-packages/...` which is gone; the orchestrator's
+    // executor ENOENTs. Classify those duplicates as transient.
+    //
+    // Trigger: rename whose `from` path EXISTS at undo time. If
+    // the user (well, the tool) has put fresh content at the
+    // rename source, the destination is by definition a
+    // throw-away pile and any captures under it are duplicates
+    // we can safely skip.
+    let mut transient_rename_destinations: Vec<PathBuf> = Vec::new();
+    for ev in events {
+        if let CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) = &ev.kind
+            && probe.stat(from).is_some()
+        {
+            transient_rename_destinations.push(to.clone());
+        }
+    }
+    for p in pre_images.iter().chain(unlinks.iter()) {
+        if atomic.contains(p) || transient.contains(p) {
+            continue;
+        }
+        let under_transient_dst = transient_rename_destinations
+            .iter()
+            .any(|to| p.starts_with(to) && p != to);
+        if under_transient_dst {
+            transient.insert(p.clone());
+        }
+    }
+
+    // DR-CR-54.B — orphan-parent transient classification.
+    //
+    // Build tools routinely create files under ephemeral parent
+    // directories (`/tmp/pip-ephem-wheel-cache-X/wheels/...`,
+    // `/tmp/cargo-installXXX/`, `make`'s build-dir intermediates)
+    // then `rm -rf` the parent on clean-up. The shim captures
+    // pre-images of those files at unlink/open/rename time, but
+    // the parent dir is gone by undo time AND no captured event
+    // recreates it.
+    //
+    // Without this filter, the per-event inverse emission queues a
+    // `RecreatePath` (Unlink's inverse) or `RestoreContent`
+    // (FilePreImage's inverse) at the orphan path. The executor
+    // then hits ENOENT on the missing parent → `Failed`. The
+    // orchestrator's abort policy halts the whole plan, stranding
+    // RestoreContent ops for paths the user actually cares about
+    // (e.g. `site-packages/foo.py`) behind a build-cache cleanup.
+    //
+    // Classify as transient instead: no inverse emitted, no
+    // failure to abort the orchestrator. The orchestrator's
+    // existing `failed/conflicted` counters still surface true
+    // user-state restoration failures.
+    //
+    // Heuristic: parent dir missing at undo time AND no captured
+    // event creates the parent. We deliberately don't try to
+    // `mkdir -p` the parent — that would silently recreate
+    // throw-away dirs with default permissions, polluting the
+    // user's tmp.
+    let event_creates_path = |q: &PathBuf| creates.contains(q) || rename_destinations.contains(q);
+    // Index DISTINCT captured paths by their immediate parent so
+    // we can require ≥2 sibling captures before firing the filter.
+    // The intent: a SINGLE isolated `rm foo` against a gone-parent
+    // path is the user wanting a Missing-conflict (existing
+    // behavior), while a CLUSTER of captures under the same
+    // gone-parent is a build-tool cleanup pattern (orphan,
+    // suppress).
+    //
+    // Important: dedupe across `pre_images` and `unlinks` — a
+    // single `rm foo` has both an Unlink AND a pre-image at the
+    // same path. Counting them as 2 siblings would mis-classify.
+    let mut siblings_by_parent: std::collections::HashMap<PathBuf, HashSet<PathBuf>> =
+        std::collections::HashMap::new();
+    for p in pre_images.iter().chain(unlinks.iter()) {
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            siblings_by_parent
+                .entry(parent.to_path_buf())
+                .or_default()
+                .insert(p.clone());
+        }
+    }
+    for p in pre_images.iter().chain(unlinks.iter()) {
+        // Skip paths already classified.
+        if atomic.contains(p) || transient.contains(p) {
+            continue;
+        }
+        // Only fire the orphan-parent filter when the FILE itself
+        // is also gone. A file that still exists at undo time has
+        // a real parent dir somewhere — the existing logic handles
+        // it. Without this guard, in-memory test probes that only
+        // register the file (and not its `/`-walk of parents)
+        // would mis-classify legitimate restores as transient.
+        if probe.stat(p).is_some() {
+            continue;
+        }
+        let Some(parent) = p.parent() else {
+            continue;
+        };
+        if parent.as_os_str().is_empty() {
+            continue;
+        }
+        // Parent exists at undo → not an orphan; existing logic handles it.
+        if probe.stat(parent).is_some() {
+            continue;
+        }
+        // Conservative: require ≥2 captures under the same parent
+        // before declaring a cluster-style orphan. Single isolated
+        // captures (the `rm foo` shape) fall through to existing
+        // Missing-conflict logic so the user gets actionable
+        // feedback rather than silent skip.
+        let cluster = siblings_by_parent
+            .get(&parent.to_path_buf())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        // At this point: path is gone AND parent is gone. That's
+        // sufficient signal for "transient" — the user's tool
+        // both wrote to this path AND tore down the directory
+        // tree around it. The cluster/grandparent variants we
+        // tried previously left singleton cases like pip's
+        // `/tmp/pip-build-tracker-X/<hex>` un-classified, where
+        // pip writes one tracker file under a unique tmpdir then
+        // `rmtree`s the whole dir. The simpler rule covers them.
+        //
+        // For the legitimate `rm /important/file.txt` case in
+        // production, the parent dir typically still exists (the
+        // user removed the file but not the directory), so this
+        // check exits at the `probe.stat(parent).is_some()` guard
+        // above and we fall through to the existing
+        // Missing-conflict path. When BOTH file AND its parent
+        // are gone, restoring is moot — there's no consistent
+        // tree to restore into.
+        let _ = (cluster, unlinks.contains(p) && !pre_images.contains(p));
+        // Parent has its own create/rename-to event somewhere in
+        // the plan → not orphan; the inverse for that event will
+        // handle parent existence.
+        let parent_buf = parent.to_path_buf();
+        if event_creates_path(&parent_buf) {
+            continue;
+        }
+        // Same check for ancestors above the immediate parent — a
+        // create at any ancestor still makes us non-orphan because
+        // its Unlink-inverse cleans up the whole subtree (`rm -rf`).
+        let mut ancestor = parent.parent();
+        let mut covered_by_ancestor_event = false;
+        while let Some(anc) = ancestor {
+            if anc.as_os_str().is_empty() {
+                break;
+            }
+            if event_creates_path(&anc.to_path_buf()) {
+                covered_by_ancestor_event = true;
+                break;
+            }
+            ancestor = anc.parent();
+        }
+        if covered_by_ancestor_event {
+            continue;
+        }
+        transient.insert(p.clone());
+    }
+
     // W09.20 — hardlink classification. For each (dev, inode) group
     // with multiple paths (i.e. the original setup had a hardlink
     // alias), check which paths are alive on disk at undo time:
@@ -1128,6 +1362,34 @@ fn emit_for_tree_op(
             if atomic_replace_paths.contains(to) {
                 return;
             }
+            // DR-CR-54.B — when the rename's `from` (source) is
+            // re-populated by the user's tool at undo time (pip's
+            // pattern: rename old site-packages out, then mkdir +
+            // write new site-packages), reversing the rename would
+            // either fail (`to` is gone — pip cleaned it up) or
+            // stomp on the fresh state at `from`. Suppress; the
+            // per-file FilePreImages at `from/...` paths carry the
+            // restore via RestoreContent through the
+            // atomic_replace_paths path.
+            if probe.stat(from).is_some() && probe.stat(to).is_none() {
+                return;
+            }
+            // DR-CR-54.B — orphan rename inside a transient subtree
+            // (e.g. pip's deep wheel-cache renames inside
+            // `/tmp/pip-ephem-wheel-cache-X/`). Both sides gone AND
+            // the parent of `to` also gone: the inverse rename has
+            // nowhere to put the file. Suppress instead of emitting
+            // a ConflictMissing — the user doesn't care about
+            // build-cache rename residue.
+            if probe.stat(from).is_none()
+                && probe.stat(to).is_none()
+                && to
+                    .parent()
+                    .map(|tp| !tp.as_os_str().is_empty() && probe.stat(tp).is_none())
+                    .unwrap_or(false)
+            {
+                return;
+            }
             // Inverse of `from -> to` is `to -> from`.
             nodes.push(PlanNode {
                 op: InverseOp::Rename {
@@ -1427,7 +1689,19 @@ mod tests {
 
     #[test]
     fn missing_path_yields_missing_conflict() {
-        let probe = InMemoryProbe::new(); // path not inserted
+        // /tmp exists in production; populate it in the probe so
+        // the orphan-parent transient classifier (DR-CR-54.B)
+        // doesn't sweep this path into transient and skip the
+        // Missing-conflict emission.
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            PathBuf::from("/tmp"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let mut store = InMemoryStore::new();
         let blob = BlobHash::from_bytes([0xCD; 32]);
         store.put_blob(blob, 10);
@@ -1500,7 +1774,17 @@ mod tests {
         // Simulate `rm foo`: T1 = FilePreImage, T2 = TreeOp::Unlink.
         // Reverse order should put RecreatePath (from Unlink) before
         // RestoreContent (from FilePreImage).
-        let probe = InMemoryProbe::new();
+        let mut probe = InMemoryProbe::new();
+        // Populate /tmp so the DR-CR-54.B orphan-parent classifier
+        // doesn't sweep this `rm foo` shape into transient.
+        probe.insert(
+            PathBuf::from("/tmp"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let mut store = InMemoryStore::new();
         let inode = InodeRef::new(1, 7);
         let blob = BlobHash::from_bytes([1; 32]);
@@ -2199,6 +2483,224 @@ mod tests {
         assert!(
             has_restore,
             "RestoreContent missing; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dir_rename_per_file_preimage_classifies_as_atomic_replace() {
+        // DR-CR-54.B — pip's flow renames `site-packages →
+        // <staging>`. The shim's recursive walk captures
+        // per-file pre-images keyed at the ORIGINAL paths
+        // (`site-packages/foo.py`). pip then re-creates
+        // `site-packages/foo.py` with new content; the shim
+        // journals a TreeOp::Create for it (no pre-image — file
+        // didn't exist post-rename).
+        //
+        // Per-event inverses without this fix:
+        //   - Create's Unlink-inverse → RecreatePath → empty
+        //     file with captured mode → ConflictPhantom (file
+        //     already exists from the new content).
+        //   - FilePreImage's RestoreContent → original bytes.
+        //
+        // Atomic-replace classification suppresses the
+        // RecreatePath; RestoreContent alone overwrites cleanly.
+        let srcdir = PathBuf::from("/lib/python/site-packages");
+        let dstdir = PathBuf::from("/lib/python/.shit-stage");
+        let file_path = PathBuf::from("/lib/python/site-packages/top_level.txt");
+        let dir_inode = InodeRef::new(1, 1000);
+        let file_inode = InodeRef::new(1, 2000);
+        let blob = BlobHash::from_bytes([0xCD; 32]);
+
+        let mut store = InMemoryStore::new();
+        store.put_blob(blob, 14);
+
+        // file_path exists at undo time (re-created by pip with v2 content).
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            file_path.clone(),
+            ProbeStat {
+                inode: file_inode,
+                meta: meta(14),
+            },
+            None,
+        );
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let dir_rename = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: srcdir.clone(),
+                to: dstdir.clone(),
+                inode: dir_inode,
+            }),
+        };
+        let recursive_pre = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: file_inode,
+                path: file_path.clone(),
+                blob,
+                meta: meta(14),
+                post_content_hash: None,
+            },
+        };
+        let create = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(0, 0),
+                path: file_path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o644,
+            }),
+        };
+
+        let p = plan(
+            dummy_command(),
+            &[dir_rename, recursive_pre, create],
+            &probe,
+            &store,
+        );
+
+        // RecreatePath for the per-file path MUST NOT emit —
+        // it'd ConflictPhantom on the pip-recreated file.
+        let has_recreate = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RecreatePath { path, .. } if path == &file_path));
+        assert!(
+            !has_recreate,
+            "RecreatePath for dir-rename-atomic-replace path leaked through; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+
+        // RestoreContent for the per-file path MUST emit.
+        let has_restore = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if path == &file_path));
+        assert!(
+            has_restore,
+            "RestoreContent missing for dir-rename-atomic-replace path; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_parent_cluster_classifies_as_transient() {
+        // DR-CR-54.B — pip's flow writes intermediate files into
+        // an ephemeral wheel-cache dir
+        // (`/tmp/pip-ephem-wheel-cache-X/wheels/foo.whl`) then
+        // `rm -rf`'s the whole tree on cleanup. Our shim captures
+        // pre-images of those files; at undo time both the files
+        // AND their parent dir are gone. Without this rule the
+        // executor's RestoreContent hits ENOENT on the missing
+        // parent → Failed → orchestrator abort policy halts the
+        // plan, stranding the actually-useful RestoreContents.
+        //
+        // ≥2 captures under the same missing parent gates the
+        // filter to "build-tool cleanup" clusters; a SINGLE
+        // captured path with a missing parent stays in
+        // Missing-conflict territory so the user gets actionable
+        // feedback.
+        let probe = InMemoryProbe::new(); // nothing exists
+        let mut store = InMemoryStore::new();
+        let blob = BlobHash::from_bytes([0xCC; 32]);
+        store.put_blob(blob, 5);
+        let inode_a = InodeRef::new(1, 11);
+        let inode_b = InodeRef::new(1, 12);
+        let mk = |id: u64, path: &str, inode: InodeRef| CaptureEvent {
+            id: EventId(id),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: PathBuf::from(path),
+                blob,
+                meta: meta(5),
+                post_content_hash: None,
+            },
+        };
+        let evs = vec![
+            mk(1, "/tmp/pip-ephem-wheel-cache-X/wheels/a.whl", inode_a),
+            mk(2, "/tmp/pip-ephem-wheel-cache-X/wheels/b.whl", inode_b),
+        ];
+        let p = plan(dummy_command(), &evs, &probe, &store);
+        // Both paths share `/tmp/pip-ephem-wheel-cache-X/wheels`
+        // as parent, neither parent nor children exist at undo.
+        // Cluster size = 2 → transient → zero plan nodes.
+        assert_eq!(
+            p.nodes.len(),
+            0,
+            "orphan-parent cluster should emit no plan nodes; got: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_parent_path_and_parent_both_gone_classifies_as_transient() {
+        // DR-CR-54.B — when BOTH the captured path AND its
+        // immediate parent are gone at undo time, the user's
+        // tool tore down the surrounding tree. There's no
+        // consistent state to restore into. Sweep to transient
+        // so the orchestrator doesn't ENOENT-cascade on a
+        // doomed RecreatePath.
+        //
+        // The legitimate `rm /tmp/lonely/file.txt` case where
+        // the user wants a Missing-conflict still works as
+        // before: /tmp/lonely typically remains on disk, the
+        // parent-exists check at the top of the orphan filter
+        // exits early, and the existing Missing-conflict path
+        // emits the node.
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            PathBuf::from("/tmp"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
+        let mut store = InMemoryStore::new();
+        let blob = BlobHash::from_bytes([0xDD; 32]);
+        store.put_blob(blob, 5);
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, 5),
+                path: PathBuf::from("/tmp/lonely/file.txt"),
+                blob,
+                meta: meta(5),
+                post_content_hash: None,
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert_eq!(
+            p.nodes.len(),
+            0,
+            "path-gone + parent-gone should classify as transient (0 plan nodes); got: {:?}",
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
     }
