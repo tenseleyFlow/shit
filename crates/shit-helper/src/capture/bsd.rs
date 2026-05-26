@@ -641,6 +641,36 @@ impl PumpState {
         // to emit a Rename inverse. Documented as W06 territory —
         // the same cwd-watch-scope expansion that closes `make
         // install` closes the rename-source-half capture too.
+        // W09.16.1.ci-fix — emit SymlinkRemoved for symlinks that
+        // were in baseline but disappeared from current. Symlinks
+        // aren't fd-tracked entries (register_subtree's open follows
+        // the symlink target, not the symlink itself), so their
+        // unlink does not raise NOTE_DELETE on a tracked fd. The dir's
+        // NOTE_WRITE is the only signal we get.
+        //
+        // On FreeBSD 14.2 ZFS, `ln -sf newtarget link` produces TWO
+        // NOTE_WRITE events: one when the old link is unlinked
+        // (current has no `link` entry), one when the new link is
+        // created (current has `link` with a new inode + new target).
+        // Without this branch, the first event clobbered baseline.entries
+        // with the entry-missing snapshot, so the second event saw
+        // prev=None for `link` and emitted only a Create (no
+        // SymlinkRemoved), losing the OLD target. On 14.4 the two
+        // operations apparently coalesce into one event so the gap
+        // never showed; 14.2 surfaced it.
+        for (name, prev_entry) in &baseline.entries {
+            if current.contains_key(name) {
+                continue;
+            }
+            let Some(old_target) = &prev_entry.symlink_target else {
+                continue;
+            };
+            let child = dir_path.join(name);
+            events.push(shit_proto::TreeOpWire::SymlinkRemoved {
+                target: old_target.clone(),
+                path: path_to_string(&child),
+            });
+        }
         let _ = &baseline.entries; // kept for the diff above (Create emit)
         // Refresh baseline so subsequent diffs are relative to the
         // post-change state.
