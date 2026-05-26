@@ -1242,6 +1242,7 @@ jobs:
             git-checkout-file-undo-linux.sh
             git-stash-drop-undo-linux.sh
             git-branch-D-undo-linux.sh
+            git-branch-D-packed-undo-linux.sh
             git-checkout-branch-undo-linux.sh
             git-clean-fd-undo-linux.sh
           )
