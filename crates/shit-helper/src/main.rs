@@ -23,6 +23,7 @@ mod capsicum_bsd;
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "macos",
 ))]
 mod capture;
 mod cloud;
@@ -33,6 +34,8 @@ mod db;
 mod ebpf;
 #[cfg(target_os = "linux")]
 mod fanotify;
+#[cfg(target_os = "macos")]
+mod fsevents;
 mod handshake;
 mod health;
 #[cfg(target_os = "linux")]
@@ -910,8 +913,21 @@ pub enum CaptureTier {
     /// L04 retains this only as a debug signal: prerequisites met
     /// but we chose to *not* load (e.g. `SHIT_FORCE_TIER=fanotify-perm`).
     EbpfLsmAvailableButDeferred,
-    /// macOS EndpointSecurity (S07). Reserved.
+    /// macOS EndpointSecurity (S07/M03). Pre-mutation AUTH-event
+    /// interception. Requires the
+    /// `com.apple.developer.endpoint-security.client` entitlement on
+    /// a SIP-enforced system; usable ad-hoc on a SIP-disabled dev
+    /// target. M01 ships the FsEventsDegraded fallback; M03 lights
+    /// up this tier.
     EndpointSecurity,
+    /// macOS FSEvents post-hoc (M01). The degraded fallback when ES
+    /// is unavailable (no entitlement, or FDA not granted, or
+    /// ad-hoc-signed dev build on SIP-enforced host). Events arrive
+    /// after the syscall completes, so we cannot capture file
+    /// content pre-images; tree-ops and the post-state are captured
+    /// with `partial = true`. Honest "(degraded)" label flows
+    /// through `shit list`.
+    FsEventsDegraded,
     /// BSD kqueue-only (S10). Post-hoc events; no pre-mutation
     /// blocking. Used when no LD_PRELOAD shim is installed and the
     /// storage substrate isn't ZFS.
@@ -934,7 +950,8 @@ impl CaptureTier {
             CaptureTier::EbpfLsmAvailableButDeferred => {
                 "ebpf-lsm-available (S09 loader deferred; running fanotify)"
             }
-            CaptureTier::EndpointSecurity => "endpoint-security (S07)",
+            CaptureTier::EndpointSecurity => "endpoint-security (S07/M03)",
+            CaptureTier::FsEventsDegraded => "fsevents-degraded (M01 post-hoc)",
             CaptureTier::KqueueOnly => "kqueue-only (S10 post-hoc)",
             CaptureTier::KqueuePreloadShim => "kqueue + LD_PRELOAD shim (S10)",
             CaptureTier::ZfsSnapshot => "zfs-snapshot (S10 coarse pre-mutation)",
@@ -978,17 +995,31 @@ fn privileged_setup() -> PrivilegedSetup {
             tier,
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let tier = pick_macos_tier();
+        tracing::info!(tier = tier.label(), "kernel capture tier picked");
+        PrivilegedSetup {
+            caps: shit_proto::HelperCaps {
+                watch_tree: true,
+                // FSEvents is post-hoc — no syscall-blocking primitive.
+                // M03's EndpointSecurity tier flips this to true.
+                auth_subscribe: false,
+                package_hook: false,
+            },
+            tier,
+        }
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
+        target_os = "macos",
     )))]
     {
-        // macOS path lands in S07. Helper still claims `watch_tree`
-        // since that primitive is best-effort even with no kernel
-        // hooks.
+        // No supported kernel-tier on this OS.
         PrivilegedSetup {
             caps: shit_proto::HelperCaps {
                 watch_tree: true,
@@ -1029,6 +1060,17 @@ fn pick_bsd_tier() -> CaptureTier {
         return CaptureTier::KqueuePreloadShim;
     }
     CaptureTier::KqueueOnly
+}
+
+/// Decide which macOS capture tier to use. M01 always returns
+/// `FsEventsDegraded`. M03 will try `EndpointSecurity` first
+/// (entitlement + FDA probe) and fall back here.
+///
+/// The `partial = true` flag on every captured event downstream is
+/// what flows the "(degraded)" label through `shit list`.
+#[cfg(target_os = "macos")]
+fn pick_macos_tier() -> CaptureTier {
+    CaptureTier::FsEventsDegraded
 }
 
 /// Bundles the long-lived state for the eBPF-LSM tier (L04). Held
@@ -1428,6 +1470,27 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         }
     };
 
+    // M01.A: macOS FSEvents-degraded capture producer. Mirrors the
+    // BSD spawn shape. Producer is created unconditionally on macOS;
+    // the M03 ES producer will sit alongside (decided at WatchTree
+    // dispatch) once it lands.
+    #[cfg(target_os = "macos")]
+    let macos_capture: Option<capture::macos::CaptureControl> = {
+        match capture::macos::spawn(Arc::clone(&conn)) {
+            Ok((ctrl, _join)) => {
+                tracing::info!("macos fsevents capture runtime spawned");
+                Some(ctrl)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "macos fsevents capture runtime failed to start; continuing without it"
+                );
+                None
+            }
+        }
+    };
+
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
@@ -1469,6 +1532,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_bsd_capture = bsd_capture.clone();
     #[cfg(target_os = "linux")]
     let request_lsm = lsm_state.as_ref().map(|s| s.dispatch.clone());
+    #[cfg(target_os = "macos")]
+    let request_macos_capture = macos_capture.clone();
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
@@ -1483,6 +1548,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 target_os = "dragonfly",
             ))]
             request_bsd_capture,
+            #[cfg(target_os = "macos")]
+            request_macos_capture,
         )
     });
 
@@ -1534,6 +1601,16 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     ))]
     drop(bsd_capture);
 
+    // M01.A: same wind-down shape for macOS. Drop on CaptureControl
+    // closes the control channel; the FSEvents pump exits on its
+    // next iteration.
+    #[cfg(target_os = "macos")]
+    if let Some(ctrl) = &macos_capture {
+        ctrl.shutdown();
+    }
+    #[cfg(target_os = "macos")]
+    drop(macos_capture);
+
     Ok(())
 }
 
@@ -1551,6 +1628,7 @@ fn request_loop(
         target_os = "dragonfly",
     ))]
     bsd_capture: Option<capture::bsd::CaptureControl>,
+    #[cfg(target_os = "macos")] macos_capture: Option<capture::macos::CaptureControl>,
 ) -> anyhow::Result<()> {
     use shit_proto::{HelperRequest, HelperResponse};
 
@@ -1707,12 +1785,30 @@ fn request_loop(
                         "watch_tree ignored — no bsd capture (degraded)"
                     );
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_capture {
+                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        cwd_path = %cwd_path,
+                        "watch_tree dispatched to macos fsevents capture"
+                    );
+                } else {
+                    tracing::debug!(
+                        %session,
+                        command_seq,
+                        "watch_tree ignored — no macos capture (degraded)"
+                    );
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
                     target_os = "netbsd",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "macos",
                 )))]
                 {
                     let _ = (root_pid, session, command_seq, &cwd_path);
@@ -1802,12 +1898,18 @@ fn request_loop(
                     ctrl.on_unwatch_tree(session, command_seq);
                     tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_capture {
+                    ctrl.on_unwatch_tree(session, command_seq);
+                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
                     target_os = "netbsd",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "macos",
                 )))]
                 {
                     let _ = (session, command_seq);

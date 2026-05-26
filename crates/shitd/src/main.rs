@@ -77,7 +77,11 @@ const fn daemon_kernel_tier_default() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        "endpoint-security"
+        // M01 baseline: FSEvents post-hoc tier. M03 flips the helper-
+        // side classifier to "endpoint-security" at runtime when ES
+        // is available; the daemon overwrites this default with the
+        // helper's report on first handshake either way.
+        "fsevents-degraded"
     }
     #[cfg(target_os = "freebsd")]
     {

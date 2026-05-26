@@ -129,6 +129,7 @@ fn spawn_helper_and_complete_handshake() {
                 "fanotify"
                     | "bpf-lsm"
                     | "endpoint-security"
+                    | "fsevents-degraded"
                     | "kqueue"
                     | "preload-shim"
                     | "degraded"
