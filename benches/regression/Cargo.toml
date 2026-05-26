@@ -48,6 +48,12 @@ path = "src/bin/compare.rs"
 name = "doctor-bench"
 path = "src/bin/doctor.rs"
 
+# B07 — shell-hook UDS send latency. Spins up a shitd, opens
+# SOCK_DGRAM, times send() per PreExec frame.
+[[bin]]
+name = "shell-hook-bench"
+path = "src/bin/shell_hook.rs"
+
 # Linux-only fanotify-perm responder workload. The bin exists on all
 # platforms (builds with an `eprintln!("not Linux") + exit 0` stub)
 # so CI workflows can invoke it unconditionally; the real measurement
@@ -61,6 +67,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+# B07 — shell-hook bench needs to construct + encode HookMessage
+# frames and ride the SOCK_DGRAM the daemon listens on. Cheap deps
+# already in the workspace.
+shit-proto = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
