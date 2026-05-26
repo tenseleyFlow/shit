@@ -32,6 +32,8 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod capture;
+#[cfg(test)]
+mod capture_tests;
 pub mod drain;
 pub mod error;
 pub mod event_loop;
