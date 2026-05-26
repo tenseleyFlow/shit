@@ -675,7 +675,7 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
                     Some(path.to_string_lossy().into_owned()),
                     "TreeOpCreate",
                 ),
-                T::Unlink { inode, path } => (
+                T::Unlink { inode, path, .. } => (
                     Some(inode.dev as i64),
                     Some(inode.inode as i64),
                     Some(path.to_string_lossy().into_owned()),

@@ -105,7 +105,12 @@ fn arb_unlink(id: u64, ts: u64) -> impl Strategy<Value = CaptureEvent> {
         command: cmd(1),
         ts: TimePoint::new(ts, 0),
         partial: false,
-        kind: CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path }),
+        kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode,
+            path,
+            kind: shit_planner::metadata::FileKind::Regular,
+            mode: 0o100644,
+        }),
     })
 }
 

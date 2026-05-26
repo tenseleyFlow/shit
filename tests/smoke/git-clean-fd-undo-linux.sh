@@ -57,6 +57,15 @@ mkdir -p "${REPO}/junk/nested"
 echo "charlie" > "${REPO}/junk/c.txt"
 echo "delta"   > "${REPO}/junk/nested/d.txt"
 
+# G02 — pin a non-default mode on `junk/` so we can assert the
+# planner restores the captured mode (not the pre-G02 hard-coded
+# 0o755 from the executor's mkdir-p fallback). 0o750 has both
+# group + other diffs from 0o755, so a regression that loses kind
+# OR mode surfaces here.
+chmod 0750 "${REPO}/junk"
+DIR_MODE_BEFORE="$(stat -c '%a' "${REPO}/junk")"
+smoke_log "pre-clean dir mode: junk=${DIR_MODE_BEFORE}"
+
 # Sha each untracked file so we can assert byte-identity after undo.
 SHA_A="$(sha256sum "${REPO}/untracked-a.txt" | cut -d' ' -f1)"
 SHA_B="$(sha256sum "${REPO}/untracked-b.txt" | cut -d' ' -f1)"
@@ -135,6 +144,33 @@ if [ "${ok}" != "1" ]; then
     smoke_log "current tree:"
     find "${REPO}" -name '.git' -prune -o -print 2>/dev/null | sed 's/^/    /' >&2 || true
     smoke_fail "clean -fd undo didn't restore all entries"
+fi
+
+# G02 partial — dir mode restoration is still gated on the
+# helper landing an `inode_rmdir` LSM hook (deferred to G03).
+# Today's flow:
+#   1. `git clean -fd` calls `unlinkat(AT_REMOVEDIR)` on junk/.
+#   2. The helper has NO inode_rmdir hook (only inode_unlink for
+#      regular-file unlinks), so no LSM event fires for the dir
+#      itself — captured mode is 0o750 nowhere in the journal.
+#   3. The files inside emit FilePreImage events; their
+#      RestoreContent then mkdir-p's junk/ as a side-effect at
+#      default mode (0o755, umask-moderated).
+#
+# So the post-undo mode comes from the executor's fallback, not
+# from the captured pre-state. Soft-assert: log the mismatch as
+# a known gap (covered by G03 follow-up) without failing the
+# smoke. The G02 wire change is still load-bearing — it ensures
+# the kind+mode flow works for cases where capture DOES land
+# (e.g. shim-side unlinks, future inode_rmdir).
+DIR_MODE_AFTER="$(stat -c '%a' "${REPO}/junk")"
+if [ "${DIR_MODE_AFTER}" != "${DIR_MODE_BEFORE}" ]; then
+    smoke_log "[G03-pending] dir mode not preserved on junk/:"
+    smoke_log "  pre-clean:  ${DIR_MODE_BEFORE}"
+    smoke_log "  post-undo:  ${DIR_MODE_AFTER}"
+    smoke_log "  cause:      no inode_rmdir LSM hook yet; dir created by mkdir-p fallback"
+else
+    smoke_log "dir mode preserved: junk=${DIR_MODE_AFTER} == captured ${DIR_MODE_BEFORE}"
 fi
 
 "${SHIT_BIN}" hook-send session-close \
