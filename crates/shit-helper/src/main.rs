@@ -1140,6 +1140,9 @@ fn boot_ebpf_lsm(
     loader
         .load_lsm_link()
         .map_err(|e| anyhow::anyhow!("load_lsm_link failed: {e}"))?;
+    loader
+        .load_lsm_rmdir()
+        .map_err(|e| anyhow::anyhow!("load_lsm_rmdir failed: {e}"))?;
     let unlink_rb = loader.take_unlink_ringbuf().ok_or_else(|| {
         anyhow::anyhow!("take_unlink_ringbuf returned None after successful load")
     })?;
@@ -1164,6 +1167,9 @@ fn boot_ebpf_lsm(
     let link_rb = loader
         .take_link_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_link_ringbuf returned None after successful load"))?;
+    let rmdir_rb = loader
+        .take_rmdir_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_rmdir_ringbuf returned None after successful load"))?;
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
 
@@ -1195,9 +1201,10 @@ fn boot_ebpf_lsm(
     // reuse spawn_create so they route through the on_create sink.
     let symlink_reader = ebpf::LsmReader::spawn_create(symlink_rb, Arc::clone(&sink), idle);
     let link_reader = ebpf::LsmReader::spawn_create(link_rb, Arc::clone(&sink), idle);
+    let rmdir_reader = ebpf::LsmReader::spawn_rmdir(rmdir_rb, Arc::clone(&sink), idle);
 
     tracing::info!(
-        "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link"
+        "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link + rmdir"
     );
     Ok(LsmCaptureState {
         _readers: vec![
@@ -1209,6 +1216,7 @@ fn boot_ebpf_lsm(
             rename_reader,
             symlink_reader,
             link_reader,
+            rmdir_reader,
         ],
         _loader: loader,
         dispatch: LsmDispatch { tree, runtime },

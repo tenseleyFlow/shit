@@ -659,6 +659,80 @@ impl LinuxCaptureRuntime {
         );
     }
 
+    /// G03 — handler for `lsm/inode_rmdir` events.
+    ///
+    /// Emits a `TreeOpWire::Unlink { kind: Directory, mode: <captured> }`
+    /// so the planner's RecreatePath inverse restores the dir at its
+    /// original mode instead of mkdir-p's umask-moderated 0o755.
+    ///
+    /// Dirs have no content, so unlike `handle_lsm_unlink` we do NOT
+    /// emit a CapturedPreImage — only the tree-shape event. The
+    /// captured mode arrives via the BPF program reading
+    /// `dentry->d_inode->i_mode` at hook-fire time (before the kernel
+    /// commits the rmdir).
+    ///
+    /// `ev.mode` carries both S_IFDIR and the permission bits; mask
+    /// off the file-type bits since the wire's `kind` field already
+    /// encodes Directory.
+    pub fn handle_lsm_rmdir(&mut self, ev: &LsmRmdirView<'_>) {
+        let ws = self.watches.entry(ev.command).or_default();
+
+        let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
+
+        let Some(resolved_path) = resolve_via_parent(
+            &ws.dir_paths,
+            ev_dev_userspace,
+            ev.parent_inode,
+            ev.basename,
+        ) else {
+            tracing::warn!(
+                pid = ev.pid,
+                parent_inode = ev.parent_inode,
+                basename = ev.basename,
+                "lsm rmdir: parent_inode not in dir_paths; dropping event"
+            );
+            return;
+        };
+
+        // Mask off S_IFMT (file-type bits); the wire's kind field
+        // encodes Directory separately. 0o7777 covers setuid/setgid/
+        // sticky + the 9 permission bits — everything mkdir(2) accepts.
+        let mode = ev.mode & 0o7777;
+
+        let resp = HelperResponse::TreeMutation {
+            session: ev.command.session,
+            seq: ev.command.seq,
+            op: shit_proto::TreeOpWire::Unlink {
+                dev: ev_dev_userspace,
+                inode: ev.inode,
+                path: path_to_string(std::path::Path::new(&resolved_path)),
+                kind: shit_proto::FileKindWire::Directory,
+                mode,
+            },
+            ts_unix_nanos: now_unix_nanos(),
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "lsm rmdir send_response failed");
+        }
+
+        // Drop the dir's path mapping. Subsequent events for the same
+        // (dev, inode) under a recreated dir at the same path must
+        // re-resolve via a fresh mkdir LSM event.
+        ws.dir_paths.remove(&(ev_dev_userspace, ev.inode));
+
+        tracing::info!(
+            session = %ev.command.session,
+            seq = ev.command.seq,
+            pid = ev.pid,
+            dev = ev_dev_userspace,
+            inode = ev.inode,
+            mode = format_args!("{:o}", mode),
+            basename = ev.basename,
+            path = %resolved_path,
+            "lsm-rmdir TreeMutation sent",
+        );
+    }
+
     /// L04 phase 3 — handler for `lsm/inode_setattr` events. Captures
     /// the pre-change metadata (mode/uid/gid) reported by the BPF
     /// program. The file content is re-read from the pre-opened fd
@@ -1577,6 +1651,22 @@ pub struct LsmRenameView<'a> {
     pub new_parent_inode: u64,
     pub old_basename: &'a str,
     pub new_basename: &'a str,
+}
+
+/// G03 — View into an `lsm/inode_rmdir` event. Captures the
+/// pre-removal dir mode so the planner restores the real mode on
+/// undo instead of mkdir-p's umask-moderated default. `mode` here
+/// still carries S_IFDIR; the handler masks it off before passing
+/// it to the wire (the wire's `kind` field encodes Directory).
+#[derive(Debug, Clone, Copy)]
+pub struct LsmRmdirView<'a> {
+    pub command: CommandId,
+    pub pid: u32,
+    pub dev: u64,
+    pub inode: u64,
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub basename: &'a str,
 }
 
 /// Decide whether the producer should emit a pre-image capture for
