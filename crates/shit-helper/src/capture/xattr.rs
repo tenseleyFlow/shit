@@ -25,6 +25,15 @@ use std::os::fd::RawFd;
 /// xattr support on the filesystem (UFS without UFS2, tmpfs without
 /// xattr enable) yields an empty map rather than a capture failure.
 pub fn read_user_xattrs(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
+    // NOTE (W09.21 / capsicum-default-on interaction): on FreeBSD with
+    // cap_enter active (B05 default), `extattr_*_fd` returns no
+    // attributes on tracked fds even when the file has them — capsicum
+    // does not include CAP_EXTATTR_* in the implicit rights of an
+    // O_RDONLY-opened fd. Fix path is to cap_rights_limit each
+    // subtree fd with CAP_EXTATTR_GET|LIST|SET|DELETE, or to open
+    // fds before cap_enter with rights explicitly carried in. Until
+    // then xattr capture is a no-op when capsicum is active; the
+    // smoke validates the round-trip with SHIT_CAPSICUM=0.
     #[cfg(target_os = "freebsd")]
     {
         freebsd::read(fd)
