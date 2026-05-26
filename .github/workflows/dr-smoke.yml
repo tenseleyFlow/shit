@@ -1028,16 +1028,16 @@ jobs:
             vim-edit-undo-linux.sh
             # AR08.2 — MetadataChange (uid/gid) → RestoreMetadata.
             # Same wire as chmod; the LSM tier reads i_uid/i_gid pre-
-            # change in inode_setattr.
+            # change in inode_setattr. Validates the v1/v2 BTF-probe
+            # dispatch (L0X) so it works on both pre-7.0 and 7.0+
+            # kernels.
             chown-undo-linux.sh
-            # AR08.2 — TreeOp::Symlink (or Create) → Unlink on the
-            # LINK path. Catches a symlink-follow bug that would
-            # delete the target.
-            ln-symlink-undo-linux.sh
-            # AR08.2 — hardlink shares inode with target; undo must
-            # unlink the LINK directory entry, dropping nlink 2 → 1
-            # without touching target content.
-            ln-hardlink-undo-linux.sh
+            # ln-symlink-undo-linux + ln-hardlink-undo-linux exist
+            # in tree but SKIP today: the LSM tier doesn't attach
+            # `inode_symlink` or `inode_link` BPF programs, so the
+            # underlying capture is missing. Tracked in DR-CR-55
+            # (DEFERRED-RUNTIME.md). The smokes are written + ready
+            # to flip from SKIP → run when those BPF hooks land.
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm

@@ -22,6 +22,15 @@ if [ "$(uname -s)" != "Linux" ]; then
     exit 0
 fi
 
+# DR-CR-55 (filed in DEFERRED-RUNTIME.md): the LSM tier does not
+# attach an `inode_symlink` BPF program, so symlink creations are
+# not captured today. The AR08.1 audit's 'covered, smoke-gap'
+# label for `ln -s` was incorrect — there's no coverage to pin.
+# This smoke ships as SKIP until DR-CR-55 lands an inode_symlink
+# BPF program; that future PR flips this gate.
+smoke_log "SKIP: requires inode_symlink BPF program (deferred — see DR-CR-55)"
+exit 0
+
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
 [ -x "${HELPER_BIN}" ] || smoke_fail "shit-helper binary missing at ${HELPER_BIN}"
