@@ -33,6 +33,8 @@ mod db;
 mod ebpf;
 #[cfg(target_os = "linux")]
 mod fanotify;
+#[cfg(target_os = "macos")]
+mod fsevents;
 mod handshake;
 mod health;
 #[cfg(target_os = "linux")]
