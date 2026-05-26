@@ -33,7 +33,8 @@ pub use ctl::{
     ContainerVerbWire, CtlRequest, CtlResponse, DaemonStatus, DbConnInfo, DbEngineParseError,
     DbEngineWire, DbEventReq, DbTxStateWire, GcReport, GcRequest, MetricsSnapshot, NetEventReq,
     NetToolParseError, NetToolWire, PinRequest, PinSummary, PkgEventReq, PkgManagerParseError,
-    PkgManagerWire, PkgPhase, ProcEventReq, ProcSnapshot, ProcToolParseError, ProcToolWire,
+    PkgManagerWire, PkgPhase, PreStashRedirectError, PreStashRedirectsResult, ProcEventReq,
+    ProcSnapshot, ProcToolParseError, ProcToolWire, RedirectOpWire, RedirectTargetWire,
     SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire, UndoReportWire, UndoRequest,
 };
 pub use frame::{

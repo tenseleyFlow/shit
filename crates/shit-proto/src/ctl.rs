@@ -850,16 +850,21 @@ pub enum CtlResponse {
         ready: bool,
         reason: Option<String>,
     },
-    /// Reply to `PreStashRedirects` (AR06.5). `stashed` counts the
-    /// targets the daemon successfully hashed + journaled;
-    /// `errors` carries per-target failure messages keyed by the
-    /// target's path (so the shell can log them at debug level
-    /// without blocking the user's command). The shell ignores both
-    /// fields in the common case and just unblocks on ack.
-    PreStashRedirectsAck {
-        stashed: u32,
-        errors: Vec<PreStashRedirectError>,
-    },
+    /// Reply to `PreStashRedirects` (AR06.5). See
+    /// [`PreStashRedirectsResult`] for field semantics. The shell
+    /// hook ignores per-target errors in the common case and just
+    /// unblocks on ack — a missed pre-stash falls back to the
+    /// kernel tier rather than failing the user's command.
+    PreStashRedirectsAck(PreStashRedirectsResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreStashRedirectsResult {
+    /// Targets the daemon successfully hashed + journaled.
+    pub stashed: u32,
+    /// Per-target failure messages. Append-class targets (deferred)
+    /// land here too; not surfaced to the user.
+    pub errors: Vec<PreStashRedirectError>,
 }
 
 /// Wire form of [`shit_shell::redirect::RedirectTarget`]. Kept in
