@@ -543,15 +543,24 @@ impl PumpState {
             // paired Create's inverse (Unlink) runs first in
             // reverse-event-order; net effect restores the OLD
             // target.
-            if let Some(p) = prev
-                && let Some(old_target) = &p.symlink_target
-                && p.symlink_target != cur_entry.symlink_target
-            {
-                let child = dir_path.join(name);
-                events.push(shit_proto::TreeOpWire::SymlinkRemoved {
-                    target: old_target.clone(),
-                    path: path_to_string(&child),
-                });
+            if let Some(p) = prev {
+                tracing::info!(
+                    name = %name.to_string_lossy(),
+                    prev_inode = p.inode,
+                    cur_inode = cur_entry.inode,
+                    prev_target = ?p.symlink_target,
+                    cur_target = ?cur_entry.symlink_target,
+                    "W09.16.1 dir-diff: same-name-changed entry"
+                );
+                if let Some(old_target) = &p.symlink_target
+                    && p.symlink_target != cur_entry.symlink_target
+                {
+                    let child = dir_path.join(name);
+                    events.push(shit_proto::TreeOpWire::SymlinkRemoved {
+                        target: old_target.clone(),
+                        path: path_to_string(&child),
+                    });
+                }
             }
             // New entry, or entry with different inode at same name.
             let child = dir_path.join(name);
