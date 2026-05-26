@@ -1391,6 +1391,12 @@ jobs:
                     kill-proc-undo-fbsd.sh \
                     capsicum-default-on-fbsd.sh \
                     git-commit-undo-fbsd.sh \
+                    git-reset-hard-undo-fbsd.sh \
+                    git-checkout-file-undo-fbsd.sh \
+                    git-stash-drop-undo-fbsd.sh \
+                    git-branch-D-undo-fbsd.sh \
+                    git-clean-fd-undo-fbsd.sh \
+                    git-checkout-branch-undo-fbsd.sh \
                     vim-edit-undo-fbsd.sh \
                     cp-recursive-undo-fbsd.sh \
                     sed-inline-undo-fbsd.sh \
