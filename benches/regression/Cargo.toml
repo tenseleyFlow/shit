@@ -65,6 +65,12 @@ path = "src/bin/hook_helper.rs"
 name = "kqueue-drain-bench"
 path = "src/bin/kqueue_drain.rs"
 
+# B07 — budget gate. Compares a bench JSON against tools/perf/budgets.toml;
+# exits non-zero on breach.
+[[bin]]
+name = "gate"
+path = "src/bin/gate.rs"
+
 # Linux-only fanotify-perm responder workload. The bin exists on all
 # platforms (builds with an `eprintln!("not Linux") + exit 0` stub)
 # so CI workflows can invoke it unconditionally; the real measurement
@@ -84,6 +90,8 @@ anyhow = { workspace = true }
 shit-proto = { workspace = true }
 uuid = { workspace = true }
 tempfile = "3.10"
+# B07 — gate bin reads budgets.toml.
+toml = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
