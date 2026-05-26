@@ -47,6 +47,7 @@ pub async fn serve(
     active: Arc<ActiveCommands>,
     helper_link: Option<Arc<HelperLink>>,
     watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
+    live_baseline: Arc<crate::baseline::LiveBaseline>,
 ) -> anyhow::Result<()> {
     let env_filter = cfg.env.filter();
     if let Some(parent) = cfg.hook_socket_path.parent() {
@@ -93,7 +94,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index, &env_stash, &shell_state_stash, &env_filter, &active, helper_link.as_deref(), watch_ready.as_deref());
+                                handle(msg, &index, &env_stash, &shell_state_stash, &env_filter, &active, helper_link.as_deref(), watch_ready.as_deref(), live_baseline.as_ref());
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -131,6 +132,7 @@ fn handle(
     active: &ActiveCommands,
     helper_link: Option<&HelperLink>,
     watch_ready: Option<&crate::watch_ready::WatchReadyMap>,
+    live_baseline: &crate::baseline::LiveBaseline,
 ) {
     let session = msg.session();
     let kind = msg.kind();
@@ -239,6 +241,15 @@ fn handle(
                 if let Err(e) = index.put_command(&existing) {
                     warn!(err = %e, "put_command (post) failed");
                 }
+                // W09.21.1 — daemon-side xattr post-sweep. The
+                // helper can't observe xattr changes under
+                // cap_enter (extattr_*_fd blocked at the syscall
+                // level), so the daemon does a final diff between
+                // LiveBaseline's cached xattrs and the on-disk
+                // state, journaling MetadataChange events for any
+                // path whose user-namespace xattrs drifted. See
+                // `xattr::post_exec_sweep` for the why.
+                crate::xattr::post_exec_sweep(&existing.cwd, command, live_baseline, index);
             }
             // S24.C: tell the helper to stop watching this command's
             // tree. CapturedPreImage events for this (session, seq)

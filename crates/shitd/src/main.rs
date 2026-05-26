@@ -31,6 +31,7 @@ mod svc_track;
 mod telemetry;
 mod tracing_ring_layer;
 mod watch_ready;
+mod xattr;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -412,6 +413,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // readiness map when there's a helper, so PostExec's forget()
     // is a no-op in degraded mode.
     let watch_ready_for_server = helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready));
+    let live_baseline_for_server = Arc::clone(&live_baseline);
     let result = tokio::select! {
         r = server::serve(
             cfg,
@@ -422,6 +424,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             active_for_server,
             helper_link_for_server,
             watch_ready_for_server,
+            live_baseline_for_server,
         ) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
