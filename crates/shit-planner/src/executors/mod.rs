@@ -24,6 +24,7 @@ pub mod process;
 pub mod services;
 pub mod shell_state;
 pub mod terraform;
+pub mod xattr;
 
 pub use aws::{AwsExecutor, AwsRunner, SystemAwsRunner};
 pub use container::{ContainerExecutor, ContainerRunner, SystemContainerRunner};
