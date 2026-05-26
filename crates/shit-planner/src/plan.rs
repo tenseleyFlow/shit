@@ -527,29 +527,24 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             .get(&parent.to_path_buf())
             .map(|s| s.len())
             .unwrap_or(0);
-        // Unlinks WITHOUT a captured pre-image are almost always
-        // directory removals (`shutil.rmtree` calls
-        // `unlinkat(.., AT_REMOVEDIR)`; our shim emits an Unlink
-        // event but `symlink_metadata.is_file()` returns false on
-        // dirs, so no pre-image). Recreating those via
-        // RecreatePath needs the parent to exist; with the parent
-        // gone it'd ENOENT-cascade. Single-entry dir-Unlinks
-        // qualify as orphan even without a cluster of siblings.
-        let is_unlink_without_preimage = unlinks.contains(p) && !pre_images.contains(p);
-        // Ancestor-chain-gone heuristic: when the GRANDPARENT
-        // also doesn't exist, the path lives in a transient
-        // subtree that the user's tool nuked top-down. This
-        // catches pip's `/tmp/pip-build-tracker-X/<hex>` and
-        // `/tmp/pip-ephem-wheel-cache-X/wheels/.../foo.whl`
-        // singletons where the cluster-of-siblings heuristic
-        // misses (one file per deep tmpdir).
-        let grandparent_gone = parent
-            .parent()
-            .map(|gp| !gp.as_os_str().is_empty() && probe.stat(gp).is_none())
-            .unwrap_or(false);
-        if cluster < 2 && !is_unlink_without_preimage && !grandparent_gone {
-            continue;
-        }
+        // At this point: path is gone AND parent is gone. That's
+        // sufficient signal for "transient" — the user's tool
+        // both wrote to this path AND tore down the directory
+        // tree around it. The cluster/grandparent variants we
+        // tried previously left singleton cases like pip's
+        // `/tmp/pip-build-tracker-X/<hex>` un-classified, where
+        // pip writes one tracker file under a unique tmpdir then
+        // `rmtree`s the whole dir. The simpler rule covers them.
+        //
+        // For the legitimate `rm /important/file.txt` case in
+        // production, the parent dir typically still exists (the
+        // user removed the file but not the directory), so this
+        // check exits at the `probe.stat(parent).is_some()` guard
+        // above and we fall through to the existing
+        // Missing-conflict path. When BOTH file AND its parent
+        // are gone, restoring is moot — there's no consistent
+        // tree to restore into.
+        let _ = (cluster, unlinks.contains(p) && !pre_images.contains(p));
         // Parent has its own create/rename-to event somewhere in
         // the plan → not orphan; the inverse for that event will
         // handle parent existence.
@@ -2659,14 +2654,20 @@ mod tests {
     }
 
     #[test]
-    fn orphan_parent_single_isolated_stays_missing_conflict() {
-        // DR-CR-54.B counter-test — a single isolated captured
-        // path with a missing parent BUT existing grandparent
-        // (the typical `rm /tmp/lonely/file.txt` shape where
-        // /tmp exists) must still emit the Missing-conflict plan
-        // node so the user gets actionable feedback. Only when
-        // the ancestor chain is gone too do we sweep into
-        // transient.
+    fn orphan_parent_path_and_parent_both_gone_classifies_as_transient() {
+        // DR-CR-54.B — when BOTH the captured path AND its
+        // immediate parent are gone at undo time, the user's
+        // tool tore down the surrounding tree. There's no
+        // consistent state to restore into. Sweep to transient
+        // so the orchestrator doesn't ENOENT-cascade on a
+        // doomed RecreatePath.
+        //
+        // The legitimate `rm /tmp/lonely/file.txt` case where
+        // the user wants a Missing-conflict still works as
+        // before: /tmp/lonely typically remains on disk, the
+        // parent-exists check at the top of the orphan filter
+        // exits early, and the existing Missing-conflict path
+        // emits the node.
         let mut probe = InMemoryProbe::new();
         probe.insert(
             PathBuf::from("/tmp"),
@@ -2696,9 +2697,11 @@ mod tests {
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
-        assert!(
-            !p.nodes.is_empty(),
-            "single-isolated orphan should still emit a plan node (Missing conflict); got 0"
+        assert_eq!(
+            p.nodes.len(),
+            0,
+            "path-gone + parent-gone should classify as transient (0 plan nodes); got: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
     }
 
