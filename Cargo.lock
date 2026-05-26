@@ -1787,6 +1787,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "shit-helper",
  "shit-proto",
  "tempfile",
  "toml",

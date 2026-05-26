@@ -59,3 +59,18 @@ kind = "throughput"
 p50_us = 4_000
 p99_us = 6_400
 fail_at_p99_us = 12_800
+
+[[gate]]
+name = "per-event-capture"
+description = "kqueue::capture::read_pre_image on a 64 KiB pre-image"
+kind = "latency"
+# B07.6: per-event pre-image read. read_pre_image is fundamentally
+# a pread(2) loop; on a healthy host it's microseconds (shit-fbsd
+# measured ~3µs median at 64KB). Sprint budget targets the full
+# "pre-image + SCM_RIGHTS upload" pair; our bench measures only
+# the read, so we sit far under. Budget kept at sprint-spec
+# values to catch catastrophic regressions (e.g. accidental
+# sync flush, blocking copy).
+p50_us = 5_000
+p99_us = 25_000
+fail_at_p99_us = 50_000

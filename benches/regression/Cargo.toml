@@ -65,6 +65,12 @@ path = "src/bin/hook_helper.rs"
 name = "kqueue-drain-bench"
 path = "src/bin/kqueue_drain.rs"
 
+# B07.6 — per-event pre-image read latency. FreeBSD-only inner via
+# shit_helper lib facade; cross-platform stub elsewhere.
+[[bin]]
+name = "per-event-capture-bench"
+path = "src/bin/per_event_capture.rs"
+
 # B07 — budget gate. Compares a bench JSON against tools/perf/budgets.toml;
 # exits non-zero on breach.
 [[bin]]
@@ -103,5 +109,8 @@ tempfile = "3.10"
 blake3 = { workspace = true }
 
 # B07 kqueue-drain bench drives EVFILT_VNODE directly via libc.
+# B07.6 per-event-capture bench links shit-helper's lib facade to
+# call read_pre_image without spawning the helper.
 [target.'cfg(target_os = "freebsd")'.dependencies]
 libc = { workspace = true }
+shit-helper = { workspace = true }

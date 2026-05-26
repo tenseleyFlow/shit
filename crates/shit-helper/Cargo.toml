@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# B07.6 — small library surface exposing the bench-relevant pieces
+# (kqueue::capture::{read_pre_image, stream_copy_to_staging,
+# CaptureError}) so the perf-regression bench can measure the real
+# hot path without spawning the full helper. main.rs remains the
+# canonical entry point; the lib is a deliberately minimal facade.
+[lib]
+name = "shit_helper"
+path = "src/lib.rs"
+
 [[bin]]
 name = "shit-helper"
 path = "src/main.rs"

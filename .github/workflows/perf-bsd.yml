@@ -93,6 +93,14 @@ jobs:
               --input target/bench/kqueue-drain.json \
               --budgets tools/perf/budgets.toml
 
+            echo "===== per-event-capture (latency) ====="
+            ./target/release/per-event-capture-bench --n 1000 --warmup 50 \
+              --out target/bench/per-event-capture.json
+            cat target/bench/per-event-capture.json
+            ./target/release/gate --gate per-event-capture \
+              --input target/bench/per-event-capture.json \
+              --budgets tools/perf/budgets.toml
+
       # NOTE: artifact upload of target/bench/*.json would require
       # syncing files out of the FreeBSD VM. For now the gate log
       # output (cat <json> + gate verdict) is the durable record.
