@@ -65,8 +65,8 @@ const PROFILE: &str = r#"(version 1)
 "#;
 
 pub fn enter(state_dir: &Path) -> anyhow::Result<()> {
-    let profile = CString::new(PROFILE)
-        .map_err(|e| anyhow::anyhow!("profile contains interior NUL: {e}"))?;
+    let profile =
+        CString::new(PROFILE).map_err(|e| anyhow::anyhow!("profile contains interior NUL: {e}"))?;
 
     // The STATE_DIR parameter is unused by the M01 profile body but
     // we still pass it so the parameter-array shape matches what M03
@@ -79,9 +79,8 @@ pub fn enter(state_dir: &Path) -> anyhow::Result<()> {
     let params: [*const c_char; 3] = [key.as_ptr(), value.as_ptr(), ptr::null()];
 
     let mut errbuf: *mut c_char = ptr::null_mut();
-    let rc = unsafe {
-        sandbox_init_with_parameters(profile.as_ptr(), 0, params.as_ptr(), &mut errbuf)
-    };
+    let rc =
+        unsafe { sandbox_init_with_parameters(profile.as_ptr(), 0, params.as_ptr(), &mut errbuf) };
 
     if rc != 0 {
         let msg = if errbuf.is_null() {
