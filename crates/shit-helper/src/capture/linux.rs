@@ -566,15 +566,33 @@ impl LinuxCaptureRuntime {
         //     against rare reuse.
         // `capture_dev` is glibc-encoded (from fstat); compare against
         // the converted ev_dev_userspace, not the raw kernel dev.
+        //
+        // G03 — directory variant. The inode_rmdir hook routes here
+        // with `is_directory: true`. We treat file_type==Directory
+        // as the validation target instead of Regular, AND we skip
+        // content capture (dirs have no bytes). The `meta_wire`
+        // still carries mode/uid/gid so the daemon's marker-only
+        // path emits TreeOp::Unlink with the right kind+mode for
+        // the planner's RecreatePath inverse.
+        let expected_type = if ev.is_directory {
+            FileType::Directory
+        } else {
+            FileType::Regular
+        };
         let race_won = capture_fd_owned.is_some()
             && capture_dev == ev_dev_userspace
             && capture_inode == ev.inode
-            && file_type == FileType::Regular;
+            && file_type == expected_type;
         let race_fd = capture_fd_owned;
         // Alias to keep the wire-build block below readable.
         let _ = (capture_dev, capture_inode);
 
-        let (stored_bytes, blob_hash, staging_fd, meta_wire) = if race_won {
+        let (stored_bytes, blob_hash, staging_fd, meta_wire) = if race_won && ev.is_directory {
+            // G03 — dir capture: fstat for metadata only, no bytes.
+            let fd = race_fd.as_ref().unwrap().as_raw_fd();
+            let meta = fstat_meta(fd);
+            (0, [0u8; 32], None, meta)
+        } else if race_won {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
             match (read_pre_image(fd), fstat_meta(fd)) {
                 (Ok(bytes), Some(meta)) => {
@@ -599,6 +617,7 @@ impl LinuxCaptureRuntime {
                 dev = ev.dev,
                 inode = ev.inode,
                 basename = ev.basename,
+                is_directory = ev.is_directory,
                 "lsm unlink race lost — marker-only CapturedPreImage"
             );
             (0, [0u8; 32], None, None)
@@ -1412,6 +1431,23 @@ fn pre_open_recurse(
                 continue;
             }
             ws.dir_paths.insert((meta.dev(), meta.ino()), path.clone());
+            // G03 — also stash an O_PATH fd for the dir in pre_opens
+            // so a subsequent inode_rmdir can race-win via the held
+            // fd (the dentry vanishes post-rmdir; without a pinned
+            // fd, fstat-by-path returns ENOENT and we lose the
+            // captured mode). O_PATH doesn't require read perm and
+            // works with fstat for metadata.
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                ws.pre_opens
+                    .insert((meta.dev(), meta.ino()), OwnedFd::from(f));
+                ws.path_to_inode
+                    .insert(path.clone(), (meta.dev(), meta.ino()));
+                *opened += 1;
+            }
             pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
             continue;
         }
@@ -1501,6 +1537,13 @@ pub struct LsmUnlinkView<'a> {
     pub inode: u64,
     pub parent_inode: u64,
     pub basename: &'a str,
+    /// G03 — set when this event came from the `inode_rmdir` LSM
+    /// hook rather than `inode_unlink`. The handler skips bytes-
+    /// capture (directories have no content) and emits a marker
+    /// CapturedPreImage with the dir's mode so the daemon's
+    /// kind_from_mode_bits derives `Directory` and the planner's
+    /// RecreatePath emits the right inverse.
+    pub is_directory: bool,
 }
 
 /// View into an `lsm/inode_setattr` event as the BPF ringbuf reader
@@ -1985,6 +2028,7 @@ mod tests {
             inode,
             parent_inode: 0,
             basename,
+            is_directory: false,
         };
 
         rt.handle_lsm_unlink(&view);
@@ -2016,6 +2060,7 @@ mod tests {
             inode: 0xcafe_babe,
             parent_inode: 0,
             basename: "this-file-does-not-exist-anywhere.xyz",
+            is_directory: false,
         };
 
         rt.handle_lsm_unlink(&view);
