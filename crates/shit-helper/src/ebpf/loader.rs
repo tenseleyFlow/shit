@@ -75,6 +75,12 @@ const INODE_SYMLINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_symlink.b
 /// the target inode's nlink drops 2 → 1 as a side effect.
 const INODE_LINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_link.bpf.o");
 
+/// G03 — BPF object containing the `lsm/inode_rmdir` LSM hook.
+/// Carries the about-to-be-removed dir's `mode` (kind+permission
+/// bits) so the planner's RecreatePath restores the original mode
+/// instead of mkdir-p's umask-moderated default.
+const INODE_RMDIR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_rmdir.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
@@ -85,6 +91,7 @@ const LSM_HOOK_FILE_OPEN: &str = "file_open";
 const LSM_HOOK_INODE_RENAME: &str = "inode_rename";
 const LSM_HOOK_INODE_SYMLINK: &str = "inode_symlink";
 const LSM_HOOK_INODE_LINK: &str = "inode_link";
+const LSM_HOOK_INODE_RMDIR: &str = "inode_rmdir";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
@@ -105,6 +112,7 @@ const LSM_PROG_FILE_OPEN: &str = "shit_file_open";
 const LSM_PROG_INODE_RENAME: &str = "shit_inode_rename";
 const LSM_PROG_INODE_SYMLINK: &str = "shit_inode_symlink";
 const LSM_PROG_INODE_LINK: &str = "shit_inode_link";
+const LSM_PROG_INODE_RMDIR: &str = "shit_inode_rmdir";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
@@ -117,6 +125,7 @@ const RINGBUF_OPEN_EVENTS: &str = "open_events";
 const RINGBUF_RENAME_EVENTS: &str = "rename_events";
 const RINGBUF_SYMLINK_EVENTS: &str = "symlink_events";
 const RINGBUF_LINK_EVENTS: &str = "link_events";
+const RINGBUF_RMDIR_EVENTS: &str = "rmdir_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -169,6 +178,7 @@ pub struct EbpfLoader {
     rename_bpf: Option<aya::Ebpf>,
     symlink_bpf: Option<aya::Ebpf>,
     link_bpf: Option<aya::Ebpf>,
+    rmdir_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -198,6 +208,7 @@ impl EbpfLoader {
             rename_bpf: None,
             symlink_bpf: None,
             link_bpf: None,
+            rmdir_bpf: None,
         }
     }
 
@@ -525,6 +536,63 @@ impl EbpfLoader {
     pub fn take_mkdir_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.mkdir_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_MKDIR_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// G03 — Load + attach the `lsm/inode_rmdir` program. Carries
+    /// the pre-removal dir mode so the planner's RecreatePath
+    /// restores the real mode instead of mkdir-p's umask default.
+    pub fn load_lsm_rmdir(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.rmdir_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_rmdir: rmdir program already loaded".into(),
+            ));
+        }
+
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+
+        let aligned: Vec<u8> = INODE_RMDIR_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_rmdir): {e}")))?;
+
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_RMDIR)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_RMDIR}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+
+        prog.load(LSM_HOOK_INODE_RMDIR, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_RMDIR}): {e}")))?;
+
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+
+        tracing::info!(
+            hook = LSM_HOOK_INODE_RMDIR,
+            prog = LSM_PROG_INODE_RMDIR,
+            ringbuf = RINGBUF_RMDIR_EVENTS,
+            "ebpf-lsm inode_rmdir loaded and attached"
+        );
+        self.rmdir_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// G03 — Take the `rmdir_events` ringbuf.
+    pub fn take_rmdir_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.rmdir_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_RMDIR_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
     }
 
