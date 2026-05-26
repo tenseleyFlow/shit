@@ -78,6 +78,14 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         | InverseOp::FileExtend { path, .. } => {
             out.push(TouchKey::Path(path.clone()));
         }
+        // W09.20 — CreateHardlink touches both endpoints. `source`
+        // is the live alias (we read its inode); `target` is where
+        // we create the new link. Serialize against any concurrent
+        // op on either.
+        InverseOp::CreateHardlink { source, target } => {
+            out.push(TouchKey::Path(source.clone()));
+            out.push(TouchKey::Path(target.clone()));
+        }
         // Env / package / network / systemd / process / db ops are
         // informational or system-wide; they don't compete on a path
         // or inode within the file tier. We deliberately don't

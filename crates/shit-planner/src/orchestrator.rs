@@ -388,6 +388,24 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                     None
                 }
             }
+            // W09.20 — CreateHardlink needs source LIVE (we read its
+            // inode) and target ABSENT (we create it). Missing source
+            // is a hard failure; existing target is Phantom.
+            InverseOp::CreateHardlink { source, target } => {
+                if !self.probe.exists(source) {
+                    Some(Conflict::Missing {
+                        detail: format!(
+                            "hardlink source {source:?} no longer exists; cannot link {target:?}"
+                        ),
+                    })
+                } else if self.probe.exists(target) {
+                    Some(Conflict::Phantom {
+                        detail: format!("{target:?} already exists; cannot link"),
+                    })
+                } else {
+                    None
+                }
+            }
             InverseOp::Rename { from, to } => {
                 if !self.probe.exists(from) {
                     Some(Conflict::Missing {
