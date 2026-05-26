@@ -784,6 +784,10 @@ fn handle_tree_mutation(
             target,
             path: std::path::PathBuf::from(path),
         },
+        TreeOpWire::SymlinkRemoved { target, path } => TreeOp::SymlinkRemoved {
+            target,
+            path: std::path::PathBuf::from(path),
+        },
     };
 
     let ts = crate::server::next_ts();
