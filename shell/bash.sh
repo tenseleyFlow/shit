@@ -56,6 +56,24 @@ __shit_pre() {
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # AR06.5 — synchronous pre-stash for stream-redirect targets in
+    # the about-to-run command. Runs AFTER pre-exec so the daemon
+    # has the command record by the time the FilePreImage event
+    # arrives, and BEFORE bash's open(O_TRUNC) so the original
+    # content gets captured. The shit subcommand parses
+    # $BASH_COMMAND, fast-paths no-redirect lines (no socket touch),
+    # and degrades quietly on daemon-down. Per-target errors land
+    # in our stderr at debug volume but never fail the hook.
+    case "${BASH_COMMAND}" in
+        *">"*|*"|"*|*"of="*)
+            "$_SHIT_BIN" hook-send pre-exec-redirects \
+                --session "$_SHIT_SESSION" \
+                --seq "$_SHIT_SEQ" \
+                --cmdline "$BASH_COMMAND" \
+                --sock "$_SHIT_SOCK" \
+                >/dev/null 2>&1 || true
+            ;;
+    esac
     # S15: opt-in env tracking. Off by default until daemon ingestion
     # lands. `env -0` is GNU coreutils + BSD `env` ≥2024; on legacy
     # systems users get a fallback via `printenv` (not -0-safe for
