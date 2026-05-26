@@ -528,17 +528,24 @@ impl PumpState {
                 continue;
             }
             // W09.16.1 — `ln -sf newtarget existing_link`: the OLD
-            // symlink got unlinked (inode freed) and a new symlink
-            // with a different inode took its place at the same
-            // name. Emit `SymlinkRemoved` carrying the OLD target
-            // BEFORE the `Create` for the new symlink — the planner
-            // inverts SymlinkRemoved as `CreateSymlink { target:
-            // old_target, path }` and Create's inverse is Unlink;
-            // reverse-event-order means the new symlink gets
-            // unlinked first, then the old one is recreated.
+            // symlink got unlinked and a new symlink took its place
+            // at the same name. The OS may or may not reuse the
+            // freed st_ino for the new symlink; we can't depend on
+            // inode change to detect the replacement (FreeBSD 14.2's
+            // ZFS reuses the freed inode in tight succession,
+            // leaving the entry's (dev, inode) identical pre- and
+            // post-replacement — surfaced via CI on the W09.16.1 PR).
+            // Emit `SymlinkRemoved` whenever the old entry was a
+            // symlink AND its target differs from the new one — the
+            // target string is the load-bearing signal, not the
+            // inode. The planner inverts SymlinkRemoved as
+            // `CreateSymlink { target: old_target, path }` and the
+            // paired Create's inverse (Unlink) runs first in
+            // reverse-event-order; net effect restores the OLD
+            // target.
             if let Some(p) = prev
                 && let Some(old_target) = &p.symlink_target
-                && (p.dev != cur_entry.dev || p.inode != cur_entry.inode)
+                && p.symlink_target != cur_entry.symlink_target
             {
                 let child = dir_path.join(name);
                 events.push(shit_proto::TreeOpWire::SymlinkRemoved {
