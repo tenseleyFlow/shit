@@ -367,8 +367,20 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
     /// annotations on `PlanNode.conflict`.
     fn precondition_conflict(&self, op: &InverseOp) -> Option<Conflict> {
         match op {
-            InverseOp::RestoreContent { path, .. }
-            | InverseOp::RestoreMetadata { path, .. }
+            // G01.3: RestoreContent does not require the target to
+            // exist — its executor writes a tmpfile in the parent
+            // dir and renames it into place, creating the target
+            // if it isn't there. Stripping the existence check
+            // unblocks the `git stash drop` shape where git
+            // deletes `.git/refs/stash` + `.git/logs/refs/stash`
+            // entirely after rewriting them. As long as the
+            // PARENT exists, the executor can succeed; if the
+            // parent is gone the executor returns its own
+            // ENOENT-with-context as Failed (which is the right
+            // signal — a true precondition violation, not a
+            // recoverable gap).
+            InverseOp::RestoreContent { .. } => None,
+            InverseOp::RestoreMetadata { path, .. }
             | InverseOp::Unlink { path }
             | InverseOp::FileExtend { path, .. } => {
                 if self.probe.exists(path) {

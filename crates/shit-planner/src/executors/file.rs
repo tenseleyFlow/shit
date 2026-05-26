@@ -125,6 +125,17 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             .parent()
             .ok_or_else(|| format!("path {path:?} has no parent dir; cannot place tmpfile"))?;
 
+        // G01.5 — if the parent dir was removed alongside this file
+        // (e.g. `git clean -fd` rmdirs untracked directories after
+        // unlinking their contents), recreate the ancestor chain
+        // with default mode (0o755). Untracked dirs typically have
+        // default mode anyway; if a future use case needs the
+        // ORIGINAL mode we'd need to plumb kind+mode through the
+        // wire (deferred — see G01 plan).
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir -p {parent:?}: {e}"))?;
+        }
+
         // Tmpfile name: ".shit-tmp-<pid>-<ns>" alongside target so rename(2)
         // is atomic on the same filesystem. If the rename later fails
         // across mounts, that's reported back as Failed — caller should
@@ -475,6 +486,19 @@ fn recreate_path_inner(
     use std::os::unix::fs::PermissionsExt;
 
     let perm_bits = mode & 0o7777;
+    // G01.5 — mkdir -p the parent if it's gone. Same rationale as
+    // restore_content_inner: a recursive `rm -rf` (or `git clean -fd`)
+    // leaves nested files orphaned from their dir tree at undo time.
+    // Untracked / build-cache dirs typically had default mode; if the
+    // user needs the original mode of an intermediate, a future wire
+    // change to TreeOpWire::Unlink carrying kind+mode would let the
+    // planner emit dedicated dir RecreatePath ops first (deferred,
+    // see G01 plan).
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir -p {parent:?}: {e}"))?;
+    }
     match kind {
         FileKind::Regular => {
             // Create empty file; `RestoreContent` (if present in the
@@ -1097,29 +1121,34 @@ mod tests {
     }
 
     #[test]
-    fn restore_content_does_not_leave_tmpfile_on_failure() {
-        // Pointing at a dir that doesn't exist forces the tmpfile
-        // create to fail. After the call there must be no stray
-        // .shit-tmp-* alongside the target.
+    fn restore_content_recreates_missing_parent_dir() {
+        // G01.5: when the parent dir is gone (e.g. `git clean -fd`
+        // rmdir'd it after unlinking contents), RestoreContent
+        // should `mkdir -p` the chain and complete successfully.
+        // Pre-G01.5 this test asserted Failed; the new behavior is
+        // Applied because the executor recreates missing ancestors
+        // with default mode (0o755).
         let tmpdir = tempfile::tempdir().expect("tempdir");
-        let nonexistent_parent = tmpdir.path().join("no-such-dir");
+        let nonexistent_parent = tmpdir.path().join("nested-a").join("nested-b");
         let target = nonexistent_parent.join("file");
 
         let blob_hash = BlobHash::from_bytes([1; 32]);
         let mut reader = InMemoryBlobReader::new();
-        reader.insert(blob_hash, b"x".to_vec());
+        reader.insert(blob_hash, b"hello".to_vec());
 
         let executor = FileExecutor::new(&reader);
         let op = InverseOp::RestoreContent {
             inode: InodeRef::new(1, 1),
-            path: target,
+            path: target.clone(),
             blob: blob_hash,
         };
         match executor.execute(&op, false, ConflictPolicy::default()) {
-            ExecutionOutcome::Failed { .. } => {}
-            other => panic!("expected Failed, got {other:?}"),
+            ExecutionOutcome::Applied => {}
+            other => panic!("expected Applied, got {other:?}"),
         }
-        // The parent dir doesn't exist, so we can't enumerate.
-        // The test really just asserts the call didn't panic.
+        // File now exists with the expected content; parents were
+        // created.
+        let body = std::fs::read(&target).expect("read restored file");
+        assert_eq!(body, b"hello");
     }
 }

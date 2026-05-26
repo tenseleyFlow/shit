@@ -170,6 +170,13 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     // multiple names.
     let mut paths_by_inode: std::collections::HashMap<crate::inode::InodeRef, HashSet<PathBuf>> =
         std::collections::HashMap::new();
+    // G01.5 — reverse map for the W09.5 atomic-replace branch's
+    // hardlink-aware guard. When an unlinked path's captured inode
+    // is part of a multi-name group (i.e. a hardlink alias), we
+    // need to defer to the W09.20 CreateHardlink classifier
+    // instead of forcing atomic_replace.
+    let mut unlinks_with_inode: std::collections::HashMap<PathBuf, crate::inode::InodeRef> =
+        std::collections::HashMap::new();
     for ev in events {
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, .. } => {
@@ -194,6 +201,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
                         .entry(*inode)
                         .or_default()
                         .insert(path.clone());
+                    unlinks_with_inode.insert(path.clone(), *inode);
                 }
             }
             // AR01.1 follow-up: the Linux LSM `inode_rename` hook is
@@ -235,6 +243,28 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             continue;
         }
         if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
+            continue;
+        }
+        // G01.3: path GONE at undo but parent dir exists →
+        // still atomic_replace IF this is a rename destination
+        // (the `git stash drop` shape: rename overwrites a file
+        // with a captured pre-image, then later code deletes the
+        // result). RestoreContent recreates the original from the
+        // captured blob; ReverseRename + RecreatePath would fail.
+        //
+        // We deliberately do NOT extend to the pure
+        // Create+Unlink+PreImage shape (e.g. touch+echo+rm in one
+        // command). For that case the captured pre-image is the
+        // file's IN-COMMAND content — not a pre-command snapshot —
+        // and the user's expected post-undo state is "file
+        // absent", i.e. transient.
+        let is_rename_destination = rename_destinations.contains(p);
+        if is_rename_destination
+            && let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+            && probe.stat(parent).is_some()
+        {
             atomic.insert(p.clone());
         } else {
             transient.insert(p.clone());
@@ -321,13 +351,19 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     // inverse is suppressed (would race with RestoreContent or
     // create an empty file racing the restore).
     //
-    // We deliberately do NOT classify the file-gone-at-undo case
-    // here. That's the `rm foo` shape: file unlinked, not recreated.
-    // The user wants RecreatePath(foo) + RestoreContent(foo) + meta
-    // — the existing per-event inverse emission already handles it
-    // correctly (RecreatePath drops an empty file with the right
-    // mode/uid/gid, then RestoreContent overwrites with the captured
-    // bytes). Suppressing those would silently break `rm` undo.
+    // G01.3 update: we used to skip the file-gone-at-undo case
+    // here, on the theory that `rm foo` undo wanted RecreatePath
+    // (empty file with right mode) + RestoreContent (bytes) +
+    // RestoreMetadata. Now that the orchestrator's RestoreContent
+    // executor creates the target file from blob via tmpfile +
+    // rename (G01.3 orchestrator relaxation), RecreatePath is
+    // redundant and racy — RestoreContent + RestoreMetadata
+    // together create the file with correct bytes and metadata in
+    // two ops. Classifying gone-at-undo as atomic_replace
+    // suppresses the now-redundant RecreatePath (which would
+    // ConflictPhantom once RestoreContent has already created
+    // the file). Real-world trigger: `git branch -D feat`
+    // unlinks `.git/refs/heads/feat` entirely.
     for p in &unlinks {
         if !pre_images.contains(p) {
             continue;
@@ -335,9 +371,34 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         if creates.contains(p) || rename_destinations.contains(p) {
             continue;
         }
-        if probe.stat(p).is_some() {
-            atomic.insert(p.clone());
+        // G01.5: classify as atomic_replace regardless of whether
+        // path / parent exist at undo time. The executor's
+        // RestoreContent now `mkdir -p`s missing parents, so
+        // restoring a deeply nested gone-with-gone-parent file
+        // succeeds without RecreatePath. Keeping RecreatePath in
+        // the plan would race RestoreContent and ConflictPhantom
+        // (path already created by whichever fires first).
+        //
+        // EXCEPT for hardlink groups (W09.20). When the captured
+        // inode is shared with another path that's still alive at
+        // undo time, the right inverse is CreateHardlink (back to
+        // the surviving alias), NOT RestoreContent which would
+        // tmpfile+rename a fresh inode and break the alias chain.
+        // Detect by walking the unlinked path's captured inode
+        // and looking for a sibling in `paths_by_inode`. The
+        // dedicated W09.20 hardlink classifier below will then
+        // emit the CreateHardlink. If we mis-claim this as
+        // atomic_replace, the FilePreImage arm's
+        // `hardlink_dead_to_source` guard misses and we lose
+        // hardlink-aware restore.
+        let is_hardlink_dead = unlinks_with_inode
+            .get(p)
+            .and_then(|inode| paths_by_inode.get(inode))
+            .is_some_and(|siblings| siblings.len() > 1);
+        if is_hardlink_dead {
+            continue;
         }
+        atomic.insert(p.clone());
     }
     // W09.20 — hardlink classification. For each (dev, inode) group
     // with multiple paths (i.e. the original setup had a hardlink
@@ -467,15 +528,28 @@ fn emit_for_event(
             // W01.B.fix-rename-coalescing: skip the inode-match check
             // for atomic-replace paths. The captured inode IS supposed
             // to differ from what's on disk now — that's the signature.
-            // We still check existence (Missing branch) below by
-            // re-probing.
+            // We still check existence below by re-probing, but G01.3
+            // relaxes the gone-path branch: if the parent dir exists,
+            // RestoreContent can recreate the file from the captured
+            // blob (write tmpfile + rename into place is the existing
+            // executor path). Only mark Missing when the parent is
+            // gone too — that's the truly unrecoverable shape.
             let mut conflict = if atomic_replace_paths.contains(path) {
-                if probe.stat(path).is_none() {
-                    Some(Conflict::Missing {
-                        detail: format!("{} no longer exists", path.display()),
-                    })
-                } else {
+                if probe.stat(path).is_some() {
                     None
+                } else {
+                    let parent_alive = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .and_then(|p| probe.stat(p))
+                        .is_some();
+                    if parent_alive {
+                        None
+                    } else {
+                        Some(Conflict::Missing {
+                            detail: format!("{} no longer exists", path.display()),
+                        })
+                    }
                 }
             } else {
                 file_path_conflict(path, *inode, probe)
@@ -1498,8 +1572,14 @@ mod tests {
     #[test]
     fn reverse_chronological_order_puts_unlink_before_preimage() {
         // Simulate `rm foo`: T1 = FilePreImage, T2 = TreeOp::Unlink.
-        // Reverse order should put RecreatePath (from Unlink) before
-        // RestoreContent (from FilePreImage).
+        //
+        // G01.5: the planner now classifies Unlink+PreImage with no
+        // Create/Rename as atomic_replace regardless of whether the
+        // path or its parent exist at undo time. The executor's
+        // RestoreContent recreates missing parents via `mkdir -p`
+        // and creates the target via tmpfile + rename, so a
+        // dedicated RecreatePath inverse is redundant + racy.
+        // The plan is now: RestoreContent + RestoreMetadata.
         let probe = InMemoryProbe::new();
         let mut store = InMemoryStore::new();
         let inode = InodeRef::new(1, 7);
@@ -1536,9 +1616,22 @@ mod tests {
             }),
         };
         let p = plan(dummy_command(), &[pre, unlink], &probe, &store);
-        assert!(matches!(p.nodes[0].op, InverseOp::RecreatePath { .. }));
-        assert!(matches!(p.nodes[1].op, InverseOp::RestoreContent { .. }));
-        assert!(matches!(p.nodes[2].op, InverseOp::RestoreMetadata { .. }));
+        assert!(
+            matches!(p.nodes[0].op, InverseOp::RestoreContent { .. }),
+            "expected RestoreContent first; got {:?}",
+            p.nodes[0].op
+        );
+        assert!(
+            matches!(p.nodes[1].op, InverseOp::RestoreMetadata { .. }),
+            "expected RestoreMetadata second; got {:?}",
+            p.nodes.get(1).map(|n| &n.op)
+        );
+        assert_eq!(
+            p.nodes.len(),
+            2,
+            "expected exactly 2 ops (atomic-replace shape); got: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
     }
 
     #[test]
