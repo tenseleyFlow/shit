@@ -1235,6 +1235,15 @@ jobs:
             # 2 → 1 as a side effect.
             ln-symlink-undo-linux.sh
             ln-hardlink-undo-linux.sh
+            # G01 — destructive git operations. Each exercises the
+            # LSM rename + atomic-replace path under a different
+            # git workflow; all expect applied=N failed=0 conflicts=0.
+            git-reset-hard-undo-linux.sh
+            git-checkout-file-undo-linux.sh
+            git-stash-drop-undo-linux.sh
+            git-branch-D-undo-linux.sh
+            git-checkout-branch-undo-linux.sh
+            git-clean-fd-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
