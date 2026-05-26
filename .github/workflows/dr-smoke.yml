@@ -725,6 +725,60 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  set-e-undo:
+    # AR06.2 -- set -o errexit / set +o errexit toggling. Captures
+    # the opts-only diff path through the ShellStateDiff event and
+    # the planner's render_bash. Same precmd-queue plumbing as
+    # cd-undo (DR-CR-50), but with pwd held constant so opts is
+    # the only dimension that fires.
+    name: set-e-undo smoke (AR06.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/set-e-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: set-e-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  alias-undo:
+    # AR06.3 -- alias add / unalias undo. Same precmd-queue
+    # plumbing; pwd held constant so aliases is the only dimension
+    # that fires.
+    name: alias-undo smoke (AR06.3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/alias-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alias-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   dd-of-undo:
     # AR08.2 -- dd's `of=path` is a truncate-class redirect; the
     # shell-side redirect parser maps it to DdOf and pre-stashes
