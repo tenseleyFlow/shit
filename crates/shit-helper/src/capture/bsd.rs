@@ -813,7 +813,7 @@ impl PumpState {
             inode,
             path: path.as_deref().map(path_to_string),
             before: before.to_wire(),
-            after: after.to_wire(),
+            after: after.clone().to_wire(),
             ts_unix_nanos: now_nanos,
         };
         if let Err(e) = self.conn.send_response(&resp) {
