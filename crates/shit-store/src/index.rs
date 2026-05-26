@@ -707,6 +707,14 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::ShellStateDiff { .. } => Denormalized {
+            discriminant: "ShellStateDiff",
+            dev: None,
+            inode: None,
+            path: None,
+            blob_hash: None,
+            post_content_hash: None,
+        },
         K::PackageOp { .. } => Denormalized {
             discriminant: "PackageOp",
             dev: None,
