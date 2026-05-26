@@ -224,6 +224,19 @@ impl PumpState {
                 continue;
             };
             let entries = read_dir_entries(raw).unwrap_or_default();
+            // W09.16.1 CI diag — dump baseline dir entries with
+            // their symlink_target so we know if `config` is in
+            // the map at attach time.
+            for (name, e) in &entries {
+                tracing::info!(
+                    fd = raw,
+                    name = %name.to_string_lossy(),
+                    dev = e.dev,
+                    inode = e.inode,
+                    symlink_target = ?e.symlink_target,
+                    "W09.16.1 baseline entry"
+                );
+            }
             dir_baselines.insert(
                 raw,
                 DirBaseline {
@@ -514,8 +527,25 @@ impl PumpState {
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
         let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
         let mut new_dirs_to_watch: Vec<std::path::PathBuf> = Vec::new();
+        // W09.16.1 CI diag — dump current entries pre-diff.
+        for (name, e) in &current {
+            tracing::info!(
+                fd,
+                name = %name.to_string_lossy(),
+                dev = e.dev,
+                inode = e.inode,
+                symlink_target = ?e.symlink_target,
+                "W09.16.1 dir-diff current entry"
+            );
+        }
         for (name, cur_entry) in &current {
             let prev = baseline.entries.get(name);
+            tracing::info!(
+                fd,
+                name = %name.to_string_lossy(),
+                prev_some = prev.is_some(),
+                "W09.16.1 dir-diff per-iter (pre check)"
+            );
             // Unchanged entry: same (dev, inode) AND (for symlinks)
             // same target. Symlink target equality is checked because
             // `ln -sf newtarget link` allocates a NEW inode for the
