@@ -23,6 +23,7 @@ mod capsicum_bsd;
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "dragonfly",
+    target_os = "macos",
 ))]
 mod capture;
 mod cloud;
@@ -1469,6 +1470,27 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         }
     };
 
+    // M01.A: macOS FSEvents-degraded capture producer. Mirrors the
+    // BSD spawn shape. Producer is created unconditionally on macOS;
+    // the M03 ES producer will sit alongside (decided at WatchTree
+    // dispatch) once it lands.
+    #[cfg(target_os = "macos")]
+    let macos_capture: Option<capture::macos::CaptureControl> = {
+        match capture::macos::spawn(Arc::clone(&conn)) {
+            Ok((ctrl, _join)) => {
+                tracing::info!("macos fsevents capture runtime spawned");
+                Some(ctrl)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "macos fsevents capture runtime failed to start; continuing without it"
+                );
+                None
+            }
+        }
+    };
+
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
@@ -1510,6 +1532,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_bsd_capture = bsd_capture.clone();
     #[cfg(target_os = "linux")]
     let request_lsm = lsm_state.as_ref().map(|s| s.dispatch.clone());
+    #[cfg(target_os = "macos")]
+    let request_macos_capture = macos_capture.clone();
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
@@ -1524,6 +1548,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 target_os = "dragonfly",
             ))]
             request_bsd_capture,
+            #[cfg(target_os = "macos")]
+            request_macos_capture,
         )
     });
 
@@ -1575,6 +1601,16 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     ))]
     drop(bsd_capture);
 
+    // M01.A: same wind-down shape for macOS. Drop on CaptureControl
+    // closes the control channel; the FSEvents pump exits on its
+    // next iteration.
+    #[cfg(target_os = "macos")]
+    if let Some(ctrl) = &macos_capture {
+        ctrl.shutdown();
+    }
+    #[cfg(target_os = "macos")]
+    drop(macos_capture);
+
     Ok(())
 }
 
@@ -1592,6 +1628,7 @@ fn request_loop(
         target_os = "dragonfly",
     ))]
     bsd_capture: Option<capture::bsd::CaptureControl>,
+    #[cfg(target_os = "macos")] macos_capture: Option<capture::macos::CaptureControl>,
 ) -> anyhow::Result<()> {
     use shit_proto::{HelperRequest, HelperResponse};
 
@@ -1748,12 +1785,30 @@ fn request_loop(
                         "watch_tree ignored — no bsd capture (degraded)"
                     );
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_capture {
+                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        cwd_path = %cwd_path,
+                        "watch_tree dispatched to macos fsevents capture"
+                    );
+                } else {
+                    tracing::debug!(
+                        %session,
+                        command_seq,
+                        "watch_tree ignored — no macos capture (degraded)"
+                    );
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
                     target_os = "netbsd",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "macos",
                 )))]
                 {
                     let _ = (root_pid, session, command_seq, &cwd_path);
@@ -1843,12 +1898,18 @@ fn request_loop(
                     ctrl.on_unwatch_tree(session, command_seq);
                     tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_capture {
+                    ctrl.on_unwatch_tree(session, command_seq);
+                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
                     target_os = "netbsd",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "macos",
                 )))]
                 {
                     let _ = (session, command_seq);

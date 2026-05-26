@@ -51,9 +51,6 @@
 //! delivering, which unacceptably increases capture latency.
 
 #![cfg(target_os = "macos")]
-// M01.7 ships the module + its unit tests. M01.8 wires the producer
-// into capture/macos.rs and removes these allows.
-#![allow(dead_code)]
 
 use std::ffi::{CStr, c_void};
 use std::os::raw::c_char;
@@ -121,20 +118,19 @@ const K_FS_EVENT_STREAM_CREATE_FLAG_FILE_EVENTS: u32 = 0x10;
 const K_FS_EVENT_STREAM_CREATE_FLAG_IGNORE_SELF: u32 = 0x08;
 
 // Event flag bits (kFSEventStreamEventFlag*). The full enumeration is
-// in FSEvents.h. We surface the ones M01 acts on.
+// in FSEvents.h. We surface the ones M01.A acts on. Additional flags
+// (IS_FILE/IS_DIR/IS_SYMLINK/INODE_META_MOD/CHANGE_OWNER/XATTR_MOD)
+// get added back here when M02 (doctor) or a later sprint needs them
+// — deleted now per "no hypothetical future requirements."
 const FLAG_MUST_SCAN_SUBDIRS: u32 = 0x01;
 const FLAG_ROOT_CHANGED: u32 = 0x20;
 const FLAG_ITEM_CREATED: u32 = 0x100;
 const FLAG_ITEM_REMOVED: u32 = 0x200;
-const FLAG_ITEM_INODE_META_MOD: u32 = 0x400;
 const FLAG_ITEM_RENAMED: u32 = 0x800;
+// FLAG_ITEM_MODIFIED is referenced only by `is_modified`, which is
+// test-only; gate it the same way to avoid a bin-target warning.
+#[cfg_attr(not(test), allow(dead_code))]
 const FLAG_ITEM_MODIFIED: u32 = 0x1000;
-const FLAG_ITEM_FINDER_INFO_MOD: u32 = 0x2000;
-const FLAG_ITEM_CHANGE_OWNER: u32 = 0x4000;
-const FLAG_ITEM_XATTR_MOD: u32 = 0x8000;
-const FLAG_ITEM_IS_FILE: u32 = 0x10000;
-const FLAG_ITEM_IS_DIR: u32 = 0x20000;
-const FLAG_ITEM_IS_SYMLINK: u32 = 0x40000;
 
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
@@ -158,7 +154,6 @@ unsafe extern "C" {
     fn FSEventStreamStop(stream_ref: FSEventStreamRef);
     fn FSEventStreamInvalidate(stream_ref: FSEventStreamRef);
     fn FSEventStreamRelease(stream_ref: FSEventStreamRef);
-    fn FSEventStreamFlushSync(stream_ref: FSEventStreamRef);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -182,12 +177,12 @@ pub enum FsEventsError {
 }
 
 /// A single decoded FSEvents event. `partial = true` always — see
-/// module docs. Downstream consumers translate this into the IPC
-/// `CapturedPreImage` shape.
+/// module docs. Downstream consumers translate this into a wire
+/// `TreeMutation` (M01.A) or `CapturedPreImage` (when M03's ES path
+/// supplies pre-image content via clonefile).
 #[derive(Debug, Clone)]
 pub struct FsEventRecord {
     pub path: PathBuf,
-    pub event_id: u64,
     pub flags: u32,
 }
 
@@ -201,31 +196,19 @@ impl FsEventRecord {
     pub fn is_renamed(&self) -> bool {
         self.flags & FLAG_ITEM_RENAMED != 0
     }
+    /// FSEvents reports both Created+Modified on first-write
+    /// scenarios; tests rely on this to tolerate flag combos. Other
+    /// callers should not use `is_modified` in degraded mode — there
+    /// is no pre-image to undo a modification against.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_modified(&self) -> bool {
         self.flags & FLAG_ITEM_MODIFIED != 0
-    }
-    pub fn is_meta_changed(&self) -> bool {
-        self.flags
-            & (FLAG_ITEM_INODE_META_MOD
-                | FLAG_ITEM_FINDER_INFO_MOD
-                | FLAG_ITEM_CHANGE_OWNER
-                | FLAG_ITEM_XATTR_MOD)
-            != 0
     }
     pub fn is_root_changed(&self) -> bool {
         self.flags & FLAG_ROOT_CHANGED != 0
     }
     pub fn must_scan_subdirs(&self) -> bool {
         self.flags & FLAG_MUST_SCAN_SUBDIRS != 0
-    }
-    pub fn is_file(&self) -> bool {
-        self.flags & FLAG_ITEM_IS_FILE != 0
-    }
-    pub fn is_dir(&self) -> bool {
-        self.flags & FLAG_ITEM_IS_DIR != 0
-    }
-    pub fn is_symlink(&self) -> bool {
-        self.flags & FLAG_ITEM_IS_SYMLINK != 0
     }
 }
 
@@ -332,6 +315,10 @@ struct CallbackContext {
 impl FsEventsStream {
     /// Start watching `roots` with [`StreamOptions::default`]. See
     /// [`Self::start_with_options`] for the configurable variant.
+    /// Test-only: the producer in `capture/macos.rs` calls
+    /// `start_with_options` directly so the default helper is only
+    /// reached from tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start(roots: Vec<PathBuf>) -> Result<(Self, Receiver<FsEventRecord>), FsEventsError> {
         Self::start_with_options(roots, StreamOptions::default())
     }
@@ -578,7 +565,7 @@ extern "C" fn fsevents_callback(
     num_events: usize,
     event_paths: *const c_void,
     event_flags: *const FSEventStreamEventFlags,
-    event_ids: *const FSEventStreamEventId,
+    _event_ids: *const FSEventStreamEventId,
 ) {
     if client_callback_info.is_null() || num_events == 0 {
         return;
@@ -590,7 +577,6 @@ extern "C" fn fsevents_callback(
         unsafe { std::slice::from_raw_parts(event_paths as *const *const c_char, num_events) };
     let flags: &[FSEventStreamEventFlags] =
         unsafe { std::slice::from_raw_parts(event_flags, num_events) };
-    let ids: &[FSEventStreamEventId] = unsafe { std::slice::from_raw_parts(event_ids, num_events) };
 
     for i in 0..num_events {
         let path_ptr = paths[i];
@@ -601,7 +587,6 @@ extern "C" fn fsevents_callback(
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(path_bytes));
         let record = FsEventRecord {
             path,
-            event_id: ids[i],
             flags: flags[i],
         };
         // Channel send failure means the receiver was dropped — caller
