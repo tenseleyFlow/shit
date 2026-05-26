@@ -63,6 +63,18 @@ const FILE_OPEN_OBJ: &[u8] = include_bytes!("../../bpf/build/file_open.bpf.o");
 /// L04.1 — BPF object containing the `lsm/inode_rename` LSM hook.
 const INODE_RENAME_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_rename.bpf.o");
 
+/// DR-CR-55 — BPF object containing the `lsm/inode_symlink` LSM
+/// hook. Emits a `shit_create_event` shape (the LSM-tier ln-as-
+/// undo path doesn't need a distinct symlink event — `Unlink(link)`
+/// is the correct inverse and stat-after-syscall fills in (dev,
+/// inode) of the new symlink).
+const INODE_SYMLINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_symlink.bpf.o");
+
+/// DR-CR-55 — BPF object containing the `lsm/inode_link` LSM hook.
+/// Same shape as inode_symlink: `Unlink(new_link)` is the inverse;
+/// the target inode's nlink drops 2 → 1 as a side effect.
+const INODE_LINK_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_link.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
@@ -71,6 +83,8 @@ const LSM_HOOK_INODE_MKDIR: &str = "inode_mkdir";
 const LSM_HOOK_INODE_CREATE: &str = "inode_create";
 const LSM_HOOK_FILE_OPEN: &str = "file_open";
 const LSM_HOOK_INODE_RENAME: &str = "inode_rename";
+const LSM_HOOK_INODE_SYMLINK: &str = "inode_symlink";
+const LSM_HOOK_INODE_LINK: &str = "inode_link";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
@@ -89,6 +103,8 @@ const LSM_PROG_INODE_MKDIR: &str = "shit_inode_mkdir";
 const LSM_PROG_INODE_CREATE: &str = "shit_inode_create";
 const LSM_PROG_FILE_OPEN: &str = "shit_file_open";
 const LSM_PROG_INODE_RENAME: &str = "shit_inode_rename";
+const LSM_PROG_INODE_SYMLINK: &str = "shit_inode_symlink";
+const LSM_PROG_INODE_LINK: &str = "shit_inode_link";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
@@ -99,6 +115,8 @@ const RINGBUF_MKDIR_EVENTS: &str = "mkdir_events";
 const RINGBUF_CREATE_EVENTS: &str = "create_events";
 const RINGBUF_OPEN_EVENTS: &str = "open_events";
 const RINGBUF_RENAME_EVENTS: &str = "rename_events";
+const RINGBUF_SYMLINK_EVENTS: &str = "symlink_events";
+const RINGBUF_LINK_EVENTS: &str = "link_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -149,6 +167,8 @@ pub struct EbpfLoader {
     create_bpf: Option<aya::Ebpf>,
     open_bpf: Option<aya::Ebpf>,
     rename_bpf: Option<aya::Ebpf>,
+    symlink_bpf: Option<aya::Ebpf>,
+    link_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -176,6 +196,8 @@ impl EbpfLoader {
             create_bpf: None,
             open_bpf: None,
             rename_bpf: None,
+            symlink_bpf: None,
+            link_bpf: None,
         }
     }
 
@@ -196,6 +218,8 @@ impl EbpfLoader {
             || self.create_bpf.is_some()
             || self.open_bpf.is_some()
             || self.rename_bpf.is_some()
+            || self.symlink_bpf.is_some()
+            || self.link_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -259,7 +283,17 @@ impl EbpfLoader {
         let create_was = self.create_bpf.take().is_some();
         let open_was = self.open_bpf.take().is_some();
         let rename_was = self.rename_bpf.take().is_some();
-        if unlink_was || setattr_was || mkdir_was || create_was || open_was || rename_was {
+        let symlink_was = self.symlink_bpf.take().is_some();
+        let link_was = self.link_bpf.take().is_some();
+        if unlink_was
+            || setattr_was
+            || mkdir_was
+            || create_was
+            || open_was
+            || rename_was
+            || symlink_was
+            || link_was
+        {
             tracing::info!(
                 unlink = unlink_was,
                 setattr = setattr_was,
@@ -267,6 +301,8 @@ impl EbpfLoader {
                 create = create_was,
                 open = open_was,
                 rename = rename_was,
+                symlink = symlink_was,
+                link = link_was,
                 "ebpf programs detached"
             );
         }
@@ -656,6 +692,111 @@ impl EbpfLoader {
     pub fn take_rename_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.rename_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_RENAME_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// DR-CR-55 — Load + attach the `lsm/inode_symlink` program.
+    /// Emits a `shit_create_event` shape into `symlink_events`;
+    /// userspace routes through the same on_create sink as
+    /// inode_create. Inverse: `Unlink(link_path)`.
+    pub fn load_lsm_symlink(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.symlink_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_symlink: symlink program already loaded".into(),
+            ));
+        }
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+        let aligned: Vec<u8> = INODE_SYMLINK_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_symlink): {e}")))?;
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_SYMLINK)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_SYMLINK}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+        prog.load(LSM_HOOK_INODE_SYMLINK, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_SYMLINK}): {e}")))?;
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+        tracing::info!(
+            hook = LSM_HOOK_INODE_SYMLINK,
+            prog = LSM_PROG_INODE_SYMLINK,
+            ringbuf = RINGBUF_SYMLINK_EVENTS,
+            "ebpf-lsm inode_symlink loaded and attached"
+        );
+        self.symlink_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// DR-CR-55 — Take the `symlink_events` ringbuf.
+    pub fn take_symlink_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.symlink_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_SYMLINK_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// DR-CR-55 — Load + attach the `lsm/inode_link` program.
+    /// Emits a `shit_create_event` shape into `link_events`;
+    /// userspace routes through the same on_create sink. Inverse:
+    /// `Unlink(new_link)`, which also drops target inode's nlink
+    /// from 2 → 1 as a side effect.
+    pub fn load_lsm_link(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.link_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_link: link program already loaded".into(),
+            ));
+        }
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+        let aligned: Vec<u8> = INODE_LINK_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_link): {e}")))?;
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_LINK)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_LINK}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+        prog.load(LSM_HOOK_INODE_LINK, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_LINK}): {e}")))?;
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+        tracing::info!(
+            hook = LSM_HOOK_INODE_LINK,
+            prog = LSM_PROG_INODE_LINK,
+            ringbuf = RINGBUF_LINK_EVENTS,
+            "ebpf-lsm inode_link loaded and attached"
+        );
+        self.link_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// DR-CR-55 — Take the `link_events` ringbuf.
+    pub fn take_link_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.link_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_LINK_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
     }
 
