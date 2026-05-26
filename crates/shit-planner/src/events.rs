@@ -101,6 +101,17 @@ pub enum CaptureEventKind {
         removed: BTreeMap<String, String>,            // name -> value (pre)
         modified: BTreeMap<String, (String, String)>, // name -> (pre, post)
     },
+    /// AR06.1 — shell-state diff observed across a command (cwd
+    /// change today; future revs will extend with set-opts,
+    /// aliases, function defs once the C06 state.rs diff machinery
+    /// is wired through the hook). The planner maps this to
+    /// `InverseOp::ShellStateRestore` with a pre-rendered
+    /// `cd '<pwd_before>'` bash snippet that the precmd-queue
+    /// runner can source on the next prompt.
+    ShellStateDiff {
+        pwd_before: PathBuf,
+        pwd_after: PathBuf,
+    },
     /// Package-manager operation (apt/dpkg/pacman/dnf/brew/pkg).
     PackageOp {
         manager: PackageManager,
