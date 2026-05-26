@@ -656,6 +656,12 @@ jobs:
       - name: build binaries + shim
         run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
       - name: run smoke
+        # DR-CR-54.B — Outcome A is the contract once the recursive
+        # pre-image (.A) + classifier extension (.B) are both in
+        # tree. Setting the env knob makes the smoke fail loud if
+        # we ever regress back to Outcome B.
+        env:
+          SHIT_REQUIRE_OUTCOME_A: "1"
         run: bash tests/smoke/pip-install-user-undo-linux.sh
       - name: upload artifacts on failure
         if: failure()
