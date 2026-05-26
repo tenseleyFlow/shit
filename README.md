@@ -6,7 +6,7 @@ You just made a mistake on the command line — an edit, a botched `mv`, a `rm` 
 
 ## Status
 
-Pre-1.0. APIs, wire formats, and on-disk layouts are unstable.
+Pre-1.0. APIs, wire formats, and on-disk layouts are unstable. The headline claim — "arbitrary command undo" — is honest only for the classes pinned by a green CI smoke today; see [Coverage today](#coverage-today) and [What doesn't work yet](#what-doesnt-work-yet) for the precise picture.
 
 ## Install
 
@@ -29,26 +29,178 @@ make ci     # everything CI runs
 
 - **`shit`** — the CLI: `shit undo`, `shit redo`, `shit list`, `shit show`, `shit pin`, `shit doctor`, …
 - **`shitd`** — a per-user daemon that owns the snapshot store, the sqlite index, the IPC sockets, and the undo planner.
-- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + an optional LD_PRELOAD shim on BSD.
-- **shell hooks** (bash, zsh, fish) that bracket each command with metadata events sent over a persistent Unix-domain-socket fd.
+- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS (planned), fanotify-perm + eBPF-LSM on Linux, kqueue + an optional LD_PRELOAD shim on FreeBSD.
+- **shell hooks** (bash today; zsh + fish scaffolded) that bracket each command with metadata events sent over a per-user Unix-domain-socket.
 
-When a command writes, renames, unlinks, or otherwise mutates a file inside a tracked process subtree, the helper captures the pre-image *before* the kernel allows the syscall to complete — using `clonefile` (APFS), `reflink` (btrfs/XFS), `zfs clone` (ZFS), hardlink, or streaming copy, picking the cheapest tier the underlying filesystem supports. Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`.
+When a command writes, renames, unlinks, or otherwise mutates a file inside a tracked process subtree, the helper captures the pre-image *before* the kernel allows the syscall to complete — using `clonefile` (APFS, planned), `reflink` (btrfs/XFS), `zfs clone` (ZFS), hardlink, or streaming copy, picking the cheapest tier the underlying filesystem supports. Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`. When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
 
-When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
+Honesty principle: any command class we cannot mechanically reverse goes in the [refuse-list catalog](#refuse-list-what-we-explicitly-wont-undo) — `shit undo` exits non-zero with a one-line reason rather than silently producing a partial undo.
 
-## Coverage
+## Coverage today
 
-Beyond files, `shit` also captures:
+Each entry below has a green CI smoke. The capture mechanism column is named at the kernel surface that fires, not the user-facing tool. "LSM" means the helper's eBPF program is attached to the named hook (`bpf_lsm_<hook>`); "shim" means the LD_PRELOAD shim in `crates/shit-preload-shim/`; "wrapper" means a packaging wrapper script in `packaging/` that brackets the real binary with `shit-helper <tool>-event`.
 
-- File metadata (perms, ACLs, xattrs).
-- Tree operations (create/delete/rename/link).
-- Environment-variable mutations (per-shell).
-- Package-manager operations (apt, dpkg, pacman, dnf, brew, FreeBSD pkg) via each manager's native hook system.
-- systemd / launchd unit operations (via CLI wrappers).
-- Network / firewall / routing changes (iptables, nft, ufw, pfctl, ip, networksetup).
-- Process lifecycle (best-effort; `shit show` produces a restart suggestion you can confirm).
+### Linux
 
-What's *not* undoable is documented honestly in each tier's design notes — we'd rather say "this was unrecoverable" than lie about it.
+**Filesystem mutations** (eBPF-LSM tier — requires `lsm=bpf` in `/sys/kernel/security/lsm` + `cap_bpf,cap_perfmon,cap_sys_admin` on the helper):
+
+| Class | LSM hook | Smoke |
+|---|---|---|
+| `rm` / `unlink` / `unlinkat` | `inode_unlink` | `rm-undo-linux.sh` |
+| `chmod`, `chown`, `chgrp`, `utimes`, `truncate` | `inode_setattr` (v1/v2 BTF-dispatch for kernel ≥7.0 `mnt_idmap` drift) | `chmod-undo-linux.sh`, `chown-undo-linux.sh` |
+| `mkdir` / `mkdirat` | `inode_mkdir` | `mkdir-undo-linux.sh` |
+| `open(O_CREAT)` / `creat` | `inode_create` | covered via `edit-undo-linux.sh`, `touch-edit-undo-linux.sh` |
+| `rename` / `renameat2` (atomic-replace, vim/git/sed dance) | `inode_rename` | `mv-undo-linux.sh`, `vim-edit-undo-linux.sh`, `sed-i-undo-linux.sh`, `git-commit-undo-linux.sh` |
+| `symlink` / `symlinkat` (`ln -s`) | `inode_symlink` | `ln-symlink-undo-linux.sh` |
+| `link` / `linkat` (hardlink) | `inode_link` | `ln-hardlink-undo-linux.sh` |
+| `open(O_TRUNC \| O_WRONLY)` (content overwrites) | `file_open` + live-baseline pre-image | `edit-undo-linux.sh`, `cp-r-undo-linux.sh` |
+| `cmd > existing-file` (shell-pre-stash race) | C06 redirect parser in the bash DEBUG trap → `PreStashRedirects` ctl | `redirect-race-undo-linux.sh`, `dd-of-undo-linux.sh` |
+
+**Build-install pre-image capture** (LD_PRELOAD shim — works without LSM caps, opt-in via the install-pattern auto-detector in `crates/shit/src/auto_inject.rs`):
+
+| Workload | Smoke |
+|---|---|
+| `make install PREFIX=…` writing into a non-watched prefix | `make-install-undo-linux.sh` |
+| `cargo install --force` overwriting an existing binary | `cargo-install-force-undo-linux.sh` |
+| `pip install --user --force-reinstall` overwriting a module | `pip-install-user-undo-linux.sh` (Outcome B today — see [DR-CR-54](#deferred-runtime-items)) |
+
+**Native-undo delegation + synthesis fallback** (helper hooks the package manager via apt's `DPkg::Pre-Install-Pkgs` / dnf's plugin / brew's `--json` snapshot):
+
+| Tool | Path | Smoke |
+|---|---|---|
+| `apt-get install / remove` (≥3.2 with native rollback) | delegates to `apt-get history-rollback <id>` | `apt-history-rollback-linux.sh` |
+| `apt-get install / remove` (<3.2) | synthesizes inverse `apt-get` invocation | `refuse-without-native-delegate.sh` (apt 2.8 path) |
+| `dnf install / remove` | delegates to `dnf history undo <id>` | `dnf-history-undo-linux.sh` |
+| `apt`-tier capture wire (DR-19) | `pkg-event` IPC + journal | `apt-pkg.sh` |
+
+**Container / orchestration** (helper-side `container-event` wrapper captures `docker inspect` JSON pre-mutation; planner walks the JSON to reconstruct a `docker run` argv with ~15 flags):
+
+| Workload | Smoke |
+|---|---|
+| `docker rm` (full container restore from `docker save` + inspect-JSON argv synthesis) | `docker-rm-undo-linux.sh` |
+| `docker rmi` (image tag restore via `docker load`) | `docker-rmi-undo-linux.sh` |
+| `docker volume rm` (volume tar stash + restore) | `docker-volume-rm-undo-linux.sh` |
+| `docker network rm` (network spec replay) | `docker-network-rm-undo-linux.sh` |
+| `docker compose down` (compose project snapshot + `up -d` replay) | `docker-compose-down-undo-linux.sh` |
+| `podman rm` (cross-runtime delegation through the same path) | `podman-rm-undo-linux.sh` |
+
+**Cloud / IaC** (helper-side `cloud-event` wrapper captures tool state pre-mutation):
+
+| Workload | Capture | Smoke |
+|---|---|---|
+| `terraform apply` | reverse via `terraform destroy` | `terraform-apply-undo-linux.sh` |
+| `terraform destroy` | reverse via state-push + `terraform apply` | `terraform-destroy-undo-linux.sh` |
+| `kubectl delete <resource>` | reverse via captured-YAML `apply -f -` (context-drift gated) | `kubectl-delete-undo-linux.sh` (kind cluster) |
+| `gh release delete` | reverse via `gh release create` from captured metadata + asset list | `gh-release-delete-undo-linux.sh` |
+
+**Services / networking / processes**:
+
+| Workload | Mechanism | Smoke |
+|---|---|---|
+| `systemctl stop / start / enable / disable` | wrapper → `svc-event` IPC → planner `SystemdRollback` | `systemctl-stop-undo-linux.sh`, `systemctl-svc.sh` |
+| `nft add table / chain / rule` | wrapper → `net-event` IPC | `nft-net.sh` |
+| `iptables -N / -A / -D` | wrapper → `net-event` IPC | `iptables-net-linux.sh` |
+| `kill / pkill / killall` | wrapper → `proc-event` IPC; informational + restart-hint (no reanimation) | `kill-proc-undo-linux.sh` |
+| `sqlite3 file.db "<sql>"` | shim → file pre-image; sqlite WAL-aware | `sqlite3-db.sh` |
+
+### FreeBSD
+
+Capture tier: kqueue (`EVFILT_VNODE` NOTE_WRITE/RENAME/DELETE/ATTRIB) + optional LD_PRELOAD shim for the cross-watch / install-overwrite race. Capsicum sandbox available via `SHIT_CAPSICUM=1` (default-off in current shipping; default-on tracked in B05).
+
+| Class | Smoke |
+|---|---|
+| `rm`, `mv` (same-dir / cross-dir / dir), `ln` (sym + hard), `cp -r`, `mkdir -p`, `mkfifo` | `rm-undo-fbsd.sh`, `mv-{dir,across-dirs,noop}-undo-fbsd.sh`, `ln-{symlink,hardlink}-undo-fbsd.sh`, etc. |
+| `chmod` (regular + recursive + setuid), `chown` (gid) | `chmod-{undo,recursive,setuid}-undo-fbsd.sh`, `chown-undo-fbsd.sh` |
+| `cmd > file`, `cmd >> file`, `tee`, `dd of=`, `dd conv=notrunc` (partial writes), `awk -i inplace`, `sort -o`, `sed -i` | `shell-{redirect,append}-undo-fbsd.sh`, `tee-undo-fbsd.sh`, `dd-{large-file,notrunc}-undo-fbsd.sh`, etc. |
+| `vim :wq`, `git commit`, atomic-rename save dances | `vim-edit-undo-fbsd.sh`, `git-commit-undo-fbsd.sh` |
+| `pkg install` | `pkg-install-undo-fbsd.sh` |
+| `pfctl -f`, `pfctl -F all` (firewall add + flush) | `pfctl-{add,flush}-undo-fbsd.sh` |
+| `service restart`, `kill` (pattern resolution via sysctl `kern.proc.proc`) | `service-restart-undo-fbsd.sh`, `kill-proc-undo-fbsd.sh` |
+| Long-tail: `tar -x`, `cpio -i`, `gzip`, `gunzip`, `patch -p1`, `rsync` (incremental), `xargs rm`, `find -exec rm`, `make install` (intra/cross-watch), backup-and-modify patterns | corresponding `-fbsd.sh` smokes |
+
+### macOS
+
+Today: only `daemon-boot smoke (macOS)`, `brew-pkg smoke`, and `sqlite3-db smoke (macOS)` pass. No kernel-tier capture is wired yet — EndpointSecurity client requires a signed Apple Developer ID, which is a separate engineering thread. macOS users today get the package manager + database paths but not generic filesystem undo.
+
+## Refuse-list: what we explicitly won't undo
+
+The planner short-circuits these classes at plan-build time with a one-line reason + optional remediation, surfaced under a `Refused (out of scope for shit undo):` block in `shit undo` output and exposed as `arbitrary_undo_coverage.refused_classes` in `shit doctor --json`. The list is in `crates/shit-planner/src/refuse.rs`.
+
+| Class | Examples | Why |
+|---|---|---|
+| **remote-push** | `git push`, `docker push`, `podman push`, `npm publish`, `cargo publish`, `gh release upload` | remote replication is outside our capture-tier visibility |
+| **history-rewrite** | `git rebase -i`, `git filter-branch`, `git filter-repo` | rewrites ref topology in ways the event journal cannot mechanically reverse; use `git reflog` |
+| **identity-generation** | `gpg --gen-key`, `gpg --full-gen-key`, `ssh-keygen` | key material may already be distributed; deleting the file cannot un-publish a public key |
+| **power-state** | `shutdown`, `reboot`, `halt`, `poweroff` | no inverse operation exists |
+| **sandbox-escape** | `chroot`, `unshare`, `nsenter` | namespace / chroot transitions move execution into a context our capture tier no longer observes |
+| **opaque-shell-mutation** | `source script.sh`, `. script.sh` | sourcing mutates the parent shell in arbitrary ways we don't introspect |
+| **system-identity** | `useradd`, `userdel`, `usermod`, `groupadd`, `groupdel`, `passwd` | PAM + shadow-file mutations touch state we won't trust ourselves to roll back without per-OS policy |
+
+## What doesn't work yet
+
+These are gaps where coverage is plausible but not yet shipped. Each item is tracked in `.docs/sprints/DEFERRED-RUNTIME.md` with implementation notes.
+
+### Linux
+
+- **`cd`, `set -e`, `alias`, `func() { … }`** — shell-state mutations. The C06 state-diff library exists (`crates/shit-shell/src/state.rs`) but the bash hook integration + the precmd-queue mechanism (DR-CR-50) that a child-process undo needs to push commands back into the parent shell isn't wired. AR06.1–4 work.
+- **`>>` append / `tee -a`** — captured at the parser as `Append` but the planner has no `FilePreImage → FileExtend { truncate_to: pre_size }` emission path yet. DR-CR-55-adjacent (`inode_setattr` infrastructure is there; the planner mapping is the gap).
+- **pip wheel-installer directory-rename race** — `pip install` renames `site-packages → ~ite-packages` before writing fresh content. The shim catches the rename without recursive pre-image. AR05.3 today passes via **Outcome B** (loud `0 failed, 1 conflicted` exit) — Outcome A (full byte-identical restore) needs DR-CR-54 (recursive pre-image on directory rename, or fanotify-perm handoff).
+- **`docker pull <floating-tag>` digest journaling** — DR-CR-51. Post-phase reconciliation reserved but not implemented.
+- **multi-target `docker rmi a b c` batching** — DR-CR-52. Today only the first positional is journaled.
+- **zsh + fish hook parity for `pre-exec-redirects`** — only the bash hook ships the AR06.5 DEBUG-trap call. AR06.6 work.
+- **Packaging install hooks** — `apt install shit` → `doctor`-green is the AR09 sprint goal. Today the daemon must be built + setcap'd manually.
+
+### FreeBSD
+
+- **Capsicum default-on** — sandbox is opt-in (`SHIT_CAPSICUM=1`) today. B05 promotes to default-on, which requires rewriting cross-pid path walks (`procstat`-based) to use `sysctl(KERN_PROC_CWD)` + `openat`-relative descent.
+- **NetBSD / OpenBSD / DragonFly** — explicitly post-v1 stretch (B06). Today the helper compiles only on FreeBSD; the other BSDs have an untested kqueue port.
+- **Perf budgets** — B07 wires a benchmark harness with regression gates. The "no noticeable overhead" claim is currently unmeasured on BSD.
+
+### macOS
+
+- **EndpointSecurity capture** — needs a signed binary + entitlement (DR-CR-35). Today macOS is daemon + package-manager + database only.
+- **DYLD interposer for non-SIP binaries** — DR-CR-34. Homebrew-installed cargo / pip could be hooked similarly to the Linux LD_PRELOAD path; not yet implemented.
+
+## Compatibility expectations
+
+These should work in practice once the underlying mechanism is wired (no architectural blocker discovered), but they don't have a pinned smoke today:
+
+- **`helm install / uninstall`** — same shape as `docker compose`; descriptor candidate in AR08.2.
+- **`ufw allow / deny`, `firewall-cmd --add-port`** — both are thin wrappers over iptables/nft; descriptor candidates.
+- **`git stash pop / drop`, `git reset --hard`, `git checkout <branch>`** — pre-state captured via `git rev-parse HEAD` + branch-name, reversed via the inverse `git` invocation. AR08.2.
+- **`npm install -g`, `gem install`** — same LD_PRELOAD shim path as `pip install --user`. AR08.2.
+- **`useradd` (refusal)** — the `system-identity` refuse class will catch it cleanly when the class lands at plan-build time (it does today on the planner side; the refuse-list catalog is shipped in trunk).
+
+## OS support matrix
+
+| Capability | Linux (lsm=bpf) | Linux (no LSM) | FreeBSD | macOS |
+|---|---|---|---|---|
+| filesystem capture | ✅ eBPF-LSM (8 hooks) | ⚠️ fanotify-perm fallback | ✅ kqueue | ❌ |
+| pre-image via CoW | ✅ reflink/btrfs/XFS/zfs | ✅ same | ✅ zfs clone / hardlink | ❌ |
+| LD_PRELOAD shim | ✅ install-pattern auto-inject | ✅ same | ✅ | ⚠️ DYLD planned |
+| package undo | ✅ apt, dnf | ✅ same | ✅ pkg | ✅ brew |
+| container undo | ✅ docker, podman, compose | ✅ same | ⚠️ untested | ⚠️ untested |
+| cloud undo | ✅ terraform, kubectl, gh | ✅ same | ⚠️ untested | ⚠️ untested |
+| services | ✅ systemctl | ✅ same | ✅ service | ⚠️ launchctl untested |
+| firewall | ✅ nft, iptables | ✅ same | ✅ pfctl | ❌ |
+| shell hook | ✅ bash | ✅ same | ✅ bash | ❌ macOS shell hooks untested |
+
+✅ has a green CI smoke today; ⚠️ structurally plausible but unpinned; ❌ not yet built.
+
+## Coverage matrix in JSON
+
+`shit doctor --json` emits `arbitrary_undo_coverage` with two stable fields you can pin a CI gate to:
+
+```json
+"arbitrary_undo_coverage": {
+  "covered_classes": ["container-rm", "container-rmi", "fs-content-restore", "fs-metadata", "fs-rename", "fs-tree", "kubectl-delete", "package-apt", "package-dnf", "package-brew", "preload-install", "process-note", "redirect-truncate", "service-systemctl", "tool-gh", "tool-network", "tool-terraform", "..."],
+  "refused_classes": ["remote-push", "history-rewrite", "identity-generation", "power-state", "sandbox-escape", "opaque-shell-mutation", "system-identity"],
+  "coverage_pct": 74,
+  "last_validated_at": ""
+}
+```
+
+The `covered_classes` list is hand-curated against the AR08.1 audit; the `refused_classes` list is enumerated from `shit-planner::refuse::CATALOG` at runtime so the two cannot drift.
 
 ## License
 
