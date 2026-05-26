@@ -658,6 +658,7 @@ mod tests {
                     acl: None,
                 },
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
             1,
         )];

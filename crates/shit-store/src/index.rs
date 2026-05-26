@@ -1136,6 +1136,7 @@ mod tests {
                 blob,
                 meta: meta(),
                 post_content_hash: Some(BlobHash::from_bytes([0xCD; 32])),
+                source: shit_planner::FilePreImageSource::Other,
             },
         };
         let assigned = idx.put_event(&ev).unwrap();
@@ -1181,6 +1182,7 @@ mod tests {
                     blob,
                     meta: meta(),
                     post_content_hash: None,
+                    source: shit_planner::FilePreImageSource::Other,
                 },
             })
             .unwrap();
@@ -1219,6 +1221,7 @@ mod tests {
                     blob,
                     meta: meta(),
                     post_content_hash: None,
+                    source: shit_planner::FilePreImageSource::Other,
                 },
             })
             .collect();
@@ -1287,6 +1290,7 @@ mod tests {
                 blob,
                 meta: meta(),
                 post_content_hash: None,
+                source: shit_planner::FilePreImageSource::Other,
             },
         })
         .unwrap();
@@ -1317,6 +1321,7 @@ mod tests {
                 blob,
                 meta: meta(),
                 post_content_hash: None,
+                source: shit_planner::FilePreImageSource::Other,
             },
         })
         .unwrap();
@@ -1355,6 +1360,7 @@ mod tests {
                     blob,
                     meta: meta(),
                     post_content_hash: None,
+                    source: shit_planner::FilePreImageSource::Other,
                 },
             })
             .unwrap();
@@ -1405,6 +1411,7 @@ mod tests {
                 blob: referenced,
                 meta: meta(),
                 post_content_hash: None,
+                source: shit_planner::FilePreImageSource::Other,
             },
         })
         .unwrap();
@@ -1434,6 +1441,7 @@ mod tests {
                 blob,
                 meta: meta(),
                 post_content_hash: None,
+                source: shit_planner::FilePreImageSource::Other,
             },
         })
         .unwrap();
