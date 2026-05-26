@@ -404,9 +404,7 @@ impl EbpfLoader {
 
         let prog: &mut aya::programs::Lsm = bpf
             .program_mut(chosen_prog)
-            .ok_or_else(|| {
-                EbpfError::Aya(format!("program `{chosen_prog}` not found in object"))
-            })?
+            .ok_or_else(|| EbpfError::Aya(format!("program `{chosen_prog}` not found in object")))?
             .try_into()
             .map_err(|e: aya::programs::ProgramError| {
                 EbpfError::Aya(format!("expected Lsm program: {e}"))
@@ -705,16 +703,14 @@ fn probe_lsm_hook_arity(hook_name: &str) -> Result<u32, EbpfError> {
     let type_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
     let str_off = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
     let str_len = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
-    let types_start = hdr_len.checked_add(type_off).ok_or_else(|| {
-        EbpfError::Aya("BTF header arithmetic overflow (types)".to_string())
-    })?;
+    let types_start = hdr_len
+        .checked_add(type_off)
+        .ok_or_else(|| EbpfError::Aya("BTF header arithmetic overflow (types)".to_string()))?;
     let strs_start = hdr_len
         .checked_add(str_off)
         .ok_or_else(|| EbpfError::Aya("BTF header arithmetic overflow (strs)".to_string()))?;
     if data.len() < types_start + type_len || data.len() < strs_start + str_len {
-        return Err(EbpfError::Aya(
-            "BTF blob shorter than header claims".into(),
-        ));
+        return Err(EbpfError::Aya("BTF blob shorter than header claims".into()));
     }
 
     let target_name = format!("bpf_lsm_{hook_name}");
@@ -737,7 +733,8 @@ fn probe_lsm_hook_arity(hook_name: &str) -> Result<u32, EbpfError> {
     // BTF type ids start at 1; id 0 is "void". The first type
     // header is at types_start and has id 1.
     let mut current_id: u32 = 0;
-    let mut func_proto_offsets: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut func_proto_offsets: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
     while cursor + 12 <= type_section_end {
         current_id += 1;
         let name_off = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
@@ -787,14 +784,18 @@ fn probe_lsm_hook_arity(hook_name: &str) -> Result<u32, EbpfError> {
             }
         };
 
-        if kind == 12 /* FUNC */ {
+        if kind == 12
+        /* FUNC */
+        {
             if let Some(name) = read_str(name_off)
                 && name == target_name
             {
                 func_proto_type_id = Some(size_or_type);
                 break;
             }
-        } else if kind == 13 /* FUNC_PROTO */ {
+        } else if kind == 13
+        /* FUNC_PROTO */
+        {
             func_proto_offsets.insert(current_id, cursor);
         }
 
