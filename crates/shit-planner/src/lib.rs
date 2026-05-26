@@ -42,8 +42,8 @@ pub use env::{
     parse_block as env_parse_block, redact_value,
 };
 pub use events::{
-    CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, NetworkTool, PackageManager,
-    PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
+    CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, FilePreImageSource,
+    NetworkTool, PackageManager, PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
 };
 pub use exec_log::{ExecLog, ExecLogError, default_dir as exec_log_default_dir, read_all};
 pub use executor::{

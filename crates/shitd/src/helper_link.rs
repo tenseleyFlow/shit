@@ -956,6 +956,7 @@ fn handle_captured_pre_image(
             blob: canonical_hash,
             meta,
             post_content_hash: args.post_content_hash.map(BlobHash),
+            source: shit_planner::FilePreImageSource::Other,
         },
     };
     index
@@ -1161,6 +1162,15 @@ fn handle_baseline_promoted_pre_image(
             // baseline. Acceptable v1 tradeoff documented in
             // .docs/sprints/W/W02.B.live-baseline.md.
             post_content_hash: None,
+            // G01.B.3 — load-bearing tag. The baseline cache is
+            // populated at PreExec and promoted on first
+            // modification, so by construction these bytes are
+            // exactly the file's pre-command state. The planner
+            // classifier uses this to override the line-256
+            // transient safety-net for the Create+Unlink+PreImage
+            // shape that BSD kqueue can emit (atomic-rename racing
+            // dir-diff). See plan.rs::classify_replace_paths.
+            source: shit_planner::FilePreImageSource::BaselineCachePromote,
         },
     };
     index

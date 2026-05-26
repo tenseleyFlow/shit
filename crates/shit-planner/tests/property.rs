@@ -94,6 +94,7 @@ fn arb_pre_image(id: u64, ts: u64) -> impl Strategy<Value = CaptureEvent> {
                 blob,
                 meta: empty_meta(),
                 post_content_hash: post,
+                source: shit_planner::FilePreImageSource::Other,
             },
         })
 }
@@ -272,6 +273,7 @@ proptest! {
                 blob,
                 meta: empty_meta(),
                 post_content_hash: Some(post_a), // expected
+                source: shit_planner::FilePreImageSource::Other,
             },
         };
         let p = plan(closed_record(), &[ev], &probe, &store);

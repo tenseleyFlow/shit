@@ -165,6 +165,19 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
     let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
+    // G01.B.3 — paths whose FilePreImage carries a strong "pre-command
+    // snapshot" guarantee (set by capture paths that walk the watched
+    // subtree at PreExec, like W02.B's LiveBaseline on FreeBSD). The
+    // line-256 transient safety-net deliberately fires for the
+    // Create+Unlink+PreImage shape when the pre-image is in-command
+    // mid-state (correct on Linux's touch+echo+rm where the file
+    // didn't exist pre-command). On BSD that same event shape can
+    // arise from atomic-rename racing dir-diff for a file that DID
+    // exist pre-command — and the captured bytes are genuinely
+    // pre-command. The discriminator lets the classifier override
+    // transient → atomic_replace in that case without changing
+    // Linux behavior (LSM captures have source=Other).
+    let mut pre_command_pre_images: HashSet<PathBuf> = HashSet::new();
     // W09.20 — collect (dev, inode) → set of paths from Unlink events
     // so we can detect hardlink groups: same inode appearing under
     // multiple names.
@@ -179,8 +192,11 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         std::collections::HashMap::new();
     for ev in events {
         match &ev.kind {
-            CaptureEventKind::FilePreImage { path, .. } => {
+            CaptureEventKind::FilePreImage { path, source, .. } => {
                 pre_images.insert(path.clone());
+                if matches!(source, crate::FilePreImageSource::BaselineCachePromote) {
+                    pre_command_pre_images.insert(path.clone());
+                }
             }
             CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
                 creates.insert(path.clone());
@@ -259,12 +275,28 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         // file's IN-COMMAND content — not a pre-command snapshot —
         // and the user's expected post-undo state is "file
         // absent", i.e. transient.
+        //
+        // G01.B.3: the transient classification above bakes in
+        // "captured pre-image == in-command bytes". That holds for
+        // Linux's LSM-intercepted touch+echo+rm. It does NOT hold
+        // for BSD's W02.B LiveBaseline path where the pre-image is
+        // populated at PreExec from the watched subtree, then
+        // promoted on first modification — by construction the
+        // bytes are pre-command. When any FilePreImage for this
+        // path carries `source = BaselineCachePromote`, the
+        // pre-image IS a faithful pre-command snapshot and we
+        // restore via atomic_replace (parent dir must be alive,
+        // matching the rename-destination branch's same shape
+        // requirement). Linux is unaffected — LSM captures emit
+        // source=Other and the existing transient path fires.
         let is_rename_destination = rename_destinations.contains(p);
-        if is_rename_destination
-            && let Some(parent) = p.parent()
-            && !parent.as_os_str().is_empty()
-            && probe.stat(parent).is_some()
-        {
+        let has_pre_command_snapshot = pre_command_pre_images.contains(p);
+        let parent_alive = p
+            .parent()
+            .filter(|pp| !pp.as_os_str().is_empty())
+            .and_then(|pp| probe.stat(pp))
+            .is_some();
+        if (is_rename_destination || has_pre_command_snapshot) && parent_alive {
             atomic.insert(p.clone());
         } else {
             transient.insert(p.clone());
@@ -515,6 +547,7 @@ fn emit_for_event(
             blob,
             meta,
             post_content_hash,
+            source: _,
         } => {
             // W09.20 — for the dead side of a hardlink pair, the
             // surviving alias has the right content already; the
@@ -1348,6 +1381,7 @@ mod tests {
                 blob: BlobHash::from_bytes([0u8; 32]),
                 meta: meta(10),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let probe = InMemoryProbe::new();
@@ -1417,6 +1451,7 @@ mod tests {
                 blob: BlobHash::from_bytes([1; 32]),
                 meta: meta(0),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -1458,6 +1493,7 @@ mod tests {
                 blob,
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -1497,6 +1533,7 @@ mod tests {
                 blob: BlobHash::from_bytes([0xFF; 32]),
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -1526,6 +1563,7 @@ mod tests {
                 blob,
                 meta: meta(10),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -1566,6 +1604,7 @@ mod tests {
                 blob,
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -1607,6 +1646,7 @@ mod tests {
                 blob,
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let unlink = CaptureEvent {
@@ -1798,6 +1838,7 @@ mod tests {
                 blob,
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let unlink = CaptureEvent {
@@ -1893,6 +1934,7 @@ mod tests {
                 blob,
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let unlink = CaptureEvent {
@@ -1990,6 +2032,7 @@ mod tests {
                 blob,
                 meta: meta(50),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let unlink = CaptureEvent {
@@ -2387,6 +2430,7 @@ mod tests {
                 blob,
                 meta: meta(11),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[rename, pre_image], &probe, &store);
@@ -2470,6 +2514,7 @@ mod tests {
                 blob,
                 meta: meta(20),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[pre_image, unlink], &probe, &store);
@@ -2574,6 +2619,7 @@ mod tests {
                 blob,
                 meta: meta(100),
                 post_content_hash: Some(post),
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -2614,6 +2660,7 @@ mod tests {
                 blob,
                 meta: meta(100),
                 post_content_hash: Some(expected_post),
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -2654,6 +2701,7 @@ mod tests {
                 blob,
                 meta: meta(100),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
@@ -2704,5 +2752,195 @@ mod tests {
     fn delegation_for_empty_or_whitespace_hint_is_none() {
         assert!(native_delegation_for(PackageManager::Apt, Some("")).is_none());
         assert!(native_delegation_for(PackageManager::Dnf, Some("   ")).is_none());
+    }
+
+    // G01.B.3 — Shape B: Create + PreImage + Unlink, file gone at
+    // undo time, parent dir alive, NOT a rename destination. The
+    // pre-existing classifier (correctly for Linux) folds this into
+    // the transient safety-net under the assumption that the
+    // pre-image is in-command mid-state — but on BSD's W02.B
+    // LiveBaseline path the pre-image carries
+    // `source = BaselineCachePromote` which guarantees it's a
+    // pre-command snapshot. The classifier must then override to
+    // atomic_replace so RestoreContent fires.
+    //
+    // This reproduces the `git stash drop` event sequence that
+    // motivated the discriminator (see
+    // git-stash-drop-undo-fbsd.sh smoke).
+    #[test]
+    fn baseline_promote_source_overrides_transient_for_shape_b() {
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 42);
+        let blob = BlobHash::from_bytes([0xAA; 32]);
+        let path = PathBuf::from("/repo/.git/logs/refs/stash");
+        let parent = PathBuf::from("/repo/.git/logs/refs");
+        // Parent alive; the unlinked path is GONE post-workload.
+        probe.insert(
+            parent.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 100),
+                meta: meta(0),
+            },
+            None,
+        );
+        store.put_blob(blob, 50);
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        // Event sequence Shape B: Create, PreImage (from W02.B
+        // baseline promote), Unlink. Same path. file gone.
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let pre_image = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(2, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: path.clone(),
+                blob,
+                meta: meta(50),
+                post_content_hash: None,
+                // The discriminator under test.
+                source: crate::FilePreImageSource::BaselineCachePromote,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(3, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let p = plan(
+            dummy_command(),
+            &[create, pre_image, unlink],
+            &probe,
+            &store,
+        );
+        // Expect RestoreContent + RestoreMetadata for the gone-path,
+        // NO conflict (parent alive + baseline-promote source
+        // guarantees we have genuine pre-command bytes).
+        let has_restore_content = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::RestoreContent { .. }) && n.conflict.is_none());
+        assert!(
+            has_restore_content,
+            "expected RestoreContent without conflict; got nodes {:#?}",
+            p.nodes
+        );
+        // No ConflictMissing should leak through.
+        let has_missing = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.conflict, Some(Conflict::Missing { .. })));
+        assert!(
+            !has_missing,
+            "expected no ConflictMissing; got nodes {:#?}",
+            p.nodes
+        );
+    }
+
+    // G01.B.3 — Inverse test: same Shape B but with the default
+    // `source = Other` (Linux LSM-intercepted touch+echo+rm). The
+    // classifier MUST still classify this as transient — the
+    // pre-image's bytes are in-command, not pre-command, and
+    // restoring would create a file the user expects to be absent.
+    // This is the load-bearing Linux-no-regression test.
+    #[test]
+    fn other_source_keeps_transient_safety_net_for_shape_b() {
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 42);
+        let blob = BlobHash::from_bytes([0xAA; 32]);
+        let path = PathBuf::from("/tmp/foo");
+        let parent = PathBuf::from("/tmp");
+        probe.insert(
+            parent.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 100),
+                meta: meta(0),
+            },
+            None,
+        );
+        store.put_blob(blob, 0);
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let pre_image = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(2, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: path.clone(),
+                blob,
+                meta: meta(0),
+                post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(3, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let p = plan(
+            dummy_command(),
+            &[create, pre_image, unlink],
+            &probe,
+            &store,
+        );
+        // Transient: no RestoreContent should fire (file is expected
+        // to stay absent post-undo; touch+echo+rm semantics).
+        let has_restore_content = p
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::RestoreContent { .. }));
+        assert!(
+            !has_restore_content,
+            "expected no RestoreContent (Other source must keep transient); got nodes {:#?}",
+            p.nodes
+        );
     }
 }

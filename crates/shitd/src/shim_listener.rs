@@ -452,6 +452,7 @@ fn ingest_pre_image(
             // time. The planner's post-mutation conflict detection
             // is best-effort for shim-captured events.
             post_content_hash: None,
+            source: shit_planner::FilePreImageSource::Other,
         },
     };
     index
