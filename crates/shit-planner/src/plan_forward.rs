@@ -811,6 +811,8 @@ mod tests {
             CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: InodeRef::new(1, 1),
                 path: PathBuf::from("/tmp/gone"),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
             1,
         )];

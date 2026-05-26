@@ -185,7 +185,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
                 creates.insert(path.clone());
             }
-            CaptureEventKind::TreeOp(TreeOp::Unlink { path, inode }) => {
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, inode, .. }) => {
                 unlinks.insert(path.clone());
                 // W09.20 — only index real inodes. The shim's
                 // Unlink path uses (0, 0) as a sentinel (it doesn't
@@ -1135,7 +1135,9 @@ fn emit_for_tree_op(
                 conflict,
             });
         }
-        TreeOp::Unlink { path, .. } => {
+        TreeOp::Unlink {
+            path, kind, mode, ..
+        } => {
             // W01.B.fix-rename-coalescing: ditto Create's note above —
             // atomic-replace paths get their inverse from FilePreImage.
             if atomic_replace_paths.contains(path) {
@@ -1168,18 +1170,23 @@ fn emit_for_tree_op(
                 });
                 return;
             }
-            // The user's command deleted this path; we want to recreate it.
-            // We don't know mode/kind from the unlink alone — those come from
-            // a paired FilePreImage / FileMetadata. Recreate with conservative
-            // defaults; the FilePreImage's RestoreMetadata will overwrite.
+            // G02: use the helper-captured kind + mode (LSM tier's
+            // fstat-on-held-fd before unlink commits) so a deleted
+            // directory restores as a directory with its original
+            // mode bits, not a regular file with default 0o644.
+            // Real-world fix for `git clean -fd` removing untracked
+            // dirs with non-default modes. For BSD's kqueue tier or
+            // older journals that didn't plumb kind+mode through,
+            // the events.rs serde defaults fall back to Regular /
+            // 0o100644 — matching the pre-G02 hard-coded behavior.
             let conflict = probe.stat(path).map(|_| Conflict::Phantom {
                 detail: format!("{} exists now but didn't expect it to", path.display()),
             });
             nodes.push(PlanNode {
                 op: InverseOp::RecreatePath {
                     path: path.clone(),
-                    kind: crate::metadata::FileKind::Regular,
-                    mode: 0o100644,
+                    kind: *kind,
+                    mode: *mode,
                 },
                 cohort: 0,
                 conflict,
@@ -1613,6 +1620,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode,
                 path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let p = plan(dummy_command(), &[pre, unlink], &probe, &store);
@@ -1632,6 +1641,106 @@ mod tests {
             "expected exactly 2 ops (atomic-replace shape); got: {:?}",
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn directory_unlink_emits_recreate_with_directory_kind() {
+        // G02 — a TreeOp::Unlink with kind=Directory must produce
+        // a RecreatePath whose kind is Directory (and whose mode
+        // is the captured mode), not the pre-G02 hard-coded
+        // Regular/0o100644. Without this, `git clean -fd` undo
+        // recreates removed untracked dirs as regular files.
+        let probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 42);
+        let path = PathBuf::from("/scratch/junk");
+        let unlink_dir = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Directory,
+                mode: 0o040700,
+            }),
+        };
+        let p = plan(dummy_command(), &[unlink_dir], &probe, &store);
+        let node = p
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.op, InverseOp::RecreatePath { path: p, .. } if p == &path));
+        let node = node.expect("expected RecreatePath for the unlinked dir");
+        match &node.op {
+            InverseOp::RecreatePath {
+                kind: emitted_kind,
+                mode: emitted_mode,
+                ..
+            } => {
+                assert_eq!(
+                    *emitted_kind,
+                    crate::metadata::FileKind::Directory,
+                    "RecreatePath kind should be Directory"
+                );
+                assert_eq!(
+                    *emitted_mode & 0o7777,
+                    0o0700,
+                    "RecreatePath mode should preserve captured perm bits (0o700)"
+                );
+            }
+            other => panic!("expected RecreatePath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regular_file_unlink_emits_recreate_with_captured_mode() {
+        // G02 — same shape as the dir test but for a regular file.
+        // Verifies the captured mode survives through the planner
+        // (was hard-coded 0o100644 pre-G02).
+        let probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 43);
+        let path = PathBuf::from("/scratch/script.sh");
+        let unlink_exec = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100755,
+            }),
+        };
+        let p = plan(dummy_command(), &[unlink_exec], &probe, &store);
+        let node = p
+            .nodes
+            .iter()
+            .find(|n| matches!(&n.op, InverseOp::RecreatePath { path: pp, .. } if pp == &path))
+            .expect("expected RecreatePath for the unlinked file");
+        match &node.op {
+            InverseOp::RecreatePath {
+                kind: emitted_kind,
+                mode: emitted_mode,
+                ..
+            } => {
+                assert_eq!(*emitted_kind, crate::metadata::FileKind::Regular);
+                assert_eq!(
+                    *emitted_mode & 0o7777,
+                    0o0755,
+                    "RecreatePath mode should preserve executable bit"
+                );
+            }
+            other => panic!("expected RecreatePath, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1699,6 +1808,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: old_inode,
                 path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let p = plan(dummy_command(), &[create, pre, unlink], &probe, &store);
@@ -1792,6 +1903,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: old_inode,
                 path: dest.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let rename = CaptureEvent {
@@ -1887,6 +2000,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode,
                 path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let p = plan(dummy_command(), &[create, pre, unlink], &probe, &store);
@@ -1948,6 +2063,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode,
                 path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let p = plan(dummy_command(), &[create, unlink], &probe, &store);
@@ -2338,6 +2455,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode,
                 path: dst.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let pre_image = CaptureEvent {
