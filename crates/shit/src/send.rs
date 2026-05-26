@@ -108,11 +108,18 @@ pub enum HookSendKind {
         #[arg(long)]
         sock: PathBuf,
     },
-    /// AR06.1 — pre-command shell-state snapshot. Today carries pwd
-    /// only; future revs may extend with set-opts / aliases /
-    /// functions once C06 state.rs is wired. Cheap on the hot path
-    /// (a single env-var read), so the bash hook ships it
-    /// unconditionally.
+    /// AR06.1/.2/.3 — pre-command shell-state snapshot. Carries
+    /// pwd + (AR06.2) set-opts + (AR06.3) aliases. The bash hook
+    /// collects all three; opts and aliases are passed via stdin
+    /// as NUL-separated records (one record per `\0`, fields
+    /// tab-separated). `--from-stdin` toggles reading those extra
+    /// dimensions; without it, only `--pwd` is shipped (back-compat
+    /// with the AR06.1-era hook shape).
+    ///
+    /// Why stdin and not flags: a busy shell can have hundreds of
+    /// aliases, and alias expansions can contain literal newlines.
+    /// NUL-separation handles arbitrary bytes without an encoding
+    /// step.
     #[command(name = "pre-exec-shell-state")]
     PreExecShellState {
         #[arg(long)]
@@ -123,11 +130,18 @@ pub enum HookSendKind {
         pwd: String,
         #[arg(long)]
         sock: PathBuf,
+        /// AR06.2/.3 — read opts + aliases from stdin. Format:
+        /// `OPT\tname\tvalue\0` and `ALIAS\tname\tvalue\0` records,
+        /// mixed. Other prefixes are ignored (forward-compat for
+        /// AR06.4 functions).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        from_stdin: bool,
     },
-    /// Companion to `PreExecShellState`. Bash post-exec hook calls
-    /// this with the post-command `$PWD`; daemon diffs against the
-    /// stashed pre-pwd and journals a `ShellStateDiff` event only
-    /// when pwd actually changed.
+    /// Companion to `PreExecShellState`. Same field set; bash
+    /// hook calls after the user's command. Daemon pairs with the
+    /// matching `PreExecShellState` by `(session, seq)` and emits
+    /// a `ShellStateDiff` event only when at least one dimension
+    /// differs.
     #[command(name = "post-exec-shell-state")]
     PostExecShellState {
         #[arg(long)]
@@ -138,6 +152,8 @@ pub enum HookSendKind {
         pwd: String,
         #[arg(long)]
         sock: PathBuf,
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        from_stdin: bool,
     },
     /// AR06.5 — synchronous pre-stash for shell stream redirects.
     /// The shell hook calls this BEFORE the about-to-run command's
@@ -339,31 +355,51 @@ pub fn run(kind: HookSendKind) -> Result<()> {
             seq,
             pwd,
             sock,
-        } => (
-            HookMessage::PreExecShellState {
-                session,
-                seq,
-                pwd,
-                ts_unix_nanos: ts_now(),
-            },
-            sock,
-            None,
-        ),
+            from_stdin,
+        } => {
+            let (opts, aliases) = if from_stdin {
+                read_shell_state_from_stdin()?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            (
+                HookMessage::PreExecShellState {
+                    session,
+                    seq,
+                    pwd,
+                    opts,
+                    aliases,
+                    ts_unix_nanos: ts_now(),
+                },
+                sock,
+                None,
+            )
+        }
         HookSendKind::PostExecShellState {
             session,
             seq,
             pwd,
             sock,
-        } => (
-            HookMessage::PostExecShellState {
-                session,
-                seq,
-                pwd,
-                ts_unix_nanos: ts_now(),
-            },
-            sock,
-            None,
-        ),
+            from_stdin,
+        } => {
+            let (opts, aliases) = if from_stdin {
+                read_shell_state_from_stdin()?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            (
+                HookMessage::PostExecShellState {
+                    session,
+                    seq,
+                    pwd,
+                    opts,
+                    aliases,
+                    ts_unix_nanos: ts_now(),
+                },
+                sock,
+                None,
+            )
+        }
         HookSendKind::PreExecRedirects { .. } => {
             // Handled by the early-return above; matched here only
             // to keep the match exhaustive without an unreachable!().
@@ -521,6 +557,46 @@ fn read_env_block_from_stdin() -> Result<Vec<u8>> {
         );
     }
     Ok(buf)
+}
+
+/// AR06.2/.3 — parse a shell-state stdin block. Each record is
+/// NUL-terminated; within a record, fields are tab-separated:
+///   `OPT\t<name>\t<value>\0`
+///   `ALIAS\t<name>\t<value>\0`
+/// NUL separates records so embedded newlines / tabs in alias
+/// values round-trip without escaping. Unknown record prefixes
+/// (e.g. `FUNC` once AR06.4 lands) are silently ignored —
+/// forward-compat with newer hooks talking to older daemons.
+#[allow(clippy::type_complexity)]
+fn read_shell_state_from_stdin() -> Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .context("read shell-state stdin")?;
+    let mut opts: Vec<(String, String)> = Vec::new();
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    for record_bytes in buf.split(|&b| b == 0) {
+        if record_bytes.is_empty() {
+            continue;
+        }
+        // Records are utf-8 by construction (bash text). On the
+        // rare chance of non-utf-8 in an alias value, lossy-decode
+        // — we'd rather get something than refuse the whole batch.
+        let record = String::from_utf8_lossy(record_bytes);
+        let mut parts = record.splitn(3, '\t');
+        let kind = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("").to_string();
+        let value = parts.next().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        match kind {
+            "OPT" => opts.push((name, value)),
+            "ALIAS" => aliases.push((name, value)),
+            _ => {} // FUNC (AR06.4) and any future kinds skipped silently
+        }
+    }
+    Ok((opts, aliases))
 }
 
 fn stat_cwd(cwd: &std::path::Path) -> Option<(u64, u64)> {
