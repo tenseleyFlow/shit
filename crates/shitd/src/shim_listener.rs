@@ -318,11 +318,45 @@ fn ingest_notification(
     // suppresses the ReverseRename inverse — RestoreContent on the
     // dst path is correct, while ReverseRename would leave dst
     // empty and the bytes stuck at the source tmpfile path.
-    if matches!(note.syscall.as_str(), "rename" | "renameat")
+    if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
         && let Some(pre) = &note.pre_image
         && let Err(e) = ingest_pre_image(command, pre, index, blob_store)
     {
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: rename pre-image ingest failed");
+    }
+    // DR-CR-54 — when the rename's source was a directory, the
+    // shim captured per-file pre-images for every regular file in
+    // the subtree (bounded; see RECURSIVE_MAX_* in the shim).
+    // Each entry is keyed to its **original** absolute path, so
+    // a plain `ingest_pre_image` call lands the right
+    // FilePreImage event for the planner to plan a RestoreContent
+    // against. Without this, pip-style installers that move the
+    // whole site-packages tree out of the way before writing
+    // fresh content lose all pre-state and undo can only emit a
+    // refusal.
+    if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
+        && !note.extra_pre_images.is_empty()
+    {
+        let mut journaled = 0u64;
+        let mut failed = 0u64;
+        for pre in &note.extra_pre_images {
+            match ingest_pre_image(command, pre, index, blob_store) {
+                Ok(()) => journaled += 1,
+                Err(e) => {
+                    failed += 1;
+                    warn!(err = %e, pid = note.pid, path = %pre.path, "shim notify: recursive pre-image ingest failed");
+                }
+            }
+        }
+        debug!(
+            pid = note.pid,
+            session = %command.session,
+            seq = command.seq,
+            n = note.extra_pre_images.len(),
+            journaled,
+            failed,
+            "shim notify: recursive rename pre-images ingested (DR-CR-54)"
+        );
     }
     // Fall through to journal the TreeOp::Rename below.
 
@@ -445,7 +479,7 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 path,
             }))
         }
-        "rename" | "renameat" => {
+        "rename" | "renameat" | "renameat2" => {
             // The shim packs `from\tto` into a single arg field
             // (see `crates/shit-preload-shim/src/lib.rs` rename
             // interposer).
@@ -550,6 +584,7 @@ mod tests {
                 arg: "/tmp/probe".into(),
                 ts_unix_nanos: 0,
                 pre_image: None,
+                extra_pre_images: Vec::new(),
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();

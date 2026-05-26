@@ -275,6 +275,24 @@ mod next {
         }
     }
 
+    /// DR-CR-54 — `renameat2(2)`. Linux-only superset of `renameat`
+    /// with a `flags` arg. GNU `mv` (coreutils ≥ 8.30) and Python
+    /// 3.12+'s `os.rename` glibc-internal fastpath both call this
+    /// directly; missing the interposer means we silently drop
+    /// rename events from the canonical user-facing rename tools.
+    #[cfg(target_os = "linux")]
+    pub fn real_renameat2()
+    -> unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_uint) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"renameat2\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_uint) -> c_int,
+            >(addr)
+        }
+    }
+
     /// W09.10.1 — `mkfifo(2)`. The kqueue NOTE_WRITE on the parent
     /// directory does NOT fire for FIFO/special-file creation on
     /// FreeBSD (kernel-side distinction from regular file/dir
@@ -428,7 +446,124 @@ mod policy {
             return;
         }
         let arg = format!("{from_abs}\t{to_abs}");
-        notify_inner(syscall, &arg, Some(to));
+        // DR-CR-54 — when `from` is a directory, snapshot every
+        // regular file in the subtree so the planner can restore
+        // the original tree content on undo. pip's wheel installer
+        // is the canonical motivator: it renames `site-packages →
+        // <staging>` before writing fresh content, and without
+        // recursive pre-images the original site-packages contents
+        // are unreachable by the time undo runs.
+        notify_rename_inner_with_recursive(syscall, &arg, to, &from_abs);
+    }
+
+    /// DR-CR-54 limits. A directory rename of an enormous tree
+    /// would saturate memory and the shim→daemon UDS; cap the walk
+    /// to bound worst-case overhead. When a limit trips we ship
+    /// what we have and log; the planner still gets a partial
+    /// restore which is strictly better than current "loud
+    /// refusal".
+    const RECURSIVE_MAX_FILES: usize = 1000;
+    const RECURSIVE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+    const RECURSIVE_MAX_DEPTH: usize = 5;
+
+    /// Variant of `notify_inner` that ships a directory rename's
+    /// recursive subtree pre-images alongside the primary
+    /// notification. Walks `from_abs` (the **source** of the
+    /// rename, which still has the pre-rename contents at this
+    /// point — the libc rename hasn't been forwarded yet), but
+    /// only when it is actually a directory.
+    fn notify_rename_inner_with_recursive(
+        syscall: &'static str,
+        arg: &str,
+        capture_path: &str,
+        from_abs: &str,
+    ) {
+        if disabled() {
+            return;
+        }
+        if IN_NOTIFY.with(|f| f.replace(true)) {
+            return;
+        }
+        let pre_image = capture_pre_image(capture_path);
+        let extras = collect_recursive_pre_images(from_abs);
+        let wire_arg: String = match &pre_image {
+            Some(pre) if pre.path == capture_path => pre.path.clone(),
+            _ => arg.to_string(),
+        };
+        let _ = try_notify(syscall, &wire_arg, pre_image, extras);
+        IN_NOTIFY.with(|f| f.set(false));
+    }
+
+    /// Walk `from_abs` if it is a directory and capture per-file
+    /// pre-images for every regular file in the subtree. Returns
+    /// an empty Vec for non-directories, unreadable paths, or
+    /// when limits trip before the first file. Symlinks, devices,
+    /// fifos, and other non-regular entries are skipped (their
+    /// pre-images aren't a `RestoreContent`-shaped fix).
+    fn collect_recursive_pre_images(from_abs: &str) -> Vec<shit_proto::ShimPreImage> {
+        use std::os::unix::fs::MetadataExt;
+        use std::path::{Path, PathBuf};
+
+        let p = Path::new(from_abs);
+        let Ok(meta) = std::fs::symlink_metadata(p) else {
+            return Vec::new();
+        };
+        if !meta.is_dir() {
+            return Vec::new();
+        }
+
+        let mut out: Vec<shit_proto::ShimPreImage> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        // Depth-first walk. (Depth bound keeps a path explosion
+        // contained; file/byte caps catch fan-out separately.)
+        let mut stack: Vec<(PathBuf, usize)> = vec![(p.to_path_buf(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > RECURSIVE_MAX_DEPTH {
+                continue;
+            }
+            if out.len() >= RECURSIVE_MAX_FILES {
+                break;
+            }
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                if out.len() >= RECURSIVE_MAX_FILES {
+                    break;
+                }
+                let path = entry.path();
+                // `symlink_metadata` to avoid following symlinks
+                // into unrelated parts of the filesystem.
+                let Ok(emeta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if emeta.is_dir() {
+                    stack.push((path, depth + 1));
+                    continue;
+                }
+                if !emeta.is_file() {
+                    // Symlink, fifo, socket, device — skip; their
+                    // restore semantics aren't covered by a plain
+                    // RestoreContent + bytes payload.
+                    continue;
+                }
+                let size = emeta.size();
+                if total_bytes.saturating_add(size) > RECURSIVE_MAX_BYTES {
+                    return out;
+                }
+                let Some(s) = path.to_str() else {
+                    continue;
+                };
+                if should_skip_path(s) {
+                    continue;
+                }
+                if let Some(pre) = capture_pre_image(s) {
+                    total_bytes = total_bytes.saturating_add(pre.bytes.len() as u64);
+                    out.push(pre);
+                }
+            }
+        }
+        out
     }
 
     /// W09.10.1 — create-only notification (no pre-image). Used by
@@ -548,7 +683,7 @@ mod policy {
             (Some(pre), Some(cap)) if cap == arg => pre.path.clone(),
             _ => arg.to_string(),
         };
-        let _ = try_notify(syscall, &wire_arg, pre_image);
+        let _ = try_notify(syscall, &wire_arg, pre_image, Vec::new());
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -593,6 +728,7 @@ mod policy {
         syscall: &'static str,
         arg: &str,
         pre_image: Option<shit_proto::ShimPreImage>,
+        extra_pre_images: Vec<shit_proto::ShimPreImage>,
     ) -> std::io::Result<()> {
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
@@ -621,7 +757,7 @@ mod policy {
         // immediately scheduled). For notifications without
         // pre-image, the original 50 ms stays — those are tiny and a
         // hung daemon shouldn't pause a user's `unlink` for 5s.
-        let write_timeout = if pre_image.is_some() {
+        let write_timeout = if pre_image.is_some() || !extra_pre_images.is_empty() {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(50)
@@ -637,18 +773,23 @@ mod policy {
         // syscall, not an interposer target, so this is safe.
         let pid = unsafe { libc::getpid() } as u32;
         let has_pre = pre_image.is_some();
+        let has_extras = !extra_pre_images.is_empty();
         let note = ShimNotification {
             pid,
             syscall: syscall.to_string(),
             arg: arg.to_string(),
             ts_unix_nanos: now,
             pre_image,
+            extra_pre_images,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
         // large-frame encoder uniformly — the cap is the only
         // difference, and the daemon's reader matches.
-        let frame = if has_pre {
+        // DR-CR-54: a recursive batch can blow well past the small-
+        // frame cap even with `pre_image=None`; pick large-frame
+        // whenever extras are present too.
+        let frame = if has_pre || has_extras {
             encode_frame_large(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
         } else {
             encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
@@ -838,6 +979,43 @@ mod interposers {
             return unsafe { libc::renameat(fromfd, from, tofd, to) };
         }
         unsafe { real(fromfd, from, tofd, to) }
+    }
+
+    /// DR-CR-54 — `renameat2(2)` interposer. Linux-only. The
+    /// extra `flags` arg (RENAME_NOREPLACE / RENAME_EXCHANGE /
+    /// RENAME_WHITEOUT) shapes the kernel-level semantics but
+    /// doesn't change what we journal: the destination is still
+    /// the address that gets clobbered, and the source is still
+    /// what we want to recursively pre-image when it's a
+    /// directory. Pass `flags` through to libc verbatim.
+    ///
+    /// # Safety
+    /// `from` and `to` must be valid C strings.
+    #[cfg(target_os = "linux")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn renameat2(
+        fromfd: c_int,
+        from: *const c_char,
+        tofd: c_int,
+        to: *const c_char,
+        flags: c_uint,
+    ) -> c_int {
+        policy::notify_rename_with_dst_preimage(
+            "renameat2",
+            &cstr_to_string(from),
+            &cstr_to_string(to),
+        );
+        let real = next::real_renameat2();
+        if next::is_zero(next::as_usize(real)) {
+            // glibc < 2.28 had no `renameat2` wrapper; fall back
+            // through raw syscall. This branch is unreachable on
+            // any glibc shipped within the project's MSRV-era
+            // distros, but defensive.
+            return unsafe {
+                libc::syscall(libc::SYS_renameat2, fromfd, from, tofd, to, flags as c_uint) as c_int
+            };
+        }
+        unsafe { real(fromfd, from, tofd, to, flags) }
     }
 
     /// W09.10.1 — `mkfifo(2)` interposer. FreeBSD's kqueue
