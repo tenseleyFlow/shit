@@ -165,6 +165,12 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
     let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
+    // DR-CR-54.B — rename sources. When the shim recursively
+    // pre-imaged a directory rename's subtree, the per-file
+    // FilePreImage events live at paths INSIDE the rename's
+    // `from`. We need those source paths to detect the
+    // dir-rename atomic-replace shape below.
+    let mut rename_sources: HashSet<PathBuf> = HashSet::new();
     // W09.20 — collect (dev, inode) → set of paths from Unlink events
     // so we can detect hardlink groups: same inode appearing under
     // multiple names.
@@ -207,8 +213,9 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             // apply time and intermittently deleted the destination
             // outright. Treating the rename's destination identically
             // to a Create for classification purposes closes the gap.
-            CaptureEventKind::TreeOp(TreeOp::Rename { to, .. }) => {
+            CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
                 rename_destinations.insert(to.clone());
+                rename_sources.insert(from.clone());
             }
             _ => {}
         }
@@ -339,6 +346,56 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             atomic.insert(p.clone());
         }
     }
+    // DR-CR-54.B — directory-rename atomic-replace. When the shim
+    // observes `rename(srcdir, dstdir)` where `srcdir` is a
+    // directory, it recursively captures per-file pre-images for
+    // every regular file in the subtree (DR-CR-54.A). Each
+    // FilePreImage is keyed at its **original** absolute path
+    // under `srcdir/...`. The user's tool (pip, npm, etc.) then
+    // typically:
+    //
+    //   1. opens new files at `srcdir/foo` (TreeOp::Create
+    //      journaled by the shim, no pre-image since the path was
+    //      just freed by the rename),
+    //   2. eventually removes the staging dir at `dstdir`.
+    //
+    // For each such path P (FilePreImage + Create + P descendant
+    // of some rename source AND P exists at undo time), the
+    // per-event inverses would be:
+    //
+    //   - Create's Unlink-inverse → RecreatePath (drops empty
+    //     file with captured mode) → ConflictPhantom because P
+    //     already exists from the new tool's open.
+    //   - FilePreImage's RestoreContent → writes the original
+    //     bytes.
+    //
+    // The right shape is atomic-replace: suppress the Create's
+    // inverse, let RestoreContent overwrite the new content with
+    // the captured original bytes. Same pattern as the W06.A.4
+    // single-file `install(1)`/`mv` case, just driven by a
+    // **dir** rename instead of a same-path rename.
+    for p in &creates {
+        // Skip paths already classified by the earlier loops.
+        if atomic.contains(p) || transient.contains(p) {
+            continue;
+        }
+        if !pre_images.contains(p) {
+            continue;
+        }
+        // Path must be a strict descendant of some rename source.
+        // Equal-path doesn't qualify (that's the W06.A.4 shape,
+        // already handled above).
+        let under_rename_src = rename_sources
+            .iter()
+            .any(|src| p.starts_with(src) && p != src);
+        if !under_rename_src {
+            continue;
+        }
+        if probe.stat(p).is_some() {
+            atomic.insert(p.clone());
+        }
+    }
+
     // W09.20 — hardlink classification. For each (dev, inode) group
     // with multiple paths (i.e. the original setup had a hardlink
     // alias), check which paths are alive on disk at undo time:
@@ -2199,6 +2256,117 @@ mod tests {
         assert!(
             has_restore,
             "RestoreContent missing; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dir_rename_per_file_preimage_classifies_as_atomic_replace() {
+        // DR-CR-54.B — pip's flow renames `site-packages →
+        // <staging>`. The shim's recursive walk captures
+        // per-file pre-images keyed at the ORIGINAL paths
+        // (`site-packages/foo.py`). pip then re-creates
+        // `site-packages/foo.py` with new content; the shim
+        // journals a TreeOp::Create for it (no pre-image — file
+        // didn't exist post-rename).
+        //
+        // Per-event inverses without this fix:
+        //   - Create's Unlink-inverse → RecreatePath → empty
+        //     file with captured mode → ConflictPhantom (file
+        //     already exists from the new content).
+        //   - FilePreImage's RestoreContent → original bytes.
+        //
+        // Atomic-replace classification suppresses the
+        // RecreatePath; RestoreContent alone overwrites cleanly.
+        let srcdir = PathBuf::from("/lib/python/site-packages");
+        let dstdir = PathBuf::from("/lib/python/.shit-stage");
+        let file_path = PathBuf::from("/lib/python/site-packages/top_level.txt");
+        let dir_inode = InodeRef::new(1, 1000);
+        let file_inode = InodeRef::new(1, 2000);
+        let blob = BlobHash::from_bytes([0xCD; 32]);
+
+        let mut store = InMemoryStore::new();
+        store.put_blob(blob, 14);
+
+        // file_path exists at undo time (re-created by pip with v2 content).
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            file_path.clone(),
+            ProbeStat {
+                inode: file_inode,
+                meta: meta(14),
+            },
+            None,
+        );
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let dir_rename = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: srcdir.clone(),
+                to: dstdir.clone(),
+                inode: dir_inode,
+            }),
+        };
+        let recursive_pre = CaptureEvent {
+            id: EventId(2),
+            command: cmd,
+            ts: TimePoint::new(11, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: file_inode,
+                path: file_path.clone(),
+                blob,
+                meta: meta(14),
+                post_content_hash: None,
+            },
+        };
+        let create = CaptureEvent {
+            id: EventId(3),
+            command: cmd,
+            ts: TimePoint::new(12, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(0, 0),
+                path: file_path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o644,
+            }),
+        };
+
+        let p = plan(
+            dummy_command(),
+            &[dir_rename, recursive_pre, create],
+            &probe,
+            &store,
+        );
+
+        // RecreatePath for the per-file path MUST NOT emit —
+        // it'd ConflictPhantom on the pip-recreated file.
+        let has_recreate = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RecreatePath { path, .. } if path == &file_path));
+        assert!(
+            !has_recreate,
+            "RecreatePath for dir-rename-atomic-replace path leaked through; nodes: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+
+        // RestoreContent for the per-file path MUST emit.
+        let has_restore = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if path == &file_path));
+        assert!(
+            has_restore,
+            "RestoreContent missing for dir-rename-atomic-replace path; nodes: {:?}",
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
         );
     }
