@@ -42,6 +42,12 @@ path = "src/bin/baseline.rs"
 name = "compare"
 path = "src/bin/compare.rs"
 
+# B07 — BSD perf gate. Cross-platform binary; the BSD-specific
+# budget lives in tools/perf/budgets.toml.
+[[bin]]
+name = "doctor-bench"
+path = "src/bin/doctor.rs"
+
 # Linux-only fanotify-perm responder workload. The bin exists on all
 # platforms (builds with an `eprintln!("not Linux") + exit 0` stub)
 # so CI workflows can invoke it unconditionally; the real measurement
