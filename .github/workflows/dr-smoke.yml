@@ -608,6 +608,36 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  cargo-install-force-undo:
+    # AR05.2 -- LD_PRELOAD shim's OVERWRITE path. `cargo install
+    # --force` writes a tempfile then renames over an existing
+    # binary at $CARGO_HOME/bin/. The shim's rename interposer
+    # catches the rename and captures the OLD binary's bytes as a
+    # pre-image; `shit undo` restores them via the FilePreImage
+    # path. Contrast with AR05.1 which exercises the fresh-create
+    # TreeOp::Create path.
+    name: cargo-install-force-undo smoke (AR05.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/cargo-install-force-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-install-force-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
