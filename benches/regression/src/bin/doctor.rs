@@ -19,7 +19,10 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "doctor", about = "B07 perf gate: shit doctor --json total runtime")]
+#[command(
+    name = "doctor",
+    about = "B07 perf gate: shit doctor --json total runtime"
+)]
 struct Args {
     /// Number of iterations (default 100). Doctor is heavier than
     /// the shell-hook bench, so 100 is a reasonable wall-clock vs.

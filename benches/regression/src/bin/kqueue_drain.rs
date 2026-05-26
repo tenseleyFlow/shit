@@ -26,7 +26,10 @@ mod inner {
     use std::time::Instant;
 
     #[derive(Parser)]
-    #[command(name = "kqueue-drain-bench", about = "B07 perf gate: kqueue drain throughput")]
+    #[command(
+        name = "kqueue-drain-bench",
+        about = "B07 perf gate: kqueue drain throughput"
+    )]
     pub struct Args {
         /// Iterations (default 50). Each iteration drains a fixed
         /// event window.
@@ -207,9 +210,7 @@ fn main() {
     // unconditionally so the workflow shape stays the same across
     // arch/os. On non-FreeBSD hosts emit a placeholder so the
     // step succeeds and the JSON consumer can detect the skip.
-    println!(
-        r#"{{"workload":"kqueue-drain","skipped":"non-freebsd"}}"#
-    );
+    println!(r#"{{"workload":"kqueue-drain","skipped":"non-freebsd"}}"#);
 }
 
 #[cfg(target_os = "freebsd")]

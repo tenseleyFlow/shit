@@ -83,8 +83,8 @@ fn main() -> Result<()> {
 
     let raw = std::fs::read_to_string(&args.input)
         .with_context(|| format!("read {}", args.input.display()))?;
-    let parsed: BenchJson = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", args.input.display()))?;
+    let parsed: BenchJson =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", args.input.display()))?;
 
     let (workload, median_us, p99_us, host_os, host_arch, n_kept) = match parsed {
         BenchJson::Skipped { workload, skipped } => {

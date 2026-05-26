@@ -30,7 +30,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "shell-hook-bench", about = "B07 perf gate: hook UDS send latency")]
+#[command(
+    name = "shell-hook-bench",
+    about = "B07 perf gate: hook UDS send latency"
+)]
 struct Args {
     /// Outer iterations after warmup (default 200). Each iteration
     /// sends `--batch` frames; the reported per-iter latency is
@@ -77,7 +80,11 @@ fn unix_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-fn spawn_daemon(bin: &std::path::Path, state_dir: &std::path::Path, sock: &std::path::Path) -> Result<DaemonGuard> {
+fn spawn_daemon(
+    bin: &std::path::Path,
+    state_dir: &std::path::Path,
+    sock: &std::path::Path,
+) -> Result<DaemonGuard> {
     let child = Command::new(bin)
         .arg("--foreground")
         .arg("--sock")
@@ -101,7 +108,11 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    bail!("hook socket {} not ready within {:?}", path.display(), timeout);
+    bail!(
+        "hook socket {} not ready within {:?}",
+        path.display(),
+        timeout
+    );
 }
 
 fn pre_exec_frame(session: Uuid, seq: u64, cwd: &str) -> Result<Vec<u8>> {
@@ -145,9 +156,9 @@ fn main() -> Result<()> {
     // connected, send(2) avoids the per-call address resolution
     // and matches what the shell hook does over its persistent fd.
     let client = UnixDatagram::unbound().context("UnixDatagram::unbound")?;
-    client.connect(&sock_path).with_context(|| {
-        format!("connect to {}", sock_path.display())
-    })?;
+    client
+        .connect(&sock_path)
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
 
     // Workspace uuid is configured with v7 only. v7 carries a ms
     // timestamp; for the bench a single session ID is enough.

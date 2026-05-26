@@ -19,7 +19,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "hook-helper-bench", about = "B07 perf gate: shit-helper pkg-event latency")]
+#[command(
+    name = "hook-helper-bench",
+    about = "B07 perf gate: shit-helper pkg-event latency"
+)]
 struct Args {
     #[arg(long, default_value_t = 200)]
     n: usize,
@@ -49,7 +52,11 @@ impl Drop for DaemonGuard {
     }
 }
 
-fn spawn_daemon(bin: &std::path::Path, state_dir: &std::path::Path, sock: &std::path::Path) -> Result<DaemonGuard> {
+fn spawn_daemon(
+    bin: &std::path::Path,
+    state_dir: &std::path::Path,
+    sock: &std::path::Path,
+) -> Result<DaemonGuard> {
     let child = Command::new(bin)
         .arg("--foreground")
         .arg("--sock")
@@ -127,9 +134,8 @@ fn main() -> Result<()> {
 
     let host_os = std::env::consts::OS;
     let host_arch = std::env::consts::ARCH;
-    let r = shit_regression_bench::collect("hook-helper", args.n, host_os, host_arch, || {
-        run_helper(0)
-    });
+    let r =
+        shit_regression_bench::collect("hook-helper", args.n, host_os, host_arch, || run_helper(0));
 
     let json = shit_regression_bench::to_json(&r);
     match args.out {
