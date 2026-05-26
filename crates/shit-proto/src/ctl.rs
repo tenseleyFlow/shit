@@ -118,6 +118,28 @@ pub enum CtlRequest {
         /// hang the shell forever. Caller responsibility.
         timeout_ms: u32,
     },
+    /// C06 / AR06.5 — synchronous shell-side pre-stash for stream
+    /// redirects (`cmd > file`, `cmd >> file`, `| tee file`,
+    /// `dd of=file`). The shell hook parses the command line via
+    /// [`shit_shell::redirect::parse_redirects`] BEFORE the shell
+    /// performs the `open(O_TRUNC)` / `open(O_APPEND)` syscall, and
+    /// asks the daemon to capture the destination's pre-state. The
+    /// daemon journals one `CaptureEvent::FilePreImage` per target
+    /// keyed to the open command window, so the planner can later
+    /// emit `InverseOp::RestoreContent` (truncate verbs) or
+    /// `InverseOp::FileExtend` (append verbs) on undo.
+    ///
+    /// The daemon ACKs only after every target has been hashed +
+    /// stashed; the shell is expected to block until the ack so it
+    /// races the kernel tier rather than the actual `open`. Target
+    /// errors are returned per-target in `errors`, not surfaced as
+    /// a top-level `Error` — partial pre-stash (e.g., 3/4 targets
+    /// captured) is still useful and the shell should not abort.
+    PreStashRedirects {
+        session: uuid::Uuid,
+        command_seq: u64,
+        targets: Vec<RedirectTargetWire>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -828,6 +850,52 @@ pub enum CtlResponse {
         ready: bool,
         reason: Option<String>,
     },
+    /// Reply to `PreStashRedirects` (AR06.5). See
+    /// [`PreStashRedirectsResult`] for field semantics. The shell
+    /// hook ignores per-target errors in the common case and just
+    /// unblocks on ack — a missed pre-stash falls back to the
+    /// kernel tier rather than failing the user's command.
+    PreStashRedirectsAck(PreStashRedirectsResult),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreStashRedirectsResult {
+    /// Targets the daemon successfully hashed + journaled.
+    pub stashed: u32,
+    /// Per-target failure messages. Append-class targets (deferred)
+    /// land here too; not surfaced to the user.
+    pub errors: Vec<PreStashRedirectError>,
+}
+
+/// Wire form of [`shit_shell::redirect::RedirectTarget`]. Kept in
+/// shit-proto so shit-proto consumers don't have to depend on
+/// shit-shell (the shell crate pulls in a templating dep).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedirectTargetWire {
+    pub op: RedirectOpWire,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RedirectOpWire {
+    /// `>` / `>|` / `2>` / `&>` — content overwrite. Daemon stashes
+    /// the full file content so undo can `RestoreContent`.
+    Truncate,
+    /// `>>` / `2>>` / `&>>` — content extend. Daemon captures only
+    /// the pre-size so undo can `FileExtend` (truncate-back).
+    Append,
+    /// `| tee file` (no `-a`) — same shape as `Truncate`.
+    TeeTruncate,
+    /// `| tee -a file` — same shape as `Append`.
+    TeeAppend,
+    /// `dd of=file` — same shape as `Truncate`.
+    DdOf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreStashRedirectError {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

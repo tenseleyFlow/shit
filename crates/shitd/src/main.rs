@@ -22,6 +22,7 @@ mod log_setup;
 mod net_track;
 mod pkg;
 mod proc_track;
+mod redirect_track;
 mod server;
 mod shim_listener;
 mod stats;

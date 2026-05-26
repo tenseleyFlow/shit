@@ -175,6 +175,18 @@ async fn handle_client(
         } => {
             handle_wait_watch_ready(session, command_seq, timeout_ms, watch_ready.as_deref()).await
         }
+        CtlRequest::PreStashRedirects {
+            session,
+            command_seq,
+            targets,
+        } => crate::redirect_track::handle(
+            session,
+            command_seq,
+            targets,
+            &active,
+            &index,
+            &blob_store,
+        ),
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;

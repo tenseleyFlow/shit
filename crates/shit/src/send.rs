@@ -2,7 +2,11 @@
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use shit_proto::{CtlRequest, CtlResponse, HookMessage, ShellKind, decode_frame, encode_frame};
+use shit_proto::{
+    CtlRequest, CtlResponse, HookMessage, RedirectOpWire, RedirectTargetWire, ShellKind,
+    decode_frame, encode_frame,
+};
+use shit_shell::redirect::{RedirectOp, parse_redirects};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -104,6 +108,46 @@ pub enum HookSendKind {
         #[arg(long)]
         sock: PathBuf,
     },
+    /// AR06.5 — synchronous pre-stash for shell stream redirects.
+    /// The shell hook calls this BEFORE the about-to-run command's
+    /// `open(O_TRUNC)` fires; we parse the command line for redirect
+    /// destinations and ship them via a `PreStashRedirects` ctl
+    /// request. The hook blocks on the ack so the redirect doesn't
+    /// race the pre-stash. Daemon-side per-target failures are
+    /// logged at debug level and do NOT fail this subcommand — a
+    /// missed pre-stash is acceptable degradation (kernel tier
+    /// catches up); a hard failure would block the shell.
+    ///
+    /// `--cmdline` carries the literal command-line string (the
+    /// bash hook passes `$BASH_COMMAND`, zsh passes `$1` from
+    /// preexec, fish passes `$argv` from `--on-event fish_preexec`).
+    /// `--ctl-sock` defaults to the sibling `shit-ctl.sock` of the
+    /// hook sock, matching the PreExec path.
+    #[command(name = "pre-exec-redirects")]
+    PreExecRedirects {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        seq: u64,
+        /// The literal command-line string the shell is about to
+        /// execute. Quoted whole — the parser does the tokenization.
+        #[arg(long, allow_hyphen_values = true)]
+        cmdline: String,
+        /// Hook UDS — used to derive the ctl socket if `--ctl-sock`
+        /// isn't given. Optional because the parse-and-skip fast
+        /// path doesn't need a daemon at all.
+        #[arg(long)]
+        sock: Option<PathBuf>,
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+        /// Cap the round-trip. Default 1500 ms — large enough to
+        /// hash a few-MB log file, small enough not to wedge the
+        /// shell if the daemon is unhealthy. 0 disables the call
+        /// entirely (useful when running with capture explicitly
+        /// off).
+        #[arg(long, default_value_t = 1500)]
+        timeout_ms: u32,
+    },
 }
 
 fn parse_shell(s: &str) -> Result<ShellKind, String> {
@@ -130,6 +174,21 @@ struct PostSend {
 }
 
 pub fn run(kind: HookSendKind) -> Result<()> {
+    // PreExecRedirects doesn't ship a HookMessage — it's a direct
+    // ctl call, with a fast-path "no redirects, no roundtrip" exit.
+    // Handle it before the HookMessage match so the rest of the
+    // function stays linear.
+    if let HookSendKind::PreExecRedirects {
+        session,
+        seq,
+        cmdline,
+        sock,
+        ctl_sock,
+        timeout_ms,
+    } = kind
+    {
+        return run_pre_exec_redirects(session, seq, cmdline, sock, ctl_sock, timeout_ms);
+    }
     let (msg, sock, post): (HookMessage, PathBuf, Option<PostSend>) = match kind {
         HookSendKind::SessionOpen {
             session,
@@ -244,12 +303,87 @@ pub fn run(kind: HookSendKind) -> Result<()> {
                 None,
             )
         }
+        HookSendKind::PreExecRedirects { .. } => {
+            // Handled by the early-return above; matched here only
+            // to keep the match exhaustive without an unreachable!().
+            return Ok(());
+        }
     };
     send_message(&sock, &msg)?;
     if let Some(p) = post {
         wait_watch_ready(&p)?;
     }
     Ok(())
+}
+
+/// AR06.5 — parse the command line for stream-redirect destinations
+/// and synchronously ship them to the daemon for pre-stash. Returns
+/// Ok(()) on every code path that doesn't itself misuse the API —
+/// daemon-down, daemon-erroring, per-target failures all log to
+/// stderr (when applicable) but never propagate out of the hook.
+/// The shell hook MUST NOT block on capture-tier failure.
+fn run_pre_exec_redirects(
+    session: Uuid,
+    command_seq: u64,
+    cmdline: String,
+    sock: Option<PathBuf>,
+    ctl_sock: Option<PathBuf>,
+    timeout_ms: u32,
+) -> Result<()> {
+    if timeout_ms == 0 {
+        return Ok(());
+    }
+    let analysis = parse_redirects(&cmdline);
+    if analysis.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<RedirectTargetWire> = analysis
+        .targets
+        .into_iter()
+        .map(|t| RedirectTargetWire {
+            op: to_op_wire(t.op),
+            path: t.path,
+        })
+        .collect();
+    let ctl_path = ctl_sock
+        .or_else(|| {
+            sock.as_ref()
+                .and_then(|s| s.parent().map(|p| p.join("shit-ctl.sock")))
+        })
+        .unwrap_or_else(|| PathBuf::from("shit-ctl.sock"));
+    let req = CtlRequest::PreStashRedirects {
+        session,
+        command_seq,
+        targets,
+    };
+    match call_ctl(&ctl_path, &req, timeout_ms) {
+        Ok(CtlResponse::PreStashRedirectsAck(r)) => {
+            for err in &r.errors {
+                eprintln!("shit: pre-exec-redirects: {}: {}", err.path, err.reason);
+            }
+            Ok(())
+        }
+        Ok(other) => {
+            eprintln!("shit: pre-exec-redirects: unexpected response {other:?}");
+            Ok(())
+        }
+        Err(e) => {
+            // Daemon unreachable or timed out. Log + degrade — never
+            // block the user's command on capture-tier health.
+            eprintln!("shit: pre-exec-redirects: {e:#}");
+            Ok(())
+        }
+    }
+}
+
+fn to_op_wire(op: RedirectOp) -> RedirectOpWire {
+    match op {
+        RedirectOp::Truncate => RedirectOpWire::Truncate,
+        RedirectOp::Append => RedirectOpWire::Append,
+        RedirectOp::TeeTruncate => RedirectOpWire::TeeTruncate,
+        RedirectOp::TeeAppend => RedirectOpWire::TeeAppend,
+        RedirectOp::DdOf => RedirectOpWire::DdOf,
+    }
 }
 
 /// Block until the daemon confirms helper-side capture readiness for
