@@ -1149,10 +1149,18 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
                     // remediation; surface it under refusal_lines
                     // so the CLI can render it under its own
                     // "Refused:" header.
+                    //
+                    // AR07.4: prepend the command-string so the user
+                    // can correlate the refusal back to what they
+                    // ran. Without this, multi-command undo (`shit
+                    // undo --steps N` with N > 1) shows N refusal
+                    // lines and the user can't tell which command
+                    // triggered which.
                     if matches!(rec.op, shit_planner::InverseOp::Refuse { .. }) {
                         ops_refused += 1;
                         if let Some(d) = rec.detail.as_deref() {
-                            refusal_lines.push(d.to_string());
+                            let cmd_str = cmd.cmd_string.as_deref().unwrap_or("<unknown command>");
+                            refusal_lines.push(format!("`{cmd_str}` -> {d}"));
                         }
                     } else {
                         ops_skipped += 1;
