@@ -29,7 +29,9 @@ use std::path::{Path, PathBuf};
     target_os = "linux",
 ))]
 use crate::doctor::json::HelperHandshakeReport;
-use crate::doctor::json::{DoctorReport, HostInfo, MountReport, SCHEMA_VERSION};
+use crate::doctor::json::{
+    ArbitraryUndoCoverage, DoctorReport, HostInfo, MountReport, SCHEMA_VERSION,
+};
 
 const CANDIDATE_PATHS: &[&str] = &["$HOME", "/etc", "/usr/local", "/opt", "/tmp", "/var/tmp"];
 
@@ -93,9 +95,68 @@ fn collect() -> (Vec<Row>, DoctorReport) {
         linux: collect_linux(),
         macos: None,
         mounts,
+        arbitrary_undo_coverage: collect_arbitrary_undo_coverage(),
     };
 
     (rows, report)
+}
+
+/// AR07.3 — populate the `arbitrary_undo_coverage` block. The
+/// `refused_classes` list is enumerated from the planner's
+/// refuse-list catalog so it can never drift from the code.
+/// `covered_classes` is a hand-curated inventory sourced from
+/// the AR08.1 audit; future sprints may derive it programmatically
+/// from per-class smoke status. `last_validated_at` is intentionally
+/// empty here — CI writes a fresh snapshot when it stamps the
+/// coverage matrix.
+fn collect_arbitrary_undo_coverage() -> ArbitraryUndoCoverage {
+    let refused_classes: Vec<String> = shit_planner::refuse::catalog_classes()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // The covered-classes list mirrors the AR08.1 audit's
+    // 'covered + smoke' + 'covered, smoke-gap' entries grouped by
+    // their tier-level identifier. Order is alphabetical-by-tier so
+    // a diff against the AR08.1 doc is easy to eyeball.
+    let covered_classes: Vec<String> = [
+        "container-rm",       // AR03.1 / AR10.9 — docker/podman rm
+        "container-rmi",      // AR03.2 — docker rmi
+        "container-volume",   // AR03.3 — docker volume rm
+        "container-network",  // AR03.4 — docker network rm
+        "container-compose",  // AR03.6 — docker compose down
+        "fs-content-restore", // kernel-tier FilePreImage → RestoreContent
+        "fs-metadata",        // kernel-tier MetadataChange → RestoreMetadata
+        "fs-rename",          // kernel-tier TreeOp::Rename → Rename
+        "fs-tree",            // kernel-tier TreeOp Create/Unlink/Symlink
+        "kubectl-delete",     // AR04.3
+        "package-apt",        // AR02.1 / AR02.5
+        "package-dnf",        // AR02.2
+        "package-brew",       // DR-22
+        "preload-install",    // AR05.1/.2/.3 — LD_PRELOAD shim install path
+        "process-note",       // S18 — kill/pkill/killall informational
+        "redirect-truncate",  // AR06.5 — shell redirect pre-stash
+        "service-systemctl",  // S16
+        "tool-gh",            // AR04.4 — gh release delete
+        "tool-network",       // S17 — iptables/nft/ufw/ip
+        "tool-terraform",     // AR04.1/.2
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let covered = covered_classes.len() as u32;
+    let refused = refused_classes.len() as u32;
+    let total = covered + refused;
+    let coverage_pct = if total == 0 {
+        0
+    } else {
+        ((covered as f64 / total as f64) * 100.0).round() as u32
+    };
+    ArbitraryUndoCoverage {
+        covered_classes,
+        refused_classes,
+        coverage_pct,
+        last_validated_at: String::new(),
+    }
 }
 
 fn host_info() -> HostInfo {
