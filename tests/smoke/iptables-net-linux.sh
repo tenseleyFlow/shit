@@ -37,6 +37,13 @@ HELPER="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
 WRAPPER="${SHIT_REPO_ROOT}/packaging/net-hooks/iptables-wrapper"
 [ -x "${WRAPPER}" ] || smoke_fail "iptables wrapper missing at ${WRAPPER}"
+# The iptables-wrapper derives `basename "$0"` to know which tool
+# to look up (iptables vs ip6tables) — so it MUST be invoked
+# via a name matching iptables/ip6tables, not its own filename.
+# Symlink it into a tmpdir under the expected name. (nft-wrapper
+# hardcodes /sbin/nft, hence no equivalent step.)
+WRAPPER_LINK="${SHIT_SMOKE_TMP}/iptables"
+ln -sf "${WRAPPER}" "${WRAPPER_LINK}"
 
 SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 PID="$$"
@@ -52,9 +59,9 @@ PID="$$"
 # runner user; relax mode so the sudo'd helper can connect.
 chmod 0666 "${SHIT_CTL_SOCK}" 2>/dev/null || true
 
-smoke_log "sudo wrapper -N ${TEST_CHAIN} (create test chain)"
-sudo env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "SHIT_HELPER=${HELPER}" \
-    bash "${WRAPPER}" -N "${TEST_CHAIN}"
+smoke_log "sudo wrapper -N ${TEST_CHAIN} (create test chain via symlink)"
+sudo env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "SHIT_HELPER=${HELPER}" "PATH=${SHIT_SMOKE_TMP}:${PATH}" \
+    "${WRAPPER_LINK}" -N "${TEST_CHAIN}"
 
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
