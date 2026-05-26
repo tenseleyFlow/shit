@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# AR05.3 smoke — `pip install --user` OVERWRITES a script under
-# ~/.local/bin. The LD_PRELOAD shim catches the overwrite and
-# captures the OLD script's content as a pre-image. `shit undo`
-# restores the v1 script.
+# AR05.3 smoke — `pip install --user` OVERWRITES a module file
+# under ~/.local/lib/pythonX.Y/site-packages. The LD_PRELOAD shim
+# catches the overwrite and captures the OLD module's content as
+# a pre-image. `shit undo` restores the v1 module so re-running
+# the installed entry-point prints the v1 marker.
 #
 # Same shim path as AR05.2 (cargo install --force) but exercising
 # a different runtime (pip's wheel-install path uses Python's
 # shutil.move + os.chmod sequence, which lands at libc-level as
 # rename + chmod — the rename interposer catches it).
+#
+# Note: we sha and restore the MODULE file, not the entry-point
+# wrapper script under ~/.local/bin. pip auto-generates the
+# wrapper from the same template (interpreter + import + main())
+# for any version of the same package, so its content is byte-
+# identical between v1 and v2 — sha'ing the wrapper would always
+# claim "unchanged" and miss real edits.
 #
 # Ubuntu 24.04 PEP 668: system Python is "externally managed".
 # pip install --user is blocked unless --break-system-packages
@@ -104,8 +112,16 @@ V1_OUTPUT="$("${INSTALLED_BIN}")"
 if [ "${V1_OUTPUT}" != "hello pip v1" ]; then
     smoke_fail "pre-state script doesn't print v1 marker: '${V1_OUTPUT}'"
 fi
-V1_SHA="$(sha256sum "${INSTALLED_BIN}" | awk '{print $1}')"
-smoke_log "pre-state: v1 script at ${INSTALLED_BIN}, sha=${V1_SHA:0:16}..."
+# Locate the installed MODULE file (where the print statement actually
+# lives). pip's entry-point wrapper script is auto-generated and byte-
+# identical between v1 and v2 (same import + main() call), so we have
+# to sha the module, not the wrapper.
+PY_USER_SITE="$("${PIP_BIN}" show "${PKG_NAME}" 2>/dev/null | awk '/^Location:/ {print $2}')"
+[ -n "${PY_USER_SITE}" ] || smoke_fail "could not resolve user-site location via pip show"
+INSTALLED_MOD="${PY_USER_SITE}/${MOD_NAME}.py"
+[ -f "${INSTALLED_MOD}" ] || smoke_fail "module file not found at ${INSTALLED_MOD}"
+V1_SHA="$(sha256sum "${INSTALLED_MOD}" | awk '{print $1}')"
+smoke_log "pre-state: v1 module at ${INSTALLED_MOD}, sha=${V1_SHA:0:16}..."
 
 # v2 source + version bump.
 cat > "${PKG_DIR}/${MOD_NAME}.py" <<'EOF'
@@ -150,17 +166,17 @@ V2_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
 if [ "${V2_OUTPUT}" != "hello pip v2" ]; then
     smoke_log "pip-v2.log (last 50 lines):"
     tail -50 "${SHIT_SMOKE_TMP}/pip-v2.log" | sed 's/^/    /' >&2
-    smoke_log "installed script content:"
-    sed 's/^/    /' "${INSTALLED_BIN}" >&2
-    smoke_fail "post-install script doesn't print v2 marker: '${V2_OUTPUT}'"
+    smoke_log "installed module content:"
+    sed 's/^/    /' "${INSTALLED_MOD}" >&2
+    smoke_fail "post-install module doesn't print v2 marker: '${V2_OUTPUT}'"
 fi
-V2_SHA="$(sha256sum "${INSTALLED_BIN}" | awk '{print $1}')"
+V2_SHA="$(sha256sum "${INSTALLED_MOD}" | awk '{print $1}')"
 if [ "${V2_SHA}" = "${V1_SHA}" ]; then
     smoke_log "pip-v2.log (last 50 lines):"
     tail -50 "${SHIT_SMOKE_TMP}/pip-v2.log" | sed 's/^/    /' >&2
-    smoke_fail "v2 install didn't actually change the script (sha unchanged)"
+    smoke_fail "v2 install didn't actually change the module (sha unchanged)"
 fi
-smoke_log "post-install: v2 script at ${INSTALLED_BIN}, sha=${V2_SHA:0:16}... (overwrote v1)"
+smoke_log "post-install: v2 module at ${INSTALLED_MOD}, sha=${V2_SHA:0:16}... (overwrote v1)"
 
 sleep 0.5
 
@@ -190,15 +206,20 @@ if [ ! -x "${INSTALLED_BIN}" ]; then
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_fail "${INSTALLED_BIN} missing post-undo — undo unlinked instead of restoring"
 fi
+if [ ! -f "${INSTALLED_MOD}" ]; then
+    smoke_log "undo log:"
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "${INSTALLED_MOD} missing post-undo — undo unlinked instead of restoring"
+fi
 
 POST_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
-POST_SHA="$(sha256sum "${INSTALLED_BIN}" | awk '{print $1}')"
+POST_SHA="$(sha256sum "${INSTALLED_MOD}" | awk '{print $1}')"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-# Outcome A — full undo (v1 restored byte-identical)
+# Outcome A — full undo (v1 module restored byte-identical)
 if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; then
-    smoke_log "OUTCOME A — full undo (script restored to v1 byte-identical, output='${POST_OUTPUT}', shim hits=${SHIM_HITS})"
+    smoke_log "OUTCOME A — full undo (module restored to v1 byte-identical, output='${POST_OUTPUT}', shim hits=${SHIM_HITS})"
     smoke_log "PASS: pip-install-user-undo-linux (Outcome A)"
     exit 0
 fi
