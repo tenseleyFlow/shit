@@ -781,6 +781,10 @@ mod policy {
             ts_unix_nanos: now,
             pre_image,
             extra_pre_images,
+            // AU10 — default to no failure; the call site that
+            // resolved capture paths populates this when its
+            // canonicalize step tripped. See `notify_inner_failure`.
+            failure: None,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the

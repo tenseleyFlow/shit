@@ -594,6 +594,7 @@ mod tests {
                 ts_unix_nanos: 0,
                 pre_image: None,
                 extra_pre_images: Vec::new(),
+                failure: None,
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
