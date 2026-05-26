@@ -848,6 +848,57 @@ mod policy {
             || path.starts_with("/sys/")
     }
 
+    /// Canonicalize, falling back to the raw string on failure. The
+    /// `*at` interposers keep the syscall flowing either way; this
+    /// matches the pre-AU10 behavior for them.
+    fn canonical_path_or_raw(path: &str) -> String {
+        canonical_path(path).unwrap_or_else(|_| path.to_string())
+    }
+
+    /// DR-CR-54.B — resolve an `*at` syscall's `(dirfd, path)`
+    /// pair to an absolute path. `dirfd == AT_FDCWD` (-100) uses
+    /// the caller's cwd, so canonicalize directly. Otherwise we
+    /// read `/proc/self/fd/<dirfd>` (Linux) to discover what
+    /// directory the fd refers to, then join with `path` and
+    /// canonicalize.
+    ///
+    /// When path is already absolute, dirfd is ignored (POSIX
+    /// `*at` semantics).
+    ///
+    /// Best-effort: on any failure (proc unavailable, dirfd
+    /// invalid, canonicalize fails because target doesn't exist
+    /// yet) we fall through to the existing `canonical_path` which
+    /// tries parent-canonicalize, then bare-string.
+    pub fn resolve_at_path(dirfd: libc::c_int, path: &str) -> String {
+        use std::path::Path;
+        if path.starts_with('/') {
+            return canonical_path_or_raw(path);
+        }
+        if dirfd == libc::AT_FDCWD {
+            return canonical_path_or_raw(path);
+        }
+        // Read /proc/self/fd/<dirfd> to discover the directory.
+        // FreeBSD has /dev/fd; macOS has /dev/fd too; both work
+        // similarly enough for our linux-tier interception that
+        // we keep this Linux-targeted. The shim's BSD path uses
+        // `rename`/`unlink` (non-*at) primarily.
+        #[cfg(target_os = "linux")]
+        {
+            let link = format!("/proc/self/fd/{dirfd}");
+            if let Ok(dir) = std::fs::read_link(&link) {
+                let joined = dir.join(path);
+                if let Some(s) = joined.to_str() {
+                    return canonical_path_or_raw(s);
+                }
+            }
+        }
+        // Last resort — let canonical_path try its parent-fallback
+        // dance against the raw relative input. Worse case is the
+        // existing relative-path behavior, no regression.
+        let _ = Path::new(path);
+        canonical_path_or_raw(path)
+    }
+
     /// AU10 — structured failure from [`canonical_path`]. Each
     /// variant maps to a previously-silent fallback in the pre-AU10
     /// implementation. Surfacing them as typed errors lets the
@@ -1282,10 +1333,18 @@ mod interposers {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flag: c_int) -> c_int {
         let path_str = cstr_to_string(path);
+        // DR-CR-54.B — relative paths under `unlinkat(dirfd, "x", ..)`
+        // were arriving at the daemon as the bare "x", which the
+        // planner couldn't match against absolute-pathed FilePreImage
+        // events (from the recursive-walk or open-with-pre-image
+        // sites). Resolve via the dirfd → absolute path translation
+        // BEFORE notifying so the journal stores the same key
+        // everywhere.
+        let resolved = policy::resolve_at_path(dirfd, &path_str);
         // W09.5: same shape as `unlink` — capture pre-image bytes
         // before the unlink, so unlink-then-open(O_CREAT) tools
         // can be undone.
-        policy::notify_pre_mutation_with_content("unlinkat", &path_str);
+        policy::notify_pre_mutation_with_content("unlinkat", &resolved);
         let real = next::real_unlinkat();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::unlinkat(dirfd, path, flag) };
@@ -1311,7 +1370,10 @@ mod interposers {
         if writes {
             // W06.A.4: same content-overwrite shape as `open` —
             // capture pre-image bytes when the target exists.
-            policy::notify_pre_mutation_with_content("openat", &cstr_to_string(path));
+            // DR-CR-54.B: resolve dirfd → absolute up front.
+            let path_str = cstr_to_string(path);
+            let resolved = policy::resolve_at_path(dirfd, &path_str);
+            policy::notify_pre_mutation_with_content("openat", &resolved);
         }
         let real = next::real_openat();
         if next::is_zero(next::as_usize(real)) {
@@ -1357,11 +1419,15 @@ mod interposers {
     ) -> c_int {
         // W06.A.4: same atomic-replace shape as `rename` — capture
         // pre-image of the destination.
-        policy::notify_rename_with_dst_preimage(
-            "renameat",
-            &cstr_to_string(from),
-            &cstr_to_string(to),
-        );
+        // DR-CR-54.B: resolve the *at-style (fd, path) pairs to
+        // absolute paths up-front. Without this, daemon-side path
+        // equality against shim-recursive-walk FilePreImages fails
+        // and the classifier can't reach atomic-replace.
+        let from_str = cstr_to_string(from);
+        let to_str = cstr_to_string(to);
+        let from_abs = policy::resolve_at_path(fromfd, &from_str);
+        let to_abs = policy::resolve_at_path(tofd, &to_str);
+        policy::notify_rename_with_dst_preimage("renameat", &from_abs, &to_abs);
         let real = next::real_renameat();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::renameat(fromfd, from, tofd, to) };
@@ -1388,11 +1454,12 @@ mod interposers {
         to: *const c_char,
         flags: c_uint,
     ) -> c_int {
-        policy::notify_rename_with_dst_preimage(
-            "renameat2",
-            &cstr_to_string(from),
-            &cstr_to_string(to),
-        );
+        // DR-CR-54.B: same dirfd→absolute resolution as renameat.
+        let from_str = cstr_to_string(from);
+        let to_str = cstr_to_string(to);
+        let from_abs = policy::resolve_at_path(fromfd, &from_str);
+        let to_abs = policy::resolve_at_path(tofd, &to_str);
+        policy::notify_rename_with_dst_preimage("renameat2", &from_abs, &to_abs);
         let real = next::real_renameat2();
         if next::is_zero(next::as_usize(real)) {
             // glibc < 2.28 had no `renameat2` wrapper; fall back
