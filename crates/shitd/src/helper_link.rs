@@ -630,18 +630,21 @@ fn dispatch_response(
             partial,
         } => {
             let cwd_path = std::path::PathBuf::from(&cwd);
-            if let Some(cache) = live_baseline.get_cwd(&cwd_path) {
-                cache.mark_ready();
-                tracing::info!(
-                    %session, cwd, file_count, partial, cached = cache.entry_count(),
-                    "live-baseline walk complete; cache ready"
-                );
-            } else {
-                tracing::warn!(
-                    %session, cwd, file_count, partial,
-                    "BaselineWalkComplete for unknown cwd (no entries arrived?)"
-                );
-            }
+            // W09.12: empty-cwd case — the walk completed but no
+            // entries arrived (cwd is empty pre-exec). Without an
+            // entry in the LiveBaseline by-cwd map, the
+            // shim_listener's `path_in_watched_subtree` check
+            // returns false for paths under this cwd, so its
+            // fresh-create branch fires alongside the kqueue
+            // dir-diff and we get duplicate TreeOp::Create events.
+            // Force-create the entry here so the cwd is registered
+            // as watched even with zero baseline files.
+            let cache = live_baseline.entry_for_cwd(&cwd_path);
+            cache.mark_ready();
+            tracing::info!(
+                %session, cwd, file_count, partial, cached = cache.entry_count(),
+                "live-baseline walk complete; cache ready"
+            );
         }
         HelperResponse::TreeMutation {
             session,
