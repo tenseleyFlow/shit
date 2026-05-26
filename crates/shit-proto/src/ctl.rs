@@ -173,11 +173,26 @@ pub struct UndoReportWire {
     pub ops_skipped: u32,
     pub ops_failed: u32,
     pub ops_conflicted: u32,
+    /// AR07.2: how many ops were the planner's refuse-list short-
+    /// circuit. Distinguished from generic Skipped because the
+    /// underlying reason ('we know we can't' vs 'precondition
+    /// failed') is different and the CLI renders refusals
+    /// separately. `serde(default)` so older daemons round-trip
+    /// cleanly.
+    #[serde(default)]
+    pub ops_refused: u32,
     pub dry_run: bool,
     /// Human-readable summary for `shit undo` to print.
     pub summary: String,
     /// One line per failed/conflicted op, for the user to read.
     pub detail_lines: Vec<String>,
+    /// AR07.2: separate lines for each refused class so the CLI
+    /// can render them with their own header instead of mixing
+    /// into detail_lines. Each entry is one already-formatted
+    /// user-facing string ("refused (CLASS): REASON. Remediation:
+    /// REM"). `serde(default)` for older-daemon round-trip.
+    #[serde(default)]
+    pub refusal_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
