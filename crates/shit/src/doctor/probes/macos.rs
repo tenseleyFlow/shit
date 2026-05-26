@@ -33,7 +33,9 @@
 //!   no helper bin is findable on disk (typical fresh-checkout),
 //!   the probe returns `signature_kind = "unknown"`.
 
-#![cfg(target_os = "macos")]
+// Module-level `#[cfg(target_os = "macos")]` lives on `pub mod macos;`
+// in `super::mod`; the inner `#![cfg(...)]` is redundant and trips
+// `clippy::duplicated_attributes` on newer rustc.
 
 use crate::doctor::json::{
     CodesignReport, EndpointSecurityReport, FsEventsProbeReport, SandboxReport, SipReport,
