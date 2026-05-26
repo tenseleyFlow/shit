@@ -114,7 +114,12 @@ mod freebsd {
     }
 }
 
-#[cfg(target_os = "linux")]
+// Linux xattr capture is currently no-op'd above (the AR00 runner
+// surfaced a helper-side crash when pre_open_tree's per-file
+// fstat_meta called flistxattr; the W09.21 platform target is
+// FreeBSD-only). Keep the implementation behind a manual flag so
+// the followup PR can flip it on after diagnostic work on hasu.
+#[cfg(all(target_os = "linux", feature = "linux_xattr_capture"))]
 mod linux {
     use std::collections::BTreeMap;
     use std::ffi::{CStr, CString};
@@ -174,7 +179,7 @@ mod linux {
     }
 }
 
-#[cfg(all(test, any(target_os = "freebsd", target_os = "linux")))]
+#[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
