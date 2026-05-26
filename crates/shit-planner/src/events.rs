@@ -57,6 +57,52 @@ pub struct CaptureEvent {
     pub kind: CaptureEventKind,
 }
 
+/// G01.B.3 — Provenance of a `FilePreImage`'s captured bytes.
+///
+/// The planner's classifier needs to distinguish "the bytes captured
+/// before the user's command started" (a faithful pre-command
+/// snapshot, safe to restore) from "the bytes captured by some
+/// intercept partway through the command" (may be in-command
+/// mid-state, restoring it may corrupt user intent).
+///
+/// Only `BaselineCachePromote` carries a strong guarantee: the
+/// W02.B LiveBaseline path on FreeBSD walks the watched subtree at
+/// PreExec and caches each file's bytes; the cache is promoted to a
+/// `FilePreImage` on first modification — by construction, the
+/// captured bytes are exactly the file's content at PreExec time.
+///
+/// All other paths (LSM intercept, LD_PRELOAD shim, kqueue post-hoc
+/// read) are `Other`. They may or may not represent pre-command
+/// state — the planner can't tell from the capture alone, so it
+/// falls back to its existing conservative event-shape classifier.
+///
+/// Why a discriminator over symptom-suppression (the BSD producer
+/// could just suppress spurious Create events instead): the
+/// discriminator surfaces the actual semantic ("we know this is
+/// pre-command") at the planner's decision point. Symptom-
+/// suppression patches one race in the BSD producer; the
+/// discriminator generalizes to any capture tier where we can prove
+/// the bytes are pre-command (a future macOS ES path with the same
+/// guarantee, for instance, would set `BaselineCachePromote`).
+///
+/// Default is `Other` so postcard's `#[serde(default)]` deserializes
+/// older events (pre-G01.B.3) into the existing conservative
+/// classifier behavior — no change for already-journaled events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FilePreImageSource {
+    /// The captured bytes are a faithful pre-command snapshot. Set
+    /// by the W02.B LiveBaseline promote path on FreeBSD; the cache
+    /// is populated at PreExec and promoted on first modification.
+    BaselineCachePromote,
+    /// The captured bytes came from a mid-command intercept (LSM
+    /// fanotify-perm, LD_PRELOAD shim, kqueue post-hoc). The
+    /// classifier treats these conservatively — they may be
+    /// pre-command or in-command, the planner can't tell from the
+    /// capture alone.
+    #[default]
+    Other,
+}
+
 /// Variant payload of [`CaptureEvent`]. New tiers grow this enum; existing
 /// variants are stable on-the-wire (postcard schema evolution rules apply).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,12 +121,23 @@ pub enum CaptureEventKind {
     /// post-state — e.g. degraded macOS FSEvents-only mode. The planner
     /// proceeds without post-modification conflict detection in that case,
     /// and documentation warns the user.
+    ///
+    /// G01.B.3 — `source` records which capture path produced this
+    /// pre-image. The planner's classifier consults it when deciding
+    /// whether to fold "Create + Unlink + PreImage, file gone" into
+    /// the line-256 transient safety-net (correct for Linux's
+    /// touch+echo+rm shape where the pre-image is in-command empty
+    /// bytes) or to override into atomic_replace (correct for BSD's
+    /// W02.B baseline-promote where the pre-image is guaranteed
+    /// pre-command state). See [`FilePreImageSource`].
     FilePreImage {
         inode: InodeRef,
         path: PathBuf,
         blob: BlobHash,
         meta: FileMetadata,
         post_content_hash: Option<BlobHash>,
+        #[serde(default)]
+        source: FilePreImageSource,
     },
     /// File metadata changed (chmod/chown/setxattr/setacl/utimes) without a
     /// content change. Stored separately from `FilePreImage` to avoid blob
@@ -450,6 +507,7 @@ mod tests {
                 blob: BlobHash::from_bytes([0x11; 32]),
                 meta: sample_meta(),
                 post_content_hash: Some(BlobHash::from_bytes([0x22; 32])),
+                source: crate::FilePreImageSource::Other,
             },
         };
         let bytes = postcard::to_allocvec(&ev).unwrap();
