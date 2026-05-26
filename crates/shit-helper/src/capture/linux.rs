@@ -411,6 +411,7 @@ impl LinuxCaptureRuntime {
             uid: meta.uid,
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
+            xattrs: meta.xattrs.clone(),
             is_delete,
             fd_sent_via_scm: true,
         };
@@ -617,10 +618,14 @@ impl LinuxCaptureRuntime {
             blob_hash,
             stored_bytes,
             post_content_hash: None,
-            mode: meta_wire.map(|m| m.mode).unwrap_or(0),
-            uid: meta_wire.map(|m| m.uid).unwrap_or(0),
-            gid: meta_wire.map(|m| m.gid).unwrap_or(0),
-            mtime_unix_nanos: meta_wire.map(|m| m.mtime_unix_nanos).unwrap_or(0),
+            mode: meta_wire.as_ref().map(|m| m.mode).unwrap_or(0),
+            uid: meta_wire.as_ref().map(|m| m.uid).unwrap_or(0),
+            gid: meta_wire.as_ref().map(|m| m.gid).unwrap_or(0),
+            mtime_unix_nanos: meta_wire.as_ref().map(|m| m.mtime_unix_nanos).unwrap_or(0),
+            xattrs: meta_wire
+                .as_ref()
+                .map(|m| m.xattrs.clone())
+                .unwrap_or_default(),
             is_delete: true,
             fd_sent_via_scm: staging_fd.is_some(),
         };
@@ -1610,13 +1615,14 @@ enum FileType {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StatMeta {
     mode: u32,
     uid: u32,
     gid: u32,
     size: u64,
     mtime_unix_nanos: i128,
+    xattrs: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl StatMeta {
@@ -1627,6 +1633,7 @@ impl StatMeta {
             gid: self.gid,
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
+            xattrs: self.xattrs,
         }
     }
 }
@@ -1646,6 +1653,7 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         gid: st.st_gid,
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
+        xattrs: crate::capture::xattr::read_user_xattrs(fd),
     })
 }
 
