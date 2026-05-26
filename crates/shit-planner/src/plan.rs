@@ -396,6 +396,122 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         }
     }
 
+    // DR-CR-54.B — orphan-parent transient classification.
+    //
+    // Build tools routinely create files under ephemeral parent
+    // directories (`/tmp/pip-ephem-wheel-cache-X/wheels/...`,
+    // `/tmp/cargo-installXXX/`, `make`'s build-dir intermediates)
+    // then `rm -rf` the parent on clean-up. The shim captures
+    // pre-images of those files at unlink/open/rename time, but
+    // the parent dir is gone by undo time AND no captured event
+    // recreates it.
+    //
+    // Without this filter, the per-event inverse emission queues a
+    // `RecreatePath` (Unlink's inverse) or `RestoreContent`
+    // (FilePreImage's inverse) at the orphan path. The executor
+    // then hits ENOENT on the missing parent → `Failed`. The
+    // orchestrator's abort policy halts the whole plan, stranding
+    // RestoreContent ops for paths the user actually cares about
+    // (e.g. `site-packages/foo.py`) behind a build-cache cleanup.
+    //
+    // Classify as transient instead: no inverse emitted, no
+    // failure to abort the orchestrator. The orchestrator's
+    // existing `failed/conflicted` counters still surface true
+    // user-state restoration failures.
+    //
+    // Heuristic: parent dir missing at undo time AND no captured
+    // event creates the parent. We deliberately don't try to
+    // `mkdir -p` the parent — that would silently recreate
+    // throw-away dirs with default permissions, polluting the
+    // user's tmp.
+    let event_creates_path = |q: &PathBuf| creates.contains(q) || rename_destinations.contains(q);
+    // Index DISTINCT captured paths by their immediate parent so
+    // we can require ≥2 sibling captures before firing the filter.
+    // The intent: a SINGLE isolated `rm foo` against a gone-parent
+    // path is the user wanting a Missing-conflict (existing
+    // behavior), while a CLUSTER of captures under the same
+    // gone-parent is a build-tool cleanup pattern (orphan,
+    // suppress).
+    //
+    // Important: dedupe across `pre_images` and `unlinks` — a
+    // single `rm foo` has both an Unlink AND a pre-image at the
+    // same path. Counting them as 2 siblings would mis-classify.
+    let mut siblings_by_parent: std::collections::HashMap<PathBuf, HashSet<PathBuf>> =
+        std::collections::HashMap::new();
+    for p in pre_images.iter().chain(unlinks.iter()) {
+        if let Some(parent) = p.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            siblings_by_parent
+                .entry(parent.to_path_buf())
+                .or_default()
+                .insert(p.clone());
+        }
+    }
+    for p in pre_images.iter().chain(unlinks.iter()) {
+        // Skip paths already classified.
+        if atomic.contains(p) || transient.contains(p) {
+            continue;
+        }
+        // Only fire the orphan-parent filter when the FILE itself
+        // is also gone. A file that still exists at undo time has
+        // a real parent dir somewhere — the existing logic handles
+        // it. Without this guard, in-memory test probes that only
+        // register the file (and not its `/`-walk of parents)
+        // would mis-classify legitimate restores as transient.
+        if probe.stat(p).is_some() {
+            continue;
+        }
+        let Some(parent) = p.parent() else {
+            continue;
+        };
+        if parent.as_os_str().is_empty() {
+            continue;
+        }
+        // Parent exists at undo → not an orphan; existing logic handles it.
+        if probe.stat(parent).is_some() {
+            continue;
+        }
+        // Conservative: require ≥2 captures under the same parent
+        // before declaring a cluster-style orphan. Single isolated
+        // captures (the `rm foo` shape) fall through to existing
+        // Missing-conflict logic so the user gets actionable
+        // feedback rather than silent skip.
+        let cluster = siblings_by_parent
+            .get(&parent.to_path_buf())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        if cluster < 2 {
+            continue;
+        }
+        // Parent has its own create/rename-to event somewhere in
+        // the plan → not orphan; the inverse for that event will
+        // handle parent existence.
+        let parent_buf = parent.to_path_buf();
+        if event_creates_path(&parent_buf) {
+            continue;
+        }
+        // Same check for ancestors above the immediate parent — a
+        // create at any ancestor still makes us non-orphan because
+        // its Unlink-inverse cleans up the whole subtree (`rm -rf`).
+        let mut ancestor = parent.parent();
+        let mut covered_by_ancestor_event = false;
+        while let Some(anc) = ancestor {
+            if anc.as_os_str().is_empty() {
+                break;
+            }
+            if event_creates_path(&anc.to_path_buf()) {
+                covered_by_ancestor_event = true;
+                break;
+            }
+            ancestor = anc.parent();
+        }
+        if covered_by_ancestor_event {
+            continue;
+        }
+        transient.insert(p.clone());
+    }
+
     // W09.20 — hardlink classification. For each (dev, inode) group
     // with multiple paths (i.e. the original setup had a hardlink
     // alias), check which paths are alive on disk at undo time:
@@ -2368,6 +2484,95 @@ mod tests {
             has_restore,
             "RestoreContent missing for dir-rename-atomic-replace path; nodes: {:?}",
             p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_parent_cluster_classifies_as_transient() {
+        // DR-CR-54.B — pip's flow writes intermediate files into
+        // an ephemeral wheel-cache dir
+        // (`/tmp/pip-ephem-wheel-cache-X/wheels/foo.whl`) then
+        // `rm -rf`'s the whole tree on cleanup. Our shim captures
+        // pre-images of those files; at undo time both the files
+        // AND their parent dir are gone. Without this rule the
+        // executor's RestoreContent hits ENOENT on the missing
+        // parent → Failed → orchestrator abort policy halts the
+        // plan, stranding the actually-useful RestoreContents.
+        //
+        // ≥2 captures under the same missing parent gates the
+        // filter to "build-tool cleanup" clusters; a SINGLE
+        // captured path with a missing parent stays in
+        // Missing-conflict territory so the user gets actionable
+        // feedback.
+        let probe = InMemoryProbe::new(); // nothing exists
+        let mut store = InMemoryStore::new();
+        let blob = BlobHash::from_bytes([0xCC; 32]);
+        store.put_blob(blob, 5);
+        let inode_a = InodeRef::new(1, 11);
+        let inode_b = InodeRef::new(1, 12);
+        let mk = |id: u64, path: &str, inode: InodeRef| CaptureEvent {
+            id: EventId(id),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: PathBuf::from(path),
+                blob,
+                meta: meta(5),
+                post_content_hash: None,
+            },
+        };
+        let evs = vec![
+            mk(1, "/tmp/pip-ephem-wheel-cache-X/wheels/a.whl", inode_a),
+            mk(2, "/tmp/pip-ephem-wheel-cache-X/wheels/b.whl", inode_b),
+        ];
+        let p = plan(dummy_command(), &evs, &probe, &store);
+        // Both paths share `/tmp/pip-ephem-wheel-cache-X/wheels`
+        // as parent, neither parent nor children exist at undo.
+        // Cluster size = 2 → transient → zero plan nodes.
+        assert_eq!(
+            p.nodes.len(),
+            0,
+            "orphan-parent cluster should emit no plan nodes; got: {:?}",
+            p.nodes.iter().map(|n| &n.op).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_parent_single_isolated_stays_missing_conflict() {
+        // DR-CR-54.B counter-test — a single isolated captured
+        // path with a missing parent must still emit the
+        // Missing-conflict plan node so the user gets actionable
+        // feedback. Only CLUSTERS (≥2 captures under the same
+        // missing parent) are classified as transient.
+        let probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let blob = BlobHash::from_bytes([0xDD; 32]);
+        store.put_blob(blob, 5);
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, 5),
+                path: PathBuf::from("/tmp/lonely/file.txt"),
+                blob,
+                meta: meta(5),
+                post_content_hash: None,
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert!(
+            !p.nodes.is_empty(),
+            "single-isolated orphan should still emit a plan node (Missing conflict); got 0"
         );
     }
 
