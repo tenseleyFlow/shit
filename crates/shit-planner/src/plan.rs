@@ -170,6 +170,13 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     // multiple names.
     let mut paths_by_inode: std::collections::HashMap<crate::inode::InodeRef, HashSet<PathBuf>> =
         std::collections::HashMap::new();
+    // G01.5 — reverse map for the W09.5 atomic-replace branch's
+    // hardlink-aware guard. When an unlinked path's captured inode
+    // is part of a multi-name group (i.e. a hardlink alias), we
+    // need to defer to the W09.20 CreateHardlink classifier
+    // instead of forcing atomic_replace.
+    let mut unlinks_with_inode: std::collections::HashMap<PathBuf, crate::inode::InodeRef> =
+        std::collections::HashMap::new();
     for ev in events {
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, .. } => {
@@ -194,6 +201,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
                         .entry(*inode)
                         .or_default()
                         .insert(path.clone());
+                    unlinks_with_inode.insert(path.clone(), *inode);
                 }
             }
             // AR01.1 follow-up: the Linux LSM `inode_rename` hook is
@@ -370,6 +378,26 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         // succeeds without RecreatePath. Keeping RecreatePath in
         // the plan would race RestoreContent and ConflictPhantom
         // (path already created by whichever fires first).
+        //
+        // EXCEPT for hardlink groups (W09.20). When the captured
+        // inode is shared with another path that's still alive at
+        // undo time, the right inverse is CreateHardlink (back to
+        // the surviving alias), NOT RestoreContent which would
+        // tmpfile+rename a fresh inode and break the alias chain.
+        // Detect by walking the unlinked path's captured inode
+        // and looking for a sibling in `paths_by_inode`. The
+        // dedicated W09.20 hardlink classifier below will then
+        // emit the CreateHardlink. If we mis-claim this as
+        // atomic_replace, the FilePreImage arm's
+        // `hardlink_dead_to_source` guard misses and we lose
+        // hardlink-aware restore.
+        let is_hardlink_dead = unlinks_with_inode
+            .get(p)
+            .and_then(|inode| paths_by_inode.get(inode))
+            .is_some_and(|siblings| siblings.len() > 1);
+        if is_hardlink_dead {
+            continue;
+        }
         atomic.insert(p.clone());
     }
     // W09.20 — hardlink classification. For each (dev, inode) group
