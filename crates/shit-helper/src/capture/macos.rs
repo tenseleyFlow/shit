@@ -102,13 +102,7 @@ impl CaptureControl {
     /// `sysctl(KERN_PROC_CWD)` fallback because libproc cross-PID
     /// queries are unreliable enough (TCC, dropped privileges) that
     /// requiring the path keeps the contract honest.
-    pub fn on_watch_tree(
-        &self,
-        session: Uuid,
-        command_seq: u64,
-        _root_pid: u32,
-        cwd_path: &str,
-    ) {
+    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, _root_pid: u32, cwd_path: &str) {
         if cwd_path.is_empty() {
             tracing::warn!(
                 %session,
@@ -257,10 +251,7 @@ impl PumpState {
         let roots: Vec<PathBuf> = self.watches.values().cloned().collect();
         match FsEventsStream::start_with_options(roots.clone(), StreamOptions::default()) {
             Ok((stream, rx)) => {
-                tracing::info!(
-                    n_roots = roots.len(),
-                    "fsevents stream (re)started"
-                );
+                tracing::info!(n_roots = roots.len(), "fsevents stream (re)started");
                 self.stream = Some((stream, rx));
             }
             Err(e) => {

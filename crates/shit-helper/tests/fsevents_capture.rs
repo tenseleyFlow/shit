@@ -291,14 +291,18 @@ fn recv_frame_with_deadline(fd: &std::os::fd::OwnedFd, deadline: Instant) -> Opt
     }
     let remaining = deadline - now;
     set_recv_timeout(fd, remaining);
-    match try_recv_exact(fd, &mut [0u8; 4]) {
-        ReadOutcome::Bytes(header) => {
-            let body_len = u32::from_be_bytes(header) as usize;
-            let mut out = vec![0u8; 4 + body_len];
-            out[..4].copy_from_slice(&header);
-            recv_exact(fd, &mut out[4..]);
-            Some(out)
-        }
+    let header = try_recv_header(fd)?;
+    let body_len = u32::from_be_bytes(header) as usize;
+    let mut out = vec![0u8; 4 + body_len];
+    out[..4].copy_from_slice(&header);
+    recv_exact(fd, &mut out[4..]);
+    Some(out)
+}
+
+fn try_recv_header(fd: &std::os::fd::OwnedFd) -> Option<[u8; 4]> {
+    let mut scratch = [0u8; 4];
+    match try_recv_exact(fd, &mut scratch) {
+        ReadOutcome::Bytes(bytes) => Some(bytes),
         ReadOutcome::Eof | ReadOutcome::Timeout => None,
     }
 }
@@ -350,19 +354,13 @@ fn recv_exact(fd: &std::os::fd::OwnedFd, buf: &mut [u8]) {
 
 /// Drain incoming HelperResponses until `pred` matches or `timeout`
 /// elapses. Returns the matching response or `None` on timeout.
-fn drain_until<F>(
-    fd: &std::os::fd::OwnedFd,
-    timeout: Duration,
-    pred: F,
-) -> Option<HelperResponse>
+fn drain_until<F>(fd: &std::os::fd::OwnedFd, timeout: Duration, pred: F) -> Option<HelperResponse>
 where
     F: Fn(&HelperResponse) -> bool,
 {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let Some(bytes) = recv_frame_with_deadline(fd, deadline) else {
-            return None;
-        };
+        let bytes = recv_frame_with_deadline(fd, deadline)?;
         let resp: HelperResponse = decode_frame(&bytes).expect("decode HelperResponse");
         if pred(&resp) {
             return Some(resp);
