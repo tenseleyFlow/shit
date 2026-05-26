@@ -85,6 +85,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
             InverseOp::RecreatePath { .. } => self.apply_recreate_path(op),
             InverseOp::Rename { .. } => self.apply_rename(op),
             InverseOp::CreateSymlink { .. } => self.apply_create_symlink(op),
+            InverseOp::CreateHardlink { .. } => self.apply_create_hardlink(op),
             InverseOp::FileExtend { .. } => self.apply_file_extend(op),
             other => ExecutionOutcome::Failed {
                 err: format!(
@@ -263,6 +264,26 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             Ok(()) => ExecutionOutcome::Applied,
             Err(e) => ExecutionOutcome::Failed {
                 err: format!("symlink {path:?} -> {link_target:?}: {e}"),
+            },
+        }
+    }
+
+    /// W09.20 — `link(source, target)`. Restores a hardlink: the
+    /// surviving alias (`source`) is the still-live path; `target`
+    /// is the freshly-dead path we want to re-alias to the same
+    /// inode. POSIX `link(2)` preserves inode (no content copy);
+    /// nlink on the inode increments to match the original
+    /// pre-unlink count.
+    fn apply_create_hardlink(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::CreateHardlink { source, target } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_create_hardlink: wrong variant".into(),
+            };
+        };
+        match fs::hard_link(source, target) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(e) => ExecutionOutcome::Failed {
+                err: format!("link {source:?} -> {target:?}: {e}"),
             },
         }
     }
