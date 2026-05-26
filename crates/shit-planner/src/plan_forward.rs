@@ -110,6 +110,31 @@ fn emit_forward_for_event(
             });
         }
         CaptureEventKind::TreeOp(op) => emit_forward_for_tree_op(op, probe, nodes),
+        CaptureEventKind::ShellStateDiff {
+            pwd_before,
+            pwd_after,
+        } => {
+            // Forward direction: redo the cd, i.e. cd to pwd_after.
+            if pwd_before == pwd_after {
+                return;
+            }
+            let pwd_after_str = pwd_after.to_string_lossy();
+            let escaped = pwd_after_str.replace('\'', "'\\''");
+            let snippet = format!("cd '{escaped}'\n");
+            nodes.push(PlanNode {
+                op: InverseOp::ShellStateRestore {
+                    pwd_before: Some(pwd_after.clone()),
+                    opts_diff: Vec::new(),
+                    aliases_diff: Vec::new(),
+                    funcs_diff: Vec::new(),
+                    snippet_bash: Some(snippet.clone()),
+                    snippet_zsh: Some(snippet),
+                    snippet_fish: None,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
         CaptureEventKind::EnvDiff {
             added,
             removed,
