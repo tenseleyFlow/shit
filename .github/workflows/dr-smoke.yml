@@ -1126,7 +1126,8 @@ jobs:
                     ssh-keygen-undo-fbsd.sh \
                     python-venv-undo-fbsd.sh \
                     chmod-setuid-undo-fbsd.sh \
-                    tee-undo-fbsd.sh"
+                    tee-undo-fbsd.sh \
+                    backup-and-modify-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
