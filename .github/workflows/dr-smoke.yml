@@ -666,6 +666,36 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  redirect-race-undo:
+    # AR06.5 -- the C06 load-bearing target. bash performs open(O_TRUNC)
+    # in `cmd > file` BEFORE invoking cmd, so the kernel tier can't
+    # attribute the original bytes to the user's command. The shell hook's
+    # DEBUG-trap synchronously asks the daemon to pre-stash the file's
+    # pre-truncate content. `shit undo` then restores those bytes. Outcome
+    # A is the goal; Outcome B (loud refusal) acceptable; Outcome C (silent
+    # wrong restore) fails the smoke.
+    name: redirect-race-undo smoke (AR06.5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/redirect-race-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redirect-race-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
