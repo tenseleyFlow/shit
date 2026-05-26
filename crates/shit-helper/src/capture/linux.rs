@@ -1436,7 +1436,11 @@ fn pre_open_recurse(
             // fd (the dentry vanishes post-rmdir; without a pinned
             // fd, fstat-by-path returns ENOENT and we lose the
             // captured mode). O_PATH doesn't require read perm and
-            // works with fstat for metadata.
+            // works with fstat for metadata. We deliberately do NOT
+            // bump `opened` here — that counter tracks regular-file
+            // snapshots against PRE_OPEN_TREE_MAX_FILES; the depth
+            // cap (PRE_OPEN_TREE_DEPTH_LIMIT=8) already bounds the
+            // dir-fd count.
             if let Ok(f) = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
@@ -1446,7 +1450,6 @@ fn pre_open_recurse(
                     .insert((meta.dev(), meta.ino()), OwnedFd::from(f));
                 ws.path_to_inode
                     .insert(path.clone(), (meta.dev(), meta.ino()));
-                *opened += 1;
             }
             pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
             continue;
@@ -2122,7 +2125,14 @@ mod tests {
             4,
             "all files should have pre-snapshots"
         );
-        assert_eq!(ws.pre_opens.len(), 4, "all files should have open fds");
+        // G03: pre_opens holds fds for both files (O_RDONLY) and dirs
+        // (O_PATH) — 4 files + 3 nested dirs (.git, objects, 02).
+        assert_eq!(
+            ws.pre_opens.len(),
+            7,
+            "expected 4 file fds + 3 dir fds, got {}",
+            ws.pre_opens.len()
+        );
         // 4 dirs: root, .git, .git/objects, .git/objects/02.
         // (root was inserted by the caller; pre_open_recurse adds the 3 below.)
         assert_eq!(
@@ -2141,11 +2151,12 @@ mod tests {
 
         // AR01.1.fix-rename-target-preimage — every regular file must
         // be in path_to_inode so a future rename-over-this-path
-        // resolves the OLD (dev, inode).
+        // resolves the OLD (dev, inode). G03 — dirs are also indexed
+        // for the same reason (rename-over-dir uses the same map).
         assert_eq!(
             ws.path_to_inode.len(),
-            4,
-            "every opened file should appear in path_to_inode (4 expected), got {:?}",
+            7,
+            "expected 4 file + 3 dir entries in path_to_inode, got {:?}",
             ws.path_to_inode
         );
         let index_md = std::fs::metadata(git.join("index")).unwrap();
