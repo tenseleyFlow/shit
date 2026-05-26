@@ -239,21 +239,21 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             continue;
         }
         // G01.3: path GONE at undo but parent dir exists →
-        // still atomic_replace. RestoreContent will recreate the
-        // file from the captured blob; ReverseRename + RecreatePath
-        // would fail because the source path is gone and the lock-
-        // file path is gone too. Real-world trigger: `git stash
-        // drop` of the only stash entry — git rewrites
-        // `.git/logs/refs/stash` via lock+rename, then unlinks
-        // the stash file entirely when there are no remaining
-        // entries to log. The pre-image captured the original
-        // 158-byte reflog and we want it back.
+        // still atomic_replace IF this is a rename destination
+        // (the `git stash drop` shape: rename overwrites a file
+        // with a captured pre-image, then later code deletes the
+        // result). RestoreContent recreates the original from the
+        // captured blob; ReverseRename + RecreatePath would fail.
         //
-        // Falls back to transient only when the parent is gone
-        // too — that's the "the user nuked the whole subtree"
-        // shape from DR-CR-54.B that we already treat as
-        // unrecoverable.
-        if let Some(parent) = p.parent()
+        // We deliberately do NOT extend to the pure
+        // Create+Unlink+PreImage shape (e.g. touch+echo+rm in one
+        // command). For that case the captured pre-image is the
+        // file's IN-COMMAND content — not a pre-command snapshot —
+        // and the user's expected post-undo state is "file
+        // absent", i.e. transient.
+        let is_rename_destination = rename_destinations.contains(p);
+        if is_rename_destination
+            && let Some(parent) = p.parent()
             && !parent.as_os_str().is_empty()
             && probe.stat(parent).is_some()
         {
