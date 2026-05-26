@@ -163,11 +163,21 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         match restore_metadata_inner(path, target) {
             Ok(()) => ExecutionOutcome::Applied,
             Err(MetadataRestoreError::ChownNeedsPrivilege { uid, gid }) => {
-                // DR-15: retry via the helper IPC router.
+                // DR-15: retry via the helper IPC router. The helper
+                // does the chown; the daemon finishes mode + mtime
+                // here. W09.13 — chmod MUST run after chown so that
+                // setuid/setgid bits in `target.mode` survive (chown
+                // strips them).
                 match self.privileged_router.chown(path, uid, gid, false) {
                     PrivilegedOpOutcome::Applied => {
-                        // chown via helper succeeded; finish the mtime
-                        // half ourselves.
+                        use std::os::unix::fs::PermissionsExt;
+                        let mode_only = target.mode & 0o7777;
+                        let perms = std::fs::Permissions::from_mode(mode_only);
+                        if let Err(e) = fs::set_permissions(path, perms) {
+                            return ExecutionOutcome::Failed {
+                                err: format!("chmod {path:?} -> {mode_only:o}: {e}"),
+                            };
+                        }
                         match restore_mtime_only(path, target) {
                             Ok(()) => ExecutionOutcome::Applied,
                             Err(e) => ExecutionOutcome::Failed { err: e },
@@ -320,22 +330,23 @@ pub(crate) enum MetadataRestoreError {
     Other(String),
 }
 
-/// Restore mode + chown + mtime. On EPERM during chown, returns
+/// Restore chown + mode + mtime. On EPERM during chown, returns
 /// [`MetadataRestoreError::ChownNeedsPrivilege`] so the executor can
-/// route through the helper. mode and mtime are applied before the
-/// chown returns the signal (mtime restoration happens via the
-/// post-router path); any other error becomes `Other(err)`.
+/// route through the helper; any other error becomes `Other(err)`.
+///
+/// **Order matters**: chown MUST run before chmod. POSIX `chown(2)`
+/// strips `S_ISUID`/`S_ISGID` from regular files for security
+/// (so a setuid-root binary can't be re-owned to a regular user and
+/// keep its powers). FreeBSD enforces this; Linux enforces it unless
+/// the calling process holds `CAP_FSETID`. If we chmod first and chown
+/// second, the restored setuid/setgid bits get cleared by the chown —
+/// the W09.13 setuid-restore bug. chown-then-chmod keeps the final
+/// mode authoritative.
 fn restore_metadata_inner(
     path: &Path,
     target: &crate::metadata::FileMetadata,
 ) -> Result<(), MetadataRestoreError> {
     use std::os::unix::fs::PermissionsExt;
-
-    let mode_only = target.mode & 0o7777;
-    let perms = std::fs::Permissions::from_mode(mode_only);
-    fs::set_permissions(path, perms).map_err(|e| {
-        MetadataRestoreError::Other(format!("chmod {path:?} -> {mode_only:o}: {e}"))
-    })?;
 
     let uid = Some(nix::unistd::Uid::from_raw(target.uid));
     let gid = Some(nix::unistd::Gid::from_raw(target.gid));
@@ -354,6 +365,12 @@ fn restore_metadata_inner(
             )));
         }
     }
+
+    let mode_only = target.mode & 0o7777;
+    let perms = std::fs::Permissions::from_mode(mode_only);
+    fs::set_permissions(path, perms).map_err(|e| {
+        MetadataRestoreError::Other(format!("chmod {path:?} -> {mode_only:o}: {e}"))
+    })?;
 
     restore_mtime_only(path, target).map_err(MetadataRestoreError::Other)
 }
@@ -717,6 +734,52 @@ mod tests {
         assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
         let m = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         assert_eq!(m, 0o640);
+    }
+
+    /// W09.13 — setuid/setgid must survive RestoreMetadata. The naive
+    /// chmod-then-chown ordering loses these bits because POSIX
+    /// `chown(2)` strips `S_ISUID`/`S_ISGID` from regular files for
+    /// security. The executor's restore_metadata_inner runs chown
+    /// FIRST and chmod second so the final mode is authoritative.
+    #[test]
+    fn restore_metadata_preserves_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("setuid-binary");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        // Start with 0o755 (no setuid). Capture the current uid/gid;
+        // we'll "chown to self" which is the only chown we can do
+        // unprivileged but still triggers the kernel's setuid-strip
+        // behavior.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let st = std::fs::metadata(&target).unwrap();
+        let uid = std::os::unix::fs::MetadataExt::uid(&st);
+        let gid = std::os::unix::fs::MetadataExt::gid(&st);
+        let target_meta = crate::metadata::FileMetadata {
+            mode: 0o104755, // S_IFREG | setuid | rwxr-xr-x
+            uid,
+            gid,
+            size: 0,
+            mtime_unix_nanos: 0,
+            xattrs: std::collections::BTreeMap::new(),
+            acl: None,
+        };
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RestoreMetadata {
+            inode: InodeRef::new(0, 0),
+            path: target.clone(),
+            target: target_meta,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        let final_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            final_mode, 0o4755,
+            "setuid bit (0o4000) was stripped — chown probably ran after chmod"
+        );
     }
 
     #[test]
