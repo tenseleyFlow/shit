@@ -1032,12 +1032,14 @@ jobs:
             # dispatch (L0X) so it works on both pre-7.0 and 7.0+
             # kernels.
             chown-undo-linux.sh
-            # ln-symlink-undo-linux + ln-hardlink-undo-linux exist
-            # in tree but SKIP today: the LSM tier doesn't attach
-            # `inode_symlink` or `inode_link` BPF programs, so the
-            # underlying capture is missing. Tracked in DR-CR-55
-            # (DEFERRED-RUNTIME.md). The smokes are written + ready
-            # to flip from SKIP → run when those BPF hooks land.
+            # DR-CR-55 — inode_symlink + inode_link BPF programs;
+            # emit shit_create_event into dedicated ringbufs that
+            # route through the existing on_create sink. Inverse is
+            # Unlink(link_path) for both — for symlink the target
+            # is untouched, for hardlink the target's nlink drops
+            # 2 → 1 as a side effect.
+            ln-symlink-undo-linux.sh
+            ln-hardlink-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm

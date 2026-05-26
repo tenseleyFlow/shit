@@ -19,14 +19,6 @@ if [ "$(uname -s)" != "Linux" ]; then
     exit 0
 fi
 
-# DR-CR-55 (filed in DEFERRED-RUNTIME.md): the LSM tier does not
-# attach an `inode_link` BPF program, so hardlink creations are
-# not captured today. The AR08.1 audit's 'covered, smoke-gap'
-# label for `ln` was incorrect. This smoke ships as SKIP until
-# DR-CR-55 lands the BPF program.
-smoke_log "SKIP: requires inode_link BPF program (deferred — see DR-CR-55)"
-exit 0
-
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
 [ -x "${HELPER_BIN}" ] || smoke_fail "shit-helper missing"
