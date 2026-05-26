@@ -59,6 +59,12 @@ path = "src/bin/shell_hook.rs"
 name = "hook-helper-bench"
 path = "src/bin/hook_helper.rs"
 
+# B07 — kqueue drain throughput. FreeBSD-only inner; cross-platform
+# stub on other OSes so the workflow can invoke it unconditionally.
+[[bin]]
+name = "kqueue-drain-bench"
+path = "src/bin/kqueue_drain.rs"
+
 # Linux-only fanotify-perm responder workload. The bin exists on all
 # platforms (builds with an `eprintln!("not Linux") + exit 0` stub)
 # so CI workflows can invoke it unconditionally; the real measurement
@@ -87,3 +93,7 @@ tempfile = "3.10"
 # algorithm `shit-helper`'s LinuxCaptureRuntime uses, so the measured
 # cost reflects the real CAPTURE_TO_ALLOW hot path.
 blake3 = { workspace = true }
+
+# B07 kqueue-drain bench drives EVFILT_VNODE directly via libc.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc = { workspace = true }
