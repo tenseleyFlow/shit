@@ -75,6 +75,7 @@ pub mod kind {
     pub const OPEN: u8 = 4;
     pub const CREATE: u8 = 5;
     pub const RENAME: u8 = 6;
+    pub const RMDIR: u8 = 7;
 }
 
 /// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
@@ -269,6 +270,61 @@ impl CreateEvent {
     }
 }
 
+/// `lsm/inode_rmdir` event — mirrors `struct shit_rmdir_event`.
+/// Captures the dir's pre-removal `(dev, inode, mode)` so the
+/// planner's RecreatePath inverse can restore the real mode.
+///
+/// `mode` carries both the file-type bits (S_IFDIR) and the
+/// permission bits; the userspace handler masks with `!S_IFMT`
+/// before storing on the wire.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RmdirEvent {
+    pub hdr: EventHeader,
+    pub dev: u64,
+    pub inode: u64,
+    pub parent_inode: u64,
+    pub mode: u32,
+    pub name_len: u32,
+    pub name: [u8; NAME_BUF_LEN],
+}
+
+const _: () = assert!(std::mem::size_of::<RmdirEvent>() == 328);
+
+impl Default for RmdirEvent {
+    fn default() -> Self {
+        Self {
+            hdr: EventHeader::default(),
+            dev: 0,
+            inode: 0,
+            parent_inode: 0,
+            mode: 0,
+            name_len: 0,
+            name: [0; NAME_BUF_LEN],
+        }
+    }
+}
+
+impl std::fmt::Debug for RmdirEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RmdirEvent")
+            .field("hdr", &self.hdr)
+            .field("dev", &self.dev)
+            .field("inode", &self.inode)
+            .field("parent_inode", &self.parent_inode)
+            .field("mode", &format_args!("{:o}", self.mode))
+            .field("name", &self.basename_str())
+            .finish()
+    }
+}
+
+impl RmdirEvent {
+    pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
+        let len = (self.name_len as usize).min(NAME_BUF_LEN);
+        String::from_utf8_lossy(&self.name[..len])
+    }
+}
+
 /// `lsm/file_open` event — mirrors `struct shit_open_event`.
 /// BPF pre-filters to write-intent (FMODE_WRITE), so every record
 /// here is a "file is about to be mutated" signal.
@@ -360,6 +416,7 @@ pub trait LsmEventSink: Send + Sync + 'static {
     fn on_create(&self, _ev: &CreateEvent) {}
     fn on_open(&self, _ev: &OpenEvent) {}
     fn on_rename(&self, _ev: &RenameEvent) {}
+    fn on_rmdir(&self, _ev: &RmdirEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
@@ -563,6 +620,33 @@ impl LsmEventSink for LinuxCaptureSink {
         };
         self.runtime.lock().unwrap().handle_lsm_rename(&view);
     }
+
+    fn on_rmdir(&self, ev: &RmdirEvent) {
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
+            tracing::trace!(pid, "untracked pid; dropping lsm rmdir event");
+            return;
+        };
+        let basename_cow = ev.basename_str();
+        let view = crate::capture::linux::LsmRmdirView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            parent_inode: ev.parent_inode,
+            mode: ev.mode,
+            basename: &basename_cow,
+        };
+        self.runtime.lock().unwrap().handle_lsm_rmdir(&view);
+    }
 }
 
 /// Stub sink — logs each event at info-level. Useful for the manual
@@ -668,6 +752,23 @@ impl LsmEventSink for LoggingSink {
             "lsm event"
         );
     }
+
+    fn on_rmdir(&self, ev: &RmdirEvent) {
+        let comm = comm_to_string(&ev.hdr.comm);
+        let basename = ev.basename_str();
+        tracing::info!(
+            kind = "rmdir",
+            pid = ev.hdr.pid,
+            ts_ns = ev.hdr.ts_ns,
+            dev = ev.dev,
+            inode = ev.inode,
+            parent_inode = ev.parent_inode,
+            mode = format_args!("{:o}", ev.mode),
+            basename = %basename,
+            comm,
+            "lsm event"
+        );
+    }
 }
 
 /// Convert a `[u8; 16]` `comm` array (NUL-terminated, like
@@ -713,6 +814,11 @@ pub fn decode_open(bytes: &[u8]) -> Option<OpenEvent> {
 /// Decode a raw ringbuf record as a [`RenameEvent`].
 pub fn decode_rename(bytes: &[u8]) -> Option<RenameEvent> {
     decode_event::<RenameEvent>(bytes, kind::RENAME)
+}
+
+/// Decode a raw ringbuf record as an [`RmdirEvent`].
+pub fn decode_rmdir(bytes: &[u8]) -> Option<RmdirEvent> {
+    decode_event::<RmdirEvent>(bytes, kind::RMDIR)
 }
 
 /// Internal helper shared by per-kind decoders. `T` must be `repr(C)`
@@ -902,6 +1008,32 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as RenameEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// Spawn an rmdir-ringbuf reader. Convenience wrapper for
+    /// `lsm/inode_rmdir` (G03).
+    pub fn spawn_rmdir(
+        rmdir_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-rmdir",
+            rmdir_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_rmdir(bytes) {
+                    sink.on_rmdir(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as RmdirEvent"
                     );
                 }
             }),
@@ -1145,6 +1277,49 @@ mod tests {
         assert_eq!(decoded.parent_inode, 42);
         assert_eq!(decoded.mode, 0o755);
         assert_eq!(decoded.basename_str(), "bar");
+    }
+
+    #[test]
+    fn rmdir_event_layout_is_328_bytes() {
+        assert_eq!(std::mem::size_of::<RmdirEvent>(), 328);
+        assert_eq!(std::mem::align_of::<RmdirEvent>(), 8);
+    }
+
+    #[test]
+    fn decode_rmdir_round_trips() {
+        let mut name_buf = [0u8; NAME_BUF_LEN];
+        name_buf[..4].copy_from_slice(b"docs");
+        let original = RmdirEvent {
+            hdr: EventHeader {
+                kind: kind::RMDIR,
+                _pad: [0; 3],
+                pid: 4321,
+                tgid: 4321,
+                parent_pid: 0,
+                ts_ns: 0x0011_2233_4455_6677,
+                comm: *b"rmdir\0\0\0\0\0\0\0\0\0\0\0",
+            },
+            dev: 0x802,
+            inode: 555,
+            parent_inode: 42,
+            mode: 0o40700,
+            name_len: 4,
+            name: name_buf,
+        };
+        let bytes: [u8; 328] = unsafe { std::mem::transmute(original) };
+        let decoded = decode_rmdir(&bytes).expect("decode");
+        assert_eq!(decoded.hdr.kind, kind::RMDIR);
+        assert_eq!(decoded.inode, 555);
+        assert_eq!(decoded.parent_inode, 42);
+        assert_eq!(decoded.mode, 0o40700);
+        assert_eq!(decoded.basename_str(), "docs");
+    }
+
+    #[test]
+    fn decode_rmdir_rejects_unlink_kind() {
+        let mut bytes = [0u8; 328];
+        bytes[0] = kind::UNLINK;
+        assert!(decode_rmdir(&bytes).is_none());
     }
 
     #[test]
