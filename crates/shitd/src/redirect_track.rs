@@ -32,8 +32,7 @@ use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::inode::InodeRef;
 use shit_planner::metadata::FileMetadata;
 use shit_proto::{
-    CtlResponse, PreStashRedirectError, PreStashRedirectsResult, RedirectOpWire,
-    RedirectTargetWire,
+    CtlResponse, PreStashRedirectError, PreStashRedirectsResult, RedirectOpWire, RedirectTargetWire,
 };
 use shit_store::{BlobStore, Index};
 use std::collections::BTreeMap;
@@ -144,13 +143,12 @@ fn stash_truncate(
     // already filtered at the shell-side parser (is_special_path),
     // but we defense-in-depth here too.
     if !meta.file_type().is_file() {
-        return Err(format!(
-            "not a regular file ({:?})",
-            meta.file_type()
-        ));
+        return Err(format!("not a regular file ({:?})", meta.file_type()));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
-    let (blob_hash, stat) = blob_store.put(&bytes).map_err(|e| format!("blob put: {e}"))?;
+    let (blob_hash, stat) = blob_store
+        .put(&bytes)
+        .map_err(|e| format!("blob put: {e}"))?;
     let ts = crate::server::next_ts();
     index
         .put_blob_record(blob_hash, stat.stored_bytes, stat.compressed, ts)

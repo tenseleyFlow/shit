@@ -359,10 +359,7 @@ fn run_pre_exec_redirects(
     match call_ctl(&ctl_path, &req, timeout_ms) {
         Ok(CtlResponse::PreStashRedirectsAck(r)) => {
             for err in &r.errors {
-                eprintln!(
-                    "shit: pre-exec-redirects: {}: {}",
-                    err.path, err.reason
-                );
+                eprintln!("shit: pre-exec-redirects: {}: {}", err.path, err.reason);
             }
             Ok(())
         }
