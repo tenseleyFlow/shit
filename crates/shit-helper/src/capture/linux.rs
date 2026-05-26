@@ -776,6 +776,7 @@ impl LinuxCaptureRuntime {
             uid: ev.old_uid,
             gid: ev.old_gid,
             mtime_unix_nanos: meta_mtime,
+            xattrs: crate::capture::xattr::read_user_xattrs(ev.fd),
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1204,6 +1205,7 @@ impl LinuxCaptureRuntime {
             uid: meta.uid,
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
+            xattrs: meta.xattrs.clone(),
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1303,6 +1305,7 @@ impl LinuxCaptureRuntime {
                         uid: meta.uid,
                         gid: meta.gid,
                         mtime_unix_nanos: meta.mtime_unix_nanos,
+                        xattrs: meta.xattrs.clone(),
                         is_delete: true,
                         fd_sent_via_scm: true,
                     };
