@@ -56,15 +56,16 @@ __shit_pre() {
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
-    # AR06.1 — shell-state snapshot. Today pwd only; future revs
-    # extend with set-opts / aliases / functions once the C06
-    # state.rs diff is wired through. Cheap enough (one
-    # `$PWD` read + one hook-send fork) to ship unconditionally.
-    "$_SHIT_BIN" hook-send pre-exec-shell-state \
+    # AR06.1/.2/.3 — shell-state snapshot: pwd + set-opts +
+    # aliases. Functions (AR06.4) land in a follow-up. We pipe
+    # opts + aliases over stdin as NUL-separated records since
+    # alias expansions can contain newlines / tabs / pipes.
+    __shit_collect_shell_state | "$_SHIT_BIN" hook-send pre-exec-shell-state \
         --session "$_SHIT_SESSION" \
         --seq "$_SHIT_SEQ" \
         --pwd "$PWD" \
         --sock "$_SHIT_SOCK" \
+        --from-stdin \
         >/dev/null 2>&1 || true
     # AR06.5 — synchronous pre-stash for stream-redirect targets in
     # the about-to-run command. Runs AFTER pre-exec so the daemon
@@ -106,15 +107,13 @@ __shit_post() {
         --exit-code "$rc" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
-    # AR06.1 — post-command shell-state snapshot. Daemon diffs
-    # against the matching pre-pwd and journals a ShellStateDiff
-    # only when pwd actually changed (no event = no orchestrator
-    # work later).
-    "$_SHIT_BIN" hook-send post-exec-shell-state \
+    # AR06.1/.2/.3 — post-command shell-state snapshot.
+    __shit_collect_shell_state | "$_SHIT_BIN" hook-send post-exec-shell-state \
         --session "$_SHIT_SESSION" \
         --seq "$_SHIT_SEQ" \
         --pwd "$PWD" \
         --sock "$_SHIT_SOCK" \
+        --from-stdin \
         >/dev/null 2>&1 || true
     # AR06.1 / DR-CR-50 — drain the precmd-queue. `shit undo
     # --apply-shell-state` writes shell snippets here; we source
@@ -137,6 +136,40 @@ __shit_close() {
         --session "$_SHIT_SESSION" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+}
+
+# AR06.2/.3 — emit NUL-separated shell-state records on stdout
+# for the `shit hook-send pre/post-exec-shell-state --from-stdin`
+# subcommand to read. Format:
+#   OPT\t<name>\t<value>\0      (set -o lines: name + on/off)
+#   ALIAS\t<name>\t<value>\0    (alias values are the raw
+#                                expansion, single-quotes stripped
+#                                and '\\''-unescaped back to ')
+# Functions (AR06.4) deferred; this helper is forward-compat
+# (the daemon ignores unknown record kinds).
+__shit_collect_shell_state() {
+    # set -o output is line-oriented: "name<spaces>value" — bash's
+    # builtin (not /usr/bin/set, which doesn't exist).
+    set -o 2>/dev/null | while read -r __shit_name __shit_value; do
+        [[ -n "$__shit_name" ]] && printf 'OPT\t%s\t%s\0' "$__shit_name" "$__shit_value"
+    done
+    # alias output: lines like  alias NAME='VALUE'
+    # bash escapes embedded ' as '\'' inside the value's outer
+    # quotes; un-escape here so the daemon stores the literal.
+    alias 2>/dev/null | while IFS= read -r __shit_line; do
+        [[ "$__shit_line" != alias\ * ]] && continue
+        __shit_line=${__shit_line#alias }
+        local __shit_name=${__shit_line%%=*}
+        local __shit_value=${__shit_line#*=}
+        # Strip outer single-quotes (always present in bash's
+        # default `alias` output).
+        if [[ "$__shit_value" == \'*\' ]]; then
+            __shit_value=${__shit_value#\'}
+            __shit_value=${__shit_value%\'}
+            __shit_value=${__shit_value//\'\\\'\'/\'}
+        fi
+        printf 'ALIAS\t%s\t%s\0' "$__shit_name" "$__shit_value"
+    done
 }
 
 # AR06.1 / DR-CR-50 — drain the per-session precmd queue. The
