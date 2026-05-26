@@ -269,6 +269,29 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                 )),
             };
         }
+        // AR07.1: Refuse nodes are informational only. The orchestrator
+        // never dispatches them to an executor (no executor declares
+        // InverseTier::Refuse support). Surface as Skipped so the CLI
+        // reports them with the catalog reason + remediation rendered
+        // from the op itself.
+        if let InverseOp::Refuse {
+            class,
+            reason,
+            remediation,
+        } = op
+        {
+            let detail = match remediation {
+                Some(rem) => format!("refused ({class}): {reason}. Remediation: {rem}"),
+                None => format!("refused ({class}): {reason}"),
+            };
+            return ExecutionRecord {
+                op_index,
+                op: op.clone(),
+                tier: op.tier(),
+                outcome_kind: OutcomeKind::Skipped,
+                detail: Some(detail),
+            };
+        }
         let conflict = self.precondition_conflict(op);
         let outcome = match (conflict, policy) {
             (None, _) => self.executor.execute(op, dry_run, policy),
@@ -393,7 +416,8 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             | InverseOp::TerraformReverse { .. }
             | InverseOp::ContainerRestore { .. }
             | InverseOp::ShellStateRestore { .. }
-            | InverseOp::DbNote { .. } => None,
+            | InverseOp::DbNote { .. }
+            | InverseOp::Refuse { .. } => None,
         }
     }
 }

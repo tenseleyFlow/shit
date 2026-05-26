@@ -97,7 +97,8 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         | InverseOp::TerraformReverse { .. }
         | InverseOp::ContainerRestore { .. }
         | InverseOp::ShellStateRestore { .. }
-        | InverseOp::DbNote { .. } => {}
+        | InverseOp::DbNote { .. }
+        | InverseOp::Refuse { .. } => {}
     }
     out
 }

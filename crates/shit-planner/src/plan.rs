@@ -37,6 +37,33 @@ pub fn plan(
     probe: &dyn StateProbe,
     store: &dyn PlannerStore,
 ) -> UndoPlan {
+    // AR07.1: refuse-list short-circuit. If the original command
+    // matches a refuse-list entry, the plan is a single Refuse node
+    // carrying the catalog reason + remediation. We skip per-event
+    // analysis entirely — a partial inverse for a refused class
+    // would be worse than honest refusal (the user might apply it
+    // and end up in a half-state, with the OOS effects still in
+    // place). Refusal lives in `nodes`, not `warnings`, so
+    // `shit undo --dry-run` renders it with the same weight as an
+    // applicable op.
+    if let Some(cmd_str) = command.cmd_string.as_deref()
+        && let Some(entry) = crate::refuse::match_command(cmd_str)
+    {
+        return UndoPlan {
+            command,
+            nodes: vec![PlanNode {
+                op: InverseOp::Refuse {
+                    class: entry.class.to_string(),
+                    reason: entry.reason.to_string(),
+                    remediation: entry.remediation.map(str::to_string),
+                },
+                cohort: 0,
+                conflict: None,
+            }],
+            warnings: Vec::new(),
+        };
+    }
+
     let mut nodes = Vec::new();
     let mut warnings = Vec::new();
 
@@ -994,6 +1021,64 @@ mod tests {
         let plan = plan(dummy_command(), &[], &probe, &store);
         assert!(plan.is_empty());
         assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn refuse_list_short_circuits_per_event_analysis() {
+        // AR07.1: a command matching the refuse-list catalog produces
+        // a single Refuse node, regardless of what events were
+        // captured. The events would normally drive per-event
+        // inverses; the refuse path skips them.
+        let mut cmd = dummy_command();
+        cmd.cmd_string = Some("git push origin main".to_string());
+        // Construct a FilePreImage event that — if not short-
+        // circuited — would normally emit a RestoreContent op.
+        let event = CaptureEvent {
+            id: EventId(1),
+            command: cmd.command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(64, 1234),
+                path: PathBuf::from("/tmp/refuse-probe.txt"),
+                blob: BlobHash::from_bytes([0u8; 32]),
+                meta: meta(10),
+                post_content_hash: None,
+            },
+        };
+        let probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let p = plan(cmd, &[event], &probe, &store);
+        assert_eq!(p.nodes.len(), 1, "expected exactly one Refuse node");
+        match &p.nodes[0].op {
+            InverseOp::Refuse { class, reason, .. } => {
+                assert_eq!(class, "remote-push");
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+        assert!(
+            p.warnings.is_empty(),
+            "refuse short-circuit should not emit warnings"
+        );
+    }
+
+    #[test]
+    fn non_refused_command_still_processes_events_normally() {
+        // Sanity: a normal command (touch /tmp/x — not on the refuse
+        // list) goes through the per-event pipeline as before. This
+        // anchors the test that the short-circuit is gated on a
+        // catalog match, not always-on.
+        let cmd = dummy_command(); // cmd_string is "touch /tmp/x"
+        let probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let p = plan(cmd, &[], &probe, &store);
+        assert!(
+            !p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::Refuse { .. })),
+            "non-refused command should never emit Refuse nodes"
+        );
     }
 
     #[test]

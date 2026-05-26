@@ -240,6 +240,20 @@ pub enum InverseOp {
         stash_tarball: Option<BlobHash>,
         requires_confirmation: bool,
     },
+    /// AR07.1: planner refuses this command class. Carries the
+    /// catalog class identifier + reason + remediation so the CLI
+    /// can render an honest "we can't reverse this; here's why"
+    /// message. The orchestrator never applies this op — it's
+    /// informational only — but it lives in `nodes` (not
+    /// `warnings`) so dry-run rendering treats it with the same
+    /// weight as an applicable op.
+    Refuse {
+        /// Stable class identifier from
+        /// [`crate::refuse::RefuseEntry::class`].
+        class: String,
+        reason: String,
+        remediation: Option<String>,
+    },
 }
 
 /// C03: kubectl verb captured against a single resource (or a
@@ -513,7 +527,8 @@ impl InverseOp {
             | Self::TerraformReverse { .. }
             | Self::ContainerRestore { .. }
             | Self::ShellStateRestore { .. }
-            | Self::DbNote { .. } => None,
+            | Self::DbNote { .. }
+            | Self::Refuse { .. } => None,
         }
     }
 
@@ -550,6 +565,7 @@ impl InverseOp {
             Self::ContainerRestore { .. } => InverseTier::Container,
             Self::ShellStateRestore { .. } => InverseTier::ShellState,
             Self::DbNote { .. } => InverseTier::Database,
+            Self::Refuse { .. } => InverseTier::Refuse,
         }
     }
 }
@@ -567,6 +583,10 @@ pub enum InverseTier {
     Container,
     ShellState,
     Database,
+    /// AR07.1: refusal class. The orchestrator never dispatches to
+    /// any executor for this tier — the plan node carries the
+    /// reason + remediation for user-facing rendering only.
+    Refuse,
 }
 
 /// One step in the plan, with conflict/cohort decoration.

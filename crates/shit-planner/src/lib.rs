@@ -28,6 +28,7 @@ pub mod plan_forward;
 pub mod probe;
 pub mod probe_live;
 pub mod proc;
+pub mod refuse;
 pub mod services;
 pub mod store;
 pub mod time;
