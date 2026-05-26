@@ -813,7 +813,7 @@ impl PumpState {
             inode,
             path: path.as_deref().map(path_to_string),
             before: before.to_wire(),
-            after: after.clone().to_wire(),
+            after: after.to_wire(),
             ts_unix_nanos: now_nanos,
         };
         if let Err(e) = self.conn.send_response(&resp) {
@@ -893,14 +893,14 @@ struct StatMeta {
 
 impl StatMeta {
     /// Convert to the wire shape the daemon expects.
-    fn to_wire(self) -> shit_proto::FileMetadataWire {
+    fn to_wire(&self) -> shit_proto::FileMetadataWire {
         shit_proto::FileMetadataWire {
             mode: self.mode,
             uid: self.uid,
             gid: self.gid,
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
-            xattrs: self.xattrs,
+            xattrs: self.xattrs.clone(),
         }
     }
 }

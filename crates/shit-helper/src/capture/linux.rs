@@ -1631,14 +1631,15 @@ struct StatMeta {
 }
 
 impl StatMeta {
-    fn to_wire(self) -> shit_proto::FileMetadataWire {
+    #[allow(dead_code)] // currently unused on linux — kept for symmetry with bsd
+    fn to_wire(&self) -> shit_proto::FileMetadataWire {
         shit_proto::FileMetadataWire {
             mode: self.mode,
             uid: self.uid,
             gid: self.gid,
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
-            xattrs: self.xattrs,
+            xattrs: self.xattrs.clone(),
         }
     }
 }
