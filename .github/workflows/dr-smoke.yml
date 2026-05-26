@@ -696,6 +696,35 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  cd-undo:
+    # AR06.1 + DR-CR-50 -- the cd-undo + precmd-queue smoke. A
+    # child daemon can't mutate the parent shell's cwd, so the
+    # orchestrator writes a `cd '<original-pwd>'` snippet to a
+    # per-session precmd-queue file; the bash hook drains the
+    # file on PROMPT_COMMAND. Smoke validates the queue file is
+    # written + sourcing it restores pwd correctly.
+    name: cd-undo smoke (AR06.1 / DR-CR-50)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/cd-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cd-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   dd-of-undo:
     # AR08.2 -- dd's `of=path` is a truncate-class redirect; the
     # shell-side redirect parser maps it to DdOf and pre-stashes
