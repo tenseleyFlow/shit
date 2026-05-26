@@ -1096,9 +1096,11 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
             ops_skipped: 0,
             ops_failed: 0,
             ops_conflicted: 0,
+            ops_refused: 0,
             dry_run: req.dry_run,
             summary: "no completed commands recorded; nothing to undo".to_string(),
             detail_lines: Vec::new(),
+            refusal_lines: Vec::new(),
         });
     }
 
@@ -1125,7 +1127,9 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
     let mut ops_skipped = 0u32;
     let mut ops_failed = 0u32;
     let mut ops_conflicted = 0u32;
+    let mut ops_refused = 0u32;
     let mut detail_lines: Vec<String> = Vec::new();
+    let mut refusal_lines: Vec<String> = Vec::new();
 
     use shit_planner::PlannerStore;
     for cmd in commands {
@@ -1137,7 +1141,23 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
         for rec in &report.records {
             match rec.outcome_kind {
                 OutcomeKind::Applied | OutcomeKind::WouldApply => ops_applied += 1,
-                OutcomeKind::Skipped => ops_skipped += 1,
+                OutcomeKind::Skipped => {
+                    // AR07.2: separate refuse-list short-circuits
+                    // from generic skip (filtered-by-path, conflict-
+                    // skip). The orchestrator stamped the detail
+                    // string with the catalog class + reason +
+                    // remediation; surface it under refusal_lines
+                    // so the CLI can render it under its own
+                    // "Refused:" header.
+                    if matches!(rec.op, shit_planner::InverseOp::Refuse { .. }) {
+                        ops_refused += 1;
+                        if let Some(d) = rec.detail.as_deref() {
+                            refusal_lines.push(d.to_string());
+                        }
+                    } else {
+                        ops_skipped += 1;
+                    }
+                }
                 OutcomeKind::Failed => {
                     ops_failed += 1;
                     detail_lines.push(format!(
@@ -1163,8 +1183,8 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
 
     let summary = format!(
         "undo report: commands={commands_attempted} applied={ops_applied} \
-         skipped={ops_skipped} failed={ops_failed} conflicts={ops_conflicted} \
-         dry_run={}",
+         skipped={ops_skipped} refused={ops_refused} failed={ops_failed} \
+         conflicts={ops_conflicted} dry_run={}",
         req.dry_run,
     );
     CtlResponse::UndoReport(UndoReportWire {
@@ -1173,8 +1193,10 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
         ops_skipped,
         ops_failed,
         ops_conflicted,
+        ops_refused,
         dry_run: req.dry_run,
         summary,
         detail_lines,
+        refusal_lines,
     })
 }
