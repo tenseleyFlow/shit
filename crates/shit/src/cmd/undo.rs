@@ -164,6 +164,18 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
                     println!("  {line}");
                 }
             }
+            // AR07.2: render the refuse-list short-circuits in their
+            // own block. Refusals aren't conflicts or failures —
+            // they're honest "we can't do this, and here's why" — so
+            // they get their own header to keep the user's eye from
+            // confusing them with actionable problems.
+            if !report.refusal_lines.is_empty() {
+                println!();
+                println!("Refused (out of scope for shit undo):");
+                for line in &report.refusal_lines {
+                    println!("  {line}");
+                }
+            }
             // Exit non-zero when anything failed/conflicted so scripts
             // and the smoke matrix get an actionable status.
             if report.ops_failed > 0 || report.ops_conflicted > 0 {
@@ -171,6 +183,21 @@ pub fn run(args: UndoArgs) -> anyhow::Result<()> {
                     "undo: {} failed, {} conflicted",
                     report.ops_failed,
                     report.ops_conflicted,
+                ));
+            }
+            // AR07.2: a plan whose ONLY content was refusals isn't
+            // a success — the user typed `shit undo` expecting
+            // something to happen. Exit non-zero so scripts can
+            // see this state, but with a different message than
+            // failed/conflicted (no remediation, no "fix this").
+            if report.ops_applied == 0
+                && report.ops_refused > 0
+                && report.ops_failed == 0
+                && report.ops_conflicted == 0
+            {
+                return Err(anyhow::anyhow!(
+                    "undo: nothing applicable — {} refused class(es) only",
+                    report.ops_refused,
                 ));
             }
             Ok(())
