@@ -46,6 +46,14 @@ __shit_pre() {
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # AR06.1/.2/.3 — shell-state snapshot: pwd + set-opts + aliases.
+    __shit_collect_shell_state | "$_SHIT_BIN" hook-send pre-exec-shell-state \
+        --session "$_SHIT_SESSION" \
+        --seq "$_SHIT_SEQ" \
+        --pwd "$PWD" \
+        --sock "$_SHIT_SOCK" \
+        --from-stdin \
+        >/dev/null 2>&1 || true
     # S15: opt-in env tracking. Off by default; SHIT_TRACK_ENV=1 enables.
     if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
         env -0 2>/dev/null | "$_SHIT_BIN" hook-send pre-exec-env \
@@ -65,6 +73,18 @@ __shit_post() {
         --exit-code "$rc" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # AR06.1/.2/.3 — post-command shell-state snapshot.
+    __shit_collect_shell_state | "$_SHIT_BIN" hook-send post-exec-shell-state \
+        --session "$_SHIT_SESSION" \
+        --seq "$_SHIT_SEQ" \
+        --pwd "$PWD" \
+        --sock "$_SHIT_SOCK" \
+        --from-stdin \
+        >/dev/null 2>&1 || true
+    # AR06.1 / DR-CR-50 — drain the precmd-queue. `shit undo
+    # --apply-shell-state` writes shell snippets here; we source
+    # + truncate so they run before the next prompt.
+    __shit_drain_precmd_queue
     if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
         env -0 2>/dev/null | "$_SHIT_BIN" hook-send post-exec-env \
             --session "$_SHIT_SESSION" \
@@ -73,6 +93,37 @@ __shit_post() {
             >/dev/null 2>&1 || true
     fi
     return $rc
+}
+
+# AR06.2/.3 — emit NUL-separated shell-state records. Format:
+#   OPT\t<name>\t<value>\0
+#   ALIAS\t<name>\t<value>\0
+# zsh provides `$options` (associative: name -> on/off) and
+# `$aliases` (associative: name -> expansion), so we don't have
+# to parse `set -o` / `alias` output. This is faster AND more
+# robust against zsh's NO_-prefixed "off" rendering quirk.
+__shit_collect_shell_state() {
+    emulate -L zsh
+    local name value
+    for name value in ${(kv)options}; do
+        printf 'OPT\t%s\t%s\0' "$name" "$value"
+    done
+    for name value in ${(kv)aliases}; do
+        printf 'ALIAS\t%s\t%s\0' "$name" "$value"
+    done
+}
+
+# AR06.1 / DR-CR-50 — same drain mechanic as bash. The
+# orchestrator's SystemShellStateRunner appends snippets to
+# `$XDG_STATE_HOME/shit/precmd-queue/<session-uuid>`; we source
+# the file in the current shell (so it actually mutates state),
+# then truncate.
+__shit_drain_precmd_queue() {
+    local _q="${XDG_STATE_HOME:-$HOME/.local/state}/shit/precmd-queue/$_SHIT_SESSION"
+    if [[ -s "$_q" ]]; then
+        source "$_q" 2>/dev/null || true
+        : > "$_q"
+    fi
 }
 
 __shit_close() {
