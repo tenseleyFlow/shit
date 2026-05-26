@@ -68,6 +68,11 @@ pub struct BaselineEntry {
     /// content) — if the inode has the same number but size or
     /// blob differ at PostExec, we re-baseline.
     pub size: u64,
+    /// User-namespace extended attributes captured at baseline time
+    /// (W09.21 capsicum fix). Captured here in the daemon because
+    /// the helper runs under `cap_enter(2)` where `extattr_*_fd` is
+    /// blocked at the syscall level. See `xattr.rs` for the why.
+    pub xattrs: std::collections::BTreeMap<String, Vec<u8>>,
     /// True from the first `promote()` of this inode within a
     /// command's window until the next PostExec re-baseline. While
     /// stale the entry's `blob` is no longer the live pre-image
@@ -82,27 +87,38 @@ pub struct BaselineEntry {
 }
 
 impl BaselineEntry {
-    pub fn new(inode: InodeRef, blob: BlobHash, size: u64) -> Self {
+    pub fn new(
+        inode: InodeRef,
+        blob: BlobHash,
+        size: u64,
+        xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Self {
         Self {
             inode,
             blob,
             size,
+            xattrs,
             stale: false,
             stale_for_command: None,
         }
     }
 
     /// Mark stale on first promotion within a command. Returns the
-    /// blob the caller should emit as FilePreImage. Returns `None`
-    /// when already stale for this command (no double-emit).
-    pub fn mark_stale(&mut self, command: CommandId) -> Option<BlobHash> {
+    /// blob + xattrs the caller should emit in the FilePreImage's
+    /// FileMetadata. Returns `None` when already stale for this
+    /// command (no double-emit).
+    pub fn mark_stale(
+        &mut self,
+        command: CommandId,
+    ) -> Option<(BlobHash, std::collections::BTreeMap<String, Vec<u8>>)> {
         if self.stale && self.stale_for_command == Some(command) {
             return None;
         }
         let pre_image = self.blob;
+        let xattrs = self.xattrs.clone();
         self.stale = true;
         self.stale_for_command = Some(command);
-        Some(pre_image)
+        Some((pre_image, xattrs))
     }
 }
 
@@ -151,7 +167,11 @@ impl BaselineCacheEntry {
     ///
     /// Caller is responsible for emitting the actual FilePreImage
     /// event; this method only flips the in-memory state.
-    pub fn promote(&self, inode: InodeRef, command: CommandId) -> Option<BlobHash> {
+    pub fn promote(
+        &self,
+        inode: InodeRef,
+        command: CommandId,
+    ) -> Option<(BlobHash, std::collections::BTreeMap<String, Vec<u8>>)> {
         let mut map = self.by_inode.write().unwrap();
         let entry = map.get_mut(&inode)?;
         entry.mark_stale(command)
@@ -194,6 +214,19 @@ impl BaselineCacheEntry {
 
     pub fn state(&self) -> WalkState {
         *self.state.read().unwrap()
+    }
+
+    /// Snapshot every (path, entry) pair currently cached. Used by
+    /// the daemon's PostExec xattr sweep (W09.21.1) to diff each
+    /// cached file's pre-command xattrs against the live FS without
+    /// holding the locks across the read.
+    pub fn snapshot_entries(&self) -> Vec<(PathBuf, BaselineEntry)> {
+        let by_inode = self.by_inode.read().unwrap();
+        let by_path = self.by_path.read().unwrap();
+        by_path
+            .iter()
+            .filter_map(|(p, inode)| by_inode.get(inode).map(|e| (p.clone(), e.clone())))
+            .collect()
     }
 
     pub fn entry_count(&self) -> usize {
@@ -308,6 +341,7 @@ mod tests {
             InodeRef::new(1, inode_num),
             BlobHash::from_bytes([blob_byte; 32]),
             42,
+            std::collections::BTreeMap::new(),
         )
     }
 
@@ -333,10 +367,12 @@ mod tests {
         let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
         cache.insert(PathBuf::from("/tmp/x/foo"), entry(100, 0xAA));
 
-        // First promote within the command: returns the blob.
-        let blob1 = cache.promote(InodeRef::new(1, 100), cmd(1));
-        assert!(blob1.is_some());
-        assert_eq!(blob1.unwrap().0, [0xAA; 32]);
+        // First promote within the command: returns (blob, xattrs).
+        let promote1 = cache.promote(InodeRef::new(1, 100), cmd(1));
+        assert!(promote1.is_some());
+        let (blob1, xattrs1) = promote1.unwrap();
+        assert_eq!(blob1.0, [0xAA; 32]);
+        assert!(xattrs1.is_empty());
 
         // Same command, same inode: returns None (no double-emit).
         let blob2 = cache.promote(InodeRef::new(1, 100), cmd(1));
@@ -406,9 +442,9 @@ mod tests {
         // (In the real flow, PostExec re-baselines via insert() so
         // command 2 would see the post-command-1 content. Step 4
         // wires that in.)
-        let blob2 = cache.promote(InodeRef::new(1, 100), cmd(2));
-        assert!(blob2.is_some());
-        assert_eq!(blob2.unwrap().0, [0xAA; 32]);
+        let promote2 = cache.promote(InodeRef::new(1, 100), cmd(2));
+        assert!(promote2.is_some());
+        assert_eq!(promote2.unwrap().0.0, [0xAA; 32]);
     }
 
     #[test]
