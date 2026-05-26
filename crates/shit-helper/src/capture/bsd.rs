@@ -294,6 +294,10 @@ impl PumpState {
     }
 
     fn handle_vnode(&mut self, fd: RawFd, kind: VnodeEventKind) {
+        // W09.16.1 CI diag — log EVERY vnode event entry so we
+        // can confirm whether kqueue is firing at all for the
+        // symlink-replace case on 14.2 ZFS.
+        tracing::info!(fd, ?kind, "W09.16.1 handle_vnode entry");
         // S29.3: route NOTE_ATTRIB (chmod/chown/touch) into its own
         // handler before the content-capture branch so we never
         // try to pread bytes for a metadata-only event.
