@@ -37,11 +37,13 @@ pub(crate) fn next_ts() -> TimePoint {
     TimePoint::new(logical, wall)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     cfg: ResolvedConfig,
     stats: Arc<Stats>,
     index: Arc<Index>,
     env_stash: Arc<EnvPreStash>,
+    shell_state_stash: Arc<crate::shell_state_track::ShellStatePreStash>,
     active: Arc<ActiveCommands>,
     helper_link: Option<Arc<HelperLink>>,
     watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
@@ -91,7 +93,7 @@ pub async fn serve(
                         match decode_frame::<HookMessage>(&buf[..n]) {
                             Ok(msg) => {
                                 stats.note_hook_msg();
-                                handle(msg, &index, &env_stash, &env_filter, &active, helper_link.as_deref(), watch_ready.as_deref());
+                                handle(msg, &index, &env_stash, &shell_state_stash, &env_filter, &active, helper_link.as_deref(), watch_ready.as_deref());
                             }
                             Err(e) => {
                                 stats.note_decode_error();
@@ -119,10 +121,12 @@ pub async fn serve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     msg: HookMessage,
     index: &Index,
     env_stash: &EnvPreStash,
+    shell_state_stash: &crate::shell_state_track::ShellStatePreStash,
     env_filter: &shit_planner::EnvFilter,
     active: &ActiveCommands,
     helper_link: Option<&HelperLink>,
@@ -277,6 +281,24 @@ fn handle(
                 env_block,
                 env_filter,
                 index,
+            );
+        }
+        HookMessage::PreExecShellState { seq, pwd, .. } => {
+            debug!(%session, kind, seq, pwd = %pwd, "pre-exec-shell-state");
+            crate::shell_state_track::handle_pre(
+                shell_state_stash,
+                CommandId { session, seq: *seq },
+                std::path::PathBuf::from(pwd),
+            );
+        }
+        HookMessage::PostExecShellState { seq, pwd, .. } => {
+            debug!(%session, kind, seq, pwd = %pwd, "post-exec-shell-state");
+            crate::shell_state_track::handle_post(
+                shell_state_stash,
+                CommandId { session, seq: *seq },
+                std::path::PathBuf::from(pwd),
+                index,
+                ts,
             );
         }
         HookMessage::SessionClose { .. } => {
