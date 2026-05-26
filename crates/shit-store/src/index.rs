@@ -810,6 +810,14 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::CaptureRefused { path, .. } => Denormalized {
+            discriminant: "CaptureRefused",
+            dev: None,
+            inode: None,
+            path: Some(path.to_string_lossy().into_owned()),
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 
