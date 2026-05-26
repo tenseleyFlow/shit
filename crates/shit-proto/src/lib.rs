@@ -113,27 +113,49 @@ pub enum HookMessage {
         env_block: Vec<u8>,
         ts_unix_nanos: u64,
     },
-    /// AR06.1 — pre-command shell-state snapshot. Today carries
-    /// `pwd` only; future variants may extend with set-opts /
-    /// aliases / functions (C06 state.rs has the diff machinery
-    /// already; this wire ships the minimal capture for cd-undo).
-    /// Additive: future fields go on a sibling `*ExecShellStateV2`
-    /// variant so old daemons round-trip cleanly.
+    /// AR06.1 — pre-command shell-state snapshot. Carries pwd plus
+    /// (AR06.2/.3) optional set-opts and aliases. The bash hook
+    /// always sets `pwd`; `opts` and `aliases` are populated when
+    /// the hook's shell-state collection routine runs (always-on
+    /// since bash 4 — see shell/bash.sh `__shit_collect_state`).
+    /// `serde(default)` on the additive fields so an old daemon
+    /// reading a new client's envelope (or vice versa) round-trips
+    /// cleanly.
+    ///
+    /// AR06.4 (functions) lands as another `#[serde(default)]` Vec
+    /// in a follow-up PR — function-body capture is more delicate
+    /// (multi-line bodies, `declare -f` output parsing) and earns
+    /// its own focused scope.
     PreExecShellState {
         session: Uuid,
         seq: u64,
         pwd: String,
+        /// AR06.2 — `(name, "on"|"off"|stringy-value)` pairs from
+        /// `set -o`. Ordered as the shell emits them (typically
+        /// alphabetical).
+        #[serde(default)]
+        opts: Vec<(String, String)>,
+        /// AR06.3 — `(name, value)` pairs from the bash `alias`
+        /// builtin. Values are the raw alias expansion (the bash
+        /// hook strips the surrounding single-quotes and unescapes
+        /// `'\\''` -> `'`).
+        #[serde(default)]
+        aliases: Vec<(String, String)>,
         ts_unix_nanos: u64,
     },
-    /// Companion to [`PreExecShellState`]. Emitted only when the
-    /// shell state has changed across the command (the bash hook
-    /// elides this when `$PWD` is unchanged). Daemon pairs with
-    /// the matching `PreExecShellState` by `(session, seq)` and
-    /// emits a `CaptureEventKind::ShellStateDiff`.
+    /// Companion to [`PreExecShellState`]. Same field set; emitted
+    /// after the user's command. Daemon pairs with the matching
+    /// `PreExecShellState` by `(session, seq)`, diffs all four
+    /// dimensions, and emits a `CaptureEventKind::ShellStateDiff`
+    /// only when at least one differs.
     PostExecShellState {
         session: Uuid,
         seq: u64,
         pwd: String,
+        #[serde(default)]
+        opts: Vec<(String, String)>,
+        #[serde(default)]
+        aliases: Vec<(String, String)>,
         ts_unix_nanos: u64,
     },
     /// Emitted when the shell exits.
