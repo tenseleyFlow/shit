@@ -1065,7 +1065,8 @@ jobs:
                     background-job-undo-fbsd.sh \
                     large-file-overwrite-undo-fbsd.sh \
                     mkfifo-undo-fbsd.sh \
-                    ssh-keygen-undo-fbsd.sh"
+                    ssh-keygen-undo-fbsd.sh \
+                    python-venv-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can

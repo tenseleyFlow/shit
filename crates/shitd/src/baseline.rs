@@ -275,6 +275,20 @@ impl LiveBaseline {
     pub fn cached_cwd_count(&self) -> usize {
         self.by_cwd.read().unwrap().len()
     }
+
+    /// W09.12 — return true if `path` is inside any actively-watched
+    /// cwd subtree. Used by the shim_listener to skip its
+    /// fresh-create journaling branch for paths that the in-watch
+    /// kqueue tier will *also* report; without this the same Create
+    /// gets journaled twice (once from the shim, once from the
+    /// dir-diff), and undo emits N inverse unlinks → first one
+    /// succeeds, the rest fail with ConflictMissing.
+    ///
+    /// `path` is expected to be absolute. Caller's responsibility.
+    pub fn path_in_watched_subtree(&self, path: &Path) -> bool {
+        let map = self.by_cwd.read().unwrap();
+        map.keys().any(|cwd| path.starts_with(cwd))
+    }
 }
 
 #[cfg(test)]
