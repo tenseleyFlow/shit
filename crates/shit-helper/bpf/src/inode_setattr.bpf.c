@@ -85,15 +85,21 @@ static __always_inline __u32 translate_ia_valid(__u32 ia_valid)
     return out;
 }
 
-SEC("lsm/inode_setattr")
-int BPF_PROG(shit_inode_setattr,
-             struct dentry *dentry,
-             struct iattr *attr)
+/* Body shared between the v1 (2-arg) and v2 (3-arg / mnt_idmap-prefixed)
+ * entry points. We split because the LSM chain entry's signature
+ * shifted between kernels: pre-7.0 was `(dentry, attr)`; 7.0+ is
+ * `(idmap, dentry, attr)` because the kernel started passing
+ * mnt_idmap through the LSM hook chain itself. A single program with
+ * the wrong arity loads cleanly but reads register-shifted arguments
+ * → every field is garbage → events drop at userspace as (dev=0,
+ * inode=0). Userspace BTF-probes bpf_lsm_inode_setattr's vlen at
+ * load time and attaches whichever entry point matches. */
+static __always_inline void __do_setattr(struct dentry *dentry, struct iattr *attr)
 {
     struct shit_setattr_event *e =
         bpf_ringbuf_reserve(&setattr_events, sizeof(*e), 0);
     if (!e) {
-        return 0;
+        return;
     }
 
     /* Header. */
@@ -131,5 +137,30 @@ int BPF_PROG(shit_inode_setattr,
     e->_pad3 = 0;
 
     bpf_ringbuf_submit(e, 0);
+}
+
+/* v1: 2-arg form. Kernels where the LSM chain's bpf_lsm_inode_setattr
+ * has FUNC_PROTO vlen=2 (`dentry, attr`). Pre-7.0. */
+SEC("lsm/inode_setattr")
+int BPF_PROG(shit_inode_setattr,
+             struct dentry *dentry,
+             struct iattr *attr)
+{
+    __do_setattr(dentry, attr);
+    return 0;
+}
+
+/* v2: 3-arg form. Kernels where the LSM chain's bpf_lsm_inode_setattr
+ * has FUNC_PROTO vlen=3 (`idmap, dentry, attr`). 7.0+. The `idmap`
+ * argument is unused by us — we always operate on the inode's own
+ * mount idmap, not a remapped one. */
+SEC("lsm/inode_setattr")
+int BPF_PROG(shit_inode_setattr_v2,
+             struct mnt_idmap *idmap,
+             struct dentry *dentry,
+             struct iattr *attr)
+{
+    (void)idmap;
+    __do_setattr(dentry, attr);
     return 0;
 }
