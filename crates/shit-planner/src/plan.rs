@@ -481,7 +481,16 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             .get(&parent.to_path_buf())
             .map(|s| s.len())
             .unwrap_or(0);
-        if cluster < 2 {
+        // Unlinks WITHOUT a captured pre-image are almost always
+        // directory removals (`shutil.rmtree` calls
+        // `unlinkat(.., AT_REMOVEDIR)`; our shim emits an Unlink
+        // event but `symlink_metadata.is_file()` returns false on
+        // dirs, so no pre-image). Recreating those via
+        // RecreatePath needs the parent to exist; with the parent
+        // gone it'd ENOENT-cascade. Single-entry dir-Unlinks
+        // qualify as orphan even without a cluster of siblings.
+        let is_unlink_without_preimage = unlinks.contains(p) && !pre_images.contains(p);
+        if cluster < 2 && !is_unlink_without_preimage {
             continue;
         }
         // Parent has its own create/rename-to event somewhere in
