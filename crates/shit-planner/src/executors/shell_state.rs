@@ -198,11 +198,23 @@ impl<R: ShellStateRunner> InverseOpExecutor for ShellStateExecutor<R> {
         };
 
         if matches!(target, ShellTarget::Fish) {
-            return ExecutionOutcome::Skipped {
-                reason: "fish has no safe precmd-queue equivalent; source the snippet manually \
-                         (see DR-30)"
-                    .into(),
+            // AR06.6 — surface the rendered body so a fish user
+            // has something to copy-paste instead of just a
+            // doc-pointer. DR-30 still applies (we don't write
+            // to a precmd-queue for fish), but informational has
+            // to actually inform.
+            let body = snippet_fish.as_deref().unwrap_or("");
+            let reason = if body.is_empty() {
+                "fish has no safe precmd-queue equivalent (see DR-30); no fish snippet was \
+                 rendered for this diff"
+                    .to_string()
+            } else {
+                format!(
+                    "fish has no safe precmd-queue equivalent (see DR-30); source this manually:\n\
+                     {body}"
+                )
             };
+            return ExecutionOutcome::Skipped { reason };
         }
 
         let snippet = match target {
@@ -277,7 +289,7 @@ mod tests {
             funcs_diff: vec![],
             snippet_bash: Some("cd '/home/u'\nset -o errexit\n".into()),
             snippet_zsh: Some("cd '/home/u'\nsetopt errexit\n".into()),
-            snippet_fish: None,
+            snippet_fish: Some("cd '/home/u'\n".into()),
         }
     }
 
@@ -342,6 +354,12 @@ mod tests {
         match exe.execute(&sample_op(), false, ConflictPolicy::Abort) {
             ExecutionOutcome::Skipped { reason } => {
                 assert!(reason.contains("DR-30"), "got: {reason}");
+                // AR06.6 — the rendered body must be in the reason so
+                // a fish user can copy-paste without re-running `shit show`.
+                assert!(
+                    reason.contains("cd '/home/u'"),
+                    "skip reason should embed snippet body; got: {reason}"
+                );
             }
             other => panic!("expected Skipped, got {other:?}"),
         }
