@@ -168,6 +168,12 @@ fn emit_forward_for_event(
                 &aliases_inv,
                 &funcs_inv,
             );
+            let snippet_fish = crate::shell_state_render::render_fish(
+                pwd_for_render,
+                &opts_inv,
+                &aliases_inv,
+                &funcs_inv,
+            );
             nodes.push(PlanNode {
                 op: InverseOp::ShellStateRestore {
                     pwd_before: if pwd_changed {
@@ -180,7 +186,7 @@ fn emit_forward_for_event(
                     funcs_diff: funcs_inv,
                     snippet_bash: Some(snippet_bash),
                     snippet_zsh: Some(snippet_zsh),
-                    snippet_fish: None,
+                    snippet_fish: Some(snippet_fish),
                 },
                 cohort: 0,
                 conflict: None,

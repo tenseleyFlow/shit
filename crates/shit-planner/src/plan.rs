@@ -547,9 +547,11 @@ fn emit_for_event(
             funcs,
         } => {
             // AR06.1/.2/.3 — pwd + set-opts + aliases (+ funcs in
-            // AR06.4). Snippets rendered for bash + zsh via the
-            // shared helper; fish stays None (no precmd-queue
-            // equivalent per the executor's existing contract).
+            // AR06.4). Snippets rendered for bash + zsh + fish via
+            // the shared helper. fish stays informational on the
+            // apply path (DR-30: no safe precmd-queue equivalent),
+            // but the rendered body is useful for `shit show` and
+            // for users to copy-paste manually.
             let pwd_changed = pwd_before != pwd_after;
             if !pwd_changed && opts.is_empty() && aliases.is_empty() && funcs.is_empty() {
                 return; // Defensive: daemon shouldn't journal empty diffs.
@@ -595,6 +597,12 @@ fn emit_for_event(
                 &aliases_diff,
                 &funcs_diff,
             );
+            let snippet_fish = crate::shell_state_render::render_fish(
+                pwd_for_render,
+                &opts_diff,
+                &aliases_diff,
+                &funcs_diff,
+            );
             nodes.push(PlanNode {
                 op: InverseOp::ShellStateRestore {
                     pwd_before: if pwd_changed {
@@ -607,7 +615,7 @@ fn emit_for_event(
                     funcs_diff,
                     snippet_bash: Some(snippet_bash),
                     snippet_zsh: Some(snippet_zsh),
-                    snippet_fish: None,
+                    snippet_fish: Some(snippet_fish),
                 },
                 cohort: 0,
                 conflict: None,
