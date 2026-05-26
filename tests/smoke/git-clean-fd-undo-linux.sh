@@ -146,32 +146,18 @@ if [ "${ok}" != "1" ]; then
     smoke_fail "clean -fd undo didn't restore all entries"
 fi
 
-# G02 partial — dir mode restoration is still gated on the
-# helper landing an `inode_rmdir` LSM hook (deferred to G03).
-# Today's flow:
-#   1. `git clean -fd` calls `unlinkat(AT_REMOVEDIR)` on junk/.
-#   2. The helper has NO inode_rmdir hook (only inode_unlink for
-#      regular-file unlinks), so no LSM event fires for the dir
-#      itself — captured mode is 0o750 nowhere in the journal.
-#   3. The files inside emit FilePreImage events; their
-#      RestoreContent then mkdir-p's junk/ as a side-effect at
-#      default mode (0o755, umask-moderated).
-#
-# So the post-undo mode comes from the executor's fallback, not
-# from the captured pre-state. Soft-assert: log the mismatch as
-# a known gap (covered by G03 follow-up) without failing the
-# smoke. The G02 wire change is still load-bearing — it ensures
-# the kind+mode flow works for cases where capture DOES land
-# (e.g. shim-side unlinks, future inode_rmdir).
+# G03 landed inode_rmdir: `unlinkat(AT_REMOVEDIR)` fires
+# lsm/inode_rmdir → CapturedPreImage (Directory, mode) on the
+# wire → planner's RecreatePath inverse restores the dir at the
+# captured mode. The G02 soft-assert can now be hard.
 DIR_MODE_AFTER="$(stat -c '%a' "${REPO}/junk")"
 if [ "${DIR_MODE_AFTER}" != "${DIR_MODE_BEFORE}" ]; then
-    smoke_log "[G03-pending] dir mode not preserved on junk/:"
+    smoke_log "dir mode mismatch on junk/:"
     smoke_log "  pre-clean:  ${DIR_MODE_BEFORE}"
     smoke_log "  post-undo:  ${DIR_MODE_AFTER}"
-    smoke_log "  cause:      no inode_rmdir LSM hook yet; dir created by mkdir-p fallback"
-else
-    smoke_log "dir mode preserved: junk=${DIR_MODE_AFTER} == captured ${DIR_MODE_BEFORE}"
+    smoke_fail "dir mode not preserved (G03 inode_rmdir hook should restore it)"
 fi
+smoke_log "dir mode preserved: junk=${DIR_MODE_AFTER} == captured ${DIR_MODE_BEFORE}"
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
