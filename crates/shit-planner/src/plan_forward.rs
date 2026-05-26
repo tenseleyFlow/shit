@@ -113,22 +113,73 @@ fn emit_forward_for_event(
         CaptureEventKind::ShellStateDiff {
             pwd_before,
             pwd_after,
+            opts,
+            aliases,
+            funcs,
         } => {
-            // Forward direction: redo the cd, i.e. cd to pwd_after.
-            if pwd_before == pwd_after {
+            // Forward (`shit redo`) direction: re-apply the diff —
+            // pwd_after, post-value opts, post-value aliases, etc.
+            // We invert each diff entry's (pre, post) before
+            // rendering so the existing render_bash helper (which
+            // restores to `pre`) produces a snippet that restores
+            // to `post`.
+            let pwd_changed = pwd_before != pwd_after;
+            if !pwd_changed && opts.is_empty() && aliases.is_empty() && funcs.is_empty() {
                 return;
             }
-            let pwd_after_str = pwd_after.to_string_lossy();
-            let escaped = pwd_after_str.replace('\'', "'\\''");
-            let snippet = format!("cd '{escaped}'\n");
+            let pwd_for_render: Option<&std::path::Path> = if pwd_changed {
+                Some(pwd_after.as_path())
+            } else {
+                None
+            };
+            let opts_inv: Vec<crate::inverse::OptDiff> = opts
+                .iter()
+                .map(|(name, pre, post)| crate::inverse::OptDiff {
+                    name: name.clone(),
+                    pre: post.clone(),
+                    post: pre.clone(),
+                })
+                .collect();
+            let aliases_inv: Vec<crate::inverse::AliasDiff> = aliases
+                .iter()
+                .map(|(name, pre, post)| crate::inverse::AliasDiff {
+                    name: name.clone(),
+                    pre: post.clone(),
+                    post: pre.clone(),
+                })
+                .collect();
+            let funcs_inv: Vec<crate::inverse::FuncDiff> = funcs
+                .iter()
+                .map(|(name, pre, post)| crate::inverse::FuncDiff {
+                    name: name.clone(),
+                    pre: post.clone(),
+                    post: pre.clone(),
+                })
+                .collect();
+            let snippet_bash = crate::shell_state_render::render_bash(
+                pwd_for_render,
+                &opts_inv,
+                &aliases_inv,
+                &funcs_inv,
+            );
+            let snippet_zsh = crate::shell_state_render::render_zsh(
+                pwd_for_render,
+                &opts_inv,
+                &aliases_inv,
+                &funcs_inv,
+            );
             nodes.push(PlanNode {
                 op: InverseOp::ShellStateRestore {
-                    pwd_before: Some(pwd_after.clone()),
-                    opts_diff: Vec::new(),
-                    aliases_diff: Vec::new(),
-                    funcs_diff: Vec::new(),
-                    snippet_bash: Some(snippet.clone()),
-                    snippet_zsh: Some(snippet),
+                    pwd_before: if pwd_changed {
+                        Some(pwd_after.clone())
+                    } else {
+                        None
+                    },
+                    opts_diff: opts_inv,
+                    aliases_diff: aliases_inv,
+                    funcs_diff: funcs_inv,
+                    snippet_bash: Some(snippet_bash),
+                    snippet_zsh: Some(snippet_zsh),
                     snippet_fish: None,
                 },
                 cohort: 0,

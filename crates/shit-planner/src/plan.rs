@@ -542,31 +542,71 @@ fn emit_for_event(
         CaptureEventKind::ShellStateDiff {
             pwd_before,
             pwd_after,
+            opts,
+            aliases,
+            funcs,
         } => {
-            // AR06.1 — emit a ShellStateRestore. Snippet is the
-            // canonical bash `cd '<before>'`; quoting follows the
-            // existing snippet renderer used by render_bash. zsh
-            // gets the same body (cd quoting is shell-compatible);
-            // fish lands when the C06 state.rs diff machinery is
-            // wired through the hook.
-            if pwd_before == pwd_after {
-                return; // No-op; defensive.
+            // AR06.1/.2/.3 — pwd + set-opts + aliases (+ funcs in
+            // AR06.4). Snippets rendered for bash + zsh via the
+            // shared helper; fish stays None (no precmd-queue
+            // equivalent per the executor's existing contract).
+            let pwd_changed = pwd_before != pwd_after;
+            if !pwd_changed && opts.is_empty() && aliases.is_empty() && funcs.is_empty() {
+                return; // Defensive: daemon shouldn't journal empty diffs.
             }
-            let pwd_before_str = pwd_before.to_string_lossy();
-            // POSIX single-quote escape: ' -> '\''
-            let escaped = pwd_before_str.replace('\'', "'\\''");
-            let snippet = format!("cd '{escaped}'\n");
+            let pwd_for_render: Option<&std::path::Path> = if pwd_changed {
+                Some(pwd_before.as_path())
+            } else {
+                None
+            };
+            let opts_diff: Vec<crate::inverse::OptDiff> = opts
+                .iter()
+                .map(|(name, pre, post)| crate::inverse::OptDiff {
+                    name: name.clone(),
+                    pre: pre.clone(),
+                    post: post.clone(),
+                })
+                .collect();
+            let aliases_diff: Vec<crate::inverse::AliasDiff> = aliases
+                .iter()
+                .map(|(name, pre, post)| crate::inverse::AliasDiff {
+                    name: name.clone(),
+                    pre: pre.clone(),
+                    post: post.clone(),
+                })
+                .collect();
+            let funcs_diff: Vec<crate::inverse::FuncDiff> = funcs
+                .iter()
+                .map(|(name, pre, post)| crate::inverse::FuncDiff {
+                    name: name.clone(),
+                    pre: pre.clone(),
+                    post: post.clone(),
+                })
+                .collect();
+            let snippet_bash = crate::shell_state_render::render_bash(
+                pwd_for_render,
+                &opts_diff,
+                &aliases_diff,
+                &funcs_diff,
+            );
+            let snippet_zsh = crate::shell_state_render::render_zsh(
+                pwd_for_render,
+                &opts_diff,
+                &aliases_diff,
+                &funcs_diff,
+            );
             nodes.push(PlanNode {
                 op: InverseOp::ShellStateRestore {
-                    pwd_before: Some(pwd_before.clone()),
-                    opts_diff: Vec::new(),
-                    aliases_diff: Vec::new(),
-                    funcs_diff: Vec::new(),
-                    snippet_bash: Some(snippet.clone()),
-                    snippet_zsh: Some(snippet),
-                    // fish: no precmd-queue equivalent (per
-                    // existing executor doc); leave None so
-                    // the executor surfaces the deferral.
+                    pwd_before: if pwd_changed {
+                        Some(pwd_before.clone())
+                    } else {
+                        None
+                    },
+                    opts_diff,
+                    aliases_diff,
+                    funcs_diff,
+                    snippet_bash: Some(snippet_bash),
+                    snippet_zsh: Some(snippet_zsh),
                     snippet_fish: None,
                 },
                 cohort: 0,
