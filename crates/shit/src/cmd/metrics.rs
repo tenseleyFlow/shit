@@ -325,6 +325,7 @@ mod tests {
             last_gc_bytes_reclaimed: 1024 * 1024,
             last_gc_at_unix_secs: 1_700_000_000,
             kernel_tier: "fanotify".into(),
+            helper_link_state: shit_proto::HelperLinkState::Connected,
         }
     }
 
