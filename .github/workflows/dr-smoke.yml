@@ -1244,6 +1244,10 @@ jobs:
             git-branch-D-undo-linux.sh
             git-checkout-branch-undo-linux.sh
             git-clean-fd-undo-linux.sh
+            # G03 — inode_rmdir LSM hook captures dir mode on
+            # rmdir(2) so RecreatePath restores the original mode
+            # instead of mkdir-p's umask-moderated default.
+            rmdir-mode-undo-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
