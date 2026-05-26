@@ -258,6 +258,9 @@ pub enum HelperResponse {
         uid: u32,
         gid: u32,
         mtime_unix_nanos: i128,
+        /// User-namespace xattrs at capture time (W09.21). Empty when
+        /// the FS has none or the read failed.
+        xattrs: std::collections::BTreeMap<String, Vec<u8>>,
         /// True when this capture was triggered by `NOTE_DELETE`. The
         /// daemon journals a paired `TreeOp::Unlink` so `shit undo`
         /// knows to recreate the file at `path`, not just restore the
@@ -306,6 +309,9 @@ pub enum HelperResponse {
         uid: u32,
         gid: u32,
         mtime_unix_nanos: i128,
+        /// User-namespace xattrs at baseline time (W09.21). Empty when
+        /// the FS has none or the read failed.
+        xattrs: std::collections::BTreeMap<String, Vec<u8>>,
         /// Always `true` when this variant is sent — the staging fd
         /// is attached via SCM_RIGHTS. Mirrors `CapturedPreImage`'s
         /// flag for decoder symmetry.
@@ -477,6 +483,12 @@ pub struct FileMetadataWire {
     pub gid: u32,
     pub size: u64,
     pub mtime_unix_nanos: i128,
+    /// User-namespace extended attributes (W09.21). Keys are the
+    /// namespace-stripped name — FreeBSD lists EXTATTR_NAMESPACE_USER
+    /// names as-is, Linux strips the `user.` prefix on the way in.
+    /// Empty when the filesystem has none, the xattr read failed, or
+    /// the platform doesn't support xattrs.
+    pub xattrs: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 /// Wire mirror of `shit_planner::FileKind`. Same enum shape.
@@ -743,6 +755,7 @@ mod tests {
                 gid: 1000,
                 size: 100,
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
+                xattrs: std::collections::BTreeMap::new(),
             },
             after: FileMetadataWire {
                 mode: 0o100755,
@@ -750,6 +763,7 @@ mod tests {
                 gid: 1000,
                 size: 100,
                 mtime_unix_nanos: 1_700_000_000_100_000_000,
+                xattrs: std::collections::BTreeMap::new(),
             },
             ts_unix_nanos: 1_700_000_000_200_000_000,
         };
@@ -792,6 +806,11 @@ mod tests {
             uid: 1001,
             gid: 1001,
             mtime_unix_nanos: 1_700_000_000_000_000_000,
+            xattrs: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("shit.test".to_string(), b"v".to_vec());
+                m
+            },
             is_delete: true,
             fd_sent_via_scm: true,
         };
@@ -816,6 +835,7 @@ mod tests {
             uid: 0,
             gid: 0,
             mtime_unix_nanos: 0,
+            xattrs: std::collections::BTreeMap::new(),
             is_delete: false,
             fd_sent_via_scm: true,
         };
