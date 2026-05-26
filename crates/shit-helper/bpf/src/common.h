@@ -37,6 +37,13 @@ enum shit_event_kind {
     SHIT_EVT_OPEN = 4,
     SHIT_EVT_CREATE = 5,
     SHIT_EVT_RENAME = 6,
+    /* G03 — `lsm/inode_rmdir` event. Same struct shape as
+     * shit_unlink_event (the kernel LSM hook signature is identical:
+     * (inode *dir, dentry *target)). Userspace dispatches by kind tag
+     * and routes to handle_lsm_rmdir, which fstat's the held fd for
+     * the dir's mode so the planner can emit RecreatePath{Directory,
+     * <captured mode>} instead of mkdir-p'ing at the default 0o755. */
+    SHIT_EVT_RMDIR = 7,
 };
 
 /* Bounded comm length matches kernel's TASK_COMM_LEN. */
