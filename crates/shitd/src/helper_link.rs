@@ -513,9 +513,24 @@ fn dispatch_response(
                     let inode_ref = InodeRef::new(dev, inode);
                     let path_buf: PathBuf = path.unwrap_or_default().into();
                     let ts = crate::server::next_ts();
-                    if let Err(e) =
-                        journal_unlink_idempotent(index, command, ts, inode_ref, path_buf)
-                    {
+                    // G02: derive kind from mode bits (S_IFMT). The
+                    // marker-only path is the canonical route for
+                    // dir-removal via LSM's inode_unlink because the
+                    // helper's fstat returns FileType::Directory and
+                    // the pre-image-bytes capture is skipped (dirs
+                    // have no content). With kind+mode plumbed here,
+                    // the planner emits RecreatePath{Directory} so
+                    // `git clean -fd` undo restores the dir as a
+                    // dir, not a regular file.
+                    if let Err(e) = journal_unlink_idempotent(
+                        index,
+                        command,
+                        ts,
+                        inode_ref,
+                        path_buf,
+                        kind_from_mode_bits(mode),
+                        mode,
+                    ) {
                         tracing::error!(error = %e, %session, seq, "marker-only Unlink journal failed");
                     }
                     return;
@@ -742,7 +757,14 @@ fn handle_tree_mutation(
     // Unlink is dedupe-sensitive: the dir-diff and the per-file Delete
     // both surface Unlink for the same removal. Route through
     // `journal_unlink_idempotent` and return early.
-    if let TreeOpWire::Unlink { dev, inode, path } = &op {
+    if let TreeOpWire::Unlink {
+        dev,
+        inode,
+        path,
+        kind,
+        mode,
+    } = &op
+    {
         let ts = crate::server::next_ts();
         return journal_unlink_idempotent(
             index,
@@ -750,6 +772,8 @@ fn handle_tree_mutation(
             ts,
             InodeRef::new(*dev, *inode),
             std::path::PathBuf::from(path),
+            convert_kind(*kind),
+            *mode,
         );
     }
 
@@ -930,7 +954,18 @@ fn handle_captured_pre_image(
         .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
 
     if args.is_delete {
-        journal_unlink_idempotent(index, command, ts, inode_ref, path_buf)?;
+        // G02: inherit kind+mode from the captured pre-image's
+        // metadata. The mode bits carry the original perms; kind
+        // is derived from S_IFMT.
+        journal_unlink_idempotent(
+            index,
+            command,
+            ts,
+            inode_ref,
+            path_buf,
+            kind_from_mode_bits(args.mode),
+            args.mode,
+        )?;
     }
     Ok(())
 }
@@ -943,18 +978,39 @@ fn handle_captured_pre_image(
 /// per logical mutation — otherwise plan() emits two RecreatePath
 /// nodes and the second hits ConflictPhantom at undo time (the smoke
 /// regression surfaced this).
+/// G02 — derive `FileKind` from raw POSIX mode bits. The helper's
+/// fstat-on-held-fd before unlink captures the full mode including
+/// S_IFMT type bits; the planner needs a typed `FileKind` to emit
+/// the right `RecreatePath` variant.
+fn kind_from_mode_bits(mode: u32) -> shit_planner::metadata::FileKind {
+    use shit_planner::metadata::FileKind;
+    match mode & 0o170000 {
+        0o040000 => FileKind::Directory,
+        0o100000 => FileKind::Regular,
+        0o120000 => FileKind::Symlink,
+        // FIFO / Socket / Block / Char devices — uncommon at unlink
+        // time; fall through to Regular so the planner's
+        // RecreatePath emits a regular-file inverse. The unit test
+        // suite's directory restore is the load-bearing case.
+        _ => FileKind::Regular,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn journal_unlink_idempotent(
     index: &Index,
     command: CommandId,
     ts: shit_planner::TimePoint,
     inode_ref: InodeRef,
     path: std::path::PathBuf,
+    kind: shit_planner::metadata::FileKind,
+    mode: u32,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::PlannerStore;
     let already = index.events_for_command(command).into_iter().any(|e| {
         matches!(
             &e.kind,
-            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path })
+            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path, .. })
                 if *inode == inode_ref && existing_path == &path
         )
     });
@@ -969,6 +1025,8 @@ fn journal_unlink_idempotent(
         kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
             inode: inode_ref,
             path,
+            kind,
+            mode,
         }),
     };
     index.put_event(&unlink_ev).map_err(|e| {
@@ -1101,7 +1159,15 @@ fn handle_baseline_promoted_pre_image(
         .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
 
     if is_delete {
-        journal_unlink_idempotent(index, command, ts, inode_ref, path_buf)?;
+        journal_unlink_idempotent(
+            index,
+            command,
+            ts,
+            inode_ref,
+            path_buf,
+            kind_from_mode_bits(mode),
+            mode,
+        )?;
     }
     Ok(())
 }
@@ -1277,8 +1343,16 @@ mod tests_dispatch {
         let inode_ref = InodeRef::new(64, 999);
         let path_buf: PathBuf = "/tmp/.git/index.lock".into();
         let ts = crate::server::next_ts();
-        journal_unlink_idempotent(&index, command, ts, inode_ref, path_buf)
-            .expect("marker-only journal");
+        journal_unlink_idempotent(
+            &index,
+            command,
+            ts,
+            inode_ref,
+            path_buf,
+            shit_planner::metadata::FileKind::Regular,
+            0o100644,
+        )
+        .expect("marker-only journal");
 
         let events = index.events_for_command(command);
         assert_eq!(events.len(), 1, "expected 1 Unlink, got {events:#?}");
