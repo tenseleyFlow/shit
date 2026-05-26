@@ -31,12 +31,12 @@ pub fn kernel_tier_classifier() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        // DR-12 lights up EndpointSecurity. Stage 1 helper runs
-        // without the entitlement; the tier string is still
-        // "endpoint-security" because that's the *intended* tier —
-        // when the runtime falls back, the helper updates the
-        // string to "degraded" before sending the ack.
-        "endpoint-security"
+        // M01 ships the FSEvents-based degraded tier as the macOS
+        // baseline (no Apple-paperwork dependency). M03 lights up
+        // EndpointSecurity and the classifier becomes a runtime
+        // check that returns "endpoint-security" when ES is
+        // entitled + FDA-granted, "fsevents-degraded" otherwise.
+        "fsevents-degraded"
     }
     #[cfg(target_os = "freebsd")]
     {
