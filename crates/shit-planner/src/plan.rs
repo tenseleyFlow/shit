@@ -396,6 +396,52 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         }
     }
 
+    // DR-CR-54.B — transient rename-destination subtree.
+    //
+    // pip's overwrite pattern is `rename(site-packages,
+    // ~ite-packages)` to move the OLD content out of the way,
+    // then `mkdir site-packages` + writes for new content, then
+    // recursive removal of `~ite-packages`. By undo time:
+    //   - `site-packages` exists (pip created the new one — this
+    //     is the path the user cares about; the SOURCE side of
+    //     the rename is covered by the DR-CR-54.B classifier
+    //     above, which treats per-file pre-images keyed at
+    //     `site-packages/...` as atomic_replace),
+    //   - `~ite-packages` is gone (pip cleaned up).
+    //
+    // The shim's per-file `unlinkat` captures during pip's
+    // cleanup journal both unlink+pre-image events at
+    // `~ite-packages/...` paths — duplicates of the recursive-
+    // walk pre-images, but at the post-rename path. Their
+    // inverses (RecreatePath + RestoreContent) target
+    // `~ite-packages/...` which is gone; the orchestrator's
+    // executor ENOENTs. Classify those duplicates as transient.
+    //
+    // Trigger: rename whose `from` path EXISTS at undo time. If
+    // the user (well, the tool) has put fresh content at the
+    // rename source, the destination is by definition a
+    // throw-away pile and any captures under it are duplicates
+    // we can safely skip.
+    let mut transient_rename_destinations: Vec<PathBuf> = Vec::new();
+    for ev in events {
+        if let CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) = &ev.kind
+            && probe.stat(from).is_some()
+        {
+            transient_rename_destinations.push(to.clone());
+        }
+    }
+    for p in pre_images.iter().chain(unlinks.iter()) {
+        if atomic.contains(p) || transient.contains(p) {
+            continue;
+        }
+        let under_transient_dst = transient_rename_destinations
+            .iter()
+            .any(|to| p.starts_with(to) && p != to);
+        if under_transient_dst {
+            transient.insert(p.clone());
+        }
+    }
+
     // DR-CR-54.B — orphan-parent transient classification.
     //
     // Build tools routinely create files under ephemeral parent
@@ -1308,6 +1354,18 @@ fn emit_for_tree_op(
             // gone at undo time anyway. Same suppression principle as
             // TreeOp::Create above.
             if atomic_replace_paths.contains(to) {
+                return;
+            }
+            // DR-CR-54.B — when the rename's `from` (source) is
+            // re-populated by the user's tool at undo time (pip's
+            // pattern: rename old site-packages out, then mkdir +
+            // write new site-packages), reversing the rename would
+            // either fail (`to` is gone — pip cleaned it up) or
+            // stomp on the fresh state at `from`. Suppress; the
+            // per-file FilePreImages at `from/...` paths carry the
+            // restore via RestoreContent through the
+            // atomic_replace_paths path.
+            if probe.stat(from).is_some() && probe.stat(to).is_none() {
                 return;
             }
             // Inverse of `from -> to` is `to -> from`.
