@@ -37,6 +37,7 @@ enum shit_event_kind {
     SHIT_EVT_OPEN = 4,
     SHIT_EVT_CREATE = 5,
     SHIT_EVT_RENAME = 6,
+    SHIT_EVT_RMDIR = 7,
 };
 
 /* Bounded comm length matches kernel's TASK_COMM_LEN. */
@@ -181,6 +182,27 @@ struct shit_open_event {
     __u64 inode;
     __u32 f_mode;
     __u32 f_flags;
+};
+
+/* lsm/inode_rmdir — `rmdir(2)` / `unlinkat(AT_REMOVEDIR)`. Fires
+ * BEFORE the kernel actually removes the (empty) directory. We
+ * capture the dir's pre-removal `i_mode` so the planner's
+ * RecreatePath inverse can restore the original mode instead of
+ * mkdir-p's umask-moderated default. G02 added kind/mode to
+ * TreeOpWire::Unlink; G03 routes a real mode through this hook.
+ *
+ * `mode` here carries BOTH the file-type bits (S_IFDIR) and the
+ * permission bits (0o7777). Userspace masks with !S_IFMT before
+ * storing on the wire (the wire's `kind` field carries S_IFDIR
+ * separately). */
+struct shit_rmdir_event {
+    struct shit_event_hdr hdr;
+    __u64 dev;
+    __u64 inode;
+    __u64 parent_inode;
+    __u32 mode;
+    __u32 name_len;
+    char  name[SHIT_NAME_MAX + 1];
 };
 
 /* lsm/inode_rename — `rename(2)` / `renameat2(2)`. Captures
