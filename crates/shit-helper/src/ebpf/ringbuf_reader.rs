@@ -75,6 +75,7 @@ pub mod kind {
     pub const OPEN: u8 = 4;
     pub const CREATE: u8 = 5;
     pub const RENAME: u8 = 6;
+    pub const RMDIR: u8 = 7;
 }
 
 /// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
@@ -360,6 +361,9 @@ pub trait LsmEventSink: Send + Sync + 'static {
     fn on_create(&self, _ev: &CreateEvent) {}
     fn on_open(&self, _ev: &OpenEvent) {}
     fn on_rename(&self, _ev: &RenameEvent) {}
+    /// G03 — `inode_rmdir` events. Wire shape is identical to
+    /// `UnlinkEvent` (kernel LSM hook signature is the same).
+    fn on_rmdir(&self, _ev: &UnlinkEvent) {}
 }
 
 /// Production sink — bridges decoded BPF events into the
@@ -422,6 +426,38 @@ impl LsmEventSink for LinuxCaptureSink {
             inode: ev.inode,
             parent_inode: ev.parent_inode,
             basename: &basename_cow,
+            is_directory: false,
+        };
+        self.runtime.lock().unwrap().handle_lsm_unlink(&view);
+    }
+
+    fn on_rmdir(&self, ev: &UnlinkEvent) {
+        // G03 — identical wire to on_unlink. We route through the
+        // same handle_lsm_unlink path with is_directory=true so the
+        // handler skips content capture (dirs have no bytes) and
+        // emits a marker CapturedPreImage with the dir's mode.
+        if self.is_excluded(ev.hdr.pid) {
+            return;
+        }
+        let pid = ev.hdr.pid as i32;
+        let Some((session, seq)) = self
+            .tree
+            .lock()
+            .unwrap()
+            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+        else {
+            tracing::trace!(pid, "untracked pid; dropping lsm rmdir event");
+            return;
+        };
+        let basename_cow = ev.basename_str();
+        let view = crate::capture::linux::LsmUnlinkView {
+            command: shit_planner::events::CommandId { session, seq },
+            pid: ev.hdr.pid,
+            dev: ev.dev,
+            inode: ev.inode,
+            parent_inode: ev.parent_inode,
+            basename: &basename_cow,
+            is_directory: true,
         };
         self.runtime.lock().unwrap().handle_lsm_unlink(&view);
     }
@@ -689,6 +725,14 @@ pub fn decode_unlink(bytes: &[u8]) -> Option<UnlinkEvent> {
     decode_event::<UnlinkEvent>(bytes, kind::UNLINK)
 }
 
+/// G03 — rmdir events share `UnlinkEvent`'s C struct shape but tag
+/// themselves with `SHIT_EVT_RMDIR`. Userspace dispatches them to
+/// `on_rmdir` so the sink can mark the captured pre-image as a
+/// directory.
+pub fn decode_rmdir(bytes: &[u8]) -> Option<UnlinkEvent> {
+    decode_event::<UnlinkEvent>(bytes, kind::RMDIR)
+}
+
 /// Decode a raw ringbuf record as a [`SetattrEvent`]. Same shape as
 /// [`decode_unlink`].
 pub fn decode_setattr(bytes: &[u8]) -> Option<SetattrEvent> {
@@ -772,6 +816,34 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as UnlinkEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// G03 — spawn an rmdir-ringbuf reader. Wire shape is identical
+    /// to unlink (same kernel hook signature) but dispatched via
+    /// `on_rmdir` so userspace can flag the event as a directory
+    /// removal at the sink level.
+    pub fn spawn_rmdir(
+        rmdir_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-rmdir",
+            rmdir_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_rmdir(bytes) {
+                    sink.on_rmdir(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as UnlinkEvent (rmdir)"
                     );
                 }
             }),
