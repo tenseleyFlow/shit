@@ -696,6 +696,58 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  dd-of-undo:
+    # AR08.2 -- dd's `of=path` is a truncate-class redirect; the
+    # shell-side redirect parser maps it to DdOf and pre-stashes
+    # via the AR06.5 path. This pins the dd-specific contract.
+    name: dd-of-undo smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/dd-of-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dd-of-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  iptables-net:
+    # AR08.2 -- iptables wrapper bracket-fires the daemon; a
+    # NetworkOp event lands in the journal. Closes AR08.1 smoke
+    # gap for iptables (the symmetrical companion to nft-net).
+    name: iptables-net smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite + iptables
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 iptables
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/iptables-net-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptables-net-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
@@ -974,6 +1026,18 @@ jobs:
             # under vim's writebackup workflow; classifier must flag
             # `.foo.txt.swp` / `4913` / `foo.txt~` as transient.
             vim-edit-undo-linux.sh
+            # AR08.2 — MetadataChange (uid/gid) → RestoreMetadata.
+            # Same wire as chmod; the LSM tier reads i_uid/i_gid pre-
+            # change in inode_setattr. Validates the v1/v2 BTF-probe
+            # dispatch (L0X) so it works on both pre-7.0 and 7.0+
+            # kernels.
+            chown-undo-linux.sh
+            # ln-symlink-undo-linux + ln-hardlink-undo-linux exist
+            # in tree but SKIP today: the LSM tier doesn't attach
+            # `inode_symlink` or `inode_link` BPF programs, so the
+            # underlying capture is missing. Tracked in DR-CR-55
+            # (DEFERRED-RUNTIME.md). The smokes are written + ready
+            # to flip from SKIP → run when those BPF hooks land.
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm

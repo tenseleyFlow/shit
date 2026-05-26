@@ -77,6 +77,14 @@ const LSM_HOOK_INODE_RENAME: &str = "inode_rename";
 /// section and the function name agree.
 const LSM_PROG_INODE_UNLINK: &str = "shit_inode_unlink";
 const LSM_PROG_INODE_SETATTR: &str = "shit_inode_setattr";
+/// L0X portability — three-argument variant of the inode_setattr
+/// BPF program for kernels where `bpf_lsm_inode_setattr` was
+/// extended to pass `mnt_idmap` as the first arg (Linux 7.0+).
+/// The userspace loader BTF-probes the kernel's hook signature
+/// and picks v1 or v2 at load time. See
+/// `crates/shit-helper/bpf/src/inode_setattr.bpf.c` for the
+/// shared body and the v1/v2 entry points.
+const LSM_PROG_INODE_SETATTR_V2: &str = "shit_inode_setattr_v2";
 const LSM_PROG_INODE_MKDIR: &str = "shit_inode_mkdir";
 const LSM_PROG_INODE_CREATE: &str = "shit_inode_create";
 const LSM_PROG_FILE_OPEN: &str = "shit_file_open";
@@ -360,13 +368,43 @@ impl EbpfLoader {
         let mut bpf = aya::Ebpf::load(&aligned)
             .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_setattr): {e}")))?;
 
+        // L0X — pick v1 (2-arg) vs v2 (3-arg) based on the kernel's
+        // bpf_lsm_inode_setattr FUNC_PROTO arity. Newer kernels
+        // (7.0+) added `mnt_idmap` as the LSM chain entry's first
+        // parameter; on those, the 2-arg BPF program loads cleanly
+        // but reads register-shifted garbage. See
+        // `crates/shit-helper/bpf/src/inode_setattr.bpf.c` for the
+        // shared body + entry points.
+        let chosen_prog = match probe_lsm_hook_arity(LSM_HOOK_INODE_SETATTR) {
+            Ok(3) => {
+                tracing::info!(
+                    hook = LSM_HOOK_INODE_SETATTR,
+                    "BTF-probe says vlen=3 (mnt_idmap-prefixed); picking v2 entry point"
+                );
+                LSM_PROG_INODE_SETATTR_V2
+            }
+            Ok(2) => LSM_PROG_INODE_SETATTR,
+            Ok(other) => {
+                tracing::warn!(
+                    hook = LSM_HOOK_INODE_SETATTR,
+                    arity = other,
+                    "unexpected vlen for bpf_lsm_inode_setattr; defaulting to v1"
+                );
+                LSM_PROG_INODE_SETATTR
+            }
+            Err(e) => {
+                tracing::warn!(
+                    hook = LSM_HOOK_INODE_SETATTR,
+                    err = %e,
+                    "BTF probe failed; defaulting to v1 (will read garbage on 7.0+ kernels)"
+                );
+                LSM_PROG_INODE_SETATTR
+            }
+        };
+
         let prog: &mut aya::programs::Lsm = bpf
-            .program_mut(LSM_PROG_INODE_SETATTR)
-            .ok_or_else(|| {
-                EbpfError::Aya(format!(
-                    "program `{LSM_PROG_INODE_SETATTR}` not found in object"
-                ))
-            })?
+            .program_mut(chosen_prog)
+            .ok_or_else(|| EbpfError::Aya(format!("program `{chosen_prog}` not found in object")))?
             .try_into()
             .map_err(|e: aya::programs::ProgramError| {
                 EbpfError::Aya(format!("expected Lsm program: {e}"))
@@ -381,7 +419,7 @@ impl EbpfLoader {
 
         tracing::info!(
             hook = LSM_HOOK_INODE_SETATTR,
-            prog = LSM_PROG_INODE_SETATTR,
+            prog = chosen_prog,
             ringbuf = RINGBUF_SETATTR_EVENTS,
             "ebpf-lsm inode_setattr loaded and attached"
         );
@@ -632,6 +670,189 @@ impl EbpfLoader {
         let map = bpf.take_map(RINGBUF_UNLINK_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
     }
+}
+
+/// L0X — BTF probe for the parameter count of `bpf_lsm_<hook>`.
+///
+/// The LSM hook chain entry's signature can shift between kernel
+/// releases (notably `inode_setattr` gained `mnt_idmap` as a
+/// first arg around 7.0). The BPF verifier accepts our program
+/// regardless, so a mismatch loads + attaches but reads register-
+/// shifted garbage. Userspace BTF-probes ahead of load and picks
+/// the matching entry point.
+///
+/// Parses `/sys/kernel/btf/vmlinux` directly because `aya_obj::Btf`
+/// keeps the `FuncProto::params` field crate-private and doesn't
+/// expose a public vlen accessor. The BTF wire format is small
+/// and stable (`Documentation/bpf/btf.rst`).
+fn probe_lsm_hook_arity(hook_name: &str) -> Result<u32, EbpfError> {
+    let data = std::fs::read("/sys/kernel/btf/vmlinux")
+        .map_err(|e| EbpfError::Aya(format!("read /sys/kernel/btf/vmlinux: {e}")))?;
+    if data.len() < 24 {
+        return Err(EbpfError::Aya("BTF blob too short for header".into()));
+    }
+    // btf_header (little-endian per kernel ABI).
+    let magic = u16::from_le_bytes([data[0], data[1]]);
+    if magic != 0xeb9f {
+        return Err(EbpfError::Aya(format!(
+            "BTF magic mismatch: 0x{magic:04x} (expected 0xeb9f)"
+        )));
+    }
+    let hdr_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let type_off = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let type_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+    let str_off = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+    let str_len = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+    let types_start = hdr_len
+        .checked_add(type_off)
+        .ok_or_else(|| EbpfError::Aya("BTF header arithmetic overflow (types)".to_string()))?;
+    let strs_start = hdr_len
+        .checked_add(str_off)
+        .ok_or_else(|| EbpfError::Aya("BTF header arithmetic overflow (strs)".to_string()))?;
+    if data.len() < types_start + type_len || data.len() < strs_start + str_len {
+        return Err(EbpfError::Aya("BTF blob shorter than header claims".into()));
+    }
+
+    let target_name = format!("bpf_lsm_{hook_name}");
+    let read_str = |name_off: u32| -> Option<&str> {
+        let off = strs_start + name_off as usize;
+        if off >= strs_start + str_len {
+            return None;
+        }
+        let bytes = &data[off..strs_start + str_len];
+        let end = bytes.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&bytes[..end]).ok()
+    };
+
+    // Walk the types section. Each type starts with a 12-byte
+    // btf_type header; FUNC and FUNC_PROTO are the kinds we care
+    // about (12 and 13 respectively in the on-wire encoding).
+    let mut func_proto_type_id: Option<u32> = None;
+    let mut cursor = types_start;
+    let type_section_end = types_start + type_len;
+    // BTF type ids start at 1; id 0 is "void". The first type
+    // header is at types_start and has id 1.
+    let mut current_id: u32 = 0;
+    let mut func_proto_offsets: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::new();
+    while cursor + 12 <= type_section_end {
+        current_id += 1;
+        let name_off = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        let info = u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap());
+        let size_or_type = u32::from_le_bytes(data[cursor + 8..cursor + 12].try_into().unwrap());
+        let kind = (info >> 24) & 0x1F;
+        let vlen = info & 0xFFFF;
+        // Variable-length payload after the 12-byte type header.
+        // Per Documentation/bpf/btf.rst, each BTF kind has its own
+        // trailing struct (some sized by vlen, some fixed).
+        let payload_size: usize = match kind {
+            // No trailing payload.
+            0  // VOID
+            | 2  // PTR
+            | 7  // FWD
+            | 8  // TYPEDEF
+            | 9  // VOLATILE
+            | 10 // CONST
+            | 11 // RESTRICT
+            | 12 // FUNC
+            | 16 // FLOAT
+            | 18 // TYPE_TAG
+            => 0,
+            // 4-byte trailer (single u32).
+            1   // INT: u32 int_info
+            | 14 // VAR: u32 linkage
+            | 17 // DECL_TAG: u32 component_idx
+            => 4,
+            // ARRAY: btf_array (type, index_type, nelems) = 3 u32 = 12 B.
+            3 => 12,
+            // STRUCT/UNION: vlen * btf_member (3 u32 = 12 B each).
+            4 | 5 => (vlen as usize) * 12,
+            // ENUM: vlen * btf_enum (2 u32 = 8 B each).
+            6 => (vlen as usize) * 8,
+            // FUNC_PROTO: vlen * btf_param (2 u32 = 8 B each).
+            13 => (vlen as usize) * 8,
+            // DATASEC: vlen * btf_var_secinfo (3 u32 = 12 B each).
+            15 => (vlen as usize) * 12,
+            // ENUM64: vlen * btf_enum64 (3 u32 = 12 B each;
+            // name + val_lo + val_hi).
+            19 => (vlen as usize) * 12,
+            // Unknown kind — be conservative and stop the walk.
+            _ => {
+                return Err(EbpfError::Aya(format!(
+                    "BTF probe: unknown kind {kind} at type id {current_id}"
+                )));
+            }
+        };
+
+        if kind == 12
+        /* FUNC */
+        {
+            if let Some(name) = read_str(name_off)
+                && name == target_name
+            {
+                func_proto_type_id = Some(size_or_type);
+                break;
+            }
+        } else if kind == 13
+        /* FUNC_PROTO */
+        {
+            func_proto_offsets.insert(current_id, cursor);
+        }
+
+        cursor += 12 + payload_size;
+    }
+
+    let proto_id = func_proto_type_id.ok_or_else(|| {
+        EbpfError::Aya(format!(
+            "BTF probe: no FUNC entry named `{target_name}` found"
+        ))
+    })?;
+
+    // If the FUNC_PROTO was earlier in the section (typical), look
+    // it up by offset; else continue walking from where we stopped.
+    let proto_cursor = if let Some(&off) = func_proto_offsets.get(&proto_id) {
+        off
+    } else {
+        // Walk forward from `cursor` looking for proto_id.
+        let mut id = current_id;
+        let mut c = cursor;
+        loop {
+            if c + 12 > type_section_end {
+                return Err(EbpfError::Aya(format!(
+                    "BTF probe: FUNC_PROTO id {proto_id} not found"
+                )));
+            }
+            id += 1;
+            let info = u32::from_le_bytes(data[c + 4..c + 8].try_into().unwrap());
+            let kind = (info >> 24) & 0x1F;
+            let vlen = info & 0xFFFF;
+            if id == proto_id {
+                if kind != 13 {
+                    return Err(EbpfError::Aya(format!(
+                        "BTF probe: id {proto_id} has kind {kind}, expected FUNC_PROTO (13)"
+                    )));
+                }
+                break c;
+            }
+            let payload_size: usize = match kind {
+                0 | 2 | 7 | 8 | 9 | 10 | 11 | 12 | 16 | 18 => 0,
+                1 | 14 | 17 => 4,
+                3 => 12,
+                4 | 5 | 15 | 19 => (vlen as usize) * 12,
+                6 | 13 => (vlen as usize) * 8,
+                _ => {
+                    return Err(EbpfError::Aya(format!(
+                        "BTF probe: unknown kind {kind} at type id {id}"
+                    )));
+                }
+            };
+            c += 12 + payload_size;
+        }
+    };
+    let proto_info =
+        u32::from_le_bytes(data[proto_cursor + 4..proto_cursor + 8].try_into().unwrap());
+    let proto_vlen = proto_info & 0xFFFF;
+    Ok(proto_vlen)
 }
 
 #[cfg(test)]
