@@ -209,6 +209,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: InodeRef::new(1, 5),
                 path: PathBuf::from("/tmp/x"),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
             }),
         });
         let fetched = s.events_for_command(cmd);

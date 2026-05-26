@@ -474,9 +474,17 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
     match syscall {
         "unlink" | "unlinkat" => {
             let path = PathBuf::from(arg);
+            // G02: shim doesn't carry kind/mode in its notification
+            // wire (the shim's notify happens pre-syscall and
+            // doesn't fstat). Default to Regular/0o100644, matching
+            // pre-G02 hard-coded behavior. The kernel-tier LSM
+            // path (helper) DOES carry kind+mode and overrides this
+            // when both tiers see the same unlink.
             Some(CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: InodeRef::new(0, 0),
                 path,
+                kind: shit_planner::metadata::FileKind::Regular,
+                mode: 0o100644,
             }))
         }
         "rename" | "renameat" | "renameat2" => {

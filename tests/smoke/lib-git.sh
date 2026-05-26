@@ -17,6 +17,14 @@
 #     this library if it wants a custom skip message; otherwise the
 #     smoke will fail at first `git_invoke` call.
 
+# FreeBSD ships git under /usr/local/bin after `pkg install git`;
+# CI invokes smokes via a minimal PATH so make sure that location
+# is reachable before probing.
+case "$(uname -s)" in
+    FreeBSD|NetBSD|OpenBSD|DragonFly)
+        export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
+        ;;
+esac
 GIT_BIN="$(command -v git || true)"
 if [ -n "${GIT_BIN}" ]; then
     export GIT_BIN
@@ -42,12 +50,23 @@ git_invoke() {
         "${GIT_BIN}" "${GIT_HERMETIC[@]}" "$@"
 }
 
-# Helper-cap preflight. Each G01 smoke needs the LSM tier to capture
-# .git/* atomic-rename pre-images. Returns 1 + logs FAIL if caps
-# are missing — the smoke should `exit 1` to surface the bless
-# command.
+# Helper-cap preflight. Linux: each G01 smoke needs the LSM tier
+# to capture .git/* atomic-rename pre-images, which requires
+# cap_sys_admin on the helper binary. Returns 1 + logs FAIL if
+# caps are missing — the smoke should `exit 1` to surface the
+# bless command.
+#
+# FreeBSD: kqueue capture doesn't need elevated caps (capsicum is
+# a sandbox the helper enters, not a privilege). Return 0
+# (no-op) so the same harness works for the G01.B BSD mirror.
 smoke_g01_assert_helper_caps() {
     local helper_bin="$1"
+    case "$(uname -s)" in
+        FreeBSD|NetBSD|OpenBSD|DragonFly)
+            smoke_log "helper caps: n/a (BSD — kqueue tier, no privileged caps required)"
+            return 0
+            ;;
+    esac
     if ! command -v getcap >/dev/null 2>&1; then
         smoke_log "SKIP: getcap missing; can't verify helper caps"
         return 2

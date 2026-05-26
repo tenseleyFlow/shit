@@ -419,6 +419,13 @@ pub enum PrivilegedOpOutcome {
     Failed { err: String },
 }
 
+fn default_unlink_kind_wire() -> FileKindWire {
+    FileKindWire::Regular
+}
+fn default_unlink_mode_wire() -> u32 {
+    0o100644
+}
+
 /// Wire-side mirror of `shit_planner::TreeOp`. Kept duplicated here
 /// rather than imported so `shit-proto` stays free of the planner
 /// dep. The daemon converts on ingest (`shitd::helper_link::handle_tree_mutation`).
@@ -435,6 +442,26 @@ pub enum TreeOpWire {
         dev: u64,
         inode: u64,
         path: String,
+        /// G02 — kind + mode of the entry being unlinked, captured
+        /// by the helper via fstat-on-held-fd before the unlink
+        /// commits. Lets the planner emit a typed RecreatePath
+        /// (Directory vs Regular, with the original mode bits)
+        /// instead of hard-coding Regular/0o644. Real-world
+        /// trigger: `git clean -fd` removes untracked directories
+        /// — without kind here we'd emit RecreatePath{Regular}
+        /// for a path that's actually a directory, and the
+        /// undo restore would either fail or create a regular
+        /// file where a dir belonged.
+        ///
+        /// serde-default both fields so journals written by
+        /// pre-G02 helpers (or BSD's kqueue tier, which still
+        /// emits via a different path) decode cleanly. The
+        /// defaults conservatively say "regular file, 0o644"
+        /// which matches the pre-G02 hard-coded behavior.
+        #[serde(default = "default_unlink_kind_wire")]
+        kind: FileKindWire,
+        #[serde(default = "default_unlink_mode_wire")]
+        mode: u32,
     },
     Rename {
         from: String,

@@ -270,6 +270,13 @@ pub enum DbTxState {
     Unknown,
 }
 
+fn default_unlink_kind_event() -> FileKind {
+    FileKind::Regular
+}
+fn default_unlink_mode_event() -> u32 {
+    0o100644
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TreeOp {
     Create {
@@ -281,6 +288,15 @@ pub enum TreeOp {
     Unlink {
         inode: InodeRef,
         path: PathBuf,
+        /// G02 — kind + mode of the entry at unlink time. Used by
+        /// `emit_for_tree_op` to drive `InverseOp::RecreatePath`
+        /// with the correct file/dir distinction and original mode
+        /// bits. `serde(default)` covers older journals (and the
+        /// BSD kqueue tier, which doesn't yet plumb this through).
+        #[serde(default = "default_unlink_kind_event")]
+        kind: FileKind,
+        #[serde(default = "default_unlink_mode_event")]
+        mode: u32,
     },
     Rename {
         from: PathBuf,
@@ -463,6 +479,8 @@ mod tests {
             kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: sample_inode(),
                 path: PathBuf::from("/tmp/x"),
+                kind: FileKind::Regular,
+                mode: 0o100644,
             }),
         };
         let bytes = postcard::to_allocvec(&ev).unwrap();

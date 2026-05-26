@@ -24,8 +24,8 @@ source "${SHIT_REPO_ROOT}/tests/smoke/lib.sh"
 # shellcheck source=lib-git.sh
 source "${SHIT_REPO_ROOT}/tests/smoke/lib-git.sh"
 
-if [ "$(uname -s)" != "Linux" ]; then
-    smoke_log "SKIP: git-clean-fd-undo-linux is Linux-only"
+if [ "$(uname -s)" != "FreeBSD" ]; then
+    smoke_log "SKIP: git-clean-fd-undo-fbsd is FreeBSD-only"
     exit 0
 fi
 if [ -z "${GIT_BIN}" ]; then
@@ -57,20 +57,11 @@ mkdir -p "${REPO}/junk/nested"
 echo "charlie" > "${REPO}/junk/c.txt"
 echo "delta"   > "${REPO}/junk/nested/d.txt"
 
-# G02 — pin a non-default mode on `junk/` so we can assert the
-# planner restores the captured mode (not the pre-G02 hard-coded
-# 0o755 from the executor's mkdir-p fallback). 0o750 has both
-# group + other diffs from 0o755, so a regression that loses kind
-# OR mode surfaces here.
-chmod 0750 "${REPO}/junk"
-DIR_MODE_BEFORE="$(stat -c '%a' "${REPO}/junk")"
-smoke_log "pre-clean dir mode: junk=${DIR_MODE_BEFORE}"
-
 # Sha each untracked file so we can assert byte-identity after undo.
-SHA_A="$(sha256sum "${REPO}/untracked-a.txt" | cut -d' ' -f1)"
-SHA_B="$(sha256sum "${REPO}/untracked-b.txt" | cut -d' ' -f1)"
-SHA_C="$(sha256sum "${REPO}/junk/c.txt" | cut -d' ' -f1)"
-SHA_D="$(sha256sum "${REPO}/junk/nested/d.txt" | cut -d' ' -f1)"
+SHA_A="$(/sbin/sha256 -q "${REPO}/untracked-a.txt")"
+SHA_B="$(/sbin/sha256 -q "${REPO}/untracked-b.txt")"
+SHA_C="$(/sbin/sha256 -q "${REPO}/junk/c.txt")"
+SHA_D="$(/sbin/sha256 -q "${REPO}/junk/nested/d.txt")"
 smoke_log "untracked: a=${SHA_A:0:8} b=${SHA_B:0:8} c=${SHA_C:0:8} d=${SHA_D:0:8}"
 
 smoke_start_shitd
@@ -86,6 +77,21 @@ cd "${REPO}"
 "${SHIT_BIN}" hook-send pre-exec \
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "${REPO}" --shell bash --sock "${SHIT_HOOK_SOCK}"
+
+# BSD-specific: the kqueue capture pipeline runs the baseline walk
+# asynchronously after PreExec. Wait for it to complete before the
+# workload runs, otherwise the workload races baseline and its
+# modifications happen before LiveBaseline can record them. The
+# Linux equivalent doesn't need this because LSM is synchronous.
+sleep 0.5
+
+# BSD-specific: the kqueue capture pipeline does the baseline walk
+# asynchronously after PreExec. Wait for it to complete before
+# running the workload, otherwise the workload races baseline and
+# its modifications happen before the LiveBaseline can record
+# them (= no FilePreImage events captured). The Linux equivalent
+# doesn't need this because LSM is synchronous.
+sleep 0.5
 
 # THE workload.
 smoke_log "git clean -fd"
@@ -119,7 +125,7 @@ check_file() {
     local path="$1" expected="$2"
     [ -f "${path}" ] || { smoke_log "missing: ${path}"; return 1; }
     local got
-    got="$(sha256sum "${path}" | cut -d' ' -f1)"
+    got="$(/sbin/sha256 -q "${path}")"
     [ "${got}" = "${expected}" ] || {
         smoke_log "sha mismatch ${path}: expected=${expected} got=${got}"
         return 1
@@ -146,34 +152,7 @@ if [ "${ok}" != "1" ]; then
     smoke_fail "clean -fd undo didn't restore all entries"
 fi
 
-# G02 partial — dir mode restoration is still gated on the
-# helper landing an `inode_rmdir` LSM hook (deferred to G03).
-# Today's flow:
-#   1. `git clean -fd` calls `unlinkat(AT_REMOVEDIR)` on junk/.
-#   2. The helper has NO inode_rmdir hook (only inode_unlink for
-#      regular-file unlinks), so no LSM event fires for the dir
-#      itself — captured mode is 0o750 nowhere in the journal.
-#   3. The files inside emit FilePreImage events; their
-#      RestoreContent then mkdir-p's junk/ as a side-effect at
-#      default mode (0o755, umask-moderated).
-#
-# So the post-undo mode comes from the executor's fallback, not
-# from the captured pre-state. Soft-assert: log the mismatch as
-# a known gap (covered by G03 follow-up) without failing the
-# smoke. The G02 wire change is still load-bearing — it ensures
-# the kind+mode flow works for cases where capture DOES land
-# (e.g. shim-side unlinks, future inode_rmdir).
-DIR_MODE_AFTER="$(stat -c '%a' "${REPO}/junk")"
-if [ "${DIR_MODE_AFTER}" != "${DIR_MODE_BEFORE}" ]; then
-    smoke_log "[G03-pending] dir mode not preserved on junk/:"
-    smoke_log "  pre-clean:  ${DIR_MODE_BEFORE}"
-    smoke_log "  post-undo:  ${DIR_MODE_AFTER}"
-    smoke_log "  cause:      no inode_rmdir LSM hook yet; dir created by mkdir-p fallback"
-else
-    smoke_log "dir mode preserved: junk=${DIR_MODE_AFTER} == captured ${DIR_MODE_BEFORE}"
-fi
-
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: git-clean-fd-undo-linux (files + dirs restored, ${NUM_PRE} pre-images)"
+smoke_log "PASS: git-clean-fd-undo-fbsd (files + dirs restored, ${NUM_PRE} pre-images)"
