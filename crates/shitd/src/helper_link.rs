@@ -540,12 +540,13 @@ fn dispatch_response(
             // couldn't capture at all.
             let inode_ref = shit_planner::InodeRef::new(dev, inode);
             let cmd = shit_planner::events::CommandId { session, seq };
-            let baseline_blob = live_baseline
+            let baseline_promote = live_baseline
                 .get_cwd_for_inode(dev, inode)
                 .and_then(|cache| cache.promote(inode_ref, cmd));
-            if let Some(blob) = baseline_blob {
+            if let Some((blob, baseline_xattrs)) = baseline_promote {
                 tracing::info!(
                     %session, seq, dev, inode,
+                    xattr_count = baseline_xattrs.len(),
                     "promoted live-baseline blob into FilePreImage (pre-write content captured at session-open)"
                 );
                 if let Err(e) = handle_baseline_promoted_pre_image(
@@ -560,6 +561,7 @@ fn dispatch_response(
                     uid,
                     gid,
                     mtime_unix_nanos,
+                    baseline_xattrs,
                     is_delete,
                     index,
                 ) {
@@ -1013,7 +1015,15 @@ fn handle_baseline_captured(
     // `handle_captured_pre_image` path records the blob normally.
     let _ = stat;
     let inode_ref = InodeRef::new(dev, inode);
-    let entry = crate::baseline::BaselineEntry::new(inode_ref, canonical_hash, stored_bytes);
+    // W09.21 — read user-namespace xattrs here in the daemon (not
+    // the helper) because the helper runs under cap_enter(2) where
+    // extattr_*_fd is blocked unconditionally regardless of fd rights.
+    // The daemon's read happens BEFORE the user's command runs (the
+    // WatchTreeReady ack to PreExec waits for all BaselineCaptured to
+    // flush), so we see the genuine pre-command state.
+    let xattrs = crate::xattr::read_user_xattrs_at_path(&path);
+    let entry =
+        crate::baseline::BaselineEntry::new(inode_ref, canonical_hash, stored_bytes, xattrs);
     let cache = live_baseline.entry_for_cwd(&cwd);
     cache.insert(path.clone(), entry);
     tracing::debug!(
@@ -1046,6 +1056,7 @@ fn handle_baseline_promoted_pre_image(
     uid: u32,
     gid: u32,
     mtime_unix_nanos: i128,
+    xattrs: BTreeMap<String, Vec<u8>>,
     is_delete: bool,
     index: &Index,
 ) -> Result<(), HelperLinkError> {
@@ -1057,7 +1068,10 @@ fn handle_baseline_promoted_pre_image(
         gid,
         size: stored_bytes,
         mtime_unix_nanos,
-        xattrs: BTreeMap::new(),
+        // W09.21 — xattrs captured daemon-side at session-open (helper
+        // can't because of cap_enter). Restore via planner's
+        // restore_metadata_inner → restore_user_xattrs.
+        xattrs,
         acl: None,
     };
     let path_buf: PathBuf = path.clone().unwrap_or_default().into();

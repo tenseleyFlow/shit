@@ -30,14 +30,14 @@ SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
 [ -x "${SHIT_BIN}" ]   || smoke_fail "shit missing"
 export SHIT_HELPER_BIN="${HELPER_BIN}"
 
-# W09.21 capsicum-default-on interaction: helper's tracked fds don't
-# carry CAP_EXTATTR_* rights under cap_enter, so extattr_*_fd reads
-# return empty. Until that's fixed (open subtree fds with explicit
-# CAP_EXTATTR_* rights), the smoke is meaningful only with capsicum
-# disabled. Set SHIT_CAPSICUM=0 to opt out for this smoke. Must be
-# exported BEFORE smoke_start_shitd so the daemon (and its helper
-# child) inherit it.
-export SHIT_CAPSICUM="${SHIT_CAPSICUM:-0}"
+# W09.21.1 — xattr capture now runs daemon-side at BaselineCaptured
+# ingest (helper can't because cap_enter blocks extattr_*_fd at the
+# syscall level, not by per-fd rights — verified empirically on
+# FreeBSD 14.4). The daemon is never cap_enter'd, so it reads the
+# user-namespace xattrs of every cached file at session-open and
+# stores them on the BaselineEntry. Baseline-promotion then carries
+# them into FilePreImage's FileMetadata, where the planner's
+# RestoreMetadata applies the diff. No SHIT_CAPSICUM=0 escape needed.
 
 smoke_start_shitd
 
