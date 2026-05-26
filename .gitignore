@@ -43,3 +43,4 @@ Thumbs.db
 /out/
 tools/freebsd-vm/work/
 tools/linux-bpf-vm/work/
+tools/macos-tart-vm/work/
