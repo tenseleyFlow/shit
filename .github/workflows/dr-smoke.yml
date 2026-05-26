@@ -696,6 +696,139 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  chown-undo:
+    # AR08.2 -- LSM tier already emits MetadataChange with uid/gid
+    # for any chown(2); planner already routes to RestoreMetadata.
+    # This pins the contract on Linux specifically. Closes the
+    # AR08.1 'covered, smoke-gap' entry for chown/chgrp.
+    name: chown-undo smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/chown-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chown-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  ln-symlink-undo:
+    # AR08.2 -- TreeOp::Symlink (or TreeOp::Create) capture +
+    # planner's Unlink inverse on the LINK path, not the target.
+    # Catches a buggy implementation that follows the symlink and
+    # deletes the target. Closes AR08.1 smoke gap for ln -s.
+    name: ln-symlink-undo smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/ln-symlink-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ln-symlink-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  ln-hardlink-undo:
+    # AR08.2 -- hardlink shares inode with target; undo must unlink
+    # the LINK directory entry only, dropping nlink from 2 to 1
+    # without touching target's content. Closes AR08.1 smoke gap
+    # for hardlinks.
+    name: ln-hardlink-undo smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/ln-hardlink-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ln-hardlink-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  dd-of-undo:
+    # AR08.2 -- dd's `of=path` is a truncate-class redirect; the
+    # shell-side redirect parser maps it to DdOf and pre-stashes
+    # via the AR06.5 path. This pins the dd-specific contract.
+    name: dd-of-undo smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/dd-of-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dd-of-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  iptables-net:
+    # AR08.2 -- iptables wrapper bracket-fires the daemon; a
+    # NetworkOp event lands in the journal. Closes AR08.1 smoke
+    # gap for iptables (the symmetrical companion to nft-net).
+    name: iptables-net smoke (AR08.2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite + iptables
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 iptables
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/iptables-net-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptables-net-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   systemctl-svc:
     name: systemctl-svc smoke (DR-34)
     runs-on: ubuntu-24.04
