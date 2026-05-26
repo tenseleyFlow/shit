@@ -64,6 +64,15 @@ smoke_dump_daemon_logs() {
                 tail -100 "${f}" 2>/dev/null | sed 's/^/    /' >&2 || true
             done
     fi
+    # shitd.log carries the helper's stderr (helper inherits the
+    # daemon's fd 2). Helper-side tracing — kqueue dispatch, dir-diff,
+    # symlink-target decisions — only lands here, NOT in the daemon
+    # JSON log. Dump the tail on failure so CI surfaces it.
+    if [ -f "${SHIT_SMOKE_TMP}/shitd.log" ]; then
+        smoke_log "shitd.log (stdout/stderr, includes helper tracing):"
+        echo "    --- ${SHIT_SMOKE_TMP}/shitd.log ---" >&2
+        tail -200 "${SHIT_SMOKE_TMP}/shitd.log" 2>/dev/null | sed 's/^/    /' >&2 || true
+    fi
 }
 
 # Start shitd in the background. Blocks until the ctl socket appears

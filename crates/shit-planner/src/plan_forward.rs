@@ -381,6 +381,20 @@ fn emit_forward_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec
                 conflict: phantom_if_exists(path, probe),
             });
         }
+        TreeOp::SymlinkRemoved { path, .. } => {
+            // W09.16.1 — forward of "symlink at `path` was removed"
+            // is to remove it. The paired Create event (for the new
+            // symlink that took its place) re-creates the replacement
+            // forward; this just removes the OLD one. Conflict-wise:
+            // the OLD symlink should not exist at forward time
+            // (it's the new one that should be present). If the path
+            // is missing, that's expected — no-op.
+            nodes.push(PlanNode {
+                op: InverseOp::Unlink { path: path.clone() },
+                cohort: 0,
+                conflict: phantom_if_missing(path, probe),
+            });
+        }
     }
 }
 

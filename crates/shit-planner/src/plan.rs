@@ -432,7 +432,8 @@ fn event_path(ev: &CaptureEvent) -> Option<&PathBuf> {
         CaptureEventKind::MetadataChange { path, .. } => Some(path),
         CaptureEventKind::TreeOp(TreeOp::Create { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. })
-        | CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. }) => Some(path),
+        | CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. })
+        | CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => Some(path),
         _ => None,
     }
 }
@@ -1067,6 +1068,22 @@ fn emit_for_tree_op(
         TreeOp::Symlink { path, .. } => {
             nodes.push(PlanNode {
                 op: InverseOp::Unlink { path: path.clone() },
+                cohort: 0,
+                conflict: None,
+            });
+        }
+        TreeOp::SymlinkRemoved { target, path } => {
+            // W09.16.1 — the OLD symlink at `path` was removed
+            // (by `ln -sf` or `rm + ln -s`); recreate it. The
+            // paired Create event for the NEW symlink at the
+            // same path produced an Unlink inverse that runs
+            // BEFORE this one (reverse-event-order), so the
+            // path is free by the time we get here.
+            nodes.push(PlanNode {
+                op: InverseOp::CreateSymlink {
+                    target: target.clone(),
+                    path: path.clone(),
+                },
                 cohort: 0,
                 conflict: None,
             });

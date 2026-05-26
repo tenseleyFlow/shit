@@ -262,6 +262,15 @@ pub enum TreeOp {
         target: String, // symlink contents (string the kernel returns)
         path: PathBuf,  // location of the symlink itself
     },
+    /// W09.16.1 — a pre-existing symlink was atomically replaced.
+    /// Carries the OLD target so undo can restore it. The planner
+    /// inverts this as `CreateSymlink { target, path }`; the
+    /// new symlink's Unlink inverse (from the paired `Create`
+    /// event) runs first, then this restores the original target.
+    SymlinkRemoved {
+        target: String, // the OLD symlink's target
+        path: PathBuf,  // path of the symlink that was replaced
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

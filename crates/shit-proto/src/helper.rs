@@ -447,6 +447,21 @@ pub enum TreeOpWire {
         /// Path of the symlink itself.
         path: String,
     },
+    /// W09.16.1 — a pre-existing symlink was atomically replaced
+    /// (e.g. by `ln -sf newtarget existing_link`, which internally
+    /// does `unlink(existing_link); symlink(newtarget, existing_link)`).
+    /// Carries the OLD target so undo can restore it; the NEW symlink
+    /// is reported separately as `Create { kind: Symlink, .. }` by the
+    /// dir-diff in the same handler call. Planner inverts this as
+    /// `CreateSymlink { target: old_target, path }` — after the
+    /// new-symlink's Unlink inverse has executed, the old symlink
+    /// gets recreated at the same path.
+    SymlinkRemoved {
+        /// The OLD symlink's target (`readlink` value pre-replacement).
+        target: String,
+        /// Path of the symlink that was removed.
+        path: String,
+    },
 }
 
 /// Wire mirror of a subset of `shit_planner::FileMetadata`. xattrs and
@@ -523,7 +538,8 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
                 TreeOpWire::Create { path, .. } | TreeOpWire::Unlink { path, .. } => path.len(),
                 TreeOpWire::Rename { from, to, .. } => from.len().max(to.len()),
                 TreeOpWire::Link { target, .. } => target.len(),
-                TreeOpWire::Symlink { target, path } => target.len().max(path.len()),
+                TreeOpWire::Symlink { target, path }
+                | TreeOpWire::SymlinkRemoved { target, path } => target.len().max(path.len()),
             };
             if longest > HELPER_PATH_HINT_MAX {
                 return Err(HelperProtoError::PathHintTooLong {

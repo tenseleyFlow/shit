@@ -96,10 +96,26 @@ struct WatchState {
 struct DirBaseline {
     /// Absolute path of the directory (for emitting child paths).
     path: PathBuf,
-    /// Child name → (dev, inode) at baseline time. We store inode so
-    /// the diff can detect rename-within-dir as
-    /// `Unlink old_name + Create new_name` for the same inode.
-    entries: BTreeMap<std::ffi::OsString, (u64, u64)>,
+    /// Child name → per-entry baseline. We store inode so the diff
+    /// can detect rename-within-dir; the optional symlink_target
+    /// (captured via readlinkat at scan time) lets the diff detect
+    /// `ln -sf newtarget link` and emit a SymlinkRemoved event
+    /// carrying the OLD target so undo can restore it.
+    entries: BTreeMap<std::ffi::OsString, DirEntryBaseline>,
+}
+
+/// W09.16.1 — per-directory-entry baseline. The (dev, inode) pair
+/// detects entry replacement at the same name; `symlink_target`
+/// (populated for symlink entries via readlinkat) lets the dir-diff
+/// emit a `SymlinkRemoved` event carrying the OLD target so undo
+/// can restore it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirEntryBaseline {
+    dev: u64,
+    inode: u64,
+    /// `Some(readlink_value)` if this entry was a symlink at scan
+    /// time. `None` for regular files, dirs, FIFOs, sockets, etc.
+    symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,6 +224,19 @@ impl PumpState {
                 continue;
             };
             let entries = read_dir_entries(raw).unwrap_or_default();
+            // W09.16.1 CI diag — dump baseline dir entries with
+            // their symlink_target so we know if `config` is in
+            // the map at attach time.
+            for (name, e) in &entries {
+                tracing::info!(
+                    fd = raw,
+                    name = %name.to_string_lossy(),
+                    dev = e.dev,
+                    inode = e.inode,
+                    symlink_target = ?e.symlink_target,
+                    "W09.16.1 baseline entry"
+                );
+            }
             dir_baselines.insert(
                 raw,
                 DirBaseline {
@@ -278,6 +307,10 @@ impl PumpState {
     }
 
     fn handle_vnode(&mut self, fd: RawFd, kind: VnodeEventKind) {
+        // W09.16.1 CI diag — log EVERY vnode event entry so we
+        // can confirm whether kqueue is firing at all for the
+        // symlink-replace case on 14.2 ZFS.
+        tracing::info!(fd, ?kind, "W09.16.1 handle_vnode entry");
         // S29.3: route NOTE_ATTRIB (chmod/chown/touch) into its own
         // handler before the content-capture branch so we never
         // try to pread bytes for a metadata-only event.
@@ -494,34 +527,97 @@ impl PumpState {
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
         let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
         let mut new_dirs_to_watch: Vec<std::path::PathBuf> = Vec::new();
-        for (name, &(dev, inode)) in &current {
-            match baseline.entries.get(name) {
-                Some(&prev) if prev == (dev, inode) => {} // unchanged
-                Some(_) | None => {
-                    // New entry, or entry with different inode at same name.
+        // W09.16.1 CI diag — dump current entries pre-diff.
+        for (name, e) in &current {
+            tracing::info!(
+                fd,
+                name = %name.to_string_lossy(),
+                dev = e.dev,
+                inode = e.inode,
+                symlink_target = ?e.symlink_target,
+                "W09.16.1 dir-diff current entry"
+            );
+        }
+        for (name, cur_entry) in &current {
+            let prev = baseline.entries.get(name);
+            tracing::info!(
+                fd,
+                name = %name.to_string_lossy(),
+                prev_some = prev.is_some(),
+                "W09.16.1 dir-diff per-iter (pre check)"
+            );
+            // Unchanged entry: same (dev, inode) AND (for symlinks)
+            // same target. Symlink target equality is checked because
+            // `ln -sf newtarget link` allocates a NEW inode for the
+            // new symlink, so (dev, inode) already detects the
+            // replacement — but we want to ALSO catch the degenerate
+            // case where the inode happens to land back on the old
+            // one (filesystem reuse with same st_ino under heavy
+            // churn). Cheap to compare.
+            if let Some(p) = prev
+                && p.dev == cur_entry.dev
+                && p.inode == cur_entry.inode
+                && p.symlink_target == cur_entry.symlink_target
+            {
+                continue;
+            }
+            // W09.16.1 — `ln -sf newtarget existing_link`: the OLD
+            // symlink got unlinked and a new symlink took its place
+            // at the same name. The OS may or may not reuse the
+            // freed st_ino for the new symlink; we can't depend on
+            // inode change to detect the replacement (FreeBSD 14.2's
+            // ZFS reuses the freed inode in tight succession,
+            // leaving the entry's (dev, inode) identical pre- and
+            // post-replacement — surfaced via CI on the W09.16.1 PR).
+            // Emit `SymlinkRemoved` whenever the old entry was a
+            // symlink AND its target differs from the new one — the
+            // target string is the load-bearing signal, not the
+            // inode. The planner inverts SymlinkRemoved as
+            // `CreateSymlink { target: old_target, path }` and the
+            // paired Create's inverse (Unlink) runs first in
+            // reverse-event-order; net effect restores the OLD
+            // target.
+            if let Some(p) = prev {
+                tracing::info!(
+                    name = %name.to_string_lossy(),
+                    prev_inode = p.inode,
+                    cur_inode = cur_entry.inode,
+                    prev_target = ?p.symlink_target,
+                    cur_target = ?cur_entry.symlink_target,
+                    "W09.16.1 dir-diff: same-name-changed entry"
+                );
+                if let Some(old_target) = &p.symlink_target
+                    && p.symlink_target != cur_entry.symlink_target
+                {
                     let child = dir_path.join(name);
-                    // file_kind_AT (not _for): under cap_enter,
-                    // absolute-path stat returns ENOTCAPABLE, falls
-                    // through to Regular, and the dir-watching branch
-                    // below never fires for new dirs. W03.B.
-                    let kind = file_kind_at(fd, name);
-                    events.push(shit_proto::TreeOpWire::Create {
-                        dev,
-                        inode,
+                    events.push(shit_proto::TreeOpWire::SymlinkRemoved {
+                        target: old_target.clone(),
                         path: path_to_string(&child),
-                        kind,
-                        mode: file_mode_for(&child).unwrap_or(0),
                     });
-                    match kind {
-                        shit_proto::FileKindWire::Regular => {
-                            new_files_to_watch.push(child);
-                        }
-                        shit_proto::FileKindWire::Directory => {
-                            new_dirs_to_watch.push(child);
-                        }
-                        _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
-                    }
                 }
+            }
+            // New entry, or entry with different inode at same name.
+            let child = dir_path.join(name);
+            // file_kind_AT (not _for): under cap_enter,
+            // absolute-path stat returns ENOTCAPABLE, falls
+            // through to Regular, and the dir-watching branch
+            // below never fires for new dirs. W03.B.
+            let kind = file_kind_at(fd, name);
+            events.push(shit_proto::TreeOpWire::Create {
+                dev: cur_entry.dev,
+                inode: cur_entry.inode,
+                path: path_to_string(&child),
+                kind,
+                mode: file_mode_for(&child).unwrap_or(0),
+            });
+            match kind {
+                shit_proto::FileKindWire::Regular => {
+                    new_files_to_watch.push(child);
+                }
+                shit_proto::FileKindWire::Directory => {
+                    new_dirs_to_watch.push(child);
+                }
+                _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
             }
         }
         // **Intentionally do not emit Unlink for removed entries here.**
@@ -545,6 +641,36 @@ impl PumpState {
         // to emit a Rename inverse. Documented as W06 territory —
         // the same cwd-watch-scope expansion that closes `make
         // install` closes the rename-source-half capture too.
+        // W09.16.1.ci-fix — emit SymlinkRemoved for symlinks that
+        // were in baseline but disappeared from current. Symlinks
+        // aren't fd-tracked entries (register_subtree's open follows
+        // the symlink target, not the symlink itself), so their
+        // unlink does not raise NOTE_DELETE on a tracked fd. The dir's
+        // NOTE_WRITE is the only signal we get.
+        //
+        // On FreeBSD 14.2 ZFS, `ln -sf newtarget link` produces TWO
+        // NOTE_WRITE events: one when the old link is unlinked
+        // (current has no `link` entry), one when the new link is
+        // created (current has `link` with a new inode + new target).
+        // Without this branch, the first event clobbered baseline.entries
+        // with the entry-missing snapshot, so the second event saw
+        // prev=None for `link` and emitted only a Create (no
+        // SymlinkRemoved), losing the OLD target. On 14.4 the two
+        // operations apparently coalesce into one event so the gap
+        // never showed; 14.2 surfaced it.
+        for (name, prev_entry) in &baseline.entries {
+            if current.contains_key(name) {
+                continue;
+            }
+            let Some(old_target) = &prev_entry.symlink_target else {
+                continue;
+            };
+            let child = dir_path.join(name);
+            events.push(shit_proto::TreeOpWire::SymlinkRemoved {
+                target: old_target.clone(),
+                path: path_to_string(&child),
+            });
+        }
         let _ = &baseline.entries; // kept for the diff above (Create emit)
         // Refresh baseline so subsequent diffs are relative to the
         // post-change state.
@@ -907,7 +1033,9 @@ fn path_to_string(p: &Path) -> String {
 /// `cap_enter(2)`. The caller already holds `dir_fd` as a tracked
 /// kqueue watch fd (we dup before fdopendir to avoid losing the
 /// original reference).
-fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsString, (u64, u64)>> {
+fn read_dir_entries(
+    dir_fd: RawFd,
+) -> std::io::Result<BTreeMap<std::ffi::OsString, DirEntryBaseline>> {
     let mut out = BTreeMap::new();
     // SAFETY: dir_fd is alive (caller holds the OwnedFd in
     // TrackedSubtree). dup returns a fresh fd we own; fdopendir
@@ -957,10 +1085,54 @@ fn read_dir_entries(dir_fd: RawFd) -> std::io::Result<BTreeMap<std::ffi::OsStrin
             continue;
         }
         let name_os = std::ffi::OsString::from(std::ffi::OsStr::from_bytes(name_bytes));
-        out.insert(name_os, (st.st_dev as u64, st.st_ino));
+        // W09.16.1 — for symlinks, capture readlink target so dir-diff
+        // can later detect `ln -sf newtarget link` (same-name +
+        // different-inode + old-kind-was-symlink) and emit
+        // SymlinkRemoved with the OLD target.
+        let symlink_target = if (st.st_mode as libc::mode_t) & libc::S_IFMT == libc::S_IFLNK {
+            readlink_at(dir_fd, &name_c)
+        } else {
+            None
+        };
+        out.insert(
+            name_os,
+            DirEntryBaseline {
+                dev: st.st_dev as u64,
+                inode: st.st_ino,
+                symlink_target,
+            },
+        );
     }
     unsafe { libc::closedir(dir) };
     Ok(out)
+}
+
+/// W09.16.1 — read a symlink target via `readlinkat(2)`, which is
+/// the fd-relative form (capsicum-compatible). Returns the target
+/// string as the kernel returned it (no canonicalization or symlink
+/// chasing), or `None` if the entry isn't a symlink or readlink
+/// fails. Buffer sized to PATH_MAX (1024 on FreeBSD); longer
+/// targets get truncated, which we accept — the smoke surfaces the
+/// limit if it ever becomes a problem.
+fn readlink_at(dir_fd: RawFd, name: &std::ffi::CStr) -> Option<String> {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let n = unsafe {
+        libc::readlinkat(
+            dir_fd,
+            name.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    let n = n as usize;
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    // readlinkat doesn't NUL-terminate; the n bytes are the target.
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
 /// Classify a directory child's `FileKind` for the wire via
