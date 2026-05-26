@@ -787,7 +787,7 @@ impl PumpState {
             tracing::warn!(fd, "fstat_meta failed during attrib handling");
             return;
         };
-        let before = match ws.meta_baselines.get(&fd).copied() {
+        let before = match ws.meta_baselines.get(&fd).cloned() {
             Some(b) => b,
             None => {
                 // No baseline (shouldn't happen post-attach; could
