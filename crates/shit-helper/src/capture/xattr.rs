@@ -119,7 +119,7 @@ mod linux {
         if list_size <= 0 {
             return BTreeMap::new();
         }
-        let mut buf = vec![0i8; list_size as usize];
+        let mut buf = vec![0 as libc::c_char; list_size as usize];
         let n = unsafe { libc::flistxattr(fd, buf.as_mut_ptr(), buf.len()) };
         if n <= 0 {
             return BTreeMap::new();

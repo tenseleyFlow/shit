@@ -164,7 +164,10 @@ mod platform {
         if size <= 0 {
             return BTreeMap::new();
         }
-        let mut buf = vec![0i8; size as usize];
+        // c_char is i8 on x86_64 and u8 on aarch64; use it directly
+        // so the platform's libc binding accepts the pointer without
+        // a cast.
+        let mut buf = vec![0 as libc::c_char; size as usize];
         let n = unsafe { libc::flistxattr(fd, buf.as_mut_ptr(), buf.len()) };
         if n <= 0 {
             return BTreeMap::new();
