@@ -632,7 +632,7 @@ mod policy {
     /// over the wire instead of returning the raw user-passed
     /// string and praying the daemon's path matcher gets lucky.
     #[derive(Debug, thiserror::Error)]
-    enum CanonicalizeError {
+    pub(super) enum CanonicalizeError {
         /// The path has no `file_name()` component — covers `/`
         /// and trailing-slash inputs. Extremely rare for shim
         /// callsites (would mean the user `rename`'d to "/" which
