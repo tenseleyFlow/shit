@@ -131,24 +131,33 @@ smoke_log "PreExec seq=1 pid=${PID} cwd=${PKG_DIR}"
     --cwd "${PKG_DIR}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
-# THE workload. LD_PRELOAD the shim. pip install --upgrade
-# overwrites the v1 script + module at ~/.local.
-smoke_log "LD_PRELOAD=${SHIM_LIB} pip install ${PIP_FLAGS} --upgrade (v2)"
-( cd "${PKG_DIR}" && LD_PRELOAD="${SHIM_LIB}" "${PIP_BIN}" install ${PIP_FLAGS} --upgrade . ) \
+# THE workload. LD_PRELOAD the shim. pip install --force-reinstall
+# overwrites the v1 script + module at ~/.local. --force-reinstall
+# (not just --upgrade) because pip's wheel-cache hashing on local
+# path installs can short-circuit even when source content changed
+# (the cache key depends on path + version, not content hash).
+smoke_log "LD_PRELOAD=${SHIM_LIB} pip install ${PIP_FLAGS} --force-reinstall --no-cache-dir (v2)"
+( cd "${PKG_DIR}" && LD_PRELOAD="${SHIM_LIB}" "${PIP_BIN}" install ${PIP_FLAGS} --force-reinstall --no-cache-dir . ) \
     >"${SHIT_SMOKE_TMP}/pip-v2.log" 2>&1
 PIP_RC=$?
 if [ "${PIP_RC}" -ne 0 ]; then
     smoke_log "pip-v2.log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/pip-v2.log" >&2
-    smoke_fail "pip install --upgrade (v2) exited rc=${PIP_RC}"
+    smoke_fail "pip install --force-reinstall (v2) exited rc=${PIP_RC}"
 fi
 
 V2_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
 if [ "${V2_OUTPUT}" != "hello pip v2" ]; then
+    smoke_log "pip-v2.log (last 50 lines):"
+    tail -50 "${SHIT_SMOKE_TMP}/pip-v2.log" | sed 's/^/    /' >&2
+    smoke_log "installed script content:"
+    sed 's/^/    /' "${INSTALLED_BIN}" >&2
     smoke_fail "post-install script doesn't print v2 marker: '${V2_OUTPUT}'"
 fi
 V2_SHA="$(sha256sum "${INSTALLED_BIN}" | awk '{print $1}')"
 if [ "${V2_SHA}" = "${V1_SHA}" ]; then
+    smoke_log "pip-v2.log (last 50 lines):"
+    tail -50 "${SHIT_SMOKE_TMP}/pip-v2.log" | sed 's/^/    /' >&2
     smoke_fail "v2 install didn't actually change the script (sha unchanged)"
 fi
 smoke_log "post-install: v2 script at ${INSTALLED_BIN}, sha=${V2_SHA:0:16}... (overwrote v1)"
