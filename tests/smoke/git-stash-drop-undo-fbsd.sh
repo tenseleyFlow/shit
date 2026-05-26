@@ -32,23 +32,59 @@ if [ -z "${GIT_BIN}" ]; then
     exit 0
 fi
 
-# G01.B.3 known issue (2026-05-26): on FreeBSD the kqueue + shim
-# pipeline captures 6 FilePreImage events for `git stash drop`
-# (refs/stash, logs/refs/stash, plus their tmp-file atomic-rename
-# halves), but the undo planner only emits 2 inverse ops. The
-# result: refs/stash gets restored byte-identical (assertion 1
-# passes) but `git stash list` can't see the entry (assertion 2
-# fails) — the reflog (logs/refs/stash) isn't being restored to
-# a content git's stash-list walker accepts.
+# G01.B.3 — SKIP with documented root cause (2026-05-26).
 #
-# Capture is healthy; the bug is somewhere in the planner's
-# inverse-emit for this specific event shape. The Linux
-# equivalent passes because LSM's atomic-rename classifier emits
-# a different event shape that the planner handles correctly.
+# Capture pipeline is healthy: the BSD kqueue NOTE_RENAME/DELETE
+# stream + W02.B LiveBaseline promotion produce FilePreImage
+# events for both .git/refs/stash and .git/logs/refs/stash before
+# git's stash-drop removes them. Verified via direct journal
+# inspection (`sqlite3 ... events`).
 #
-# Tracked for a follow-on fix. SKIP for now so the freebsd-smoke
-# matrix can stay green on the other 5 G01.B smokes.
-smoke_log "SKIP: git-stash-drop-undo-fbsd (G01.B.3 known planner issue — 6 FilePreImage events captured, only 2 inverse ops emitted; tracked for follow-on)"
+# The gap is in the PLANNER classifier (crates/shit-planner/src/
+# plan.rs, `classify_replace_paths`). For `git stash drop` of the
+# last entry on BSD, kqueue emits two distinct event shapes per
+# file:
+#
+#   A. {PreImage, Unlink, no Create, no Rename} — refs/stash, the
+#      reflog when git just unlinks it.
+#   B. {Create, PreImage, Unlink, file gone, NOT a rename
+#      destination} — logs/refs/stash, observed when git's
+#      write-then-unlink sequence races the helper's dir-diff and
+#      a synthetic Create event is journaled for the new inode.
+#
+# Shape A is correctly classified as atomic_replace by the
+# `unlinks` loop (line ~367) — RestoreContent with the captured
+# blob produces the right inverse.
+#
+# Shape B falls into the `creates ∪ rename_destinations` loop
+# (line ~226) which deliberately classifies "Create + Unlink +
+# PreImage, file gone, NOT a rename destination" as TRANSIENT
+# rather than atomic_replace. The comment at line ~256 explains
+# why: on Linux, that shape means "touch + echo + rm in one
+# command", where the captured pre-image is in-command content
+# (NOT a pre-command snapshot), and the user's expected
+# post-undo state IS "file absent" — so transient is correct.
+#
+# On BSD with the W02.B LiveBaseline path, the captured
+# pre-image IS a pre-command snapshot (taken at PreExec). The
+# planner can't currently tell those two cases apart because
+# FilePreImage events don't carry a "from_baseline" flag.
+#
+# Fixing this properly requires:
+#   (a) FilePreImage gaining a `source: BaselinePromote |
+#       ShimMidCommand | LsmIntercept` field on the wire, OR
+#   (b) the BSD producer suppressing the spurious Create event
+#       for shape B so it collapses into shape A.
+#
+# Either is bigger than this PR's scope. Linux is unaffected
+# because LSM is synchronous: the intercept fires BEFORE git's
+# rename completes, capturing the genuine pre-image without the
+# synthetic Create. The shape B race is BSD-kqueue-specific.
+#
+# Tracked separately. SKIP keeps the freebsd-smoke matrix green
+# on the other 5 G01.B smokes; the smoke file lives in trunk so
+# the deferred work has a clear target.
+smoke_log "SKIP: git-stash-drop-undo-fbsd (planner classifier needs FilePreImage source-discriminator to handle BSD-kqueue shape B; see comment + follow-on task)"
 exit 0
 
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
