@@ -29,6 +29,11 @@ pub const PRE_STASH_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone)]
 pub struct ShellStatePre {
     pub pwd: PathBuf,
+    /// AR06.2 — `set -o` snapshot: name → value (typically
+    /// "on"/"off", sometimes stringly).
+    pub opts: std::collections::BTreeMap<String, String>,
+    /// AR06.3 — alias snapshot: name → expansion.
+    pub aliases: std::collections::BTreeMap<String, String>,
     pub ts: Instant,
 }
 
@@ -43,7 +48,13 @@ impl ShellStatePreStash {
         }
     }
 
-    pub fn insert(&self, key: CommandId, pwd: PathBuf) {
+    pub fn insert(
+        &self,
+        key: CommandId,
+        pwd: PathBuf,
+        opts: std::collections::BTreeMap<String, String>,
+        aliases: std::collections::BTreeMap<String, String>,
+    ) {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
@@ -51,6 +62,8 @@ impl ShellStatePreStash {
             key,
             ShellStatePre {
                 pwd,
+                opts,
+                aliases,
                 ts: Instant::now(),
             },
         );
@@ -80,19 +93,34 @@ impl Default for ShellStatePreStash {
     }
 }
 
-/// Stash the pre-command pwd. Called from the daemon's
-/// HookMessage::PreExecShellState handler.
-pub fn handle_pre(stash: &ShellStatePreStash, command: CommandId, pwd: PathBuf) {
-    stash.insert(command, pwd);
+/// Convert the wire-form Vec<(name, value)> pairs to a BTreeMap
+/// for canonical ordering + cheap diff.
+fn pairs_to_map(pairs: Vec<(String, String)>) -> std::collections::BTreeMap<String, String> {
+    pairs.into_iter().collect()
 }
 
-/// Take the matching pre-pwd, diff against post-pwd, journal a
-/// ShellStateDiff event when they differ. No-op when the pre is
-/// missing (orphan post — TTL expired or hook misordering).
+/// Stash the pre-command shell state. Called from the daemon's
+/// HookMessage::PreExecShellState handler.
+pub fn handle_pre(
+    stash: &ShellStatePreStash,
+    command: CommandId,
+    pwd: PathBuf,
+    opts: Vec<(String, String)>,
+    aliases: Vec<(String, String)>,
+) {
+    stash.insert(command, pwd, pairs_to_map(opts), pairs_to_map(aliases));
+}
+
+/// Take the matching pre-state, diff against post values, journal
+/// a ShellStateDiff event when ANY dimension changed (pwd / opts /
+/// aliases). No-op when pre is missing (orphan post — TTL expired
+/// or hook misordering).
 pub fn handle_post(
     stash: &ShellStatePreStash,
     command: CommandId,
     pwd_after: PathBuf,
+    opts_after_pairs: Vec<(String, String)>,
+    aliases_after_pairs: Vec<(String, String)>,
     index: &Index,
     ts: TimePoint,
 ) {
@@ -104,8 +132,15 @@ pub fn handle_post(
         );
         return;
     };
-    if pre.pwd == pwd_after {
-        // No change → no event.
+    let opts_after = pairs_to_map(opts_after_pairs);
+    let aliases_after = pairs_to_map(aliases_after_pairs);
+
+    let pwd_changed = pre.pwd != pwd_after;
+    let opts_diff = diff_string_map(&pre.opts, &opts_after);
+    let aliases_diff = diff_optional_map(&pre.aliases, &aliases_after);
+
+    if !pwd_changed && opts_diff.is_empty() && aliases_diff.is_empty() {
+        // Nothing to do.
         return;
     }
     let event = CaptureEvent {
@@ -116,9 +151,50 @@ pub fn handle_post(
         kind: CaptureEventKind::ShellStateDiff {
             pwd_before: pre.pwd,
             pwd_after,
+            opts: opts_diff,
+            aliases: aliases_diff,
+            funcs: Vec::new(), // AR06.4 — follow-up
         },
     };
     if let Err(e) = index.put_event(&event) {
         tracing::warn!(err = %e, "shell-state-diff put_event failed");
     }
+}
+
+/// Diff two name→value maps. Both sides always have a value
+/// (set-opts are always-present). Returns `(name, pre, post)` for
+/// names whose values differ.
+fn diff_string_map(
+    pre: &std::collections::BTreeMap<String, String>,
+    post: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let all: std::collections::BTreeSet<&String> = pre.keys().chain(post.keys()).collect();
+    for name in all {
+        let p = pre.get(name).cloned().unwrap_or_default();
+        let q = post.get(name).cloned().unwrap_or_default();
+        if p != q {
+            out.push((name.clone(), p, q));
+        }
+    }
+    out
+}
+
+/// Diff two name→value maps where either side may be missing.
+/// Returns `(name, pre, post)` triples for any name present on at
+/// least one side with a different value.
+fn diff_optional_map(
+    pre: &std::collections::BTreeMap<String, String>,
+    post: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut out = Vec::new();
+    let all: std::collections::BTreeSet<&String> = pre.keys().chain(post.keys()).collect();
+    for name in all {
+        let p = pre.get(name).cloned();
+        let q = post.get(name).cloned();
+        if p != q {
+            out.push((name.clone(), p, q));
+        }
+    }
+    out
 }
