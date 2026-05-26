@@ -969,4 +969,40 @@ pub struct MetricsSnapshot {
     /// "endpoint-security"; FreeBSD: "kqueue"). Empty when capture
     /// tier not yet initialized.
     pub kernel_tier: String,
+    /// B03.A — current helper link state. Sticky `kernel_tier` lies
+    /// after a helper crash (it's set once at handshake and never
+    /// cleared), so doctor needs a separate signal to tell
+    /// "helper handshook then died" from "helper alive right now".
+    ///
+    /// `#[serde(default)]` for forward-compat: an older client
+    /// deserializing a new daemon's snapshot, or vice versa, gets
+    /// `HelperLinkState::NeverConnected` and degrades to the
+    /// kernel-tier heuristic gracefully.
+    #[serde(default)]
+    pub helper_link_state: HelperLinkState,
+}
+
+/// B03.A — helper link liveness signal carried in
+/// [`MetricsSnapshot::helper_link_state`].
+///
+/// Three states, monotonic transitions:
+/// 1. `NeverConnected` — daemon started, helper handshake hasn't
+///    completed yet (or never will, e.g. helper binary missing).
+/// 2. `Connected` — helper handshake completed and the dispatch
+///    loop is reading.
+/// 3. `Disconnected` — handshake completed, but the dispatch loop
+///    has since seen `HelperLinkError::HelperExited`. The daemon
+///    keeps running (degraded mode); doctor surfaces this so the
+///    operator knows capture coverage is lost until the daemon
+///    restarts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HelperLinkState {
+    /// No helper handshake has occurred yet.
+    #[default]
+    NeverConnected,
+    /// Helper handshake completed; dispatch loop is live.
+    Connected,
+    /// Helper handshake completed, then the dispatch loop saw
+    /// `HelperExited`. Capture-tier events are no longer arriving.
+    Disconnected,
 }

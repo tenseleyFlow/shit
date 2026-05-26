@@ -281,7 +281,7 @@ fn db_event_req_with_large_statement_blob_encodes() {
 
 #[test]
 fn metrics_snapshot_postcard_roundtrip() {
-    use shit_proto::{CtlResponse, MetricsSnapshot};
+    use shit_proto::{CtlResponse, HelperLinkState, MetricsSnapshot};
     let snap = MetricsSnapshot {
         uptime_secs: 3600,
         pid: 12345,
@@ -297,6 +297,7 @@ fn metrics_snapshot_postcard_roundtrip() {
         last_gc_bytes_reclaimed: 1024 * 1024,
         last_gc_at_unix_secs: 1_700_000_000,
         kernel_tier: "fanotify".into(),
+        helper_link_state: HelperLinkState::Connected,
     };
     let frame = encode_frame(&CtlResponse::Metrics(snap.clone())).unwrap();
     let back: CtlResponse = decode_frame(&frame).unwrap();
