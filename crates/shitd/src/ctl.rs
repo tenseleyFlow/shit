@@ -1143,8 +1143,19 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
                 .with_session(cmd.command.session.to_string()),
         );
         if req.apply_shell_state {
-            shell_state_exec = shell_state_exec
-                .with_apply(shit_planner::executors::shell_state::ShellTarget::Bash);
+            // AR06.6 — pick the snippet target by session shell.
+            // Before this, the daemon always handed the bash
+            // snippet to the precmd-queue regardless of the user's
+            // shell — fine when only bash had a hook, broken once
+            // zsh ships its own.
+            use shit_planner::executors::shell_state::ShellTarget;
+            let target = match cmd.shell_kind {
+                shit_proto::ShellKind::Bash => ShellTarget::Bash,
+                shit_proto::ShellKind::Zsh => ShellTarget::Zsh,
+                shit_proto::ShellKind::Fish => ShellTarget::Fish,
+                shit_proto::ShellKind::Unknown => ShellTarget::Bash,
+            };
+            shell_state_exec = shell_state_exec.with_apply(target);
         }
         let executor = MultiTierExecutor {
             file_executor: FileExecutor::new(&reader),
@@ -1191,6 +1202,18 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
                         }
                     } else {
                         ops_skipped += 1;
+                        // AR06.6 — surface shell-state informational
+                        // bodies (fish snippets, default no-apply
+                        // mode) so the user actually sees what to
+                        // copy-paste. Other skip categories (filtered
+                        // by --paths, conflict-skip) stay silent here
+                        // — their detail is either obvious from
+                        // context or already surfaced elsewhere.
+                        if matches!(rec.op, shit_planner::InverseOp::ShellStateRestore { .. })
+                            && let Some(d) = rec.detail.as_deref()
+                        {
+                            detail_lines.push(format!("shell-state: {d}"));
+                        }
                     }
                 }
                 OutcomeKind::Failed => {
