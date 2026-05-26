@@ -426,6 +426,7 @@ impl PumpState {
             uid: meta.uid,
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
+            xattrs: meta.xattrs.clone(),
             is_delete,
             fd_sent_via_scm: true,
         };
@@ -786,7 +787,7 @@ impl PumpState {
             tracing::warn!(fd, "fstat_meta failed during attrib handling");
             return;
         };
-        let before = match ws.meta_baselines.get(&fd).copied() {
+        let before = match ws.meta_baselines.get(&fd).cloned() {
             Some(b) => b,
             None => {
                 // No baseline (shouldn't happen post-attach; could
@@ -878,24 +879,28 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     Some((st.st_dev as u64, st.st_ino as u64, kind))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StatMeta {
     mode: u32,
     uid: u32,
     gid: u32,
     size: u64,
     mtime_unix_nanos: i128,
+    /// User-namespace xattrs read at the same point as the stat. Empty
+    /// when the filesystem has none or the read failed. (W09.21)
+    xattrs: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl StatMeta {
-    /// Convert to the wire shape the daemon expects. Same field set.
-    fn to_wire(self) -> shit_proto::FileMetadataWire {
+    /// Convert to the wire shape the daemon expects.
+    fn to_wire(&self) -> shit_proto::FileMetadataWire {
         shit_proto::FileMetadataWire {
             mode: self.mode,
             uid: self.uid,
             gid: self.gid,
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
+            xattrs: self.xattrs.clone(),
         }
     }
 }
@@ -917,6 +922,7 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         gid: st.st_gid as u32,
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
+        xattrs: crate::capture::xattr::read_user_xattrs(fd),
     })
 }
 
@@ -994,6 +1000,7 @@ fn baseline_walk_and_emit(
             uid: meta.uid,
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
+            xattrs: meta.xattrs.clone(),
             fd_sent_via_scm: true,
         };
 

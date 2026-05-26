@@ -416,6 +416,7 @@ mod tests {
             uid: 0,
             gid: 0,
             mtime_unix_nanos: 0,
+            xattrs: std::collections::BTreeMap::new(),
             is_delete: false,
             fd_sent_via_scm: true,
         };

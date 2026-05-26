@@ -393,6 +393,15 @@ fn restore_metadata_inner(
         MetadataRestoreError::Other(format!("chmod {path:?} -> {mode_only:o}: {e}"))
     })?;
 
+    // W09.21 — converge xattrs to the captured set. After chmod
+    // because some FSes refuse xattr ops on a 0o000-permission file
+    // owned by another uid; chmod first ensures we can write the
+    // attribute. Best-effort: individual op failures are warn-logged
+    // and don't fail the whole restore (see [`xattr::restore_user_xattrs`]).
+    if let Err(e) = crate::executors::xattr::restore_user_xattrs(path, &target.xattrs) {
+        tracing::warn!(path = %path.display(), err = %e, "xattr restore reported error");
+    }
+
     restore_mtime_only(path, target).map_err(MetadataRestoreError::Other)
 }
 
