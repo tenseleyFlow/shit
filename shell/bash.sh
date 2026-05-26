@@ -56,6 +56,16 @@ __shit_pre() {
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # AR06.1 — shell-state snapshot. Today pwd only; future revs
+    # extend with set-opts / aliases / functions once the C06
+    # state.rs diff is wired through. Cheap enough (one
+    # `$PWD` read + one hook-send fork) to ship unconditionally.
+    "$_SHIT_BIN" hook-send pre-exec-shell-state \
+        --session "$_SHIT_SESSION" \
+        --seq "$_SHIT_SEQ" \
+        --pwd "$PWD" \
+        --sock "$_SHIT_SOCK" \
+        >/dev/null 2>&1 || true
     # AR06.5 — synchronous pre-stash for stream-redirect targets in
     # the about-to-run command. Runs AFTER pre-exec so the daemon
     # has the command record by the time the FilePreImage event
@@ -96,6 +106,22 @@ __shit_post() {
         --exit-code "$rc" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+    # AR06.1 — post-command shell-state snapshot. Daemon diffs
+    # against the matching pre-pwd and journals a ShellStateDiff
+    # only when pwd actually changed (no event = no orchestrator
+    # work later).
+    "$_SHIT_BIN" hook-send post-exec-shell-state \
+        --session "$_SHIT_SESSION" \
+        --seq "$_SHIT_SEQ" \
+        --pwd "$PWD" \
+        --sock "$_SHIT_SOCK" \
+        >/dev/null 2>&1 || true
+    # AR06.1 / DR-CR-50 — drain the precmd-queue. `shit undo
+    # --apply-shell-state` writes shell snippets here; we source
+    # + truncate so they run before the next prompt. The queue
+    # path is keyed by session-uuid so concurrent shells stay
+    # isolated.
+    __shit_drain_precmd_queue
     if [[ -n "${SHIT_TRACK_ENV:-}" ]]; then
         env -0 2>/dev/null | "$_SHIT_BIN" hook-send post-exec-env \
             --session "$_SHIT_SESSION" \
@@ -111,6 +137,20 @@ __shit_close() {
         --session "$_SHIT_SESSION" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
+}
+
+# AR06.1 / DR-CR-50 — drain the per-session precmd queue. The
+# orchestrator's SystemShellStateRunner appends shell snippets to
+# `$XDG_STATE_HOME/shit/precmd-queue/<session-uuid>`; on every
+# prompt cycle we source then truncate, so each snippet runs
+# exactly once.
+__shit_drain_precmd_queue() {
+    local _q="${XDG_STATE_HOME:-$HOME/.local/state}/shit/precmd-queue/$_SHIT_SESSION"
+    if [[ -s "$_q" ]]; then
+        # shellcheck disable=SC1090
+        source "$_q" 2>/dev/null || true
+        : > "$_q"
+    fi
 }
 
 trap '__shit_pre' DEBUG
