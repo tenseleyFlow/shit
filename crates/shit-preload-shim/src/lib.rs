@@ -365,6 +365,9 @@ mod policy {
     /// here, but `set_read_timeout` on a `UnixStream` gives the same
     /// allow-on-timeout property.
     pub fn notify_pre_mutation(syscall: &'static str, arg: &str) {
+        if should_skip_path(arg) {
+            return;
+        }
         notify_inner(syscall, arg, None);
     }
 
@@ -382,6 +385,9 @@ mod policy {
     /// exceeds cap, read fails) still ship the notification with
     /// `pre_image=None`; the daemon decides how to journal it.
     pub fn notify_pre_mutation_with_content(syscall: &'static str, path: &str) {
+        if should_skip_path(path) {
+            return;
+        }
         notify_inner(syscall, path, Some(path));
     }
 
@@ -437,8 +443,34 @@ mod policy {
     /// undo-side executor runs from a different cwd and needs the
     /// absolute path to find what to unlink.
     pub fn notify_create(syscall: &'static str, path: &str) {
+        if should_skip_path(path) {
+            return;
+        }
         let abs = canonical_path(path);
+        if should_skip_path(&abs) {
+            return;
+        }
         notify_inner(syscall, &abs, None);
+    }
+
+    /// W09.11 — paths whose mutations are NOT user-visible state
+    /// and must never appear in the journal. `/dev/null`, `/dev/zero`,
+    /// `/dev/random`, `/dev/urandom`, `/dev/tty`, `/dev/stdin`,
+    /// `/dev/stdout`, `/dev/stderr`, etc. — character/block devices.
+    /// Tools like ssh-keygen, openssl, ssh routinely `open(O_WRONLY)`
+    /// on `/dev/null` for stderr/log suppression; without this guard
+    /// the shim fires a Create event whose `unlink` inverse would
+    /// fail with EPERM and surface a spurious "1 failed" in the
+    /// undo report.
+    ///
+    /// Also skip `/proc` (Linux) and `/sys` — kernel pseudo-fs; any
+    /// "write" there is a runtime config knob, not a file mutation
+    /// we can or should undo.
+    fn should_skip_path(path: &str) -> bool {
+        path.starts_with("/dev/")
+            || path == "/dev"
+            || path.starts_with("/proc/")
+            || path.starts_with("/sys/")
     }
 
     /// Best-effort absolute path resolution. Prefer `canonicalize`
