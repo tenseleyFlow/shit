@@ -106,6 +106,26 @@ pub struct ShimNotification {
     /// `None` for non-content syscalls and for cases listed in
     /// [`ShimPreImage`]'s docstring.
     pub pre_image: Option<ShimPreImage>,
+    /// DR-CR-54 — additional pre-images for paths *under* the
+    /// primary `arg` path. Populated by the shim's rename
+    /// interposer when `from` is a directory: every regular
+    /// file in the source subtree is captured into one of these
+    /// entries, attributed to its **original** (pre-rename) path.
+    ///
+    /// Daemon-side, each entry is ingested via the same path as
+    /// the primary `pre_image` — they become FilePreImage events
+    /// keyed by their original absolute path. The planner then
+    /// emits a RestoreContent per entry.
+    ///
+    /// Empty for non-rename notifications (including current
+    /// rename-of-file, which only fills `pre_image`).
+    ///
+    /// The shim and daemon always ship as a matched pair (the
+    /// shim is loaded by the install's `auto-inject-install-env`
+    /// from a path inside the same release), so adding fields
+    /// here is forward-only; we don't try to round-trip with an
+    /// older shim.
+    pub extra_pre_images: Vec<ShimPreImage>,
 }
 
 /// Ack the daemon sends back. S24.D.2 ships `Allow` only; the broader
@@ -130,6 +150,7 @@ mod tests {
             arg: "/tmp/probe".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
             pre_image: None,
+            extra_pre_images: Vec::new(),
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -154,6 +175,7 @@ mod tests {
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
                 bytes: b"hello".to_vec(),
             }),
+            extra_pre_images: Vec::new(),
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
@@ -165,5 +187,46 @@ mod tests {
         let frame = encode_frame(&ShimAck::Allow).expect("encode");
         let decoded: ShimAck = decode_frame(&frame).expect("decode");
         assert_eq!(decoded, ShimAck::Allow);
+    }
+
+    /// DR-CR-54 — a rename whose source was a directory ships
+    /// per-file pre-images for every regular file in the subtree.
+    /// Round-trip a representative payload to pin both the new
+    /// field and the encoder choice (must be `_large`).
+    #[test]
+    fn shim_notification_with_recursive_pre_images_round_trips() {
+        fn pre(path: &str, bytes: &[u8]) -> ShimPreImage {
+            ShimPreImage {
+                path: path.into(),
+                dev: 64,
+                inode: 0,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                size: bytes.len() as u64,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                bytes: bytes.to_vec(),
+            }
+        }
+        let n = ShimNotification {
+            pid: 5555,
+            syscall: "rename".into(),
+            arg: "/abs/site-packages\t/abs/.shit-stage".into(),
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+            pre_image: None,
+            extra_pre_images: vec![
+                pre("/abs/site-packages/pkg/__init__.py", b""),
+                pre("/abs/site-packages/pkg/mod.py", b"def main(): pass\n"),
+                pre("/abs/site-packages/pkg/sub/inner.py", b"x = 1\n"),
+            ],
+        };
+        let frame = crate::frame::encode_frame_large(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
+        assert_eq!(decoded, n);
+        assert_eq!(decoded.extra_pre_images.len(), 3);
+        assert_eq!(
+            decoded.extra_pre_images[1].path,
+            "/abs/site-packages/pkg/mod.py"
+        );
     }
 }
