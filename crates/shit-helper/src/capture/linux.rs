@@ -788,6 +788,16 @@ impl LinuxCaptureRuntime {
             path: Some(path_to_string(&path)),
             blob_hash,
             stored_bytes: bytes.len() as u64,
+            // AU11 — `post_content_hash: None` is correct here. The
+            // LSM `inode_setattr` hook is an AUTH event firing
+            // pre-mutation; the kernel hasn't applied the change at
+            // this point, so the held fd still shows pre-content
+            // and we can't cheaply predict the post-state without
+            // either (a) waiting for the corresponding `file_open`+
+            // `inode_release` cycle, which `handle_lsm_release`
+            // already covers with Some(post_hash), or (b) emulating
+            // the kernel's setattr semantics (truncate-to-size etc.)
+            // which duplicates VFS work for marginal benefit.
             post_content_hash: None,
             // Pre-change metadata from the BPF event — these are the
             // values undo restores to.
