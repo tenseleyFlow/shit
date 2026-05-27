@@ -254,6 +254,40 @@ pub struct es_event_open_t {
     pub _reserved: [u8; 64],
 }
 
+/// `es_event_setmode_t` from ESMessage.h. `mode` is the new mode
+/// to be applied. `target.stat` carries the BEFORE mode.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_setmode_t {
+    pub mode: libc::mode_t,
+    pub target: *const es_file_t,
+    pub _reserved: [u8; 64],
+}
+
+/// `es_event_setowner_t` from ESMessage.h. `uid`/`gid` are the new
+/// owners; `target.stat` carries the BEFORE owners.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_setowner_t {
+    pub uid: libc::uid_t,
+    pub gid: libc::gid_t,
+    pub target: *const es_file_t,
+    pub _reserved: [u8; 64],
+}
+
+/// `es_event_utimes_t` from ESMessage.h. `atime`/`mtime` are the new
+/// timestamps; `target.stat` carries the BEFORE mtime (which is what
+/// we capture — the daemon's restore path applies the saved mtime via
+/// utimensat).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_utimes_t {
+    pub target: *const es_file_t,
+    pub atime: libc::timespec,
+    pub mtime: libc::timespec,
+    pub _reserved: [u8; 64],
+}
+
 /// `es_events_t` union — Apple's version has ~120 variants; we
 /// model only the variants we consume. All variants share offset 0
 /// per union semantics, so reading the variant matching the
@@ -266,6 +300,9 @@ pub union es_events_t {
     pub rename: std::mem::ManuallyDrop<es_event_rename_t>,
     pub truncate: std::mem::ManuallyDrop<es_event_truncate_t>,
     pub open: std::mem::ManuallyDrop<es_event_open_t>,
+    pub setmode: std::mem::ManuallyDrop<es_event_setmode_t>,
+    pub setowner: std::mem::ManuallyDrop<es_event_setowner_t>,
+    pub utimes: std::mem::ManuallyDrop<es_event_utimes_t>,
     pub fork: std::mem::ManuallyDrop<es_event_fork_t>,
     pub exit: std::mem::ManuallyDrop<es_event_exit_t>,
 }
@@ -471,6 +508,30 @@ impl<'a> EsMessage<'a> {
         }
         // SAFETY: discriminant guarantees the union variant.
         unsafe { Some(&*(&(*self.raw).event.open as *const _ as *const es_event_open_t)) }
+    }
+
+    pub fn as_setmode(&self) -> Option<&'a es_event_setmode_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_SETMODE {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.setmode as *const _ as *const es_event_setmode_t)) }
+    }
+
+    pub fn as_setowner(&self) -> Option<&'a es_event_setowner_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_SETOWNER {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.setowner as *const _ as *const es_event_setowner_t)) }
+    }
+
+    pub fn as_utimes(&self) -> Option<&'a es_event_utimes_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_UTIMES {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.utimes as *const _ as *const es_event_utimes_t)) }
     }
 
     /// Convenience: `es_file_t` for the truncate target. Returns

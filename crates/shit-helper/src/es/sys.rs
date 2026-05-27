@@ -73,6 +73,12 @@ impl es_event_type_t {
     pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
     pub const AUTH_TRUNCATE: Self = Self(40);
+    /// Metadata-mutation events (M03.1.I.D). Each fires AUTH-style;
+    /// the producer emits a `CapturedMetadataChange` event with a
+    /// stat-snapshot taken BEFORE the syscall commits.
+    pub const AUTH_SETMODE: Self = Self(48);
+    pub const AUTH_SETOWNER: Self = Self(49);
+    pub const AUTH_UTIMES: Self = Self(60);
 
     /// NOTIFY events — no response required, just informational.
     /// M03.1.E uses NOTIFY_EXEC for the subscribe-deliver smoke;
