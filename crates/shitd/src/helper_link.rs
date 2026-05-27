@@ -622,6 +622,14 @@ fn dispatch_response(
                     mtime_unix_nanos,
                     baseline_xattrs,
                     is_delete,
+                    // AU11 — the helper's `post_content_hash` (which
+                    // on BSD post-hoc kqueue is the held-fd's
+                    // CURRENT content hash) is genuinely post-state.
+                    // Carry it through so the planner's drift
+                    // detection still fires for baseline-promoted
+                    // captures (previously the W02.B path discarded
+                    // it as a v1 tradeoff).
+                    post_content_hash,
                     index,
                 ) {
                     tracing::error!(error = %e, %session, seq, "baseline-promoted FilePreImage journal failed");
@@ -1161,6 +1169,7 @@ fn handle_baseline_promoted_pre_image(
     mtime_unix_nanos: i128,
     xattrs: BTreeMap<String, Vec<u8>>,
     is_delete: bool,
+    post_content_hash: Option<[u8; 32]>,
     index: &Index,
 ) -> Result<(), HelperLinkError> {
     let command = CommandId { session, seq };
@@ -1190,13 +1199,15 @@ fn handle_baseline_promoted_pre_image(
             path: path_buf.clone(),
             blob,
             meta,
-            // No post-content hash on the baseline-promoted path —
-            // we discarded the helper's staging fd. Conflict
-            // detection for "user modified after our capture"
-            // doesn't fire for in-place writes promoted from
-            // baseline. Acceptable v1 tradeoff documented in
-            // .docs/sprints/W/W02.B.live-baseline.md.
-            post_content_hash: None,
+            // AU11 — the helper attached the held fd's
+            // post-mutation content hash on BSD kqueue (post-hoc;
+            // see capture/bsd.rs::handle_vnode). Plumbing it
+            // through here restores drift detection on the
+            // baseline-promoted path that pre-AU11 W02.B
+            // explicitly traded off. Still None for Delete events
+            // (no post-state) and None when the helper couldn't
+            // hash for some reason.
+            post_content_hash: post_content_hash.map(BlobHash),
             // G01.B.3 — load-bearing tag. The baseline cache is
             // populated at PreExec and promoted on first
             // modification, so by construction these bytes are
