@@ -14,20 +14,24 @@ env:
 
 jobs:
   smoke-discovery:
-    # AU14-A — informational smoke-matrix surface. Runs the AU14 driver
-    # against tests/smoke/*.sh, verifies every smoke carries a valid
-    # SMOKE_* metadata header, and uploads smoke-matrix.json as a
-    # build artifact. NOT YET gating real smoke execution — the
-    # hand-curated jobs below continue to drive what actually runs.
-    # AU14-B will retire the hand-curated arrays and gate on this
-    # matrix.
-    name: smoke discovery + verify (AU14-A)
+    # AU14-B — gating smoke-discovery surface. Three checks, in order:
+    #   1. verify  — every smoke has valid SMOKE_* metadata
+    #   2. verify-coverage — every runnable smoke is referenced by some
+    #      job in dr-smoke.yml (standalone job OR bucket consumer)
+    #   3. matrix summary + artifact upload
+    # The linux-kernel-capture + freebsd-smoke jobs now consume the
+    # driver's bucket subcommand directly, so adding a new smoke without
+    # wiring it into either a bucket-eligible runner or a standalone job
+    # fails this gate loud.
+    name: smoke discovery + verify (AU14)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: verify metadata headers
         run: bash tools/audit/smoke-driver.sh verify
+      - name: verify CI coverage
+        run: bash tools/audit/smoke-driver.sh verify-coverage
       - name: emit smoke-matrix.json
         run: |
           bash tools/audit/smoke-driver.sh discover > smoke-matrix.json
@@ -1305,87 +1309,24 @@ jobs:
         run: |
           set +e
           TIER="${{ steps.tier.outputs.tier }}"
-          # Two smoke groups by tier-dependency:
+          # AU14-B — bucket is the source of truth for which smokes
+          # belong on the self-hosted-lsm runner. Two groups split by
+          # SMOKE_TIER_REQUIRED:
           #
-          # - LSM-required: rm/chmod/mkdir/mv/touch-edit. These hard-
-          #   require `bpf` in /sys/kernel/security/lsm and pin
-          #   SHIT_FORCE_TIER=ebpf-lsm internally. They cannot run on
-          #   a kernel whose boot cmdline omits `lsm=...,bpf,...` —
-          #   their own pre-flight rejects loudly with a remediation
-          #   message. Ubuntu 24.04's stock cmdline omits bpf so on
-          #   the GHA hosted runner this group is skipped.
+          # - tier=lsm   — hard-require `bpf` in /sys/kernel/security/lsm
+          #                and pin SHIT_FORCE_TIER=ebpf-lsm. Skipped when
+          #                the runner falls back to fanotify (e.g. stock
+          #                Ubuntu 24.04 hosted, which omits bpf from the
+          #                kernel cmdline).
           #
-          # - Tier-agnostic: edit-undo. Overwrite-of-existing-file
-          #   capture works under either tier (fanotify-perm's
-          #   FAN_OPEN_PERM or LSM's file_open hook).
-          TIER_AGNOSTIC=( edit-undo-linux.sh )
-          LSM_SMOKES=(
-            rm-undo-linux.sh
-            chmod-undo-linux.sh
-            mkdir-undo-linux.sh
-            mv-undo-linux.sh
-            touch-edit-undo-linux.sh
-            # AR01.1 — multi-event workload. Requires LSM because
-            # git's atomic-replace of .git/index via rename is
-            # invisible to fanotify-perm; without the rename event
-            # the index isn't restored and `git status --porcelain`
-            # diverges from the staged state.
-            git-commit-undo-linux.sh
-            # AR01.4 — sed -i atomic rename. Exercises the same
-            # inode_rename + fix-rename-target-preimage path as
-            # AR01.1; under fanotify-perm the .lock-target-rename
-            # is invisible so the OLD file's content can't be
-            # captured.
-            sed-i-undo-linux.sh
-            # AR01.3 — cp -r bulk creates. Stress-tests the strict
-            # path resolver under racing mkdir+create from per-program
-            # ringbuf reader threads; asserts >= 6 TreeOpCreate
-            # events to surface any resolver-race drops directly
-            # (don't trust the orchestrator's remove_dir_all fallback
-            # to paper over capture-side bugs).
-            cp-r-undo-linux.sh
-            # AR01.2 — vim atomic-rename save dance + transient swap.
-            # Validates the same rename-target-preimage path as AR01.4
-            # under vim's writebackup workflow; classifier must flag
-            # `.foo.txt.swp` / `4913` / `foo.txt~` as transient.
-            vim-edit-undo-linux.sh
-            # AR08.2 — MetadataChange (uid/gid) → RestoreMetadata.
-            # Same wire as chmod; the LSM tier reads i_uid/i_gid pre-
-            # change in inode_setattr. Validates the v1/v2 BTF-probe
-            # dispatch (L0X) so it works on both pre-7.0 and 7.0+
-            # kernels.
-            chown-undo-linux.sh
-            # DR-CR-55 — inode_symlink + inode_link BPF programs;
-            # emit shit_create_event into dedicated ringbufs that
-            # route through the existing on_create sink. Inverse is
-            # Unlink(link_path) for both — for symlink the target
-            # is untouched, for hardlink the target's nlink drops
-            # 2 → 1 as a side effect.
-            ln-symlink-undo-linux.sh
-            ln-hardlink-undo-linux.sh
-            # G01 — destructive git operations. Each exercises the
-            # LSM rename + atomic-replace path under a different
-            # git workflow; all expect applied=N failed=0 conflicts=0.
-            git-reset-hard-undo-linux.sh
-            git-checkout-file-undo-linux.sh
-            git-stash-drop-undo-linux.sh
-            git-branch-D-undo-linux.sh
-            git-branch-D-packed-undo-linux.sh
-            git-checkout-branch-undo-linux.sh
-            git-clean-fd-undo-linux.sh
-            # L04.2 — in-place content overwrite via open(O_RDWR)
-            # + write/mmap. Closes the BSD-W06.A.4 mirror gap.
-            write-in-place-undo-linux.sh
-            mmap-write-undo-linux.sh
-            # AU10 — LD_PRELOAD shim's canonicalize_path now
-            # surfaces capture-incomplete refusals to undo instead
-            # of silently mis-attributing.
-            canonicalize-fail-surface-linux.sh
-          )
+          # - tier=any   — works under either fanotify-perm or
+          #                ebpf-lsm. Always runs.
+          mapfile -t TIER_AGNOSTIC < <(bash tools/audit/smoke-driver.sh bucket self-hosted-lsm any)
+          mapfile -t LSM_SMOKES   < <(bash tools/audit/smoke-driver.sh bucket self-hosted-lsm lsm)
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
             RUN=( "${TIER_AGNOSTIC[@]}" "${LSM_SMOKES[@]}" )
-            echo "Runner has ebpf-lsm functional; running full smoke matrix"
+            echo "Runner has ebpf-lsm functional; running full smoke matrix (${#RUN[@]} smokes)"
           else
             RUN=( "${TIER_AGNOSTIC[@]}" )
             echo "Runner picks tier=${TIER}; skipping LSM-only smokes (need lsm=bpf in cmdline)"
@@ -1393,13 +1334,13 @@ jobs:
           FAIL=0
           for s in "${RUN[@]}"; do
             echo ""
-            echo "===== ${s} ====="
-            timeout 300 bash "tests/smoke/${s}"
+            echo "===== $(basename $s) ====="
+            timeout 300 bash "$s"
             rc=$?
             if [ "$rc" -eq 0 ]; then
-              echo "PASS: ${s}"
+              echo "PASS: $(basename $s)"
             else
-              echo "FAIL: ${s} (rc=${rc})"
+              echo "FAIL: $(basename $s) (rc=${rc})"
               FAIL=$((FAIL + 1))
             fi
           done
@@ -1515,100 +1456,21 @@ jobs:
             echo "  uname: $(uname -srm)"
             echo "  timeout: $(/usr/bin/timeout --version 2>&1 | head -1 || /usr/bin/timeout 2>&1 | head -1 || true)"
 
-            echo "===== smoke-surface drift check ====="
-            # AU05.7 — prep for AU14 (CI-runs-every-smoke driver).
-            # Catch the case where a new *-fbsd*.sh smoke lands in
-            # tests/smoke/ without being wired into SMOKES below. The
-            # only intentionally-excluded fbsd smoke today is
-            # git-branch-D-undo-fbsd.sh (deferred to G01.4-packed).
-            # Any other unwired smoke fails this gate loud.
-            # FreeBSD VM shell is /bin/sh — no process substitution,
-            # no `grep -F`. Use temp files + plain grep -E for parity.
-            FBSD_KNOWN_EXCLUDED="git-branch-D-undo-fbsd.sh"
-            ALL_FBSD_FILE="$(mktemp)"
-            WIRED_FBSD_FILE="$(mktemp)"
-            ls tests/smoke/*-fbsd*.sh | xargs -n1 basename | sort > "${ALL_FBSD_FILE}"
-            grep -oE '[a-z][a-z0-9_-]*-fbsd\.sh' .github/workflows/dr-smoke.yml \
-              | sort -u > "${WIRED_FBSD_FILE}"
-            UNWIRED="$(comm -23 "${ALL_FBSD_FILE}" "${WIRED_FBSD_FILE}" || true)"
-            UNWIRED_BAD="$(printf '%s\n' "${UNWIRED}" \
-              | grep -vE "^(${FBSD_KNOWN_EXCLUDED})$" \
-              | grep -v '^$' \
-              || true)"
-            rm -f "${ALL_FBSD_FILE}" "${WIRED_FBSD_FILE}"
-            if [ -n "${UNWIRED_BAD}" ]; then
-              echo "FAIL: smoke surface drift — unwired *-fbsd* smokes not on the known-excluded list:"
-              echo "${UNWIRED_BAD}" | sed 's/^/    /'
-              echo "  Either add them to SMOKES below, or add them to FBSD_KNOWN_EXCLUDED with a comment."
-              exit 1
-            fi
-            echo "  all *-fbsd*.sh smokes accounted for (excluded: ${FBSD_KNOWN_EXCLUDED:-none})"
+            echo "===== bucket the freebsd-vm smokes via the AU14 driver ====="
+            # AU14-B — single source of truth. The driver reads
+            # SMOKE_RUNNER_HINT from each smoke's header and emits the
+            # paths of every smoke whose runner == 'freebsd-vm' and
+            # whose EXCLUDED_BY is empty. Replaces the hand-curated
+            # SMOKES list that lived here pre-AU14-B and the AU05
+            # smoke-surface drift assertion (now handled globally by
+            # the smoke-discovery + smoke-discovery-coverage jobs).
+            SMOKES="$(bash tools/audit/smoke-driver.sh bucket freebsd-vm \
+                        | xargs -n1 basename)"
+            SMOKE_COUNT="$(printf '%s\n' "$SMOKES" | wc -l | tr -d ' ')"
+            echo "  bucket size: $SMOKE_COUNT smokes"
 
             echo "===== run smokes ====="
             FAIL_COUNT=0
-            SMOKES="rm-undo-fbsd.sh \
-                    mkdir-undo-fbsd.sh \
-                    chmod-undo-fbsd.sh \
-                    touch-edit-undo-fbsd.sh \
-                    pkg-install-undo-fbsd.sh \
-                    service-restart-undo-fbsd.sh \
-                    pfctl-add-undo-fbsd.sh \
-                    pfctl-flush-undo-fbsd.sh \
-                    kill-proc-undo-fbsd.sh \
-                    capsicum-default-on-fbsd.sh \
-                    git-commit-undo-fbsd.sh \
-                    git-reset-hard-undo-fbsd.sh \
-                    git-checkout-file-undo-fbsd.sh \
-                    git-stash-drop-undo-fbsd.sh \
-                    git-branch-D-undo-fbsd.sh \
-                    git-clean-fd-undo-fbsd.sh \
-                    git-checkout-branch-undo-fbsd.sh \
-                    vim-edit-undo-fbsd.sh \
-                    cp-recursive-undo-fbsd.sh \
-                    sed-inline-undo-fbsd.sh \
-                    cargo-build-undo-fbsd.sh \
-                    make-install-undo-fbsd.sh \
-                    mv-across-dirs-undo-fbsd.sh \
-                    make-install-overwrite-undo-fbsd.sh \
-                    ln-symlink-undo-fbsd.sh \
-                    shell-redirect-undo-fbsd.sh \
-                    awk-inplace-undo-fbsd.sh \
-                    tar-extract-undo-fbsd.sh \
-                    gzip-undo-fbsd.sh \
-                    find-exec-rm-undo-fbsd.sh \
-                    ln-hardlink-undo-fbsd.sh \
-                    cpio-extract-undo-fbsd.sh \
-                    patch-apply-undo-fbsd.sh \
-                    sort-inplace-undo-fbsd.sh \
-                    split-undo-fbsd.sh \
-                    rsync-incremental-undo-fbsd.sh \
-                    xargs-rm-undo-fbsd.sh \
-                    chmod-recursive-undo-fbsd.sh \
-                    mv-noop-undo-fbsd.sh \
-                    dd-notrunc-undo-fbsd.sh \
-                    mv-dir-undo-fbsd.sh \
-                    mkdir-p-undo-fbsd.sh \
-                    bash-c-undo-fbsd.sh \
-                    and-chain-undo-fbsd.sh \
-                    read-only-cmd-undo-fbsd.sh \
-                    chown-undo-fbsd.sh \
-                    background-job-undo-fbsd.sh \
-                    large-file-overwrite-undo-fbsd.sh \
-                    mkfifo-undo-fbsd.sh \
-                    ssh-keygen-undo-fbsd.sh \
-                    python-venv-undo-fbsd.sh \
-                    chmod-setuid-undo-fbsd.sh \
-                    tee-undo-fbsd.sh \
-                    backup-and-modify-undo-fbsd.sh \
-                    rotate-and-touch-undo-fbsd.sh \
-                    shell-append-undo-fbsd.sh \
-                    non-ascii-filename-undo-fbsd.sh \
-                    hardlink-rm-undo-fbsd.sh \
-                    symlink-replace-undo-fbsd.sh \
-                    xattr-undo-fbsd.sh \
-                    post-hash-non-delete-fbsd.sh \
-                    preload-shim-fbsd.sh \
-                    dd-large-file-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
@@ -1676,7 +1538,7 @@ jobs:
               echo "===== $FAIL_COUNT smoke(s) failed ====="
               exit 1
             fi
-            echo "===== all 10 BSD smokes green ====="
+            echo "===== all $SMOKE_COUNT BSD smokes green ====="
       - name: upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
