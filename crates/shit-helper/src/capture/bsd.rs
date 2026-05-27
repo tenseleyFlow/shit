@@ -413,6 +413,26 @@ impl PumpState {
         // the daemon uses to attach the event to the originating
         // PreExec'd command (the helper-local seq_counter we had here
         // before tripped a sqlite FK constraint on the daemon side).
+        // AU11 — `post_content_hash` for non-Delete events. On BSD
+        // kqueue fires AFTER the syscall commits, so the held fd
+        // points to the inode's POST-mutation content. The
+        // `stream_copy_to_staging` call above hashed exactly those
+        // bytes, so `claimed_hash` IS the post-content hash for
+        // non-Delete events.
+        //
+        // The blob bytes the daemon ultimately journals come from
+        // the LiveBaseline cache (`handle_baseline_promoted_pre_image`
+        // in shitd::helper_link) — that's the pre-command snapshot.
+        // So the wire's `blob_hash` gets overridden daemon-side to
+        // the real pre-image hash, while `post_content_hash` we set
+        // here carries the helper's view of "what's at the fd now"
+        // for the planner's drift-detection at undo time.
+        //
+        // For Delete events the fd survives unlink (per S23.4's
+        // architectural test) and `claimed_hash` IS the pre-image
+        // hash — there's no "post-content" because the file is
+        // gone, so keep None.
+        let post_content_hash = if is_delete { None } else { Some(claimed_hash) };
         let resp = HelperResponse::CapturedPreImage {
             session: command.session,
             seq: command.seq,
@@ -421,7 +441,7 @@ impl PumpState {
             path: path.as_deref().map(path_to_string),
             blob_hash: claimed_hash,
             stored_bytes,
-            post_content_hash: None, // TODO: compute when not Delete
+            post_content_hash,
             mode: meta.mode,
             uid: meta.uid,
             gid: meta.gid,
