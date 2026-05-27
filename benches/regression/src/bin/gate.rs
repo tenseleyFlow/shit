@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! B07 — perf budget gate. Reads a bench JSON (RunResult) and
-//! compares its p50/p99 against `tools/perf/budgets.toml`.
-//! Exits 0 within budget, 1 on breach, 2 on missing/unknown gate
-//! (so CI surfaces config drift loud).
+//! Perf budget gate. Reads a bench JSON (RunResult) and
+//! compares its p50/p99 against the matching section of
+//! `tools/perf/budgets.toml`. Exits 0 within budget, 1 on breach,
+//! 2 on missing/unknown gate (so CI surfaces config drift loud).
 //!
-//! Usage: `gate --gate <name> --input <result.json>
+//! Usage: `gate --tier <bsd|lsm> --gate <name> --input <result.json>
 //!              [--budgets <path>] [--skip-on-missing-gate]`
+//!
+//! The budgets file is sectioned by tier:
+//!   - `[[bsd.gate]]` entries are enforced when `--tier bsd`
+//!   - `[[lsm.gate]]` entries are enforced when `--tier lsm`
 //!
 //! `--skip-on-missing-gate` lets the workflow keep running while
 //! new bins are being added; without it, an unknown `<name>` fails
@@ -17,14 +21,17 @@
 //! contains `"skipped": "..."`, the gate prints + exits 0.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "gate", about = "B07 perf budget gate")]
+#[command(name = "gate", about = "perf budget gate")]
 struct Args {
-    /// Gate name to enforce (e.g. "doctor", "shell-hook").
+    /// Which tier's budget section to enforce.
+    #[arg(long, value_enum)]
+    tier: Tier,
+    /// Gate name to enforce (e.g. "doctor", "lsm-event-capture").
     #[arg(long)]
     gate: String,
     /// Path to the bench JSON to evaluate.
@@ -33,14 +40,32 @@ struct Args {
     /// Path to budgets.toml. Defaults to tools/perf/budgets.toml.
     #[arg(long, default_value = "tools/perf/budgets.toml")]
     budgets: PathBuf,
-    /// If the gate name isn't in budgets.toml, exit 0 instead of
-    /// the default exit 2. Useful when iterating bin additions.
+    /// If the gate name isn't in the matching tier section, exit 0
+    /// instead of the default exit 2. Useful when iterating bin
+    /// additions.
     #[arg(long)]
     skip_on_missing_gate: bool,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Tier {
+    Bsd,
+    Lsm,
+}
+
+/// Sectioned budgets file. Each tier carries its own `[[<tier>.gate]]`
+/// array. AU13 introduced the sectioning; pre-AU13 the file had a
+/// single top-level `[[gate]]` array — fully replaced (no compat shim).
 #[derive(Debug, Deserialize)]
 struct BudgetsFile {
+    #[serde(default)]
+    bsd: TierSection,
+    #[serde(default)]
+    lsm: TierSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TierSection {
     #[serde(default)]
     gate: Vec<GateEntry>,
 }
@@ -106,15 +131,20 @@ fn main() -> Result<()> {
     let budgets: BudgetsFile = toml::from_str(&budgets_raw)
         .with_context(|| format!("parse budgets {}", args.budgets.display()))?;
 
-    let Some(gate) = budgets.gate.iter().find(|g| g.name == args.gate) else {
+    let (tier_label, tier_gates) = match args.tier {
+        Tier::Bsd => ("bsd", &budgets.bsd.gate),
+        Tier::Lsm => ("lsm", &budgets.lsm.gate),
+    };
+
+    let Some(gate) = tier_gates.iter().find(|g| g.name == args.gate) else {
         let gate_name = &args.gate;
         let budgets_path = args.budgets.display();
         if args.skip_on_missing_gate {
-            println!("{workload}: SKIP (no '{gate_name}' gate in {budgets_path})");
+            println!("{workload}: SKIP (no '{gate_name}' gate in [{tier_label}] section of {budgets_path})");
             return Ok(());
         }
         eprintln!(
-            "{workload}: gate '{gate_name}' not found in {budgets_path} \
+            "{workload}: gate '{gate_name}' not found in [{tier_label}] section of {budgets_path} \
              (use --skip-on-missing-gate to ignore)"
         );
         std::process::exit(2);

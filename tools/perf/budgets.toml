@@ -1,27 +1,35 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# B07 — BSD perf gates. Per-surface latency and throughput budgets
-# the `gate` bin (benches/regression/src/bin/gate.rs) enforces in
-# `.github/workflows/perf-bsd.yml`. A breach exits the workflow
-# non-zero and surfaces the offending metric in the job log.
+# Perf-gate budgets per tier. The `gate` bin
+# (benches/regression/src/bin/gate.rs) takes `--tier <bsd|lsm>` and
+# enforces the matching section's `[[<tier>.gate]]` entries against
+# bench JSON outputs.
+#
+# Workflows:
+#   - .github/workflows/perf-bsd.yml passes --tier bsd
+#   - .github/workflows/perf-lsm.yml passes --tier lsm
 #
 # Units:
 #   - p50_us / p99_us / fail_at_p99_us — microseconds (latency
 #     gates). Lower is better.
-#   - p50_min_us / p99_min_us — minimum acceptable per-iter
-#     elapsed for THROUGHPUT-shaped workloads. The bin's iter time
+#   - For THROUGHPUT-shaped workloads, the bin's per-iter elapsed
 #     should stay BELOW these or throughput drops; the gate fails
-#     when actual p50/p99 EXCEEDS these (i.e. iter slowed down,
-#     throughput dropped).
+#     when actual p50/p99 EXCEEDS the budgets (i.e. iter slowed
+#     down, throughput dropped).
 #   - kind = "latency" (default) for latency-style gates;
-#     kind = "throughput" for ones where the per-iter elapsed
-#     corresponds to draining a fixed unit of work.
+#     kind = "throughput" for fixed-unit-of-work iters.
 #
-# 30% slop bakes in cross-platform-actions FreeBSD VM jitter.
-# Adjust budgets in this file (not silently in the workflow)
-# when a systematic shift is observed across many runs.
+# Both BSD and LSM tiers bake ~30% slop for CI jitter (BSD: the
+# cross-platform-actions VM; LSM: the AR00 self-hosted runner
+# under variable load). Adjust budgets here (not silently in the
+# workflow) when a systematic shift is observed across many runs.
 
-[[gate]]
+# =====================================================================
+# BSD tier (B07 — perf-bsd.yml inside the FreeBSD cross-platform-actions
+# VM)
+# =====================================================================
+
+[[bsd.gate]]
 name = "doctor"
 description = "shit doctor --json total runtime"
 kind = "latency"
@@ -29,7 +37,7 @@ p50_us = 500_000
 p99_us = 1_500_000
 fail_at_p99_us = 2_000_000
 
-[[gate]]
+[[bsd.gate]]
 name = "shell-hook"
 description = "100-frame PreExec burst over SOCK_DGRAM"
 kind = "latency"
@@ -38,7 +46,7 @@ p50_us = 1_000
 p99_us = 5_000
 fail_at_p99_us = 10_000
 
-[[gate]]
+[[bsd.gate]]
 name = "hook-helper"
 description = "shit-helper pkg-event apt pre invocation"
 kind = "latency"
@@ -46,7 +54,7 @@ p50_us = 20_000
 p99_us = 100_000
 fail_at_p99_us = 200_000
 
-[[gate]]
+[[bsd.gate]]
 name = "kqueue-drain"
 description = "EVFILT_VNODE drain of 64 NOTE_WRITE events"
 kind = "throughput"
@@ -60,7 +68,7 @@ p50_us = 4_000
 p99_us = 6_400
 fail_at_p99_us = 12_800
 
-[[gate]]
+[[bsd.gate]]
 name = "per-event-capture"
 description = "kqueue::capture::read_pre_image on a 64 KiB pre-image"
 kind = "latency"
@@ -73,4 +81,42 @@ kind = "latency"
 # sync flush, blocking copy).
 p50_us = 5_000
 p99_us = 25_000
+fail_at_p99_us = 50_000
+
+# =====================================================================
+# LSM tier (AU13 — perf-lsm.yml on the AR00 self-hosted runner; LSM=bpf)
+# =====================================================================
+
+[[lsm.gate]]
+name = "lsm-program-load"
+description = "BPF program load + attach latency for one LSM hook"
+kind = "latency"
+# BPF verifier + JIT + LSM attach. Sprint target: p50<50ms,
+# p99<200ms, fail at 500ms. Cold-cache; warm-up discards first 3.
+p50_us = 50_000
+p99_us = 200_000
+fail_at_p99_us = 500_000
+
+[[lsm.gate]]
+name = "lsm-ringbuf-drain"
+description = "userspace ringbuf consumer drain of 64 synthetic events"
+kind = "throughput"
+# Throughput-shaped: 64 events per iter, target 10k ev/sec p50.
+# 64 / 6400us  = 10k ev/sec (p50 budget)
+# 64 / 12800us = 5k ev/sec  (p99 budget)
+# 64 / 32000us = 2k ev/sec  (fail floor)
+p50_us = 6_400
+p99_us = 12_800
+fail_at_p99_us = 32_000
+
+[[lsm.gate]]
+name = "lsm-event-capture"
+description = "end-to-end rm under LSM tier → CapturedPreImage in journal"
+kind = "latency"
+# Sprint target: p50<5ms, p99<20ms, fail at 50ms. This is the
+# user-visible latency that determines whether shit is "noticeable"
+# on the LSM path. Bench drives a real shitd + LSM tier + WatchTree
+# + rm and measures rm → journaled CapturedPreImage round-trip.
+p50_us = 5_000
+p99_us = 20_000
 fail_at_p99_us = 50_000
