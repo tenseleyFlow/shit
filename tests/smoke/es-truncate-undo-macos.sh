@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: es-truncate-undo-macos
+# SMOKE_PLATFORM: macos
+# SMOKE_TIER_REQUIRED: mocked-es
+# SMOKE_RUNNER_HINT: macos-14
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # M03.1.I.C end-to-end smoke — macOS ES AUTH_TRUNCATE.
 #

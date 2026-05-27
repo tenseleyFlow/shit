@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: refuse-without-native-delegate
+# SMOKE_PLATFORM: any
+# SMOKE_TIER_REQUIRED: any
+# SMOKE_RUNNER_HINT: ubuntu-24.04
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # AR02.5 smoke — validates that when a package manager LACKS native
 # undo (apt < 3.2 here), `shit undo` falls back to the synthesized
