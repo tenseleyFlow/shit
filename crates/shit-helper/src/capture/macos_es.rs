@@ -19,15 +19,29 @@
 //!
 //! ## Sub-slice layout
 //!
-//! - M03.1.I.2 (this file's first commit): scaffold — ControlMsg,
-//!   CaptureControl, spawn + pump shell. No event handling yet.
-//! - M03.1.I.3: PumpState carries tracked_tokens/cwds; ES callback
-//!   does the audit_token filter + NOTIFY_FORK auto-add + NOTIFY_EXIT
-//!   remove.
-//! - M03.1.I.4: AUTH_UNLINK clonefile capture + worker emission.
+//! - M03.1.I.2: scaffold — ControlMsg, CaptureControl, spawn + pump
+//!   shell. No event handling yet.
+//! - M03.1.I.3: PumpState carries tracked-pid map; ES callback does
+//!   the pid filter + NOTIFY_FORK auto-add + NOTIFY_EXIT prune.
+//! - M03.1.I.4: AUTH_UNLINK clonefile capture + worker emission via
+//!   SCM_RIGHTS staging fd.
 //! - M03.1.I.5: main.rs spawns this alongside FSEvents producer.
 //! - M03.1.I.6: handshake reports `endpoint-security` when this is
 //!   the active tier.
+//! - M03.1.I.7: VM smoke covering PreExec → mutate → CapturedPreImage
+//!   → undo cycle.
+//!
+//! ## Pid-keyed tracking (M03.1.I.7 finding)
+//!
+//! The filter is keyed on PID, not full `audit_token_t`. During I.7
+//! bring-up we observed that the kernel-attached `audit_token` differs
+//! between `NOTIFY_EXEC` (post-exec snapshot) and the immediately-
+//! following `AUTH_UNLINK` for the SAME process — typically by a +1
+//! bump of `val[7]` (pidversion). The mechanism appears to be some
+//! mid-process kernel transition we don't yet fully model. Using
+//! pid as the lookup key (with `audit_token` cached for diagnostics)
+//! sidesteps this entirely; NOTIFY_EXIT prunes the entry on
+//! termination so subsequent pid reuse can't false-match.
 
 #![cfg(target_os = "macos")]
 
@@ -47,7 +61,7 @@ use shit_planner::events::CommandId;
 use shit_proto::{HELPER_PATH_HINT_MAX, HelperResponse};
 use uuid::Uuid;
 
-use crate::es::message::{EsMessage, audit_token_t};
+use crate::es::message::{EsMessage, audit_token_for_pid, audit_token_t};
 use crate::es::sys;
 use crate::ipc::Conn;
 
@@ -75,34 +89,39 @@ const PUMP_IDLE_SLEEP: Duration = Duration::from_millis(50);
 // ─────────────────────────────────────────────────────────────────────
 //
 // Kernel callback (Apple-owned serial dispatch queue) reads:
-// - pid_to_token (resolve pids harvested by NOTIFY_EXEC)
-// - tracked_tokens (filter AUTH events)
+// - tracked_pids (filter AUTH events)
 // - ring_tx (push CaptureRecord on AUTH match)
-// - staging_dir (clonefile destination — M03.1.I.4)
+// - staging_dir (clonefile destination)
 //
 // Pump thread writes:
-// - on ControlMsg::Attach: looks up root_pid in pid_to_token →
-//   inserts (audit_token, CommandId) into tracked_tokens
-// - on ControlMsg::Detach: removes from tracked_tokens
+// - on ControlMsg::Attach: inserts (root_pid, CommandId) into
+//   tracked_pids; opportunistically populates pid_to_token via
+//   Mach for diagnostic visibility
+// - on ControlMsg::Detach: removes the CommandId's entry
 //
 // Callback also writes:
-// - NOTIFY_EXEC: pid_to_token.insert(pid, token)
-// - NOTIFY_FORK: if parent in tracked, tracked_tokens.insert(child)
-// - NOTIFY_EXIT: pid_to_token.remove + tracked_tokens.remove
+// - NOTIFY_EXEC: refreshes pid_to_token (debug only)
+// - NOTIFY_FORK: if parent's pid in tracked, inserts child pid
+// - NOTIFY_EXIT: prunes both maps for the dying pid
 //
 // Single-shared because the helper only runs one producer at a time.
 
 /// State the ES callback reads + writes. Initialized exactly once
 /// by [`pump`] at startup via [`PUMP`].
 pub struct PumpHandle {
-    /// pid → audit_token map, populated by NOTIFY_EXEC observation +
-    /// initial bsdinfo lookup. Used by ControlMsg::Attach to resolve
-    /// the daemon-supplied root_pid to its audit_token.
+    /// pid → most-recently-observed audit_token. Diagnostic +
+    /// debugging aid; the filter no longer uses this since
+    /// `audit_token_t` proved unstable across exec/unlink even for
+    /// the same process (pidversion drift discovered M03.1.I.7).
     pub pid_to_token: Mutex<HashMap<i32, audit_token_t>>,
-    /// audit_token → CommandId map. AUTH_UNLINK handler reads
-    /// (filter); NOTIFY_FORK handler writes (auto-add children
-    /// of tracked processes, inheriting the parent's CommandId).
-    pub tracked_tokens: Mutex<HashMap<audit_token_t, CommandId>>,
+    /// pid → CommandId map. ALL AUTH events filter on this. We use
+    /// pid (not audit_token) because Apple's pidversion field in
+    /// `audit_token_t` increments mid-process unexpectedly, so the
+    /// post-exec NOTIFY_EXEC and the subsequent AUTH_UNLINK from the
+    /// SAME process can carry different audit_tokens. Pid is the
+    /// stable identifier within a process's lifetime; NOTIFY_EXIT
+    /// prunes the entry so pid reuse never confuses us.
+    pub tracked_pids: Mutex<HashMap<i32, CommandId>>,
     /// Bounded ring the callback pushes CaptureRecords into. The
     /// pump thread drains; if full, the callback drops the record
     /// + DENYs (preserves the undo invariant: never silently lose
@@ -157,14 +176,16 @@ pub struct CaptureRecord {
 // Producer handler — global Block invoked by the ES kernel callback
 // ─────────────────────────────────────────────────────────────────────
 //
-// Three event types delivered:
-// - NOTIFY_EXEC: harvest pid→token mapping
-// - NOTIFY_FORK: propagate tracked-token to child (parent observed
-//   in tracked_tokens → child inherits the CommandId)
-// - NOTIFY_EXIT: prune both maps
-// - AUTH_UNLINK: if process in tracked_tokens, push CaptureRecord
-//   to ring + respond ALLOW (M03.1.I.4 adds the clonefile step);
-//   if not tracked, respond ALLOW immediately
+// Four event types delivered:
+// - NOTIFY_EXEC: refresh pid_to_token (diagnostic only — the
+//   tracked-pid set survives exec automatically since pid is stable)
+// - NOTIFY_FORK: propagate tracked status to child (parent's pid in
+//   tracked_pids → child pid inherits the CommandId)
+// - NOTIFY_EXIT: prune both maps for the dying pid
+// - AUTH_UNLINK: if process pid in tracked_pids, inline-clonefile +
+//   enqueue CaptureRecord + respond ALLOW; if ring full, DENY (the
+//   undo invariant trumps the syscall's success). Untracked: ALLOW
+//   immediately.
 
 extern "C" fn producer_invoke(
     _block: *const sys::Block<()>,
@@ -340,34 +361,30 @@ fn path_to_string(p: &Path) -> Option<String> {
 }
 
 fn handle_notify_exec(pump: &PumpHandle, msg: &EsMessage<'_>) {
-    // Apple stores pid at val[5] of audit_token_t per libbsm's
-    // audit_token_to_pid() macro. We avoid that detail here — we
-    // store the FULL audit_token keyed by pid. Stale entries get
-    // pruned on NOTIFY_EXIT.
-    let token = msg.process_audit_token();
-    let pid = pid_from_audit_token(&token);
+    // Refresh pid → audit_token (debug aid only since the filter
+    // now uses pid). Tracked status, if any, is keyed by pid and
+    // survives exec automatically.
+    let new_token = msg.process_audit_token();
+    let pid = pid_from_audit_token(&new_token);
     if let Ok(mut g) = pump.pid_to_token.lock() {
-        g.insert(pid, token);
+        g.insert(pid, new_token);
     }
 }
 
 fn handle_notify_fork(pump: &PumpHandle, msg: &EsMessage<'_>) {
     let parent_token = msg.process_audit_token();
-    // If parent is tracked, child inherits the same CommandId.
-    let inherit = match pump.tracked_tokens.lock() {
-        Ok(g) => g.get(&parent_token).copied(),
+    let parent_pid = pid_from_audit_token(&parent_token);
+    let inherit = match pump.tracked_pids.lock() {
+        Ok(g) => g.get(&parent_pid).copied(),
         Err(_) => return,
     };
     if let Some(command) = inherit
         && let Some(child_token) = msg.fork_child_audit_token()
     {
-        if let Ok(mut g) = pump.tracked_tokens.lock() {
-            g.insert(child_token, command);
-        }
-        // Also record the child's pid → token mapping for any later
-        // direct-pid lookups (e.g., a follow-on WatchTree of the
-        // same descendant).
         let child_pid = pid_from_audit_token(&child_token);
+        if let Ok(mut g) = pump.tracked_pids.lock() {
+            g.insert(child_pid, command);
+        }
         if let Ok(mut g) = pump.pid_to_token.lock() {
             g.insert(child_pid, child_token);
         }
@@ -380,8 +397,8 @@ fn handle_notify_exit(pump: &PumpHandle, msg: &EsMessage<'_>) {
     if let Ok(mut g) = pump.pid_to_token.lock() {
         g.remove(&pid);
     }
-    if let Ok(mut g) = pump.tracked_tokens.lock() {
-        g.remove(&token);
+    if let Ok(mut g) = pump.tracked_pids.lock() {
+        g.remove(&pid);
     }
 }
 
@@ -392,8 +409,9 @@ fn handle_auth_unlink(
     msg: &EsMessage<'_>,
 ) {
     let token = msg.process_audit_token();
-    let command = match pump.tracked_tokens.lock() {
-        Ok(g) => g.get(&token).copied(),
+    let pid = pid_from_audit_token(&token);
+    let command = match pump.tracked_pids.lock() {
+        Ok(g) => g.get(&pid).copied(),
         Err(_) => None,
     };
     let Some(command) = command else {
@@ -518,6 +536,10 @@ enum ControlMsg {
     Attach {
         command: CommandId,
         root_path: PathBuf,
+        /// Daemon-supplied pid of the process the shell hook ran in.
+        /// Used to resolve the audit_token via [`PumpHandle::pid_to_token`]
+        /// (populated by NOTIFY_EXEC from helper-startup forward).
+        root_pid: i32,
     },
     Detach {
         command: CommandId,
@@ -545,7 +567,7 @@ impl CaptureControl {
     /// `cwd_path` must be non-empty — macOS doesn't have a
     /// FreeBSD-style sysctl(KERN_PROC_CWD) fallback we'd want to
     /// rely on.
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, _root_pid: u32, cwd_path: &str) {
+    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32, cwd_path: &str) {
         if cwd_path.is_empty() {
             tracing::warn!(
                 %session,
@@ -561,6 +583,7 @@ impl CaptureControl {
         if let Err(e) = self.tx.try_send(ControlMsg::Attach {
             command,
             root_path: PathBuf::from(cwd_path),
+            root_pid: root_pid as i32,
         }) {
             tracing::warn!(
                 %session,
@@ -660,7 +683,7 @@ impl PumpState {
         // bail rather than silently shadowing.
         let handle = PumpHandle {
             pid_to_token: Mutex::new(HashMap::new()),
-            tracked_tokens: Mutex::new(HashMap::new()),
+            tracked_pids: Mutex::new(HashMap::new()),
             ring_tx,
             staging_dir: staging_dir.clone(),
             events_seen: AtomicU64::new(0),
@@ -702,57 +725,41 @@ impl PumpState {
     }
 
     fn attach(&mut self, command: CommandId, root_path: PathBuf, root_pid: Option<i32>) {
-        // Resolve the daemon-supplied root_pid to its audit_token.
-        // Two sources, tried in order:
-        //
-        // 1. pid_to_token (populated by NOTIFY_EXEC). This is the
-        //    cheap + correct path for any process that exec'd
-        //    AFTER our subscription started.
-        // 2. proc_pidinfo(PROC_PIDTBSDINFO) via libproc — fallback
-        //    for processes that already existed (e.g. the user's
-        //    long-running shell). I.3 ships path 1; path 2 is a
-        //    follow-up in I.4 if we discover gaps.
-        //
-        // Without a token resolved, the watch is essentially a no-op
-        // until a tracked child exec's. We accept that for I.3 — the
-        // smoke we'll run in I.7 spawns a fresh subprocess as the
-        // command runner, which routes through NOTIFY_EXEC.
-        let resolved = root_pid.and_then(|pid| {
-            let pump = PUMP.get()?;
-            let g = pump.pid_to_token.lock().ok()?;
-            g.get(&pid).copied()
-        });
-        match resolved {
-            Some(token) => {
-                if let Some(pump) = PUMP.get()
-                    && let Ok(mut g) = pump.tracked_tokens.lock()
-                {
-                    g.insert(token, command);
-                }
-                tracing::info!(
-                    %command.session,
-                    seq = command.seq,
-                    path = %root_path.display(),
-                    pid = root_pid.unwrap_or(-1),
-                    "macos-es watch attached (audit_token resolved)"
-                );
+        let Some(pid) = root_pid else {
+            tracing::warn!(
+                %command.session,
+                seq = command.seq,
+                "macos-es WatchTree without root_pid; descendants only"
+            );
+            return;
+        };
+        if let Some(pump) = PUMP.get() {
+            if let Ok(mut g) = pump.tracked_pids.lock() {
+                g.insert(pid, command);
             }
-            None => {
-                tracing::info!(
-                    %command.session,
-                    seq = command.seq,
-                    path = %root_path.display(),
-                    pid = root_pid.unwrap_or(-1),
-                    "macos-es watch attached (pid not yet seen via NOTIFY_EXEC; \
-                     descendants will be auto-tracked once they exec)"
-                );
+            // Mach lookup is best-effort — populates pid_to_token
+            // for diagnostic purposes only since the filter is now
+            // pid-keyed. The shell pre-dates the helper subscription
+            // in the typical smoke flow, so without this nothing
+            // logs the shell's audit_token.
+            if let Some(t) = audit_token_for_pid(pid)
+                && let Ok(mut g) = pump.pid_to_token.lock()
+            {
+                g.insert(pid, t);
             }
         }
+        tracing::info!(
+            %command.session,
+            seq = command.seq,
+            path = %root_path.display(),
+            pid,
+            "macos-es watch attached"
+        );
     }
 
     fn detach(&mut self, command: CommandId) {
         if let Some(pump) = PUMP.get()
-            && let Ok(mut g) = pump.tracked_tokens.lock()
+            && let Ok(mut g) = pump.tracked_pids.lock()
         {
             g.retain(|_, cmd| *cmd != command);
         }
@@ -893,16 +900,18 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
         "macos-es capture pump started (I.4: AUTH_UNLINK capture pipeline live)"
     );
 
+    // Periodic diagnostic — every 2s, log the event counters so the
+    // smoke output reveals whether ES is delivering at all.
+    let mut last_tick = std::time::Instant::now();
     loop {
         // 1. Control channel first (low latency for attach/detach).
         match ctrl_rx.try_recv() {
-            Ok(ControlMsg::Attach { command, root_path }) => {
-                // I.3 has no root_pid plumbing yet — that lands in I.5
-                // when main.rs forwards the daemon's WatchTree.root_pid
-                // through. For now we pass None and rely on NOTIFY_FORK
-                // auto-add to populate the tracked set as descendants
-                // exec under whatever shell the smoke launches.
-                state.attach(command, root_path, None);
+            Ok(ControlMsg::Attach {
+                command,
+                root_path,
+                root_pid,
+            }) => {
+                state.attach(command, root_path, Some(root_pid));
                 continue;
             }
             Ok(ControlMsg::Detach { command }) => {
@@ -927,7 +936,21 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
             continue;
         }
 
-        // 3. Idle.
+        // 3. Periodic counter dump for operator observability.
+        // DEBUG level so it's available via RUST_LOG=debug but
+        // doesn't flood prod INFO logs.
+        if last_tick.elapsed() >= Duration::from_secs(10) {
+            if let Some(pump) = PUMP.get() {
+                let seen = pump.events_seen.load(Ordering::Relaxed);
+                let passed = pump.events_passed_filter.load(Ordering::Relaxed);
+                let emitted = pump.events_emitted.load(Ordering::Relaxed);
+                let tracked = pump.tracked_pids.lock().map(|g| g.len()).unwrap_or(0);
+                tracing::debug!(seen, passed, emitted, tracked, "macos-es counters");
+            }
+            last_tick = std::time::Instant::now();
+        }
+
+        // 4. Idle.
         std::thread::sleep(PUMP_IDLE_SLEEP);
     }
 }
