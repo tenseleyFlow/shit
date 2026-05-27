@@ -346,6 +346,7 @@ mod next {
     target_os = "openbsd",
     target_os = "dragonfly",
     target_os = "linux",
+    target_os = "macos",
 ))]
 mod policy {
     //! Pre-mutation notification policy. Stage 1 (this revision):
@@ -389,6 +390,10 @@ mod policy {
     /// the S24 plan. We can't use `select(2)` directly from safe Rust
     /// here, but `set_read_timeout` on a `UnixStream` gives the same
     /// allow-on-timeout property.
+    // Called by BSD/Linux truncate / ftruncate / pwrite / mmap
+    // interposers. macOS adds those interposers in M07.B; until
+    // then this function is dead on the macos build.
+    #[allow(dead_code)]
     pub fn notify_pre_mutation(syscall: &'static str, arg: &str) {
         if should_skip_path(arg) {
             return;
