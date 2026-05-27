@@ -471,6 +471,14 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
                     Some(m.kernel_tier)
                 },
                 error: error_msg,
+                // M03.x.POWER-USER.3: the daemon's ctl Metrics response
+                // doesn't yet carry the helper's degraded_reason. The
+                // doctor's own `probe_endpoint_security` calls the
+                // helper's es-probe directly + surfaces the same
+                // information via `EndpointSecurityReport.notes`. Once
+                // ctl proto grows a helper_degraded_reason field we
+                // can populate this from `m`.
+                degraded_reason: None,
             }
         }
         Ok(other) => HelperHandshakeReport {
@@ -479,6 +487,7 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
             helper_version: None,
             kernel_tier: None,
             error: Some(format!("unexpected ctl response: {other:?}")),
+            degraded_reason: None,
         },
         Err(e) => HelperHandshakeReport {
             ok: false,
@@ -486,6 +495,7 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
             helper_version: None,
             kernel_tier: None,
             error: Some(e.to_string()),
+            degraded_reason: None,
         },
     }
 }

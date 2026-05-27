@@ -16,14 +16,30 @@ use crate::ipc::{Conn, ConnError};
 /// telemetry stream so operators can tell *which* tier is actually
 /// running — Linux can degrade from bpf-lsm → fanotify → inotify;
 /// FreeBSD's preload-shim is best-effort; the daemon needs to know.
-pub fn kernel_tier_classifier() -> &'static str {
+/// M03.x.POWER-USER.3 — classify the active capture tier AND return
+/// a structured reason when it degraded from the intended target.
+/// Used by [`perform_helper_side`] to populate the
+/// `HelperResponse::HandshakeAck::{kernel_tier, degraded_reason}`
+/// fields so the daemon's doctor surface can lead the user to a
+/// specific fix.
+///
+/// The string in `.1` mirrors the helper's ES probe outcome enum
+/// (`NotEntitled`, `NotPrivileged`, etc.) with a brief remediation
+/// hint. `.1 = None` when either the tier is the intended one or
+/// the platform doesn't have a degraded ES path to explain.
+///
+/// Pre-M03.x.POWER-USER.3 this was a `kernel_tier_classifier() ->
+/// &'static str`; the new shape returns a tuple so the wire can
+/// carry both pieces in one pass over the probe (the ES probe is a
+/// few-µs syscall but still worth avoiding a duplicate).
+pub fn classify_kernel_tier() -> (&'static str, Option<String>) {
     #[cfg(target_os = "linux")]
     {
         // DR-01..04 light up bpf-lsm; until then the helper falls
         // back to fanotify-perm (DR-08). The string mirrors the
         // expected production tier so the operator sees the right
         // banner during Stage 1 even though the runtime is degraded.
-        "fanotify"
+        ("fanotify", None)
     }
     #[cfg(target_os = "macos")]
     {
@@ -38,17 +54,55 @@ pub fn kernel_tier_classifier() -> &'static str {
         // tier is the source of truth for content-bearing events.
         use crate::es::probe::{ProbeResult, probe_client_creation};
         match probe_client_creation() {
-            ProbeResult::Success => "endpoint-security",
-            _ => "fsevents-degraded",
+            ProbeResult::Success => ("endpoint-security", None),
+            r => {
+                let reason = describe_es_probe_failure(&r);
+                ("fsevents-degraded", Some(reason))
+            }
         }
     }
     #[cfg(target_os = "freebsd")]
     {
-        "kqueue"
+        ("kqueue", None)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     {
-        "unsupported"
+        ("unsupported", None)
+    }
+}
+
+/// macOS-only: map an ES probe failure to a human-readable
+/// remediation hint the daemon's doctor surface can show.
+#[cfg(target_os = "macos")]
+fn describe_es_probe_failure(r: &crate::es::probe::ProbeResult) -> String {
+    use crate::es::probe::ProbeResult;
+    match r {
+        ProbeResult::Success => unreachable!("caller handles SUCCESS path"),
+        ProbeResult::NotEntitled => {
+            "ES NotEntitled — helper binary lacks the ES entitlement, OR AMFI is \
+             rejecting the claim (run `shit setup-es-mode --check`)"
+                .into()
+        }
+        ProbeResult::NotPermitted => {
+            "ES NotPermitted — entitlement OK but Full Disk Access not granted \
+             (System Settings → Privacy & Security → Full Disk Access)"
+                .into()
+        }
+        ProbeResult::NotPrivileged => {
+            "ES NotPrivileged — helper not running as root (production runs via \
+             shitd with elevation; dev runs need sudo)"
+                .into()
+        }
+        ProbeResult::InvalidArgument => "ES InvalidArgument (probe bug)".into(),
+        ProbeResult::InternalError => "ES InternalError (host-side ES issue)".into(),
+        ProbeResult::TooManyClients => {
+            "ES TooManyClients — host is saturated with ES subscribers; close \
+             other ES clients (XDR/EDR agents) before retrying"
+                .into()
+        }
+        ProbeResult::UnknownResult(raw) => {
+            format!("ES UnknownResult({raw}) — kernel returned an unrecognized status")
+        }
     }
 }
 
@@ -137,13 +191,15 @@ pub fn perform_helper_side(
     }
 
     let granted = capability_request.intersect(local_caps);
+    let (tier, degraded_reason) = classify_kernel_tier();
     let ack = HelperResponse::HandshakeAck {
         helper_pid: std::process::id(),
         helper_uid: current_uid(),
         protocol_version: HELPER_PROTOCOL_VERSION,
         granted,
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
-        kernel_tier: kernel_tier_classifier().to_string(),
+        kernel_tier: tier.to_string(),
+        degraded_reason,
     };
     // DR-64 fault-injection: crash mid-reply. The daemon must
     // observe the disconnect, log the failed handshake, and
@@ -182,6 +238,7 @@ pub fn perform_daemon_side(
         granted,
         helper_version: _,
         kernel_tier: _,
+        degraded_reason: _,
     } = resp
     else {
         return Err(HandshakeError::NotHandshake);

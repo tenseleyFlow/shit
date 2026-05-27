@@ -196,6 +196,20 @@ pub enum HelperResponse {
         /// Daemon stashes this in `Stats::kernel_tier` so
         /// `shit metrics` surfaces what's actually active.
         kernel_tier: String,
+        /// M03.x.POWER-USER.3 — when `kernel_tier != "endpoint-security"`
+        /// on macOS, names the SPECIFIC reason ES isn't running
+        /// (e.g. `"NotEntitled: SIP+AuthRoot+AMFI bypass needed"`,
+        /// `"NotPrivileged: helper not running as root"`,
+        /// `"NotSupportedOnThisOs"`). `None` when the tier is the
+        /// intended one or the platform doesn't have a degraded ES
+        /// path. The doctor reads this to drive its
+        /// `shit setup-es-mode` remediation surface.
+        ///
+        /// serde-default so pre-3 helpers' acks deserialize cleanly
+        /// (they emit no `degraded_reason` field; daemon sees
+        /// `None`, behavior unchanged from pre-3 baseline).
+        #[serde(default)]
+        degraded_reason: Option<String>,
     },
     /// One pending auth event awaiting daemon's `AuthDecision`. The
     /// content fd (when needed) is attached via SCM_RIGHTS — never
@@ -641,6 +655,7 @@ mod tests {
             },
             helper_version: "shit-helper 0.1.0 (commit deadbeef)".into(),
             kernel_tier: "fanotify".into(),
+            degraded_reason: None,
         };
         let bytes = encode_frame(&ack).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();

@@ -143,6 +143,14 @@ pub struct HelperHandshakeReport {
     /// Connection / handshake error message when `ok=false`. `None`
     /// on success.
     pub error: Option<String>,
+    /// M03.x.POWER-USER.3 — populated when `kernel_tier` is the
+    /// degraded fallback for a platform that has a higher tier
+    /// available (e.g. `"fsevents-degraded"` on macOS when ES was
+    /// the intended target). Names the specific reason the helper
+    /// fell back. `None` when the tier is the intended one or the
+    /// platform has no higher tier to degrade from.
+    #[serde(default)]
+    pub degraded_reason: Option<String>,
 }
 
 /// Linux-family report. Populated by L05 (the Linux doctor uplift).
@@ -451,6 +459,7 @@ mod tests {
                     helper_version: None,
                     kernel_tier: None,
                     error: Some("no daemon running".into()),
+                    degraded_reason: None,
                 },
                 preload_shim_installed: false,
             }),
@@ -586,6 +595,7 @@ mod tests {
                 helper_version: Some("0.1.0".into()),
                 kernel_tier: Some("fsevents-degraded".into()),
                 error: None,
+                degraded_reason: None,
             },
             es_capable: false,
             es_blockers: vec![],

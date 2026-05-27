@@ -83,6 +83,13 @@ pub struct HelperLink {
     /// link-up so `shit metrics` and the structured log stream
     /// surface what's actually running.
     pub kernel_tier: String,
+    /// M03.x.POWER-USER.3 — populated when `kernel_tier` is the
+    /// fallback variant for a platform that has a higher tier
+    /// available (e.g. `"fsevents-degraded"` on macOS when ES is
+    /// the intended target). The string names the specific reason
+    /// ES isn't running. `None` when the tier IS the intended one.
+    /// Surfaced to the doctor + the structured log.
+    pub degraded_reason: Option<String>,
 }
 
 impl HelperLink {
@@ -320,6 +327,7 @@ pub fn spawn_and_handshake(
         granted,
         helper_version: _,
         kernel_tier,
+        degraded_reason,
     } = resp
     else {
         return Err(HelperLinkError::NotHandshakeAck);
@@ -330,6 +338,13 @@ pub fn spawn_and_handshake(
             helper: protocol_version,
         });
     }
+    if let Some(reason) = degraded_reason.as_deref() {
+        tracing::info!(
+            kernel_tier = %kernel_tier,
+            degraded_reason = %reason,
+            "helper handshake: tier degraded — see `shit setup-es-mode --check` for remediation"
+        );
+    }
 
     Ok(HelperLink {
         conn_fd,
@@ -338,6 +353,7 @@ pub fn spawn_and_handshake(
         helper_uid,
         granted,
         kernel_tier,
+        degraded_reason,
     })
 }
 
