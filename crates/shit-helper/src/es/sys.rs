@@ -177,31 +177,33 @@ pub struct es_client_t(u8, PhantomData<*mut u8>);
 
 /// Flags bits in `Block_literal.flags`. Only `BLOCK_IS_GLOBAL` is
 /// relevant for the M03.1.A probe.
-const BLOCK_IS_GLOBAL: c_int = 1 << 28;
+pub const BLOCK_IS_GLOBAL: c_int = 1 << 28;
 
 #[repr(C)]
-struct BlockDescriptor {
-    reserved: c_ulong,
+pub struct BlockDescriptor {
+    pub reserved: c_ulong,
     /// Total size of the Block_literal (must match `Block::size_of_self()`).
-    size: c_ulong,
+    pub size: c_ulong,
 }
 
 /// Layout-compatible with `struct Block_literal_1` from the
 /// block-ABI spec. We don't include the optional copy/dispose
-/// helpers — global blocks don't use them.
+/// helpers — global blocks don't use them. All fields `pub` so
+/// downstream modules (`capture::macos_es`) can construct their
+/// own handler statics without going through this module.
 #[repr(C)]
 pub struct Block<F: 'static> {
     /// Set to `&_NSConcreteGlobalBlock` so the runtime recognizes
     /// the layout.
-    isa: *const c_void,
-    flags: c_int,
-    reserved: c_int,
+    pub isa: *const c_void,
+    pub flags: c_int,
+    pub reserved: c_int,
     /// Trampoline that calls our Rust handler. First arg is always
     /// `*const Block<F>` (block-ABI convention).
-    invoke: *const c_void,
-    descriptor: *const BlockDescriptor,
+    pub invoke: *const c_void,
+    pub descriptor: *const BlockDescriptor,
     /// Marker so the compiler can carry F's variance through.
-    _phantom: PhantomData<F>,
+    pub _phantom: PhantomData<F>,
 }
 
 // Apple guarantees global blocks are immutable + thread-safe — every
@@ -213,7 +215,7 @@ unsafe impl<F: 'static> Send for Block<F> {}
 unsafe extern "C" {
     /// Block class for global (static) blocks. The runtime checks
     /// `block->isa == _NSConcreteGlobalBlock` to skip copy/dispose.
-    static _NSConcreteGlobalBlock: c_void;
+    pub static _NSConcreteGlobalBlock: c_void;
 }
 
 // ─────────────────────────────────────────────────────────────────────

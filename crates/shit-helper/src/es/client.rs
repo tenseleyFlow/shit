@@ -255,6 +255,48 @@ impl EsClient {
             .load(Ordering::Relaxed)
             .saturating_sub(self.start_count)
     }
+
+    /// Construct an EsClient with a caller-provided global Block
+    /// handler + event subscription set. Used by the macOS ES
+    /// producer (`capture::macos_es`) to subscribe with its own
+    /// `PRODUCER_HANDLER` block that drives the tree-filter +
+    /// capture pipeline.
+    ///
+    /// `handler_block` must point to a `'static`-lifetime global
+    /// Block (i.e., a `&Block<()>` cast). The caller owns the
+    /// lifetime; this constructor only stores the kernel-side
+    /// `*mut es_client_t`.
+    ///
+    /// SAFETY: the caller must guarantee `handler_block` outlives
+    /// the EsClient (use a `static`-lifetime block). `events` must
+    /// be a non-empty slice of valid event-type discriminants.
+    pub unsafe fn new_with_handler(
+        handler_block: *const c_void,
+        events: &[sys::es_event_type_t],
+    ) -> Result<Self, EsClientError> {
+        let mut client: *mut sys::es_client_t = ptr::null_mut();
+        let result =
+            unsafe { sys::es_new_client(&mut client as *mut *mut sys::es_client_t, handler_block) };
+        if result != sys::es_new_client_result_t::SUCCESS {
+            return Err(EsClientError::NewClient(result));
+        }
+
+        let start_count = sys::EVENT_COUNTER.load(Ordering::Relaxed);
+
+        let sub = unsafe { sys::es_subscribe(client, events.as_ptr(), events.len() as u32) };
+        if sub != sys::es_return_t::SUCCESS {
+            unsafe {
+                let _ = sys::es_delete_client(client);
+            }
+            return Err(EsClientError::Subscribe(sub));
+        }
+
+        Ok(Self {
+            client,
+            start_count,
+            _not_send: std::marker::PhantomData,
+        })
+    }
 }
 
 impl Drop for EsClient {
