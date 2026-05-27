@@ -20,15 +20,27 @@
 
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // BSD: versioned-symbol script for the FBSD_1.x exports.
     let bsd = matches!(
         target_os.as_str(),
         "freebsd" | "netbsd" | "openbsd" | "dragonfly"
     );
-    if !bsd {
-        return;
+    if bsd {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        let ver_script = format!("{manifest_dir}/shim.ver");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={ver_script}");
+        println!("cargo:rerun-if-changed=shim.ver");
     }
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    let ver_script = format!("{manifest_dir}/shim.ver");
-    println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={ver_script}");
-    println!("cargo:rerun-if-changed=shim.ver");
+
+    // macOS: C trampolines for variadic open/openat. See macos_shim.c
+    // for the rationale (Apple AArch64 puts variadic args on the stack
+    // while fixed args go in registers; Rust can't write a fn that
+    // receives variadic args correctly on stable).
+    if target_os == "macos" {
+        cc::Build::new()
+            .file("src/macos_shim.c")
+            .compile("shit_preload_shim_macos");
+        println!("cargo:rerun-if-changed=src/macos_shim.c");
+    }
 }
