@@ -423,8 +423,7 @@ fn stream_copy_to_staging(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "file {} bytes exceeds stream-copy cap {} bytes (non-APFS path)",
-                expected_size, STREAM_COPY_CAP
+                "file {expected_size} bytes exceeds stream-copy cap {STREAM_COPY_CAP} bytes (non-APFS path)"
             ),
         ));
     }
