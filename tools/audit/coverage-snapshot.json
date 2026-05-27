@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "generated_at": "",
+  "workflow_run_url": "",
+  "commit_sha": "",
+  "green_smokes": [],
+  "covered_classes": [],
+  "refused_classes": [],
+  "pending_classes": [],
+  "comment": "AU02 sentinel placeholder. CI updates this on green trunk runs; manual release pulls the latest artifact and commits it here. Empty timestamps signal 'no validation recorded yet' to shit doctor."
+}

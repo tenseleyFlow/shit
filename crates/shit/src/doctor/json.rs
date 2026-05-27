@@ -53,31 +53,44 @@ pub struct DoctorReport {
 /// AR07.3 coverage manifest. Tells the user (and CI) what
 /// `shit undo` honestly claims to do.
 ///
-/// The catalog of refused classes lives in
-/// [`shit_planner::refuse::CATALOG`] and is enumerated here via
-/// [`shit_planner::refuse::catalog_classes`] so the two never
-/// drift.
+/// AU02 dropped `coverage_pct` — a percentage over a fictitious
+/// denominator misleads more than it informs. The three count
+/// fields (`covered_count`, `refused_count`, `pending_count`) plus
+/// the three lists give consumers the raw material to draw their
+/// own conclusions.
 ///
-/// `covered_classes` is the inventory of capture-tier-supported
-/// classes shit currently undoes. Sourced from the AR08.1
-/// coverage audit; today it's a hand-curated list per OS. A
-/// future sprint may derive it programmatically from
-/// `InverseTier` + per-class smoke status, but the AR07.3 surface
-/// freezes the contract first.
+/// Sources of truth:
 ///
-/// `coverage_pct` is a rough rollup for the human-facing doctor
-/// summary, computed as `covered / (covered + refused)` rounded
-/// to whole percent. It's a guide, not a contract.
+/// - `covered_classes` ← `shit_planner::coverage_catalog::COVERAGE_CATALOG`
+/// - `refused_classes` ← `shit_planner::refuse::catalog_classes`
+/// - `pending_classes` ← `shit_planner::coverage_catalog::PENDING_CATALOG`
 ///
-/// `last_validated_at` is set by CI when it writes a fresh
-/// doctor JSON snapshot; defaults to the empty string when no
-/// validation has been recorded.
+/// `last_validated_at` and `snapshot_workflow_run_url` come from
+/// the embedded coverage snapshot at `tools/audit/coverage-snapshot.json`
+/// (`include_str!`'d into the binary at compile time). When the
+/// snapshot is the sentinel/empty placeholder, both fields are empty
+/// strings — meaning "no CI validation has been recorded yet".
+///
+/// `binary_built_at` is the build timestamp (RFC3339, UTC); compare
+/// against `last_validated_at` to detect a stale binary still serving
+/// an old validation claim.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ArbitraryUndoCoverage {
     pub covered_classes: Vec<String>,
     pub refused_classes: Vec<String>,
-    pub coverage_pct: u32,
+    #[serde(default)]
+    pub pending_classes: Vec<String>,
+    #[serde(default)]
+    pub covered_count: u32,
+    #[serde(default)]
+    pub refused_count: u32,
+    #[serde(default)]
+    pub pending_count: u32,
     pub last_validated_at: String,
+    #[serde(default)]
+    pub snapshot_workflow_run_url: String,
+    #[serde(default)]
+    pub binary_built_at: String,
 }
 
 /// Host identification — OS family, version, arch. Always present.
@@ -364,7 +377,7 @@ pub struct MountReport {
 
 /// Current schema version. Consumers MAY pin this; we only bump
 /// it for breaking changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -407,14 +420,14 @@ mod tests {
         // intentionally bumped the version, update the assertion
         // here AND publish the migration note in
         // `.docs/audits/doctor-json-schema.md`.
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
     }
 
     #[test]
     fn report_serializes_to_json() {
         let r = empty_report();
         let s = serde_json::to_string(&r).expect("serialize");
-        assert!(s.contains("\"schema_version\":1"));
+        assert!(s.contains("\"schema_version\":2"));
         assert!(s.contains("\"os\":\"freebsd\""));
         assert!(s.contains("\"runtime_capture\":\"kqueue-only\""));
     }
@@ -437,19 +450,33 @@ mod tests {
         r.arbitrary_undo_coverage = ArbitraryUndoCoverage {
             covered_classes: vec!["fs-content-restore".to_string()],
             refused_classes: vec!["remote-push".to_string(), "power-state".to_string()],
-            coverage_pct: 33,
+            pending_classes: vec!["bsd-shim-default".to_string()],
+            covered_count: 1,
+            refused_count: 2,
+            pending_count: 1,
             last_validated_at: "2026-05-26T00:00:00Z".to_string(),
+            snapshot_workflow_run_url: "https://github.com/x/y/actions/runs/1".to_string(),
+            binary_built_at: "2026-05-26T01:23:45Z".to_string(),
         };
         let s = serde_json::to_string(&r).expect("serialize");
-        // Field present even when other coverage fields are empty.
         assert!(s.contains("\"arbitrary_undo_coverage\""));
         assert!(s.contains("\"covered_classes\":[\"fs-content-restore\"]"));
         assert!(
             s.contains("\"refused_classes\":[\"remote-push\",\"power-state\"]"),
             "refused_classes list missing or in unexpected order: {s}"
         );
-        assert!(s.contains("\"coverage_pct\":33"));
+        assert!(s.contains("\"pending_classes\":[\"bsd-shim-default\"]"));
+        assert!(s.contains("\"covered_count\":1"));
+        assert!(s.contains("\"refused_count\":2"));
+        assert!(s.contains("\"pending_count\":1"));
         assert!(s.contains("\"last_validated_at\":\"2026-05-26T00:00:00Z\""));
+        assert!(s.contains("\"binary_built_at\":\"2026-05-26T01:23:45Z\""));
+        assert!(s.contains("\"snapshot_workflow_run_url\":\"https://github.com/x/y/actions/runs/1\""));
+        // AU02 dropped coverage_pct — must NOT appear.
+        assert!(
+            !s.contains("\"coverage_pct\""),
+            "coverage_pct should be gone in schema v2: {s}"
+        );
     }
 
     #[test]
@@ -459,17 +486,19 @@ mod tests {
         let r2: DoctorReport = serde_json::from_str(&s).expect("deserialize");
         assert!(r2.arbitrary_undo_coverage.covered_classes.is_empty());
         assert!(r2.arbitrary_undo_coverage.refused_classes.is_empty());
-        assert_eq!(r2.arbitrary_undo_coverage.coverage_pct, 0);
+        assert!(r2.arbitrary_undo_coverage.pending_classes.is_empty());
+        assert_eq!(r2.arbitrary_undo_coverage.covered_count, 0);
         assert!(r2.arbitrary_undo_coverage.last_validated_at.is_empty());
+        assert!(r2.arbitrary_undo_coverage.snapshot_workflow_run_url.is_empty());
+        assert!(r2.arbitrary_undo_coverage.binary_built_at.is_empty());
     }
 
     #[test]
     fn older_envelope_without_coverage_field_round_trips_via_serde_default() {
-        // Forward-compat sanity: an envelope from a build that
-        // predates AR07.3 (no arbitrary_undo_coverage key in the
-        // JSON) deserializes cleanly, populating the field with
-        // ArbitraryUndoCoverage::default(). The schema_version
-        // stays at 1 because the field is additive.
+        // Forward-compat: an envelope from any prior schema (no
+        // arbitrary_undo_coverage key, or v1 with coverage_pct) still
+        // deserializes cleanly. v1's coverage_pct silently dropped via
+        // serde's default deny-unknown-fields-off behavior.
         let legacy = r#"{
             "schema_version": 1,
             "host": {"os":"linux","os_release":"6.5.0","arch":"x86_64"},
@@ -482,6 +511,37 @@ mod tests {
         assert_eq!(r.schema_version, 1);
         assert!(r.arbitrary_undo_coverage.covered_classes.is_empty());
         assert!(r.arbitrary_undo_coverage.refused_classes.is_empty());
+    }
+
+    #[test]
+    fn v1_envelope_with_coverage_pct_field_still_deserializes() {
+        // A v1 envelope carrying coverage_pct + last_validated_at
+        // round-trips through v2 deserialization (the dropped field
+        // is ignored). Tests the migration path for downstream
+        // consumers who cached v1 JSON.
+        let v1 = r#"{
+            "schema_version": 1,
+            "host": {"os":"linux","os_release":"6.5.0","arch":"x86_64"},
+            "bsd": null,
+            "linux": null,
+            "macos": null,
+            "mounts": [],
+            "arbitrary_undo_coverage": {
+                "covered_classes": ["fs-rename"],
+                "refused_classes": ["remote-push"],
+                "coverage_pct": 50,
+                "last_validated_at": "2026-01-01T00:00:00Z"
+            }
+        }"#;
+        let r: DoctorReport = serde_json::from_str(v1).expect("deserialize v1");
+        assert_eq!(r.arbitrary_undo_coverage.covered_classes, vec!["fs-rename"]);
+        assert_eq!(r.arbitrary_undo_coverage.refused_classes, vec!["remote-push"]);
+        assert_eq!(
+            r.arbitrary_undo_coverage.last_validated_at,
+            "2026-01-01T00:00:00Z"
+        );
+        // v2-only count fields default to zero.
+        assert_eq!(r.arbitrary_undo_coverage.covered_count, 0);
     }
 
     #[test]
