@@ -165,6 +165,19 @@ pub static PUMP: OnceLock<PumpHandle> = OnceLock::new();
 pub enum CaptureRecord {
     PreImage(PreImageRecord),
     TreeOp(TreeOpRecord),
+    /// Metadata-only change (chmod/chown/touch). No clonefile — the
+    /// `before`/`after` snapshots carry everything undo needs.
+    MetadataChange(MetadataChangeRecord),
+}
+
+pub struct MetadataChangeRecord {
+    pub command: CommandId,
+    pub path: PathBuf,
+    pub dev: u64,
+    pub inode: u64,
+    pub before: shit_proto::FileMetadataWire,
+    pub after: shit_proto::FileMetadataWire,
+    pub ts_unix_nanos: u64,
 }
 
 pub struct PreImageRecord {
@@ -262,6 +275,11 @@ extern "C" fn producer_invoke(
         handle_auth_truncate(pump, client, message, &msg);
     } else if event_type == sys::es_event_type_t::AUTH_OPEN {
         handle_auth_open(pump, client, message, &msg);
+    } else if event_type == sys::es_event_type_t::AUTH_SETMODE
+        || event_type == sys::es_event_type_t::AUTH_SETOWNER
+        || event_type == sys::es_event_type_t::AUTH_UTIMES
+    {
+        handle_auth_metadata(pump, client, message, &msg, event_type);
     }
     // Unknown event type — shouldn't happen since we control the
     // subscription set. Respond ALLOW if it's an AUTH variant we
@@ -584,6 +602,121 @@ fn handle_auth_truncate(
     enqueue_capture_record(pump, client, message, record, Some(&staging_path));
 }
 
+/// Metadata-mutation handler (M03.1.I.D). Catches AUTH_SETMODE,
+/// AUTH_SETOWNER, AUTH_UTIMES. Each event carries the new value(s)
+/// + a target file whose kernel-attached stat captures the BEFORE
+///   snapshot. We assemble `before` + `after` `FileMetadataWire`
+///   values + queue a MetadataChange record; no clonefile, no staging.
+///
+/// All three pass through ALLOW unconditionally — denying a metadata
+/// mutation is louder than the user's chmod/chown/touch typo, and
+/// we capture enough to invert the change regardless.
+fn handle_auth_metadata(
+    pump: &PumpHandle,
+    client: *mut sys::es_client_t,
+    message: *const c_void,
+    msg: &EsMessage<'_>,
+    event_type: sys::es_event_type_t,
+) {
+    let token = msg.process_audit_token();
+    let pid = pid_from_audit_token(&token);
+    let command = match pump.tracked_pids.lock() {
+        Ok(g) => g.get(&pid).copied(),
+        Err(_) => None,
+    };
+    let Some(command) = command else {
+        respond_allow(client, message);
+        return;
+    };
+    pump.events_passed_filter.fetch_add(1, Ordering::Relaxed);
+
+    // Extract (target_file_ptr, after-snapshot deltas) from the
+    // event-specific payload. `after` starts as a copy of `before`;
+    // only the fields the syscall actually mutates get overwritten.
+    let (target_ptr, after_delta) = if event_type == sys::es_event_type_t::AUTH_SETMODE {
+        match msg.as_setmode() {
+            Some(e) => (e.target, MetaDelta::Mode(e.mode as u32)),
+            None => {
+                respond_allow(client, message);
+                return;
+            }
+        }
+    } else if event_type == sys::es_event_type_t::AUTH_SETOWNER {
+        match msg.as_setowner() {
+            Some(e) => (e.target, MetaDelta::Owner(e.uid, e.gid)),
+            None => {
+                respond_allow(client, message);
+                return;
+            }
+        }
+    } else if event_type == sys::es_event_type_t::AUTH_UTIMES {
+        match msg.as_utimes() {
+            Some(e) => (
+                e.target,
+                MetaDelta::Mtime(
+                    (e.mtime.tv_sec as i128) * 1_000_000_000 + (e.mtime.tv_nsec as i128),
+                ),
+            ),
+            None => {
+                respond_allow(client, message);
+                return;
+            }
+        }
+    } else {
+        respond_allow(client, message);
+        return;
+    };
+
+    if target_ptr.is_null() {
+        respond_allow(client, message);
+        return;
+    }
+    let file = unsafe { &*target_ptr };
+    let target_path = unsafe { file.path.as_path() };
+    let stat = file.stat;
+
+    let before = shit_proto::FileMetadataWire {
+        mode: stat.st_mode as u32,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        size: stat.st_size as u64,
+        mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        xattrs: std::collections::BTreeMap::new(),
+    };
+    let mut after = before.clone();
+    match after_delta {
+        MetaDelta::Mode(new) => after.mode = new,
+        MetaDelta::Owner(new_uid, new_gid) => {
+            after.uid = new_uid;
+            after.gid = new_gid;
+        }
+        MetaDelta::Mtime(new_ns) => after.mtime_unix_nanos = new_ns,
+    }
+
+    let ts_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let record = CaptureRecord::MetadataChange(MetadataChangeRecord {
+        command,
+        path: target_path.to_path_buf(),
+        dev: stat.st_dev as u64,
+        inode: stat.st_ino,
+        before,
+        after,
+        ts_unix_nanos,
+    });
+    enqueue_capture_record(pump, client, message, record, None);
+}
+
+/// What field(s) of FileMetadataWire to update for `after`.
+enum MetaDelta {
+    Mode(u32),
+    Owner(u32, u32),
+    Mtime(i128),
+}
+
 /// Kernel `FFLAGS` write-intent bits. From `<sys/fcntl.h>`:
 /// FREAD=0x01, FWRITE=0x02. FAPPEND (0x08) implies write but
 /// post-pends; the original bytes survive an append, so we don't
@@ -888,7 +1021,7 @@ fn cleanup_dropped_record(rec: CaptureRecord, fallback_path: Option<&Path>) {
             drop(p.staging_fd);
             let _ = std::fs::remove_file(&p.staging_path);
         }
-        CaptureRecord::TreeOp(_) => {
+        CaptureRecord::TreeOp(_) | CaptureRecord::MetadataChange(_) => {
             if let Some(p) = fallback_path {
                 let _ = std::fs::remove_file(p);
             }
@@ -1103,6 +1236,9 @@ impl PumpState {
             sys::es_event_type_t::AUTH_UNLINK,
             sys::es_event_type_t::AUTH_RENAME,
             sys::es_event_type_t::AUTH_TRUNCATE,
+            sys::es_event_type_t::AUTH_SETMODE,
+            sys::es_event_type_t::AUTH_SETOWNER,
+            sys::es_event_type_t::AUTH_UTIMES,
             sys::es_event_type_t::NOTIFY_EXEC,
             sys::es_event_type_t::NOTIFY_FORK,
             sys::es_event_type_t::NOTIFY_EXIT,
@@ -1218,6 +1354,7 @@ impl PumpState {
         match rec {
             CaptureRecord::PreImage(p) => self.emit_captured_preimage(p),
             CaptureRecord::TreeOp(t) => self.emit_tree_mutation(t),
+            CaptureRecord::MetadataChange(m) => self.emit_metadata_change(m),
         }
         if let Some(pump) = PUMP.get() {
             pump.events_emitted.fetch_add(1, Ordering::Relaxed);
@@ -1308,6 +1445,27 @@ impl PumpState {
                 seq = rec.command.seq,
                 err = %e,
                 "macos-es TreeMutation send failed"
+            );
+        }
+    }
+
+    fn emit_metadata_change(&self, rec: MetadataChangeRecord) {
+        let resp = HelperResponse::CapturedMetadataChange {
+            session: rec.command.session,
+            seq: rec.command.seq,
+            dev: rec.dev,
+            inode: rec.inode,
+            path: path_to_string(&rec.path),
+            before: rec.before,
+            after: rec.after,
+            ts_unix_nanos: rec.ts_unix_nanos,
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(
+                %rec.command.session,
+                seq = rec.command.seq,
+                err = %e,
+                "macos-es CapturedMetadataChange send failed"
             );
         }
     }
