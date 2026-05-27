@@ -202,6 +202,13 @@ enum Cmd {
     #[cfg(target_os = "macos")]
     #[command(name = "setup-es-mode")]
     SetupEsMode(cmd::setup_es_mode::SetupEsModeArgs),
+
+    /// macOS dyld-shim install/uninstall/status (M07.A).
+    /// Wires the user's shell rc to export DYLD_INSERT_LIBRARIES
+    /// pointing at the locally-built (or installed) shim dylib.
+    #[cfg(target_os = "macos")]
+    #[command(name = "dyld-hooks")]
+    DyldHooks(cmd::dyld_hooks::DyldHooksArgs),
 }
 
 #[derive(Subcommand)]
@@ -400,6 +407,8 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
         }
         #[cfg(target_os = "macos")]
         Cmd::SetupEsMode(args) => Ok(cmd::setup_es_mode::run(args)?),
+        #[cfg(target_os = "macos")]
+        Cmd::DyldHooks(args) => Ok(cmd::dyld_hooks::run(args)?),
     }
 }
 
