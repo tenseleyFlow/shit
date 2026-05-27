@@ -1448,7 +1448,8 @@ jobs:
                     non-ascii-filename-undo-fbsd.sh \
                     hardlink-rm-undo-fbsd.sh \
                     symlink-replace-undo-fbsd.sh \
-                    xattr-undo-fbsd.sh"
+                    xattr-undo-fbsd.sh \
+                    post-hash-non-delete-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
