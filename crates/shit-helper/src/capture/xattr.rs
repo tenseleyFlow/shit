@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Extended-attribute capture (W09.21).
+//! Extended-attribute capture (W09.21 / M03.x.XATTR on macOS).
 //!
-//! Reads all user-namespace xattrs off a file descriptor into a
-//! `BTreeMap<String, Vec<u8>>` (ordered for stable hashing). FreeBSD
-//! uses `extattr_list_fd(2)` / `extattr_get_fd(2)` with
-//! `EXTATTR_NAMESPACE_USER`; Linux uses `flistxattr(2)` /
-//! `fgetxattr(2)` restricted to the `user.` prefix. Other targets
-//! return an empty map.
+//! Reads xattrs off a file descriptor into a
+//! `BTreeMap<String, Vec<u8>>` (ordered for stable hashing). Per-OS:
 //!
-//! ## Why user namespace only
-//!
-//! `EXTATTR_NAMESPACE_SYSTEM` (FreeBSD) and `security.*` /
-//! `trusted.*` (Linux) require root. The helper *might* be privileged,
-//! but the planner-side restore would also need root — and most tools
-//! that set xattrs (setfattr, setextattr, rsync, tar with `--xattrs`)
-//! default to the user namespace. We can extend coverage later if a
-//! concrete tool needs it.
+//! - **FreeBSD:** `extattr_list_fd(2)` / `extattr_get_fd(2)` with
+//!   `EXTATTR_NAMESPACE_USER` only. System namespace requires root +
+//!   the planner-side restore would also need root.
+//! - **macOS:** `flistxattr(2)` / `fgetxattr(2)` — captures the FULL
+//!   xattr set including `com.apple.*` (Gatekeeper quarantine,
+//!   Spotlight metadata, FinderInfo, ACLs, codesign signatures).
+//!   Restoring a file without its xattrs leaves it broken in
+//!   user-visible ways (signed binaries unsigned, quarantined
+//!   apps un-quarantined, etc.).
+//! - **Linux:** stubbed pending the L04 pre_open_tree integration —
+//!   adding flistxattr to that hot path crashed the runner; see
+//!   note below.
 
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
@@ -48,7 +48,11 @@ pub fn read_user_xattrs(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
     {
         freebsd::read(fd)
     }
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::read(fd)
+    }
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
     {
         let _ = fd;
         BTreeMap::new()
@@ -114,6 +118,85 @@ mod freebsd {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::os::fd::RawFd;
+
+    unsafe extern "C" {
+        fn flistxattr(
+            fd: libc::c_int,
+            namebuf: *mut libc::c_char,
+            size: libc::size_t,
+            options: libc::c_int,
+        ) -> libc::ssize_t;
+
+        fn fgetxattr(
+            fd: libc::c_int,
+            name: *const libc::c_char,
+            value: *mut libc::c_void,
+            size: libc::size_t,
+            position: u32,
+            options: libc::c_int,
+        ) -> libc::ssize_t;
+    }
+
+    /// Apple's xattr list format: NUL-terminated names concatenated.
+    /// Different from FreeBSD's length-prefixed form. Empty value
+    /// list returns 0 with success (no xattrs).
+    ///
+    /// Capture the FULL xattr set on macOS — `com.apple.quarantine`,
+    /// codesign signatures, Spotlight metadata, ACLs, FinderInfo —
+    /// all need restoration during undo or the file ends up
+    /// user-visibly broken (signed binaries unsigned, etc.).
+    pub fn read(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
+        // First call with NULL/0 → returns the size needed.
+        // SAFETY: passing 0/NULL is the documented size-query form;
+        // fd is borrowed-valid for this call.
+        let list_size = unsafe { flistxattr(fd, std::ptr::null_mut(), 0, 0) };
+        if list_size <= 0 {
+            return BTreeMap::new();
+        }
+        let mut buf = vec![0u8; list_size as usize];
+        // SAFETY: buf has list_size bytes; fd borrowed-valid.
+        let n = unsafe { flistxattr(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n <= 0 {
+            return BTreeMap::new();
+        }
+        let mut out = BTreeMap::new();
+        // Split on NUL; skip the trailing empty slice the split
+        // produces when the buffer ends with a NUL.
+        for name_bytes in buf[..n as usize]
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+        {
+            let Ok(name) = std::str::from_utf8(name_bytes) else {
+                continue;
+            };
+            let Ok(cname) = CString::new(name) else {
+                continue;
+            };
+            // SAFETY: cname NUL-terminated; fd borrowed-valid;
+            // value=NULL/size=0 is the size-query form.
+            let val_size = unsafe { fgetxattr(fd, cname.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+            if val_size < 0 {
+                continue;
+            }
+            let mut val = vec![0u8; val_size as usize];
+            // SAFETY: val has val_size bytes; fd + cname still valid.
+            let m =
+                unsafe { fgetxattr(fd, cname.as_ptr(), val.as_mut_ptr().cast(), val.len(), 0, 0) };
+            if m < 0 {
+                continue;
+            }
+            val.truncate(m as usize);
+            out.insert(name.to_string(), val);
+        }
+        out
+    }
+}
+
 #[cfg(all(test, target_os = "freebsd"))]
 mod tests {
     use super::*;
@@ -127,5 +210,49 @@ mod tests {
             got.is_empty(),
             "unexpected xattrs on fresh tempfile: {got:?}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests_macos {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    // NOTE: macOS Sonoma+ auto-stamps `com.apple.provenance` on every
+    // newly-created file, so we can't assert "fresh file has no
+    // xattrs". The smoke gate is "we can read xattrs and round-trip
+    // a user-set one without corrupting it".
+
+    #[test]
+    fn round_trips_a_user_xattr() {
+        // Set an xattr via shell `xattr -w` (Apple's CLI) on a real
+        // file in tempdir, then read it via our binding. Skips if
+        // `xattr` is unavailable (CI image quirk).
+        let xattr = match std::process::Command::new("xattr").arg("-h").output() {
+            Ok(o) if o.status.success() => "xattr",
+            _ => {
+                eprintln!("skip: `xattr` CLI not present");
+                return;
+            }
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("xattr-target.txt");
+        std::fs::File::create(&p).unwrap().write_all(b"x").unwrap();
+        let set = std::process::Command::new(xattr)
+            .args(["-w", "com.example.shit-test", "the-value"])
+            .arg(&p)
+            .status()
+            .expect("xattr -w");
+        if !set.success() {
+            eprintln!("skip: xattr -w returned non-success — fs likely lacks xattr support");
+            return;
+        }
+        let f = std::fs::File::open(&p).unwrap();
+        let got = read_user_xattrs(f.as_raw_fd());
+        let val = got
+            .get("com.example.shit-test")
+            .expect("xattr key not captured");
+        assert_eq!(val, b"the-value", "captured xattr value mismatch");
     }
 }

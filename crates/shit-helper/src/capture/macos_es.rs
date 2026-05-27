@@ -1546,8 +1546,11 @@ impl PumpState {
             uid: rec.uid,
             gid: rec.gid,
             mtime_unix_nanos: rec.mtime_unix_nanos,
-            // M03.1.I scope: no xattr capture (follow-up).
-            xattrs: std::collections::BTreeMap::new(),
+            // M03.x.XATTR — read off the staging fd. clonefile
+            // preserved xattrs at clone time; the staging fd points
+            // at a stable snapshot. Best-effort; missing xattr
+            // support yields an empty map.
+            xattrs: crate::capture::xattr::read_user_xattrs(rec.staging_fd.as_raw_fd()),
             is_delete: rec.is_delete,
             fd_sent_via_scm: true,
         };
