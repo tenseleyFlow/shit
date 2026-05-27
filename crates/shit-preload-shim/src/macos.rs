@@ -54,6 +54,19 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
     unsafe { libc::unlink(pathname) }
 }
 
+/// Replacement for `unlinkat(2)`. Modern coreutils (`rm`, `find`,
+/// `git`'s clean path) prefer the dirfd-relative variant over bare
+/// `unlink`; missing the interposer would leave `rm -r` silently
+/// uncovered.
+///
+/// # Safety
+/// Same contract as `libc::unlinkat` — `pathname` must point to a
+/// valid NUL-terminated C string; `dirfd` must be `AT_FDCWD` or
+/// an open dirfd; `flags` is `0` or `AT_REMOVEDIR`.
+unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
+    unsafe { libc::unlinkat(dirfd, pathname, flags) }
+}
+
 /// `__DATA,__interpose` table entry for `unlink`. The dynamic
 /// linker reads this at image-load time and rewrites the
 /// lazy-binding stubs for `unlink` in the host process to point
@@ -68,6 +81,13 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
 static INTERPOSE_UNLINK: InterposeEntry = InterposeEntry {
     replacement: my_unlink as *const c_void,
     target: libc::unlink as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_UNLINKAT: InterposeEntry = InterposeEntry {
+    replacement: my_unlinkat as *const c_void,
+    target: libc::unlinkat as *const c_void,
 };
 
 /// `(replacement, target)` pair the dynamic linker expects in
@@ -105,5 +125,12 @@ mod tests {
             INTERPOSE_UNLINK.replacement, INTERPOSE_UNLINK.target,
             "replacement and target must be distinct function addresses"
         );
+    }
+
+    #[test]
+    fn unlinkat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_UNLINKAT.replacement.is_null());
+        assert!(!INTERPOSE_UNLINKAT.target.is_null());
+        assert_ne!(INTERPOSE_UNLINKAT.replacement, INTERPOSE_UNLINKAT.target);
     }
 }
