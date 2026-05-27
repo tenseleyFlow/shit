@@ -55,6 +55,7 @@ __shit_pre() {
         --shell bash \
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
+        --cmdline "$BASH_COMMAND" \
         >/dev/null 2>&1 || true
     # AR06.1/.2/.3 — shell-state snapshot: pwd + set-opts +
     # aliases. Functions (AR06.4) land in a follow-up. We pipe

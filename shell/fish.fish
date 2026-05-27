@@ -42,6 +42,7 @@ function __shit_pre --on-event fish_preexec
         --shell fish \
         --depth (count $SHLVL >/dev/null; and echo $SHLVL; or echo 1) \
         --sock $_SHIT_SOCK \
+        --cmdline "$argv" \
         >/dev/null 2>&1
     # AR06.1 / AR06.6 — pwd-only shell-state snapshot. fish has
     # no `set -o` (opts always emit as informational comments;
