@@ -170,6 +170,7 @@ fn handle(
             cwd_dev,
             cwd_path,
             shell_kind,
+            cmd_string,
             ..
         } => {
             info!(
@@ -192,7 +193,10 @@ fn handle(
             active.insert(*pid, command);
             let cmd = CommandRecord {
                 command,
-                cmd_string: None,
+                // AU26: shell hooks ship `$BASH_COMMAND` (or the zsh
+                // / fish equivalent) so the planner's refuse-list
+                // match has the command string to operate on.
+                cmd_string: cmd_string.clone(),
                 cwd: PathBuf::from(cwd_path),
                 pid: *pid,
                 shell_kind: *shell_kind,

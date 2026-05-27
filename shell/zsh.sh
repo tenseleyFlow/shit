@@ -45,6 +45,7 @@ __shit_pre() {
         --shell zsh \
         --depth "${SHLVL:-1}" \
         --sock "$_SHIT_SOCK" \
+        --cmdline "${1:-}" \
         >/dev/null 2>&1 || true
     # AR06.1/.2/.3 — shell-state snapshot: pwd + set-opts + aliases.
     __shit_collect_shell_state | "$_SHIT_BIN" hook-send pre-exec-shell-state \

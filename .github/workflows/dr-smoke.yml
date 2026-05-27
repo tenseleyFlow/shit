@@ -241,6 +241,35 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  refuse-cmd-string-wire:
+    # AU26 — refuse-list cmd_string wire end-to-end. Validates that
+    # PreExec --cmdline plumbs through to CommandRecord.cmd_string,
+    # and that `git push origin main` triggers the refuse-list
+    # short-circuit (exit non-zero + remote-push class named).
+    # Tier-agnostic; runs on the default Ubuntu image without
+    # special caps.
+    name: refuse-cmd-string-wire smoke (AU26)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/refuse-cmd-string-wire-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refuse-cmd-string-wire-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   refuse-without-native-delegate:
     # AR02.5 -- validates the synthesis-fallback branch of the
     # native-undo-delegation contract: on apt < 3.2 (no native

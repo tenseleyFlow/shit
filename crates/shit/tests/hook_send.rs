@@ -57,6 +57,7 @@ fn preexec_round_trips_through_cli() {
             depth,
             cwd_inode,
             cwd_dev,
+            cmd_string,
             ..
         } => {
             assert_eq!(seq, 42);
@@ -65,10 +66,62 @@ fn preexec_round_trips_through_cli() {
             assert_eq!(depth, 1);
             assert!(cwd_inode != 0, "cwd_inode should be populated from stat()");
             assert!(cwd_dev != 0, "cwd_dev should be populated from stat()");
+            // AU26: backward-compat — omitting --cmdline produces None.
+            assert_eq!(cmd_string, None, "no --cmdline should ship cmd_string=None");
         }
         m => panic!("expected PreExec, got {m:?}"),
     }
 }
+
+/// AU26: `--cmdline "git push origin main"` produces
+/// `cmd_string: Some("git push origin main")` on the wire.
+/// Verifies the cmdline plumbs through send.rs into the
+/// HookMessage::PreExec frame without mangling.
+#[test]
+fn preexec_cmdline_plumbs_through_to_wire() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("test.sock");
+    let listener = listener_at(&sock);
+
+    let status = Command::new(shit_bin())
+        .args([
+            "hook-send",
+            "pre-exec",
+            "--session",
+            "00000000-0000-0000-0000-000000000001",
+            "--seq",
+            "1",
+            "--pid",
+            "1234",
+            "--cwd",
+        ])
+        .arg(tmp.path())
+        .args(["--shell", "bash", "--depth", "1", "--sock"])
+        .arg(&sock)
+        .args(["--cmdline", "git push origin main"])
+        .status()
+        .expect("spawn shit");
+    assert!(status.success(), "shit hook-send pre-exec --cmdline failed");
+
+    match recv_one(&listener) {
+        HookMessage::PreExec { cmd_string, .. } => {
+            assert_eq!(
+                cmd_string.as_deref(),
+                Some("git push origin main"),
+                "cmdline should ship through verbatim"
+            );
+        }
+        m => panic!("expected PreExec, got {m:?}"),
+    }
+}
+
+// AU26: truncation behavior (over-cap inputs cut at the nearest
+// char boundary) is unit-tested in `shit-proto::tests`. We don't
+// retest via the CLI here because macOS UDS DGRAM defaults cap
+// payloads at ~2 KiB, smaller than the 4 KiB cmdline cap — going
+// over UDS would conflate the cmdline cap with the kernel datagram
+// limit. The unit tests in shit-proto cover the truncation in
+// isolation.
 
 #[test]
 fn postexec_round_trips_through_cli() {

@@ -24,6 +24,7 @@ fn sample_preexec() -> HookMessage {
         ts_unix_nanos: 1_700_000_100_000_000_000,
         shell_kind: ShellKind::Zsh,
         depth: 1,
+        cmd_string: Some("git push origin main".to_string()),
     }
 }
 
