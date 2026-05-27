@@ -32,6 +32,8 @@ mod crash;
 mod db;
 #[cfg(target_os = "linux")]
 mod ebpf;
+#[cfg(target_os = "macos")]
+mod es;
 #[cfg(target_os = "linux")]
 mod fanotify;
 #[cfg(target_os = "macos")]
@@ -347,6 +349,25 @@ enum Mode {
         #[arg(long)]
         daemon_sock: PathBuf,
     },
+    /// M03.1.C — `shit doctor` ES client-creation probe (macOS only).
+    ///
+    /// Attempts `es_new_client` with a no-op handler, immediately
+    /// tears down via `es_delete_client`, prints a single-line JSON
+    /// result. Doctor parses to fill
+    /// `MacReport.endpoint_security.entitlement_present`.
+    ///
+    /// Output shape:
+    /// ```
+    /// {"result":"Success"} | {"result":"NotEntitled"} | {"result":"NotPermitted"}
+    ///   | {"result":"NotPrivileged"} | {"result":"InvalidArgument"}
+    ///   | {"result":"InternalError"} | {"result":"TooManyClients"}
+    ///   | {"result":"UnknownResult","raw":<u32>}
+    /// ```
+    ///
+    /// Always exits 0; the caller reads the JSON to discover the
+    /// kernel verdict.
+    #[command(name = "es-probe")]
+    EsProbe,
     /// L05 — `shit doctor` Linux fanotify functional probe.
     ///
     /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
@@ -571,8 +592,46 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         } => cloud::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
+        Mode::EsProbe => run_es_probe(),
         Mode::ProbeFanotify => run_probe_fanotify(),
         Mode::ProbeEbpf => run_probe_ebpf(),
+    }
+}
+
+/// M03.1.C — ES client-creation probe. Calls `es_new_client`,
+/// immediately tears down via `es_delete_client`, prints a one-line
+/// JSON result the doctor parses. Always exits 0; caller reads the
+/// JSON.
+///
+/// On non-macOS targets this exits with a "not supported" JSON line
+/// so the doctor (cross-platform) can call it without a target_os
+/// check.
+fn run_es_probe() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let r = crate::es::probe_client_creation();
+        // Emit the variant name verbatim plus the raw u32 for the
+        // UnknownResult variant. Hand-rolled to avoid pulling
+        // serde into this binary just for one line.
+        let line = match r {
+            crate::es::ProbeResult::UnknownResult(raw) => {
+                format!(r#"{{"result":"UnknownResult","raw":{raw}}}"#)
+            }
+            crate::es::ProbeResult::Success => r#"{"result":"Success"}"#.into(),
+            crate::es::ProbeResult::NotEntitled => r#"{"result":"NotEntitled"}"#.into(),
+            crate::es::ProbeResult::NotPermitted => r#"{"result":"NotPermitted"}"#.into(),
+            crate::es::ProbeResult::NotPrivileged => r#"{"result":"NotPrivileged"}"#.into(),
+            crate::es::ProbeResult::InvalidArgument => r#"{"result":"InvalidArgument"}"#.into(),
+            crate::es::ProbeResult::InternalError => r#"{"result":"InternalError"}"#.into(),
+            crate::es::ProbeResult::TooManyClients => r#"{"result":"TooManyClients"}"#.into(),
+        };
+        println!("{line}");
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!(r#"{{"result":"NotSupportedOnThisOs"}}"#);
+        Ok(())
     }
 }
 

@@ -635,21 +635,132 @@ fn worker_main(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// EndpointSecurity (M02 stub)
+// EndpointSecurity (M03.1.C — wired)
 // ─────────────────────────────────────────────────────────────────────
 
-/// EndpointSecurity probe. M02 stages this — the real probe lands
-/// in M03's first commit when the ES FFI bindings ship in
-/// `shit-helper`. Until then we return a clearly-marked
-/// "not yet implemented" report so the doctor can render an honest
-/// remediation line.
+/// EndpointSecurity probe. Spawns the helper's `es-probe`
+/// subcommand (M03.1.C), parses the one-line JSON it prints, and
+/// maps to [`EndpointSecurityReport`].
+///
+/// The helper actually attempts `es_new_client` with a no-op
+/// handler and reports the kernel verdict. Doctor caller runs as
+/// the user (not root); the helper subprocess inherits user
+/// privileges. On a stock SIP-on macOS without entitlement that
+/// means we'll get `NotPrivileged` or `NotEntitled` depending on
+/// host check ordering — both are reported honestly via the
+/// `notes` field.
+///
+/// To get a Success result from the probe, the helper must run in
+/// a context where ES is unlocked:
+/// - SIP off + AMFI bypass (Tart VM dev), OR
+/// - Signed + notarized binary with the entitlement (M04 +
+///   Apple paperwork), OR
+/// - Running as root WITH one of the above.
 pub fn probe_endpoint_security() -> EndpointSecurityReport {
+    let Some(bin) = find_helper_bin() else {
+        return EndpointSecurityReport {
+            entitlement_present: false,
+            fda_granted: false,
+            client_can_subscribe: false,
+            subscribed_event_kinds: vec![],
+            notes: vec![
+                "no helper binary found on disk — build via `cargo build -p shit-helper` \
+                 or install the release artifact"
+                    .into(),
+            ],
+        };
+    };
+
+    let out = Command::new(&bin).arg("es-probe").output();
+    let stdout = match &out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(o) => {
+            return EndpointSecurityReport {
+                notes: vec![format!(
+                    "shit-helper es-probe exited {} (stderr: {})",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )],
+                ..Default::default()
+            };
+        }
+        Err(e) => {
+            return EndpointSecurityReport {
+                notes: vec![format!("spawn shit-helper es-probe failed: {e}")],
+                ..Default::default()
+            };
+        }
+    };
+
+    let line = stdout.lines().next().unwrap_or("").trim();
+    parse_es_probe_line(line)
+}
+
+/// Parse the one-line JSON the helper's `es-probe` emits. Hand-rolled
+/// (no serde_json import needed for one field) and tolerant of the
+/// `UnknownResult,"raw":<u32>` two-field shape.
+fn parse_es_probe_line(line: &str) -> EndpointSecurityReport {
+    let result = line.split('"').nth(3).unwrap_or("").to_string();
+    let (entitlement_present, client_can_subscribe, note) = match result.as_str() {
+        "Success" => (
+            true,
+            true,
+            "ES client created successfully (kernel SUCCESS)".to_string(),
+        ),
+        "NotEntitled" => (
+            false,
+            false,
+            "ES returned NOT_ENTITLED — missing entitlement on signed binary, \
+             OR running ad-hoc on a system without AMFI bypass"
+                .to_string(),
+        ),
+        "NotPermitted" => (
+            true, // entitlement check passed; TCC is the gate
+            false,
+            "ES returned NOT_PERMITTED — entitlement OK but Full Disk Access \
+             not granted; remediate via System Settings → Privacy → Full Disk Access"
+                .to_string(),
+        ),
+        "NotPrivileged" => (
+            false,
+            false,
+            "ES returned NOT_PRIVILEGED — helper not running as root. \
+             Production helpers run as root via shitd; the doctor's user-context \
+             probe correctly reports this gap"
+                .to_string(),
+        ),
+        "InvalidArgument" => (
+            false,
+            false,
+            "ES returned INVALID_ARGUMENT (probe bug)".into(),
+        ),
+        "InternalError" => (
+            false,
+            false,
+            "ES returned INTERNAL_ERROR (host-side ES issue)".into(),
+        ),
+        "TooManyClients" => (
+            false,
+            false,
+            "ES returned TOO_MANY_CLIENTS — host saturated; close other ES clients".into(),
+        ),
+        "NotSupportedOnThisOs" => (
+            false,
+            false,
+            "ES not supported on this OS (probe ran on non-macOS helper)".into(),
+        ),
+        other => (
+            false,
+            false,
+            format!("unknown es-probe result '{other}' (line: '{line}')"),
+        ),
+    };
     EndpointSecurityReport {
-        entitlement_present: false,
+        entitlement_present,
         fda_granted: false, // overwritten by the doctor with the FDA probe's result
-        client_can_subscribe: false,
+        client_can_subscribe,
         subscribed_event_kinds: vec![],
-        notes: vec!["ES probe not yet implemented (M03)".into()],
+        notes: vec![note],
     }
 }
 
@@ -766,11 +877,51 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_security_stub_returns_m03_pending() {
-        let r = probe_endpoint_security();
+    fn es_probe_parser_success() {
+        let r = parse_es_probe_line(r#"{"result":"Success"}"#);
+        assert!(r.entitlement_present);
+        assert!(r.client_can_subscribe);
+        assert!(r.notes.iter().any(|n| n.contains("SUCCESS")));
+    }
+
+    #[test]
+    fn es_probe_parser_not_entitled() {
+        let r = parse_es_probe_line(r#"{"result":"NotEntitled"}"#);
         assert!(!r.entitlement_present);
         assert!(!r.client_can_subscribe);
-        assert!(r.notes.iter().any(|n| n.contains("M03")));
+        assert!(r.notes.iter().any(|n| n.contains("NOT_ENTITLED")));
+    }
+
+    #[test]
+    fn es_probe_parser_not_permitted_keeps_entitlement_true() {
+        // NOT_PERMITTED means entitlement check passed but TCC denied.
+        let r = parse_es_probe_line(r#"{"result":"NotPermitted"}"#);
+        assert!(r.entitlement_present);
+        assert!(!r.client_can_subscribe);
+        assert!(r.notes.iter().any(|n| n.contains("Full Disk Access")));
+    }
+
+    #[test]
+    fn es_probe_parser_not_privileged() {
+        let r = parse_es_probe_line(r#"{"result":"NotPrivileged"}"#);
+        assert!(!r.entitlement_present);
+        assert!(!r.client_can_subscribe);
+        assert!(r.notes.iter().any(|n| n.contains("root")));
+    }
+
+    #[test]
+    fn es_probe_parser_unknown_result_carried_verbatim() {
+        let r = parse_es_probe_line(r#"{"result":"SomethingNew","raw":99}"#);
+        assert!(!r.entitlement_present);
+        assert!(r.notes.iter().any(|n| n.contains("SomethingNew")));
+    }
+
+    #[test]
+    fn es_probe_parser_garbage_input_is_safe() {
+        let r = parse_es_probe_line("");
+        assert!(!r.entitlement_present);
+        // Empty input → result string is empty → falls into the
+        // "unknown" arm with an empty token.
     }
 
     #[test]

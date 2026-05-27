@@ -52,10 +52,13 @@ aya = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # CoreFoundation runloop + string + array types for the FSEvents
-# producer (M01) and, later, the EndpointSecurity client (M03).
-# We declare the FSEvents `extern "C"` surface inline in
-# `src/fsevents.rs` because the API is small (~10 functions) and a
-# vendored binding gives us tighter control than an external crate.
+# producer (M01) and the EndpointSecurity client (M03). The
+# FSEvents `extern "C"` surface lives inline in `src/fsevents.rs`;
+# the ES surface lives inline in `src/es/sys.rs`. We vendor both
+# rather than depending on wrapper crates to match the project's
+# "own the FFI" pattern (shit-capture/src/cow/clonefile_macos.rs,
+# our raw kqueue on BSD via libc, etc.). Reference for the ES
+# bindings: HarfangLab/endpoint-sec at github.com.
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
