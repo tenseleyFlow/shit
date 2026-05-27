@@ -351,3 +351,74 @@ smoke_wait_for_event() {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/shitd.log" >&2 || true
     smoke_fail "timed out waiting for ${min}+ events matching '${predicate}'"
 }
+
+# AU15 — assert that running `shit undo` for a refused class
+# produces the expected refusal output: exit non-zero, log
+# contains "Refused"/"out of scope" wording, log names the
+# class. Pre-AU26 the refuse-list catalog was unreachable at
+# runtime; this helper validates the wire is alive end-to-end.
+#
+# Args:
+#   $1 = class name (e.g. "remote-push") — must match
+#        crates/shit-planner/src/refuse.rs::CATALOG[].class.
+#   $2 = cmdline to feed PreExec via --cmdline. Must be one
+#        of the catalog patterns for that class (e.g.
+#        "git push origin main" for remote-push).
+#
+# Assumes:
+#   - `smoke_start_shitd` has been called.
+#   - $SHIT_BIN, $SHIT_HOOK_SOCK are set.
+#   - cwd is somewhere safe (the smoke's scratch dir).
+#
+# Side effects:
+#   - Sends one full SessionOpen → PreExec → PostExec →
+#     SessionClose cycle with seq=1.
+#   - Runs `shit undo --yes` and tees the log to
+#     $SHIT_SMOKE_TMP/undo-${class}.log.
+#   - Calls smoke_fail on any mismatch.
+smoke_refuse_assert() {
+    local class="$1"
+    local cmdline="$2"
+    if [ -z "${class}" ] || [ -z "${cmdline}" ]; then
+        smoke_fail "smoke_refuse_assert: usage <class> <cmdline>"
+    fi
+    local session
+    session="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    local pid="$$"
+    local log="${SHIT_SMOKE_TMP}/undo-${class}.log"
+
+    "${SHIT_BIN}" hook-send session-open \
+        --session "${session}" --pid "${pid}" --shell bash \
+        --tty "$(tty 2>/dev/null || echo /dev/null)" \
+        --sock "${SHIT_HOOK_SOCK}"
+    "${SHIT_BIN}" hook-send pre-exec \
+        --session "${session}" --seq 1 --pid "${pid}" \
+        --cwd "$(pwd)" --shell bash --depth 1 \
+        --cmdline "${cmdline}" \
+        --sock "${SHIT_HOOK_SOCK}"
+    "${SHIT_BIN}" hook-send post-exec \
+        --session "${session}" --seq 1 --exit-code 0 \
+        --sock "${SHIT_HOOK_SOCK}"
+
+    smoke_log "running: shit undo --yes (refused class=${class}, cmdline='${cmdline}')"
+    local rc=0
+    "${SHIT_BIN}" undo --yes 2>&1 | tee "${log}" || rc=$?
+
+    if [ "${rc}" -eq 0 ]; then
+        sed 's/^/    /' "${log}" >&2
+        smoke_fail "shit undo exited 0 for refused class=${class}; refusal didn't fire"
+    fi
+    if ! grep -qiE "refuse|out of scope" "${log}"; then
+        sed 's/^/    /' "${log}" >&2
+        smoke_fail "shit undo for ${class} exited ${rc} but log doesn't mention refuse / out of scope"
+    fi
+    if ! grep -qF "${class}" "${log}"; then
+        sed 's/^/    /' "${log}" >&2
+        smoke_fail "shit undo for ${class} exited ${rc} but log doesn't name the class"
+    fi
+
+    "${SHIT_BIN}" hook-send session-close \
+        --session "${session}" --sock "${SHIT_HOOK_SOCK}"
+
+    smoke_log "refused as expected: class=${class}, exit=${rc}"
+}
