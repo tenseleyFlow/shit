@@ -11,6 +11,7 @@
 //! `.docs/audits/planner-spec.md` for the longer rationale.
 
 pub mod cohort;
+pub mod coverage_catalog;
 pub mod db;
 pub mod env;
 pub mod events;
