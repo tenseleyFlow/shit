@@ -124,6 +124,13 @@ pub struct PumpHandle {
     /// stable identifier within a process's lifetime; NOTIFY_EXIT
     /// prunes the entry so pid reuse never confuses us.
     pub tracked_pids: Mutex<HashMap<i32, CommandId>>,
+    /// Per-command (dev, inode) dedup for AUTH_OPEN(W). Real-world
+    /// commands open the same file many times (compiler reads a
+    /// header repeatedly under -j); clonefile-on-first-open is
+    /// sufficient — subsequent opens use the cached PreImage. The
+    /// daemon's restore path is keyed on (dev, inode) so emitting
+    /// duplicates would be harmless but wasteful.
+    pub open_dedup: Mutex<HashMap<(CommandId, u64, u64), ()>>,
     /// Bounded ring the callback pushes CaptureRecords into. The
     /// pump thread drains; if full, the callback drops the record
     /// + DENYs (preserves the undo invariant: never silently lose
@@ -253,6 +260,8 @@ extern "C" fn producer_invoke(
         handle_auth_rename(pump, client, message, &msg);
     } else if event_type == sys::es_event_type_t::AUTH_TRUNCATE {
         handle_auth_truncate(pump, client, message, &msg);
+    } else if event_type == sys::es_event_type_t::AUTH_OPEN {
+        handle_auth_open(pump, client, message, &msg);
     }
     // Unknown event type — shouldn't happen since we control the
     // subscription set. Respond ALLOW if it's an AUTH variant we
@@ -280,6 +289,26 @@ fn respond_deny(client: *mut sys::es_client_t, message: *const c_void) {
             sys::es_auth_result_t::DENY,
             true,
         );
+    }
+}
+
+/// AUTH_OPEN uses a different responder than the other AUTH events:
+/// `es_respond_flags_result(authorized_flags=fflag)` means "allow the
+/// open with exactly the access modes requested". Passing the
+/// original `fflag` is the equivalent of "ALLOW" for the flag-based
+/// response API. Passing `0` would deny everything.
+fn respond_allow_open_flags(client: *mut sys::es_client_t, message: *const c_void, fflag: u32) {
+    // SAFETY: same kernel-callback contract.
+    unsafe {
+        let _ =
+            sys::es_respond_flags_result(client, message as *const sys::es_message_t, fflag, true);
+    }
+}
+
+fn respond_deny_open_flags(client: *mut sys::es_client_t, message: *const c_void) {
+    // SAFETY: same kernel-callback contract.
+    unsafe {
+        let _ = sys::es_respond_flags_result(client, message as *const sys::es_message_t, 0, true);
     }
 }
 
@@ -553,6 +582,139 @@ fn handle_auth_truncate(
         is_delete: false,
     });
     enqueue_capture_record(pump, client, message, record, Some(&staging_path));
+}
+
+/// Kernel `FFLAGS` write-intent bits. From `<sys/fcntl.h>`:
+/// FREAD=0x01, FWRITE=0x02. FAPPEND (0x08) implies write but
+/// post-pends; the original bytes survive an append, so we don't
+/// need a pre-image just for FAPPEND — only when the file would be
+/// modified destructively (FWRITE without O_APPEND, OR FWRITE with
+/// the O_TRUNC bit which arrives as AUTH_TRUNCATE separately).
+///
+/// In practice every fopen("w") sets FWRITE (and O_TRUNC, which
+/// fires AUTH_TRUNCATE separately). fopen("r+") sets FWRITE without
+/// truncation — that's the path where AUTH_OPEN(W) capture is the
+/// ONLY source for the pre-image (no AUTH_TRUNCATE follow-up).
+const FFLAG_FWRITE: i32 = 0x02;
+
+/// AUTH_OPEN handler. Filters for write-intent (FWRITE bit); on
+/// match, inline-clonefile the pre-write bytes (per-command dedup
+/// so repeated opens of the same inode are free after the first).
+/// Pure read-opens pass through with no work.
+///
+/// Response API is `es_respond_flags_result` (unique to AUTH_OPEN);
+/// `authorized_flags = fflag` is the equivalent of ALLOW.
+fn handle_auth_open(
+    pump: &PumpHandle,
+    client: *mut sys::es_client_t,
+    message: *const c_void,
+    msg: &EsMessage<'_>,
+) {
+    let Some(event) = msg.as_open() else {
+        respond_allow_open_flags(client, message, 0xFFFFFFFF);
+        return;
+    };
+    let fflag = event.fflag;
+
+    // Read-only opens: nothing to capture, fast-path ALLOW.
+    if fflag & FFLAG_FWRITE == 0 {
+        respond_allow_open_flags(client, message, fflag as u32);
+        return;
+    }
+
+    let token = msg.process_audit_token();
+    let pid = pid_from_audit_token(&token);
+    let command = match pump.tracked_pids.lock() {
+        Ok(g) => g.get(&pid).copied(),
+        Err(_) => None,
+    };
+    let Some(command) = command else {
+        respond_allow_open_flags(client, message, fflag as u32);
+        return;
+    };
+    pump.events_passed_filter.fetch_add(1, Ordering::Relaxed);
+
+    if event.file.is_null() {
+        respond_allow_open_flags(client, message, fflag as u32);
+        return;
+    }
+    let file = unsafe { &*event.file };
+    let target_path = unsafe { file.path.as_path() };
+    let stat = file.stat;
+    let key = (command, stat.st_dev as u64, stat.st_ino);
+
+    // Per-command (dev, inode) dedup. First write-open captures; the
+    // rest are free.
+    let first_time = match pump.open_dedup.lock() {
+        Ok(mut g) => g.insert(key, ()).is_none(),
+        Err(_) => true,
+    };
+    if !first_time {
+        respond_allow_open_flags(client, message, fflag as u32);
+        return;
+    }
+
+    // Skip files of size 0 — there's nothing to preserve. Saves a
+    // clonefile syscall + a wasted CapturedPreImage event for the
+    // common "create a new file" path (touch, > newfile).
+    if stat.st_size == 0 {
+        respond_allow_open_flags(client, message, fflag as u32);
+        return;
+    }
+
+    let (staging_path, staging_fd) = match inline_clonefile(target_path, &pump.staging_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(
+                %command.session,
+                seq = command.seq,
+                path = %target_path.display(),
+                err = %e,
+                "macos-es open-write clone failed; DENY open"
+            );
+            respond_deny_open_flags(client, message);
+            return;
+        }
+    };
+
+    let record = CaptureRecord::PreImage(PreImageRecord {
+        command,
+        path: target_path.to_path_buf(),
+        staging_path: staging_path.clone(),
+        staging_fd,
+        dev: stat.st_dev as u64,
+        inode: stat.st_ino,
+        mode: stat.st_mode as u32,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        // The path survives post-open; we just captured the pre-write
+        // bytes. Undo restores the bytes; no TreeOp::Unlink needed.
+        is_delete: false,
+    });
+
+    // Enqueue + respond. We can't use the shared `enqueue_capture_record`
+    // helper because the AUTH_OPEN responder is flags-based, not
+    // auth-result-based. Inline the same try_send semantics.
+    match pump.ring_tx.try_send(record) {
+        Ok(()) => respond_allow_open_flags(client, message, fflag as u32),
+        Err(TrySendError::Full(rec)) => {
+            if let CaptureRecord::PreImage(p) = rec {
+                drop(p.staging_fd);
+                let _ = std::fs::remove_file(&p.staging_path);
+            }
+            tracing::warn!("macos-es open-write ring full; DENY open");
+            respond_deny_open_flags(client, message);
+        }
+        Err(TrySendError::Disconnected(rec)) => {
+            if let CaptureRecord::PreImage(p) = rec {
+                drop(p.staging_fd);
+                let _ = std::fs::remove_file(&p.staging_path);
+            }
+            tracing::error!("macos-es open-write ring disconnected (worker dead); ALLOW open");
+            respond_allow_open_flags(client, message, fflag as u32);
+        }
+    }
 }
 
 /// AUTH_RENAME handler. Always emits TreeMutation(Rename); also emits
@@ -916,6 +1078,7 @@ impl PumpState {
         let handle = PumpHandle {
             pid_to_token: Mutex::new(HashMap::new()),
             tracked_pids: Mutex::new(HashMap::new()),
+            open_dedup: Mutex::new(HashMap::new()),
             ring_tx,
             staging_dir: staging_dir.clone(),
             events_seen: AtomicU64::new(0),
@@ -936,6 +1099,7 @@ impl PumpState {
         // even though we never respond to them, otherwise the kernel
         // never delivers them.
         let events = [
+            sys::es_event_type_t::AUTH_OPEN,
             sys::es_event_type_t::AUTH_UNLINK,
             sys::es_event_type_t::AUTH_RENAME,
             sys::es_event_type_t::AUTH_TRUNCATE,
@@ -992,10 +1156,16 @@ impl PumpState {
     }
 
     fn detach(&mut self, command: CommandId) {
-        if let Some(pump) = PUMP.get()
-            && let Ok(mut g) = pump.tracked_pids.lock()
-        {
-            g.retain(|_, cmd| *cmd != command);
+        if let Some(pump) = PUMP.get() {
+            if let Ok(mut g) = pump.tracked_pids.lock() {
+                g.retain(|_, cmd| *cmd != command);
+            }
+            // Drop the per-command open-dedup entries — the next
+            // command's PreImage shouldn't be suppressed by a
+            // stale entry from a previous command.
+            if let Ok(mut g) = pump.open_dedup.lock() {
+                g.retain(|(cmd, _, _), _| *cmd != command);
+            }
         }
         tracing::info!(
             %command.session,
