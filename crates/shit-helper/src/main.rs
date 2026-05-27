@@ -760,9 +760,7 @@ fn run_es_path_log_smoke(duration_secs: u64) -> anyhow::Result<()> {
                 match c {
                     '"' => paths_json.push_str("\\\""),
                     '\\' => paths_json.push_str("\\\\"),
-                    c if (c as u32) < 0x20 => {
-                        paths_json.push_str(&format!("\\u{:04x}", c as u32))
-                    }
+                    c if (c as u32) < 0x20 => paths_json.push_str(&format!("\\u{:04x}", c as u32)),
                     c => paths_json.push(c),
                 }
             }
@@ -804,8 +802,8 @@ fn run_es_tree_filter_smoke(duration_secs: u64) -> anyhow::Result<()> {
         // ACCEPT-side demo: helper-process unlinks. The event's
         // process == helper, so audit_token matches the seeded
         // self-token and the path gets recorded.
-        let self_test_path = std::env::temp_dir()
-            .join(format!("shit-es-tree-filter-self-{}", std::process::id()));
+        let self_test_path =
+            std::env::temp_dir().join(format!("shit-es-tree-filter-self-{}", std::process::id()));
         std::fs::write(&self_test_path, b"x").ok();
         // Brief pause so the create-side syscalls have settled into
         // a stable on-disk state before we remove (helps the kernel
@@ -825,9 +823,7 @@ fn run_es_tree_filter_smoke(duration_secs: u64) -> anyhow::Result<()> {
                 match c {
                     '"' => paths_json.push_str("\\\""),
                     '\\' => paths_json.push_str("\\\\"),
-                    c if (c as u32) < 0x20 => {
-                        paths_json.push_str(&format!("\\u{:04x}", c as u32))
-                    }
+                    c if (c as u32) < 0x20 => paths_json.push_str(&format!("\\u{:04x}", c as u32)),
                     c => paths_json.push(c),
                 }
             }
