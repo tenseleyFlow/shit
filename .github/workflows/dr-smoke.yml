@@ -1480,16 +1480,20 @@ jobs:
             # only intentionally-excluded fbsd smoke today is
             # git-branch-D-undo-fbsd.sh (deferred to G01.4-packed).
             # Any other unwired smoke fails this gate loud.
+            # FreeBSD VM shell is /bin/sh — no process substitution,
+            # no `grep -F`. Use temp files + plain grep -E for parity.
             FBSD_KNOWN_EXCLUDED="git-branch-D-undo-fbsd.sh"
-            ALL_FBSD="$(ls tests/smoke/*-fbsd*.sh | xargs -n1 basename | sort)"
-            # Pick up every *-fbsd*.sh referenced anywhere in the
-            # workflow — covers the SMOKES list and any future
-            # per-smoke job. Linux smokes don't match the suffix so
-            # they're naturally excluded.
-            WIRED_FBSD="$(grep -oE '[a-z][a-z0-9_-]*-fbsd\.sh' .github/workflows/dr-smoke.yml \
-                          | sort -u)"
-            UNWIRED="$(comm -23 <(printf '%s\n' "${ALL_FBSD}") <(printf '%s\n' "${WIRED_FBSD}") || true)"
-            UNWIRED_BAD="$(printf '%s\n' "${UNWIRED}" | grep -vxF "${FBSD_KNOWN_EXCLUDED}" || true)"
+            ALL_FBSD_FILE="$(mktemp)"
+            WIRED_FBSD_FILE="$(mktemp)"
+            ls tests/smoke/*-fbsd*.sh | xargs -n1 basename | sort > "${ALL_FBSD_FILE}"
+            grep -oE '[a-z][a-z0-9_-]*-fbsd\.sh' .github/workflows/dr-smoke.yml \
+              | sort -u > "${WIRED_FBSD_FILE}"
+            UNWIRED="$(comm -23 "${ALL_FBSD_FILE}" "${WIRED_FBSD_FILE}" || true)"
+            UNWIRED_BAD="$(printf '%s\n' "${UNWIRED}" \
+              | grep -vE "^(${FBSD_KNOWN_EXCLUDED})$" \
+              | grep -v '^$' \
+              || true)"
+            rm -f "${ALL_FBSD_FILE}" "${WIRED_FBSD_FILE}"
             if [ -n "${UNWIRED_BAD}" ]; then
               echo "FAIL: smoke surface drift — unwired *-fbsd* smokes not on the known-excluded list:"
               echo "${UNWIRED_BAD}" | sed 's/^/    /'
