@@ -71,6 +71,14 @@ fi
 # Attempt the setcap. sudo -n: refuse to prompt; we'd rather log
 # the next step than hang a build pipeline.
 if sudo -n "${SETCAP_BIN}" "${CAPS}" "${BIN}" 2>/dev/null; then
+    # Drop a sentinel so doctor's caps_stale check can tell a
+    # subsequent rebuild from a fresh checkout that's never had
+    # caps. The sentinel's mtime is set to the helper's mtime at
+    # apply time; a later rebuild bumps the helper's mtime past
+    # the sentinel → caps_stale = true.
+    SENTINEL="${BIN}.setcap-applied"
+    : > "${SENTINEL}" 2>/dev/null || true
+    touch -r "${BIN}" "${SENTINEL}" 2>/dev/null || true
     log "applied ${CAPS} to ${BIN}"
     exit 0
 fi

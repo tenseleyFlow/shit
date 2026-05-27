@@ -87,6 +87,42 @@ pub fn read_helper_binary_caps() -> HelperBinaryCaps {
         cap_bpf: stdout.contains("cap_bpf"),
         cap_perfmon: stdout.contains("cap_perfmon"),
         readable: true,
+        caps_stale: probe_caps_stale(&bin),
+    }
+}
+
+/// AU08 — true when the helper binary has been rebuilt since caps
+/// were last applied. The sentinel `<helper>.setcap-applied` is dropped
+/// by `tools/linux/post-build-setcap.sh` on each successful setcap with
+/// mtime equal to the helper's mtime at apply time. After a rebuild,
+/// the helper's mtime advances past the sentinel's — and on Linux that
+/// rebuild also stripped the file caps. Distinguishes "first-run, never
+/// set caps" (sentinel absent → false) from "had caps, lost them on
+/// rebuild" (sentinel older than helper → true).
+fn probe_caps_stale(helper: &std::path::Path) -> bool {
+    use std::fs;
+    let sentinel = helper.with_extension(extension_with_suffix(helper, "setcap-applied"));
+    let Ok(helper_meta) = fs::metadata(helper) else {
+        return false;
+    };
+    let Ok(sentinel_meta) = fs::metadata(&sentinel) else {
+        return false;
+    };
+    match (helper_meta.modified(), sentinel_meta.modified()) {
+        (Ok(h), Ok(s)) => h > s,
+        _ => false,
+    }
+}
+
+/// Helper-bin sentinel paths. `with_extension` would drop any existing
+/// extension; we want to append `.setcap-applied` to whatever the path
+/// already is (`shit-helper` on Linux, no extension). Return value is
+/// the appended suffix when no existing extension; otherwise the
+/// existing extension joined with the suffix.
+fn extension_with_suffix(helper: &std::path::Path, suffix: &str) -> String {
+    match helper.extension().and_then(|e| e.to_str()) {
+        Some(existing) if !existing.is_empty() => format!("{existing}.{suffix}"),
+        _ => suffix.to_string(),
     }
 }
 
@@ -357,6 +393,47 @@ mod tests {
         if !lsms.is_empty() {
             assert!(lsms.iter().any(|s| !s.is_empty()));
         }
+    }
+
+    #[test]
+    fn probe_caps_stale_false_when_no_sentinel() {
+        // Fresh checkout case: helper present, sentinel never written.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("shit-helper");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        assert!(!probe_caps_stale(&bin));
+    }
+
+    #[test]
+    fn probe_caps_stale_false_when_sentinel_matches_helper() {
+        // Sentinel was just written; mtimes equal → not stale.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("shit-helper");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let sentinel = dir.path().join("shit-helper.setcap-applied");
+        std::fs::write(&sentinel, b"").unwrap();
+        // Force same mtime — touch -r equivalent.
+        let bin_meta = std::fs::metadata(&bin).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&bin_meta);
+        filetime::set_file_mtime(&sentinel, mtime).unwrap();
+        assert!(!probe_caps_stale(&bin));
+    }
+
+    #[test]
+    fn probe_caps_stale_true_when_helper_newer_than_sentinel() {
+        // Caps applied, then a rebuild bumped the helper's mtime.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("shit-helper");
+        let sentinel = dir.path().join("shit-helper.setcap-applied");
+        std::fs::write(&sentinel, b"").unwrap();
+        // Backdate sentinel by 10s.
+        let now = std::time::SystemTime::now();
+        let old = now - std::time::Duration::from_secs(10);
+        let old_ft = filetime::FileTime::from_system_time(old);
+        filetime::set_file_mtime(&sentinel, old_ft).unwrap();
+        // Helper is "newer" because we write it after backdating the sentinel.
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        assert!(probe_caps_stale(&bin));
     }
 
     #[test]
