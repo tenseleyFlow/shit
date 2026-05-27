@@ -1473,6 +1473,31 @@ jobs:
             echo "  uname: $(uname -srm)"
             echo "  timeout: $(/usr/bin/timeout --version 2>&1 | head -1 || /usr/bin/timeout 2>&1 | head -1 || true)"
 
+            echo "===== smoke-surface drift check ====="
+            # AU05.7 — prep for AU14 (CI-runs-every-smoke driver).
+            # Catch the case where a new *-fbsd*.sh smoke lands in
+            # tests/smoke/ without being wired into SMOKES below. The
+            # only intentionally-excluded fbsd smoke today is
+            # git-branch-D-undo-fbsd.sh (deferred to G01.4-packed).
+            # Any other unwired smoke fails this gate loud.
+            FBSD_KNOWN_EXCLUDED="git-branch-D-undo-fbsd.sh"
+            ALL_FBSD="$(ls tests/smoke/*-fbsd*.sh | xargs -n1 basename | sort)"
+            # Pick up every *-fbsd*.sh referenced anywhere in the
+            # workflow — covers the SMOKES list and any future
+            # per-smoke job. Linux smokes don't match the suffix so
+            # they're naturally excluded.
+            WIRED_FBSD="$(grep -oE '[a-z][a-z0-9_-]*-fbsd\.sh' .github/workflows/dr-smoke.yml \
+                          | sort -u)"
+            UNWIRED="$(comm -23 <(printf '%s\n' "${ALL_FBSD}") <(printf '%s\n' "${WIRED_FBSD}") || true)"
+            UNWIRED_BAD="$(printf '%s\n' "${UNWIRED}" | grep -vxF "${FBSD_KNOWN_EXCLUDED}" || true)"
+            if [ -n "${UNWIRED_BAD}" ]; then
+              echo "FAIL: smoke surface drift — unwired *-fbsd* smokes not on the known-excluded list:"
+              echo "${UNWIRED_BAD}" | sed 's/^/    /'
+              echo "  Either add them to SMOKES below, or add them to FBSD_KNOWN_EXCLUDED with a comment."
+              exit 1
+            fi
+            echo "  all *-fbsd*.sh smokes accounted for (excluded: ${FBSD_KNOWN_EXCLUDED:-none})"
+
             echo "===== run smokes ====="
             FAIL_COUNT=0
             SMOKES="rm-undo-fbsd.sh \
