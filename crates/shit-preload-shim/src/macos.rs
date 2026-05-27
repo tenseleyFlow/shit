@@ -27,7 +27,7 @@
 //! `__DATA,__interpose` section: `(my_foo as *const c_void,
 //! libc::foo as *const c_void)`. The dynamic linker does the rest.
 
-use libc::{c_char, c_int, c_uint, c_void};
+use libc::{c_char, c_int, c_uint, c_void, mode_t};
 
 // M07.A.1: first interposer. Proves the DYLD_INTERPOSE Rust pattern
 // works on this codebase end-to-end (compiles, links into a cdylib,
@@ -138,6 +138,24 @@ unsafe extern "C" fn my_openat(
     unsafe { openat(dirfd, path, flags, mode) }
 }
 
+/// Replacement for `mkdir(2)`. Captures directory-create
+/// events; the future undo path removes the directory if it
+/// was empty at creation time.
+///
+/// # Safety
+/// Same contract as `libc::mkdir`.
+unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
+    unsafe { libc::mkdir(path, mode) }
+}
+
+/// Replacement for `mkdirat(2)`. Dirfd-relative variant.
+///
+/// # Safety
+/// Same contract as `libc::mkdirat`.
+unsafe extern "C" fn my_mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
+    unsafe { libc::mkdirat(dirfd, path, mode) }
+}
+
 /// `__DATA,__interpose` table entry for `unlink`. The dynamic
 /// linker reads this at image-load time and rewrites the
 /// lazy-binding stubs for `unlink` in the host process to point
@@ -187,6 +205,20 @@ static INTERPOSE_OPEN: InterposeEntry = InterposeEntry {
 static INTERPOSE_OPENAT: InterposeEntry = InterposeEntry {
     replacement: my_openat as *const c_void,
     target: openat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_MKDIR: InterposeEntry = InterposeEntry {
+    replacement: my_mkdir as *const c_void,
+    target: libc::mkdir as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_MKDIRAT: InterposeEntry = InterposeEntry {
+    replacement: my_mkdirat as *const c_void,
+    target: libc::mkdirat as *const c_void,
 };
 
 /// `(replacement, target)` pair the dynamic linker expects in
@@ -259,5 +291,46 @@ mod tests {
         assert!(!INTERPOSE_OPENAT.replacement.is_null());
         assert!(!INTERPOSE_OPENAT.target.is_null());
         assert_ne!(INTERPOSE_OPENAT.replacement, INTERPOSE_OPENAT.target);
+    }
+
+    #[test]
+    fn mkdir_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_MKDIR.replacement.is_null());
+        assert!(!INTERPOSE_MKDIR.target.is_null());
+        assert_ne!(INTERPOSE_MKDIR.replacement, INTERPOSE_MKDIR.target);
+    }
+
+    #[test]
+    fn mkdirat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_MKDIRAT.replacement.is_null());
+        assert!(!INTERPOSE_MKDIRAT.target.is_null());
+        assert_ne!(INTERPOSE_MKDIRAT.replacement, INTERPOSE_MKDIRAT.target);
+    }
+
+    /// Cross-cutting: count of expected interpose entries after
+    /// M07.A.2 lands. Section-size check is in the integration
+    /// test (`section_size_matches_entry_count`) so it doesn't
+    /// require otool here. This test just enumerates the entries
+    /// that exist as a regression gate — if someone adds a static
+    /// without bumping the assertion, the test points to the
+    /// omission in CR.
+    #[test]
+    fn all_m07a2_entries_present() {
+        let entries: &[&InterposeEntry] = &[
+            &INTERPOSE_UNLINK,
+            &INTERPOSE_UNLINKAT,
+            &INTERPOSE_RENAME,
+            &INTERPOSE_RENAMEAT,
+            &INTERPOSE_OPEN,
+            &INTERPOSE_OPENAT,
+            &INTERPOSE_MKDIR,
+            &INTERPOSE_MKDIRAT,
+        ];
+        assert_eq!(entries.len(), 8, "M07.A.2 final interposer count");
+        for e in entries {
+            assert!(!e.replacement.is_null());
+            assert!(!e.target.is_null());
+            assert_ne!(e.replacement, e.target);
+        }
     }
 }
