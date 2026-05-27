@@ -16,10 +16,6 @@ use crate::ipc::{Conn, ConnError};
 /// telemetry stream so operators can tell *which* tier is actually
 /// running — Linux can degrade from bpf-lsm → fanotify → inotify;
 /// FreeBSD's preload-shim is best-effort; the daemon needs to know.
-///
-/// Stage 1 returns the compile-time tier expectation. When the real
-/// runtime probes land (DR-01..DR-13), the classifier becomes a
-/// runtime check and the cfg gating moves into the per-tier modules.
 pub fn kernel_tier_classifier() -> &'static str {
     #[cfg(target_os = "linux")]
     {
@@ -31,12 +27,20 @@ pub fn kernel_tier_classifier() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        // M01 ships the FSEvents-based degraded tier as the macOS
-        // baseline (no Apple-paperwork dependency). M03 lights up
-        // EndpointSecurity and the classifier becomes a runtime
-        // check that returns "endpoint-security" when ES is
-        // entitled + FDA-granted, "fsevents-degraded" otherwise.
-        "fsevents-degraded"
+        // M03.1.I.6: runtime probe of EndpointSecurity. The probe
+        // creates + immediately drops a minimal ES client (a few µs)
+        // and returns Success when the binary is entitled + the
+        // env (SIP+AuthRoot+AMFI bypass in dev, signed binary in
+        // prod) accepts the entitlement. Anywhere else → still on
+        // FSEvents degraded tier. The producer (`capture::macos_es`)
+        // ALSO runs alongside FSEvents per Decision 3 of the
+        // M03.1.I design; this string just tells the daemon which
+        // tier is the source of truth for content-bearing events.
+        use crate::es::probe::{ProbeResult, probe_client_creation};
+        match probe_client_creation() {
+            ProbeResult::Success => "endpoint-security",
+            _ => "fsevents-degraded",
+        }
     }
     #[cfg(target_os = "freebsd")]
     {
