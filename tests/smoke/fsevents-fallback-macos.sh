@@ -5,8 +5,8 @@
 # SMOKE_TIER_REQUIRED: mocked-es
 # SMOKE_RUNNER_HINT: macos-14
 # SMOKE_TIMEOUT_SEC: 300
-# EXCLUDED_BY: 
-# EXCLUDED_REASON: 
+# EXCLUDED_BY: M03-vm-runner
+# EXCLUDED_REASON: macOS smokes need a signed binary on a Tart VM; GH-hosted macos-14 runner cannot satisfy the EndpointSecurity entitlement 
 #
 # M01 / M01.A smoke — macOS FSEvents-degraded capture end-to-end.
 #

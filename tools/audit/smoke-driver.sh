@@ -31,9 +31,11 @@ usage() {
 usage: smoke-driver.sh <subcommand> [args]
 
 Subcommands:
-  discover        emit smoke-matrix.json describing every smoke
-  verify          fail if any smoke has invalid/missing metadata
-  bucket <hint>   list paths of smokes whose SMOKE_RUNNER_HINT == hint
+  discover                emit smoke-matrix.json describing every smoke
+  verify                  fail if any smoke has invalid/missing metadata
+  verify-coverage         fail if any runnable smoke isn't wired in dr-smoke.yml
+  bucket <hint> [tier]    list paths of smokes whose SMOKE_RUNNER_HINT == hint
+                          (optional second arg filters on SMOKE_TIER_REQUIRED)
 USAGE
     exit 64
 }
@@ -162,20 +164,73 @@ print(sum(1 for r in data if r["excluded_by"]))')"
     log "smoke surface: ${total} total / ${runnable} runnable / ${excluded} excluded"
 }
 
+# Verify every runnable smoke is referenced by some job in dr-smoke.yml.
+# - Smokes whose runner is self-hosted-lsm or freebsd-vm are covered by
+#   bucket-driven aggregate jobs (linux-kernel-capture, freebsd-smoke);
+#   the driver bucket call itself is the wiring, so they're auto-covered.
+# - All other runners (ubuntu-24.04, macos-14) use 1-job-per-smoke
+#   standalone jobs; the workflow must reference tests/smoke/<name>.sh
+#   directly.
+#
+# Fails non-zero with the list of un-wired smokes.
+do_verify_coverage() {
+    local matrix workflow
+    matrix="$(do_discover)" || return 1
+    workflow="${REPO_ROOT}/.github/workflows/dr-smoke.yml"
+    if [ ! -f "${workflow}" ]; then
+        log "ERROR: workflow file not found: ${workflow}"
+        return 1
+    fi
+    local unwired
+    unwired="$(echo "${matrix}" | python3 -c "
+import json, re, sys
+workflow_text = open(sys.argv[1]).read()
+bucket_runners = {'self-hosted-lsm', 'freebsd-vm'}
+unwired = []
+for r in json.load(sys.stdin):
+    if r['excluded_by']:
+        continue
+    if r['runner'] in bucket_runners:
+        # Covered by the bucket-driven aggregate job.
+        continue
+    # Standalone smoke — must be referenced explicitly.
+    name = r['name']
+    pattern = re.compile(r'tests/smoke/' + re.escape(name) + r'\.sh\b')
+    if not pattern.search(workflow_text):
+        unwired.append(name)
+for n in unwired:
+    print(n)
+" "${workflow}")"
+    if [ -n "${unwired}" ]; then
+        log "ERROR: smokes runnable but unwired in dr-smoke.yml:"
+        echo "${unwired}" | sed 's/^/    /' >&2
+        log "Either wire a job for each, or annotate EXCLUDED_BY in the smoke header."
+        return 1
+    fi
+    log "coverage: every runnable smoke is wired into dr-smoke.yml"
+}
+
 do_bucket() {
     local hint="${1:-}"
+    local tier="${2:-}"
     if [ -z "${hint}" ]; then
-        log "usage: smoke-driver.sh bucket <runner-hint>"
+        log "usage: smoke-driver.sh bucket <runner-hint> [tier]"
         exit 64
     fi
     do_discover \
         | python3 -c "
 import json, sys
 hint = sys.argv[1]
+tier_filter = sys.argv[2] if len(sys.argv) > 2 else ''
 for r in json.load(sys.stdin):
-    if r['runner'] == hint and not r['excluded_by']:
-        print(r['file'])
-" "${hint}"
+    if r['runner'] != hint:
+        continue
+    if r['excluded_by']:
+        continue
+    if tier_filter and r['tier'] != tier_filter:
+        continue
+    print(r['file'])
+" "${hint}" "${tier}"
 }
 
 main() {
@@ -185,6 +240,7 @@ main() {
     case "${cmd}" in
         discover) do_discover "$@" ;;
         verify)   do_verify "$@" ;;
+        verify-coverage) do_verify_coverage "$@" ;;
         bucket)   do_bucket "$@" ;;
         -h|--help|help) usage ;;
         *) log "unknown subcommand: ${cmd}"; usage ;;
