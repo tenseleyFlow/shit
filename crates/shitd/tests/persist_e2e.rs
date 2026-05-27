@@ -109,6 +109,11 @@ log_level = "warn"
                 ts_unix_nanos: 2,
                 shell_kind: ShellKind::Bash,
                 depth: 1,
+                // AU26: PreExec carries cmd_string for refuse-list
+                // matching. PostExec below will upsert with None;
+                // the COALESCE in `put_command` must preserve this
+                // value rather than clobber it to NULL.
+                cmd_string: Some("git push origin main".to_string()),
             })
             .unwrap(),
             &sock,
@@ -152,6 +157,16 @@ log_level = "warn"
                 assert_eq!(cmd.pid, 9876);
                 assert_eq!(cmd.shell_kind, ShellKind::Bash);
                 assert!(cmd.ended_at.is_some());
+                // AU26: PreExec's cmd_string must survive the
+                // PostExec upsert. The COALESCE in put_command
+                // prevents the post-exec amend (which ships
+                // cmd_string=None) from clobbering the PreExec
+                // value.
+                assert_eq!(
+                    cmd.cmd_string.as_deref(),
+                    Some("git push origin main"),
+                    "cmd_string from PreExec must survive PostExec upsert via COALESCE"
+                );
                 return;
             } else {
                 last_state = format!("{cmd:?}");
