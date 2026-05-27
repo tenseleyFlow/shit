@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: kill-proc-undo-fbsd
+# SMOKE_PLATFORM: freebsd
+# SMOKE_TIER_REQUIRED: kqueue
+# SMOKE_RUNNER_HINT: freebsd-vm
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # B02 smoke — `pkill -f <pattern>` brackets via the proc-event wire
 # and the daemon journals a ProcessOp event with a populated

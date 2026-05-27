@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: mv-noop-undo-fbsd
+# SMOKE_PLATFORM: freebsd
+# SMOKE_TIER_REQUIRED: kqueue
+# SMOKE_RUNNER_HINT: freebsd-vm
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # W09.8.mv-noop smoke — `mv foo foo` is a no-op rename. POSIX
 # says rename(2) of a file to itself is a no-op; the kernel

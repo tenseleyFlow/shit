@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: chown-undo-fbsd
+# SMOKE_PLATFORM: freebsd
+# SMOKE_TIER_REQUIRED: kqueue
+# SMOKE_RUNNER_HINT: freebsd-vm
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # W09.10.chown smoke — `chown` changes a file's group via NOTE_ATTRIB.
 # Mirrors chmod's path (S29.3 captures both via the same MetadataChange

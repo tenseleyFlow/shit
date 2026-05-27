@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: and-chain-undo-fbsd
+# SMOKE_PLATFORM: freebsd
+# SMOKE_TIER_REQUIRED: kqueue
+# SMOKE_RUNNER_HINT: freebsd-vm
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # W09.9.and-chain smoke — `cmd1 && cmd2 && cmd3` runs three
 # distinct mutations under one PreExec/PostExec window. The

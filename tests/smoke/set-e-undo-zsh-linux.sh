@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: set-e-undo-zsh-linux
+# SMOKE_PLATFORM: linux
+# SMOKE_TIER_REQUIRED: any
+# SMOKE_RUNNER_HINT: ubuntu-24.04
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # AR06.6 smoke — zsh parity for set-e-undo. zsh's option-restore
 # snippet uses `setopt` / `unsetopt`, not bash's `set ±o`. We

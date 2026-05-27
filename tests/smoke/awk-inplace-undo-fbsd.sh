@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: awk-inplace-undo-fbsd
+# SMOKE_PLATFORM: freebsd
+# SMOKE_TIER_REQUIRED: kqueue
+# SMOKE_RUNNER_HINT: freebsd-vm
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # W09.4 smoke — `awk -i inplace` modifies a file in-place via the
 # tmpfile-rename atomic pattern. Mirrors the vim/sed-inline shape

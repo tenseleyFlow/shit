@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: fsevents-fallback-macos
+# SMOKE_PLATFORM: macos
+# SMOKE_TIER_REQUIRED: mocked-es
+# SMOKE_RUNNER_HINT: macos-14
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # M01 / M01.A smoke — macOS FSEvents-degraded capture end-to-end.
 #

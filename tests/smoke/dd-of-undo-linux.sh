@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: dd-of-undo-linux
+# SMOKE_PLATFORM: linux
+# SMOKE_TIER_REQUIRED: any
+# SMOKE_RUNNER_HINT: ubuntu-24.04
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # AR08.2.dd-of smoke — `dd if=/dev/zero of=existing` truncates and
 # overwrites an existing file. Same race shape as `cmd > existing`

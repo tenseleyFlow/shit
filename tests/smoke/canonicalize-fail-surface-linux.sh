@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: canonicalize-fail-surface-linux
+# SMOKE_PLATFORM: linux
+# SMOKE_TIER_REQUIRED: any
+# SMOKE_RUNNER_HINT: ubuntu-24.04
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # AU10 smoke — when the LD_PRELOAD shim's canonicalize_path trips
 # its load-bearing fallback (both the path AND its parent are

@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# SMOKE_NAME: git-stash-drop-undo-linux
+# SMOKE_PLATFORM: linux
+# SMOKE_TIER_REQUIRED: any
+# SMOKE_RUNNER_HINT: ubuntu-24.04
+# SMOKE_TIMEOUT_SEC: 300
+# EXCLUDED_BY: 
+# EXCLUDED_REASON: 
 #
 # G01.3 smoke — `git stash drop` removes the most recent stash
 # entry; `shit undo` restores `.git/refs/stash` (and its reflog)
