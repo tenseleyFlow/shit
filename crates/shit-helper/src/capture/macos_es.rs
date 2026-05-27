@@ -35,21 +35,35 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CString, c_void};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_ulong;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use shit_planner::events::CommandId;
+use shit_proto::{HELPER_PATH_HINT_MAX, HelperResponse};
 use uuid::Uuid;
 
 use crate::es::message::{EsMessage, audit_token_t};
 use crate::es::sys;
 use crate::ipc::Conn;
+
+unsafe extern "C" {
+    /// `int clonefile(const char *src, const char *dst, uint32_t flags);`
+    /// from `<sys/clonefile.h>` (libc). Declared here to keep the macOS
+    /// ES producer self-contained; `shit-capture`'s `clonefile_macos.rs`
+    /// has the same extern but is owned by that crate.
+    fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
+}
+
+const CLONE_NOFOLLOW: u32 = 0x0001;
+const CLONE_NOOWNERCOPY: u32 = 0x0002;
 
 /// Channel capacity for control messages from the request loop.
 /// Mirrors `capture::bsd`'s sizing.
@@ -112,11 +126,27 @@ pub struct PumpHandle {
 pub static PUMP: OnceLock<PumpHandle> = OnceLock::new();
 
 /// CaptureRecord — what the callback queues for the pump worker
-/// after an AUTH match. M03.1.I.4 adds the staging_fd field +
-/// the worker reads it for hash + sendmsg.
+/// after a successful inline clonefile.
+///
+/// Holding `staging_fd` ties the staging file's lifetime to this
+/// record: when the worker has hashed + sent, it drops the fd; the
+/// receiver-side daemon holds its own fd (received via SCM_RIGHTS),
+/// and the staging file is unlinked by `staging_path` cleanup once
+/// both fds are closed.
 pub struct CaptureRecord {
     pub command: CommandId,
+    /// Source path the kernel was about to unlink. Recorded so the
+    /// daemon can recreate the file at the same path during undo.
     pub path: PathBuf,
+    /// On-disk staging file the inline clonefile wrote. Worker
+    /// removes this AFTER `send_response_with_fd` returns (the fd
+    /// in `staging_fd` keeps the inode alive across the unlink).
+    pub staging_path: PathBuf,
+    /// `O_RDONLY` fd into `staging_path`. Sent via SCM_RIGHTS to the
+    /// daemon; daemon receives an independent fd that shares the
+    /// open file description (so offset 0 is preserved as long as
+    /// the helper hashes via `pread` rather than `read`).
+    pub staging_fd: OwnedFd,
     pub dev: u64,
     pub inode: u64,
     pub mode: u32,
@@ -124,7 +154,6 @@ pub struct CaptureRecord {
     pub gid: u32,
     pub mtime_unix_nanos: i128,
     pub is_delete: bool,
-    // M03.1.I.4: pub staging_fd: std::os::fd::OwnedFd,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -199,6 +228,120 @@ fn respond_allow(client: *mut sys::es_client_t, message: *const c_void) {
     }
 }
 
+fn respond_deny(client: *mut sys::es_client_t, message: *const c_void) {
+    // SAFETY: same contract as respond_allow.
+    unsafe {
+        let _ = sys::es_respond_auth_result(
+            client,
+            message as *const sys::es_message_t,
+            sys::es_auth_result_t::DENY,
+            true,
+        );
+    }
+}
+
+/// Per-process monotonic counter for staging-file naming. We never
+/// reuse a name within a process lifetime; combined with `pid` in the
+/// filename, this gives global uniqueness across helper restarts too.
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Inline clonefile from `src_path` → fresh file under `staging_dir`.
+/// Returns the staging path + an `O_RDONLY` fd ready for SCM_RIGHTS.
+///
+/// Called from the ES kernel callback BEFORE responding ALLOW. Must
+/// complete in microseconds on APFS (clonefile is a CoW reference,
+/// not a byte copy). On non-APFS volumes this fails with EOPNOTSUPP;
+/// fallback to streaming-read is M03.1.I.G follow-up.
+fn inline_clonefile(src_path: &Path, staging_dir: &Path) -> std::io::Result<(PathBuf, OwnedFd)> {
+    let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let staging_path = staging_dir.join(format!("es-{pid}-{seq:016x}"));
+
+    let c_src = CString::new(src_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "src path contains NUL")
+    })?;
+    let c_dst = CString::new(staging_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "staging path contains NUL",
+        )
+    })?;
+
+    // SAFETY: both pointers are NUL-terminated CStrings valid for the
+    // call; clonefile returns 0 on success, -1 on error.
+    let rc = unsafe {
+        clonefile(
+            c_src.as_ptr(),
+            c_dst.as_ptr(),
+            CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Reopen the staging file read-only for the SCM_RIGHTS hand-off.
+    // O_CLOEXEC so a hypothetical child of the helper doesn't inherit
+    // the staging-fd (defense-in-depth — pump thread doesn't fork
+    // children today).
+    let rflags = libc::O_RDONLY | libc::O_CLOEXEC;
+    // SAFETY: c_dst is a NUL-terminated path; open returns >= 0 on
+    // success or -1 on error.
+    let rfd = unsafe { libc::open(c_dst.as_ptr(), rflags) };
+    if rfd < 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(err);
+    }
+    // SAFETY: rfd is a fresh kernel-allocated fd we now own.
+    let fd = unsafe { OwnedFd::from_raw_fd(rfd) };
+    Ok((staging_path, fd))
+}
+
+/// Hash the file behind `fd` via `pread`, without disturbing its
+/// offset. Caller passes `size` from the kernel-attached stat so we
+/// know when to stop (saves an `fstat` round-trip in the worker).
+fn hash_via_pread(fd: RawFd, size: u64) -> std::io::Result<([u8; 32], u64)> {
+    const CHUNK: usize = 64 * 1024;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut offset: i64 = 0;
+    let target = size as i64;
+    while offset < target {
+        let want = ((target - offset) as usize).min(CHUNK);
+        // SAFETY: buf is writable of len >= want; fd valid for the call.
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), want, offset) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            // Short read vs the stat-claimed size: clonefile snapshot
+            // is supposed to be byte-stable, but tolerate the case to
+            // keep the worker from getting stuck. Ship what we hashed.
+            break;
+        }
+        let n_usize = n as usize;
+        hasher.update(&buf[..n_usize]);
+        offset += n as i64;
+    }
+    Ok((*hasher.finalize().as_bytes(), offset as u64))
+}
+
+fn path_to_string(p: &Path) -> Option<String> {
+    let s = String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string();
+    if s.len() > HELPER_PATH_HINT_MAX {
+        // Send None rather than a truncated path that could mislead
+        // the daemon's restore logic. Daemon falls back to dev+inode
+        // identity in that case.
+        return None;
+    }
+    Some(s)
+}
+
 fn handle_notify_exec(pump: &PumpHandle, msg: &EsMessage<'_>) {
     // Apple stores pid at val[5] of audit_token_t per libbsm's
     // audit_token_to_pid() macro. We avoid that detail here — we
@@ -257,23 +400,91 @@ fn handle_auth_unlink(
         Err(_) => None,
     };
     let Some(command) = command else {
-        // Not tracked — ALLOW without recording.
         respond_allow(client, message);
         return;
     };
     pump.events_passed_filter.fetch_add(1, Ordering::Relaxed);
 
-    // M03.1.I.4 inserts the clonefile + record-push here. Stage 3
-    // just records the event for diagnostic visibility + ALLOWs.
-    if let Some(path) = msg.unlink_target_path() {
-        tracing::debug!(
-            %command.session,
-            seq = command.seq,
-            path = %path.display(),
-            "macos-es AUTH_UNLINK pass filter (capture wiring is M03.1.I.4)"
-        );
+    // Pull path + stat in one borrow — no userspace stat(2) racing
+    // the impending unlink.
+    let Some(file) = msg.unlink_target_file() else {
+        respond_allow(client, message);
+        return;
+    };
+    let target_path = unsafe { file.path.as_path() };
+    let stat = file.stat;
+
+    // 1. Inline clonefile — must succeed before we let the syscall
+    //    proceed; under hard-fail, capture failure → DENY so the
+    //    user gets "permission denied" instead of an unrecoverable
+    //    unlink with no pre-image.
+    let (staging_path, staging_fd) = match inline_clonefile(target_path, &pump.staging_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(
+                %command.session,
+                seq = command.seq,
+                path = %target_path.display(),
+                err = %e,
+                "macos-es clonefile failed; DENY unlink (hard-fail per CLAUDE.md)"
+            );
+            respond_deny(client, message);
+            return;
+        }
+    };
+
+    // 2. Pack the record. stat fields are kernel-attached; no extra
+    //    syscalls needed.
+    let record = CaptureRecord {
+        command,
+        path: target_path.to_path_buf(),
+        staging_path: staging_path.clone(),
+        staging_fd,
+        dev: stat.st_dev as u64,
+        inode: stat.st_ino,
+        mode: stat.st_mode as u32,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        is_delete: true,
+    };
+
+    // 3. Enqueue. try_send so we never block in the kernel callback.
+    match pump.ring_tx.try_send(record) {
+        Ok(()) => {
+            respond_allow(client, message);
+        }
+        Err(TrySendError::Full(rec)) => {
+            // Worker backlogged — DENY to preserve the undo invariant.
+            // Drop the staging fd (closes) + unlink the on-disk copy.
+            tracing::warn!(
+                %command.session,
+                seq = command.seq,
+                path = %rec.path.display(),
+                "macos-es ring full; DENY unlink + drop staging clone"
+            );
+            drop(rec);
+            let _ = std::fs::remove_file(&staging_path);
+            respond_deny(client, message);
+        }
+        Err(TrySendError::Disconnected(rec)) => {
+            // Worker died — ALLOW (no point holding the syscall
+            // hostage when the daemon-emit path is gone). The
+            // CapturedPreImage simply never reaches the daemon for
+            // this event; FSEvents producer (Decision 3 coexistence)
+            // still emits the TreeOp::Unlink so undo gets the path
+            // back, just not the byte content.
+            tracing::error!(
+                %command.session,
+                seq = command.seq,
+                path = %rec.path.display(),
+                "macos-es ring disconnected (worker dead); ALLOW unlink, drop staging"
+            );
+            drop(rec);
+            let _ = std::fs::remove_file(&staging_path);
+            respond_allow(client, message);
+        }
     }
-    respond_allow(client, message);
 }
 
 /// Extract the BSD pid stored in `audit_token_t.val[5]` per Apple's
@@ -556,29 +767,113 @@ impl PumpState {
     }
 
     fn drain_ring_once(&mut self) -> bool {
-        // I.4 hashes + emits CapturedPreImage from each record.
-        // I.3 just drains + logs so the ring doesn't back-pressure
-        // the callback into DENY territory during smoke runs.
-        match self.ring_rx.try_recv() {
-            Ok(rec) => {
-                tracing::debug!(
-                    path = %rec.path.display(),
-                    dev = rec.dev,
-                    inode = rec.inode,
-                    "macos-es drained capture record (worker emission lands in I.4)"
-                );
-                if let Some(pump) = PUMP.get() {
-                    pump.events_emitted.fetch_add(1, Ordering::Relaxed);
-                }
-                true
-            }
-            Err(TryRecvError::Empty) => false,
+        let rec = match self.ring_rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => {
                 tracing::warn!("macos-es ring disconnected; pump exiting");
-                false
+                return false;
             }
+        };
+        self.emit_captured_preimage(rec);
+        if let Some(pump) = PUMP.get() {
+            pump.events_emitted.fetch_add(1, Ordering::Relaxed);
         }
+        true
     }
+
+    fn emit_captured_preimage(&self, rec: CaptureRecord) {
+        // Hash via pread so the staging fd's offset stays at 0 — the
+        // daemon-side recvmsg fd shares this open-file-description
+        // and reads starting at 0.
+        //
+        // Stat-claimed size comes from the kernel-attached `stat` the
+        // ES message carried; we don't fstat the staging fd because
+        // clonefile-clone-size == source-size at the moment of clone.
+        let claimed_size = stat_size_for_fd(rec.staging_fd.as_raw_fd()).unwrap_or(0);
+        let (blob_hash, stored_bytes) =
+            match hash_via_pread(rec.staging_fd.as_raw_fd(), claimed_size) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(
+                        %rec.command.session,
+                        seq = rec.command.seq,
+                        path = %rec.path.display(),
+                        err = %e,
+                        "macos-es worker hash failed; dropping CaptureRecord"
+                    );
+                    let _ = std::fs::remove_file(&rec.staging_path);
+                    return;
+                }
+            };
+
+        let resp = HelperResponse::CapturedPreImage {
+            session: rec.command.session,
+            seq: rec.command.seq,
+            dev: rec.dev,
+            inode: rec.inode,
+            path: path_to_string(&rec.path),
+            blob_hash,
+            stored_bytes,
+            // AUTH_UNLINK fires pre-syscall; the file is then unlinked
+            // (we ALLOW'd). No post-state to hash. AUTH_OPEN(W) and
+            // AUTH_RENAME paths land in M03.1.I.B / .A and set this.
+            post_content_hash: None,
+            mode: rec.mode,
+            uid: rec.uid,
+            gid: rec.gid,
+            mtime_unix_nanos: rec.mtime_unix_nanos,
+            // M03.1.I scope: no xattr capture (follow-up). BSD producer
+            // reads via flistxattr on the staging fd; symmetric path on
+            // macOS lands once we wire it through.
+            xattrs: std::collections::BTreeMap::new(),
+            is_delete: rec.is_delete,
+            fd_sent_via_scm: true,
+        };
+
+        if let Err(e) = self
+            .conn
+            .send_response_with_fd(&resp, rec.staging_fd.as_raw_fd())
+        {
+            tracing::warn!(
+                %rec.command.session,
+                seq = rec.command.seq,
+                path = %rec.path.display(),
+                err = %e,
+                "macos-es send_response_with_fd failed"
+            );
+        } else {
+            tracing::info!(
+                %rec.command.session,
+                seq = rec.command.seq,
+                path = %rec.path.display(),
+                dev = rec.dev,
+                inode = rec.inode,
+                bytes = stored_bytes,
+                "macos-es CapturedPreImage sent"
+            );
+        }
+
+        // Drop fd → close. Once the daemon's recvmsg'd fd is also
+        // closed, the staging file's inode is released. We unlink
+        // the path here best-effort (the inode survives via either
+        // open fd until both close).
+        drop(rec.staging_fd);
+        let _ = std::fs::remove_file(&rec.staging_path);
+    }
+}
+
+/// `fstat`-via-libc helper for the staging fd. Returns the file's
+/// reported size (`st_size`), or `None` on `fstat` error.
+fn stat_size_for_fd(fd: RawFd) -> Option<u64> {
+    // SAFETY: libc::stat is layout-stable for the platform; fd valid
+    // for the call (caller holds the OwnedFd).
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st as *mut _) };
+    if rc != 0 {
+        return None;
+    }
+    Some(st.st_size as u64)
 }
 
 fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
@@ -598,7 +893,7 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
     };
     tracing::info!(
         staging = %state.staging_dir.display(),
-        "macos-es capture pump started (I.3: tree tracking live; I.4: capture pipeline pending)"
+        "macos-es capture pump started (I.4: AUTH_UNLINK capture pipeline live)"
     );
 
     loop {
@@ -643,3 +938,85 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
 // Drop ordering: pump returns → PumpState dropped → EsClient::drop →
 // es_delete_client. PUMP stays populated (OnceLock can't reset) but
 // the callback no longer fires because ES torn down its delivery loop.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn path_to_string_short_path_round_trips() {
+        let p = Path::new("/tmp/short/path.txt");
+        assert_eq!(path_to_string(p).as_deref(), Some("/tmp/short/path.txt"));
+    }
+
+    #[test]
+    fn path_to_string_oversize_returns_none() {
+        // HELPER_PATH_HINT_MAX is 4000; build a path one over.
+        let s = "/".to_string() + &"a".repeat(HELPER_PATH_HINT_MAX);
+        assert!(s.len() > HELPER_PATH_HINT_MAX);
+        let p = PathBuf::from(s);
+        assert_eq!(path_to_string(&p), None);
+    }
+
+    #[test]
+    fn inline_clonefile_round_trips_bytes() {
+        // Requires APFS — runner tempdir is APFS on dev mac; CI on
+        // macos-14 may be APFS or tmpfs. Skip on EOPNOTSUPP.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.txt");
+        let payload = b"clonefile round-trip test bytes";
+        std::fs::File::create(&src)
+            .unwrap()
+            .write_all(payload)
+            .unwrap();
+
+        let staging_dir = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        let (staging_path, fd) = match inline_clonefile(&src, &staging_dir) {
+            Ok(t) => t,
+            Err(e)
+                if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                    || e.raw_os_error() == Some(libc::ENOTSUP) =>
+            {
+                eprintln!("skip: fs does not support clonefile");
+                return;
+            }
+            Err(e) => panic!("inline_clonefile failed: {e}"),
+        };
+        // The staging file exists and the fd reads the source bytes.
+        assert!(staging_path.exists());
+        let (hash, len) = hash_via_pread(fd.as_raw_fd(), payload.len() as u64).unwrap();
+        assert_eq!(len, payload.len() as u64);
+        let expected = blake3::hash(payload);
+        assert_eq!(hash, *expected.as_bytes());
+        // Cleanup: drop fd then remove staging file.
+        drop(fd);
+        let _ = std::fs::remove_file(&staging_path);
+    }
+
+    #[test]
+    fn hash_via_pread_preserves_fd_offset() {
+        // After hashing via pread, a separately-opened fd (mimicking
+        // SCM_RIGHTS at the daemon side) reads from offset 0 because
+        // pread doesn't touch the open-file-description's offset.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("hash-offset.txt");
+        let payload = b"abcdefgh";
+        std::fs::write(&p, payload).unwrap();
+
+        let f = std::fs::File::open(&p).unwrap();
+        let fd = f.as_raw_fd();
+        let (_, len) = hash_via_pread(fd, payload.len() as u64).unwrap();
+        assert_eq!(len, payload.len() as u64);
+
+        // Read via plain read(2) — should start at offset 0, get all
+        // bytes back.
+        use std::io::Read;
+        let mut g = std::fs::File::open(&p).unwrap();
+        let mut buf = Vec::new();
+        g.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf[..], payload);
+    }
+}

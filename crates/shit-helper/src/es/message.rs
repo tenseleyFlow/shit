@@ -355,6 +355,21 @@ impl<'a> EsMessage<'a> {
         unsafe { Some((*event.target).path.as_path()) }
     }
 
+    /// The full `es_file_t` for an unlink target — path + stat in one
+    /// borrow. Used by the producer (M03.1.I.4) so the inline AUTH
+    /// callback can read path, dev, inode, mode, uid, gid, mtime
+    /// from the kernel-attached stat without a userspace stat(2)
+    /// syscall (which would race the impending unlink).
+    pub fn unlink_target_file(&self) -> Option<&'a es_file_t> {
+        let event = self.as_unlink()?;
+        if event.target.is_null() {
+            return None;
+        }
+        // SAFETY: target is a non-null *const es_file_t valid for
+        // the message lifetime.
+        unsafe { Some(&*event.target) }
+    }
+
     /// `Some(&es_event_fork_t)` iff `event_type == NOTIFY_FORK`.
     /// M03.1.I.3 consumes for tree-tracking.
     #[allow(dead_code)]

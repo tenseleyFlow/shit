@@ -92,10 +92,10 @@ pub struct es_auth_result_t(pub u32);
 
 impl es_auth_result_t {
     pub const ALLOW: Self = Self(0);
-    /// Reserved for the M03.1.G+ capture-fail path (clonefile failed
-    /// → deny the unlink rather than lose pre-image). Kept out of the
-    /// dead-code lint until then.
-    #[allow(dead_code)]
+    /// Capture-fail path (clonefile failed → deny the unlink rather
+    /// than lose the pre-image). Used by `capture::macos_es` to
+    /// preserve the undo invariant under the project's "hard-fail by
+    /// default" posture (per `CLAUDE.md`).
     pub const DENY: Self = Self(1);
 }
 
