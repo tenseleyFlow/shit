@@ -249,6 +249,8 @@ extern "C" fn producer_invoke(
         handle_auth_unlink(pump, client, message, &msg);
     } else if event_type == sys::es_event_type_t::AUTH_RENAME {
         handle_auth_rename(pump, client, message, &msg);
+    } else if event_type == sys::es_event_type_t::AUTH_TRUNCATE {
+        handle_auth_truncate(pump, client, message, &msg);
     }
     // Unknown event type — shouldn't happen since we control the
     // subscription set. Respond ALLOW if it's an AUTH variant we
@@ -485,6 +487,69 @@ fn handle_auth_unlink(
         is_delete: true,
     });
 
+    enqueue_capture_record(pump, client, message, record, Some(&staging_path));
+}
+
+/// AUTH_TRUNCATE handler. Captures the file's pre-truncate bytes via
+/// inline clonefile. Structurally identical to UNLINK except is_delete
+/// is false — the path still exists post-syscall, just with 0 bytes.
+/// Daemon journals FilePreImage without a paired TreeOp::Unlink, so
+/// undo restores the bytes to the same path.
+fn handle_auth_truncate(
+    pump: &PumpHandle,
+    client: *mut sys::es_client_t,
+    message: *const c_void,
+    msg: &EsMessage<'_>,
+) {
+    let token = msg.process_audit_token();
+    let pid = pid_from_audit_token(&token);
+    let command = match pump.tracked_pids.lock() {
+        Ok(g) => g.get(&pid).copied(),
+        Err(_) => None,
+    };
+    let Some(command) = command else {
+        respond_allow(client, message);
+        return;
+    };
+    pump.events_passed_filter.fetch_add(1, Ordering::Relaxed);
+
+    let Some(file) = msg.truncate_target_file() else {
+        respond_allow(client, message);
+        return;
+    };
+    let target_path = unsafe { file.path.as_path() };
+    let stat = file.stat;
+
+    let (staging_path, staging_fd) = match inline_clonefile(target_path, &pump.staging_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(
+                %command.session,
+                seq = command.seq,
+                path = %target_path.display(),
+                err = %e,
+                "macos-es truncate clone failed; DENY truncate"
+            );
+            respond_deny(client, message);
+            return;
+        }
+    };
+
+    let record = CaptureRecord::PreImage(PreImageRecord {
+        command,
+        path: target_path.to_path_buf(),
+        staging_path: staging_path.clone(),
+        staging_fd,
+        dev: stat.st_dev as u64,
+        inode: stat.st_ino,
+        mode: stat.st_mode as u32,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        // The path still exists after the syscall; we just need to
+        // restore its bytes during undo. No TreeOp::Unlink pairing.
+        is_delete: false,
+    });
     enqueue_capture_record(pump, client, message, record, Some(&staging_path));
 }
 
@@ -871,6 +936,7 @@ impl PumpState {
         let events = [
             sys::es_event_type_t::AUTH_UNLINK,
             sys::es_event_type_t::AUTH_RENAME,
+            sys::es_event_type_t::AUTH_TRUNCATE,
             sys::es_event_type_t::NOTIFY_EXEC,
             sys::es_event_type_t::NOTIFY_FORK,
             sys::es_event_type_t::NOTIFY_EXIT,
