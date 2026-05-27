@@ -120,12 +120,21 @@ impl Index {
     pub fn put_command(&self, cmd: &CommandRecord) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
+            // AU26: COALESCE(excluded.cmd_string, cmd_string) means
+            // a later upsert with cmd_string=None does NOT clobber a
+            // previously-recorded Some value. The PreExec hook writes
+            // the string first; tier-event handlers (pkg/env/svc/net/
+            // proc/db) upsert with cmd_string=None when they amend
+            // CommandRecord state — that mustn't overwrite the real
+            // string. The PreExec path can still set cmd_string from
+            // None to Some (and vice-versa only if it explicitly
+            // ships a real None — which it never does).
             "INSERT INTO commands (session, seq, cmd_string, cwd, pid, shell_kind,
                                    started_logical, started_wall_nanos,
                                    ended_logical, ended_wall_nanos, exit_code)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(session, seq) DO UPDATE SET
-                cmd_string = excluded.cmd_string,
+                cmd_string = COALESCE(excluded.cmd_string, cmd_string),
                 ended_logical = excluded.ended_logical,
                 ended_wall_nanos = excluded.ended_wall_nanos,
                 exit_code = excluded.exit_code",
