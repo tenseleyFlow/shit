@@ -4,6 +4,7 @@
 # SMOKE_PLATFORM: linux
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: ubuntu-24.04
+# SMOKE_TIMEOUT_SEC: 60
 #
 # AU26 smoke — refuse-list cmd_string wire end-to-end.
 #
