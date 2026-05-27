@@ -38,8 +38,6 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_es;
 
-// xattr capture is consumed by the BSD + Linux producers; macOS will
-// pick it up in M03 (ES path with clonefile pre-image content). Gate
-// out of the macOS build until then to avoid a dead-code warning.
-#[cfg(not(target_os = "macos"))]
+// xattr capture is consumed by the BSD, Linux, and macOS producers
+// (macOS via M03.x.XATTR — reads off the staging fd post-clonefile).
 pub mod xattr;
