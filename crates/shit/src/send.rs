@@ -44,6 +44,15 @@ pub enum HookSendKind {
         depth: u8,
         #[arg(long)]
         sock: PathBuf,
+        /// AU26: the literal command-line string the shell is about
+        /// to run. Bash passes `$BASH_COMMAND`, zsh passes `$1` from
+        /// `preexec`, fish passes `$argv` from `--on-event
+        /// fish_preexec`. Plumbed into `CommandRecord.cmd_string` so
+        /// the planner's refuse-list match can fire at undo time.
+        /// Optional + `allow_hyphen_values` because real commands
+        /// frequently start with `--` flags.
+        #[arg(long, allow_hyphen_values = true)]
+        cmdline: Option<String>,
         /// Task #105 — after sending the PreExec datagram, BLOCK
         /// until the helper signals capture-is-ready for this
         /// (session, seq) via `CtlRequest::WaitWatchReady`. Defaults
@@ -262,6 +271,7 @@ pub fn run(kind: HookSendKind) -> Result<()> {
             shell,
             depth,
             sock,
+            cmdline,
             ctl_sock,
             wait_ready_ms,
         } => {
@@ -285,6 +295,13 @@ pub fn run(kind: HookSendKind) -> Result<()> {
                     timeout_ms: wait_ready_ms,
                 })
             };
+            // AU26: truncate to PRE_EXEC_CMDLINE_MAX_BYTES at the
+            // nearest UTF-8 char boundary at or below the cap. The
+            // bash hook ships $BASH_COMMAND verbatim; pathological
+            // macros / aliased pipelines can exceed 4 KiB but
+            // truncation can't hide a refuse-list pattern (every
+            // catalog pattern is <40 bytes).
+            let cmd_string = cmdline.map(shit_proto::truncate_cmd_string);
             (
                 HookMessage::PreExec {
                     session,
@@ -296,6 +313,7 @@ pub fn run(kind: HookSendKind) -> Result<()> {
                     ts_unix_nanos: ts_now(),
                     shell_kind: shell,
                     depth,
+                    cmd_string,
                 },
                 sock,
                 post,
