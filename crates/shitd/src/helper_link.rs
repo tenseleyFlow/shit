@@ -143,59 +143,94 @@ fn recv_frame_with_fd_blocking(
     fd: std::os::fd::RawFd,
 ) -> Result<(Vec<u8>, Option<OwnedFd>), HelperLinkError> {
     use std::os::fd::FromRawFd;
-    let mut buf = vec![0u8; shit_proto::MAX_HELPER_FRAME_SIZE];
-    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
-    let mut cmsg_buf: Vec<u8> = Vec::with_capacity(cmsg_space::<std::os::fd::RawFd>());
-    let result = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
-        .map_err(map_peer_gone)?;
-    let n = result.bytes;
-    if n == 0 {
-        return Err(HelperLinkError::HelperExited);
-    }
-    let mut received_fd: Option<OwnedFd> = None;
-    for cmsg in result.cmsgs()? {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg
-            && let Some(raw) = fds.first()
-        {
-            // SAFETY: the kernel just handed us a fresh fd via SCM_RIGHTS;
-            // ownership transfers to us. Multiple fds in one cmsg would be
-            // unusual; we take the first and close any others.
-            received_fd = Some(unsafe { OwnedFd::from_raw_fd(*raw) });
-            for extra in fds.iter().skip(1) {
-                // SAFETY: same — we own these but won't use them.
-                drop(unsafe { OwnedFd::from_raw_fd(*extra) });
-            }
-        }
-    }
-    buf.truncate(n);
-    // On STREAM transports (macOS only after W01.B.fix-framing) the
-    // kernel may deliver fewer bytes than the frame demands; complete
-    // the read with plain recv(2) (cmsg already delivered with the
-    // first chunk).
+
+    // On macOS the transport is STREAM (XNU has no AF_UNIX
+    // SOCK_SEQPACKET). recvmsg with a max-size iov can suck up MORE
+    // bytes than one frame when the sender has multiple frames in
+    // flight (helper emits CapturedPreImage immediately followed by
+    // another frame). The excess bytes belong to the next frame and
+    // can't be put back — so we cap the recvmsg iov at the header
+    // size, then plain recv for the body. The SCM_RIGHTS cmsg rides
+    // with the first chunk per Apple's UDS semantics, so the 4-byte
+    // header recvmsg still picks up the fd.
+    //
+    // SEQPACKET (Linux/BSD) preserves boundaries; a single recvmsg
+    // delivers exactly one frame, so the legacy MAX_FRAME_SIZE buffer
+    // path applies there.
     #[cfg(target_os = "macos")]
     {
-        if buf.len() >= 4 {
-            let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-            let frame_len = 4 + body_len;
-            if frame_len > shit_proto::MAX_HELPER_FRAME_SIZE {
-                return Err(HelperLinkError::Decode(shit_proto::DecodeError::TooLarge(
-                    frame_len,
-                )));
-            }
-            while buf.len() < frame_len {
-                let needed = frame_len - buf.len();
-                let mut chunk = vec![0u8; needed];
-                let m = nix::sys::socket::recv(fd, &mut chunk, MsgFlags::empty())
-                    .map_err(map_peer_gone)?;
-                if m == 0 {
-                    return Err(HelperLinkError::HelperExited);
+        let mut header = [0u8; 4];
+        let mut iov = [std::io::IoSliceMut::new(&mut header)];
+        let mut cmsg_buf: Vec<u8> = Vec::with_capacity(cmsg_space::<std::os::fd::RawFd>());
+        let result = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
+            .map_err(map_peer_gone)?;
+        let n = result.bytes;
+        if n == 0 {
+            return Err(HelperLinkError::HelperExited);
+        }
+        let mut received_fd: Option<OwnedFd> = None;
+        for cmsg in result.cmsgs()? {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg
+                && let Some(raw) = fds.first()
+            {
+                // SAFETY: kernel handed us a fresh fd; ownership transfers.
+                received_fd = Some(unsafe { OwnedFd::from_raw_fd(*raw) });
+                for extra in fds.iter().skip(1) {
+                    drop(unsafe { OwnedFd::from_raw_fd(*extra) });
                 }
-                chunk.truncate(m);
-                buf.extend_from_slice(&chunk);
             }
         }
+        // Complete short header read if recvmsg returned <4 bytes.
+        let mut header_v = header[..n].to_vec();
+        while header_v.len() < 4 {
+            let mut chunk = [0u8; 4];
+            let need = 4 - header_v.len();
+            let m = nix::sys::socket::recv(fd, &mut chunk[..need], MsgFlags::empty())
+                .map_err(map_peer_gone)?;
+            if m == 0 {
+                return Err(HelperLinkError::HelperExited);
+            }
+            header_v.extend_from_slice(&chunk[..m]);
+        }
+        let body_len =
+            u32::from_be_bytes([header_v[0], header_v[1], header_v[2], header_v[3]]) as usize;
+        let frame_len = 4 + body_len;
+        if frame_len > shit_proto::MAX_HELPER_FRAME_SIZE {
+            return Err(HelperLinkError::Decode(shit_proto::DecodeError::TooLarge(
+                frame_len,
+            )));
+        }
+        let mut buf = Vec::with_capacity(frame_len);
+        buf.extend_from_slice(&header_v);
+        buf.resize(frame_len, 0);
+        recv_exact(fd, &mut buf[4..])?;
+        Ok((buf, received_fd))
     }
-    Ok((buf, received_fd))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut buf = vec![0u8; shit_proto::MAX_HELPER_FRAME_SIZE];
+        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let mut cmsg_buf: Vec<u8> = Vec::with_capacity(cmsg_space::<std::os::fd::RawFd>());
+        let result = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
+            .map_err(map_peer_gone)?;
+        let n = result.bytes;
+        if n == 0 {
+            return Err(HelperLinkError::HelperExited);
+        }
+        let mut received_fd: Option<OwnedFd> = None;
+        for cmsg in result.cmsgs()? {
+            if let ControlMessageOwned::ScmRights(fds) = cmsg
+                && let Some(raw) = fds.first()
+            {
+                received_fd = Some(unsafe { OwnedFd::from_raw_fd(*raw) });
+                for extra in fds.iter().skip(1) {
+                    drop(unsafe { OwnedFd::from_raw_fd(*extra) });
+                }
+            }
+        }
+        buf.truncate(n);
+        Ok((buf, received_fd))
+    }
 }
 
 impl Drop for HelperLink {
