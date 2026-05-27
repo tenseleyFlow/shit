@@ -9,8 +9,9 @@
 //!
 //! S24.B lands the FreeBSD/kqueue producer ([`bsd`]). L01 lands the
 //! Linux/fanotify producer ([`linux`]). M01.A lands the macOS/FSEvents
-//! degraded-tier producer ([`macos`]); M03 will layer the ES producer
-//! on top of the same wire.
+//! degraded-tier producer ([`macos`]); M03.1.I layers the ES producer
+//! ([`macos_es`]) alongside it (both run in parallel per the M03.1.I
+//! design's defense-in-depth posture).
 
 #[cfg(any(
     target_os = "freebsd",
@@ -33,6 +34,9 @@ pub mod linux;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+#[cfg(target_os = "macos")]
+pub mod macos_es;
 
 // xattr capture is consumed by the BSD + Linux producers; macOS will
 // pick it up in M03 (ES path with clonefile pre-image content). Gate
