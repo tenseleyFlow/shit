@@ -27,29 +27,36 @@
 //! `__DATA,__interpose` section: `(my_foo as *const c_void,
 //! libc::foo as *const c_void)`. The dynamic linker does the rest.
 
-use libc::{c_char, c_int, c_uint, c_void, mode_t};
+use super::policy;
+use libc::{O_RDWR, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, c_void, mode_t};
 
-// M07.A.1: first interposer. Proves the DYLD_INTERPOSE Rust pattern
-// works on this codebase end-to-end (compiles, links into a cdylib,
-// the `__DATA,__interpose` section is emitted with the expected
-// pair). Subsequent slices (M07.A.2..) extend to open / openat /
-// rename / renameat / unlinkat / mkdir / mkdirat with the same
-// pattern.
-//
-// Stage 1 of the interposer is passthrough-only: we delegate
-// straight to libc::unlink. M07.A.N wires the daemon notification
-// (mirroring the BSD/Linux dispatch path) once the shim's macOS
-// runtime hooks are in place. Keeping stage 1 passthrough means
-// the interposer can land + be validated in CI without depending
-// on the daemon being reachable.
+/// Materialize a NUL-terminated C string into an owned `String` for
+/// the policy notification. Returns empty on NULL or invalid UTF-8
+/// (the policy module is lossy-tolerant on its `arg` field — it's
+/// for logging / pre-image keying, not source-of-truth restoration).
+fn cstr_to_string(path: *const c_char) -> String {
+    if path.is_null() {
+        return String::new();
+    }
+    // SAFETY: caller's libc-contract guarantees `path` is a valid
+    // NUL-terminated C string when non-null.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(path) };
+    bytes.to_string_lossy().into_owned()
+}
 
-/// Replacement for `unlink(2)`. Currently a passthrough; the
-/// notification dispatch lands in a subsequent M07.A slice.
+// Interposer set for M07.A: install-event coverage. Each replacement
+// notifies `policy` (fail-open: socket missing / daemon down / 50ms
+// ack timeout all swallow silently) then forwards to the libc symbol.
+// Filter logic for open/openat (write-mode only) mirrors the BSD/Linux
+// interposers' policy choices.
+
+/// Replacement for `unlink(2)`.
 ///
 /// # Safety
 /// Same contract as `libc::unlink` — `pathname` must point to a
 /// valid NUL-terminated C string for the duration of the call.
 unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
+    policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(pathname));
     // SAFETY: caller upholds libc::unlink's contract on pathname.
     unsafe { libc::unlink(pathname) }
 }
@@ -64,6 +71,7 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
 /// valid NUL-terminated C string; `dirfd` must be `AT_FDCWD` or
 /// an open dirfd; `flags` is `0` or `AT_REMOVEDIR`.
 unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
+    policy::notify_pre_mutation_with_content("unlinkat", &cstr_to_string(pathname));
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
 }
 
@@ -75,6 +83,7 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
 /// Same contract as `libc::rename` — both args must be valid
 /// NUL-terminated C strings for the duration of the call.
 unsafe extern "C" fn my_rename(from: *const c_char, to: *const c_char) -> c_int {
+    policy::notify_rename_with_dst_preimage("rename", &cstr_to_string(from), &cstr_to_string(to));
     unsafe { libc::rename(from, to) }
 }
 
@@ -90,6 +99,7 @@ unsafe extern "C" fn my_renameat(
     tofd: c_int,
     to: *const c_char,
 ) -> c_int {
+    policy::notify_rename_with_dst_preimage("renameat", &cstr_to_string(from), &cstr_to_string(to));
     unsafe { libc::renameat(fromfd, from, tofd, to) }
 }
 
@@ -112,20 +122,24 @@ unsafe extern "C" {
     fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
 }
 
-/// Replacement for `open(2)`. Currently passthrough; the
-/// notification filter (O_CREAT|O_WRONLY|O_TRUNC) lands when
-/// dispatch wiring arrives in a later M07.A slice.
+/// Replacement for `open(2)`. Notifies on any write-mode open
+/// (`O_WRONLY` / `O_RDWR` / `O_TRUNC`) — truncate-on-open is the
+/// canonical destructive shape.
 ///
 /// # Safety
 /// Same contract as libc `open(2)` — `path` must be a valid
 /// NUL-terminated C string; `mode` is read only when `O_CREAT`
 /// is in `flags`.
 unsafe extern "C" fn my_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
+    if writes {
+        policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
+    }
     unsafe { open(path, flags, mode) }
 }
 
-/// Replacement for `openat(2)`. Same passthrough+future-filter
-/// shape as `my_open`.
+/// Replacement for `openat(2)`. Same write-mode notification
+/// filter as `my_open`.
 ///
 /// # Safety
 /// Same contract as libc `openat(2)`.
@@ -135,6 +149,10 @@ unsafe extern "C" fn my_openat(
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
+    let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
+    if writes {
+        policy::notify_pre_mutation_with_content("openat", &cstr_to_string(path));
+    }
     unsafe { openat(dirfd, path, flags, mode) }
 }
 
@@ -145,6 +163,10 @@ unsafe extern "C" fn my_openat(
 /// # Safety
 /// Same contract as `libc::mkdir`.
 unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
+    // `notify_create` carries the new path without a pre-image (the
+    // path doesn't exist pre-syscall). Daemon journals a TreeOp::Create
+    // whose inverse is `rmdir` (or `unlink` on the planner side).
+    policy::notify_create("mkdir", &cstr_to_string(path));
     unsafe { libc::mkdir(path, mode) }
 }
 
@@ -153,6 +175,7 @@ unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
 /// # Safety
 /// Same contract as `libc::mkdirat`.
 unsafe extern "C" fn my_mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
+    policy::notify_create("mkdirat", &cstr_to_string(path));
     unsafe { libc::mkdirat(dirfd, path, mode) }
 }
 
