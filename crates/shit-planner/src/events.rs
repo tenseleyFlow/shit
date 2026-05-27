@@ -94,6 +94,23 @@ pub enum FilePreImageSource {
     /// by the W02.B LiveBaseline promote path on FreeBSD; the cache
     /// is populated at PreExec and promoted on first modification.
     BaselineCachePromote,
+    /// The captured bytes are a faithful PRE-MUTATION snapshot —
+    /// captured by an AUTH-style intercept that fires BEFORE the
+    /// kernel commits the syscall. Set by macOS EndpointSecurity's
+    /// inline-clonefile path (M03.1.I): the helper clonefiles the
+    /// target inside the AUTH callback, BEFORE responding ALLOW, so
+    /// the captured bytes are exactly the file's content at the
+    /// moment the user's command tried to mutate it.
+    ///
+    /// Semantically equivalent to `BaselineCachePromote` for the
+    /// classifier's purposes (both are "trusted pre-mutation"), but
+    /// distinct because the capture mechanism differs and operators
+    /// reading the journal benefit from knowing which tier produced
+    /// it. The planner's `pre_command_pre_images` set + the
+    /// `spurious_creates_with_preimage` classifier
+    /// (M03.x.OPEN-UNDO) both treat this variant identically to
+    /// `BaselineCachePromote`.
+    EsAuthPreMutation,
     /// The captured bytes came from a mid-command intercept (LSM
     /// fanotify-perm, LD_PRELOAD shim, kqueue post-hoc). The
     /// classifier treats these conservatively — they may be
@@ -101,6 +118,22 @@ pub enum FilePreImageSource {
     /// capture alone.
     #[default]
     Other,
+}
+
+impl FilePreImageSource {
+    /// True for sources whose captured bytes are known to faithfully
+    /// represent the file's state BEFORE the user's command (or, for
+    /// AUTH-tier captures, before the specific mutation). Used by the
+    /// planner's classifier to decide whether a `FilePreImage` is
+    /// authoritative enough to override sibling tree-op signals
+    /// (e.g. a spurious FSEvents `Create` for a path that ES knows
+    /// existed pre-mutation).
+    pub fn is_trusted_pre_mutation(&self) -> bool {
+        matches!(
+            self,
+            FilePreImageSource::BaselineCachePromote | FilePreImageSource::EsAuthPreMutation
+        )
+    }
 }
 
 /// Variant payload of [`CaptureEvent`]. New tiers grow this enum; existing

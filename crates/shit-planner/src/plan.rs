@@ -208,7 +208,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, source, .. } => {
                 pre_images.insert(path.clone());
-                if matches!(source, crate::FilePreImageSource::BaselineCachePromote) {
+                if source.is_trusted_pre_mutation() {
                     pre_command_pre_images.insert(path.clone());
                 }
             }
@@ -346,6 +346,17 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     // suppress the Create's Unlink inverse so RestoreContent can
     // rewrite the original bytes without a racing delete.
     //
+    // CRITICAL — only suppress when the FilePreImage's source is a
+    // TRUSTED pre-mutation snapshot (`BaselineCachePromote` or
+    // `EsAuthPreMutation`). BSD's kqueue post-hoc capture emits
+    // FilePreImage with source=Other for legitimately-new files
+    // (e.g. `cp foo foo.bak` produces Create(foo.bak) +
+    // FilePreImage(foo.bak, source=Other) where the captured bytes
+    // are the just-cp'd content, NOT pre-command). Suppressing the
+    // Create-inverse there would leave a new file behind on undo —
+    // the regression that surfaced this guard
+    // (`backup-and-modify-undo-fbsd.sh` on PR #122's first run).
+    //
     // Guard with `probe.stat(p).is_some()` so we don't suppress the
     // Create-inverse for a path that's now gone (something else
     // deleted it post-create-mid-command; the user's expectation
@@ -355,7 +366,11 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         if unlinks.contains(p) {
             continue;
         }
-        if !pre_images.contains(p) {
+        // pre_command_pre_images is populated only when source is
+        // BaselineCachePromote or EsAuthPreMutation — i.e. trusted
+        // pre-mutation captures. Generic pre_images (any source)
+        // would over-fire on BSD's post-hoc captures.
+        if !pre_command_pre_images.contains(p) {
             continue;
         }
         if probe.stat(p).is_some() {
