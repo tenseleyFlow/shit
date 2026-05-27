@@ -14,5 +14,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_instructions(&git)?
         .add_instructions(&rustc)?
         .emit()?;
+    // AU02 — coverage snapshot is include_str!'d into doctor::coverage_snapshot.
+    // Trigger a rebuild on snapshot changes so the embedded data stays
+    // current with what's in-tree. The default cargo rebuild detection
+    // covers source files; the snapshot lives outside src/ so we need
+    // the explicit rerun-if-changed.
+    println!("cargo:rerun-if-changed=../../tools/audit/coverage-snapshot.json");
     Ok(())
 }
