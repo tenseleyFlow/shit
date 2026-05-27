@@ -207,13 +207,21 @@ mod tests {
     #[test]
     fn discover_paths_includes_workspace_and_install_locations() {
         let paths = discover_helper_binary_paths();
-        assert!(paths.iter().any(|p| p.ends_with("target/debug/shit-helper")));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.ends_with("target/debug/shit-helper"))
+        );
         assert!(
             paths
                 .iter()
                 .any(|p| p.ends_with("target/release/shit-helper"))
         );
         assert!(paths.iter().any(|p| p.ends_with(".cargo/bin/shit-helper")));
-        assert!(paths.iter().any(|p| p == &PathBuf::from("/usr/local/bin/shit-helper")));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p == &PathBuf::from("/usr/local/bin/shit-helper"))
+        );
     }
 }
