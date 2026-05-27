@@ -90,6 +90,17 @@ fn fix_linux_caps() -> anyhow::Result<()> {
     use std::process::Command;
 
     let caps = probes::linux::read_caps();
+    // Distinguish "helper not findable" from "helper found with all
+    // caps". Without this, an unresolvable helper produces the
+    // misleading "caps satisfy the runtime requirement" message.
+    if !caps.helper_binary.readable {
+        eprintln!(
+            "shit doctor --fix: helper binary not found on disk.\n  \
+             Build it (`cargo build --release -p shit-helper`) or set\n  \
+             SHIT_HELPER_BIN to the binary path before re-running."
+        );
+        anyhow::bail!("helper binary not found");
+    }
     let Some(cmd_str) = caps.setcap_remediation.as_deref() else {
         println!("shit doctor --fix: helper caps already satisfy the runtime requirement.");
         return Ok(());

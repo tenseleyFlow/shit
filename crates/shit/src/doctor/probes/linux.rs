@@ -275,6 +275,18 @@ fn find_helper_bin() -> Option<PathBuf> {
             }
         }
     }
+    // AU08 — workspace target dirs. The docstring promised these; the
+    // previous body silently lied. Catches the bare `shit doctor` case
+    // from a fresh `cargo build` where SHIT_HELPER_BIN isn't exported
+    // and the helper isn't installed system-wide.
+    if let Ok(cwd) = std::env::current_dir() {
+        for rel in ["target/release/shit-helper", "target/debug/shit-helper"] {
+            let cand = cwd.join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
     None
 }
 
