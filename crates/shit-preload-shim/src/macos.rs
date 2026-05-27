@@ -67,6 +67,32 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
 }
 
+/// Replacement for `rename(2)`. The atomic-move syscall behind
+/// `mv`, `install`'s temp-then-rename pattern, and most "save
+/// atomically" editor paths (`vim :wq`).
+///
+/// # Safety
+/// Same contract as `libc::rename` — both args must be valid
+/// NUL-terminated C strings for the duration of the call.
+unsafe extern "C" fn my_rename(from: *const c_char, to: *const c_char) -> c_int {
+    unsafe { libc::rename(from, to) }
+}
+
+/// Replacement for `renameat(2)`. Dirfd-relative variant; modern
+/// coreutils prefer this over bare `rename`.
+///
+/// # Safety
+/// Same contract as `libc::renameat` — both pathnames must be
+/// valid NUL-terminated C strings; dirfds are `AT_FDCWD` or open.
+unsafe extern "C" fn my_renameat(
+    fromfd: c_int,
+    from: *const c_char,
+    tofd: c_int,
+    to: *const c_char,
+) -> c_int {
+    unsafe { libc::renameat(fromfd, from, tofd, to) }
+}
+
 /// `__DATA,__interpose` table entry for `unlink`. The dynamic
 /// linker reads this at image-load time and rewrites the
 /// lazy-binding stubs for `unlink` in the host process to point
@@ -88,6 +114,20 @@ static INTERPOSE_UNLINK: InterposeEntry = InterposeEntry {
 static INTERPOSE_UNLINKAT: InterposeEntry = InterposeEntry {
     replacement: my_unlinkat as *const c_void,
     target: libc::unlinkat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_RENAME: InterposeEntry = InterposeEntry {
+    replacement: my_rename as *const c_void,
+    target: libc::rename as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_RENAMEAT: InterposeEntry = InterposeEntry {
+    replacement: my_renameat as *const c_void,
+    target: libc::renameat as *const c_void,
 };
 
 /// `(replacement, target)` pair the dynamic linker expects in
@@ -132,5 +172,19 @@ mod tests {
         assert!(!INTERPOSE_UNLINKAT.replacement.is_null());
         assert!(!INTERPOSE_UNLINKAT.target.is_null());
         assert_ne!(INTERPOSE_UNLINKAT.replacement, INTERPOSE_UNLINKAT.target);
+    }
+
+    #[test]
+    fn rename_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_RENAME.replacement.is_null());
+        assert!(!INTERPOSE_RENAME.target.is_null());
+        assert_ne!(INTERPOSE_RENAME.replacement, INTERPOSE_RENAME.target);
+    }
+
+    #[test]
+    fn renameat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_RENAMEAT.replacement.is_null());
+        assert!(!INTERPOSE_RENAMEAT.target.is_null());
+        assert_ne!(INTERPOSE_RENAMEAT.replacement, INTERPOSE_RENAMEAT.target);
     }
 }
