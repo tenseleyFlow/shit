@@ -173,6 +173,24 @@ enum Cmd {
         /// `.docs/audits/doctor-json-schema.md` for the contract.
         #[arg(long)]
         json: bool,
+        /// AU08 — attempt automatic remediation of detected problems.
+        /// Currently scoped to Linux helper file caps: tries
+        /// `sudo -n setcap …` against the helper binary. Exits non-zero
+        /// when sudo would prompt; surfaces the manual command + offers
+        /// the sudoers snippet generator on that failure.
+        #[arg(long, conflicts_with_all = ["json", "emit_sudoers_snippet"])]
+        fix: bool,
+        /// AU08 — print a paste-ready sudoers/extraRules snippet that
+        /// grants NOPASSWD for `setcap` on the helper binary. Use
+        /// `--target nixos` for the NixOS `security.sudo.extraRules`
+        /// form; defaults to generic sudoers grammar.
+        #[arg(long, conflicts_with_all = ["json", "fix"])]
+        emit_sudoers_snippet: bool,
+        /// Target grammar for `--emit-sudoers-snippet`. One of
+        /// `generic` (default, covers Debian/Fedora/RHEL/Arch) or
+        /// `nixos`.
+        #[arg(long, default_value = "generic", requires = "emit_sudoers_snippet")]
+        target: String,
     },
 }
 
@@ -352,7 +370,24 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
                 Ok(())
             }
         },
-        Cmd::Doctor { json } => Ok(doctor::run(json)?),
+        Cmd::Doctor {
+            json,
+            fix,
+            emit_sudoers_snippet,
+            target,
+        } => {
+            if emit_sudoers_snippet {
+                let parsed: doctor::snippet::SudoersTarget = target.parse().map_err(|e| {
+                    anyhow::anyhow!("invalid --target: {e}; expected 'generic' or 'nixos'")
+                })?;
+                print!("{}", doctor::snippet::emit_sudoers_snippet(parsed));
+                return Ok(());
+            }
+            if fix {
+                return Ok(doctor::run_fix()?);
+            }
+            Ok(doctor::run(json)?)
+        }
     }
 }
 

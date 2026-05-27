@@ -58,6 +58,89 @@ pub fn run(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// AU08 — automatic remediation entry point (`shit doctor --fix`).
+///
+/// Today's scope is narrow: Linux helper file capabilities. The
+/// existing report already computes a `setcap_remediation` string;
+/// `--fix` attempts that string with `sudo -n`. On success, prints a
+/// confirmation. On failure (no NOPASSWD, no sudo, non-Linux),
+/// prints the manual command + a pointer to
+/// `--emit-sudoers-snippet`. Exits non-zero when remediation is
+/// needed but couldn't be applied; zero when nothing was wrong or
+/// the apply succeeded.
+///
+/// Other platforms: no-op success today. AU07 (BSD shim default-on)
+/// is expected to extend this with shim-install remediation.
+pub fn run_fix() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return fix_linux_caps();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!(
+            "shit doctor --fix: no auto-remediation is currently implemented for this platform"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fix_linux_caps() -> anyhow::Result<()> {
+    use std::process::Command;
+
+    let caps = probes::linux::read_caps();
+    let Some(cmd_str) = caps.setcap_remediation.as_deref() else {
+        println!("shit doctor --fix: helper caps already satisfy the runtime requirement.");
+        return Ok(());
+    };
+
+    // The remediation string is shaped `sudo setcap <CAPS> <PATH>`.
+    // For `--fix` we want a non-interactive variant: replace the
+    // leading `sudo` with `sudo -n`. If the string ever changes
+    // shape, fall back to printing it verbatim.
+    let argv: Vec<&str> = cmd_str.split_whitespace().collect();
+    if argv.first() != Some(&"sudo") || argv.len() < 4 {
+        eprintln!("shit doctor --fix: unexpected remediation shape; run manually:");
+        eprintln!("  {cmd_str}");
+        anyhow::bail!("remediation shape unrecognized");
+    }
+    let rest = &argv[1..]; // setcap CAPS PATH
+
+    if caps.helper_binary.caps_stale {
+        eprintln!("shit doctor --fix: caps stripped by a rebuild since last apply.");
+    } else {
+        eprintln!("shit doctor --fix: helper caps missing; attempting setcap.");
+    }
+    eprintln!("  sudo -n {}", rest.join(" "));
+
+    let status = Command::new("sudo").arg("-n").args(rest).status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("shit doctor --fix: caps applied successfully.");
+            Ok(())
+        }
+        Ok(s) => {
+            eprintln!(
+                "shit doctor --fix: sudo -n exited {}; NOPASSWD likely not configured.",
+                s.code().unwrap_or(-1)
+            );
+            eprintln!("  Run manually:");
+            eprintln!("    {cmd_str}");
+            eprintln!("  Or paste a NOPASSWD block once with:");
+            eprintln!("    shit doctor --emit-sudoers-snippet           # generic sudoers");
+            eprintln!("    shit doctor --emit-sudoers-snippet --target nixos  # NixOS");
+            anyhow::bail!("setcap not applied")
+        }
+        Err(e) => {
+            eprintln!("shit doctor --fix: failed to spawn sudo: {e}");
+            eprintln!("  Run manually:");
+            eprintln!("    {cmd_str}");
+            anyhow::bail!("could not invoke sudo")
+        }
+    }
+}
+
 /// Build the full report. Side-effect-free except for the probes
 /// in [`probes::bsd`] (which do small kqueue + sysctl + subprocess
 /// I/O — all documented to be <2s total).
