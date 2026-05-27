@@ -103,47 +103,67 @@ unsafe extern "C" fn my_renameat(
     unsafe { libc::renameat(fromfd, from, tofd, to) }
 }
 
-// `open` / `openat` are variadic in C (`int open(const char *,
-// int, ...)`) — POSIX guarantees the `mode` arg is read only
-// when `O_CREAT` is in `flags`. We declare fixed-arity 3-arg
-// (resp. 4-arg) wrappers; on aarch64 / x86_64 the call ABI
-// places the extra arg in a register, so the wrapper reads
-// garbage for `mode` on 2-arg callers but never USES it unless
-// the flags say to. This matches the BSD/Linux shim's approach.
+// Open/openat replacements live in the C trampoline (`macos_shim.c`)
+// because Apple's AArch64 variadic ABI is incompatible with a
+// Rust-side fixed-arity interpose function (mode arg gets read from
+// the wrong place — a register instead of the va_arg stack slot —
+// silently corrupting file modes). The C trampoline does
+// `va_arg(ap, int)` correctly and forwards to `rust_shim_open` /
+// `rust_shim_openat` below for the notify + libc passthrough.
 //
-// libc-rs declares `open` / `openat` as Rust variadic FFI
-// (`extern "C" fn(..., ...)`), which can't be coerced to a
-// function-item pointer cleanly. We re-declare them as fixed-
-// arity `extern "C"` so the linker resolves to the same
-// libsystem_c symbol but Rust can take their addresses for
-// the interpose pair.
+// The interpose entries point at the C-side `macos_shim_open` /
+// `macos_shim_openat` symbols as replacements, and at libsystem_c's
+// `_open` / `_openat` as targets (resolved via the `addr` module's
+// fixed-arity aliases — see below).
 unsafe extern "C" {
-    fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
-    fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+    fn macos_shim_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+    fn macos_shim_openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
 }
 
-/// Replacement for `open(2)`. Notifies on any write-mode open
-/// (`O_WRONLY` / `O_RDWR` / `O_TRUNC`) — truncate-on-open is the
-/// canonical destructive shape.
+// Address-only aliases for libsystem_c's `_open` / `_openat`. We
+// need fixed-arity signatures so Rust can do the `as *const c_void`
+// coercion for the interpose target — the dynamic linker resolves
+// `link_name = "open"` to the same symbol regardless of the Rust
+// signature.
+#[allow(dead_code)]
+mod addr {
+    use libc::{c_char, c_int, c_uint};
+    unsafe extern "C" {
+        #[link_name = "open"]
+        pub fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+        #[link_name = "openat"]
+        pub fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+    }
+}
+
+/// Rust target of the C trampoline for `open(2)`. The trampoline
+/// has already done `va_arg` for `mode` and is calling us with a
+/// proper fixed-arity 3-arg form. We notify on write flags then
+/// re-dispatch to libc's variadic `open` (Rust's variadic-out
+/// codegen handles the ABI back to libsystem_c correctly).
+///
+/// `#[no_mangle]` because the C trampoline links against this
+/// symbol by name.
 ///
 /// # Safety
 /// Same contract as libc `open(2)` — `path` must be a valid
-/// NUL-terminated C string; `mode` is read only when `O_CREAT`
+/// NUL-terminated C string; `mode` only meaningful when `O_CREAT`
 /// is in `flags`.
-unsafe extern "C" fn my_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+#[unsafe(no_mangle)]
+unsafe extern "C" fn rust_shim_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
     if writes {
         policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
     }
-    unsafe { open(path, flags, mode) }
+    unsafe { libc::open(path, flags, mode as c_int) }
 }
 
-/// Replacement for `openat(2)`. Same write-mode notification
-/// filter as `my_open`.
+/// Rust target of the C trampoline for `openat(2)`.
 ///
 /// # Safety
 /// Same contract as libc `openat(2)`.
-unsafe extern "C" fn my_openat(
+#[unsafe(no_mangle)]
+unsafe extern "C" fn rust_shim_openat(
     dirfd: c_int,
     path: *const c_char,
     flags: c_int,
@@ -153,7 +173,7 @@ unsafe extern "C" fn my_openat(
     if writes {
         policy::notify_pre_mutation_with_content("openat", &cstr_to_string(path));
     }
-    unsafe { openat(dirfd, path, flags, mode) }
+    unsafe { libc::openat(dirfd, path, flags, mode as c_int) }
 }
 
 /// Replacement for `mkdir(2)`. Captures directory-create
@@ -219,15 +239,15 @@ static INTERPOSE_RENAMEAT: InterposeEntry = InterposeEntry {
 #[used]
 #[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_OPEN: InterposeEntry = InterposeEntry {
-    replacement: my_open as *const c_void,
-    target: open as *const c_void,
+    replacement: macos_shim_open as *const c_void,
+    target: addr::open as *const c_void,
 };
 
 #[used]
 #[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_OPENAT: InterposeEntry = InterposeEntry {
-    replacement: my_openat as *const c_void,
-    target: openat as *const c_void,
+    replacement: macos_shim_openat as *const c_void,
+    target: addr::openat as *const c_void,
 };
 
 #[used]
@@ -330,13 +350,13 @@ mod tests {
         assert_ne!(INTERPOSE_MKDIRAT.replacement, INTERPOSE_MKDIRAT.target);
     }
 
-    /// Cross-cutting: count of expected interpose entries after
-    /// M07.A.2 lands. Section-size check is in the integration
-    /// test (`section_size_matches_entry_count`) so it doesn't
-    /// require otool here. This test just enumerates the entries
-    /// that exist as a regression gate — if someone adds a static
-    /// without bumping the assertion, the test points to the
-    /// omission in CR.
+    /// Cross-cutting: count of expected interpose entries.
+    /// Regression gate — if someone adds a static without bumping
+    /// the assertion, the test points to the omission in code
+    /// review. (Open/openat replacements live in the C trampoline
+    /// `macos_shim.c`; their interpose entries still appear in
+    /// this list, with the replacement field pointing at the C
+    /// symbol rather than a Rust function.)
     #[test]
     fn all_m07a2_entries_present() {
         let entries: &[&InterposeEntry] = &[
