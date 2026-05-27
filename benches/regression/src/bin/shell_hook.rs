@@ -123,6 +123,7 @@ fn pre_exec_frame(session: Uuid, seq: u64, cwd: &str) -> Result<Vec<u8>> {
         ts_unix_nanos: unix_nanos(),
         shell_kind: ShellKind::Bash,
         depth: 0,
+        cmd_string: None,
     };
     let frame = encode_frame(&msg)?;
     Ok(frame)
