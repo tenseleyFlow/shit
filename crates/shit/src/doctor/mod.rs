@@ -17,6 +17,7 @@
 
 pub mod json;
 pub mod probes;
+pub mod snippet;
 
 use shit_capture::{CaptureOpts, CowTier, FsKind, detect_fs, supported_tiers, would_pick};
 use std::path::{Path, PathBuf};
