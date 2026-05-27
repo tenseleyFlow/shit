@@ -13,6 +13,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  smoke-discovery:
+    # AU14-A — informational smoke-matrix surface. Runs the AU14 driver
+    # against tests/smoke/*.sh, verifies every smoke carries a valid
+    # SMOKE_* metadata header, and uploads smoke-matrix.json as a
+    # build artifact. NOT YET gating real smoke execution — the
+    # hand-curated jobs below continue to drive what actually runs.
+    # AU14-B will retire the hand-curated arrays and gate on this
+    # matrix.
+    name: smoke discovery + verify (AU14-A)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify metadata headers
+        run: bash tools/audit/smoke-driver.sh verify
+      - name: emit smoke-matrix.json
+        run: |
+          bash tools/audit/smoke-driver.sh discover > smoke-matrix.json
+          echo "===== matrix summary ====="
+          python3 -c "
+          import json
+          data = json.load(open('smoke-matrix.json'))
+          from collections import Counter
+          print(f'total: {len(data)}')
+          print(f'runnable: {sum(1 for r in data if not r[\"excluded_by\"])}')
+          print(f'excluded: {sum(1 for r in data if r[\"excluded_by\"])}')
+          for r in data:
+              if r['excluded_by']:
+                  print(f'  EXCLUDED: {r[\"name\"]} (by {r[\"excluded_by\"]}): {r[\"excluded_reason\"]}')
+          print('by runner:', dict(Counter(r['runner'] for r in data)))
+          print('by platform:', dict(Counter(r['platform'] for r in data)))
+          print('by tier:', dict(Counter(r['tier'] for r in data)))
+          "
+      - name: upload smoke-matrix.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-matrix
+          path: smoke-matrix.json
+
   daemon-boot:
     name: daemon-boot smoke
     runs-on: ubuntu-24.04
