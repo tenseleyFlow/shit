@@ -160,6 +160,27 @@ pub struct es_event_unlink_t {
     pub _reserved: [u8; 64],
 }
 
+/// `es_event_fork_t` from ESMessage.h. `msg.process` is the parent;
+/// `child` points to the new child process. M03.1.I consumes this
+/// to harvest the child's audit_token for tree-tracking.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_fork_t {
+    pub child: *const es_process_t,
+    pub _reserved: [u8; 64],
+}
+
+/// `es_event_exit_t` from ESMessage.h. `msg.process` is the dying
+/// process (we read its audit_token to remove from the tracked
+/// set). `stat` is the wait(2)-style exit status; we don't care
+/// about the value, only the fact of the exit.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_exit_t {
+    pub stat: std::os::raw::c_int,
+    pub _reserved: [u8; 64],
+}
+
 /// `es_events_t` union — Apple's version has ~120 variants; we
 /// model only the variants we consume. All variants share offset 0
 /// per union semantics, so reading the variant matching the
@@ -169,6 +190,8 @@ pub struct es_event_unlink_t {
 #[allow(non_camel_case_types)]
 pub union es_events_t {
     pub unlink: std::mem::ManuallyDrop<es_event_unlink_t>,
+    pub fork: std::mem::ManuallyDrop<es_event_fork_t>,
+    pub exit: std::mem::ManuallyDrop<es_event_exit_t>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -330,6 +353,42 @@ impl<'a> EsMessage<'a> {
         // the message lifetime; the string token inside has a
         // length + data that the kernel maintains.
         unsafe { Some((*event.target).path.as_path()) }
+    }
+
+    /// `Some(&es_event_fork_t)` iff `event_type == NOTIFY_FORK`.
+    /// M03.1.I.3 consumes for tree-tracking.
+    #[allow(dead_code)]
+    pub fn as_fork(&self) -> Option<&'a es_event_fork_t> {
+        if self.event_type() != super::sys::es_event_type_t::NOTIFY_FORK {
+            return None;
+        }
+        // SAFETY: discriminant check above guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.fork as *const _ as *const es_event_fork_t)) }
+    }
+
+    /// `Some(&es_event_exit_t)` iff `event_type == NOTIFY_EXIT`.
+    /// M03.1.I.3 consumes for tree-tracking cleanup.
+    #[allow(dead_code)]
+    pub fn as_exit(&self) -> Option<&'a es_event_exit_t> {
+        if self.event_type() != super::sys::es_event_type_t::NOTIFY_EXIT {
+            return None;
+        }
+        // SAFETY: discriminant check.
+        unsafe { Some(&*(&(*self.raw).event.exit as *const _ as *const es_event_exit_t)) }
+    }
+
+    /// Convenience: audit_token of the child process forked. Returns
+    /// `None` if the message isn't a fork or the child pointer is null.
+    /// M03.1.I.3 consumes for tree-tracking auto-add.
+    #[allow(dead_code)]
+    pub fn fork_child_audit_token(&self) -> Option<audit_token_t> {
+        let event = self.as_fork()?;
+        if event.child.is_null() {
+            return None;
+        }
+        // SAFETY: child is non-null *const es_process_t valid for
+        // the message lifetime; audit_token at offset 0.
+        unsafe { Some((*event.child).audit_token) }
     }
 }
 

@@ -68,10 +68,14 @@ impl es_event_type_t {
     pub const AUTH_UNLINK: Self = Self(8);
 
     /// NOTIFY events — no response required, just informational.
-    /// M03.1.E subscribes to NOTIFY_EXEC for the subscribe-deliver
-    /// smoke. AUTH_OPEN / AUTH_RENAME / NOTIFY_FORK / NOTIFY_EXIT
-    /// get added back when M03.1.G+ slices need them.
+    /// M03.1.E uses NOTIFY_EXEC for the subscribe-deliver smoke;
+    /// M03.1.I.3 uses NOTIFY_FORK + NOTIFY_EXIT for tree-tracking
+    /// (auto-add child audit_tokens, remove on exit).
     pub const NOTIFY_EXEC: Self = Self(9);
+    #[allow(dead_code)] // M03.1.I.3 consumes
+    pub const NOTIFY_FORK: Self = Self(11);
+    #[allow(dead_code)] // M03.1.I.3 consumes
+    pub const NOTIFY_EXIT: Self = Self(15);
 }
 
 // ─────────────────────────────────────────────────────────────────────
