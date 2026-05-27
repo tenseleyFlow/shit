@@ -1,10 +1,20 @@
-.PHONY: dev build test lint fmt fmt-fix tidy clean ci doc license-check tracing-leak-check
+.PHONY: dev build test lint fmt fmt-fix tidy clean ci doc license-check tracing-leak-check post-build
 
 dev:
 	cargo build --workspace
+	@$(MAKE) --no-print-directory post-build BIN=target/debug/shit-helper
 
 build:
 	cargo build --workspace --release
+	@$(MAKE) --no-print-directory post-build BIN=target/release/shit-helper
+
+# AU08 — reapply helper file caps stripped by cargo's link step.
+# No-op unless SHIT_AUTO_SETCAP=1 is exported (the script's own gate).
+# Self-skips on non-Linux uname.
+post-build:
+	@if [ -x tools/linux/post-build-setcap.sh ] && [ -n "$(BIN)" ]; then \
+		bash tools/linux/post-build-setcap.sh "$(BIN)"; \
+	fi
 
 test:
 	cargo test --workspace

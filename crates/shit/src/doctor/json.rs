@@ -208,6 +208,15 @@ pub struct HelperBinaryCaps {
     /// file caps. False when the helper isn't installed where we
     /// can find it (typical fresh-checkout case).
     pub readable: bool,
+    /// AU08 — true when caps existed previously (sentinel file present)
+    /// but the helper binary mtime is newer than the sentinel, i.e. a
+    /// rebuild has stripped the caps since the last apply. Distinguishes
+    /// a fresh checkout (never had caps; sentinel absent → false) from a
+    /// post-rebuild state (had caps; cargo stripped them → true). When
+    /// true, `shit doctor --fix` (or re-running with SHIT_AUTO_SETCAP=1)
+    /// is the targeted remediation.
+    #[serde(default)]
+    pub caps_stale: bool,
 }
 
 /// Effective caps of the calling process (the `shit` CLI). Read
