@@ -30,9 +30,6 @@
 //!   the active tier.
 
 #![cfg(target_os = "macos")]
-// Whole module is dead until M03.1.I.5 wires main.rs to spawn this
-// alongside the FSEvents producer. The allow comes off in I.5.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};

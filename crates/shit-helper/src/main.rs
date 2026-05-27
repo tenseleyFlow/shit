@@ -1818,9 +1818,16 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     };
 
     // M01.A: macOS FSEvents-degraded capture producer. Mirrors the
-    // BSD spawn shape. Producer is created unconditionally on macOS;
-    // the M03 ES producer will sit alongside (decided at WatchTree
-    // dispatch) once it lands.
+    // BSD spawn shape.
+    //
+    // M03.1.I.5: ES producer (`capture::macos_es`) spawns ALONGSIDE
+    // FSEvents per the coexistence ratification (design doc Decision
+    // 3). Both feed the daemon; CapturedPreImage (ES) and
+    // TreeOp::Unlink (FSEvents) are distinct event kinds so the
+    // daemon doesn't dedup them against each other. The ES producer
+    // only succeeds inside the SIP+AuthRoot+AMFI-bypassed VM today
+    // (or, in production, with the entitlement); on a stock dev mac
+    // it returns NotEntitled and we proceed FSEvents-only.
     #[cfg(target_os = "macos")]
     let macos_capture: Option<capture::macos::CaptureControl> = {
         match capture::macos::spawn(Arc::clone(&conn)) {
@@ -1832,6 +1839,32 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 tracing::warn!(
                     err = %e,
                     "macos fsevents capture runtime failed to start; continuing without it"
+                );
+                None
+            }
+        }
+    };
+
+    // M03.1.I.5: ES producer (coexists with FSEvents). spawn() only
+    // creates the thread; EsClient creation happens inside the pump
+    // and fails late (NotEntitled) on environments without the
+    // entitlement — the pump thread logs + exits cleanly, the
+    // CaptureControl handle still exists but its dispatches become
+    // no-ops once the worker is gone. That's the desired degraded
+    // posture for stock-Mac dev environments.
+    #[cfg(target_os = "macos")]
+    let macos_es_capture: Option<capture::macos_es::CaptureControl> = {
+        let staging_dir = cli.state_dir.join("helper-staging");
+        match capture::macos_es::spawn(Arc::clone(&conn), staging_dir) {
+            Ok((ctrl, _join)) => {
+                tracing::info!("macos endpoint-security capture runtime spawned");
+                Some(ctrl)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "macos endpoint-security capture runtime failed to start; \
+                     continuing with FSEvents only"
                 );
                 None
             }
@@ -1881,6 +1914,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_lsm = lsm_state.as_ref().map(|s| s.dispatch.clone());
     #[cfg(target_os = "macos")]
     let request_macos_capture = macos_capture.clone();
+    #[cfg(target_os = "macos")]
+    let request_macos_es_capture = macos_es_capture.clone();
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
@@ -1897,6 +1932,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             request_bsd_capture,
             #[cfg(target_os = "macos")]
             request_macos_capture,
+            #[cfg(target_os = "macos")]
+            request_macos_es_capture,
         )
     });
 
@@ -1958,6 +1995,17 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     drop(macos_capture);
 
+    // M03.1.I.5: shut down the ES pump alongside FSEvents. Same
+    // best-effort posture — the EsClient is held by PumpState
+    // (!Send) and only drops when the pump thread exits, which
+    // happens after it processes our Shutdown ControlMsg.
+    #[cfg(target_os = "macos")]
+    if let Some(ctrl) = &macos_es_capture {
+        ctrl.shutdown();
+    }
+    #[cfg(target_os = "macos")]
+    drop(macos_es_capture);
+
     Ok(())
 }
 
@@ -1976,6 +2024,7 @@ fn request_loop(
     ))]
     bsd_capture: Option<capture::bsd::CaptureControl>,
     #[cfg(target_os = "macos")] macos_capture: Option<capture::macos::CaptureControl>,
+    #[cfg(target_os = "macos")] macos_es_capture: Option<capture::macos_es::CaptureControl>,
 ) -> anyhow::Result<()> {
     use shit_proto::{HelperRequest, HelperResponse};
 
@@ -2149,6 +2198,22 @@ fn request_loop(
                         "watch_tree ignored — no macos capture (degraded)"
                     );
                 }
+                // M03.1.I.5: ES producer runs alongside FSEvents per
+                // the coexistence ratification. Both receive every
+                // WatchTree; ES filters by audit_token (kernel-stable
+                // identity), FSEvents by path prefix. Daemon ingests
+                // the distinct event kinds without dedup conflict.
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_es_capture {
+                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        cwd_path = %cwd_path,
+                        "watch_tree dispatched to macos endpoint-security capture"
+                    );
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
@@ -2249,6 +2314,11 @@ fn request_loop(
                 if let Some(ctrl) = &macos_capture {
                     ctrl.on_unwatch_tree(session, command_seq);
                     tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_es_capture {
+                    ctrl.on_unwatch_tree(session, command_seq);
+                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
                 }
                 #[cfg(not(any(
                     target_os = "linux",
