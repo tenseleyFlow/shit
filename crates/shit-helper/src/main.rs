@@ -400,6 +400,20 @@ enum Mode {
         #[arg(long, default_value_t = 2)]
         duration_secs: u64,
     },
+    /// M03.1.G — Subscribe to AUTH_UNLINK, decode each message, log
+    /// the target path, respond ALLOW. After `--duration-secs`
+    /// seconds, prints a JSON array of paths observed.
+    ///
+    /// Output: `{"events_received":<u64>,"paths":[<string>,...],"duration_secs":<u64>}`
+    /// on success, `{"error":...}` on failure.
+    ///
+    /// CAUTION: same as `es-auth-smoke` — every unlink on the host
+    /// briefly blocks on our ALLOW response. Don't run long.
+    #[command(name = "es-path-log-smoke")]
+    EsPathLogSmoke {
+        #[arg(long, default_value_t = 2)]
+        duration_secs: u64,
+    },
     /// L05 — `shit doctor` Linux fanotify functional probe.
     ///
     /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
@@ -627,6 +641,7 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         Mode::EsProbe => run_es_probe(),
         Mode::EsProbeSubscribe { duration_secs } => run_es_probe_subscribe(duration_secs),
         Mode::EsAuthSmoke { duration_secs } => run_es_auth_smoke(duration_secs),
+        Mode::EsPathLogSmoke { duration_secs } => run_es_path_log_smoke(duration_secs),
         Mode::ProbeFanotify => run_probe_fanotify(),
         Mode::ProbeEbpf => run_probe_ebpf(),
     }
@@ -684,6 +699,58 @@ fn run_es_probe_subscribe(duration_secs: u64) -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(duration_secs));
         let n = client.events_received();
         println!(r#"{{"events_received":{n},"duration_secs":{duration_secs}}}"#);
+        drop(client);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = duration_secs;
+        println!(r#"{{"error":"NotSupportedOnThisOs"}}"#);
+        Ok(())
+    }
+}
+
+/// M03.1.G — subscribe to AUTH_UNLINK with the path-logging
+/// handler; drain + print observed paths as JSON after the window.
+fn run_es_path_log_smoke(duration_secs: u64) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let client = match crate::es::EsClient::new_path_logging() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(r#"{{"error":"{e}"}}"#);
+                return Ok(());
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_secs(duration_secs));
+        let n = client.events_received();
+        let paths = client.drain_logged_paths();
+        // Hand-render the JSON to avoid pulling serde_json into the
+        // privileged binary. Path strings get backslash-escaped for
+        // any quotes / backslashes; macOS paths shouldn't contain
+        // control chars but we tolerate them.
+        let mut paths_json = String::from("[");
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                paths_json.push(',');
+            }
+            paths_json.push('"');
+            for c in p.display().to_string().chars() {
+                match c {
+                    '"' => paths_json.push_str("\\\""),
+                    '\\' => paths_json.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => {
+                        paths_json.push_str(&format!("\\u{:04x}", c as u32))
+                    }
+                    c => paths_json.push(c),
+                }
+            }
+            paths_json.push('"');
+        }
+        paths_json.push(']');
+        println!(
+            r#"{{"events_received":{n},"paths":{paths_json},"duration_secs":{duration_secs}}}"#
+        );
         drop(client);
         Ok(())
     }

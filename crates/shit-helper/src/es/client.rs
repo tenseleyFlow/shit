@@ -151,6 +151,53 @@ impl EsClient {
         })
     }
 
+    /// Subscribe to AUTH_UNLINK with the path-logging handler
+    /// (M03.1.G). Same response posture as
+    /// [`Self::new_auth_counting`] but also decodes each message
+    /// and records the unlink target path in
+    /// [`super::sys::LAST_UNLINK_PATHS`]. Drain via
+    /// [`Self::drain_logged_paths`] after the smoke window.
+    pub fn new_path_logging() -> Result<Self, EsClientError> {
+        let mut client: *mut sys::es_client_t = ptr::null_mut();
+        let result = unsafe {
+            sys::es_new_client(
+                &mut client as *mut *mut sys::es_client_t,
+                &sys::PATH_LOG_HANDLER as *const _ as *const c_void,
+            )
+        };
+        if result != sys::es_new_client_result_t::SUCCESS {
+            return Err(EsClientError::NewClient(result));
+        }
+
+        let start_count = sys::EVENT_COUNTER.load(Ordering::Relaxed);
+
+        let events = [sys::es_event_type_t::AUTH_UNLINK];
+        let sub = unsafe { sys::es_subscribe(client, events.as_ptr(), events.len() as u32) };
+        if sub != sys::es_return_t::SUCCESS {
+            unsafe {
+                let _ = sys::es_delete_client(client);
+            }
+            return Err(EsClientError::Subscribe(sub));
+        }
+
+        Ok(Self {
+            client,
+            start_count,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Drain the path-logging buffer (M03.1.G). Returns and clears
+    /// the recorded paths. Safe to call from any thread but
+    /// typically used by the calling thread after teardown to
+    /// dump the smoke results.
+    pub fn drain_logged_paths(&self) -> Vec<std::path::PathBuf> {
+        match sys::LAST_UNLINK_PATHS.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Events delivered to the counter handler since this client
     /// was constructed.
     pub fn events_received(&self) -> u64 {

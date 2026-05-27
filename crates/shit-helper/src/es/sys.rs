@@ -337,6 +337,68 @@ pub static ALLOW_COUNTER_HANDLER: Block<()> = Block {
 };
 
 // ─────────────────────────────────────────────────────────────────────
+// Path-logging handler (M03.1.G — decode + log + respond ALLOW)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Same response shape as ALLOW_COUNTER_HANDLER but also decodes the
+// message and records the unlink target path in a bounded Mutex.
+// The smoke CLI drains the buffer after the subscription window.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Bounded ring of the most-recent unlink target paths. Capped to
+/// avoid unbounded growth if the smoke runs long. Drained by the
+/// `es-path-log-smoke` CLI after the subscription window closes.
+pub static LAST_UNLINK_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+const LAST_UNLINK_CAP: usize = 256;
+
+extern "C" fn path_log_invoke(
+    _block: *const Block<()>,
+    client: *mut es_client_t,
+    message: *const c_void,
+) {
+    EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: client + message are kernel-owned for the duration
+    // of this callback per Apple's docs. The EsMessage wrapper
+    // borrows the pointer only inside this scope.
+    unsafe {
+        let msg = super::message::EsMessage::from_raw(message);
+        if let Some(p) = msg.unlink_target_path()
+            && let Ok(mut g) = LAST_UNLINK_PATHS.lock()
+        {
+            if g.len() >= LAST_UNLINK_CAP {
+                g.remove(0);
+            }
+            g.push(p.to_path_buf());
+        }
+        let _ = es_respond_auth_result(
+            client,
+            message as *const es_message_t,
+            es_auth_result_t::ALLOW,
+            true,
+        );
+    }
+}
+
+static PATH_LOG_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: core::mem::size_of::<Block<()>>() as c_ulong,
+};
+
+/// Pre-built global Block that decodes the message, records the
+/// unlink target path in [`LAST_UNLINK_PATHS`], then responds ALLOW.
+/// Safe for AUTH_UNLINK subscriptions.
+pub static PATH_LOG_HANDLER: Block<()> = Block {
+    isa: unsafe { &_NSConcreteGlobalBlock as *const _ },
+    flags: BLOCK_IS_GLOBAL,
+    reserved: 0,
+    invoke: path_log_invoke as *const c_void,
+    descriptor: &PATH_LOG_DESCRIPTOR,
+    _phantom: PhantomData,
+};
+
+// ─────────────────────────────────────────────────────────────────────
 // ES extern fns
 // ─────────────────────────────────────────────────────────────────────
 
