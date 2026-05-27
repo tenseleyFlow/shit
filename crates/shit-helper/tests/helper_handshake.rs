@@ -117,6 +117,7 @@ fn spawn_helper_and_complete_handshake() {
             granted,
             helper_version,
             kernel_tier,
+            degraded_reason: _,
         } => {
             assert_eq!(protocol_version, HELPER_PROTOCOL_VERSION);
             assert_eq!(helper_uid, daemon_uid);

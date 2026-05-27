@@ -192,6 +192,16 @@ enum Cmd {
         #[arg(long, default_value = "generic", requires = "emit_sudoers_snippet")]
         target: String,
     },
+    /// macOS power-user EndpointSecurity setup helper. Documents +
+    /// applies the SIP-disable + AuthRoot-disable + AMFI-bypass +
+    /// helper-codesign steps required to run shit's ES-tier
+    /// capture on a stock Mac (M03.x.POWER-USER post-entitlement-
+    /// denial pivot). Use `--check` to inspect prereqs, `--print`
+    /// for the copy-pasteable setup script, `--apply` to run the
+    /// local-machine pieces.
+    #[cfg(target_os = "macos")]
+    #[command(name = "setup-es-mode")]
+    SetupEsMode(cmd::setup_es_mode::SetupEsModeArgs),
 }
 
 #[derive(Subcommand)]
@@ -388,6 +398,8 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
             }
             Ok(doctor::run(json)?)
         }
+        #[cfg(target_os = "macos")]
+        Cmd::SetupEsMode(args) => Ok(cmd::setup_es_mode::run(args)?),
     }
 }
 

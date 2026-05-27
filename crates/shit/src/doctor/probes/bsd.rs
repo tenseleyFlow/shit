@@ -228,6 +228,7 @@ pub fn helper_handshake_probe(daemon_sock: &Path) -> HelperHandshakeReport {
             helper_version: None,
             kernel_tier: None,
             error: Some("shit-helper binary not found".into()),
+            degraded_reason: None,
         };
     };
 
@@ -250,6 +251,7 @@ pub fn helper_handshake_probe(daemon_sock: &Path) -> HelperHandshakeReport {
                 helper_version: None,
                 kernel_tier: None,
                 error: Some(format!("spawn {}: {e}", bin.display())),
+                degraded_reason: None,
             };
         }
     };
@@ -266,6 +268,7 @@ pub fn helper_handshake_probe(daemon_sock: &Path) -> HelperHandshakeReport {
             } else {
                 stderr
             }),
+            degraded_reason: None,
         };
     }
 
@@ -281,6 +284,7 @@ pub fn helper_handshake_probe(daemon_sock: &Path) -> HelperHandshakeReport {
                 helper_version: None,
                 kernel_tier: None,
                 error: Some(format!("helper output not JSON: {e}")),
+                degraded_reason: None,
             };
         }
     };
@@ -301,6 +305,12 @@ pub fn helper_handshake_probe(daemon_sock: &Path) -> HelperHandshakeReport {
             .and_then(|x| x.as_str())
             .map(String::from),
         error: v.get("error").and_then(|x| x.as_str()).map(String::from),
+        // M03.x.POWER-USER.3 — helper's handshake-probe subcommand
+        // emits this when present; tolerate absence for older helpers.
+        degraded_reason: v
+            .get("degraded_reason")
+            .and_then(|x| x.as_str())
+            .map(String::from),
     }
 }
 

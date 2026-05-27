@@ -26,6 +26,8 @@ pub mod pin;
 pub mod pkg_hooks;
 pub mod proc_hooks;
 pub mod redo;
+#[cfg(target_os = "macos")]
+pub mod setup_es_mode;
 pub mod show;
 pub mod svc_hooks;
 pub mod undo;

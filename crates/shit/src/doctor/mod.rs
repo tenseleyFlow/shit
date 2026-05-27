@@ -368,9 +368,17 @@ fn collect_macos() -> Option<json::MacReport> {
                 .to_string(),
         );
     }
+    // M03.x.POWER-USER — independent of whether ES is currently
+    // running, check whether the helper on disk CARRIES the
+    // entitlement. False here + true entitlement_present is
+    // impossible (latter implies former); true here + false
+    // entitlement_present means AMFI is rejecting the claim
+    // (the user has the entitlement plist embedded but SIP/auth-
+    // root/AMFI prereqs aren't met).
+    es.helper_has_es_entitlement = macos::probe_helper_has_es_entitlement(None);
 
-    // Stable tier label — fsevents-degraded baseline today. M03 will
-    // flip to "endpoint-security" when entitlement_present +
+    // Stable tier label — fsevents-degraded baseline today. M03
+    // flips to "endpoint-security" when entitlement_present +
     // fda_granted + client_can_subscribe all become true.
     let runtime_capture = if es.entitlement_present && es.fda_granted && es.client_can_subscribe {
         "endpoint-security".to_string()
@@ -380,6 +388,11 @@ fn collect_macos() -> Option<json::MacReport> {
         "degraded".to_string()
     };
 
+    // M03.x.POWER-USER — compose the prereq summary AFTER all
+    // individual probes have run. Pure function; the inputs are
+    // the already-populated SipReport + EndpointSecurityReport.
+    let (es_capable, es_blockers) = macos::compose_es_capable(&sip, &es);
+
     Some(json::MacReport {
         runtime_capture,
         endpoint_security: es,
@@ -388,6 +401,8 @@ fn collect_macos() -> Option<json::MacReport> {
         sip,
         sandbox,
         helper_handshake: probe_helper_handshake(),
+        es_capable,
+        es_blockers,
     })
 }
 
@@ -456,6 +471,14 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
                     Some(m.kernel_tier)
                 },
                 error: error_msg,
+                // M03.x.POWER-USER.3: the daemon's ctl Metrics response
+                // doesn't yet carry the helper's degraded_reason. The
+                // doctor's own `probe_endpoint_security` calls the
+                // helper's es-probe directly + surfaces the same
+                // information via `EndpointSecurityReport.notes`. Once
+                // ctl proto grows a helper_degraded_reason field we
+                // can populate this from `m`.
+                degraded_reason: None,
             }
         }
         Ok(other) => HelperHandshakeReport {
@@ -464,6 +487,7 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
             helper_version: None,
             kernel_tier: None,
             error: Some(format!("unexpected ctl response: {other:?}")),
+            degraded_reason: None,
         },
         Err(e) => HelperHandshakeReport {
             ok: false,
@@ -471,6 +495,7 @@ fn probe_helper_handshake() -> HelperHandshakeReport {
             helper_version: None,
             kernel_tier: None,
             error: Some(e.to_string()),
+            degraded_reason: None,
         },
     }
 }
