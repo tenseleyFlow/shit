@@ -74,7 +74,7 @@ pub fn run(json: bool) -> anyhow::Result<()> {
 pub fn run_fix() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return fix_linux_caps();
+        fix_linux_caps()
     }
     #[cfg(not(target_os = "linux"))]
     {
