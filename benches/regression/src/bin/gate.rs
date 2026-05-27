@@ -140,7 +140,9 @@ fn main() -> Result<()> {
         let gate_name = &args.gate;
         let budgets_path = args.budgets.display();
         if args.skip_on_missing_gate {
-            println!("{workload}: SKIP (no '{gate_name}' gate in [{tier_label}] section of {budgets_path})");
+            println!(
+                "{workload}: SKIP (no '{gate_name}' gate in [{tier_label}] section of {budgets_path})"
+            );
             return Ok(());
         }
         eprintln!(
