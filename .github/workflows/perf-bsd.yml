@@ -62,7 +62,7 @@ jobs:
               ./target/release/doctor-bench --n 100 \
               --out target/bench/doctor.json
             cat target/bench/doctor.json
-            ./target/release/gate --gate doctor \
+            ./target/release/gate --tier bsd --gate doctor \
               --input target/bench/doctor.json \
               --budgets tools/perf/budgets.toml
 
@@ -71,7 +71,7 @@ jobs:
               ./target/release/shell-hook-bench --n 200 --batch 100 --warmup 20 \
               --out target/bench/shell-hook.json
             cat target/bench/shell-hook.json
-            ./target/release/gate --gate shell-hook \
+            ./target/release/gate --tier bsd --gate shell-hook \
               --input target/bench/shell-hook.json \
               --budgets tools/perf/budgets.toml
 
@@ -81,7 +81,7 @@ jobs:
               ./target/release/hook-helper-bench --n 100 --warmup 10 \
               --out target/bench/hook-helper.json
             cat target/bench/hook-helper.json
-            ./target/release/gate --gate hook-helper \
+            ./target/release/gate --tier bsd --gate hook-helper \
               --input target/bench/hook-helper.json \
               --budgets tools/perf/budgets.toml
 
@@ -89,7 +89,7 @@ jobs:
             ./target/release/kqueue-drain-bench --n 50 --warmup 5 \
               --out target/bench/kqueue-drain.json
             cat target/bench/kqueue-drain.json
-            ./target/release/gate --gate kqueue-drain \
+            ./target/release/gate --tier bsd --gate kqueue-drain \
               --input target/bench/kqueue-drain.json \
               --budgets tools/perf/budgets.toml
 
@@ -97,7 +97,7 @@ jobs:
             ./target/release/per-event-capture-bench --n 1000 --warmup 50 \
               --out target/bench/per-event-capture.json
             cat target/bench/per-event-capture.json
-            ./target/release/gate --gate per-event-capture \
+            ./target/release/gate --tier bsd --gate per-event-capture \
               --input target/bench/per-event-capture.json \
               --budgets tools/perf/budgets.toml
 
