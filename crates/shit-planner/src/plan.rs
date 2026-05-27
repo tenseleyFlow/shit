@@ -144,6 +144,20 @@ struct EventClassification {
     atomic_replace_paths: HashSet<PathBuf>,
     transient_paths: HashSet<PathBuf>,
     rename_subsumed_creates: HashSet<PathBuf>,
+    /// M03.x.OPEN-UNDO — paths that have BOTH a `FilePreImage` AND a
+    /// `TreeOp::Create` in the same command, but NO matching
+    /// `TreeOp::Unlink`. This is the FSEvents-coexistence race on
+    /// macOS: ES correctly emits `FilePreImage` for an
+    /// `open(O_WRONLY)` against an existing file; FSEvents spuriously
+    /// emits a `TreeOp::Create` for the same path (the kernel sets
+    /// `ItemCreated` on the inode's flag bitmask for files created in
+    /// the recent past, even past the FSEvents stream start). Without
+    /// suppression the planner emits `RestoreContent + Unlink` and
+    /// the latter wins on apply → file ends up deleted instead of
+    /// restored. The FilePreImage's existence is authoritative
+    /// evidence that the file existed pre-command; suppress the
+    /// spurious Create's `Unlink` inverse.
+    spurious_creates_with_preimage: HashSet<PathBuf>,
     /// W09.20 — paths that share an inode with another path AND
     /// still exist on disk at undo time. The pre-mutation events for
     /// these paths are spurious noise from kqueue NOTE_DELETE firing
@@ -319,6 +333,33 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         }
         if probe.stat(p).is_none() {
             transient.insert(p.clone());
+        }
+    }
+    // M03.x.OPEN-UNDO — Create + PreImage with NO Unlink, path EXISTS
+    // at undo. This is the FSEvents-on-macOS race: ES correctly
+    // emitted FilePreImage for `dd conv=notrunc` (or any open(W)
+    // against an existing file), and FSEvents independently emitted
+    // TreeOp::Create for the same path because the kernel's
+    // ItemCreated flag bit was still set on the inode from a
+    // pre-watch-attach creation event. The FilePreImage's existence
+    // is authoritative evidence that the file existed pre-command;
+    // suppress the Create's Unlink inverse so RestoreContent can
+    // rewrite the original bytes without a racing delete.
+    //
+    // Guard with `probe.stat(p).is_some()` so we don't suppress the
+    // Create-inverse for a path that's now gone (something else
+    // deleted it post-create-mid-command; the user's expectation
+    // there is "stay gone" via the existing transient rule above).
+    let mut spurious_creates_with_preimage: HashSet<PathBuf> = HashSet::new();
+    for p in &creates {
+        if unlinks.contains(p) {
+            continue;
+        }
+        if !pre_images.contains(p) {
+            continue;
+        }
+        if probe.stat(p).is_some() {
+            spurious_creates_with_preimage.insert(p.clone());
         }
     }
     // W06.A.5: Create + Rename(to=path) with NO Unlink → the shim
@@ -498,6 +539,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         atomic_replace_paths: atomic,
         transient_paths: transient,
         rename_subsumed_creates,
+        spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
     }
@@ -1183,6 +1225,14 @@ fn emit_for_tree_op(
             // either race and delete the moved-back file or beat the
             // rename to it and leave the original location empty.
             if rename_subsumed_creates.contains(path) {
+                return;
+            }
+            // M03.x.OPEN-UNDO: FSEvents-on-macOS race — Create observed
+            // alongside FilePreImage for the same path, no Unlink, path
+            // still on disk. The FilePreImage's RestoreContent will
+            // rewrite the original bytes; an Unlink here would race
+            // and delete the file the user actually wants restored.
+            if class.spurious_creates_with_preimage.contains(path) {
                 return;
             }
             // The user's command created this path; inverse is unlink.
