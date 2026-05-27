@@ -170,6 +170,55 @@ pub struct es_event_fork_t {
     pub _reserved: [u8; 64],
 }
 
+/// `es_destination_type_t` discriminant for `es_event_rename_t.destination`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct es_destination_type_t(pub u32);
+
+impl es_destination_type_t {
+    /// Destination is a pre-existing file that will be overwritten by
+    /// the rename. The pre-existing bytes are LOST after the syscall;
+    /// the M03.1.I.A capture path clonefiles this file's content into
+    /// staging before responding ALLOW so undo can restore them.
+    pub const EXISTING_FILE: Self = Self(0);
+    /// Destination path doesn't exist yet; rename creates it. No
+    /// pre-image to capture — `TreeOp::Rename(from→to)` alone lets
+    /// undo invert the rename.
+    pub const NEW_PATH: Self = Self(1);
+}
+
+/// `es_event_rename_destination_t.new_path` — directory + filename
+/// for the case where the destination doesn't pre-exist.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_rename_new_path_t {
+    pub dir: *const es_file_t,
+    pub filename: es_string_token_t,
+    pub filename_truncated: bool,
+}
+
+/// `es_event_rename_t.destination` union. The active variant is
+/// selected by [`es_event_rename_t::destination_type`].
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub union es_event_rename_destination_t {
+    pub existing_file: *const es_file_t,
+    pub new_path: std::mem::ManuallyDrop<es_event_rename_new_path_t>,
+}
+
+/// `es_event_rename_t` from ESMessage.h. `source` is the file being
+/// renamed; `destination` is either an existing file (overwrite, with
+/// content loss) or a new path (no loss).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_rename_t {
+    pub source: *const es_file_t,
+    pub destination_type: es_destination_type_t,
+    pub destination: es_event_rename_destination_t,
+    pub _reserved: [u8; 64],
+}
+
 /// `es_event_exit_t` from ESMessage.h. `msg.process` is the dying
 /// process (we read its audit_token to remove from the tracked
 /// set). `stat` is the wait(2)-style exit status; we don't care
@@ -190,6 +239,7 @@ pub struct es_event_exit_t {
 #[allow(non_camel_case_types)]
 pub union es_events_t {
     pub unlink: std::mem::ManuallyDrop<es_event_unlink_t>,
+    pub rename: std::mem::ManuallyDrop<es_event_rename_t>,
     pub fork: std::mem::ManuallyDrop<es_event_fork_t>,
     pub exit: std::mem::ManuallyDrop<es_event_exit_t>,
 }
@@ -368,6 +418,15 @@ impl<'a> EsMessage<'a> {
         // SAFETY: target is a non-null *const es_file_t valid for
         // the message lifetime.
         unsafe { Some(&*event.target) }
+    }
+
+    /// `Some(&es_event_rename_t)` iff `event_type == AUTH_RENAME`.
+    pub fn as_rename(&self) -> Option<&'a es_event_rename_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_RENAME {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.rename as *const _ as *const es_event_rename_t)) }
     }
 
     /// `Some(&es_event_fork_t)` iff `event_type == NOTIFY_FORK`.

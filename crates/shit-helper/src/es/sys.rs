@@ -65,6 +65,7 @@ pub struct es_event_type_t(pub u32);
 impl es_event_type_t {
     /// AUTH events — handler MUST respond via `es_respond_auth_result`
     /// within 5 seconds or the kernel kills the client.
+    pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
 
     /// NOTIFY events — no response required, just informational.
@@ -72,9 +73,7 @@ impl es_event_type_t {
     /// M03.1.I.3 uses NOTIFY_FORK + NOTIFY_EXIT for tree-tracking
     /// (auto-add child audit_tokens, remove on exit).
     pub const NOTIFY_EXEC: Self = Self(9);
-    #[allow(dead_code)] // M03.1.I.3 consumes
     pub const NOTIFY_FORK: Self = Self(11);
-    #[allow(dead_code)] // M03.1.I.3 consumes
     pub const NOTIFY_EXIT: Self = Self(15);
 }
 
