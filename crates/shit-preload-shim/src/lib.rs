@@ -124,6 +124,13 @@ pub mod install_pattern;
 pub mod prefix_match;
 pub mod runtime;
 
+// M07.A: macOS interposition surface, separate module because the
+// mechanism is `__DATA,__interpose` (static section table) rather
+// than the `dlsym(RTLD_NEXT)` pattern the BSD/Linux `mod next`
+// branch uses. See macos.rs for the rationale.
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
