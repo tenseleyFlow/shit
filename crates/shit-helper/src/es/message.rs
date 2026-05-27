@@ -455,6 +455,52 @@ pub fn audit_token_self() -> Option<audit_token_t> {
     Some(audit_token_t { val: buf })
 }
 
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    /// `kern_return_t task_name_for_pid(task_t target_tport, int pid, task_name_t *tn);`
+    /// — read-only task port. Doesn't need the task_for_pid-allow
+    /// entitlement; root-privileged callers can read any process's
+    /// task-name port for the purposes of `task_info` queries.
+    fn task_name_for_pid(target_tport: u32, pid: i32, tn: *mut u32) -> i32;
+}
+
+/// Resolve `pid` to its `audit_token_t` via Mach. Used as a fallback
+/// when [`PumpHandle::pid_to_token`] doesn't have the pid yet — most
+/// commonly because the shell predates the helper subscription, so
+/// no NOTIFY_EXEC was delivered for it. Requires root (or the
+/// `task_for_pid-allow` entitlement) per Apple's docs.
+///
+/// Returns `None` on Mach error (process doesn't exist, permission
+/// denied, etc.).
+pub fn audit_token_for_pid(pid: i32) -> Option<audit_token_t> {
+    let mut task: u32 = 0;
+    // SAFETY: mach_task_self_ + task_name_for_pid are linked from libSystem.
+    let rc = unsafe { task_name_for_pid(mach_task_self_, pid, &mut task as *mut _) };
+    if rc != 0 {
+        return None;
+    }
+    let mut buf = [0u32; 8];
+    let mut count = 8u32;
+    // SAFETY: task is a valid mach_port_t for the duration of this call.
+    let rc = unsafe { task_info(task, TASK_AUDIT_TOKEN, buf.as_mut_ptr(), &mut count) };
+    // Release the task port — task_name_for_pid returns a +1 reference.
+    // SAFETY: task is the same port we just got back; deallocate_port
+    // is the documented release path.
+    unsafe {
+        let _ = mach_port_deallocate(mach_task_self_, task);
+    }
+    if rc != 0 || count < 8 {
+        return None;
+    }
+    Some(audit_token_t { val: buf })
+}
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    /// `kern_return_t mach_port_deallocate(ipc_space_t task, mach_port_name_t name);`
+    fn mach_port_deallocate(task: u32, name: u32) -> i32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
