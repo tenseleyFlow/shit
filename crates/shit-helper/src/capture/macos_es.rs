@@ -335,14 +335,24 @@ fn respond_deny_open_flags(client: *mut sys::es_client_t, message: *const c_void
 /// filename, this gives global uniqueness across helper restarts too.
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Inline clonefile from `src_path` → fresh file under `staging_dir`.
-/// Returns the staging path + an `O_RDONLY` fd ready for SCM_RIGHTS.
+/// Hard cap on stream-copy fallback size. Files larger than this on
+/// non-APFS volumes are NOT captured — the inline copy would push us
+/// toward the ES 5-second auth deadline. 32 MiB matches the design
+/// doc's stated limit; raised later if real workloads need it.
+const STREAM_COPY_CAP: u64 = 32 * 1024 * 1024;
+
+/// Inline pre-image stage. Tries APFS [`clonefile(2)`] first (µs-fast,
+/// CoW reference, no byte copy); falls back to a streaming read on
+/// non-APFS volumes (EOPNOTSUPP / ENOTSUP / EXDEV).
 ///
-/// Called from the ES kernel callback BEFORE responding ALLOW. Must
-/// complete in microseconds on APFS (clonefile is a CoW reference,
-/// not a byte copy). On non-APFS volumes this fails with EOPNOTSUPP;
-/// fallback to streaming-read is M03.1.I.G follow-up.
-fn inline_clonefile(src_path: &Path, staging_dir: &Path) -> std::io::Result<(PathBuf, OwnedFd)> {
+/// `expected_size` from the kernel-attached stat lets the fallback
+/// short-circuit oversize files BEFORE allocating a buffer or
+/// touching disk — preserves the ES 5-s auth deadline.
+fn inline_clonefile(
+    src_path: &Path,
+    staging_dir: &Path,
+    expected_size: u64,
+) -> std::io::Result<(PathBuf, OwnedFd)> {
     let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let staging_path = staging_dir.join(format!("es-{pid}-{seq:016x}"));
@@ -367,7 +377,14 @@ fn inline_clonefile(src_path: &Path, staging_dir: &Path) -> std::io::Result<(Pat
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOTSUP) | Some(libc::EXDEV) => {
+                // Non-APFS or cross-volume — fall back to stream copy.
+                return stream_copy_to_staging(src_path, &staging_path, expected_size);
+            }
+            _ => return Err(err),
+        }
     }
 
     // Reopen the staging file read-only for the SCM_RIGHTS hand-off.
@@ -386,6 +403,125 @@ fn inline_clonefile(src_path: &Path, staging_dir: &Path) -> std::io::Result<(Pat
     // SAFETY: rfd is a fresh kernel-allocated fd we now own.
     let fd = unsafe { OwnedFd::from_raw_fd(rfd) };
     Ok((staging_path, fd))
+}
+
+/// Stream-copy fallback for non-APFS / cross-volume cases. Opens src
+/// O_RDONLY, opens staging O_WRONLY|O_CREAT|O_EXCL, copies up to
+/// [`STREAM_COPY_CAP`] bytes via a 64 KiB stack-bounded buffer (no
+/// large Vec<u8> on the hot path). Returns the staging path + an
+/// O_RDONLY fd matching the clonefile path's return contract.
+///
+/// Files larger than the cap return an `InvalidData` error so the
+/// caller can DENY the syscall under hard-fail policy — capturing a
+/// truncated pre-image would lie about what undo can restore.
+fn stream_copy_to_staging(
+    src_path: &Path,
+    staging_path: &Path,
+    expected_size: u64,
+) -> std::io::Result<(PathBuf, OwnedFd)> {
+    if expected_size > STREAM_COPY_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "file {} bytes exceeds stream-copy cap {} bytes (non-APFS path)",
+                expected_size, STREAM_COPY_CAP
+            ),
+        ));
+    }
+
+    let c_src = CString::new(src_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "src path contains NUL")
+    })?;
+    let c_dst = CString::new(staging_path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "staging path contains NUL",
+        )
+    })?;
+
+    // SAFETY: c_src is NUL-terminated. O_NOFOLLOW so a symlink-race
+    // can't redirect us to a different target than ES decoded.
+    let sfd_raw = unsafe {
+        libc::open(
+            c_src.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if sfd_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: sfd_raw is a fresh fd we own.
+    let sfd = unsafe { OwnedFd::from_raw_fd(sfd_raw) };
+
+    let wflags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // SAFETY: c_dst NUL-terminated; mode 0600 keeps the staging file
+    // owner-only (matches clonefile's CLONE_NOOWNERCOPY posture).
+    let wfd_raw = unsafe { libc::open(c_dst.as_ptr(), wflags, 0o600) };
+    if wfd_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    const CHUNK: usize = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK];
+    let target = expected_size as i64;
+    let mut offset: i64 = 0;
+    while offset < target {
+        let want = ((target - offset) as usize).min(CHUNK);
+        // SAFETY: src fd valid; buf writable of len >= want.
+        let n = unsafe { libc::pread(sfd.as_raw_fd(), buf.as_mut_ptr().cast(), want, offset) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            unsafe { libc::close(wfd_raw) };
+            let _ = std::fs::remove_file(staging_path);
+            return Err(err);
+        }
+        if n == 0 {
+            // File shrunk under us mid-copy. Stop + ship what we got.
+            break;
+        }
+        let n_usize = n as usize;
+        let mut written = 0usize;
+        while written < n_usize {
+            // SAFETY: wfd_raw valid; buf valid.
+            let wrc = unsafe {
+                libc::write(
+                    wfd_raw,
+                    buf.as_ptr().add(written).cast(),
+                    (n_usize - written) as libc::size_t,
+                )
+            };
+            if wrc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                unsafe { libc::close(wfd_raw) };
+                let _ = std::fs::remove_file(staging_path);
+                return Err(err);
+            }
+            written += wrc as usize;
+        }
+        offset += n as i64;
+    }
+    // SAFETY: wfd_raw is a real fd we opened above; fsync + close
+    // here so the readable handoff fd sees consistent bytes.
+    unsafe {
+        libc::fsync(wfd_raw);
+        libc::close(wfd_raw);
+    }
+
+    let rfd = unsafe { libc::open(c_dst.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if rfd < 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(staging_path);
+        return Err(err);
+    }
+    // SAFETY: rfd is a fresh kernel-allocated fd we now own.
+    let fd = unsafe { OwnedFd::from_raw_fd(rfd) };
+    Ok((staging_path.to_path_buf(), fd))
 }
 
 /// Hash the file behind `fd` via `pread`, without disturbing its
@@ -505,20 +641,21 @@ fn handle_auth_unlink(
     //    proceed; under hard-fail, capture failure → DENY so the
     //    user gets "permission denied" instead of an unrecoverable
     //    unlink with no pre-image.
-    let (staging_path, staging_fd) = match inline_clonefile(target_path, &pump.staging_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(
-                %command.session,
-                seq = command.seq,
-                path = %target_path.display(),
-                err = %e,
-                "macos-es clonefile failed; DENY unlink (hard-fail per CLAUDE.md)"
-            );
-            respond_deny(client, message);
-            return;
-        }
-    };
+    let (staging_path, staging_fd) =
+        match inline_clonefile(target_path, &pump.staging_dir, stat.st_size as u64) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %target_path.display(),
+                    err = %e,
+                    "macos-es clonefile failed; DENY unlink (hard-fail per CLAUDE.md)"
+                );
+                respond_deny(client, message);
+                return;
+            }
+        };
 
     // 2. Pack the record. stat fields are kernel-attached; no extra
     //    syscalls needed.
@@ -569,20 +706,21 @@ fn handle_auth_truncate(
     let target_path = unsafe { file.path.as_path() };
     let stat = file.stat;
 
-    let (staging_path, staging_fd) = match inline_clonefile(target_path, &pump.staging_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(
-                %command.session,
-                seq = command.seq,
-                path = %target_path.display(),
-                err = %e,
-                "macos-es truncate clone failed; DENY truncate"
-            );
-            respond_deny(client, message);
-            return;
-        }
-    };
+    let (staging_path, staging_fd) =
+        match inline_clonefile(target_path, &pump.staging_dir, stat.st_size as u64) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %target_path.display(),
+                    err = %e,
+                    "macos-es truncate clone failed; DENY truncate"
+                );
+                respond_deny(client, message);
+                return;
+            }
+        };
 
     let record = CaptureRecord::PreImage(PreImageRecord {
         command,
@@ -720,15 +858,15 @@ enum MetaDelta {
 /// Kernel `FFLAGS` write-intent bits. From `<sys/fcntl.h>`:
 /// FREAD=0x01, FWRITE=0x02. FAPPEND (0x08) implies write but
 /// post-pends; the original bytes survive an append, so we don't
-/// need a pre-image just for FAPPEND — only when the file would be
-/// modified destructively (FWRITE without O_APPEND, OR FWRITE with
-/// the O_TRUNC bit which arrives as AUTH_TRUNCATE separately).
-///
-/// In practice every fopen("w") sets FWRITE (and O_TRUNC, which
-/// fires AUTH_TRUNCATE separately). fopen("r+") sets FWRITE without
-/// truncation — that's the path where AUTH_OPEN(W) capture is the
-/// ONLY source for the pre-image (no AUTH_TRUNCATE follow-up).
+/// need a pre-image just for FAPPEND.
 const FFLAG_FWRITE: i32 = 0x02;
+
+/// O_TRUNC bit in fflag (Apple FFLAGS form keeps the original
+/// O_* values for the non-mode bits). When set, the kernel will
+/// fire a separate AUTH_TRUNCATE event for the same target —
+/// capturing here would double-emit, and the truncate handler
+/// already does the right thing.
+const FFLAG_OTRUNC: i32 = 0x0400;
 
 /// AUTH_OPEN handler. Filters for write-intent (FWRITE bit); on
 /// match, inline-clonefile the pre-write bytes (per-command dedup
@@ -751,6 +889,13 @@ fn handle_auth_open(
 
     // Read-only opens: nothing to capture, fast-path ALLOW.
     if fflag & FFLAG_FWRITE == 0 {
+        respond_allow_open_flags(client, message, fflag as u32);
+        return;
+    }
+    // O_TRUNC open: AUTH_TRUNCATE will fire separately with the same
+    // target. Capturing here too would double-emit and confuse the
+    // planner. Defer entirely to the AUTH_TRUNCATE handler.
+    if fflag & FFLAG_OTRUNC != 0 {
         respond_allow_open_flags(client, message, fflag as u32);
         return;
     }
@@ -795,20 +940,21 @@ fn handle_auth_open(
         return;
     }
 
-    let (staging_path, staging_fd) = match inline_clonefile(target_path, &pump.staging_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(
-                %command.session,
-                seq = command.seq,
-                path = %target_path.display(),
-                err = %e,
-                "macos-es open-write clone failed; DENY open"
-            );
-            respond_deny_open_flags(client, message);
-            return;
-        }
-    };
+    let (staging_path, staging_fd) =
+        match inline_clonefile(target_path, &pump.staging_dir, stat.st_size as u64) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    %command.session,
+                    seq = command.seq,
+                    path = %target_path.display(),
+                    err = %e,
+                    "macos-es open-write clone failed; DENY open"
+                );
+                respond_deny_open_flags(client, message);
+                return;
+            }
+        };
 
     let record = CaptureRecord::PreImage(PreImageRecord {
         command,
@@ -921,20 +1067,22 @@ fn handle_auth_rename(
     // If destination pre-exists, capture its bytes BEFORE letting
     // the rename proceed (rename overwrites destination atomically).
     if let Some(dest_file) = dest_existing {
-        let (staging_path, staging_fd) = match inline_clonefile(&dest_path, &pump.staging_dir) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(
-                    %command.session,
-                    seq = command.seq,
-                    dest = %dest_path.display(),
-                    err = %e,
-                    "macos-es rename dst-clone failed; DENY rename"
-                );
-                respond_deny(client, message);
-                return;
-            }
-        };
+        let dest_stat_size = dest_file.stat.st_size as u64;
+        let (staging_path, staging_fd) =
+            match inline_clonefile(&dest_path, &pump.staging_dir, dest_stat_size) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(
+                        %command.session,
+                        seq = command.seq,
+                        dest = %dest_path.display(),
+                        err = %e,
+                        "macos-es rename dst-clone failed; DENY rename"
+                    );
+                    respond_deny(client, message);
+                    return;
+                }
+            };
         let dest_stat = dest_file.stat;
         let record = CaptureRecord::PreImage(PreImageRecord {
             command,
@@ -1598,7 +1746,7 @@ mod tests {
         let staging_dir = tmp.path().join("staging");
         std::fs::create_dir_all(&staging_dir).unwrap();
 
-        let (staging_path, fd) = match inline_clonefile(&src, &staging_dir) {
+        let (staging_path, fd) = match inline_clonefile(&src, &staging_dir, payload.len() as u64) {
             Ok(t) => t,
             Err(e)
                 if e.raw_os_error() == Some(libc::EOPNOTSUPP)
@@ -1618,6 +1766,47 @@ mod tests {
         // Cleanup: drop fd then remove staging file.
         drop(fd);
         let _ = std::fs::remove_file(&staging_path);
+    }
+
+    #[test]
+    fn stream_copy_round_trips_bytes() {
+        // stream_copy_to_staging is the non-APFS fallback. It's
+        // platform-portable (just pread + write), so we test it
+        // directly on any tempdir.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.txt");
+        let payload = b"stream-copy round-trip test bytes";
+        std::fs::write(&src, payload).unwrap();
+
+        let staging = tmp.path().join("staging.bin");
+        let (out_path, fd) =
+            stream_copy_to_staging(&src, &staging, payload.len() as u64).expect("stream-copy");
+        assert_eq!(out_path, staging);
+        assert!(out_path.exists());
+        // pread the staging fd + verify content matches.
+        let (hash, len) = hash_via_pread(fd.as_raw_fd(), payload.len() as u64).unwrap();
+        assert_eq!(len, payload.len() as u64);
+        let expected = blake3::hash(payload);
+        assert_eq!(hash, *expected.as_bytes());
+        drop(fd);
+        let _ = std::fs::remove_file(&staging);
+    }
+
+    #[test]
+    fn stream_copy_refuses_oversize_file() {
+        // Cap enforcement — caller's `expected_size` must be <=
+        // STREAM_COPY_CAP. Anything larger errors out before we
+        // touch the disk, preserving the ES 5-s auth deadline.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("oversize.txt");
+        std::fs::write(&src, b"x").unwrap();
+        let staging = tmp.path().join("staging.bin");
+        let res = stream_copy_to_staging(&src, &staging, STREAM_COPY_CAP + 1);
+        assert!(res.is_err(), "expected oversize-rejection error");
+        assert!(
+            !staging.exists(),
+            "staging file should NOT have been created"
+        );
     }
 
     #[test]
