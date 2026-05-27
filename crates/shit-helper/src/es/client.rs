@@ -256,6 +256,38 @@ impl EsClient {
             .saturating_sub(self.start_count)
     }
 
+    /// Mute events whose target-file path starts with `prefix`. Used
+    /// by the producer to silence the daemon's state-dir + the
+    /// helper's staging-dir + a handful of always-noisy system paths.
+    /// Errors are logged + swallowed: muting is best-effort
+    /// optimization, not a correctness gate.
+    pub fn mute_target_prefix(&self, prefix: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = CString::new(prefix.as_os_str().as_bytes()) else {
+            tracing::warn!(path = %prefix.display(), "es mute path contains NUL; skipping");
+            return;
+        };
+        // SAFETY: client is a valid *mut es_client_t for the lifetime
+        // of self; c_path is a NUL-terminated CString valid for the call.
+        let rc = unsafe {
+            sys::es_mute_path(
+                self.client,
+                c_path.as_ptr(),
+                sys::es_mute_path_type_t::TARGET_PREFIX,
+            )
+        };
+        if rc != sys::es_return_t::SUCCESS {
+            tracing::warn!(
+                path = %prefix.display(),
+                rc = ?rc,
+                "es_mute_path returned non-success; continuing"
+            );
+        } else {
+            tracing::info!(path = %prefix.display(), "es mute target-prefix");
+        }
+    }
+
     /// Construct an EsClient with a caller-provided global Block
     /// handler + event subscription set. Used by the macOS ES
     /// producer (`capture::macos_es`) to subscribe with its own

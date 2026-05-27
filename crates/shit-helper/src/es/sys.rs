@@ -65,9 +65,20 @@ pub struct es_event_type_t(pub u32);
 impl es_event_type_t {
     /// AUTH events — handler MUST respond via `es_respond_auth_result`
     /// within 5 seconds or the kernel kills the client.
+    ///
+    /// `AUTH_OPEN` is the exception: it uses `es_respond_flags_result`
+    /// (flags-based, not allow/deny). The producer filters opens for
+    /// write-intent (FWRITE bit) and captures pre-image bytes.
+    pub const AUTH_OPEN: Self = Self(1);
     pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
     pub const AUTH_TRUNCATE: Self = Self(40);
+    /// Metadata-mutation events (M03.1.I.D). Each fires AUTH-style;
+    /// the producer emits a `CapturedMetadataChange` event with a
+    /// stat-snapshot taken BEFORE the syscall commits.
+    pub const AUTH_SETMODE: Self = Self(48);
+    pub const AUTH_SETOWNER: Self = Self(49);
+    pub const AUTH_UTIMES: Self = Self(60);
 
     /// NOTIFY events — no response required, just informational.
     /// M03.1.E uses NOTIFY_EXEC for the subscribe-deliver smoke;
@@ -527,6 +538,58 @@ unsafe extern "C" {
         result: es_auth_result_t,
         cache: bool,
     ) -> es_return_t;
+
+    /// `es_respond_result_t es_respond_flags_result(es_client_t *client,`
+    /// `                                             const es_message_t *message,`
+    /// `                                             uint32_t authorized_flags,`
+    /// `                                             bool cache);`
+    ///
+    /// Respond to an `AUTH_OPEN` event. `authorized_flags` is a
+    /// subset of the `event.open.fflag` value — bits we permit. Pass
+    /// `fflag` to allow everything requested; pass `0` to deny.
+    /// AUTH_OPEN is the ONLY event that uses this responder; all
+    /// other AUTH events use `es_respond_auth_result`.
+    pub fn es_respond_flags_result(
+        client: *mut es_client_t,
+        message: *const es_message_t,
+        authorized_flags: u32,
+        cache: bool,
+    ) -> es_return_t;
+
+    /// `es_return_t es_mute_path(es_client_t *client, const char *path,`
+    /// `                         es_mute_path_type_t type);`
+    ///
+    /// Suppress events targeting paths matching `path` per `type`.
+    /// `TARGET_PREFIX` mutes any event whose target file path starts
+    /// with `path`; `TARGET_LITERAL` requires exact match. We use
+    /// TARGET_PREFIX for our state-dir tree (avoids the daemon's DB
+    /// writes appearing as events the helper would otherwise capture).
+    pub fn es_mute_path(
+        client: *mut es_client_t,
+        path: *const libc::c_char,
+        mute_type: es_mute_path_type_t,
+    ) -> es_return_t;
+}
+
+/// `es_mute_path_type_t` discriminant for [`es_mute_path`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct es_mute_path_type_t(pub u32);
+
+impl es_mute_path_type_t {
+    /// Mute events whose ACTING process's executable path starts
+    /// with this prefix (matches by exec source, not target).
+    #[allow(dead_code)]
+    pub const PREFIX: Self = Self(0);
+    /// Same as PREFIX but exact match instead of prefix.
+    #[allow(dead_code)]
+    pub const LITERAL: Self = Self(1);
+    /// Mute events whose target file path starts with this prefix.
+    /// What we want for state-dir / staging-dir / system-cache muting.
+    pub const TARGET_PREFIX: Self = Self(2);
+    /// Same as TARGET_PREFIX but exact match instead of prefix.
+    #[allow(dead_code)]
+    pub const TARGET_LITERAL: Self = Self(3);
 }
 
 // ─────────────────────────────────────────────────────────────────────
