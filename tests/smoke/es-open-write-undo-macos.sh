@@ -153,15 +153,26 @@ if [ "${BLOB_SHA}" != "${EXPECTED_SHA}" ]; then
 fi
 smoke_log "captured blob bytes match original file sha256 ✓"
 
+# Full undo round-trip — the planner (M03.x.OPEN-UNDO) suppresses
+# the FSEvents-Create's Unlink inverse when a same-path FilePreImage
+# exists and the path is still on disk, so RestoreContent can
+# rewrite the original bytes without racing a delete.
+smoke_log "shit undo --yes"
+"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
+    smoke_log "undo log:"; sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "shit undo --yes exited non-zero"
+}
+if [ ! -f "${FILE}" ]; then
+    smoke_log "undo log:"; sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "${FILE} missing after undo — M03.x.OPEN-UNDO regression"
+fi
+RESTORED_SHA="$(shasum -a 256 "${FILE}" | awk '{print $1}')"
+if [ "${RESTORED_SHA}" != "${EXPECTED_SHA}" ]; then
+    smoke_log "expected sha=${EXPECTED_SHA}"
+    smoke_log "got      sha=${RESTORED_SHA}"
+    smoke_fail "restored content sha256 mismatch"
+fi
+smoke_log "restored content sha256 matches original ✓"
+
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
-
-# NOTE: this smoke validates ES AUTH_OPEN(W) CAPTURE, not undo
-# round-trip. The end-to-end open-write undo is blocked by an
-# unrelated FSEvents-coexistence interaction (FSEvents may emit a
-# spurious TreeOpCreate for a file that was created in the recent
-# past, causing the planner to invert with delete-instead-of-restore).
-# That's a planner/FSEvents-flag-handling bug, not an ES producer
-# bug — the ES producer correctly captures the pre-image, which IS
-# the M03.1.I.B acceptance criterion.
-
-smoke_log "PASS: es-open-write-undo-macos (M03.1.I.B — capture acceptance)"
+smoke_log "PASS: es-open-write-undo-macos (M03.1.I.B + M03.x.OPEN-UNDO)"

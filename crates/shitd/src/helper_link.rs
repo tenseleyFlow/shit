@@ -484,6 +484,7 @@ pub async fn dispatch_loop(
                             &blob_store,
                             &watch_ready,
                             &live_baseline,
+                            &link.kernel_tier,
                         );
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
@@ -522,6 +523,7 @@ fn dispatch_response(
     blob_store: &BlobStore,
     watch_ready: &crate::watch_ready::WatchReadyMap,
     live_baseline: &crate::baseline::LiveBaseline,
+    kernel_tier: &str,
 ) {
     match resp {
         HelperResponse::CapturedPreImage {
@@ -657,6 +659,7 @@ fn dispatch_response(
                 },
                 index,
                 blob_store,
+                kernel_tier,
             ) {
                 tracing::error!(error = %e, %session, seq, "failed to journal CapturedPreImage");
             }
@@ -956,6 +959,7 @@ fn handle_captured_pre_image(
     args: CapturedPreImageArgs,
     index: &Index,
     blob_store: &BlobStore,
+    kernel_tier: &str,
 ) -> Result<(), HelperLinkError> {
     let bytes = read_all_from_fd(&args.staging, args.stored_bytes as usize)?;
     let (canonical_hash, stat) = blob_store
@@ -988,6 +992,18 @@ fn handle_captured_pre_image(
     };
     let path_buf: PathBuf = args.path.clone().unwrap_or_default().into();
 
+    // M03.x.OPEN-UNDO follow-up — tag the FilePreImage's source so
+    // the planner can tell pre-mutation captures (macOS ES) from
+    // post-mutation captures (BSD kqueue post-hoc, Linux LSM, shim).
+    // The classifier's `spurious_creates_with_preimage` rule only
+    // suppresses sibling Create-inverses when the source is
+    // trusted-pre-mutation; otherwise legitimate `cp foo foo.bak`
+    // patterns get their .bak left behind on undo.
+    let source = if kernel_tier == "endpoint-security" {
+        shit_planner::FilePreImageSource::EsAuthPreMutation
+    } else {
+        shit_planner::FilePreImageSource::Other
+    };
     let pre_image = CaptureEvent {
         id: EventId(0),
         command,
@@ -999,7 +1015,7 @@ fn handle_captured_pre_image(
             blob: canonical_hash,
             meta,
             post_content_hash: args.post_content_hash.map(BlobHash),
-            source: shit_planner::FilePreImageSource::Other,
+            source,
         },
     };
     index
@@ -1345,7 +1361,7 @@ mod tests_dispatch {
             is_delete: true,
             staging: fd,
         };
-        handle_captured_pre_image(args, &index, &blob_store).expect("ingest");
+        handle_captured_pre_image(args, &index, &blob_store, "kqueue").expect("ingest");
 
         // Two events should be journaled: FilePreImage + paired
         // TreeOp::Unlink.
@@ -1465,7 +1481,7 @@ mod tests_dispatch {
             is_delete: false,
             staging: fd,
         };
-        let err = handle_captured_pre_image(args, &index, &blob_store);
+        let err = handle_captured_pre_image(args, &index, &blob_store, "kqueue");
         assert!(err.is_err(), "expected hash-mismatch refusal");
     }
 }
