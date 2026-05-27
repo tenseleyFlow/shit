@@ -427,11 +427,22 @@ mod policy {
         //
         // `from` exists pre-rename so canonicalize works. `to` may not
         // (clean rename into a new path); fall back to its parent +
-        // basename when canonicalize itself fails. Last resort: the raw
-        // string as the user passed it — undo gets the same conflict
-        // we'd get without this fix, but at least we tried.
-        let from_abs = canonical_path(from);
-        let to_abs = canonical_path(to);
+        // basename when canonicalize itself fails.
+        //
+        // AU10 — when both canonicalize attempts fail (the
+        // load-bearing silent-fallback case the brutal audit pinned)
+        // the helper records a structured ShimFailure on the
+        // outbound notification so the daemon journals a Refuse
+        // marker. The syscall itself still flows through with the
+        // raw user arg — we never block the user's command on a
+        // capture issue.
+        let (from_abs, from_failure) = canonicalize_or_raw(from, "from");
+        let (to_abs, to_failure) = canonicalize_or_raw(to, "to");
+        // Prefer the `from`-side failure when both arms tripped:
+        // `from`'s pre-image is the load-bearing input for
+        // RestoreContent, so its capture incompleteness is the more
+        // alarming signal to surface to the user.
+        let failure = from_failure.or(to_failure);
         // W09.8: rename-to-self is a syscall no-op. POSIX
         // `rename(2)` of a file to itself returns success without
         // touching anything; the kernel fires no notification.
@@ -453,7 +464,7 @@ mod policy {
         // <staging>` before writing fresh content, and without
         // recursive pre-images the original site-packages contents
         // are unreachable by the time undo runs.
-        notify_rename_inner_with_recursive(syscall, &arg, to, &from_abs);
+        notify_rename_inner_with_recursive(syscall, &arg, to, &from_abs, failure);
     }
 
     /// DR-CR-54 limits. A directory rename of an enormous tree
@@ -477,6 +488,7 @@ mod policy {
         arg: &str,
         capture_path: &str,
         from_abs: &str,
+        failure: Option<shit_proto::ShimFailure>,
     ) {
         if disabled() {
             return;
@@ -490,7 +502,7 @@ mod policy {
             Some(pre) if pre.path == capture_path => pre.path.clone(),
             _ => arg.to_string(),
         };
-        let _ = try_notify(syscall, &wire_arg, pre_image, extras);
+        let _ = try_notify(syscall, &wire_arg, pre_image, extras, failure);
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -581,11 +593,16 @@ mod policy {
         if should_skip_path(path) {
             return;
         }
-        let abs = canonical_path(path);
+        // AU10 — canonicalize_or_raw returns the raw user-passed
+        // path on Err so the syscall keeps flowing; the failure is
+        // surfaced over the wire so the daemon can journal the
+        // capture incompleteness instead of silently mis-attributing
+        // the future unlink-inverse to a relative path.
+        let (abs, failure) = canonicalize_or_raw(path, "path");
         if should_skip_path(&abs) {
             return;
         }
-        notify_inner(syscall, &abs, None);
+        notify_inner_with_failure(syscall, &abs, None, failure);
     }
 
     /// W09.11 — paths whose mutations are NOT user-visible state
@@ -608,34 +625,115 @@ mod policy {
             || path.starts_with("/sys/")
     }
 
-    /// Best-effort absolute path resolution. Prefer `canonicalize`
-    /// (resolves symlinks + relative components); fall back to a
-    /// parent-canonicalize + basename join when the path itself
-    /// doesn't yet exist; final fallback is the original string.
-    fn canonical_path(path: &str) -> String {
+    /// AU10 — structured failure from [`canonical_path`]. Each
+    /// variant maps to a previously-silent fallback in the pre-AU10
+    /// implementation. Surfacing them as typed errors lets the
+    /// shim's notify path attribute the capture incompleteness
+    /// over the wire instead of returning the raw user-passed
+    /// string and praying the daemon's path matcher gets lucky.
+    #[derive(Debug, thiserror::Error)]
+    pub(super) enum CanonicalizeError {
+        /// The path has no `file_name()` component — covers `/`
+        /// and trailing-slash inputs. Extremely rare for shim
+        /// callsites (would mean the user `rename`'d to "/" which
+        /// would EISDIR anyway), but we surface it cleanly.
+        #[error("path has no file-name component: {0:?}")]
+        NoFileName(String),
+        /// Path has no parent component. Same vanishingly-rare
+        /// shape as `NoFileName`.
+        #[error("path has no parent component: {0:?}")]
+        NoParent(String),
+        /// The load-bearing case: `canonicalize` failed on both the
+        /// path itself AND on its parent. This is exactly the silent
+        /// fallback the brutal audit pinned — pre-AU10 we returned
+        /// the raw user path and the daemon's path matcher
+        /// (which keys on canonicalized absolute paths) missed.
+        #[error(
+            "canonicalize {path:?} failed ({path_err}); parent {parent:?} also failed ({parent_err})"
+        )]
+        PathAndParentBothFailed {
+            path: String,
+            path_err: std::io::Error,
+            parent: String,
+            parent_err: std::io::Error,
+        },
+    }
+
+    /// Resolve `path` to an absolute, symlink-resolved canonical
+    /// string. AU10 — replaces the pre-AU10 silent-fallback
+    /// `String` return with a `Result` so callers must confront
+    /// resolution failure rather than letting the daemon's path
+    /// matcher miss silently.
+    ///
+    /// The Ok path keeps both prior successful branches:
+    /// (a) direct `canonicalize` for paths that exist, and
+    /// (b) `canonicalize(parent).join(name)` for paths that don't
+    /// yet exist (rename destinations on a clean prefix). The
+    /// Err path corresponds to the previously-silent
+    /// `path.to_string()` fallback at the bottom of the original
+    /// implementation.
+    pub(super) fn canonical_path(path: &str) -> Result<String, CanonicalizeError> {
         use std::path::{Path, PathBuf};
-        if let Ok(p) = std::fs::canonicalize(path)
-            && let Some(s) = p.to_str()
-        {
-            return s.to_string();
-        }
-        // Path may not exist (rename destination on a fresh path).
-        // Canonicalize the parent and join the basename. Note that
-        // `Path::new("gamma.txt").parent()` returns Some("") — an
-        // empty path — not `Some(".")`. Treat empty as cwd.
+
+        // Direct canonicalize. When this succeeds the path exists
+        // on disk and we get the symlink-resolved absolute form.
+        let direct_err = match std::fs::canonicalize(path) {
+            Ok(p) => {
+                return Ok(p.to_string_lossy().into_owned());
+            }
+            Err(e) => e,
+        };
+
+        // Path may not exist yet (rename destination on a fresh
+        // prefix is the canonical case). Canonicalize the parent
+        // and join the basename. `Path::new("gamma.txt").parent()`
+        // returns `Some("")` — an empty path — not `Some(".")`,
+        // so we have to treat empty-as-cwd explicitly.
         let p = Path::new(path);
         let Some(name) = p.file_name() else {
-            return path.to_string();
+            return Err(CanonicalizeError::NoFileName(path.to_string()));
         };
         let parent_in = match p.parent() {
             Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
             Some(parent) => parent.to_path_buf(),
-            None => return path.to_string(),
+            None => return Err(CanonicalizeError::NoParent(path.to_string())),
         };
-        if let Ok(parent_abs) = std::fs::canonicalize(&parent_in) {
-            return parent_abs.join(name).to_string_lossy().into_owned();
+        match std::fs::canonicalize(&parent_in) {
+            Ok(parent_abs) => Ok(parent_abs.join(name).to_string_lossy().into_owned()),
+            Err(parent_err) => Err(CanonicalizeError::PathAndParentBothFailed {
+                path: path.to_string(),
+                path_err: direct_err,
+                parent: parent_in.to_string_lossy().into_owned(),
+                parent_err,
+            }),
         }
-        path.to_string()
+    }
+
+    /// AU10 — Convenience for callers that need to keep the syscall
+    /// flowing even when canonicalize fails: returns
+    /// `(best_effort_path, Option<ShimFailure>)`. The path is the
+    /// canonical form on Ok, or the raw user-passed string on Err —
+    /// matching the pre-AU10 behavior for the syscall's own argv
+    /// while making the failure observable downstream.
+    ///
+    /// `which_arg` is the human-facing positional label
+    /// ("from"/"to"/"path") embedded in the resulting
+    /// `ShimFailure::CanonicalizeFailed` for the daemon's journal.
+    pub(super) fn canonicalize_or_raw(
+        path: &str,
+        which_arg: &str,
+    ) -> (String, Option<shit_proto::ShimFailure>) {
+        match canonical_path(path) {
+            Ok(abs) => (abs, None),
+            Err(e) => {
+                let failure = shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg: which_arg.to_string(),
+                    attempted_path: path.to_string(),
+                    error_chain: format!("{e}"),
+                };
+                (path.to_string(), Some(failure))
+            }
+        }
     }
 
     // Recursion guard for the notify path. The pre-image-capture
@@ -657,6 +755,20 @@ mod policy {
     }
 
     fn notify_inner(syscall: &'static str, arg: &str, capture_path: Option<&str>) {
+        notify_inner_with_failure(syscall, arg, capture_path, None);
+    }
+
+    /// AU10 — variant of `notify_inner` that lets the caller attach
+    /// a structured `ShimFailure` to the outbound notification. The
+    /// pre-AU10 [`notify_inner`] is preserved as a thin wrapper so
+    /// the dozen-plus syscall-interposer callsites that have no
+    /// failure to report stay untouched.
+    fn notify_inner_with_failure(
+        syscall: &'static str,
+        arg: &str,
+        capture_path: Option<&str>,
+        failure: Option<shit_proto::ShimFailure>,
+    ) {
         if disabled() {
             return;
         }
@@ -683,7 +795,7 @@ mod policy {
             (Some(pre), Some(cap)) if cap == arg => pre.path.clone(),
             _ => arg.to_string(),
         };
-        let _ = try_notify(syscall, &wire_arg, pre_image, Vec::new());
+        let _ = try_notify(syscall, &wire_arg, pre_image, Vec::new(), failure);
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -729,6 +841,7 @@ mod policy {
         arg: &str,
         pre_image: Option<shit_proto::ShimPreImage>,
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
     ) -> std::io::Result<()> {
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
@@ -781,6 +894,11 @@ mod policy {
             ts_unix_nanos: now,
             pre_image,
             extra_pre_images,
+            // AU10 — populated when an upstream resolution step
+            // (canonicalize, primarily) tripped the previously-
+            // silent fallback. The daemon's shim_listener journals
+            // a Refuse marker keyed by this field.
+            failure,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
@@ -1236,5 +1354,87 @@ mod tests {
         let a = super::policy::disabled();
         let b = super::policy::disabled();
         assert_eq!(a, b);
+    }
+}
+
+/// AU10 — `canonical_path` + `canonicalize_or_raw` unit tests.
+/// Gated to the same unix targets as `mod policy` itself since
+/// canonical_path lives inside policy and only runs from
+/// interposers on unix; running these tests on Windows or macOS
+/// would not exercise any production code path the interposer
+/// uses.
+#[cfg(all(
+    test,
+    any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    )
+))]
+mod canonical_tests {
+    /// Resolving an existing absolute path succeeds and returns the
+    /// canonical form. `/tmp` exists on every unix dev host.
+    #[test]
+    fn canonical_path_resolves_existing_absolute() {
+        let r = super::policy::canonical_path("/tmp").expect("canonicalize /tmp");
+        assert!(r.starts_with('/'));
+    }
+
+    /// Resolving a non-existent path whose parent DOES exist returns
+    /// Ok via the parent-canonicalize + basename trick. Critical for
+    /// the rename `to` (clean-prefix install) path.
+    #[test]
+    fn canonical_path_resolves_nonexistent_with_extant_parent() {
+        let r = super::policy::canonical_path("/tmp/shit-au10-canon-nonexistent-XYZ")
+            .expect("parent-canonicalize fallback");
+        assert!(r.ends_with("/shit-au10-canon-nonexistent-XYZ"));
+        assert!(r.starts_with("/"));
+    }
+
+    /// The audit's load-bearing failure mode: both the path AND its
+    /// parent are non-canonicalize-able (path under a non-existent
+    /// dir). Pre-AU10 this silently returned the raw input. Post-AU10
+    /// it returns Err(PathAndParentBothFailed).
+    #[test]
+    fn canonical_path_fails_when_both_path_and_parent_inaccessible() {
+        let raw = "/this-dir-does-not-exist-shit-au10/subdir/leaf";
+        let err = super::policy::canonical_path(raw).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("canonicalize"),
+            "error message should describe canonicalize failure: {msg}"
+        );
+    }
+
+    /// `canonicalize_or_raw` preserves the raw user-passed path on
+    /// Err so the syscall stays unblocked, and populates a structured
+    /// failure for the outbound notification.
+    #[test]
+    fn canonicalize_or_raw_returns_raw_on_failure() {
+        let raw = "/this-dir-does-not-exist-shit-au10/subdir/leaf";
+        let (got, failure) = super::policy::canonicalize_or_raw(raw, "from");
+        assert_eq!(got, raw, "raw path passed through on Err");
+        let f = failure.expect("failure must be populated on Err");
+        match f {
+            shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg,
+                attempted_path,
+                ..
+            } => {
+                assert_eq!(which_arg, "from");
+                assert_eq!(attempted_path, raw);
+            }
+        }
+    }
+
+    /// On the Ok path `canonicalize_or_raw` returns no failure and
+    /// the canonical form.
+    #[test]
+    fn canonicalize_or_raw_returns_none_failure_on_success() {
+        let (got, failure) = super::policy::canonicalize_or_raw("/tmp", "path");
+        assert!(failure.is_none(), "no failure on Ok path");
+        assert!(got.starts_with('/'));
     }
 }

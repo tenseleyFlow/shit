@@ -1133,7 +1133,7 @@ jobs:
       - name: build release binaries
         run: |
           cargo build --release \
-            -p shit -p shitd -p shit-helper
+            -p shit -p shitd -p shit-helper -p shit-preload-shim
 
       - name: setcap helper
         run: |
@@ -1249,6 +1249,10 @@ jobs:
             # + write/mmap. Closes the BSD-W06.A.4 mirror gap.
             write-in-place-undo-linux.sh
             mmap-write-undo-linux.sh
+            # AU10 — LD_PRELOAD shim's canonicalize_path now
+            # surfaces capture-incomplete refusals to undo instead
+            # of silently mis-attributing.
+            canonicalize-fail-surface-linux.sh
           )
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm

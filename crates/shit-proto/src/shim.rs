@@ -126,6 +126,50 @@ pub struct ShimNotification {
     /// here is forward-only; we don't try to round-trip with an
     /// older shim.
     pub extra_pre_images: Vec<ShimPreImage>,
+    /// AU10 — structured failure surfaced by the shim when a
+    /// previously-silent fallback path tripped (canonicalize
+    /// failure on rename arguments being the canonical example).
+    /// `None` for successful captures.
+    ///
+    /// `#[serde(default)]` keeps the wire backwards-compatible with
+    /// pre-AU10 shims; older daemons see the field as absent and
+    /// older shims serialize without it. Postcard's optional encoding
+    /// is one byte (`0` for None) so the cost on the happy path is
+    /// negligible.
+    #[serde(default)]
+    pub failure: Option<ShimFailure>,
+}
+
+/// AU10 — structured failure reported by the shim when capture
+/// preparation tripped a step that previously fell back silently to
+/// raw user-passed paths.
+///
+/// The shim still allows the syscall to proceed (we never block the
+/// user's command); this variant signals the daemon that the capture
+/// for this notification is **incomplete** and undo must refuse the
+/// affected path rather than silently apply a wrong inverse.
+///
+/// Carried as `Option<ShimFailure>` on [`ShimNotification`] so the
+/// wire stays backwards-compatible with older shims (the field
+/// deserializes to `None` when absent thanks to `#[serde(default)]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ShimFailure {
+    /// `canonicalize` failed for the named argument AND for its
+    /// parent. The shim has no resolved absolute path to attribute
+    /// the captured pre-image to, so the daemon journals a refusal
+    /// instead of an inverse op.
+    ///
+    /// `which_arg` is the human-facing label of the failed positional
+    /// (e.g. "from" or "to" for rename; "path" for single-path
+    /// syscalls). `attempted_path` is the raw argv the shim received.
+    /// `error_chain` is the formatted `Debug` of the underlying io
+    /// errors — kept as a single owned String so the proto crate
+    /// doesn't have to model errno.
+    CanonicalizeFailed {
+        which_arg: String,
+        attempted_path: String,
+        error_chain: String,
+    },
 }
 
 /// Ack the daemon sends back. S24.D.2 ships `Allow` only; the broader
@@ -151,6 +195,7 @@ mod tests {
             ts_unix_nanos: 1_700_000_000_000_000_000,
             pre_image: None,
             extra_pre_images: Vec::new(),
+            failure: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -176,10 +221,41 @@ mod tests {
                 bytes: b"hello".to_vec(),
             }),
             extra_pre_images: Vec::new(),
+            failure: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
         assert_eq!(decoded, n);
+    }
+
+    /// AU10 — a notification carrying a failure (capture incomplete)
+    /// round-trips both encoders. Pinning this guards the
+    /// #[serde(default)] forward-compat path: older shims serialize
+    /// without the field and the new daemon must still decode them.
+    #[test]
+    fn shim_notification_with_failure_round_trips() {
+        let n = ShimNotification {
+            pid: 9000,
+            syscall: "rename".into(),
+            arg: "foo/bar/baz\tfoo/bar/qux".into(),
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: Some(ShimFailure::CanonicalizeFailed {
+                which_arg: "from".into(),
+                attempted_path: "foo/bar/baz".into(),
+                error_chain: "ENOENT (path), ENOENT (parent)".into(),
+            }),
+        };
+        let frame = encode_frame(&n).expect("encode");
+        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        assert_eq!(decoded, n);
+        match decoded.failure {
+            Some(ShimFailure::CanonicalizeFailed { which_arg, .. }) => {
+                assert_eq!(which_arg, "from");
+            }
+            _ => panic!("expected CanonicalizeFailed"),
+        }
     }
 
     #[test]
@@ -219,6 +295,7 @@ mod tests {
                 pre("/abs/site-packages/pkg/mod.py", b"def main(): pass\n"),
                 pre("/abs/site-packages/pkg/sub/inner.py", b"x = 1\n"),
             ],
+            failure: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");

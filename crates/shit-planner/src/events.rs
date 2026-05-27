@@ -299,6 +299,25 @@ pub enum CaptureEventKind {
         op: crate::inverse::GhOp,
         captured_json: Vec<u8>,
     },
+    /// AU10 — capture for a path was incomplete and undo MUST refuse
+    /// the affected path rather than apply a wrong inverse. The
+    /// daemon's shim_listener emits this when it sees a
+    /// `ShimNotification::failure` populated; the planner converts
+    /// it into a single [`crate::inverse::InverseOp::Refuse`] node
+    /// for the path so the user-facing undo report carries an
+    /// explicit "Refused (capture incomplete): …" line instead of
+    /// silently mis-attributing or skipping.
+    ///
+    /// `class` is a stable identifier from the refuse-list catalog
+    /// (initially `"capture-incomplete"`); `path` is the syscall's
+    /// primary argument (rename `from`, unlink target, etc.);
+    /// `detail` is the structured shim failure rendered as a
+    /// human-readable string.
+    CaptureRefused {
+        class: String,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 /// Mirror of [`shit_proto::DbEngineWire`] on the planner side so

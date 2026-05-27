@@ -240,6 +240,64 @@ fn ingest_notification(
         return;
     };
 
+    // AU10 — when the shim reported a structured capture failure
+    // (canonicalize_path tripping its load-bearing fallback is the
+    // canonical example), journal a CaptureRefused event BEFORE the
+    // rest of the syscall-specific handling. The downstream
+    // pre-image/TreeOp ingest may still fire (we don't want to lose
+    // the partial capture); the journaled refusal ensures the
+    // planner surfaces the gap as an InverseOp::Refuse node at undo
+    // time instead of silently mis-attributing.
+    if let Some(failure) = &note.failure {
+        let (class, primary_path, detail) = match failure {
+            shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg,
+                attempted_path,
+                error_chain,
+            } => (
+                "capture-incomplete".to_string(),
+                PathBuf::from(attempted_path),
+                format!("shim canonicalize tripped on {which_arg} argument ({error_chain})"),
+            ),
+        };
+        // The primary path matters for the user-visible refusal
+        // text. We deliberately use the raw `attempted_path` here
+        // (not a canonicalized form) because the failure mode IS
+        // that canonicalize couldn't resolve it — surfacing the
+        // raw input is the honest signal.
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: crate::server::next_ts(),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class,
+                path: primary_path,
+                detail,
+            },
+        };
+        if let Err(e) = index.put_event(&event) {
+            warn!(
+                err = %e,
+                pid = note.pid,
+                syscall = %note.syscall,
+                "shim notify: CaptureRefused journal failed"
+            );
+        } else {
+            debug!(
+                pid = note.pid,
+                syscall = %note.syscall,
+                session = %command.session,
+                seq = command.seq,
+                "shim notify: journaled CaptureRefused (AU10)"
+            );
+        }
+        // Fall through — the syscall may have attached a partial
+        // pre_image too (e.g., `from` canonicalized but `to`
+        // didn't). Ingest what we can; the Refuse marker is
+        // additive.
+    }
+
     // W06.A.4: content syscalls with attached pre-image take the
     // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
@@ -594,6 +652,7 @@ mod tests {
                 ts_unix_nanos: 0,
                 pre_image: None,
                 extra_pre_images: Vec::new(),
+                failure: None,
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();

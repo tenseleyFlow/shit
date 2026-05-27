@@ -1045,6 +1045,38 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        CaptureEventKind::CaptureRefused {
+            class,
+            path,
+            detail,
+        } => {
+            // AU10 — the daemon's shim_listener journaled a structured
+            // refusal because the shim's canonicalize tripped (or a
+            // future capture-incomplete failure mode landed). Surface
+            // it as an InverseOp::Refuse node so the CLI's undo
+            // report carries an explicit "Refused (capture
+            // incomplete): <path>" line.
+            //
+            // Unlike refuse.rs's command-class catalog match (which
+            // emits a SINGLE Refuse per command), this is per-event:
+            // one journaled CaptureRefused -> one Refuse node. A
+            // command that hit multiple silent-fallback paths will
+            // surface each refusal independently.
+            nodes.push(PlanNode {
+                op: InverseOp::Refuse {
+                    class: class.clone(),
+                    reason: format!("capture incomplete for {}: {}", path.display(), detail),
+                    remediation: Some(
+                        "Re-run the command from a directory whose parent path exists; \
+                         shit cannot reverse this path because the shim could not resolve \
+                         an absolute path to attribute the captured pre-image to."
+                            .to_string(),
+                    ),
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
     }
 }
 

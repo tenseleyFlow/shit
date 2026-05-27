@@ -407,6 +407,20 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        CaptureEventKind::CaptureRefused { path, detail, .. } => {
+            // AU10 — the original capture was incomplete; redo
+            // (forward) has nothing to apply either. Surface the
+            // gap so the user sees parity between undo + redo
+            // surfaces.
+            warnings.push(PlanWarning::Informational {
+                tier: InverseTier::Files,
+                message: format!(
+                    "capture for {} was incomplete ({}); `shit redo` cannot re-apply",
+                    path.display(),
+                    detail
+                ),
+            });
+        }
     }
 }
 
