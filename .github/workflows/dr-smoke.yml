@@ -56,6 +56,77 @@ jobs:
           name: smoke-matrix
           path: smoke-matrix.json
 
+  stamp-coverage-snapshot:
+    # AU02 — emit a candidate coverage-snapshot.json as a build artifact
+    # on every CI run. On green trunk, the next release commits this
+    # artifact into tools/audit/coverage-snapshot.json (manual
+    # release-time step per AU02 user choice — no auto-commit noise).
+    #
+    # The snapshot includes: commit sha, workflow run URL, generated_at
+    # timestamp, and the runnable smoke set from AU14's matrix. The
+    # third set (refused_classes) comes from the planner refuse catalog
+    # at build time and is intentionally NOT in the snapshot — it's
+    # always derivable from the embedded code.
+    name: stamp coverage snapshot (AU02)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [smoke-discovery]
+    steps:
+      - uses: actions/checkout@v4
+      - name: emit candidate snapshot
+        run: |
+          bash tools/audit/smoke-driver.sh discover > /tmp/matrix.json
+          python3 - <<'PY' > coverage-snapshot.json
+          import json, os, subprocess, datetime
+          matrix = json.load(open('/tmp/matrix.json'))
+          green_smokes = sorted(r['name'] for r in matrix if not r['excluded_by'])
+          covered_classes = sorted(set(r['name'] for r in matrix
+                                       if not r['excluded_by']
+                                       and r['runner'] in ('self-hosted-lsm', 'freebsd-vm')))
+          server = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
+          repo   = os.environ.get('GITHUB_REPOSITORY', '')
+          rid    = os.environ.get('GITHUB_RUN_ID', '')
+          url    = f"{server}/{repo}/actions/runs/{rid}" if rid else ''
+          snap = {
+              'version': 1,
+              'generated_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'workflow_run_url': url,
+              'commit_sha': os.environ.get('GITHUB_SHA', ''),
+              'green_smokes': green_smokes,
+              'covered_classes': covered_classes,
+              'refused_classes': [],
+              'pending_classes': [],
+              'comment': 'AU02 CI-generated. Manual release-time commit picks up the latest artifact and overwrites tools/audit/coverage-snapshot.json.'
+          }
+          print(json.dumps(snap, indent=2))
+          PY
+          echo "===== candidate snapshot ====="
+          cat coverage-snapshot.json
+      - name: upload coverage-snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-snapshot
+          path: coverage-snapshot.json
+
+  doctor-coverage-honest:
+    # AU02 — assert `shit doctor --json` carries the honest coverage
+    # envelope (schema v2, no coverage_pct, count fields populated,
+    # binary_built_at non-empty, last_validated_at matches the
+    # embedded coverage-snapshot.json).
+    name: doctor coverage envelope (AU02)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3
+        run: sudo apt-get update && sudo apt-get install -y python3
+      - name: build shit
+        run: cargo build --release -p shit
+      - name: run smoke
+        run: bash tests/smoke/doctor-coverage-honest.sh
+
   daemon-boot:
     name: daemon-boot smoke
     runs-on: ubuntu-24.04

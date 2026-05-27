@@ -213,20 +213,18 @@ fn collect() -> (Vec<Row>, DoctorReport) {
 /// the sentinel/empty placeholder, the timestamp fields are empty
 /// strings.
 fn collect_arbitrary_undo_coverage() -> ArbitraryUndoCoverage {
-    let covered_classes: Vec<String> =
-        shit_planner::coverage_catalog::covered_class_ids()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+    let covered_classes: Vec<String> = shit_planner::coverage_catalog::covered_class_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let refused_classes: Vec<String> = shit_planner::refuse::catalog_classes()
         .into_iter()
         .map(str::to_string)
         .collect();
-    let pending_classes: Vec<String> =
-        shit_planner::coverage_catalog::pending_class_ids()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+    let pending_classes: Vec<String> = shit_planner::coverage_catalog::pending_class_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
     let covered_count = covered_classes.len() as u32;
     let refused_count = refused_classes.len() as u32;

@@ -471,7 +471,9 @@ mod tests {
         assert!(s.contains("\"pending_count\":1"));
         assert!(s.contains("\"last_validated_at\":\"2026-05-26T00:00:00Z\""));
         assert!(s.contains("\"binary_built_at\":\"2026-05-26T01:23:45Z\""));
-        assert!(s.contains("\"snapshot_workflow_run_url\":\"https://github.com/x/y/actions/runs/1\""));
+        assert!(
+            s.contains("\"snapshot_workflow_run_url\":\"https://github.com/x/y/actions/runs/1\"")
+        );
         // AU02 dropped coverage_pct — must NOT appear.
         assert!(
             !s.contains("\"coverage_pct\""),
@@ -489,7 +491,11 @@ mod tests {
         assert!(r2.arbitrary_undo_coverage.pending_classes.is_empty());
         assert_eq!(r2.arbitrary_undo_coverage.covered_count, 0);
         assert!(r2.arbitrary_undo_coverage.last_validated_at.is_empty());
-        assert!(r2.arbitrary_undo_coverage.snapshot_workflow_run_url.is_empty());
+        assert!(
+            r2.arbitrary_undo_coverage
+                .snapshot_workflow_run_url
+                .is_empty()
+        );
         assert!(r2.arbitrary_undo_coverage.binary_built_at.is_empty());
     }
 
@@ -535,7 +541,10 @@ mod tests {
         }"#;
         let r: DoctorReport = serde_json::from_str(v1).expect("deserialize v1");
         assert_eq!(r.arbitrary_undo_coverage.covered_classes, vec!["fs-rename"]);
-        assert_eq!(r.arbitrary_undo_coverage.refused_classes, vec!["remote-push"]);
+        assert_eq!(
+            r.arbitrary_undo_coverage.refused_classes,
+            vec!["remote-push"]
+        );
         assert_eq!(
             r.arbitrary_undo_coverage.last_validated_at,
             "2026-01-01T00:00:00Z"

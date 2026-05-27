@@ -83,10 +83,13 @@ mod tests {
 
     #[test]
     fn binary_built_at_is_populated() {
-        // build.rs sets SHIT_BUILD_TIMESTAMP unconditionally; if it
-        // didn't, the doctor's "stale binary" warning loses its
-        // anchor.
+        // vergen sets VERGEN_BUILD_TIMESTAMP unconditionally from
+        // build.rs; if it didn't, the doctor's "stale binary"
+        // warning would lose its anchor.
         let ts = binary_built_at();
-        assert!(!ts.is_empty(), "SHIT_BUILD_TIMESTAMP must be set by build.rs");
+        assert!(
+            !ts.is_empty(),
+            "VERGEN_BUILD_TIMESTAMP must be set by build.rs"
+        );
     }
 }
