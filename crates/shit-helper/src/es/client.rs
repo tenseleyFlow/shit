@@ -198,6 +198,56 @@ impl EsClient {
         }
     }
 
+    /// Subscribe to AUTH_UNLINK with the tree-filter handler
+    /// (M03.1.H). Pre-seeds [`super::sys::TRACKED_TOKENS`] with
+    /// `audit_token_self()` so unlinks from THIS process pass the
+    /// filter; unlinks from other host processes are ALLOW'd but
+    /// not recorded.
+    ///
+    /// Demonstrates the audit_token-based filter primitive that the
+    /// producer integration (M03.1.I) layers on top — production
+    /// seeds via WatchTree dispatches from the daemon instead of
+    /// self.
+    pub fn new_tree_filtered() -> Result<Self, EsClientError> {
+        // Seed tracked-tokens with self FIRST so any events arriving
+        // before es_subscribe returns (rare but possible) are still
+        // filtered correctly.
+        if let Some(self_token) = super::message::audit_token_self()
+            && let Ok(mut g) = sys::TRACKED_TOKENS.lock()
+        {
+            let set = g.get_or_insert_with(Default::default);
+            set.insert(self_token);
+        }
+
+        let mut client: *mut sys::es_client_t = ptr::null_mut();
+        let result = unsafe {
+            sys::es_new_client(
+                &mut client as *mut *mut sys::es_client_t,
+                &sys::TREE_FILTER_HANDLER as *const _ as *const c_void,
+            )
+        };
+        if result != sys::es_new_client_result_t::SUCCESS {
+            return Err(EsClientError::NewClient(result));
+        }
+
+        let start_count = sys::EVENT_COUNTER.load(Ordering::Relaxed);
+
+        let events = [sys::es_event_type_t::AUTH_UNLINK];
+        let sub = unsafe { sys::es_subscribe(client, events.as_ptr(), events.len() as u32) };
+        if sub != sys::es_return_t::SUCCESS {
+            unsafe {
+                let _ = sys::es_delete_client(client);
+            }
+            return Err(EsClientError::Subscribe(sub));
+        }
+
+        Ok(Self {
+            client,
+            start_count,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     /// Events delivered to the counter handler since this client
     /// was constructed.
     pub fn events_received(&self) -> u64 {

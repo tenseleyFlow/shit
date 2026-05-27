@@ -127,16 +127,22 @@ pub struct es_file_t {
 // es_process_t — opaque to M03.1.G; M03.1.H reads `audit_token`
 // ─────────────────────────────────────────────────────────────────────
 
-/// Forward declaration for `es_message_t::process` typing. The full
-/// layout (audit_token, ppid, codesigning_flags, signing_id,
-/// executable, etc.) lands in M03.1.H when tree-tracking needs it.
-/// For M03.1.G we only need this type to exist so `*const es_process_t`
-/// is well-typed in the message struct.
+/// `es_process_t` from ESMessage.h. M03.1.H reads the
+/// `audit_token` (offset 0); the trailing fields (ppid,
+/// codesigning_flags, signing_id, executable, etc.) are kept
+/// opaque until a slice that actually reads them lands.
+///
+/// We model just the audit_token field at offset 0; subsequent
+/// fields exist in the kernel memory but we never deref them, so
+/// their offsets don't matter for our read paths.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct es_process_t {
-    _opaque: u8,
-    _phantom: PhantomData<*mut u8>,
+    pub audit_token: audit_token_t,
+    // Apple's struct continues: ppid, original_ppid, group_id,
+    // session_id, codesigning_flags, is_platform_binary,
+    // is_es_client, cdhash, signing_id, team_id, executable, ...
+    // Omitted from our model until we need to read them.
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -282,6 +288,25 @@ impl<'a> EsMessage<'a> {
         unsafe { (*self.raw).event_type }
     }
 
+    /// `audit_token_t` of the process that took the action. The
+    /// kernel-stable identity; used by M03.1.H tree-filtering.
+    ///
+    /// Apple documents `process` as non-null for every message; the
+    /// internal null-check is defense-in-depth (and lets us fall
+    /// through to a sentinel rather than crash on a malformed
+    /// kernel state).
+    pub fn process_audit_token(&self) -> audit_token_t {
+        // SAFETY: message lifetime guarantees raw is valid; process
+        // is documented non-null. Sentinel on the unexpected null
+        // case so callers get a "definitely-not-tracked" token.
+        unsafe {
+            if (*self.raw).process.is_null() {
+                return audit_token_t { val: [0; 8] };
+            }
+            (*(*self.raw).process).audit_token
+        }
+    }
+
     /// `Some(&es_event_unlink_t)` iff `event_type == AUTH_UNLINK`.
     /// Reading any other variant via the union would be UB.
     pub fn as_unlink(&self) -> Option<&'a es_event_unlink_t> {
@@ -306,6 +331,54 @@ impl<'a> EsMessage<'a> {
         // length + data that the kernel maintains.
         unsafe { Some((*event.target).path.as_path()) }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// audit_token_self — read our own audit_token via Mach
+// ─────────────────────────────────────────────────────────────────────
+
+/// Apple's `TASK_AUDIT_TOKEN` flavor (from `<mach/task_info.h>`).
+const TASK_AUDIT_TOKEN: u32 = 15;
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    /// `extern mach_port_t mach_task_self_;` — our task port.
+    static mach_task_self_: u32;
+
+    /// `kern_return_t task_info(task_t, task_flavor_t,`
+    /// `                         task_info_t, mach_msg_type_number_t *);`
+    fn task_info(
+        target_task: u32,
+        flavor: u32,
+        task_info_out: *mut u32,
+        task_info_count: *mut u32,
+    ) -> i32;
+}
+
+/// Read this process's `audit_token_t` via `task_info(mach_task_self_,
+/// TASK_AUDIT_TOKEN, ...)`. M03.1.H seeds the tree-filter set with
+/// the result so we can pre-populate "this process is tracked"
+/// before any ES events arrive.
+///
+/// Returns `None` on Mach error (extremely rare for our own task).
+pub fn audit_token_self() -> Option<audit_token_t> {
+    let mut buf = [0u32; 8];
+    let mut count = 8u32;
+    // SAFETY: mach_task_self_ + task_info are linked from libSystem;
+    // we pass a pointer to a stack array of the right size + a count
+    // that matches the TASK_AUDIT_TOKEN flavor.
+    let rc = unsafe {
+        task_info(
+            mach_task_self_,
+            TASK_AUDIT_TOKEN,
+            buf.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if rc != 0 || count < 8 {
+        return None;
+    }
+    Some(audit_token_t { val: buf })
 }
 
 #[cfg(test)]
@@ -344,5 +417,19 @@ mod tests {
         // this catches it.
         assert_eq!(es_action_type_t::AUTH.0, 0);
         assert_eq!(es_action_type_t::NOTIFY.0, 1);
+    }
+
+    #[test]
+    fn audit_token_self_returns_some_on_macos() {
+        // Reading our own audit_token via Mach. Should never fail
+        // for our own task; if it does, something's wrong with the
+        // Mach binding.
+        let tok = audit_token_self();
+        assert!(tok.is_some(), "audit_token_self() returned None");
+        // Apple stores pid at val[5] for the user-token form; we don't
+        // pin to a specific layout since the field meanings are
+        // documented but we read the whole 32 bytes opaquely.
+        let tok = tok.unwrap();
+        assert_eq!(tok.val.len(), 8);
     }
 }

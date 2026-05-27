@@ -414,6 +414,26 @@ enum Mode {
         #[arg(long, default_value_t = 2)]
         duration_secs: u64,
     },
+    /// M03.1.H — Tree-filter smoke. Subscribes to AUTH_UNLINK with
+    /// the tree-filter handler seeded with this process's own
+    /// audit_token. Only unlinks from this process's audit_token
+    /// get recorded; all others are ALLOW'd but ignored.
+    ///
+    /// Compare event count vs `es-path-log-smoke` for the same
+    /// workload: the filtered version should report only the rm's
+    /// originating from this CLI's exec'd subprocesses, not
+    /// host-wide unlink traffic.
+    ///
+    /// Output: same shape as `es-path-log-smoke` (events_received +
+    /// paths + duration_secs). Note: events_received here counts
+    /// ALL delivered events (system-wide) — the FILTER applies only
+    /// to whether the path is recorded. So events_received can be
+    /// much larger than paths.len().
+    #[command(name = "es-tree-filter-smoke")]
+    EsTreeFilterSmoke {
+        #[arg(long, default_value_t = 2)]
+        duration_secs: u64,
+    },
     /// L05 — `shit doctor` Linux fanotify functional probe.
     ///
     /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
@@ -642,6 +662,7 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         Mode::EsProbeSubscribe { duration_secs } => run_es_probe_subscribe(duration_secs),
         Mode::EsAuthSmoke { duration_secs } => run_es_auth_smoke(duration_secs),
         Mode::EsPathLogSmoke { duration_secs } => run_es_path_log_smoke(duration_secs),
+        Mode::EsTreeFilterSmoke { duration_secs } => run_es_tree_filter_smoke(duration_secs),
         Mode::ProbeFanotify => run_probe_fanotify(),
         Mode::ProbeEbpf => run_probe_ebpf(),
     }
@@ -729,6 +750,71 @@ fn run_es_path_log_smoke(duration_secs: u64) -> anyhow::Result<()> {
         // privileged binary. Path strings get backslash-escaped for
         // any quotes / backslashes; macOS paths shouldn't contain
         // control chars but we tolerate them.
+        let mut paths_json = String::from("[");
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                paths_json.push(',');
+            }
+            paths_json.push('"');
+            for c in p.display().to_string().chars() {
+                match c {
+                    '"' => paths_json.push_str("\\\""),
+                    '\\' => paths_json.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => {
+                        paths_json.push_str(&format!("\\u{:04x}", c as u32))
+                    }
+                    c => paths_json.push(c),
+                }
+            }
+            paths_json.push('"');
+        }
+        paths_json.push(']');
+        println!(
+            r#"{{"events_received":{n},"paths":{paths_json},"duration_secs":{duration_secs}}}"#
+        );
+        drop(client);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = duration_secs;
+        println!(r#"{{"error":"NotSupportedOnThisOs"}}"#);
+        Ok(())
+    }
+}
+
+/// M03.1.H — subscribe to AUTH_UNLINK with tree-filter handler
+/// seeded with self audit_token; do a self-unlink (helper-process)
+/// to prove the ACCEPT side, then drain + print. Compare against
+/// `es-path-log-smoke` (no filter) for the REJECT side: external
+/// rm subprocesses have different audit_tokens and get filtered
+/// out.
+fn run_es_tree_filter_smoke(duration_secs: u64) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let client = match crate::es::EsClient::new_tree_filtered() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(r#"{{"error":"{e}"}}"#);
+                return Ok(());
+            }
+        };
+        // Give subscription a beat to register fully.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // ACCEPT-side demo: helper-process unlinks. The event's
+        // process == helper, so audit_token matches the seeded
+        // self-token and the path gets recorded.
+        let self_test_path = std::env::temp_dir()
+            .join(format!("shit-es-tree-filter-self-{}", std::process::id()));
+        std::fs::write(&self_test_path, b"x").ok();
+        // Brief pause so the create-side syscalls have settled into
+        // a stable on-disk state before we remove (helps the kernel
+        // deliver a clean unlink event).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::remove_file(&self_test_path).ok();
+        std::thread::sleep(std::time::Duration::from_secs(duration_secs));
+        let n = client.events_received();
+        let paths = client.drain_logged_paths();
         let mut paths_json = String::from("[");
         for (i, p) in paths.iter().enumerate() {
             if i > 0 {

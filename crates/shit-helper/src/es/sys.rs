@@ -399,6 +399,74 @@ pub static PATH_LOG_HANDLER: Block<()> = Block {
 };
 
 // ─────────────────────────────────────────────────────────────────────
+// Tree-filter handler (M03.1.H — filter by audit_token)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Same shape as PATH_LOG_HANDLER but only records paths whose
+// originating process's audit_token is in TRACKED_TOKENS. Always
+// responds ALLOW regardless of filter (we never deny in the slice 4
+// model — only choose whether to record). EsClient::new_tree_filtered
+// pre-seeds TRACKED_TOKENS with `audit_token_self()` so the test
+// process's own unlinks pass the filter.
+
+use super::message::audit_token_t;
+use std::collections::HashSet;
+
+/// Audit tokens whose AUTH_UNLINK events should be recorded.
+/// Mutex<HashSet> for low-contention reads + writes from the
+/// kernel callback thread (serial dispatch queue per Apple's docs).
+pub static TRACKED_TOKENS: Mutex<Option<HashSet<audit_token_t>>> = Mutex::new(None);
+
+extern "C" fn tree_filter_invoke(
+    _block: *const Block<()>,
+    client: *mut es_client_t,
+    message: *const c_void,
+) {
+    EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let msg = super::message::EsMessage::from_raw(message);
+        let token = msg.process_audit_token();
+        let in_tracked = TRACKED_TOKENS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|set| set.contains(&token)))
+            .unwrap_or(false);
+        if in_tracked
+            && let Some(p) = msg.unlink_target_path()
+            && let Ok(mut g) = LAST_UNLINK_PATHS.lock()
+        {
+            if g.len() >= LAST_UNLINK_CAP {
+                g.remove(0);
+            }
+            g.push(p.to_path_buf());
+        }
+        let _ = es_respond_auth_result(
+            client,
+            message as *const es_message_t,
+            es_auth_result_t::ALLOW,
+            true,
+        );
+    }
+}
+
+static TREE_FILTER_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: core::mem::size_of::<Block<()>>() as c_ulong,
+};
+
+/// Pre-built global Block that filters by `TRACKED_TOKENS` before
+/// recording. Same response shape as `PATH_LOG_HANDLER` (always
+/// ALLOW); only the recording step differs.
+pub static TREE_FILTER_HANDLER: Block<()> = Block {
+    isa: unsafe { &_NSConcreteGlobalBlock as *const _ },
+    flags: BLOCK_IS_GLOBAL,
+    reserved: 0,
+    invoke: tree_filter_invoke as *const c_void,
+    descriptor: &TREE_FILTER_DESCRIPTOR,
+    _phantom: PhantomData,
+};
+
+// ─────────────────────────────────────────────────────────────────────
 // ES extern fns
 // ─────────────────────────────────────────────────────────────────────
 
