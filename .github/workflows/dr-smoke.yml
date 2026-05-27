@@ -109,8 +109,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      - name: install sqlite + python3
-        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: install sqlite + python3 + libcap2-bin
+        # AU08 — libcap2-bin provides `getcap`, used by the smoke's
+        # informational helper-caps log line. Without it the smoke
+        # logs "skipped" rather than gating cap presence.
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3 libcap2-bin
       - name: build binaries
         run: cargo build --release -p shitd -p shit -p shit-helper
       - name: run smoke

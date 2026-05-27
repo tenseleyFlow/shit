@@ -110,6 +110,24 @@ if [ "${n}" -lt 1 ]; then
 fi
 smoke_log "PackageOp events: ${n}"
 
+# AU08 — informational getcap log on the helper this smoke used.
+# apt-pkg itself doesn't require caps (it routes through the
+# pkg-event helper subcommand which is unprivileged), so this is a
+# log line, not an assertion. The real cap requirement is enforced
+# at LSM-tier smokes' own pre-flights. Visibility here helps catch
+# packaging regressions where the .deb postinst would have stripped
+# or skipped setcap on real installs.
+if command -v getcap >/dev/null 2>&1; then
+    GETCAP_OUT="$(getcap "${HELPER}" 2>&1 || true)"
+    if [ -n "${GETCAP_OUT}" ]; then
+        smoke_log "AU08 helper caps: ${GETCAP_OUT}"
+    else
+        smoke_log "AU08 helper caps: <none>  (no caps applied to ${HELPER})"
+    fi
+else
+    smoke_log "AU08 helper caps: skipped — getcap not on PATH (apt-get install libcap2-bin)"
+fi
+
 # Cleanup. Always-run so subsequent smoke runs start clean.
 sudo rm -f "${APT_CONF}"
 sudo apt-get remove -y "${TARGET_PKG}" >/dev/null 2>&1 || true
