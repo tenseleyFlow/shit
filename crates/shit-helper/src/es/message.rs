@@ -241,6 +241,19 @@ pub struct es_event_truncate_t {
     pub _reserved: [u8; 64],
 }
 
+/// `es_event_open_t` from ESMessage.h. `fflag` is the kernel's
+/// in-process "FFLAGS" form of the open(2) mode (FREAD=0x01,
+/// FWRITE=0x02, FAPPEND=0x08, plus O_TRUNC/O_CREAT/etc. bits).
+/// The producer filters on write-intent (`fflag & FWRITE`) to skip
+/// pure read opens (which don't mutate).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_open_t {
+    pub fflag: i32,
+    pub file: *const es_file_t,
+    pub _reserved: [u8; 64],
+}
+
 /// `es_events_t` union — Apple's version has ~120 variants; we
 /// model only the variants we consume. All variants share offset 0
 /// per union semantics, so reading the variant matching the
@@ -252,6 +265,7 @@ pub union es_events_t {
     pub unlink: std::mem::ManuallyDrop<es_event_unlink_t>,
     pub rename: std::mem::ManuallyDrop<es_event_rename_t>,
     pub truncate: std::mem::ManuallyDrop<es_event_truncate_t>,
+    pub open: std::mem::ManuallyDrop<es_event_open_t>,
     pub fork: std::mem::ManuallyDrop<es_event_fork_t>,
     pub exit: std::mem::ManuallyDrop<es_event_exit_t>,
 }
@@ -448,6 +462,15 @@ impl<'a> EsMessage<'a> {
         }
         // SAFETY: discriminant guarantees the union variant.
         unsafe { Some(&*(&(*self.raw).event.truncate as *const _ as *const es_event_truncate_t)) }
+    }
+
+    /// `Some(&es_event_open_t)` iff `event_type == AUTH_OPEN`.
+    pub fn as_open(&self) -> Option<&'a es_event_open_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_OPEN {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.open as *const _ as *const es_event_open_t)) }
     }
 
     /// Convenience: `es_file_t` for the truncate target. Returns

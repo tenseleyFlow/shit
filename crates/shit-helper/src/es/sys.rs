@@ -65,6 +65,11 @@ pub struct es_event_type_t(pub u32);
 impl es_event_type_t {
     /// AUTH events — handler MUST respond via `es_respond_auth_result`
     /// within 5 seconds or the kernel kills the client.
+    ///
+    /// `AUTH_OPEN` is the exception: it uses `es_respond_flags_result`
+    /// (flags-based, not allow/deny). The producer filters opens for
+    /// write-intent (FWRITE bit) and captures pre-image bytes.
+    pub const AUTH_OPEN: Self = Self(1);
     pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
     pub const AUTH_TRUNCATE: Self = Self(40);
@@ -525,6 +530,23 @@ unsafe extern "C" {
         client: *mut es_client_t,
         message: *const es_message_t,
         result: es_auth_result_t,
+        cache: bool,
+    ) -> es_return_t;
+
+    /// `es_respond_result_t es_respond_flags_result(es_client_t *client,`
+    /// `                                             const es_message_t *message,`
+    /// `                                             uint32_t authorized_flags,`
+    /// `                                             bool cache);`
+    ///
+    /// Respond to an `AUTH_OPEN` event. `authorized_flags` is a
+    /// subset of the `event.open.fflag` value — bits we permit. Pass
+    /// `fflag` to allow everything requested; pass `0` to deny.
+    /// AUTH_OPEN is the ONLY event that uses this responder; all
+    /// other AUTH events use `es_respond_auth_result`.
+    pub fn es_respond_flags_result(
+        client: *mut es_client_t,
+        message: *const es_message_t,
+        authorized_flags: u32,
         cache: bool,
     ) -> es_return_t;
 }
