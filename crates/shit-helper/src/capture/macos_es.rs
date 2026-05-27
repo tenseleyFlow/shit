@@ -42,8 +42,10 @@
 //! pid as the lookup key (with `audit_token` cached for diagnostics)
 //! sidesteps this entirely; NOTIFY_EXIT prunes the entry on
 //! termination so subsequent pid reuse can't false-match.
-
-#![cfg(target_os = "macos")]
+//
+// Module-level gate is at `crates/shit-helper/src/capture/mod.rs`; no
+// inner `#![cfg]` here (rustc's `duplicated_attributes` lint flags
+// the dup under `-D warnings`).
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};
