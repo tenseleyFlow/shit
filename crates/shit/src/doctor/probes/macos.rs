@@ -38,7 +38,8 @@
 // `clippy::duplicated_attributes` on newer rustc.
 
 use crate::doctor::json::{
-    CodesignReport, EndpointSecurityReport, FsEventsProbeReport, SandboxReport, SipReport,
+    CodesignReport, EndpointSecurityReport, EsBlocker, FsEventsProbeReport, SandboxReport,
+    SipReport,
 };
 use std::ffi::{CString, c_void};
 use std::os::raw::c_char;
@@ -275,18 +276,214 @@ pub fn parse_csrutil_status(out: &str) -> &'static str {
 }
 
 pub fn probe_sip_state() -> SipReport {
-    let out = Command::new("csrutil").arg("status").output();
-    let stdout = match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => {
-            return SipReport {
-                state: "unknown".into(),
-            };
-        }
+    let sip_out = Command::new("csrutil").arg("status").output();
+    let state = match sip_out {
+        Ok(o) => parse_csrutil_status(&String::from_utf8_lossy(&o.stdout)).into(),
+        Err(_) => "unknown".to_string(),
     };
     SipReport {
-        state: parse_csrutil_status(&stdout).into(),
+        state,
+        authenticated_root: probe_authenticated_root(),
+        amfi_bypass: probe_amfi_bypass(),
     }
+}
+
+/// Parse `csrutil authenticated-root status`. Apple Silicon machines
+/// have a System volume seal that's independent of SIP itself. The
+/// AMFI-bypass install path needs BOTH disabled.
+///
+/// Output forms (macOS 11+):
+/// - `Authenticated Root status: enabled`
+/// - `Authenticated Root status: disabled`
+/// - Plus a trailing newline.
+///
+/// Returns `"enabled"` / `"disabled"` / `"unknown"`.
+pub fn parse_csrutil_authenticated_root(out: &str) -> &'static str {
+    let lower = out.to_lowercase();
+    if lower.contains("authenticated root status: enabled") {
+        "enabled"
+    } else if lower.contains("authenticated root status: disabled") {
+        "disabled"
+    } else {
+        "unknown"
+    }
+}
+
+fn probe_authenticated_root() -> String {
+    // `csrutil authenticated-root status` returns 0 on success on
+    // macOS where the command is supported, non-zero on older
+    // Intel Macs where the auth-root feature doesn't exist. Treat
+    // unknown either way; the doctor surfaces it.
+    let out = Command::new("csrutil")
+        .arg("authenticated-root")
+        .arg("status")
+        .output();
+    match out {
+        Ok(o) => parse_csrutil_authenticated_root(&String::from_utf8_lossy(&o.stdout)).into(),
+        Err(_) => "unknown".into(),
+    }
+}
+
+/// Parse `nvram boot-args` output for the AMFI bypass flag. nvram
+/// emits `boot-args\t<value>` (tab-separated). The bypass flag is
+/// `amfi_get_out_of_my_way=0x1` (or `=1`); we match the key
+/// substring rather than the exact value so a future Apple change
+/// to "=0x3" or similar still surfaces as bypass-active.
+///
+/// Returns true iff the bypass flag is present in the boot-args.
+pub fn parse_nvram_amfi_bypass(out: &str) -> bool {
+    let lower = out.to_lowercase();
+    lower.contains("amfi_get_out_of_my_way")
+}
+
+fn probe_amfi_bypass() -> bool {
+    let out = Command::new("nvram").arg("boot-args").output();
+    match out {
+        Ok(o) => parse_nvram_amfi_bypass(&String::from_utf8_lossy(&o.stdout)),
+        // nvram returns non-zero when the variable isn't set at all.
+        // That's the default state on every stock Mac — bypass=false.
+        Err(_) => false,
+    }
+}
+
+/// Parse `codesign -d --entitlements - <bin>` output for the ES
+/// entitlement key. The output is a Property List (binary or XML
+/// depending on macOS rev); we substring-match the key name rather
+/// than parse the plist — sufficient for a yes/no surface.
+///
+/// Apple's tool also prefixes a blob header line we ignore; the
+/// substring match is on the entitlement key itself, which is
+/// stable across formats.
+pub fn parse_codesign_entitlements_has_es(out: &str) -> bool {
+    out.contains("com.apple.developer.endpoint-security.client")
+}
+
+/// Read the installed helper's codesigned entitlements and report
+/// whether the ES key is present. The helper path is resolved the
+/// same way the daemon resolves it for spawning:
+/// `SHIT_HELPER_BIN` env override → `target/release/shit-helper` →
+/// `/usr/local/bin/shit-helper` → `/opt/homebrew/bin/shit-helper`.
+///
+/// Returns false on any failure (helper not found, codesign not
+/// installed, helper unsigned, etc.) — power-user mode requires the
+/// helper to be explicitly codesigned with the entitlement plist;
+/// missing = needs to run the codesign-on-install script.
+pub fn probe_helper_has_es_entitlement(helper_path: Option<&Path>) -> bool {
+    let helper = match helper_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            // Resolve like the daemon does. Cheap because we don't
+            // execute the helper — just check codesign metadata.
+            let env_override = std::env::var_os("SHIT_HELPER_BIN").map(PathBuf::from);
+            let candidates = [
+                env_override,
+                Some(PathBuf::from("target/release/shit-helper")),
+                Some(PathBuf::from("/usr/local/bin/shit-helper")),
+                Some(PathBuf::from("/opt/homebrew/bin/shit-helper")),
+            ];
+            let mut found = None;
+            for c in candidates.into_iter().flatten() {
+                if c.exists() {
+                    found = Some(c);
+                    break;
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => return false,
+            }
+        }
+    };
+    let out = Command::new("codesign")
+        .arg("-d")
+        .arg("--entitlements")
+        .arg("-")
+        .arg(&helper)
+        .output();
+    match out {
+        Ok(o) => {
+            // codesign writes the entitlement blob to stderr in
+            // older macOS revs and stdout in newer ones; check both.
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            parse_codesign_entitlements_has_es(&stdout)
+                || parse_codesign_entitlements_has_es(&stderr)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Compose `(es_capable, es_blockers)` from the four prereq probes.
+/// Pure function for unit-test friendliness; the caller wires in the
+/// already-collected reports + the EndpointSecurityReport so this
+/// function does no I/O.
+///
+/// `es_capable = true` iff:
+/// - `sip.state` is `"disabled"` OR `"custom"` (custom may keep SIP
+///   off for the filesystem-protection bit even with kext-signing on,
+///   which is enough for our purposes; if it's still blocking we'd
+///   see the next probe report blockers anyway)
+/// - `sip.authenticated_root == "disabled"`
+/// - `sip.amfi_bypass == true`
+/// - `endpoint_security.helper_has_es_entitlement == true`
+///
+/// When any prereq fails, the returned `Vec<EsBlocker>` enumerates
+/// each missing piece with a remediation command.
+pub fn compose_es_capable(sip: &SipReport, es: &EndpointSecurityReport) -> (bool, Vec<EsBlocker>) {
+    let mut blockers: Vec<EsBlocker> = Vec::new();
+
+    if !matches!(sip.state.as_str(), "disabled" | "custom") {
+        blockers.push(EsBlocker {
+            component: "sip".into(),
+            reason: format!(
+                "System Integrity Protection is {}; ES entitlement is rejected by AMFI unless SIP is off",
+                sip.state
+            ),
+            fix_command: Some("csrutil disable".into()),
+            recovery_mode: true,
+        });
+    }
+    if sip.authenticated_root != "disabled" {
+        blockers.push(EsBlocker {
+            component: "authenticated_root".into(),
+            reason: format!(
+                "Authenticated Root is {}; required to be disabled on Apple Silicon for AMFI bypass to take effect",
+                if sip.authenticated_root.is_empty() {
+                    "unknown"
+                } else {
+                    sip.authenticated_root.as_str()
+                }
+            ),
+            fix_command: Some("csrutil authenticated-root disable".into()),
+            recovery_mode: true,
+        });
+    }
+    if !sip.amfi_bypass {
+        blockers.push(EsBlocker {
+            component: "amfi_bypass".into(),
+            reason: "AMFI bypass boot-arg not set; AMFI will reject the helper's ES entitlement claim even with SIP off"
+                .into(),
+            fix_command: Some(
+                "sudo nvram boot-args=\"amfi_get_out_of_my_way=0x1\" && sudo reboot".into(),
+            ),
+            recovery_mode: false,
+        });
+    }
+    if !es.helper_has_es_entitlement {
+        blockers.push(EsBlocker {
+            component: "helper_entitlement".into(),
+            reason: "Installed shit-helper is not codesigned with the EndpointSecurity entitlement; run the install-time codesign script"
+                .into(),
+            fix_command: Some(
+                "sudo /usr/local/bin/shit-setup-es-mode || sudo /opt/homebrew/bin/shit-setup-es-mode"
+                    .into(),
+            ),
+            recovery_mode: false,
+        });
+    }
+
+    let capable = blockers.is_empty();
+    (capable, blockers)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -668,6 +865,7 @@ pub fn probe_endpoint_security() -> EndpointSecurityReport {
                  or install the release artifact"
                     .into(),
             ],
+            helper_has_es_entitlement: false,
         };
     };
 
@@ -761,6 +959,8 @@ fn parse_es_probe_line(line: &str) -> EndpointSecurityReport {
         client_can_subscribe,
         subscribed_event_kinds: vec![],
         notes: vec![note],
+        // overwritten by the doctor's dispatch with `probe_helper_has_es_entitlement`
+        helper_has_es_entitlement: false,
     }
 }
 
@@ -938,5 +1138,148 @@ mod tests {
             "unexpected SIP state: {}",
             r.state
         );
+    }
+
+    // ─── M03.x.POWER-USER.1 parsers + composition ────────────────
+
+    #[test]
+    fn auth_root_parser_disabled() {
+        assert_eq!(
+            parse_csrutil_authenticated_root("Authenticated Root status: disabled\n"),
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn auth_root_parser_enabled() {
+        assert_eq!(
+            parse_csrutil_authenticated_root("Authenticated Root status: enabled\n"),
+            "enabled"
+        );
+    }
+
+    #[test]
+    fn auth_root_parser_garbage_is_unknown() {
+        assert_eq!(parse_csrutil_authenticated_root(""), "unknown");
+        assert_eq!(
+            parse_csrutil_authenticated_root("csrutil: invalid subcommand\n"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn amfi_parser_detects_bypass_flag() {
+        assert!(parse_nvram_amfi_bypass(
+            "boot-args\tamfi_get_out_of_my_way=0x1\n"
+        ));
+        assert!(parse_nvram_amfi_bypass(
+            "boot-args\t-v amfi_get_out_of_my_way=1 keepsyms=1\n"
+        ));
+    }
+
+    #[test]
+    fn amfi_parser_empty_or_missing_is_false() {
+        assert!(!parse_nvram_amfi_bypass(""));
+        assert!(!parse_nvram_amfi_bypass("boot-args\t\n"));
+        assert!(!parse_nvram_amfi_bypass("boot-args\t-v keepsyms=1\n"));
+    }
+
+    #[test]
+    fn codesign_entitlements_parser_detects_es_key() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC ...>
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.endpoint-security.client</key>
+    <true/>
+</dict>
+</plist>"#;
+        assert!(parse_codesign_entitlements_has_es(xml));
+    }
+
+    #[test]
+    fn codesign_entitlements_parser_no_es_key_returns_false() {
+        let xml = r#"<plist version="1.0"><dict><key>some.other.key</key><true/></dict></plist>"#;
+        assert!(!parse_codesign_entitlements_has_es(xml));
+        assert!(!parse_codesign_entitlements_has_es(""));
+    }
+
+    #[test]
+    fn compose_es_capable_fully_green() {
+        let sip = SipReport {
+            state: "disabled".into(),
+            authenticated_root: "disabled".into(),
+            amfi_bypass: true,
+        };
+        let es = EndpointSecurityReport {
+            helper_has_es_entitlement: true,
+            ..Default::default()
+        };
+        let (capable, blockers) = compose_es_capable(&sip, &es);
+        assert!(capable);
+        assert!(blockers.is_empty());
+    }
+
+    #[test]
+    fn compose_es_capable_stock_mac_lists_all_four_blockers() {
+        let sip = SipReport {
+            state: "enabled".into(),
+            authenticated_root: "enabled".into(),
+            amfi_bypass: false,
+        };
+        let es = EndpointSecurityReport {
+            helper_has_es_entitlement: false,
+            ..Default::default()
+        };
+        let (capable, blockers) = compose_es_capable(&sip, &es);
+        assert!(!capable);
+        let names: Vec<&str> = blockers.iter().map(|b| b.component.as_str()).collect();
+        assert!(names.contains(&"sip"));
+        assert!(names.contains(&"authenticated_root"));
+        assert!(names.contains(&"amfi_bypass"));
+        assert!(names.contains(&"helper_entitlement"));
+        // Recovery-mode flags set correctly on the SIP/auth-root blockers.
+        for b in &blockers {
+            match b.component.as_str() {
+                "sip" | "authenticated_root" => assert!(b.recovery_mode),
+                _ => assert!(!b.recovery_mode),
+            }
+        }
+    }
+
+    #[test]
+    fn compose_es_capable_accepts_custom_sip() {
+        // `csrutil enable --without fs` leaves SIP "custom" with FS
+        // protection off — that's the same effective posture as
+        // fully disabled for AMFI's purposes.
+        let sip = SipReport {
+            state: "custom".into(),
+            authenticated_root: "disabled".into(),
+            amfi_bypass: true,
+        };
+        let es = EndpointSecurityReport {
+            helper_has_es_entitlement: true,
+            ..Default::default()
+        };
+        let (capable, blockers) = compose_es_capable(&sip, &es);
+        assert!(capable, "custom SIP should pass: blockers={blockers:?}");
+    }
+
+    #[test]
+    fn compose_es_capable_partial_block_only_lists_failing_components() {
+        // SIP off + auth-root off + AMFI on, but helper unsigned.
+        let sip = SipReport {
+            state: "disabled".into(),
+            authenticated_root: "disabled".into(),
+            amfi_bypass: true,
+        };
+        let es = EndpointSecurityReport {
+            helper_has_es_entitlement: false,
+            ..Default::default()
+        };
+        let (capable, blockers) = compose_es_capable(&sip, &es);
+        assert!(!capable);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].component, "helper_entitlement");
     }
 }

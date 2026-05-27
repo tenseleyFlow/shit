@@ -270,6 +270,20 @@ pub struct MacReport {
     /// Helper handshake — shared shape with [`BsdReport`] /
     /// [`LinuxReport`]. Same wire, same semantics.
     pub helper_handshake: HelperHandshakeReport,
+    /// M03.x.POWER-USER — composed view: is this system in a state
+    /// where ES will actually run? True iff SIP-disabled (or custom
+    /// w/ filesystem protection off), authenticated-root disabled,
+    /// AMFI bypass boot-arg set, and the installed helper carries
+    /// the ES entitlement. Drives the doctor's "tier=endpoint-
+    /// security vs tier=fsevents-degraded" remediation surface.
+    #[serde(default)]
+    pub es_capable: bool,
+    /// M03.x.POWER-USER — when `es_capable = false`, each blocker
+    /// names a specific prereq the user can fix + the command to
+    /// fix it. Empty when es_capable = true. Stable JSON so the
+    /// CLI's `shit setup-es-mode --print` can format the same data.
+    #[serde(default)]
+    pub es_blockers: Vec<EsBlocker>,
 }
 
 /// EndpointSecurity probe result.
@@ -300,6 +314,16 @@ pub struct EndpointSecurityReport {
     /// also unreachable" or "M03 not yet implemented"). Empty in the
     /// nominal case.
     pub notes: Vec<String>,
+    /// M03.x.POWER-USER — true iff the installed `shit-helper`
+    /// binary carries `com.apple.developer.endpoint-security.client`
+    /// in its embedded entitlements. Read via
+    /// `codesign -d --entitlements - <helper>` — independent of
+    /// whether AMFI is currently accepting the claim (that's
+    /// `entitlement_present`). The user opts into power-user mode
+    /// by running the install-time codesign script that flips this
+    /// from false to true.
+    #[serde(default)]
+    pub helper_has_es_entitlement: bool,
 }
 
 /// FSEvents functional probe result.
@@ -334,6 +358,43 @@ pub struct CodesignReport {
 pub struct SipReport {
     /// `"enabled"`, `"disabled"`, `"custom"`, or `"unknown"`.
     pub state: String,
+    /// M03.x.POWER-USER — `csrutil authenticated-root status` parse.
+    /// Apple Silicon machines have a System volume seal that's
+    /// independent of SIP itself. AMFI's entitlement-bypass path
+    /// requires BOTH SIP disabled AND auth-root disabled; just
+    /// disabling SIP isn't enough. `"disabled"` / `"enabled"` /
+    /// `"unknown"` (csrutil not present or output unrecognized).
+    #[serde(default)]
+    pub authenticated_root: String,
+    /// M03.x.POWER-USER — `nvram boot-args` parse for
+    /// `amfi_get_out_of_my_way=0x1`. When set, AMFI accepts
+    /// entitlement claims from ad-hoc-signed binaries — the
+    /// mechanism the M03.x.POWER-USER install relies on.
+    #[serde(default)]
+    pub amfi_bypass: bool,
+}
+
+/// M03.x.POWER-USER — one entry per ES-mode prerequisite the user's
+/// current system fails. The doctor surfaces these as a numbered
+/// remediation checklist; `shit setup-es-mode --print` formats the
+/// same data into a user-facing setup script.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EsBlocker {
+    /// Stable identifier the CLI/UX layer keys on: `"sip"`,
+    /// `"authenticated_root"`, `"amfi_bypass"`, `"helper_entitlement"`.
+    pub component: String,
+    /// Human-readable description of what's wrong.
+    pub reason: String,
+    /// Concrete shell command (Recovery-mode for SIP/auth-root,
+    /// running-macOS for AMFI/codesign) that fixes this blocker.
+    /// `None` when the fix isn't a one-command runner (e.g. needs a
+    /// full reboot after a sequence).
+    pub fix_command: Option<String>,
+    /// True iff the fix requires booting into Recovery (csrutil
+    /// commands). The doctor's text mode prepends "(Recovery)" to
+    /// these so users know they can't just run them from a terminal.
+    #[serde(default)]
+    pub recovery_mode: bool,
 }
 
 /// Sandbox profile verification.
@@ -498,6 +559,7 @@ mod tests {
                 client_can_subscribe: false,
                 subscribed_event_kinds: vec![],
                 notes: vec!["M03 not yet implemented".into()],
+                helper_has_es_entitlement: false,
             },
             fsevents: FsEventsProbeReport {
                 functional: true,
@@ -511,6 +573,8 @@ mod tests {
             },
             sip: SipReport {
                 state: "enabled".into(),
+                authenticated_root: "enabled".into(),
+                amfi_bypass: false,
             },
             sandbox: SandboxReport {
                 profile_loaded: true,
@@ -523,6 +587,8 @@ mod tests {
                 kernel_tier: Some("fsevents-degraded".into()),
                 error: None,
             },
+            es_capable: false,
+            es_blockers: vec![],
         });
         let s = serde_json::to_string(&r).expect("serialize");
         assert!(s.contains("\"runtime_capture\":\"fsevents-degraded\""));
