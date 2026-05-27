@@ -23,8 +23,10 @@
 //!   design. Requires `--i-understand-the-tradeoffs` for the
 //!   AMFI-bypass step (nvram boot-args) because AMFI weakening is
 //!   the security tradeoff most users will under-appreciate.
-
-#![cfg(target_os = "macos")]
+//
+// Module gate lives on `pub mod setup_es_mode;` in cmd/mod.rs; no
+// inner `#![cfg]` here (rustc's `duplicated_attributes` lint flags
+// the dup under `-D warnings`).
 
 use clap::Args;
 use std::path::PathBuf;
