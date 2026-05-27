@@ -141,18 +141,27 @@ pub struct PumpHandle {
 /// EsClient subscription; never replaced.
 pub static PUMP: OnceLock<PumpHandle> = OnceLock::new();
 
-/// CaptureRecord — what the callback queues for the pump worker
-/// after a successful inline clonefile.
+/// CaptureRecord — what the callback queues for the pump worker.
 ///
-/// Holding `staging_fd` ties the staging file's lifetime to this
-/// record: when the worker has hashed + sent, it drops the fd; the
-/// receiver-side daemon holds its own fd (received via SCM_RIGHTS),
-/// and the staging file is unlinked by `staging_path` cleanup once
-/// both fds are closed.
-pub struct CaptureRecord {
+/// Two variants:
+/// - `PreImage`: AUTH_UNLINK or AUTH_RENAME-overwrite — carries a
+///   staging fd from the inline clonefile. Worker hashes + emits
+///   `HelperResponse::CapturedPreImage` via SCM_RIGHTS.
+/// - `TreeOp`: AUTH_RENAME or any future tree-only event — no fd,
+///   no clonefile. Worker emits `HelperResponse::TreeMutation`.
+///
+/// A single AUTH_RENAME of an existing file generates BOTH variants:
+/// PreImage for the destination's pre-mutation bytes, TreeOp for the
+/// rename itself.
+pub enum CaptureRecord {
+    PreImage(PreImageRecord),
+    TreeOp(TreeOpRecord),
+}
+
+pub struct PreImageRecord {
     pub command: CommandId,
-    /// Source path the kernel was about to unlink. Recorded so the
-    /// daemon can recreate the file at the same path during undo.
+    /// Path of the file whose bytes we're capturing (UNLINK target
+    /// or RENAME destination).
     pub path: PathBuf,
     /// On-disk staging file the inline clonefile wrote. Worker
     /// removes this AFTER `send_response_with_fd` returns (the fd
@@ -169,7 +178,17 @@ pub struct CaptureRecord {
     pub uid: u32,
     pub gid: u32,
     pub mtime_unix_nanos: i128,
+    /// True for UNLINK + RENAME-overwrite (the file at `path` is
+    /// gone post-syscall, replaced by the rename source's bytes or
+    /// removed entirely). Daemon uses this to journal a paired
+    /// TreeOp::Unlink for the inverse-during-undo flow.
     pub is_delete: bool,
+}
+
+pub struct TreeOpRecord {
+    pub command: CommandId,
+    pub op: shit_proto::TreeOpWire,
+    pub ts_unix_nanos: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -228,6 +247,8 @@ extern "C" fn producer_invoke(
         // handle_auth_unlink calls respond_allow internally (after
         // the M03.1.I.4 clonefile step lands).
         handle_auth_unlink(pump, client, message, &msg);
+    } else if event_type == sys::es_event_type_t::AUTH_RENAME {
+        handle_auth_rename(pump, client, message, &msg);
     }
     // Unknown event type — shouldn't happen since we control the
     // subscription set. Respond ALLOW if it's an AUTH variant we
@@ -450,7 +471,7 @@ fn handle_auth_unlink(
 
     // 2. Pack the record. stat fields are kernel-attached; no extra
     //    syscalls needed.
-    let record = CaptureRecord {
+    let record = CaptureRecord::PreImage(PreImageRecord {
         command,
         path: target_path.to_path_buf(),
         staging_path: staging_path.clone(),
@@ -462,42 +483,186 @@ fn handle_auth_unlink(
         gid: stat.st_gid,
         mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
         is_delete: true,
+    });
+
+    enqueue_capture_record(pump, client, message, record, Some(&staging_path));
+}
+
+/// AUTH_RENAME handler. Always emits TreeMutation(Rename); also emits
+/// CapturedPreImage for the destination's pre-rename bytes when the
+/// destination is an existing file (rename overwrites it, losing
+/// the dst's prior content).
+fn handle_auth_rename(
+    pump: &PumpHandle,
+    client: *mut sys::es_client_t,
+    message: *const c_void,
+    msg: &EsMessage<'_>,
+) {
+    let token = msg.process_audit_token();
+    let pid = pid_from_audit_token(&token);
+    let command = match pump.tracked_pids.lock() {
+        Ok(g) => g.get(&pid).copied(),
+        Err(_) => None,
+    };
+    let Some(command) = command else {
+        respond_allow(client, message);
+        return;
+    };
+    pump.events_passed_filter.fetch_add(1, Ordering::Relaxed);
+
+    let Some(rename) = msg.as_rename() else {
+        respond_allow(client, message);
+        return;
+    };
+    if rename.source.is_null() {
+        respond_allow(client, message);
+        return;
+    }
+    let source_file = unsafe { &*rename.source };
+    let source_path = unsafe { source_file.path.as_path() }.to_path_buf();
+    let source_stat = source_file.stat;
+
+    // Resolve destination path + (if pre-existing) its file pointer
+    // for the dst-clone step. The `unsafe` blocks read tagged-union
+    // variants — guarded by `destination_type`.
+    let (dest_path, dest_existing) = match rename.destination_type {
+        crate::es::message::es_destination_type_t::EXISTING_FILE => unsafe {
+            let dest_ptr = rename.destination.existing_file;
+            if dest_ptr.is_null() {
+                (PathBuf::new(), None)
+            } else {
+                let f = &*dest_ptr;
+                (f.path.as_path().to_path_buf(), Some(f))
+            }
+        },
+        crate::es::message::es_destination_type_t::NEW_PATH => unsafe {
+            let np = &*rename.destination.new_path;
+            if np.dir.is_null() {
+                (PathBuf::new(), None)
+            } else {
+                let dir_path = (*np.dir).path.as_path();
+                let filename = np.filename.as_bytes();
+                (
+                    dir_path.join(std::path::Path::new(std::ffi::OsStr::from_bytes(filename))),
+                    None,
+                )
+            }
+        },
+        _ => (PathBuf::new(), None),
     };
 
-    // 3. Enqueue. try_send so we never block in the kernel callback.
-    match pump.ring_tx.try_send(record) {
-        Ok(()) => {
-            respond_allow(client, message);
+    let ts_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    // If destination pre-exists, capture its bytes BEFORE letting
+    // the rename proceed (rename overwrites destination atomically).
+    if let Some(dest_file) = dest_existing {
+        let (staging_path, staging_fd) = match inline_clonefile(&dest_path, &pump.staging_dir) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    %command.session,
+                    seq = command.seq,
+                    dest = %dest_path.display(),
+                    err = %e,
+                    "macos-es rename dst-clone failed; DENY rename"
+                );
+                respond_deny(client, message);
+                return;
+            }
+        };
+        let dest_stat = dest_file.stat;
+        let record = CaptureRecord::PreImage(PreImageRecord {
+            command,
+            path: dest_path.clone(),
+            staging_path: staging_path.clone(),
+            staging_fd,
+            dev: dest_stat.st_dev as u64,
+            inode: dest_stat.st_ino,
+            mode: dest_stat.st_mode as u32,
+            uid: dest_stat.st_uid,
+            gid: dest_stat.st_gid,
+            mtime_unix_nanos: (dest_stat.st_mtime as i128) * 1_000_000_000
+                + (dest_stat.st_mtime_nsec as i128),
+            is_delete: true,
+        });
+        // try_send the PreImage half; on failure short-circuit so we
+        // don't enqueue an orphaned tree-op without its pre-image.
+        match pump.ring_tx.try_send(record) {
+            Ok(()) => {}
+            Err(TrySendError::Full(rec)) => {
+                if let CaptureRecord::PreImage(p) = rec {
+                    drop(p.staging_fd);
+                    let _ = std::fs::remove_file(&p.staging_path);
+                }
+                tracing::warn!(
+                    %command.session,
+                    seq = command.seq,
+                    "macos-es ring full during rename dst capture; DENY"
+                );
+                respond_deny(client, message);
+                return;
+            }
+            Err(TrySendError::Disconnected(rec)) => {
+                if let CaptureRecord::PreImage(p) = rec {
+                    drop(p.staging_fd);
+                    let _ = std::fs::remove_file(&p.staging_path);
+                }
+                respond_allow(client, message);
+                return;
+            }
         }
+    }
+
+    // Always emit TreeMutation(Rename) so undo can invert the
+    // namespace shift. dev/inode come from source (the renamed file).
+    let tree_record = CaptureRecord::TreeOp(TreeOpRecord {
+        command,
+        op: shit_proto::TreeOpWire::Rename {
+            from: path_to_string(&source_path).unwrap_or_default(),
+            to: path_to_string(&dest_path).unwrap_or_default(),
+            dev: source_stat.st_dev as u64,
+            inode: source_stat.st_ino,
+        },
+        ts_unix_nanos,
+    });
+    enqueue_capture_record(pump, client, message, tree_record, None);
+}
+
+fn enqueue_capture_record(
+    pump: &PumpHandle,
+    client: *mut sys::es_client_t,
+    message: *const c_void,
+    record: CaptureRecord,
+    staging_to_cleanup: Option<&Path>,
+) {
+    match pump.ring_tx.try_send(record) {
+        Ok(()) => respond_allow(client, message),
         Err(TrySendError::Full(rec)) => {
-            // Worker backlogged — DENY to preserve the undo invariant.
-            // Drop the staging fd (closes) + unlink the on-disk copy.
-            tracing::warn!(
-                %command.session,
-                seq = command.seq,
-                path = %rec.path.display(),
-                "macos-es ring full; DENY unlink + drop staging clone"
-            );
-            drop(rec);
-            let _ = std::fs::remove_file(&staging_path);
+            cleanup_dropped_record(rec, staging_to_cleanup);
+            tracing::warn!("macos-es ring full; DENY syscall");
             respond_deny(client, message);
         }
         Err(TrySendError::Disconnected(rec)) => {
-            // Worker died — ALLOW (no point holding the syscall
-            // hostage when the daemon-emit path is gone). The
-            // CapturedPreImage simply never reaches the daemon for
-            // this event; FSEvents producer (Decision 3 coexistence)
-            // still emits the TreeOp::Unlink so undo gets the path
-            // back, just not the byte content.
-            tracing::error!(
-                %command.session,
-                seq = command.seq,
-                path = %rec.path.display(),
-                "macos-es ring disconnected (worker dead); ALLOW unlink, drop staging"
-            );
-            drop(rec);
-            let _ = std::fs::remove_file(&staging_path);
+            cleanup_dropped_record(rec, staging_to_cleanup);
+            tracing::error!("macos-es ring disconnected (worker dead); ALLOW syscall");
             respond_allow(client, message);
+        }
+    }
+}
+
+fn cleanup_dropped_record(rec: CaptureRecord, fallback_path: Option<&Path>) {
+    match rec {
+        CaptureRecord::PreImage(p) => {
+            drop(p.staging_fd);
+            let _ = std::fs::remove_file(&p.staging_path);
+        }
+        CaptureRecord::TreeOp(_) => {
+            if let Some(p) = fallback_path {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
 }
@@ -705,6 +870,7 @@ impl PumpState {
         // never delivers them.
         let events = [
             sys::es_event_type_t::AUTH_UNLINK,
+            sys::es_event_type_t::AUTH_RENAME,
             sys::es_event_type_t::NOTIFY_EXEC,
             sys::es_event_type_t::NOTIFY_FORK,
             sys::es_event_type_t::NOTIFY_EXIT,
@@ -779,21 +945,20 @@ impl PumpState {
                 return false;
             }
         };
-        self.emit_captured_preimage(rec);
+        match rec {
+            CaptureRecord::PreImage(p) => self.emit_captured_preimage(p),
+            CaptureRecord::TreeOp(t) => self.emit_tree_mutation(t),
+        }
         if let Some(pump) = PUMP.get() {
             pump.events_emitted.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
 
-    fn emit_captured_preimage(&self, rec: CaptureRecord) {
+    fn emit_captured_preimage(&self, rec: PreImageRecord) {
         // Hash via pread so the staging fd's offset stays at 0 — the
         // daemon-side recvmsg fd shares this open-file-description
         // and reads starting at 0.
-        //
-        // Stat-claimed size comes from the kernel-attached `stat` the
-        // ES message carried; we don't fstat the staging fd because
-        // clonefile-clone-size == source-size at the moment of clone.
         let claimed_size = stat_size_for_fd(rec.staging_fd.as_raw_fd()).unwrap_or(0);
         let (blob_hash, stored_bytes) =
             match hash_via_pread(rec.staging_fd.as_raw_fd(), claimed_size) {
@@ -819,17 +984,15 @@ impl PumpState {
             path: path_to_string(&rec.path),
             blob_hash,
             stored_bytes,
-            // AUTH_UNLINK fires pre-syscall; the file is then unlinked
-            // (we ALLOW'd). No post-state to hash. AUTH_OPEN(W) and
-            // AUTH_RENAME paths land in M03.1.I.B / .A and set this.
+            // AUTH_UNLINK + AUTH_RENAME-overwrite both fire pre-syscall;
+            // by the time the worker runs, the original bytes at `path`
+            // are gone (replaced or removed). No post-state to hash.
             post_content_hash: None,
             mode: rec.mode,
             uid: rec.uid,
             gid: rec.gid,
             mtime_unix_nanos: rec.mtime_unix_nanos,
-            // M03.1.I scope: no xattr capture (follow-up). BSD producer
-            // reads via flistxattr on the staging fd; symmetric path on
-            // macOS lands once we wire it through.
+            // M03.1.I scope: no xattr capture (follow-up).
             xattrs: std::collections::BTreeMap::new(),
             is_delete: rec.is_delete,
             fd_sent_via_scm: true,
@@ -858,12 +1021,25 @@ impl PumpState {
             );
         }
 
-        // Drop fd → close. Once the daemon's recvmsg'd fd is also
-        // closed, the staging file's inode is released. We unlink
-        // the path here best-effort (the inode survives via either
-        // open fd until both close).
         drop(rec.staging_fd);
         let _ = std::fs::remove_file(&rec.staging_path);
+    }
+
+    fn emit_tree_mutation(&self, rec: TreeOpRecord) {
+        let resp = HelperResponse::TreeMutation {
+            session: rec.command.session,
+            seq: rec.command.seq,
+            op: rec.op,
+            ts_unix_nanos: rec.ts_unix_nanos,
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(
+                %rec.command.session,
+                seq = rec.command.seq,
+                err = %e,
+                "macos-es TreeMutation send failed"
+            );
+        }
     }
 }
 
