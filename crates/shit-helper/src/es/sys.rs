@@ -50,6 +50,27 @@ use std::marker::PhantomData;
 use std::os::raw::{c_int, c_ulong};
 
 // ─────────────────────────────────────────────────────────────────────
+// Event type discriminants (mirror `es_event_type_t` from
+// <EndpointSecurity/types.h>)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Only the variants M03 actually subscribes to land here. Adding a
+// variant is a 1-line edit; we deliberately don't paste the full
+// enum (~120 events) since unused entries are dead code by default.
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct es_event_type_t(pub u32);
+
+impl es_event_type_t {
+    /// NOTIFY events — no response required, just informational.
+    /// M03.1.E subscribes to this for the subscribe-deliver smoke.
+    /// AUTH_OPEN/AUTH_RENAME/AUTH_UNLINK/NOTIFY_FORK/NOTIFY_EXIT
+    /// get added back here when M03.1.F+ slices land.
+    pub const NOTIFY_EXEC: Self = Self(9);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Result enums (mirror C enum values from <EndpointSecurity/types.h>)
 // ─────────────────────────────────────────────────────────────────────
 
@@ -202,6 +223,45 @@ pub static NOOP_HANDLER: Block<()> = Block {
 };
 
 // ─────────────────────────────────────────────────────────────────────
+// Counter handler — increments a static atomic for every delivered
+// message. Used by M03.1.E to prove the subscribe→deliver loop works
+// (counter > 0 after subscribing to a high-frequency NOTIFY event).
+// ─────────────────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global event counter. Single-shared because we only have one
+/// EsClient per process. Reads + writes via atomics — the ES
+/// callback runs on a kernel thread Apple owns.
+pub static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn counter_invoke(
+    _block: *const Block<()>,
+    _client: *mut es_client_t,
+    _message: *const c_void,
+) {
+    EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+static COUNTER_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: core::mem::size_of::<Block<()>>() as c_ulong,
+};
+
+/// Pre-built global Block that increments [`EVENT_COUNTER`] on every
+/// delivery. Used by M03.1.E's subscribe-deliver smoke test. Does
+/// NOT call `es_respond_auth_result` — only safe to use with NOTIFY
+/// events that don't require a response.
+pub static COUNTER_HANDLER: Block<()> = Block {
+    isa: unsafe { &_NSConcreteGlobalBlock as *const _ },
+    flags: BLOCK_IS_GLOBAL,
+    reserved: 0,
+    invoke: counter_invoke as *const c_void,
+    descriptor: &COUNTER_DESCRIPTOR,
+    _phantom: PhantomData,
+};
+
+// ─────────────────────────────────────────────────────────────────────
 // ES extern fns
 // ─────────────────────────────────────────────────────────────────────
 
@@ -221,6 +281,19 @@ unsafe extern "C" {
     ///
     /// Must run on the same thread that called `es_new_client`.
     pub fn es_delete_client(client: *mut es_client_t) -> es_return_t;
+
+    /// `es_return_t es_subscribe(es_client_t *client,`
+    /// `                         const es_event_type_t *events,`
+    /// `                         uint32_t event_count);`
+    ///
+    /// Subscribe an existing client to a set of event types.
+    /// Subscriptions are additive — calling again with new types
+    /// extends the subscription set rather than replacing it.
+    pub fn es_subscribe(
+        client: *mut es_client_t,
+        events: *const es_event_type_t,
+        event_count: u32,
+    ) -> es_return_t;
 }
 
 // ─────────────────────────────────────────────────────────────────────

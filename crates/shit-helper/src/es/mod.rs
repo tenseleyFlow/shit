@@ -44,7 +44,9 @@
 //! stock macOS without the entitlement; `Success` on SIP-disabled
 //! VM or on a properly-entitled stock Mac.
 
+pub mod client;
 pub mod probe;
 pub mod sys;
 
+pub use client::EsClient;
 pub use probe::{ProbeResult, probe_client_creation};

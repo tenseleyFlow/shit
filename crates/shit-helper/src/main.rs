@@ -368,6 +368,23 @@ enum Mode {
     /// kernel verdict.
     #[command(name = "es-probe")]
     EsProbe,
+    /// M03.1.E — ES subscribe-and-count smoke. Subscribes to
+    /// NOTIFY_EXEC for `--duration-secs` seconds, prints the number
+    /// of delivered events as a single-line JSON, tears down.
+    ///
+    /// Output: `{"events_received":<u64>,"duration_secs":<u64>}` on
+    /// success, or `{"error":"<EsClientError>"}` when the client
+    /// couldn't subscribe (typically not entitled / not privileged).
+    /// Always exits 0; caller reads the JSON.
+    ///
+    /// Requires the same ES-enabled environment as `es-probe`. On
+    /// non-macOS the subcommand prints
+    /// `{"error":"NotSupportedOnThisOs"}`.
+    #[command(name = "es-probe-subscribe")]
+    EsProbeSubscribe {
+        #[arg(long, default_value_t = 2)]
+        duration_secs: u64,
+    },
     /// L05 — `shit doctor` Linux fanotify functional probe.
     ///
     /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
@@ -593,6 +610,7 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         Mode::SelfBaselineWrite { state_dir } => run_self_baseline_write(&state_dir),
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
         Mode::EsProbe => run_es_probe(),
+        Mode::EsProbeSubscribe { duration_secs } => run_es_probe_subscribe(duration_secs),
         Mode::ProbeFanotify => run_probe_fanotify(),
         Mode::ProbeEbpf => run_probe_ebpf(),
     }
@@ -631,6 +649,32 @@ fn run_es_probe() -> anyhow::Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         println!(r#"{{"result":"NotSupportedOnThisOs"}}"#);
+        Ok(())
+    }
+}
+
+/// M03.1.E — subscribe to NOTIFY_EXEC for `duration_secs` seconds,
+/// print the count.
+fn run_es_probe_subscribe(duration_secs: u64) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let client = match crate::es::EsClient::new_counting() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(r#"{{"error":"{e}"}}"#);
+                return Ok(());
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_secs(duration_secs));
+        let n = client.events_received();
+        println!(r#"{{"events_received":{n},"duration_secs":{duration_secs}}}"#);
+        drop(client);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = duration_secs;
+        println!(r#"{{"error":"NotSupportedOnThisOs"}}"#);
         Ok(())
     }
 }
