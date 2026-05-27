@@ -1535,7 +1535,9 @@ jobs:
                     hardlink-rm-undo-fbsd.sh \
                     symlink-replace-undo-fbsd.sh \
                     xattr-undo-fbsd.sh \
-                    post-hash-non-delete-fbsd.sh"
+                    post-hash-non-delete-fbsd.sh \
+                    preload-shim-fbsd.sh \
+                    dd-large-file-undo-fbsd.sh"
             for smoke in $SMOKES; do
               echo "----- $smoke -----"
               # Capture timeout's exit code separately so we can
