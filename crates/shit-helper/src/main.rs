@@ -400,6 +400,40 @@ enum Mode {
         #[arg(long, default_value_t = 2)]
         duration_secs: u64,
     },
+    /// M03.1.G — Subscribe to AUTH_UNLINK, decode each message, log
+    /// the target path, respond ALLOW. After `--duration-secs`
+    /// seconds, prints a JSON array of paths observed.
+    ///
+    /// Output: `{"events_received":<u64>,"paths":[<string>,...],"duration_secs":<u64>}`
+    /// on success, `{"error":...}` on failure.
+    ///
+    /// CAUTION: same as `es-auth-smoke` — every unlink on the host
+    /// briefly blocks on our ALLOW response. Don't run long.
+    #[command(name = "es-path-log-smoke")]
+    EsPathLogSmoke {
+        #[arg(long, default_value_t = 2)]
+        duration_secs: u64,
+    },
+    /// M03.1.H — Tree-filter smoke. Subscribes to AUTH_UNLINK with
+    /// the tree-filter handler seeded with this process's own
+    /// audit_token. Only unlinks from this process's audit_token
+    /// get recorded; all others are ALLOW'd but ignored.
+    ///
+    /// Compare event count vs `es-path-log-smoke` for the same
+    /// workload: the filtered version should report only the rm's
+    /// originating from this CLI's exec'd subprocesses, not
+    /// host-wide unlink traffic.
+    ///
+    /// Output: same shape as `es-path-log-smoke` (events_received +
+    /// paths + duration_secs). Note: events_received here counts
+    /// ALL delivered events (system-wide) — the FILTER applies only
+    /// to whether the path is recorded. So events_received can be
+    /// much larger than paths.len().
+    #[command(name = "es-tree-filter-smoke")]
+    EsTreeFilterSmoke {
+        #[arg(long, default_value_t = 2)]
+        duration_secs: u64,
+    },
     /// L05 — `shit doctor` Linux fanotify functional probe.
     ///
     /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
@@ -627,6 +661,8 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         Mode::EsProbe => run_es_probe(),
         Mode::EsProbeSubscribe { duration_secs } => run_es_probe_subscribe(duration_secs),
         Mode::EsAuthSmoke { duration_secs } => run_es_auth_smoke(duration_secs),
+        Mode::EsPathLogSmoke { duration_secs } => run_es_path_log_smoke(duration_secs),
+        Mode::EsTreeFilterSmoke { duration_secs } => run_es_tree_filter_smoke(duration_secs),
         Mode::ProbeFanotify => run_probe_fanotify(),
         Mode::ProbeEbpf => run_probe_ebpf(),
     }
@@ -684,6 +720,119 @@ fn run_es_probe_subscribe(duration_secs: u64) -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(duration_secs));
         let n = client.events_received();
         println!(r#"{{"events_received":{n},"duration_secs":{duration_secs}}}"#);
+        drop(client);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = duration_secs;
+        println!(r#"{{"error":"NotSupportedOnThisOs"}}"#);
+        Ok(())
+    }
+}
+
+/// M03.1.G — subscribe to AUTH_UNLINK with the path-logging
+/// handler; drain + print observed paths as JSON after the window.
+fn run_es_path_log_smoke(duration_secs: u64) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let client = match crate::es::EsClient::new_path_logging() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(r#"{{"error":"{e}"}}"#);
+                return Ok(());
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_secs(duration_secs));
+        let n = client.events_received();
+        let paths = client.drain_logged_paths();
+        // Hand-render the JSON to avoid pulling serde_json into the
+        // privileged binary. Path strings get backslash-escaped for
+        // any quotes / backslashes; macOS paths shouldn't contain
+        // control chars but we tolerate them.
+        let mut paths_json = String::from("[");
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                paths_json.push(',');
+            }
+            paths_json.push('"');
+            for c in p.display().to_string().chars() {
+                match c {
+                    '"' => paths_json.push_str("\\\""),
+                    '\\' => paths_json.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => paths_json.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => paths_json.push(c),
+                }
+            }
+            paths_json.push('"');
+        }
+        paths_json.push(']');
+        println!(
+            r#"{{"events_received":{n},"paths":{paths_json},"duration_secs":{duration_secs}}}"#
+        );
+        drop(client);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = duration_secs;
+        println!(r#"{{"error":"NotSupportedOnThisOs"}}"#);
+        Ok(())
+    }
+}
+
+/// M03.1.H — subscribe to AUTH_UNLINK with tree-filter handler
+/// seeded with self audit_token; do a self-unlink (helper-process)
+/// to prove the ACCEPT side, then drain + print. Compare against
+/// `es-path-log-smoke` (no filter) for the REJECT side: external
+/// rm subprocesses have different audit_tokens and get filtered
+/// out.
+fn run_es_tree_filter_smoke(duration_secs: u64) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let client = match crate::es::EsClient::new_tree_filtered() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(r#"{{"error":"{e}"}}"#);
+                return Ok(());
+            }
+        };
+        // Give subscription a beat to register fully.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        // ACCEPT-side demo: helper-process unlinks. The event's
+        // process == helper, so audit_token matches the seeded
+        // self-token and the path gets recorded.
+        let self_test_path =
+            std::env::temp_dir().join(format!("shit-es-tree-filter-self-{}", std::process::id()));
+        std::fs::write(&self_test_path, b"x").ok();
+        // Brief pause so the create-side syscalls have settled into
+        // a stable on-disk state before we remove (helps the kernel
+        // deliver a clean unlink event).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::remove_file(&self_test_path).ok();
+        std::thread::sleep(std::time::Duration::from_secs(duration_secs));
+        let n = client.events_received();
+        let paths = client.drain_logged_paths();
+        let mut paths_json = String::from("[");
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                paths_json.push(',');
+            }
+            paths_json.push('"');
+            for c in p.display().to_string().chars() {
+                match c {
+                    '"' => paths_json.push_str("\\\""),
+                    '\\' => paths_json.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => paths_json.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => paths_json.push(c),
+                }
+            }
+            paths_json.push('"');
+        }
+        paths_json.push(']');
+        println!(
+            r#"{{"events_received":{n},"paths":{paths_json},"duration_secs":{duration_secs}}}"#
+        );
         drop(client);
         Ok(())
     }
@@ -1669,9 +1818,16 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     };
 
     // M01.A: macOS FSEvents-degraded capture producer. Mirrors the
-    // BSD spawn shape. Producer is created unconditionally on macOS;
-    // the M03 ES producer will sit alongside (decided at WatchTree
-    // dispatch) once it lands.
+    // BSD spawn shape.
+    //
+    // M03.1.I.5: ES producer (`capture::macos_es`) spawns ALONGSIDE
+    // FSEvents per the coexistence ratification (design doc Decision
+    // 3). Both feed the daemon; CapturedPreImage (ES) and
+    // TreeOp::Unlink (FSEvents) are distinct event kinds so the
+    // daemon doesn't dedup them against each other. The ES producer
+    // only succeeds inside the SIP+AuthRoot+AMFI-bypassed VM today
+    // (or, in production, with the entitlement); on a stock dev mac
+    // it returns NotEntitled and we proceed FSEvents-only.
     #[cfg(target_os = "macos")]
     let macos_capture: Option<capture::macos::CaptureControl> = {
         match capture::macos::spawn(Arc::clone(&conn)) {
@@ -1683,6 +1839,32 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 tracing::warn!(
                     err = %e,
                     "macos fsevents capture runtime failed to start; continuing without it"
+                );
+                None
+            }
+        }
+    };
+
+    // M03.1.I.5: ES producer (coexists with FSEvents). spawn() only
+    // creates the thread; EsClient creation happens inside the pump
+    // and fails late (NotEntitled) on environments without the
+    // entitlement — the pump thread logs + exits cleanly, the
+    // CaptureControl handle still exists but its dispatches become
+    // no-ops once the worker is gone. That's the desired degraded
+    // posture for stock-Mac dev environments.
+    #[cfg(target_os = "macos")]
+    let macos_es_capture: Option<capture::macos_es::CaptureControl> = {
+        let staging_dir = cli.state_dir.join("helper-staging");
+        match capture::macos_es::spawn(Arc::clone(&conn), staging_dir) {
+            Ok((ctrl, _join)) => {
+                tracing::info!("macos endpoint-security capture runtime spawned");
+                Some(ctrl)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "macos endpoint-security capture runtime failed to start; \
+                     continuing with FSEvents only"
                 );
                 None
             }
@@ -1732,6 +1914,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_lsm = lsm_state.as_ref().map(|s| s.dispatch.clone());
     #[cfg(target_os = "macos")]
     let request_macos_capture = macos_capture.clone();
+    #[cfg(target_os = "macos")]
+    let request_macos_es_capture = macos_es_capture.clone();
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
@@ -1748,6 +1932,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             request_bsd_capture,
             #[cfg(target_os = "macos")]
             request_macos_capture,
+            #[cfg(target_os = "macos")]
+            request_macos_es_capture,
         )
     });
 
@@ -1809,6 +1995,17 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     drop(macos_capture);
 
+    // M03.1.I.5: shut down the ES pump alongside FSEvents. Same
+    // best-effort posture — the EsClient is held by PumpState
+    // (!Send) and only drops when the pump thread exits, which
+    // happens after it processes our Shutdown ControlMsg.
+    #[cfg(target_os = "macos")]
+    if let Some(ctrl) = &macos_es_capture {
+        ctrl.shutdown();
+    }
+    #[cfg(target_os = "macos")]
+    drop(macos_es_capture);
+
     Ok(())
 }
 
@@ -1827,6 +2024,7 @@ fn request_loop(
     ))]
     bsd_capture: Option<capture::bsd::CaptureControl>,
     #[cfg(target_os = "macos")] macos_capture: Option<capture::macos::CaptureControl>,
+    #[cfg(target_os = "macos")] macos_es_capture: Option<capture::macos_es::CaptureControl>,
 ) -> anyhow::Result<()> {
     use shit_proto::{HelperRequest, HelperResponse};
 
@@ -2000,6 +2198,22 @@ fn request_loop(
                         "watch_tree ignored — no macos capture (degraded)"
                     );
                 }
+                // M03.1.I.5: ES producer runs alongside FSEvents per
+                // the coexistence ratification. Both receive every
+                // WatchTree; ES filters by audit_token (kernel-stable
+                // identity), FSEvents by path prefix. Daemon ingests
+                // the distinct event kinds without dedup conflict.
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_es_capture {
+                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                    tracing::info!(
+                        %session,
+                        command_seq,
+                        root_pid,
+                        cwd_path = %cwd_path,
+                        "watch_tree dispatched to macos endpoint-security capture"
+                    );
+                }
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
@@ -2100,6 +2314,11 @@ fn request_loop(
                 if let Some(ctrl) = &macos_capture {
                     ctrl.on_unwatch_tree(session, command_seq);
                     tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(ctrl) = &macos_es_capture {
+                    ctrl.on_unwatch_tree(session, command_seq);
+                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
                 }
                 #[cfg(not(any(
                     target_os = "linux",

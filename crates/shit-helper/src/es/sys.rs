@@ -65,13 +65,17 @@ pub struct es_event_type_t(pub u32);
 impl es_event_type_t {
     /// AUTH events — handler MUST respond via `es_respond_auth_result`
     /// within 5 seconds or the kernel kills the client.
+    pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
+    pub const AUTH_TRUNCATE: Self = Self(40);
 
     /// NOTIFY events — no response required, just informational.
-    /// M03.1.E subscribes to NOTIFY_EXEC for the subscribe-deliver
-    /// smoke. AUTH_OPEN / AUTH_RENAME / NOTIFY_FORK / NOTIFY_EXIT
-    /// get added back when M03.1.G+ slices need them.
+    /// M03.1.E uses NOTIFY_EXEC for the subscribe-deliver smoke;
+    /// M03.1.I.3 uses NOTIFY_FORK + NOTIFY_EXIT for tree-tracking
+    /// (auto-add child audit_tokens, remove on exit).
     pub const NOTIFY_EXEC: Self = Self(9);
+    pub const NOTIFY_FORK: Self = Self(11);
+    pub const NOTIFY_EXIT: Self = Self(15);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -88,10 +92,10 @@ pub struct es_auth_result_t(pub u32);
 
 impl es_auth_result_t {
     pub const ALLOW: Self = Self(0);
-    /// Reserved for the M03.1.G+ capture-fail path (clonefile failed
-    /// → deny the unlink rather than lose pre-image). Kept out of the
-    /// dead-code lint until then.
-    #[allow(dead_code)]
+    /// Capture-fail path (clonefile failed → deny the unlink rather
+    /// than lose the pre-image). Used by `capture::macos_es` to
+    /// preserve the undo invariant under the project's "hard-fail by
+    /// default" posture (per `CLAUDE.md`).
     pub const DENY: Self = Self(1);
 }
 
@@ -173,31 +177,33 @@ pub struct es_client_t(u8, PhantomData<*mut u8>);
 
 /// Flags bits in `Block_literal.flags`. Only `BLOCK_IS_GLOBAL` is
 /// relevant for the M03.1.A probe.
-const BLOCK_IS_GLOBAL: c_int = 1 << 28;
+pub const BLOCK_IS_GLOBAL: c_int = 1 << 28;
 
 #[repr(C)]
-struct BlockDescriptor {
-    reserved: c_ulong,
+pub struct BlockDescriptor {
+    pub reserved: c_ulong,
     /// Total size of the Block_literal (must match `Block::size_of_self()`).
-    size: c_ulong,
+    pub size: c_ulong,
 }
 
 /// Layout-compatible with `struct Block_literal_1` from the
 /// block-ABI spec. We don't include the optional copy/dispose
-/// helpers — global blocks don't use them.
+/// helpers — global blocks don't use them. All fields `pub` so
+/// downstream modules (`capture::macos_es`) can construct their
+/// own handler statics without going through this module.
 #[repr(C)]
 pub struct Block<F: 'static> {
     /// Set to `&_NSConcreteGlobalBlock` so the runtime recognizes
     /// the layout.
-    isa: *const c_void,
-    flags: c_int,
-    reserved: c_int,
+    pub isa: *const c_void,
+    pub flags: c_int,
+    pub reserved: c_int,
     /// Trampoline that calls our Rust handler. First arg is always
     /// `*const Block<F>` (block-ABI convention).
-    invoke: *const c_void,
-    descriptor: *const BlockDescriptor,
+    pub invoke: *const c_void,
+    pub descriptor: *const BlockDescriptor,
     /// Marker so the compiler can carry F's variance through.
-    _phantom: PhantomData<F>,
+    pub _phantom: PhantomData<F>,
 }
 
 // Apple guarantees global blocks are immutable + thread-safe — every
@@ -209,7 +215,7 @@ unsafe impl<F: 'static> Send for Block<F> {}
 unsafe extern "C" {
     /// Block class for global (static) blocks. The runtime checks
     /// `block->isa == _NSConcreteGlobalBlock` to skip copy/dispose.
-    static _NSConcreteGlobalBlock: c_void;
+    pub static _NSConcreteGlobalBlock: c_void;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -333,6 +339,136 @@ pub static ALLOW_COUNTER_HANDLER: Block<()> = Block {
     reserved: 0,
     invoke: allow_and_count_invoke as *const c_void,
     descriptor: &ALLOW_COUNTER_DESCRIPTOR,
+    _phantom: PhantomData,
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Path-logging handler (M03.1.G — decode + log + respond ALLOW)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Same response shape as ALLOW_COUNTER_HANDLER but also decodes the
+// message and records the unlink target path in a bounded Mutex.
+// The smoke CLI drains the buffer after the subscription window.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Bounded ring of the most-recent unlink target paths. Capped to
+/// avoid unbounded growth if the smoke runs long. Drained by the
+/// `es-path-log-smoke` CLI after the subscription window closes.
+pub static LAST_UNLINK_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+const LAST_UNLINK_CAP: usize = 256;
+
+extern "C" fn path_log_invoke(
+    _block: *const Block<()>,
+    client: *mut es_client_t,
+    message: *const c_void,
+) {
+    EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: client + message are kernel-owned for the duration
+    // of this callback per Apple's docs. The EsMessage wrapper
+    // borrows the pointer only inside this scope.
+    unsafe {
+        let msg = super::message::EsMessage::from_raw(message);
+        if let Some(p) = msg.unlink_target_path()
+            && let Ok(mut g) = LAST_UNLINK_PATHS.lock()
+        {
+            if g.len() >= LAST_UNLINK_CAP {
+                g.remove(0);
+            }
+            g.push(p.to_path_buf());
+        }
+        let _ = es_respond_auth_result(
+            client,
+            message as *const es_message_t,
+            es_auth_result_t::ALLOW,
+            true,
+        );
+    }
+}
+
+static PATH_LOG_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: core::mem::size_of::<Block<()>>() as c_ulong,
+};
+
+/// Pre-built global Block that decodes the message, records the
+/// unlink target path in [`LAST_UNLINK_PATHS`], then responds ALLOW.
+/// Safe for AUTH_UNLINK subscriptions.
+pub static PATH_LOG_HANDLER: Block<()> = Block {
+    isa: unsafe { &_NSConcreteGlobalBlock as *const _ },
+    flags: BLOCK_IS_GLOBAL,
+    reserved: 0,
+    invoke: path_log_invoke as *const c_void,
+    descriptor: &PATH_LOG_DESCRIPTOR,
+    _phantom: PhantomData,
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Tree-filter handler (M03.1.H — filter by audit_token)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Same shape as PATH_LOG_HANDLER but only records paths whose
+// originating process's audit_token is in TRACKED_TOKENS. Always
+// responds ALLOW regardless of filter (we never deny in the slice 4
+// model — only choose whether to record). EsClient::new_tree_filtered
+// pre-seeds TRACKED_TOKENS with `audit_token_self()` so the test
+// process's own unlinks pass the filter.
+
+use super::message::audit_token_t;
+use std::collections::HashSet;
+
+/// Audit tokens whose AUTH_UNLINK events should be recorded.
+/// Mutex<HashSet> for low-contention reads + writes from the
+/// kernel callback thread (serial dispatch queue per Apple's docs).
+pub static TRACKED_TOKENS: Mutex<Option<HashSet<audit_token_t>>> = Mutex::new(None);
+
+extern "C" fn tree_filter_invoke(
+    _block: *const Block<()>,
+    client: *mut es_client_t,
+    message: *const c_void,
+) {
+    EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let msg = super::message::EsMessage::from_raw(message);
+        let token = msg.process_audit_token();
+        let in_tracked = TRACKED_TOKENS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|set| set.contains(&token)))
+            .unwrap_or(false);
+        if in_tracked
+            && let Some(p) = msg.unlink_target_path()
+            && let Ok(mut g) = LAST_UNLINK_PATHS.lock()
+        {
+            if g.len() >= LAST_UNLINK_CAP {
+                g.remove(0);
+            }
+            g.push(p.to_path_buf());
+        }
+        let _ = es_respond_auth_result(
+            client,
+            message as *const es_message_t,
+            es_auth_result_t::ALLOW,
+            true,
+        );
+    }
+}
+
+static TREE_FILTER_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: core::mem::size_of::<Block<()>>() as c_ulong,
+};
+
+/// Pre-built global Block that filters by `TRACKED_TOKENS` before
+/// recording. Same response shape as `PATH_LOG_HANDLER` (always
+/// ALLOW); only the recording step differs.
+pub static TREE_FILTER_HANDLER: Block<()> = Block {
+    isa: unsafe { &_NSConcreteGlobalBlock as *const _ },
+    flags: BLOCK_IS_GLOBAL,
+    reserved: 0,
+    invoke: tree_filter_invoke as *const c_void,
+    descriptor: &TREE_FILTER_DESCRIPTOR,
     _phantom: PhantomData,
 };
 

@@ -45,6 +45,7 @@
 //! VM or on a properly-entitled stock Mac.
 
 pub mod client;
+pub mod message;
 pub mod probe;
 pub mod sys;
 
