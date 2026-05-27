@@ -42,6 +42,74 @@ pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE, WIRE_VERSION, decode_frame,
     decode_frame_large, encode_frame, encode_frame_large,
 };
+
+/// AU26: maximum bytes for `HookMessage::PreExec.cmd_string`. The shell
+/// hook truncates `$BASH_COMMAND` to this length before shipping.
+/// 4 KiB comfortably holds any real interactive command; truncation
+/// past 4 KiB on a pathological macro / aliased pipeline cannot hide
+/// a refuse-list pattern (every catalog pattern is <40 bytes).
+pub const PRE_EXEC_CMDLINE_MAX_BYTES: usize = 4096;
+
+/// AU26: truncate a cmd_string to `PRE_EXEC_CMDLINE_MAX_BYTES` at the
+/// nearest UTF-8 char boundary at or below the cap. Idempotent on
+/// inputs already within the cap. The shell-hook send path applies
+/// this before packing into `HookMessage::PreExec.cmd_string` so the
+/// wire never carries more than the cap.
+pub fn truncate_cmd_string(s: String) -> String {
+    if s.len() <= PRE_EXEC_CMDLINE_MAX_BYTES {
+        return s;
+    }
+    let mut cut = PRE_EXEC_CMDLINE_MAX_BYTES;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut truncated = s;
+    truncated.truncate(cut);
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_under_cap_is_idempotent() {
+        let s = "git push origin main".to_string();
+        let original = s.clone();
+        assert_eq!(truncate_cmd_string(s), original);
+    }
+
+    #[test]
+    fn truncate_at_exact_cap_is_idempotent() {
+        let s = "x".repeat(PRE_EXEC_CMDLINE_MAX_BYTES);
+        let original = s.clone();
+        assert_eq!(truncate_cmd_string(s), original);
+    }
+
+    #[test]
+    fn truncate_over_cap_cuts_to_cap() {
+        let s = "x".repeat(PRE_EXEC_CMDLINE_MAX_BYTES + 500);
+        let got = truncate_cmd_string(s);
+        assert_eq!(got.len(), PRE_EXEC_CMDLINE_MAX_BYTES);
+    }
+
+    #[test]
+    fn truncate_respects_utf8_char_boundary() {
+        // Multi-byte char at the cap boundary; truncate must back up
+        // to the char boundary, producing a string SHORTER than the
+        // cap (never a panic, never invalid UTF-8).
+        let mut s = "x".repeat(PRE_EXEC_CMDLINE_MAX_BYTES - 2);
+        s.push('日'); // 3-byte char straddling positions 4094..4097
+        s.push_str(&"y".repeat(10));
+        let got = truncate_cmd_string(s);
+        // Cap is 4096; the 3-byte 日 occupies bytes 4094..4097, so the
+        // cut at 4096 backs up to 4094 (start of 日).
+        assert_eq!(got.len(), PRE_EXEC_CMDLINE_MAX_BYTES - 2);
+        // String must still be valid UTF-8 (would have panicked
+        // already if not, but explicit assert):
+        let _ = std::str::from_utf8(got.as_bytes()).unwrap();
+    }
+}
 pub use helper::{
     AuthDecision, AuthEventKind, FileKindWire, FileMetadataWire, HELPER_PATH_HINT_MAX,
     HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest, HelperResponse,
@@ -75,6 +143,17 @@ pub enum HookMessage {
         ts_unix_nanos: u64,
         shell_kind: ShellKind,
         depth: u8,
+        /// AU26: the literal command-line string the shell is about
+        /// to run (`$BASH_COMMAND` in bash, `$1` from zsh `preexec`,
+        /// `$argv` from fish `--on-event fish_preexec`). Plumbed into
+        /// `CommandRecord.cmd_string` so the planner's refuse-list
+        /// match can fire at undo time. Pre-AU26 shells (and
+        /// hook-send callers without `--cmdline`) ship `None` via
+        /// serde default; older daemons reading new wires see the
+        /// field as Optional. Capped at `PRE_EXEC_CMDLINE_MAX_BYTES`
+        /// at the daemon boundary to bound the wire.
+        #[serde(default)]
+        cmd_string: Option<String>,
     },
     /// Emitted after each interactive command exits.
     PostExec {
