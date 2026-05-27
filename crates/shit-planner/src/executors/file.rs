@@ -510,7 +510,21 @@ fn recreate_path_inner(
             Ok(())
         }
         FileKind::Directory => {
-            fs::create_dir(path).map_err(|e| format!("mkdir {path:?}: {e}"))?;
+            // G03 — recreate_path for a Directory may run AFTER a
+            // child's RestoreContent has already `mkdir -p`'d this
+            // path at default umask. Treat AlreadyExists-and-is-dir
+            // as success and just chmod to the captured mode; any
+            // other AlreadyExists kind (file/symlink in our place)
+            // is a real conflict and bubbles up.
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && fs::symlink_metadata(path)
+                            .map(|m| m.file_type().is_dir())
+                            .unwrap_or(false) => {}
+                Err(e) => return Err(format!("mkdir {path:?}: {e}")),
+            }
             fs::set_permissions(path, fs::Permissions::from_mode(perm_bits))
                 .map_err(|e| format!("chmod {path:?} -> {perm_bits:o}: {e}"))?;
             Ok(())

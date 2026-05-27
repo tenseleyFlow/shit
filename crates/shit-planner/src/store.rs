@@ -234,6 +234,7 @@ mod tests {
                     blob: BlobHash::from_bytes([seq as u8; 32]),
                     meta: empty_meta(),
                     post_content_hash: None,
+                    source: crate::FilePreImageSource::Other,
                 },
             });
         }
@@ -264,6 +265,7 @@ mod tests {
                     blob: BlobHash::from_bytes([0; 32]),
                     meta: empty_meta(),
                     post_content_hash: None,
+                    source: crate::FilePreImageSource::Other,
                 },
             });
         }

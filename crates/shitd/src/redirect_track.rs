@@ -175,6 +175,10 @@ fn stash_truncate(
             // see what bytes the about-to-run command will write.
             // Matches the shim's pre-image journaling.
             post_content_hash: None,
+            // AR06.5 shell pre-stash: bytes captured at PreExec time,
+            // before the user's command ran. Same guarantee as
+            // W02.B's LiveBaseline promote.
+            source: shit_planner::FilePreImageSource::BaselineCachePromote,
         },
     };
     index

@@ -1438,6 +1438,26 @@ fn boot_ebpf_lsm(
     loader
         .load_lsm_link()
         .map_err(|e| anyhow::anyhow!("load_lsm_link failed: {e}"))?;
+    loader
+        .load_lsm_rmdir()
+        .map_err(|e| anyhow::anyhow!("load_lsm_rmdir failed: {e}"))?;
+    // L04.2 — file_release is best-effort. The hook is present in
+    // BTF on kernel 7.0+ but the CI runner matrix includes 6.8 where
+    // the symbol is absent. Log + continue when the hook can't be
+    // resolved; the rest of the LSM tier (unlink/setattr/open/...)
+    // stays functional. In-place-write capture degrades to "via
+    // file_open's open-time snapshot only" on older kernels.
+    let release_loaded = match loader.load_lsm_release() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "load_lsm_release unavailable on this kernel; \
+                 in-place-write capture limited to file_open path"
+            );
+            false
+        }
+    };
     let unlink_rb = loader.take_unlink_ringbuf().ok_or_else(|| {
         anyhow::anyhow!("take_unlink_ringbuf returned None after successful load")
     })?;
@@ -1462,6 +1482,19 @@ fn boot_ebpf_lsm(
     let link_rb = loader
         .take_link_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_link_ringbuf returned None after successful load"))?;
+    let rmdir_rb = loader
+        .take_rmdir_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_rmdir_ringbuf returned None after successful load"))?;
+    // L04.2 release ringbuf is None on kernels where the hook wasn't
+    // loaded (see release_loaded above). Skip spawning the reader
+    // in that case.
+    let release_rb_opt = if release_loaded {
+        Some(loader.take_release_ringbuf().ok_or_else(|| {
+            anyhow::anyhow!("take_release_ringbuf returned None after successful load")
+        })?)
+    } else {
+        None
+    };
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
 
@@ -1493,21 +1526,41 @@ fn boot_ebpf_lsm(
     // reuse spawn_create so they route through the on_create sink.
     let symlink_reader = ebpf::LsmReader::spawn_create(symlink_rb, Arc::clone(&sink), idle);
     let link_reader = ebpf::LsmReader::spawn_create(link_rb, Arc::clone(&sink), idle);
+    // G03: rmdir uses the same wire shape as unlink but routes via
+    // on_rmdir → handle_lsm_unlink with is_directory=true.
+    let rmdir_reader = ebpf::LsmReader::spawn_rmdir(rmdir_rb, Arc::clone(&sink), idle);
+    // L04.2: file_release fires at last writable-fd close; the
+    // handler diffs current content against the open-time
+    // snapshot and emits a CapturedPreImage iff they differ.
+    // Optional — only spawned on kernels where the hook loaded.
+    let release_reader =
+        release_rb_opt.map(|rb| ebpf::LsmReader::spawn_release(rb, Arc::clone(&sink), idle));
 
-    tracing::info!(
-        "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link"
-    );
+    if release_reader.is_some() {
+        tracing::info!(
+            "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link + rmdir + release"
+        );
+    } else {
+        tracing::info!(
+            "ebpf-lsm readers spawned: unlink + setattr + mkdir + create + open + rename + symlink + link + rmdir (release unavailable on this kernel)"
+        );
+    }
+    let mut readers = vec![
+        unlink_reader,
+        setattr_reader,
+        mkdir_reader,
+        create_reader,
+        open_reader,
+        rename_reader,
+        symlink_reader,
+        link_reader,
+        rmdir_reader,
+    ];
+    if let Some(r) = release_reader {
+        readers.push(r);
+    }
     Ok(LsmCaptureState {
-        _readers: vec![
-            unlink_reader,
-            setattr_reader,
-            mkdir_reader,
-            create_reader,
-            open_reader,
-            rename_reader,
-            symlink_reader,
-            link_reader,
-        ],
+        _readers: readers,
         _loader: loader,
         dispatch: LsmDispatch { tree, runtime },
     })
