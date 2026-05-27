@@ -106,6 +106,51 @@ impl EsClient {
         })
     }
 
+    /// Subscribe to AUTH_UNLINK with the ALLOW-and-count handler.
+    /// This is Slice 2 (M03.1.F) — every `unlink` syscall on the
+    /// system is delivered to our handler, which responds ALLOW
+    /// immediately + bumps [`super::sys::EVENT_COUNTER`].
+    ///
+    /// Same env requirements as [`Self::new_counting`] (signed +
+    /// AMFI-bypassed VM, or production entitlement).
+    ///
+    /// Holding this client briefly affects every unlink on the
+    /// host (kernel waits for our ALLOW). The response is inline
+    /// in the callback so latency is microseconds — fine for a
+    /// smoke. Don't hold it long-term on a busy host without
+    /// understanding the trade-off; M03.1.H+ adds the worker-
+    /// thread + ring buffer architecture that decouples response
+    /// from capture work.
+    pub fn new_auth_counting() -> Result<Self, EsClientError> {
+        let mut client: *mut sys::es_client_t = ptr::null_mut();
+        let result = unsafe {
+            sys::es_new_client(
+                &mut client as *mut *mut sys::es_client_t,
+                &sys::ALLOW_COUNTER_HANDLER as *const _ as *const c_void,
+            )
+        };
+        if result != sys::es_new_client_result_t::SUCCESS {
+            return Err(EsClientError::NewClient(result));
+        }
+
+        let start_count = sys::EVENT_COUNTER.load(Ordering::Relaxed);
+
+        let events = [sys::es_event_type_t::AUTH_UNLINK];
+        let sub = unsafe { sys::es_subscribe(client, events.as_ptr(), events.len() as u32) };
+        if sub != sys::es_return_t::SUCCESS {
+            unsafe {
+                let _ = sys::es_delete_client(client);
+            }
+            return Err(EsClientError::Subscribe(sub));
+        }
+
+        Ok(Self {
+            client,
+            start_count,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     /// Events delivered to the counter handler since this client
     /// was constructed.
     pub fn events_received(&self) -> u64 {

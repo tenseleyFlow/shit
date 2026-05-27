@@ -385,6 +385,21 @@ enum Mode {
         #[arg(long, default_value_t = 2)]
         duration_secs: u64,
     },
+    /// M03.1.F — AUTH-event response smoke. Subscribes to
+    /// AUTH_UNLINK for `--duration-secs` seconds, responds ALLOW
+    /// to every event inline, prints count.
+    ///
+    /// Output: `{"events_received":<u64>,"duration_secs":<u64>}` on
+    /// success, or `{"error":...}` on subscription failure.
+    ///
+    /// CAUTION: while this is running, EVERY unlink(2) on the host
+    /// briefly blocks on our ALLOW response (microseconds). Don't
+    /// hold it for long on a production system.
+    #[command(name = "es-auth-smoke")]
+    EsAuthSmoke {
+        #[arg(long, default_value_t = 2)]
+        duration_secs: u64,
+    },
     /// L05 — `shit doctor` Linux fanotify functional probe.
     ///
     /// Opens a fanotify-perm fd, marks a tmpdir, writes a probe
@@ -611,6 +626,7 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
         Mode::HandshakeProbe { daemon_sock } => run_handshake_probe(&daemon_sock).await,
         Mode::EsProbe => run_es_probe(),
         Mode::EsProbeSubscribe { duration_secs } => run_es_probe_subscribe(duration_secs),
+        Mode::EsAuthSmoke { duration_secs } => run_es_auth_smoke(duration_secs),
         Mode::ProbeFanotify => run_probe_fanotify(),
         Mode::ProbeEbpf => run_probe_ebpf(),
     }
@@ -659,6 +675,32 @@ fn run_es_probe_subscribe(duration_secs: u64) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let client = match crate::es::EsClient::new_counting() {
+            Ok(c) => c,
+            Err(e) => {
+                println!(r#"{{"error":"{e}"}}"#);
+                return Ok(());
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_secs(duration_secs));
+        let n = client.events_received();
+        println!(r#"{{"events_received":{n},"duration_secs":{duration_secs}}}"#);
+        drop(client);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = duration_secs;
+        println!(r#"{{"error":"NotSupportedOnThisOs"}}"#);
+        Ok(())
+    }
+}
+
+/// M03.1.F — subscribe to AUTH_UNLINK for `duration_secs` seconds,
+/// respond ALLOW to every event inline, print count.
+fn run_es_auth_smoke(duration_secs: u64) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let client = match crate::es::EsClient::new_auth_counting() {
             Ok(c) => c,
             Err(e) => {
                 println!(r#"{{"error":"{e}"}}"#);

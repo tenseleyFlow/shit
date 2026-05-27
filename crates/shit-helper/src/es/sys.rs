@@ -63,12 +63,43 @@ use std::os::raw::{c_int, c_ulong};
 pub struct es_event_type_t(pub u32);
 
 impl es_event_type_t {
+    /// AUTH events — handler MUST respond via `es_respond_auth_result`
+    /// within 5 seconds or the kernel kills the client.
+    pub const AUTH_UNLINK: Self = Self(8);
+
     /// NOTIFY events — no response required, just informational.
-    /// M03.1.E subscribes to this for the subscribe-deliver smoke.
-    /// AUTH_OPEN/AUTH_RENAME/AUTH_UNLINK/NOTIFY_FORK/NOTIFY_EXIT
-    /// get added back here when M03.1.F+ slices land.
+    /// M03.1.E subscribes to NOTIFY_EXEC for the subscribe-deliver
+    /// smoke. AUTH_OPEN / AUTH_RENAME / NOTIFY_FORK / NOTIFY_EXIT
+    /// get added back when M03.1.G+ slices need them.
     pub const NOTIFY_EXEC: Self = Self(9);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// AUTH response — M03.1.F
+// ─────────────────────────────────────────────────────────────────────
+
+/// `es_auth_result_t` — discriminated by the C enum from
+/// `<EndpointSecurity/types.h>`. Most AUTH events use this; the
+/// special case is `AUTH_OPEN` which needs `es_respond_flags_result`
+/// instead (flags-based, not allow/deny).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct es_auth_result_t(pub u32);
+
+impl es_auth_result_t {
+    pub const ALLOW: Self = Self(0);
+    /// Reserved for the M03.1.G+ capture-fail path (clonefile failed
+    /// → deny the unlink rather than lose pre-image). Kept out of the
+    /// dead-code lint until then.
+    #[allow(dead_code)]
+    pub const DENY: Self = Self(1);
+}
+
+/// Opaque ES message. Apple's `es_message_t` is a tagged-union C
+/// struct; we don't decode it in slice 2 (just pass the pointer to
+/// `es_respond_auth_result`). M03.1.G adds the decode layer.
+#[repr(transparent)]
+pub struct es_message_t(u8, PhantomData<*mut u8>);
 
 // ─────────────────────────────────────────────────────────────────────
 // Result enums (mirror C enum values from <EndpointSecurity/types.h>)
@@ -262,6 +293,50 @@ pub static COUNTER_HANDLER: Block<()> = Block {
 };
 
 // ─────────────────────────────────────────────────────────────────────
+// ALLOW-and-count handler (M03.1.F)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Responds ALLOW to every AUTH event + increments [`EVENT_COUNTER`].
+// Safe to use with AUTH subscriptions because the response happens
+// inline — no risk of the kernel's 5-s timeout firing on us.
+
+extern "C" fn allow_and_count_invoke(
+    _block: *const Block<()>,
+    client: *mut es_client_t,
+    message: *const c_void,
+) {
+    EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: client + message are owned by the kernel for the
+    // duration of this callback per Apple's docs; es_respond_auth_result
+    // is documented as safe to call inline from the message handler.
+    unsafe {
+        let _ = es_respond_auth_result(
+            client,
+            message as *const es_message_t,
+            es_auth_result_t::ALLOW,
+            true,
+        );
+    }
+}
+
+static ALLOW_COUNTER_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: core::mem::size_of::<Block<()>>() as c_ulong,
+};
+
+/// Pre-built global Block that responds ALLOW + increments
+/// [`EVENT_COUNTER`]. Used by M03.1.F's AUTH-response smoke. Safe
+/// for AUTH events (it always responds within microseconds).
+pub static ALLOW_COUNTER_HANDLER: Block<()> = Block {
+    isa: unsafe { &_NSConcreteGlobalBlock as *const _ },
+    flags: BLOCK_IS_GLOBAL,
+    reserved: 0,
+    invoke: allow_and_count_invoke as *const c_void,
+    descriptor: &ALLOW_COUNTER_DESCRIPTOR,
+    _phantom: PhantomData,
+};
+
+// ─────────────────────────────────────────────────────────────────────
 // ES extern fns
 // ─────────────────────────────────────────────────────────────────────
 
@@ -293,6 +368,28 @@ unsafe extern "C" {
         client: *mut es_client_t,
         events: *const es_event_type_t,
         event_count: u32,
+    ) -> es_return_t;
+
+    /// `es_respond_result_t es_respond_auth_result(es_client_t *client,`
+    /// `                                            const es_message_t *message,`
+    /// `                                            es_auth_result_t result,`
+    /// `                                            bool cache);`
+    ///
+    /// Respond to an AUTH event. Must be called within ~5 seconds of
+    /// delivery or the kernel kills the client. `cache=true` lets
+    /// the kernel reuse the answer for identical subsequent
+    /// invocations (cheaper); we use true for the ALLOW path since
+    /// the answer doesn't depend on per-call state.
+    ///
+    /// Return type is `es_respond_result_t` (u32) but we treat it as
+    /// `es_return_t` here — the variant set differs slightly but
+    /// SUCCESS=0 is identical and that's all we check. M03.1.G+
+    /// gets the typed enum.
+    pub fn es_respond_auth_result(
+        client: *mut es_client_t,
+        message: *const es_message_t,
+        result: es_auth_result_t,
+        cache: bool,
     ) -> es_return_t;
 }
 
