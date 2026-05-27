@@ -327,8 +327,40 @@ fn apply_helper_codesign(args: &SetupEsModeArgs) -> Result<(), CliError> {
             format!("entitlement plist {} does not exist", plist.display()),
         ));
     }
+
+    // Prefer the packaging script when it's reachable — it's the
+    // canonical implementation (does plist sanity-check + post-sign
+    // verification + emits remediation hints on AMFI rejection). The
+    // installed tarball ships it next to the entitlement plist. If
+    // we can't find it (e.g. release artifact stripped it), fall
+    // back to inline codesign so the command still works.
+    if let Some(script) = default_sign_script() {
+        println!(
+            "→ delegating to {} (helper={}, plist={})",
+            script.display(),
+            helper.display(),
+            plist.display()
+        );
+        let status = Command::new("sudo")
+            .arg(&script)
+            .arg(&helper)
+            .arg(&plist)
+            .status()
+            .map_err(|e| {
+                CliError::fail(GENERIC_FAILURE, format!("spawn {}: {e}", script.display()))
+            })?;
+        if !status.success() {
+            return Err(CliError::fail(
+                GENERIC_FAILURE,
+                format!("{} returned non-zero", script.display()),
+            ));
+        }
+        println!("  ✓ helper codesigned. Verify with `shit setup-es-mode --check`.");
+        return Ok(());
+    }
+
     println!(
-        "→ codesigning {} with entitlement plist {} (sudo)",
+        "→ inline codesigning {} with entitlement plist {} (sudo; no packaging script found)",
         helper.display(),
         plist.display()
     );
@@ -353,6 +385,20 @@ fn apply_helper_codesign(args: &SetupEsModeArgs) -> Result<(), CliError> {
     }
     println!("  ✓ helper codesigned. Verify with `shit setup-es-mode --check`.");
     Ok(())
+}
+
+fn default_sign_script() -> Option<PathBuf> {
+    for candidate in [
+        "packaging/codesign/sign-for-power-user.sh",
+        "/usr/local/share/shit/sign-for-power-user.sh",
+        "/opt/homebrew/share/shit/sign-for-power-user.sh",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn default_helper_path() -> Option<PathBuf> {
