@@ -549,6 +549,41 @@ unsafe extern "C" {
         authorized_flags: u32,
         cache: bool,
     ) -> es_return_t;
+
+    /// `es_return_t es_mute_path(es_client_t *client, const char *path,`
+    /// `                         es_mute_path_type_t type);`
+    ///
+    /// Suppress events targeting paths matching `path` per `type`.
+    /// `TARGET_PREFIX` mutes any event whose target file path starts
+    /// with `path`; `TARGET_LITERAL` requires exact match. We use
+    /// TARGET_PREFIX for our state-dir tree (avoids the daemon's DB
+    /// writes appearing as events the helper would otherwise capture).
+    pub fn es_mute_path(
+        client: *mut es_client_t,
+        path: *const libc::c_char,
+        mute_type: es_mute_path_type_t,
+    ) -> es_return_t;
+}
+
+/// `es_mute_path_type_t` discriminant for [`es_mute_path`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct es_mute_path_type_t(pub u32);
+
+impl es_mute_path_type_t {
+    /// Mute events whose ACTING process's executable path starts
+    /// with this prefix (matches by exec source, not target).
+    #[allow(dead_code)]
+    pub const PREFIX: Self = Self(0);
+    /// Same as PREFIX but exact match instead of prefix.
+    #[allow(dead_code)]
+    pub const LITERAL: Self = Self(1);
+    /// Mute events whose target file path starts with this prefix.
+    /// What we want for state-dir / staging-dir / system-cache muting.
+    pub const TARGET_PREFIX: Self = Self(2);
+    /// Same as TARGET_PREFIX but exact match instead of prefix.
+    #[allow(dead_code)]
+    pub const TARGET_LITERAL: Self = Self(3);
 }
 
 // ─────────────────────────────────────────────────────────────────────

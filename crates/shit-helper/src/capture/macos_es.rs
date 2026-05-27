@@ -1114,6 +1114,38 @@ impl PumpState {
             )?
         };
 
+        // M03.1.I.E mute list. Suppresses events targeting paths we
+        // never want to capture:
+        // - Our own state/staging dirs (avoids the feedback loop where
+        //   the daemon writing to its DB triggers AUTH events that
+        //   re-fill the journal that re-triggers writes that...)
+        // - /dev/null + /dev/random + /dev/urandom (always-noisy)
+        // - ~/Library/Caches + the user-tempdir Caches mirror
+        //   (/private/var/folders/.../C/) — high event rate, never
+        //   useful for undo
+        //
+        // Best-effort: failures log + continue (correctness unaffected,
+        // only perf).
+        if let Some(state_dir) = staging_dir.parent() {
+            client.mute_target_prefix(state_dir);
+        }
+        client.mute_target_prefix(std::path::Path::new("/dev/null"));
+        client.mute_target_prefix(std::path::Path::new("/dev/random"));
+        client.mute_target_prefix(std::path::Path::new("/dev/urandom"));
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::Path::new(&home);
+            client.mute_target_prefix(&home.join("Library/Caches"));
+        }
+        // NOTE: the per-user macOS cache mirror lives under
+        // /private/var/folders/<XX>/<YYYY>/C/, but the same parent
+        // tree holds /private/var/folders/.../T/ (per-user tempdir)
+        // which is where smoke scratchdirs and many legitimate
+        // mutations live. A prefix-mute at `/private/var/folders`
+        // would silence too much. Resolving the exact `C` subpath
+        // would need `confstr(_CS_DARWIN_USER_CACHE_DIR)`; out of
+        // scope for I.E — current muting is sufficient for the
+        // sqlite-shm feedback loop fix this slice targets.
+
         Ok(Self {
             conn,
             staging_dir,
