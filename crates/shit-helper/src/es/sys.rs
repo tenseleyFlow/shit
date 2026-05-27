@@ -67,6 +67,7 @@ impl es_event_type_t {
     /// within 5 seconds or the kernel kills the client.
     pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
+    pub const AUTH_TRUNCATE: Self = Self(40);
 
     /// NOTIFY events — no response required, just informational.
     /// M03.1.E uses NOTIFY_EXEC for the subscribe-deliver smoke;

@@ -230,6 +230,17 @@ pub struct es_event_exit_t {
     pub _reserved: [u8; 64],
 }
 
+/// `es_event_truncate_t` from ESMessage.h. Single field: the file
+/// whose contents are about to be discarded. The pre-truncate bytes
+/// are recoverable via clonefile in the AUTH callback (file still
+/// exists at `target.path` with original bytes when the event fires).
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_truncate_t {
+    pub target: *const es_file_t,
+    pub _reserved: [u8; 64],
+}
+
 /// `es_events_t` union — Apple's version has ~120 variants; we
 /// model only the variants we consume. All variants share offset 0
 /// per union semantics, so reading the variant matching the
@@ -240,6 +251,7 @@ pub struct es_event_exit_t {
 pub union es_events_t {
     pub unlink: std::mem::ManuallyDrop<es_event_unlink_t>,
     pub rename: std::mem::ManuallyDrop<es_event_rename_t>,
+    pub truncate: std::mem::ManuallyDrop<es_event_truncate_t>,
     pub fork: std::mem::ManuallyDrop<es_event_fork_t>,
     pub exit: std::mem::ManuallyDrop<es_event_exit_t>,
 }
@@ -427,6 +439,26 @@ impl<'a> EsMessage<'a> {
         }
         // SAFETY: discriminant guarantees the union variant.
         unsafe { Some(&*(&(*self.raw).event.rename as *const _ as *const es_event_rename_t)) }
+    }
+
+    /// `Some(&es_event_truncate_t)` iff `event_type == AUTH_TRUNCATE`.
+    pub fn as_truncate(&self) -> Option<&'a es_event_truncate_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_TRUNCATE {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.truncate as *const _ as *const es_event_truncate_t)) }
+    }
+
+    /// Convenience: `es_file_t` for the truncate target. Returns
+    /// `None` if the message isn't a truncate or the target ptr is null.
+    pub fn truncate_target_file(&self) -> Option<&'a es_file_t> {
+        let event = self.as_truncate()?;
+        if event.target.is_null() {
+            return None;
+        }
+        // SAFETY: target is non-null for the message lifetime.
+        unsafe { Some(&*event.target) }
     }
 
     /// `Some(&es_event_fork_t)` iff `event_type == NOTIFY_FORK`.
