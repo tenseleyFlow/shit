@@ -1019,6 +1019,92 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  kill-proc-undo-linux:
+    # AU05 GAP wire — pkill-wrapper proc-event journaling on Linux.
+    # Cousin to kill-proc smoke (DR-53) above but exercises the
+    # wrapper's pre/post hook path (not the proc-event helper subcommand
+    # directly) and asserts the wrapper-mediated ProcessOp lands even
+    # when the wrapper itself is signaled mid-flight by its own pkill.
+    name: kill-proc-undo-linux smoke (AU05)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/kill-proc-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kill-proc-undo-linux-smoke-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  apt-install-undo-linux:
+    # AU05 GAP wire — `apt-get install`; shit undo` round-trip via the
+    # pkg-event helper subcommand and PackageExecutor. Uses jq as the
+    # disposable target (small, scriptless). Requires sudo for apt-get,
+    # which GH ubuntu-24.04 runners have NOPASSWD.
+    name: apt-install-undo-linux smoke (AU05)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/apt-install-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apt-install-undo-linux-smoke-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  systemctl-stop-undo-linux:
+    # AU05 GAP wire — `systemctl --user stop`; shit undo restarts.
+    # Mirrors systemctl-svc (DR-34) pattern, including the
+    # loginctl enable-linger step to bring up the user systemd manager
+    # on the hosted runner (no logind session by default).
+    name: systemctl-stop-undo-linux smoke (AU05)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: enable user systemd manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)" || true
+          systemctl --user status --no-pager || true
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/systemctl-stop-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: systemctl-stop-undo-linux-smoke-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   sqlite3-db:
     name: sqlite3-db smoke (DR-58)
     runs-on: ubuntu-24.04
