@@ -27,7 +27,7 @@
 //! `__DATA,__interpose` section: `(my_foo as *const c_void,
 //! libc::foo as *const c_void)`. The dynamic linker does the rest.
 
-use libc::{c_char, c_int, c_void};
+use libc::{c_char, c_int, c_uint, c_void};
 
 // M07.A.1: first interposer. Proves the DYLD_INTERPOSE Rust pattern
 // works on this codebase end-to-end (compiles, links into a cdylib,
@@ -93,6 +93,51 @@ unsafe extern "C" fn my_renameat(
     unsafe { libc::renameat(fromfd, from, tofd, to) }
 }
 
+// `open` / `openat` are variadic in C (`int open(const char *,
+// int, ...)`) — POSIX guarantees the `mode` arg is read only
+// when `O_CREAT` is in `flags`. We declare fixed-arity 3-arg
+// (resp. 4-arg) wrappers; on aarch64 / x86_64 the call ABI
+// places the extra arg in a register, so the wrapper reads
+// garbage for `mode` on 2-arg callers but never USES it unless
+// the flags say to. This matches the BSD/Linux shim's approach.
+//
+// libc-rs declares `open` / `openat` as Rust variadic FFI
+// (`extern "C" fn(..., ...)`), which can't be coerced to a
+// function-item pointer cleanly. We re-declare them as fixed-
+// arity `extern "C"` so the linker resolves to the same
+// libsystem_c symbol but Rust can take their addresses for
+// the interpose pair.
+unsafe extern "C" {
+    fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+    fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int;
+}
+
+/// Replacement for `open(2)`. Currently passthrough; the
+/// notification filter (O_CREAT|O_WRONLY|O_TRUNC) lands when
+/// dispatch wiring arrives in a later M07.A slice.
+///
+/// # Safety
+/// Same contract as libc `open(2)` — `path` must be a valid
+/// NUL-terminated C string; `mode` is read only when `O_CREAT`
+/// is in `flags`.
+unsafe extern "C" fn my_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    unsafe { open(path, flags, mode) }
+}
+
+/// Replacement for `openat(2)`. Same passthrough+future-filter
+/// shape as `my_open`.
+///
+/// # Safety
+/// Same contract as libc `openat(2)`.
+unsafe extern "C" fn my_openat(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: c_uint,
+) -> c_int {
+    unsafe { openat(dirfd, path, flags, mode) }
+}
+
 /// `__DATA,__interpose` table entry for `unlink`. The dynamic
 /// linker reads this at image-load time and rewrites the
 /// lazy-binding stubs for `unlink` in the host process to point
@@ -128,6 +173,20 @@ static INTERPOSE_RENAME: InterposeEntry = InterposeEntry {
 static INTERPOSE_RENAMEAT: InterposeEntry = InterposeEntry {
     replacement: my_renameat as *const c_void,
     target: libc::renameat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_OPEN: InterposeEntry = InterposeEntry {
+    replacement: my_open as *const c_void,
+    target: open as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_OPENAT: InterposeEntry = InterposeEntry {
+    replacement: my_openat as *const c_void,
+    target: openat as *const c_void,
 };
 
 /// `(replacement, target)` pair the dynamic linker expects in
@@ -186,5 +245,19 @@ mod tests {
         assert!(!INTERPOSE_RENAMEAT.replacement.is_null());
         assert!(!INTERPOSE_RENAMEAT.target.is_null());
         assert_ne!(INTERPOSE_RENAMEAT.replacement, INTERPOSE_RENAMEAT.target);
+    }
+
+    #[test]
+    fn open_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_OPEN.replacement.is_null());
+        assert!(!INTERPOSE_OPEN.target.is_null());
+        assert_ne!(INTERPOSE_OPEN.replacement, INTERPOSE_OPEN.target);
+    }
+
+    #[test]
+    fn openat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_OPENAT.replacement.is_null());
+        assert!(!INTERPOSE_OPENAT.target.is_null());
+        assert_ne!(INTERPOSE_OPENAT.replacement, INTERPOSE_OPENAT.target);
     }
 }
