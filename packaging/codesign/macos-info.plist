@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+Minimal bundle Info.plist for the shit-helper binary (M04.1).
+
+Embedded into the helper's Mach-O at codesign time via the
+sign-and-notarize.sh pipeline. Provides bundle identity that:
+  - Apple's notary service requires (a notarized binary without a
+    CFBundleIdentifier fails the submit step with "no bundle ID").
+  - Gatekeeper logs reference when surfacing assessment results to
+    the user ("com.tenseleyflow.shit-helper is from an unknown
+    developer" rather than a hex hash).
+  - codesign -d --verbose=4 emits as `Identifier=` for auditing.
+
+CFBundleShortVersionString + CFBundleVersion are intentionally the
+placeholder string "0.0.0" — the release CI substitutes them with the
+git tag's version at sign time via /usr/libexec/PlistBuddy. The plist
+file in source can therefore be linted without a release context.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.tenseleyflow.shit-helper</string>
+    <key>CFBundleExecutable</key>
+    <string>shit-helper</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © tenseleyflow. AGPL-3.0-or-later.</string>
+</dict>
+</plist>
