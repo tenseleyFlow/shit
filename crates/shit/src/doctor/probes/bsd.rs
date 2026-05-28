@@ -189,10 +189,20 @@ pub fn zfs_datasets() -> Vec<String> {
     }
 }
 
-/// True iff the LD_PRELOAD shim is installed at the conventional
-/// path. Matches the shipped `shit hooks install --preload` target.
+/// True iff the LD_PRELOAD shim is installed.
+///
+/// AU07 — canonical install path is
+/// `/usr/local/lib/shit/libshit_preload_shim.so` (matches the actual
+/// cargo cdylib artifact name from `crates/shit-preload-shim`). The
+/// `SHIT_PRELOAD_SHIM_PATH` env var overrides for smokes that need
+/// to validate the kqueue+preload tier without sudo write access to
+/// `/usr/local/lib/shit/`. The override path is checked with the
+/// same `is_file()` predicate; symlinks count.
 pub fn preload_shim_installed() -> bool {
-    Path::new("/usr/local/lib/shit/libshit_preload.so").is_file()
+    let path = std::env::var_os("SHIT_PRELOAD_SHIM_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new("/usr/local/lib/shit/libshit_preload_shim.so").to_path_buf());
+    path.is_file()
 }
 
 /// Pick the runtime-capture tier label. Mirrors

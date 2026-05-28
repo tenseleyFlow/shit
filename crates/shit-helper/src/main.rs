@@ -1348,11 +1348,16 @@ fn pick_bsd_tier() -> CaptureTier {
     if probe.zfs.usable() {
         return CaptureTier::ZfsSnapshot;
     }
-    // Shim install path is platform-conventional: /usr/local/lib/shit/
-    // on FreeBSD, same elsewhere. The shim file existing here is the
-    // signal that the user opted into the LD_PRELOAD path.
-    let shim = std::path::Path::new("/usr/local/lib/shit/libshit_preload.so");
-    if shim.is_file() {
+    // AU07 — canonical shim install path matches the cargo cdylib
+    // artifact name (`libshit_preload_shim.{so,dylib}`). The
+    // `SHIT_PRELOAD_SHIM_PATH` env var overrides for smokes that
+    // need to exercise the kqueue+preload tier without sudo access
+    // to /usr/local/lib/shit/. Must stay in sync with the
+    // doctor probe in `crates/shit/src/doctor/probes/bsd.rs`.
+    let shim_path = std::env::var_os("SHIT_PRELOAD_SHIM_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/lib/shit/libshit_preload_shim.so"));
+    if shim_path.is_file() {
         return CaptureTier::KqueuePreloadShim;
     }
     CaptureTier::KqueueOnly
