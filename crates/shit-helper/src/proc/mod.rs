@@ -27,6 +27,8 @@ pub mod enumerate;
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
 pub mod kill_targets;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 pub async fn run_event(
     tool: &str,
