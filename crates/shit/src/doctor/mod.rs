@@ -19,6 +19,7 @@ pub mod coverage_snapshot;
 pub mod json;
 pub mod probes;
 pub mod snippet;
+pub mod visibility;
 
 use shit_capture::{CaptureOpts, CowTier, FsKind, detect_fs, supported_tiers, would_pick};
 use std::path::{Path, PathBuf};
@@ -143,6 +144,54 @@ pub fn run_shutdown_daemon() -> anyhow::Result<()> {
         CtlResponse::Error(e) => anyhow::bail!("daemon shutdown error: {e}"),
         other => anyhow::bail!("unexpected shutdown response: {other:?}"),
     }
+}
+
+/// AU12 — `shit doctor --visibility <path>`. Scan `path` for binaries
+/// whose mutations bypass the LD_PRELOAD shim (today: setuid only).
+/// `json=true` emits the `VisibilityReport` as a single-field
+/// envelope; `json=false` renders the human warning + a path list.
+pub fn run_visibility(path: &Path, json: bool) -> anyhow::Result<()> {
+    let canon = std::fs::canonicalize(path)
+        .map_err(|e| anyhow::anyhow!("canonicalize {}: {e}", path.display()))?;
+    let report = visibility::scan_path(&canon)
+        .map_err(|e| anyhow::anyhow!("scan {}: {e}", canon.display()))?;
+    if json {
+        let s = serde_json::to_string_pretty(&report)?;
+        println!("{s}");
+        return Ok(());
+    }
+    println!("visibility: {}", canon.display());
+    println!(
+        "  executables scanned:  {}{}",
+        report.executables_scanned,
+        if report.truncated {
+            format!(" (truncated at {})", report.executables_scanned)
+        } else {
+            String::new()
+        }
+    );
+    println!("  setuid bypass count:  {}", report.setuid_bypassing_shim);
+    if report.setuid_bypassing_shim > 0 {
+        println!();
+        println!(
+            "WARN: at least {} setuid binary/binaries in this tree.",
+            report.setuid_bypassing_shim
+        );
+        println!("      Their syscalls are invisible to the LD_PRELOAD shim — the kernel");
+        println!("      strips LD_PRELOAD (rtld(1)) / DYLD_INSERT_LIBRARIES (dyld(1))");
+        println!("      on exec(2) of any setuid binary. Their mutations are captured");
+        println!("      post-hoc only via the kernel tier (LSM on Linux; nothing on");
+        println!("      macOS without EndpointSecurity entitlement; kqueue-only on BSD).");
+        println!();
+        let preview = report.details.iter().take(10);
+        for entry in preview {
+            println!("    [{:?}] {}", entry.kind, entry.path.display());
+        }
+        if report.details.len() > 10 {
+            println!("    ... and {} more", report.details.len() - 10);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
