@@ -136,13 +136,35 @@ sleep 0.7
 # THE workload. cargo install --force overwrites v1 at INSTALLED_BIN.
 # The DYLD shim's rename interposer captures the OLD bytes as a
 # pre-image. shitd journals it. undo restores.
+#
+# macOS quirk: GHA macos-14's clang/ld is hardened-runtime with
+# library validation enabled. With DYLD_INSERT_LIBRARIES pointing
+# at our ad-hoc-signed shim, AMFI aborts the linker with SIGABRT
+# before cc gets to do anything ("error: linking with cc failed:
+# signal: 6 (SIGABRT)"). The dev-mac clang/ld has no hardened
+# runtime, so the issue is invisible locally.
+#
+# Workaround: cargo build the v2 binary FIRST, outside the DYLD
+# shim window. Then `cargo install --force` under shim picks up
+# the cached build artifact and just copies / renames it into
+# CARGO_ROOT/bin — the rename interposer fires on that overwrite
+# without the linker ever being invoked under shim.
+smoke_log "pre-shim cargo build (v2) so linker runs without DYLD_INSERT"
+set +e
+( cd "${CRATE_DIR}" && cargo build --release --quiet ) >"${SHIT_SMOKE_TMP}/cargo-build.log" 2>&1
+BUILD_RC=$?
+set -e
+if [ "${BUILD_RC}" -ne 0 ]; then
+    smoke_log "cargo build (v2) log:"
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/cargo-build.log" >&2
+    smoke_fail "pre-shim cargo build (v2) exited rc=${BUILD_RC}"
+fi
+
 smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} cargo install --force (v2) into ${CARGO_ROOT}"
 # `set +e` so a non-zero cargo exit doesn't kill the script before
-# we dump the log. (`set -e` from lib.sh is otherwise on; the Linux
-# twin has the same latent bug — works only because Linux cargo
-# doesn't fail under the shim.)
+# we dump the log.
 set +e
-( cd "${CRATE_DIR}" && DYLD_INSERT_LIBRARIES="${SHIM_LIB}" cargo install --force --root "${CARGO_ROOT}" --path . --quiet ) \
+( cd "${CRATE_DIR}" && DYLD_INSERT_LIBRARIES="${SHIM_LIB}" cargo install --force --offline --frozen --root "${CARGO_ROOT}" --path . --quiet ) \
     >"${SHIT_SMOKE_TMP}/cargo-v2.log" 2>&1
 CARGO_RC=$?
 set -e
