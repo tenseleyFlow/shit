@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# shit route wrapper (macOS, M06.3 / DR-44). PATH-prepended via
+# the shell hook so `route add ...` / `route delete ...` invocations
+# route through here. Mutating verbs fire a `net-event route pre /
+# post` bracket; non-mutating verbs (`get`, `monitor`, `show`,
+# no-arg) pass through unchanged.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then
+    echo "shit-route-wrapper: loop detected (depth=$depth); refusing" >&2
+    exit 127
+fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+real=""
+for cand in /sbin/route; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+if [[ -z "$real" ]]; then
+    echo "shit-route-wrapper: real route not found at /sbin/route" >&2
+    exit 127
+fi
+
+# Reentrancy: when an undo is running, don't bracket — the executor
+# is itself invoking `route delete` / `route add`, and re-capturing
+# would feed back into the daemon's NetworkOp stream.
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then
+    exec "$real" "$@"
+fi
+
+# route(8) syntax allows several "global" flags before the verb
+# (-n, -v, -q, -t). Skip them to find the first non-flag token,
+# which is the verb.
+verb=""
+for arg in "$@"; do
+    case "$arg" in
+        -n|-v|-q|-t) continue ;;
+        -*) continue ;;
+        *) verb="$arg"; break ;;
+    esac
+done
+
+mutating=0
+case "$verb" in
+    add|delete|change|flush) mutating=1 ;;
+esac
+
+if [[ "$mutating" -eq 1 ]]; then
+    # No per-scope hint — the route table is a global resource.
+    # The planner's synthesise_route diffs pre/post snapshots.
+    "$HELPER" net-event route pre "--verb=$verb" --scope-hint= 2>/dev/null || true
+    "$real" "$@"
+    rc=$?
+    "$HELPER" net-event route post "--verb=$verb" --scope-hint= 2>/dev/null || true
+    exit "$rc"
+fi
+
+exec "$real" "$@"

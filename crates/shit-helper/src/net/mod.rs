@@ -27,6 +27,8 @@ pub mod iptables;
 pub mod networksetup;
 pub mod nft;
 pub mod pfctl;
+#[cfg(target_os = "macos")]
+pub mod route_ifconfig;
 pub mod ufw;
 
 pub trait NetInspector {
@@ -46,9 +48,14 @@ fn inspector_for(t: NetToolWire) -> Option<Box<dyn NetInspector>> {
         NetToolWire::IpRoute | NetToolWire::IpAddr | NetToolWire::IpLink => {
             Some(Box::new(ip::IpInspector::for_object(t)))
         }
-        // `route` and `ifconfig` inspectors are deferred — see
-        // DR-44 (sprint outcome's deferral table). They land in
-        // M06.x followup slices.
+        // M06.3 — legacy macOS route/ifconfig (DR-44). Linux uses
+        // `ip` (ip.rs) and never reaches route/ifconfig; non-macOS
+        // BSDs aren't a v1 target.
+        #[cfg(target_os = "macos")]
+        NetToolWire::Route => Some(Box::new(route_ifconfig::RouteInspector)),
+        #[cfg(target_os = "macos")]
+        NetToolWire::Ifconfig => Some(Box::new(route_ifconfig::IfconfigInspector)),
+        #[cfg(not(target_os = "macos"))]
         NetToolWire::Route | NetToolWire::Ifconfig => None,
         // M06.1 — `networksetup` ships DNS-only first ship.
         // macOS-only; the cfg gate on the `networksetup` module

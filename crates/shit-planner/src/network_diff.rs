@@ -20,13 +20,10 @@
 //!
 //! ## Scope
 //!
-//! `IpRoute`, `IpAddr`, `IpLink` are fully implemented here. Other
-//! `DiffApply` tools (`Route`, `Ifconfig`, `Networksetup`) return an
-//! empty Vec — the planner emits an `Informational` warning that
-//! manual rollback is required. Closing them out follows the same
-//! shape as the three implemented variants; deferred to per-platform
-//! sprints (DR-44 / DR-45) since they need platform-specific dump
-//! parsers.
+//! Fully implemented: `IpRoute`, `IpAddr`, `IpLink` (Linux iproute2
+//! JSON), `Networksetup` (M06.1, DNS-only first ship), `Route` and
+//! `Ifconfig` (M06.3, macOS via `netstat -nrf inet` and `ifconfig
+//! -a` text snapshots — see DR-44).
 
 use crate::events::NetworkTool;
 use serde::Deserialize;
@@ -46,12 +43,11 @@ pub fn synthesise_diff_apply_inverse(
         NetworkTool::IpAddr => synthesise_ip_addr(before_state, after_state),
         NetworkTool::IpLink => synthesise_ip_link(before_state, after_state),
         NetworkTool::Networksetup => synthesise_networksetup(before_state, after_state),
+        NetworkTool::Route => synthesise_route(before_state, after_state),
+        NetworkTool::Ifconfig => synthesise_ifconfig(before_state, after_state),
         // FullReload / DiffApplyWithReset tools don't reach this
         // function; the planner gates by restore_method first.
-        // DiffApply tools we haven't implemented yet land here.
-        NetworkTool::Route
-        | NetworkTool::Ifconfig
-        | NetworkTool::Iptables
+        NetworkTool::Iptables
         | NetworkTool::Ip6tables
         | NetworkTool::Nft
         | NetworkTool::Ufw
@@ -617,6 +613,260 @@ fn synthesise_networksetup(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
     vec![argv]
 }
 
+// =================================================================
+// route (macOS, M06.3, DR-44)
+// =================================================================
+//
+// `route` on macOS has no JSON dump form; the helper captures
+// `netstat -nrf inet` as a flat table. We parse the table into
+// (destination, gateway, iface) triples and diff.
+//
+// Inverse:
+//   - destination in post but not pre → `route delete -net <dst>`
+//     (the gateway is dropped on delete — route(8) doesn't accept
+//     it for network routes; see sprint doc)
+//   - destination in pre but not post → `route add -net <dst> <gw>`
+//     restoring the prior gateway.
+//
+// We skip host routes managed by the kernel (Flags=UH for `127.x`,
+// Flags starting with `UC` link routes for connected interfaces).
+// Those churn under VPN clients and aren't user-issued. Heuristic:
+// only diff rows whose destination is a CIDR-ish form (contains
+// `.` or `/`, isn't `default`, isn't pure host loopback).
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RouteRow {
+    destination: String,
+    gateway: String,
+    iface: String,
+}
+
+impl RouteRow {
+    fn identity(&self) -> (String, String) {
+        (self.destination.clone(), self.iface.clone())
+    }
+}
+
+fn parse_netstat_routes(blob: &[u8]) -> Vec<RouteRow> {
+    let text = String::from_utf8_lossy(blob);
+    let mut out = Vec::new();
+    let mut in_table = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Header rows. `netstat -nrf inet` emits:
+        //   Routing tables
+        //   <blank>
+        //   Internet:
+        //   Destination        Gateway   Flags   ...   Netif Expire
+        //   <data...>
+        if trimmed == "Routing tables" || trimmed.ends_with(':') {
+            continue;
+        }
+        if trimmed.starts_with("Destination") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let mut cols = trimmed.split_whitespace();
+        let Some(dst) = cols.next() else { continue };
+        let Some(gw) = cols.next() else { continue };
+        // Flags is col 3; col 4 is Netif (varies by macOS version).
+        let _flags = cols.next();
+        let iface = cols.next().unwrap_or("").to_string();
+        out.push(RouteRow {
+            destination: dst.to_string(),
+            gateway: gw.to_string(),
+            iface,
+        });
+    }
+    out
+}
+
+/// Decide whether a route looks user-issuable (so the inverse is
+/// safe to synthesise). Kernel-managed connected/host routes
+/// (`link#NN` gateways, loopback hosts, IPv6 link-local, `127.x`
+/// containers) are skipped.
+fn route_is_diff_candidate(r: &RouteRow) -> bool {
+    if r.gateway.starts_with("link#") {
+        return false;
+    }
+    if r.destination.starts_with("127.") {
+        return false;
+    }
+    // The `default` route is user-issuable in principle but undoing
+    // it would knock the box off the network mid-session. Skip — if
+    // the user wants to undo a default-route swap, they can do it
+    // manually with a clear warning emitted upstream.
+    if r.destination == "default" {
+        return false;
+    }
+    true
+}
+
+fn synthesise_route(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
+    let pre = parse_netstat_routes(before);
+    let post = parse_netstat_routes(after);
+    let mut inverse = Vec::new();
+    // Added → delete.
+    for r in &post {
+        if !route_is_diff_candidate(r) {
+            continue;
+        }
+        if !pre.iter().any(|p| p.identity() == r.identity()) {
+            inverse.push(vec![
+                "route".to_string(),
+                "delete".to_string(),
+                "-net".to_string(),
+                r.destination.clone(),
+            ]);
+        }
+    }
+    // Removed → re-add with the original gateway.
+    for r in &pre {
+        if !route_is_diff_candidate(r) {
+            continue;
+        }
+        if !post.iter().any(|p| p.identity() == r.identity()) {
+            inverse.push(vec![
+                "route".to_string(),
+                "add".to_string(),
+                "-net".to_string(),
+                r.destination.clone(),
+                r.gateway.clone(),
+            ]);
+        }
+    }
+    inverse
+}
+
+// =================================================================
+// ifconfig (macOS, M06.3, DR-44)
+// =================================================================
+//
+// `ifconfig -a` emits per-interface blocks:
+//   en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+//       inet 192.168.1.10 netmask 0xffffff00 broadcast 192.168.1.255
+//       inet 10.0.0.5 netmask 0xff000000 broadcast 10.255.255.255
+//       status: active
+//
+// We parse into a per-interface (flags-has-UP, inet-addrs) tuple
+// and synthesise:
+//   - UP→DOWN flip → `ifconfig <if> up`
+//   - DOWN→UP flip → `ifconfig <if> down`
+//   - inet added in post → `ifconfig <if> -alias <addr>` (delete)
+//   - inet removed in post → `ifconfig <if> alias <addr> netmask <mask>`
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IfconfigIface {
+    name: String,
+    is_up: bool,
+    inets: Vec<IfconfigInet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IfconfigInet {
+    addr: String,
+    /// Native ifconfig form, e.g. `0xffffff00`. Pass-through to the
+    /// inverse `ifconfig alias` command verbatim.
+    netmask: String,
+}
+
+fn parse_ifconfig(blob: &[u8]) -> Vec<IfconfigIface> {
+    let text = String::from_utf8_lossy(blob);
+    let mut out: Vec<IfconfigIface> = Vec::new();
+    for line in text.lines() {
+        // New interface block when the line starts at col 0 with
+        // `<name>: flags=...`.
+        if !line.starts_with(char::is_whitespace)
+            && let Some(colon) = line.find(':')
+        {
+            let name = line[..colon].to_string();
+            let is_up = line.contains("<UP,") || line.contains(",UP,") || line.contains(",UP>");
+            out.push(IfconfigIface {
+                name,
+                is_up,
+                inets: Vec::new(),
+            });
+            continue;
+        }
+        let trimmed = line.trim_start();
+        // inet line: `inet 192.168.1.10 netmask 0xffffff00 ...`.
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            let mut toks = rest.split_whitespace();
+            let Some(addr) = toks.next() else { continue };
+            let mut netmask = String::new();
+            while let Some(t) = toks.next() {
+                if t == "netmask"
+                    && let Some(n) = toks.next()
+                {
+                    netmask = n.to_string();
+                    break;
+                }
+            }
+            if let Some(iface) = out.last_mut() {
+                iface.inets.push(IfconfigInet {
+                    addr: addr.to_string(),
+                    netmask,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn synthesise_ifconfig(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
+    let pre = parse_ifconfig(before);
+    let post = parse_ifconfig(after);
+    let mut inverse = Vec::new();
+    for post_if in &post {
+        let Some(pre_if) = pre.iter().find(|i| i.name == post_if.name) else {
+            continue;
+        };
+        // UP/DOWN flip.
+        if pre_if.is_up != post_if.is_up {
+            let verb = if pre_if.is_up { "up" } else { "down" };
+            inverse.push(vec![
+                "ifconfig".to_string(),
+                post_if.name.clone(),
+                verb.to_string(),
+            ]);
+        }
+        // Addresses added in post but not pre → -alias to remove.
+        for inet in &post_if.inets {
+            if !pre_if.inets.iter().any(|p| p.addr == inet.addr) {
+                inverse.push(vec![
+                    "ifconfig".to_string(),
+                    post_if.name.clone(),
+                    "-alias".to_string(),
+                    inet.addr.clone(),
+                ]);
+            }
+        }
+        // Addresses present in pre but missing in post → restore alias.
+        for inet in &pre_if.inets {
+            if !post_if.inets.iter().any(|p| p.addr == inet.addr) {
+                let mut argv = vec![
+                    "ifconfig".to_string(),
+                    post_if.name.clone(),
+                    "alias".to_string(),
+                    inet.addr.clone(),
+                ];
+                if !inet.netmask.is_empty() {
+                    argv.push("netmask".to_string());
+                    argv.push(inet.netmask.clone());
+                }
+                inverse.push(argv);
+            }
+        }
+    }
+    inverse
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,6 +1289,202 @@ mod tests {
         let before = b"# scope=Wi-Fi\n1.1.1.1\n".to_vec();
         let after = b"# scope=Ethernet\n1.1.1.1\n".to_vec();
         let inv = synthesise_networksetup(&before, &after);
+        assert!(inv.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // route (macOS, M06.3)
+    // -----------------------------------------------------------------
+
+    const NETSTAT_BASELINE: &str = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+127                127.0.0.1          UCS            lo0
+192.168.1          link#15            UCS            en0
+";
+
+    const NETSTAT_WITH_ADDED_ROUTE: &str = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+127                127.0.0.1          UCS            lo0
+192.168.1          link#15            UCS            en0
+240/4              127.0.0.1          UGSc           lo0
+";
+
+    #[test]
+    fn route_added_emits_delete() {
+        let inv = synthesise_route(
+            NETSTAT_BASELINE.as_bytes(),
+            NETSTAT_WITH_ADDED_ROUTE.as_bytes(),
+        );
+        assert_eq!(inv.len(), 1, "expected one inverse, got {inv:?}");
+        assert_eq!(inv[0][0], "route");
+        assert_eq!(inv[0][1], "delete");
+        assert_eq!(inv[0][2], "-net");
+        assert_eq!(inv[0][3], "240/4");
+    }
+
+    #[test]
+    fn route_removed_emits_add_with_gateway() {
+        let inv = synthesise_route(
+            NETSTAT_WITH_ADDED_ROUTE.as_bytes(),
+            NETSTAT_BASELINE.as_bytes(),
+        );
+        assert_eq!(inv.len(), 1, "expected one inverse, got {inv:?}");
+        assert_eq!(inv[0][0], "route");
+        assert_eq!(inv[0][1], "add");
+        assert_eq!(inv[0][2], "-net");
+        assert_eq!(inv[0][3], "240/4");
+        assert_eq!(inv[0][4], "127.0.0.1");
+    }
+
+    #[test]
+    fn route_identical_emits_nothing() {
+        let inv = synthesise_route(NETSTAT_BASELINE.as_bytes(), NETSTAT_BASELINE.as_bytes());
+        assert!(inv.is_empty());
+    }
+
+    #[test]
+    fn route_skips_kernel_managed_link_routes() {
+        // Only the kernel-managed `link#15` route differs — the
+        // synthesiser must ignore it (would be unsafe to undo).
+        let pre = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+";
+        let post = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+192.168.5          link#22            UCS            en1
+";
+        let inv = synthesise_route(pre.as_bytes(), post.as_bytes());
+        assert!(inv.is_empty(), "link#-gateway route must be skipped");
+    }
+
+    #[test]
+    fn route_skips_default_route_changes() {
+        // Even if the default route flips, we don't auto-undo:
+        // would knock the box off the network.
+        let pre = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            192.168.1.1        UGScg          en0
+";
+        let post = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags        Netif Expire
+default            10.0.0.1           UGScg          en1
+";
+        let inv = synthesise_route(pre.as_bytes(), post.as_bytes());
+        assert!(inv.is_empty(), "default-route flip must not auto-undo");
+    }
+
+    // -----------------------------------------------------------------
+    // ifconfig (macOS, M06.3)
+    // -----------------------------------------------------------------
+
+    const IFCONFIG_EN0_UP: &str = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.1.10 netmask 0xffffff00 broadcast 192.168.1.255
+\tstatus: active
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+";
+
+    const IFCONFIG_EN0_DOWN: &str = "\
+en0: flags=8862<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.1.10 netmask 0xffffff00 broadcast 192.168.1.255
+\tstatus: inactive
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+";
+
+    const IFCONFIG_EN0_WITH_ALIAS: &str = "\
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 192.168.1.10 netmask 0xffffff00 broadcast 192.168.1.255
+\tinet 10.99.0.5 netmask 0xffffff00 broadcast 10.99.0.255
+\tstatus: active
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+";
+
+    #[test]
+    fn ifconfig_up_to_down_emits_up() {
+        let inv = synthesise_ifconfig(IFCONFIG_EN0_UP.as_bytes(), IFCONFIG_EN0_DOWN.as_bytes());
+        assert!(
+            inv.iter().any(|cmd| cmd == &vec!["ifconfig", "en0", "up"]),
+            "missing en0 up inverse, got {inv:?}"
+        );
+    }
+
+    #[test]
+    fn ifconfig_down_to_up_emits_down() {
+        let inv = synthesise_ifconfig(IFCONFIG_EN0_DOWN.as_bytes(), IFCONFIG_EN0_UP.as_bytes());
+        assert!(
+            inv.iter()
+                .any(|cmd| cmd == &vec!["ifconfig", "en0", "down"]),
+            "missing en0 down inverse, got {inv:?}"
+        );
+    }
+
+    #[test]
+    fn ifconfig_alias_added_emits_minus_alias() {
+        let inv = synthesise_ifconfig(
+            IFCONFIG_EN0_UP.as_bytes(),
+            IFCONFIG_EN0_WITH_ALIAS.as_bytes(),
+        );
+        // Should emit `ifconfig en0 -alias 10.99.0.5`.
+        assert!(
+            inv.iter().any(|cmd| {
+                cmd.len() >= 4
+                    && cmd[0] == "ifconfig"
+                    && cmd[2] == "-alias"
+                    && cmd[3] == "10.99.0.5"
+            }),
+            "missing -alias inverse, got {inv:?}"
+        );
+    }
+
+    #[test]
+    fn ifconfig_alias_removed_emits_alias_with_netmask() {
+        let inv = synthesise_ifconfig(
+            IFCONFIG_EN0_WITH_ALIAS.as_bytes(),
+            IFCONFIG_EN0_UP.as_bytes(),
+        );
+        let restore = inv
+            .iter()
+            .find(|cmd| cmd.len() >= 4 && cmd[2] == "alias" && cmd[3] == "10.99.0.5")
+            .expect("alias-restore inverse missing");
+        // Should carry the netmask through.
+        assert!(
+            restore.iter().any(|t| t == "netmask"),
+            "alias restore lacks netmask, got {restore:?}"
+        );
+        assert!(
+            restore.iter().any(|t| t == "0xffffff00"),
+            "alias restore lacks captured netmask value"
+        );
+    }
+
+    #[test]
+    fn ifconfig_identical_emits_nothing() {
+        let inv = synthesise_ifconfig(IFCONFIG_EN0_UP.as_bytes(), IFCONFIG_EN0_UP.as_bytes());
         assert!(inv.is_empty());
     }
 }
