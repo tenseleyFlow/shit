@@ -2592,11 +2592,7 @@ mod apply_mknod_tests {
 
     #[test]
     fn fifo_create_with_missing_parent_returns_not_found() {
-        let outcome = apply_mknod(
-            "/nonexistent/au22/parent/fifo",
-            0o010000 | 0o644,
-            0,
-        );
+        let outcome = apply_mknod("/nonexistent/au22/parent/fifo", 0o010000 | 0o644, 0);
         assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
     }
 
