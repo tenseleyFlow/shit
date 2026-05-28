@@ -88,12 +88,24 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
         wire_to_planner(outcome)
     }
 
-    fn mknod(&self, _path: &Path, _mode: u32, _dev: u64) -> PlannerOutcome {
-        // AU22 lands the mknod side. Stub here so we don't
-        // silently route mknod requests into a helper handler that
-        // also returns PermissionDenied — same end result, fewer
-        // round-trips, clearer trace when AU22 surfaces this path.
-        PlannerOutcome::PermissionDenied
+    fn mknod(&self, path: &Path, mode: u32, dev: u64) -> PlannerOutcome {
+        // AU22 / DR-15.1 — Fifo/Socket dispatch through the helper
+        // (which calls libc::mknod with the S_IFIFO/S_IFSOCK |
+        // perm_bits composite). BlockDevice/CharDevice still
+        // return PermissionDenied at the helper since the standard
+        // capset doesn't include CAP_SYS_ADMIN (deferred DR-15.2).
+        let seq = self.next_seq();
+        let req = HelperRequest::ApplyMknod {
+            session: self.session,
+            command_seq: seq,
+            path: path.to_string_lossy().into_owned(),
+            mode,
+            dev,
+        };
+        let outcome = self
+            .helper
+            .request_priv_op_blocking(self.session, seq, req, PRIV_OP_TIMEOUT);
+        wire_to_planner(outcome)
     }
 }
 
