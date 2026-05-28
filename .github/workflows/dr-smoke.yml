@@ -331,6 +331,56 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  brew-install-undo-macos:
+    # M05.1 — brew install → shit undo → uninstall round-trip.
+    # Validates the brew planner inverse + the daemon's PkgRunner
+    # not-prepending-sudo for brew (which is unprivileged on macOS).
+    name: brew-install-undo smoke (M05.1 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/brew-install-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: brew-install-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  launchctl-bootstrap-undo-macos:
+    # M05.2 — launchctl bootstrap → shit undo → bootout round-trip.
+    # Validates the launchctl-wrapper PlistBuddy Label extraction +
+    # the daemon's SvcRunner not-prepending-sudo for launchctl
+    # (gui/<uid> targets are unprivileged) + the planner's
+    # present-diff branch in launchctl_argv.
+    name: launchctl-bootstrap-undo smoke (M05.2 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/launchctl-bootstrap-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: launchctl-bootstrap-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   chmod-undo-dyld-shim-macos:
     # M07.B.5 — chmod via brew gchmod (non-SIP so DYLD survives)
     # exercises the fchmodat interposer + daemon metadata-pre-image
