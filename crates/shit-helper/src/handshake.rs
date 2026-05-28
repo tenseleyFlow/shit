@@ -6,7 +6,9 @@
 //! `HelperResponse::HandshakeAck` advertising the capability set we can
 //! actually provide.
 
-use shit_proto::{HELPER_PROTOCOL_VERSION, HelperCaps, HelperRequest, HelperResponse};
+use shit_proto::{
+    HELPER_PROTOCOL_VERSION, HelperCaps, HelperRequest, HelperResponse, SelfVerifyReport,
+};
 use std::os::fd::RawFd;
 
 use crate::ipc::{Conn, ConnError};
@@ -192,6 +194,7 @@ pub fn perform_helper_side(
 
     let granted = capability_request.intersect(local_caps);
     let (tier, degraded_reason) = classify_kernel_tier();
+    let self_verify = self_verify_report();
     let ack = HelperResponse::HandshakeAck {
         helper_pid: std::process::id(),
         helper_uid: current_uid(),
@@ -200,6 +203,7 @@ pub fn perform_helper_side(
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
         kernel_tier: tier.to_string(),
         degraded_reason,
+        self_verify,
     };
     // DR-64 fault-injection: crash mid-reply. The daemon must
     // observe the disconnect, log the failed handshake, and
@@ -239,6 +243,7 @@ pub fn perform_daemon_side(
         helper_version: _,
         kernel_tier: _,
         degraded_reason: _,
+        self_verify: _,
     } = resp
     else {
         return Err(HandshakeError::NotHandshake);
@@ -353,6 +358,21 @@ fn peer_cred(_fd: RawFd) -> Result<(u32, u32), HandshakeError> {
 
 fn current_uid() -> u32 {
     unsafe { libc::getuid() }
+}
+
+/// Build the `SelfVerifyReport` the handshake ack carries
+/// (M07.C.3). macOS shells out to `codesign --verify --strict
+/// --deep`; other platforms return the `NotApplicable` sentinel
+/// so the wire shape is uniform.
+fn self_verify_report() -> SelfVerifyReport {
+    #[cfg(target_os = "macos")]
+    {
+        crate::codesign_verify::verify_self()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SelfVerifyReport::not_applicable()
+    }
 }
 
 #[cfg(test)]
