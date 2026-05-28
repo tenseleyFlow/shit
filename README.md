@@ -192,8 +192,8 @@ These are gaps where coverage is plausible but not yet shipped. Each item is tra
 
 ### macOS
 
-- **Signed + notarized helper distribution** — M04 sprint. Today the entitled-ES path requires a self-built helper with a developer-signed entitlement; productionizing the codesign + notarize CI pipeline is the next macOS milestone. Un-entitled installs already get FSEvents-degraded capture out of the box.
-- **DYLD interposer for non-SIP binaries** — DR-CR-34. Homebrew-installed cargo / pip could be hooked similarly to the Linux LD_PRELOAD path; not yet implemented.
+- **Notarized helper distribution** — M04 sprint. Today the entitled-ES path requires a self-built helper with a developer-signed entitlement. Codesign self-verify infrastructure shipped in M07.C (the daemon refuses helpers whose code signature doesn't validate); the remaining M04 work is the signed-distribution + notarize CI pipeline so a `brew install shit` ships a ready-to-run binary. Un-entitled installs already get FSEvents-degraded capture out of the box.
+- **DYLD interposer auto-install** — DR-CR-34. The interposer itself shipped via M07.A (`shit dyld-hooks install` writes the shim to `/usr/local/lib/libshit_preload_shim.dylib` and the M07.B.5 smoke validates end-to-end against brew's `gchmod`, a non-SIP binary). The remaining work is package-manager auto-install (so `brew install shit` configures DYLD on first run), and the auth-event coverage for the long tail of dyld-strippable syscalls. SIP-protected system binaries are intentionally out of scope — Apple strips `DYLD_INSERT_LIBRARIES` on those by design.
 - **M03.x follow-ups** — see `.docs/sprints/macos/M03.x-followup-roadmap.md` for the precise list (AUTH_LINK / AUTH_MMAP / AUTH_SETFLAGS / AUTH_CLONE handlers); each gates on a real-workload smoke surfacing the gap.
 
 ## Compatibility expectations
@@ -211,7 +211,7 @@ These should work in practice once the underlying mechanism is wired (no archite
 |---|---|---|---|---|---|
 | filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | ✅ EndpointSecurity AUTH events | ⚠️ post-hoc only, no pre-image |
 | pre-image via CoW | ✅ reflink/btrfs/XFS/zfs | ✅ same | ✅ zfs clone / hardlink | ✅ APFS clonefile | ✅ APFS clonefile |
-| LD_PRELOAD shim | ✅ install-pattern auto-inject | ✅ same | ✅ | ⚠️ DYLD interposer planned (DR-CR-34) | ⚠️ same |
+| LD_PRELOAD shim | ✅ install-pattern auto-inject | ✅ same | ✅ | ✅ DYLD interposer (M07.A install + M07.B.5 chmod smoke); SIP binaries excluded by Apple | ✅ same |
 | package undo | ✅ apt, dnf | ✅ same | ✅ pkg | ✅ brew | ✅ brew |
 | container undo | ✅ docker, podman, compose | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
 | cloud undo | ✅ terraform, kubectl, gh | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
