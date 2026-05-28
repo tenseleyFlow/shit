@@ -65,6 +65,14 @@ pub enum HelperLinkError {
     VersionMismatch { daemon: u16, helper: u16 },
     #[error("helper binary not found; set SHIT_HELPER_BIN or install on PATH")]
     HelperNotFound,
+    /// M07.C.3 — helper's `codesign --verify --strict --deep` against
+    /// its own binary failed. The daemon refuses the helper to avoid
+    /// accepting events from a process whose binary was tampered on
+    /// disk between install and exec. Recovery is to re-install or
+    /// re-codesign the helper (`shit setup-es-mode --apply` for the
+    /// macOS power-user install path).
+    #[error("helper self-verify failed: {0}")]
+    SelfVerifyFailed(String),
 }
 
 /// Outcome of a successful helper link.
@@ -356,6 +364,7 @@ pub fn spawn_and_handshake(
         helper_version: _,
         kernel_tier,
         degraded_reason,
+        self_verify,
     } = resp
     else {
         return Err(HelperLinkError::NotHandshakeAck);
@@ -373,6 +382,28 @@ pub fn spawn_and_handshake(
             "helper handshake: tier degraded — see `shit setup-es-mode --check` for remediation"
         );
     }
+    // M07.C.3 — log the helper's self-verify outcome. On macOS,
+    // a failed verify means the binary on disk has been tampered
+    // (or has lost its signature); we refuse the helper rather
+    // than accept events from a compromised process. Non-macOS
+    // helpers ship `NotApplicable` and pass through.
+    if !self_verify.ok {
+        tracing::error!(
+            reason = self_verify.reason.as_deref().unwrap_or("unknown"),
+            "helper self-verify FAILED; refusing handshake"
+        );
+        return Err(HelperLinkError::SelfVerifyFailed(
+            self_verify
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unspecified".into()),
+        ));
+    }
+    tracing::info!(
+        signature_kind = ?self_verify.signature_kind,
+        team_id = self_verify.team_id.as_deref().unwrap_or(""),
+        "helper self-verify ok"
+    );
 
     Ok(HelperLink {
         conn_fd,
