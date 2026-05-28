@@ -446,6 +446,7 @@ mod tests {
                     active: false,
                     enabled: false,
                     masked: false,
+                    present: true,
                     raw: String::new(),
                 },
                 verb: "start".into(),

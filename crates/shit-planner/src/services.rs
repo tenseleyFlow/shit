@@ -123,10 +123,15 @@ pub fn parse_systemctl_show(text: &str) -> ServiceState {
         "enabled" | "enabled-runtime" | "alias" | "linked" | "linked-runtime" | "static"
     );
     let masked = matches!(unit_file, "masked" | "masked-runtime");
+    // For systemctl, "present" means the unit file is known to the
+    // service manager. UnitFileState=="not-found" → not present;
+    // anything else (including "disabled", "masked") → present.
+    let present = !matches!(unit_file_state.as_deref(), Some("not-found") | None);
     ServiceState {
         active,
         enabled,
         masked,
+        present,
         raw: text.trim().to_string(),
     }
 }
@@ -189,6 +194,7 @@ pub fn parse_launchctl_print(text: &str) -> ServiceState {
             active: false,
             enabled: false,
             masked: false,
+            present: false,
             raw: text.trim().to_string(),
         };
     }
@@ -196,6 +202,7 @@ pub fn parse_launchctl_print(text: &str) -> ServiceState {
         active,
         enabled,
         masked: false,
+        present: true,
         raw: text.trim().to_string(),
     }
 }
@@ -258,10 +265,15 @@ pub fn parse_freebsd_service(text: &str) -> ServiceState {
     }
     let active = matches!(active_state, Some("running"));
     let enabled = matches!(enabled_flag, Some("YES"));
+    // FreeBSD service(8): if we parsed any field, the service is
+    // present. An empty input means service(8) didn't recognize the
+    // unit (typically the rc.d script is missing).
+    let present = active_state.is_some() || enabled_flag.is_some();
     ServiceState {
         active,
         enabled,
         masked: false,
+        present,
         raw: text.trim().to_string(),
     }
 }

@@ -751,12 +751,14 @@ mod tests {
             active: false,
             enabled: false,
             masked: false,
+            present: true,
             raw: String::new(),
         };
         let post = crate::events::ServiceState {
             active: true,
             enabled: true,
             masked: false,
+            present: true,
             raw: String::new(),
         };
         let events = vec![ev(
