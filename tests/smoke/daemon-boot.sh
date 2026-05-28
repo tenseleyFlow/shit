@@ -30,7 +30,7 @@ fi
 smoke_log "index.sqlite present (size=$(wc -c <"${SHIT_INDEX_DB}") bytes)"
 
 # Validate the schema landed. A fresh DB has all 6 tables.
-tables="$(smoke_journal_query 'SELECT name FROM sqlite_master WHERE type="table" ORDER BY name;')"
+tables="$(smoke_journal_query "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")"
 for required in blobs commands events paths pins sessions; do
     if ! grep -qxF "${required}" <<<"${tables}"; then
         smoke_fail "schema missing table '${required}'; got: ${tables}"
