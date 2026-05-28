@@ -848,14 +848,28 @@ impl shit_planner::executors::PkgRunner for PrivilegedPkgRunner {
             Some(v) => v,
             None => return Err("empty argv".into()),
         };
-        // Look up doas / sudo at runtime; refuse if neither is available.
-        let escalator = [
-            "/usr/local/bin/doas",
-            "/usr/local/bin/sudo",
-            "/usr/bin/sudo",
-        ]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).is_file());
+        // M05 — `brew` on macOS runs as the unprivileged invoking user
+        // (Homebrew installs under the user-writable prefix), so we
+        // MUST NOT prepend sudo for it. Asking for sudo in a daemon
+        // context where no TTY is attached fails with "a terminal is
+        // required to read the password" and the brew uninstall never
+        // runs. Other package managers (apt/dnf/pacman/pkg) need root.
+        let needs_elevation = cmd != "brew";
+        let escalator = if needs_elevation {
+            // Look up doas / sudo at runtime; fall through to direct
+            // invocation if neither exists (works when shitd happens
+            // to be root or operator deliberately runs the daemon
+            // as root).
+            [
+                "/usr/local/bin/doas",
+                "/usr/local/bin/sudo",
+                "/usr/bin/sudo",
+            ]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+        } else {
+            None
+        };
         let mut command = match escalator {
             Some(e) => {
                 let mut c = std::process::Command::new(e);
@@ -864,9 +878,9 @@ impl shit_planner::executors::PkgRunner for PrivilegedPkgRunner {
                 c
             }
             None => {
-                // Run directly — works if shitd happens to be root or
-                // the operator deliberately runs as root. Tests on the
-                // dev box go through here.
+                // Run directly — either we're not elevating (brew) or
+                // there's no escalator available + shitd happens to be
+                // root. Tests on the dev box go through here.
                 let mut c = std::process::Command::new(cmd);
                 c.args(args);
                 c
