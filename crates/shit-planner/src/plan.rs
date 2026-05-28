@@ -580,6 +580,7 @@ fn event_path(ev: &CaptureEvent) -> Option<&PathBuf> {
     match &ev.kind {
         CaptureEventKind::FilePreImage { path, .. } => Some(path),
         CaptureEventKind::MetadataChange { path, .. } => Some(path),
+        CaptureEventKind::FileAppendPreStash { path, .. } => Some(path),
         CaptureEventKind::TreeOp(TreeOp::Create { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. })
@@ -697,6 +698,31 @@ fn emit_for_event(
                     inode: *inode,
                     path: path.clone(),
                     target: before.clone(),
+                },
+                cohort: 0,
+                conflict,
+            });
+        }
+        CaptureEventKind::FileAppendPreStash {
+            inode,
+            path,
+            pre_size,
+        } => {
+            // AU27 — `cmd >> file` undo is just truncate-back-to-
+            // pre_size; the bytes that need restoring are still
+            // on disk in the [0..pre_size] range. The inode-match
+            // conflict check guards against rotation between
+            // capture and undo (logrotate moving the file out of
+            // the way mid-session would otherwise have us truncate
+            // the WRONG file). `apply_file_extend` includes a
+            // defensive grow-refusal guard, so a malformed
+            // pre_size > current_size errors at execute time
+            // rather than silently growing.
+            let conflict = file_path_conflict(path, *inode, probe);
+            nodes.push(PlanNode {
+                op: InverseOp::FileExtend {
+                    path: path.clone(),
+                    truncate_to: *pre_size,
                 },
                 cohort: 0,
                 conflict,
@@ -3038,6 +3064,99 @@ mod tests {
             !has_restore_content,
             "expected no RestoreContent (Other source must keep transient); got nodes {:#?}",
             p.nodes
+        );
+    }
+
+    /// AU27 — FileAppendPreStash event with `pre_size = 100`
+    /// emits exactly one `InverseOp::FileExtend { truncate_to:
+    /// 100 }` plan node, with no Conflict when the inode at
+    /// undo time matches the captured one.
+    #[test]
+    fn file_append_pre_stash_emits_file_extend() {
+        let mut probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 42);
+        let path = PathBuf::from("/tmp/log");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FileAppendPreStash {
+                inode,
+                path: path.clone(),
+                pre_size: 100,
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert_eq!(p.nodes.len(), 1, "expected exactly one plan node");
+        match &p.nodes[0].op {
+            InverseOp::FileExtend {
+                path: p,
+                truncate_to,
+            } => {
+                assert_eq!(*p, path);
+                assert_eq!(*truncate_to, 100);
+            }
+            other => panic!("expected FileExtend, got {other:?}"),
+        }
+        assert!(
+            p.nodes[0].conflict.is_none(),
+            "expected no conflict when inode matches, got {:?}",
+            p.nodes[0].conflict
+        );
+    }
+
+    /// AU27 — when the file's inode at undo time differs from
+    /// the captured one (rotation race), the planner annotates
+    /// a conflict so we don't truncate the wrong file.
+    #[test]
+    fn file_append_pre_stash_inode_mismatch_conflicts() {
+        let mut probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let captured_inode = InodeRef::new(1, 42);
+        let rotated_inode = InodeRef::new(1, 999);
+        let path = PathBuf::from("/tmp/log");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: rotated_inode, // file at path is now a DIFFERENT inode
+                meta: meta(0),
+            },
+            None,
+        );
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FileAppendPreStash {
+                inode: captured_inode,
+                path,
+                pre_size: 100,
+            },
+        };
+        let p = plan(dummy_command(), &[ev], &probe, &store);
+        assert_eq!(p.nodes.len(), 1);
+        assert!(
+            p.nodes[0].conflict.is_some(),
+            "expected conflict when inode differs"
         );
     }
 }
