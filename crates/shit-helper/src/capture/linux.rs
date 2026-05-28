@@ -659,9 +659,7 @@ impl LinuxCaptureRuntime {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
             let meta = fstat_meta(fd);
             (0, [0u8; 32], None, meta)
-        } else if race_won
-            && matches!(file_type, FileType::Fifo | FileType::Socket)
-        {
+        } else if race_won && matches!(file_type, FileType::Fifo | FileType::Socket) {
             // AU29 follow-up — Fifo/Socket capture: O_PATH fd held
             // by pre_open can be fstat'd for mode/uid/gid but can't
             // be read from (O_PATH semantics). Without this branch
