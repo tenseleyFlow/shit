@@ -1757,7 +1757,12 @@ jobs:
 
       - name: setcap helper
         run: |
-          sudo setcap cap_sys_admin,cap_bpf,cap_perfmon+ep \
+          # AU22 adds cap_mknod to the capset so mkfifo-restore-undo-linux
+          # (and any future Fifo/Socket restore path) can dispatch
+          # libc::mknod via helper-IPC. cap_mknod is the standard
+          # POSIX-capability gate for mknod(2) with FIFO/SOCK kinds;
+          # block/char devices still need CAP_SYS_ADMIN (DR-15.2).
+          sudo setcap cap_mknod,cap_sys_admin,cap_bpf,cap_perfmon+ep \
             target/release/shit-helper
           getcap target/release/shit-helper
 
