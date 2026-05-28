@@ -61,6 +61,9 @@ fi
 smoke_log "ack received"
 
 # Step 3 — daemon exits within the grace window.
+# After AU09 wired explicit helper.kill_helper() ahead of the
+# tokio runtime drop, all three platforms finish in ~100ms. The
+# 4s ceiling absorbs CI jitter without masking real regressions.
 gone=0
 for i in $(seq 1 40); do
     if ! kill -0 "${SHITD_PID}" 2>/dev/null; then
