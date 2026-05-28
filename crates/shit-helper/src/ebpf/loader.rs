@@ -93,6 +93,13 @@ const INODE_RMDIR_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_rmdir.bpf.o
 /// emit a CapturedPreImage if content changed."
 const FILE_RELEASE_OBJ: &[u8] = include_bytes!("../../bpf/build/file_release.bpf.o");
 
+/// AU29 — `lsm/inode_mknod` BPF object. Captures `mkfifo(3)` and
+/// `mknod(2)` for FIFO/Socket/Block/Char kinds. inode_create fires
+/// only on regular-file creation; mknod routes through a separate
+/// kernel hook. Without this program AU22's mknod-via-helper restore
+/// path has no capture input — RecreatePath{Fifo} is never emitted.
+const INODE_MKNOD_OBJ: &[u8] = include_bytes!("../../bpf/build/inode_mknod.bpf.o");
+
 /// LSM hook name (aya prepends `bpf_lsm_` internally to find the
 /// kernel BTF symbol). Matches the SEC("lsm/inode_unlink") in the .c.
 const LSM_HOOK_INODE_UNLINK: &str = "inode_unlink";
@@ -105,6 +112,7 @@ const LSM_HOOK_INODE_SYMLINK: &str = "inode_symlink";
 const LSM_HOOK_INODE_LINK: &str = "inode_link";
 const LSM_HOOK_INODE_RMDIR: &str = "inode_rmdir";
 const LSM_HOOK_FILE_RELEASE: &str = "file_release";
+const LSM_HOOK_INODE_MKNOD: &str = "inode_mknod";
 
 /// Program function name inside the .o. Set by `BPF_PROG(name, ...)`
 /// in the .c. aya looks programs up via this name when both the
@@ -127,6 +135,7 @@ const LSM_PROG_INODE_SYMLINK: &str = "shit_inode_symlink";
 const LSM_PROG_INODE_LINK: &str = "shit_inode_link";
 const LSM_PROG_INODE_RMDIR: &str = "shit_inode_rmdir";
 const LSM_PROG_FILE_RELEASE: &str = "shit_file_release";
+const LSM_PROG_INODE_MKNOD: &str = "shit_inode_mknod";
 
 /// Ringbuf map names. `take_*_ringbuf` methods remove the map from
 /// the Ebpf instance and return it as an `aya::maps::RingBuf` for
@@ -141,6 +150,7 @@ const RINGBUF_SYMLINK_EVENTS: &str = "symlink_events";
 const RINGBUF_LINK_EVENTS: &str = "link_events";
 const RINGBUF_RMDIR_EVENTS: &str = "rmdir_events";
 const RINGBUF_RELEASE_EVENTS: &str = "release_events";
+const RINGBUF_MKNOD_EVENTS: &str = "mknod_events";
 
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
@@ -195,6 +205,7 @@ pub struct EbpfLoader {
     link_bpf: Option<aya::Ebpf>,
     rmdir_bpf: Option<aya::Ebpf>,
     release_bpf: Option<aya::Ebpf>,
+    mknod_bpf: Option<aya::Ebpf>,
 }
 
 impl Default for EbpfLoader {
@@ -226,6 +237,7 @@ impl EbpfLoader {
             link_bpf: None,
             rmdir_bpf: None,
             release_bpf: None,
+            mknod_bpf: None,
         }
     }
 
@@ -250,6 +262,7 @@ impl EbpfLoader {
             || self.link_bpf.is_some()
             || self.rmdir_bpf.is_some()
             || self.release_bpf.is_some()
+            || self.mknod_bpf.is_some()
     }
 
     /// Load + attach the shipped noop tracepoint program. Returns
@@ -317,6 +330,7 @@ impl EbpfLoader {
         let link_was = self.link_bpf.take().is_some();
         let rmdir_was = self.rmdir_bpf.take().is_some();
         let release_was = self.release_bpf.take().is_some();
+        let mknod_was = self.mknod_bpf.take().is_some();
         if unlink_was
             || setattr_was
             || mkdir_was
@@ -327,6 +341,7 @@ impl EbpfLoader {
             || link_was
             || rmdir_was
             || release_was
+            || mknod_was
         {
             tracing::info!(
                 unlink = unlink_was,
@@ -339,6 +354,7 @@ impl EbpfLoader {
                 link = link_was,
                 rmdir = rmdir_was,
                 release = release_was,
+                mknod = mknod_was,
                 "ebpf programs detached"
             );
         }
@@ -942,6 +958,61 @@ impl EbpfLoader {
     pub fn take_release_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.release_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_RELEASE_EVENTS)?;
+        aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// AU29 — Load + attach the `lsm/inode_mknod` program. Captures
+    /// `mkfifo(3)` and `mknod(2)` for FIFO/Socket kinds, which
+    /// `inode_create` doesn't see (it fires only on regular-file
+    /// creation). Userspace routes the resulting events through the
+    /// same `on_create` sink → `handle_lsm_create` path; the kind
+    /// discriminator is the S_IF bits already carried in the wire's
+    /// `mode` field.
+    pub fn load_lsm_mknod(&mut self) -> Result<(), EbpfError> {
+        let outcome = self.probe();
+        if !outcome.should_attempt_load() {
+            return Err(EbpfError::PrerequisiteFailed(outcome.diagnose()));
+        }
+        if self.mknod_bpf.is_some() {
+            return Err(EbpfError::Aya(
+                "load_lsm_mknod: mknod program already loaded".into(),
+            ));
+        }
+        let btf = aya::Btf::from_sys_fs()
+            .map_err(|e| EbpfError::Aya(format!("Btf::from_sys_fs: {e}")))?;
+        let aligned: Vec<u8> = INODE_MKNOD_OBJ.to_vec();
+        let mut bpf = aya::Ebpf::load(&aligned)
+            .map_err(|e| EbpfError::Aya(format!("Ebpf::load(inode_mknod): {e}")))?;
+        let prog: &mut aya::programs::Lsm = bpf
+            .program_mut(LSM_PROG_INODE_MKNOD)
+            .ok_or_else(|| {
+                EbpfError::Aya(format!(
+                    "program `{LSM_PROG_INODE_MKNOD}` not found in object"
+                ))
+            })?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| {
+                EbpfError::Aya(format!("expected Lsm program: {e}"))
+            })?;
+        prog.load(LSM_HOOK_INODE_MKNOD, &btf)
+            .map_err(|e| EbpfError::Aya(format!("Lsm.load({LSM_HOOK_INODE_MKNOD}): {e}")))?;
+        let _link_id = prog
+            .attach()
+            .map_err(|e| EbpfError::Aya(format!("Lsm.attach: {e}")))?;
+        tracing::info!(
+            hook = LSM_HOOK_INODE_MKNOD,
+            prog = LSM_PROG_INODE_MKNOD,
+            ringbuf = RINGBUF_MKNOD_EVENTS,
+            "ebpf-lsm inode_mknod loaded and attached"
+        );
+        self.mknod_bpf = Some(bpf);
+        Ok(())
+    }
+
+    /// AU29 — Take the `mknod_events` ringbuf.
+    pub fn take_mknod_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
+        let bpf = self.mknod_bpf.as_mut()?;
+        let map = bpf.take_map(RINGBUF_MKNOD_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
     }
 
