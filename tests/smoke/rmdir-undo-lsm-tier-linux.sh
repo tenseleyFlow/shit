@@ -90,23 +90,27 @@ sleep 0.5
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
 
-# G03 rmdir route emits FilePreImage with is_delete=true; daemon
-# denormalizes as FilePreImage discriminant.
-smoke_wait_for_event "discriminant = 'FilePreImage'" 1 10
+# G03 rmdir route: helper emits CapturedPreImage{stored_bytes=0,
+# is_delete=true} marker for dirs (no bytes to send). Daemon
+# converts via journal_unlink_idempotent → TreeOpUnlink discriminant
+# (NOT FilePreImage — FilePreImage is the discriminant for events
+# that carry a content blob; the marker-only dir path bypasses that).
+smoke_wait_for_event "discriminant = 'TreeOpUnlink'" 1 10
 
-# AU20 load-bearing assertion: the LSM inode_rmdir handler (which
-# routes through handle_lsm_unlink with is_directory=true) MUST
-# have logged its emit line. A regression that breaks the rmdir
-# BPF prog would fall back to either no capture at all or to the
-# inode_unlink hook for regular files only — the dir wouldn't
-# round-trip but the smoke would catch the failure shape, not the
-# fact that LSM did the work.
-if ! grep -E "lsm-unlink CapturedPreImage sent.*is_directory=true" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
+# AU20 load-bearing assertion: the LSM inode_rmdir handler MUST
+# have logged its emit line. The handler's success info line is
+# `lsm-unlink CapturedPreImage sent` with basename=<our target>;
+# we match on basename so a co-occurring file unlink for an
+# unrelated path doesn't make the assertion pass spuriously.
+# A regression that breaks the rmdir BPF prog would either skip
+# emission entirely or route through the race-lost path (no
+# basename match for our target).
+if ! grep -E 'lsm-unlink CapturedPreImage sent.*basename="lsm_rmdir_victim"' "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
     smoke_log "shitd.log tail:"
     tail -100 "${SHIT_SMOKE_TMP}/shitd.log" | sed 's/^/    /' >&2
-    smoke_fail "LSM inode_rmdir handler did not emit; expected 'lsm-unlink CapturedPreImage sent' line with is_directory=true in shitd.log"
+    smoke_fail "LSM inode_rmdir handler did not emit; expected 'lsm-unlink CapturedPreImage sent' with basename=lsm_rmdir_victim in shitd.log"
 fi
-smoke_log "LSM inode_rmdir handler confirmed fired"
+smoke_log "LSM inode_rmdir handler confirmed fired (basename match)"
 
 "${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
