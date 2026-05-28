@@ -237,6 +237,45 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                 err: "apply_recreate_path: wrong variant".into(),
             };
         };
+        use crate::metadata::FileKind;
+        // AU22 — Fifo/Socket need mknod(2); dispatch through the
+        // privileged-op router (the helper has CAP_MKNOD). The
+        // local recreate_path_inner handles Regular/Directory only;
+        // BlockDevice/CharDevice still require CAP_SYS_ADMIN and
+        // stay refused at the helper.
+        if matches!(kind, FileKind::Fifo | FileKind::Socket) {
+            // G01.5 — same parent-tree guarantee as the regular path
+            // (recreate_path_inner does this for us; we mirror it
+            // here for the mknod branch).
+            if let Some(parent) = path.parent()
+                && !parent.exists()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                return ExecutionOutcome::Failed {
+                    err: format!("mkdir -p {parent:?}: {e}"),
+                };
+            }
+            // mode wire carries perm bits + S_IF* kind. The router
+            // dispatches into the helper which calls libc::mknod
+            // with S_IFIFO/S_IFSOCK | perm_bits.
+            return match self.privileged_router.mknod(path, *mode, 0) {
+                PrivilegedOpOutcome::Applied => ExecutionOutcome::Applied,
+                PrivilegedOpOutcome::OutOfScope => ExecutionOutcome::Failed {
+                    err: format!(
+                        "mknod {path:?} kind={kind:?}: helper refused (out of session scope)"
+                    ),
+                },
+                PrivilegedOpOutcome::PermissionDenied => ExecutionOutcome::Failed {
+                    err: format!("mknod {path:?} kind={kind:?}: EPERM (helper lacks CAP_MKNOD?)"),
+                },
+                PrivilegedOpOutcome::NotFound => ExecutionOutcome::Failed {
+                    err: format!("mknod {path:?} kind={kind:?}: parent path missing"),
+                },
+                PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
+                    err: format!("mknod {path:?} kind={kind:?}: {err}"),
+                },
+            };
+        }
         match recreate_path_inner(path, *kind, *mode) {
             Ok(()) => ExecutionOutcome::Applied,
             Err(e) => ExecutionOutcome::Failed { err: e },
@@ -474,9 +513,11 @@ fn unlink_inner(path: &Path) -> Result<(), String> {
 }
 
 /// Recreate a path the original command unlinked. Handles regular
-/// files and directories; other kinds (fifo/socket/device) need
-/// `mknod(2)` and are deferred — return a clear "needs DR-15 for
-/// mknod helper routing" message.
+/// files, directories, and (post-AU22) BlockDevice/CharDevice fail
+/// with a DR-15.2 message — those need CAP_SYS_ADMIN even with the
+/// right owner. Fifo/Socket are NOT routed here; the executor
+/// dispatches those through the PrivilegedOpRouter::mknod before
+/// reaching this function (see apply_recreate_path's AU22 branch).
 fn recreate_path_inner(
     path: &Path,
     kind: crate::metadata::FileKind,
@@ -533,13 +574,15 @@ fn recreate_path_inner(
             "RecreatePath for symlink at {path:?} is a planner bug — \
              use InverseOp::CreateSymlink which carries the target"
         )),
-        // Fifo/Socket/BlockDevice/CharDevice need mknod(2). For named
-        // pipes and sockets the helper has CAP_MKNOD by default;
-        // for block/char devices it requires CAP_SYS_ADMIN even with
-        // the right owner. Route through the helper once DR-15 lands.
+        // BlockDevice/CharDevice need mknod(2) with CAP_SYS_ADMIN
+        // even when owned by the requestor; the helper holds
+        // CAP_MKNOD but not CAP_SYS_ADMIN by default. Deferred to
+        // DR-15.2 (separate policy review for granting CAP_SYS_ADMIN
+        // to the helper). Fifo/Socket are handled upstream by
+        // apply_recreate_path's AU22 branch and never reach here.
         other => Err(format!(
             "RecreatePath for kind {other:?} at {path:?}: needs mknod(2) \
-             via helper-IPC privileged-op routing (DR-15)"
+             with CAP_SYS_ADMIN — deferred to DR-15.2"
         )),
     }
 }
