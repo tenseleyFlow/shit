@@ -223,6 +223,40 @@ unsafe extern "C" fn my_fchmod(fd: c_int, mode: mode_t) -> c_int {
     unsafe { libc::fchmod(fd, mode) }
 }
 
+/// Replacement for `chown(2)`. Captures path + metadata so the
+/// planner can restore the old uid/gid on undo.
+///
+/// # Safety
+/// Same contract as `libc::chown` — `path` must be a valid
+/// NUL-terminated C string.
+unsafe extern "C" fn my_chown(path: *const c_char, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    policy::notify_pre_mutation_with_content("chown", &cstr_to_string(path));
+    unsafe { libc::chown(path, uid, gid) }
+}
+
+/// Replacement for `fchown(2)`. Resolves fd→path; skip-notifies
+/// if F_GETPATH fails.
+///
+/// # Safety
+/// Same contract as `libc::fchown`.
+unsafe extern "C" fn my_fchown(fd: c_int, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("fchown", &path);
+    }
+    unsafe { libc::fchown(fd, uid, gid) }
+}
+
+/// Replacement for `lchown(2)`. Variant that operates on the
+/// symlink itself, not the target. Notification path is the
+/// same — daemon discriminates on the syscall name.
+///
+/// # Safety
+/// Same contract as `libc::lchown`.
+unsafe extern "C" fn my_lchown(path: *const c_char, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    policy::notify_pre_mutation_with_content("lchown", &cstr_to_string(path));
+    unsafe { libc::lchown(path, uid, gid) }
+}
+
 /// Best-effort fd → path via `fcntl(F_GETPATH)`. Returns `None`
 /// if the fd isn't backed by a path (anon fds, pipes, sockets)
 /// or if the call fails. macOS-specific: `F_GETPATH` writes up
@@ -328,6 +362,27 @@ static INTERPOSE_FCHMOD: InterposeEntry = InterposeEntry {
     target: libc::fchmod as *const c_void,
 };
 
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_CHOWN: InterposeEntry = InterposeEntry {
+    replacement: my_chown as *const c_void,
+    target: libc::chown as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHOWN: InterposeEntry = InterposeEntry {
+    replacement: my_fchown as *const c_void,
+    target: libc::fchown as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_LCHOWN: InterposeEntry = InterposeEntry {
+    replacement: my_lchown as *const c_void,
+    target: libc::lchown as *const c_void,
+};
+
 /// `(replacement, target)` pair the dynamic linker expects in
 /// `__DATA,__interpose`. Two `*const c_void`s, naturally aligned,
 /// equivalent to Apple's C `DYLD_INTERPOSE` macro output.
@@ -429,6 +484,27 @@ mod tests {
     }
 
     #[test]
+    fn chown_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_CHOWN.replacement.is_null());
+        assert!(!INTERPOSE_CHOWN.target.is_null());
+        assert_ne!(INTERPOSE_CHOWN.replacement, INTERPOSE_CHOWN.target);
+    }
+
+    #[test]
+    fn fchown_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHOWN.replacement.is_null());
+        assert!(!INTERPOSE_FCHOWN.target.is_null());
+        assert_ne!(INTERPOSE_FCHOWN.replacement, INTERPOSE_FCHOWN.target);
+    }
+
+    #[test]
+    fn lchown_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_LCHOWN.replacement.is_null());
+        assert!(!INTERPOSE_LCHOWN.target.is_null());
+        assert_ne!(INTERPOSE_LCHOWN.replacement, INTERPOSE_LCHOWN.target);
+    }
+
+    #[test]
     fn fd_to_path_returns_none_for_bad_fd() {
         // fd -1 is never valid; F_GETPATH returns -1, our helper None.
         assert!(fd_to_path(-1).is_none());
@@ -474,8 +550,16 @@ mod tests {
             // M07.B.1: chmod family
             &INTERPOSE_CHMOD,
             &INTERPOSE_FCHMOD,
+            // M07.B.2: chown family
+            &INTERPOSE_CHOWN,
+            &INTERPOSE_FCHOWN,
+            &INTERPOSE_LCHOWN,
         ];
-        assert_eq!(entries.len(), 10, "M07.A.2 + M07.B.1 interposer count");
+        assert_eq!(
+            entries.len(),
+            13,
+            "M07.A.2 + M07.B.1 + M07.B.2 interposer count"
+        );
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
