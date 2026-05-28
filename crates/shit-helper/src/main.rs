@@ -2520,7 +2520,7 @@ fn apply_mknod(path: &str, mode: u32, _dev: u64) -> shit_proto::PrivilegedOpOutc
             return PrivilegedOpOutcome::Applied;
         }
         return PrivilegedOpOutcome::Failed {
-            err: format!("path exists with wrong kind: {:?}", ft),
+            err: format!("path exists with wrong kind: {ft:?}"),
         };
     }
     // `mode` includes both file-type and perm bits; libc::mknod
@@ -2554,7 +2554,7 @@ mod apply_mknod_tests {
     fn fifo_create_at_clean_path_is_applied() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a_fifo");
-        let mode = (libc::S_IFIFO as u32) | 0o644;
+        let mode = 0o010000 | 0o644;
         let outcome = apply_mknod(p.to_str().unwrap(), mode, 0);
         assert_eq!(outcome, PrivilegedOpOutcome::Applied);
         let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
@@ -2565,7 +2565,7 @@ mod apply_mknod_tests {
     fn fifo_create_at_existing_fifo_is_idempotent_applied() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a_fifo");
-        let mode = (libc::S_IFIFO as u32) | 0o644;
+        let mode = 0o010000 | 0o644;
         assert_eq!(
             apply_mknod(p.to_str().unwrap(), mode, 0),
             PrivilegedOpOutcome::Applied
@@ -2579,7 +2579,7 @@ mod apply_mknod_tests {
 
     #[test]
     fn refuses_block_device_kind() {
-        let outcome = apply_mknod("/tmp/au22_blk", (libc::S_IFBLK as u32) | 0o644, 0);
+        let outcome = apply_mknod("/tmp/au22_blk", 0o060000 | 0o644, 0);
         assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
     }
 
@@ -2594,7 +2594,7 @@ mod apply_mknod_tests {
     fn fifo_create_with_missing_parent_returns_not_found() {
         let outcome = apply_mknod(
             "/nonexistent/au22/parent/fifo",
-            (libc::S_IFIFO as u32) | 0o644,
+            0o010000 | 0o644,
             0,
         );
         assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
@@ -2602,7 +2602,7 @@ mod apply_mknod_tests {
 
     #[test]
     fn rejects_path_with_nul_byte() {
-        let outcome = apply_mknod("/tmp/has\0nul", (libc::S_IFIFO as u32) | 0o644, 0);
+        let outcome = apply_mknod("/tmp/has\0nul", 0o010000 | 0o644, 0);
         assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
     }
 
@@ -2611,7 +2611,7 @@ mod apply_mknod_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("regfile");
         std::fs::write(&p, b"x").unwrap();
-        let outcome = apply_mknod(p.to_str().unwrap(), (libc::S_IFIFO as u32) | 0o644, 0);
+        let outcome = apply_mknod(p.to_str().unwrap(), 0o010000 | 0o644, 0);
         assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
     }
 }
