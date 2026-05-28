@@ -63,10 +63,12 @@ if [[ "$mutating" -eq 1 && -n "$service" ]]; then
     # Pass the service name as scope_hint so the inspector knows
     # which service's state to capture. The helper's pre/post
     # bracket converts to a NetEvent on the daemon's ctl socket.
-    "$HELPER" net-event networksetup pre --scope "$service" 2>/dev/null || true
+    # Strip the leading `-` from the verb (clap-friendly).
+    verb_arg="${verb#-}"
+    "$HELPER" net-event networksetup pre "--verb=$verb_arg" "--scope-hint=$service" 2>/dev/null || true
     "$real" "$@"
     rc=$?
-    "$HELPER" net-event networksetup post --scope "$service" 2>/dev/null || true
+    "$HELPER" net-event networksetup post "--verb=$verb_arg" "--scope-hint=$service" 2>/dev/null || true
     exit "$rc"
 fi
 
