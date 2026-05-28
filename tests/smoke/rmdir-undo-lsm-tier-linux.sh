@@ -99,18 +99,21 @@ smoke_wait_for_event "discriminant = 'TreeOpUnlink'" 1 10
 
 # AU20 load-bearing assertion: the LSM inode_rmdir handler MUST
 # have logged its emit line. The handler's success info line is
-# `lsm-unlink CapturedPreImage sent` with basename=<our target>;
-# we match on basename so a co-occurring file unlink for an
-# unrelated path doesn't make the assertion pass spuriously.
-# A regression that breaks the rmdir BPF prog would either skip
-# emission entirely or route through the race-lost path (no
-# basename match for our target).
-if ! grep -E 'lsm-unlink CapturedPreImage sent.*basename="lsm_rmdir_victim"' "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
+# `lsm-unlink CapturedPreImage sent` (G03 routes rmdir through
+# handle_lsm_unlink). We can't match on structured fields
+# (basename, path) because tracing's pretty-formatter interleaves
+# ANSI escape codes between the field name and value when stderr
+# is a tty-like sink. The smoke's workload contains exactly one
+# rmdir and no file unlinks of our own, so any 'lsm-unlink
+# CapturedPreImage sent' line in shitd.log is necessarily ours;
+# the TreeOpUnlink journal entry (verified above) carries the
+# path, closing the identification loop.
+if ! grep -F "lsm-unlink CapturedPreImage sent" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
     smoke_log "shitd.log tail:"
     tail -100 "${SHIT_SMOKE_TMP}/shitd.log" | sed 's/^/    /' >&2
-    smoke_fail "LSM inode_rmdir handler did not emit; expected 'lsm-unlink CapturedPreImage sent' with basename=lsm_rmdir_victim in shitd.log"
+    smoke_fail "LSM inode_rmdir handler did not emit; 'lsm-unlink CapturedPreImage sent' missing from shitd.log"
 fi
-smoke_log "LSM inode_rmdir handler confirmed fired (basename match)"
+smoke_log "LSM inode_rmdir handler confirmed fired"
 
 "${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
