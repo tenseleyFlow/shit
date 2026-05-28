@@ -116,16 +116,25 @@ sleep 0.7
 # THE workload. -setdnsservers is mutating; the wrapper brackets
 # net-event pre/post around the real networksetup call.
 #
-# IMPORTANT: `sudo` clears env by default — the wrapper's helper
-# invocation would lose XDG_RUNTIME_DIR and fail to find the
-# daemon's socket. `sudo -E` preserves env so the helper can
-# reach shitd. Critical: the helper running as root MUST see the
-# user-spawned daemon's runtime dir. macos-14 GHA's `runner` user
-# has passwordless sudo configured to allow env preservation.
+# IMPORTANT: sudo on macOS resets the env by default (sudoers
+# `Defaults env_reset`), so `sudo -E` ALONE doesn't reliably
+# preserve our smoke-specific vars. Pass them explicitly with
+# `VAR=val` syntax so the wrapper-as-root sees:
+#   - SHIT_HELPER         (path to the locally-built helper binary)
+#   - XDG_RUNTIME_DIR     (where the daemon's UDS sockets live)
+#   - XDG_STATE_HOME      (state dir; helper uses it for some lookups)
+# Without these the wrapper's HELPER defaults to
+# /usr/local/bin/shit-helper (absent on the runner), the helper
+# fails silently (|| true), no net-event reaches the daemon, and
+# the journal stays empty.
 TEST_DNS="1.1.1.1"
 smoke_log "wrapper bootstrap: ${WRAPPER} -setdnsservers ${SERVICE} ${TEST_DNS}"
 set +e
-sudo -E "${WRAPPER}" -setdnsservers "${SERVICE}" "${TEST_DNS}" \
+sudo \
+    SHIT_HELPER="${HELPER_BIN}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
+    XDG_STATE_HOME="${XDG_STATE_HOME}" \
+    "${WRAPPER}" -setdnsservers "${SERVICE}" "${TEST_DNS}" \
     >"${SHIT_SMOKE_TMP}/set.log" 2>&1
 SET_RC=$?
 set -e
