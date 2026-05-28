@@ -181,6 +181,27 @@ pub enum CaptureEventKind {
         before: FileMetadata,
         after: FileMetadata,
     },
+    /// AU27 / DR-CR-55 — `cmd >> file` / `tee -a file` pre-stash.
+    /// The C06 redirect parser classifies the redirect as
+    /// `RedirectOp::{Append, TeeAppend}`; the daemon's
+    /// `pre-exec-redirects` handler stats the target at PreExec
+    /// time and journals this event with the file's pre-size.
+    /// Inverse: [`crate::inverse::InverseOp::FileExtend`] truncates
+    /// the file back to `pre_size` at undo time.
+    ///
+    /// No blob is needed — the bytes that need restoring are
+    /// already on disk in the `[0..pre_size]` range; only the
+    /// `[pre_size..]` bytes (which the append added) need
+    /// removing.
+    FileAppendPreStash {
+        /// Inode + dev at pre-time. Conflict detection: if the
+        /// file's inode at undo time differs, the file was
+        /// rotated / replaced and truncating would clobber the
+        /// wrong file → emit `Conflict::Hard`.
+        inode: InodeRef,
+        path: PathBuf,
+        pre_size: u64,
+    },
     /// Filesystem tree operations.
     TreeOp(TreeOp),
     /// Environment variable diff observed across a command (shell-side capture).
