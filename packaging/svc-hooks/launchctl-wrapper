@@ -47,6 +47,11 @@ fi
 
 verb="${1:-}"
 target="${2:-}"
+# M05.2: `bootstrap` takes `gui/<uid>` as target + `/path/to.plist`
+# as the next positional. The label lives inside the plist; we
+# extract it below so the daemon classifier has the unit identity
+# needed to synthesize a `bootout` inverse on undo.
+plist_arg="${3:-}"
 
 mutating=0
 case "$verb" in
@@ -80,6 +85,18 @@ if [[ -n "$target" ]]; then
         if [[ "$unit" == "$rest" ]]; then
             unit=""
         fi
+    fi
+fi
+
+# M05.2 — bootstrap-specific label extraction. When the verb is
+# `bootstrap` and we didn't get a unit from the target (because the
+# target was the bare `gui/<uid>` domain), read the Label key out of
+# the plist file via PlistBuddy. macOS ships PlistBuddy at the
+# stable /usr/libexec path; no Homebrew dependency.
+if [[ "$verb" == "bootstrap" && -z "$unit" && -f "$plist_arg" ]]; then
+    extracted_label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist_arg" 2>/dev/null || true)"
+    if [[ -n "$extracted_label" ]]; then
+        unit="$extracted_label"
     fi
 fi
 
