@@ -1222,25 +1222,49 @@ impl CaptureControl {
                 }
             }
         };
-        let _ = self.tx.try_send(ControlMsg::Attach {
+        // AU16 — was `let _ = self.tx.try_send(...)`; silent drop
+        // meant a saturated or disconnected pump made the WatchTree
+        // disappear with zero diagnostic signal. Log loudly on Err
+        // (matches the macOS sibling at capture/macos.rs:121-131).
+        // The call site can't repair, but the operator now sees the
+        // failure in helper logs.
+        if let Err(e) = self.tx.try_send(ControlMsg::Attach {
             command: CommandId {
                 session,
                 seq: command_seq,
             },
             root_path: path,
-        });
+        }) {
+            tracing::warn!(
+                %session,
+                command_seq,
+                err = %e,
+                "bsd capture control channel full or closed; WatchTree dropped"
+            );
+        }
     }
 
     pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
-        let _ = self.tx.try_send(ControlMsg::Detach {
+        // AU16 — same logging treatment as on_watch_tree.
+        if let Err(e) = self.tx.try_send(ControlMsg::Detach {
             command: CommandId {
                 session,
                 seq: command_seq,
             },
-        });
+        }) {
+            tracing::warn!(
+                %session,
+                command_seq,
+                err = %e,
+                "bsd capture control channel full or closed; UnwatchTree dropped"
+            );
+        }
     }
 
-    /// Signal the pump thread to exit. Best-effort.
+    /// Signal the pump thread to exit. Best-effort: shutdown is
+    /// called during teardown where the pump may already be gone;
+    /// a silent drop here is the right semantics (matches the
+    /// macOS sibling at capture/macos.rs:150-152).
     pub fn shutdown(&self) {
         let _ = self.tx.try_send(ControlMsg::Shutdown);
     }
