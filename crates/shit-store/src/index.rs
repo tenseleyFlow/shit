@@ -676,6 +676,19 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        K::FileAppendPreStash { inode, path, .. } => Denormalized {
+            // AU27 / DR-CR-55 — daemon-side `cmd >> file` pre-stash.
+            // The full event (incl. pre_size) is serialized in the
+            // separate `payload` JSON column; this row's denorm
+            // fields just expose path + inode for the existing
+            // discriminant-keyed queries.
+            discriminant: "FileAppendPreStash",
+            dev: Some(inode.dev as i64),
+            inode: Some(inode.inode as i64),
+            path: Some(path.to_string_lossy().into_owned()),
+            blob_hash: None,
+            post_content_hash: None,
+        },
         K::TreeOp(t) => {
             let (dev, inode, path, disc) = match t {
                 T::Create { inode, path, .. } => (
