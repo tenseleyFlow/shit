@@ -257,6 +257,29 @@ unsafe extern "C" fn my_lchown(path: *const c_char, uid: libc::uid_t, gid: libc:
     unsafe { libc::lchown(path, uid, gid) }
 }
 
+/// Replacement for `utimes(2)`. Captures path + metadata so the
+/// planner can restore the old atime/mtime on undo.
+///
+/// # Safety
+/// Same contract as `libc::utimes` — `path` valid C string; `times`
+/// either NULL (set to current time) or pointer to 2 timevals.
+unsafe extern "C" fn my_utimes(path: *const c_char, times: *const libc::timeval) -> c_int {
+    policy::notify_pre_mutation_with_content("utimes", &cstr_to_string(path));
+    unsafe { libc::utimes(path, times) }
+}
+
+/// Replacement for `futimens(2)`. fd → path via F_GETPATH; skip-
+/// notifies if resolution fails.
+///
+/// # Safety
+/// Same contract as `libc::futimens`.
+unsafe extern "C" fn my_futimens(fd: c_int, times: *const libc::timespec) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("futimens", &path);
+    }
+    unsafe { libc::futimens(fd, times) }
+}
+
 /// Best-effort fd → path via `fcntl(F_GETPATH)`. Returns `None`
 /// if the fd isn't backed by a path (anon fds, pipes, sockets)
 /// or if the call fails. macOS-specific: `F_GETPATH` writes up
@@ -383,6 +406,20 @@ static INTERPOSE_LCHOWN: InterposeEntry = InterposeEntry {
     target: libc::lchown as *const c_void,
 };
 
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_UTIMES: InterposeEntry = InterposeEntry {
+    replacement: my_utimes as *const c_void,
+    target: libc::utimes as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FUTIMENS: InterposeEntry = InterposeEntry {
+    replacement: my_futimens as *const c_void,
+    target: libc::futimens as *const c_void,
+};
+
 /// `(replacement, target)` pair the dynamic linker expects in
 /// `__DATA,__interpose`. Two `*const c_void`s, naturally aligned,
 /// equivalent to Apple's C `DYLD_INTERPOSE` macro output.
@@ -505,6 +542,20 @@ mod tests {
     }
 
     #[test]
+    fn utimes_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_UTIMES.replacement.is_null());
+        assert!(!INTERPOSE_UTIMES.target.is_null());
+        assert_ne!(INTERPOSE_UTIMES.replacement, INTERPOSE_UTIMES.target);
+    }
+
+    #[test]
+    fn futimens_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FUTIMENS.replacement.is_null());
+        assert!(!INTERPOSE_FUTIMENS.target.is_null());
+        assert_ne!(INTERPOSE_FUTIMENS.replacement, INTERPOSE_FUTIMENS.target);
+    }
+
+    #[test]
     fn fd_to_path_returns_none_for_bad_fd() {
         // fd -1 is never valid; F_GETPATH returns -1, our helper None.
         assert!(fd_to_path(-1).is_none());
@@ -554,12 +605,11 @@ mod tests {
             &INTERPOSE_CHOWN,
             &INTERPOSE_FCHOWN,
             &INTERPOSE_LCHOWN,
+            // M07.B.3: utimes family
+            &INTERPOSE_UTIMES,
+            &INTERPOSE_FUTIMENS,
         ];
-        assert_eq!(
-            entries.len(),
-            13,
-            "M07.A.2 + M07.B.1 + M07.B.2 interposer count"
-        );
+        assert_eq!(entries.len(), 15, "M07.A.2 + M07.B.1..3 interposer count");
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
