@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# release.yml — macOS release tarball pipeline (M04.1).
+#
+# Triggers on `v*.*.*` git tags. Builds the macOS release binaries,
+# runs the codesign+notarize pipeline in dry-run mode (ad-hoc sign
+# only — Apple denied us the EndpointSecurity entitlement for now),
+# packages everything users need for the power-user install path into
+# a tarball, and attaches it to the GitHub release.
+#
+# When/if Apple paperwork resolves, the `--mode=dry-run` arg flips to
+# `--mode=real` and the workflow inherits APPLE_NOTARY_API_KEY_ID /
+# APPLE_NOTARY_API_ISSUER_ID / APPLE_NOTARY_API_P8 / APPLE_SIGN_IDENTITY
+# from CI secrets. No code change required at that point.
+#
+# v1.0 ships macOS arm64 only. x86_64 macOS support is M04 followup
+# (cross-compile + a second matrix entry); the same release.yml shape
+# extends straightforwardly.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  # Manual trigger for testing the pipeline without cutting a real
+  # release. Produces an artifact but does NOT create a GitHub release.
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for actions/create-release on tag push
+
+jobs:
+  macos-arm64:
+    name: macos-arm64 release tarball
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tag pushes give a shallow clone by default; release-version
+          # extraction reads the tag name, so we need the tag ref to be
+          # resolvable.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: derive version from tag or sha
+        id: version
+        shell: bash
+        run: |
+          # On a tag push, GITHUB_REF_NAME = "v1.2.3"; strip the leading
+          # "v" for the bundle versions. On workflow_dispatch, fall back
+          # to the short sha so the artifact path is unique.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "release version: ${VERSION}"
+
+      - name: build release binaries + shim
+        run: |
+          cargo build --release \
+            -p shit -p shitd -p shit-helper -p shit-preload-shim
+
+      - name: stamp Info.plist with build version
+        run: |
+          # The committed macos-info.plist uses "0.0.0" as a placeholder.
+          # Substitute the real version (from the tag) before codesign
+          # so Apple's notary records the correct bundle version.
+          INFO=packaging/codesign/macos-info.plist
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "${INFO}"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion ${{ steps.version.outputs.version }}" "${INFO}"
+          echo "Info.plist after stamp:"
+          plutil -p "${INFO}"
+
+      - name: codesign (dry-run; Apple entitlement paperwork pending)
+        run: |
+          bash packaging/codesign/sign-and-notarize.sh \
+            --mode=dry-run \
+            --bin target/release/shit-helper
+
+      - name: assemble release tarball
+        id: tarball
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          STAGE="dist/shit-macos-arm64-${VERSION}"
+          mkdir -p "${STAGE}/bin" "${STAGE}/lib" "${STAGE}/share/shit"
+          cp target/release/shit         "${STAGE}/bin/"
+          cp target/release/shitd        "${STAGE}/bin/"
+          cp target/release/shit-helper  "${STAGE}/bin/"
+          cp target/release/libshit_preload_shim.dylib "${STAGE}/lib/"
+          # The install-time codesign script + entitlement plist; the
+          # power-user-mode user runs sign-for-power-user.sh on their
+          # own machine to ad-hoc-sign the helper with the ES claim.
+          cp packaging/codesign/sign-for-power-user.sh   "${STAGE}/share/shit/"
+          cp packaging/codesign/macos-entitlements.plist "${STAGE}/share/shit/"
+          cp packaging/codesign/macos-info.plist         "${STAGE}/share/shit/"
+          # User-facing docs travel with the tarball so install-time
+          # is self-contained.
+          if [ -f docs/install-macos.md ]; then
+            cp docs/install-macos.md "${STAGE}/share/shit/"
+          fi
+          if [ -f docs/macos-power-user-install.md ]; then
+            cp docs/macos-power-user-install.md "${STAGE}/share/shit/"
+          fi
+          TARBALL="dist/shit-macos-arm64-${VERSION}.tar.gz"
+          tar -czf "${TARBALL}" -C dist "shit-macos-arm64-${VERSION}"
+          echo "tarball=${TARBALL}" >> "${GITHUB_OUTPUT}"
+          ls -la "${TARBALL}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shit-macos-arm64-${{ steps.version.outputs.version }}
+          path: ${{ steps.tarball.outputs.tarball }}
+
+      - name: attach to GitHub release (tag pushes only)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.tarball.outputs.tarball }}
+          # The release notes themselves are not auto-generated here —
+          # the maintainer publishes notes via `gh release create` and
+          # this workflow only attaches the binary. Keeps the release
+          # commentary human-curated.
+          fail_on_unmatched_files: true
+          # generate_release_notes: false is the default; leaving it
+          # unset for clarity.
