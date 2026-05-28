@@ -130,7 +130,11 @@ sleep 0.7
 TEST_DNS="1.1.1.1"
 smoke_log "wrapper bootstrap: ${WRAPPER} -setdnsservers ${SERVICE} ${TEST_DNS}"
 set +e
-sudo \
+# `sudo VAR=val cmd` is silently dropped on macOS by default
+# (sudoers `Defaults env_reset` without `setenv`). The reliable
+# form is `sudo env VAR=val cmd` — env(1) runs as root with the
+# vars set and then execs the wrapper, inheriting them.
+sudo env \
     SHIT_HELPER="${HELPER_BIN}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
     XDG_STATE_HOME="${XDG_STATE_HOME}" \
