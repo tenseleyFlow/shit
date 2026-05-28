@@ -75,6 +75,20 @@ pub enum HelperLinkError {
     SelfVerifyFailed(String),
 }
 
+/// AU28 — privileged-op waiters map shared between the dispatch
+/// loop and the HelperLinkPrivilegedOpRouter. Keyed by the wire's
+/// `(session, command_seq)`; the value is the sync sender the
+/// dispatch loop fills when the helper's `PrivilegedOpResult`
+/// arrives.
+pub type PrivOpWaiters = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (uuid::Uuid, u64),
+            std::sync::mpsc::SyncSender<shit_proto::PrivilegedOpOutcome>,
+        >,
+    >,
+>;
+
 /// Outcome of a successful helper link.
 #[derive(Debug)]
 pub struct HelperLink {
@@ -104,6 +118,15 @@ pub struct HelperLink {
     /// ES isn't running. `None` when the tier IS the intended one.
     /// Surfaced to the doctor + the structured log.
     pub degraded_reason: Option<String>,
+    /// AU28 / DR-15 stage-1 — outstanding privileged-op requests
+    /// keyed by `(session, command_seq)`. The router holds a
+    /// `SyncSender` here, sends the request via `send_request`,
+    /// then blocks on the matching `Receiver`. The dispatch loop
+    /// peels `HelperResponse::PrivilegedOpResult` off the wire
+    /// and forwards the outcome to the waiter (single-flight per
+    /// key; the key is monotonic per router instance so collisions
+    /// don't happen in practice).
+    pub priv_op_waiters: PrivOpWaiters,
 }
 
 impl HelperLink {
@@ -255,6 +278,63 @@ fn recv_frame_with_fd_blocking(
 }
 
 impl HelperLink {
+    /// AU28 / DR-15 stage-1 — synchronous request/reply for a
+    /// privileged op (chown, mknod). Registers a waiter keyed by
+    /// `(session, command_seq)`, sends the request, blocks on the
+    /// receiver up to `timeout`. The dispatch loop forwards the
+    /// matching `PrivilegedOpResult` to the waiter.
+    ///
+    /// On timeout, ENXIO / EPIPE on send, or any other transport
+    /// failure, returns `PrivilegedOpOutcome::Failed { err }`.
+    /// Caller (the FileExecutor) treats Failed as a non-recoverable
+    /// privileged-op error — same as the original EPERM that
+    /// triggered the route.
+    pub fn request_priv_op_blocking(
+        &self,
+        session: uuid::Uuid,
+        command_seq: u64,
+        req: shit_proto::HelperRequest,
+        timeout: std::time::Duration,
+    ) -> shit_proto::PrivilegedOpOutcome {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut waiters = self
+                .priv_op_waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            waiters.insert((session, command_seq), tx);
+        }
+        if let Err(e) = self.send_request(&req) {
+            // Clear our waiter; no reply will ever arrive.
+            self.priv_op_waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(session, command_seq));
+            return shit_proto::PrivilegedOpOutcome::Failed {
+                err: format!("send_request: {e}"),
+            };
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.priv_op_waiters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&(session, command_seq));
+                shit_proto::PrivilegedOpOutcome::Failed {
+                    err: format!("priv-op timeout after {timeout:?}"),
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Sender dropped without sending; dispatch removed the
+                // waiter (e.g. on helper exit) but didn't fill it.
+                shit_proto::PrivilegedOpOutcome::Failed {
+                    err: "priv-op response channel disconnected".into(),
+                }
+            }
+        }
+    }
+
     /// AU09 — terminate the helper child and reap it. Idempotent; safe
     /// to call multiple times or alongside `Drop` (the inner `Option`
     /// short-circuits the second pass). Required during graceful
@@ -413,6 +493,9 @@ pub fn spawn_and_handshake(
         granted,
         kernel_tier,
         degraded_reason,
+        priv_op_waiters: PrivOpWaiters::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     })
 }
 
@@ -560,6 +643,7 @@ pub async fn dispatch_loop(
                             &watch_ready,
                             &live_baseline,
                             &link.kernel_tier,
+                            &link.priv_op_waiters,
                         );
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
@@ -591,6 +675,7 @@ pub async fn dispatch_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_response(
     resp: HelperResponse,
     fd: Option<OwnedFd>,
@@ -599,6 +684,7 @@ fn dispatch_response(
     watch_ready: &crate::watch_ready::WatchReadyMap,
     live_baseline: &crate::baseline::LiveBaseline,
     kernel_tier: &str,
+    priv_op_waiters: &PrivOpWaiters,
 ) {
     match resp {
         HelperResponse::CapturedPreImage {
@@ -849,6 +935,35 @@ fn dispatch_response(
             };
             watch_ready.mark_ready(cmd);
             tracing::debug!(%session, command_seq, "WatchTreeReady routed");
+        }
+        HelperResponse::PrivilegedOpResult {
+            session,
+            command_seq,
+            outcome,
+        } => {
+            // AU28 / DR-15 stage-1 — route to the waiter the
+            // HelperLinkPrivilegedOpRouter registered before
+            // sending the request. Drop on the floor if no waiter
+            // (the request timed out and cleared its entry; the
+            // helper's response is now late + irrelevant).
+            let mut waiters = priv_op_waiters.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tx) = waiters.remove(&(session, command_seq)) {
+                if let Err(e) = tx.send(outcome.clone()) {
+                    tracing::warn!(
+                        %session,
+                        command_seq,
+                        err = %e,
+                        "priv-op waiter receiver dropped before response arrived"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    ?outcome,
+                    "PrivilegedOpResult arrived but no waiter — likely a timeout race"
+                );
+            }
         }
         other => {
             tracing::trace!(
