@@ -128,6 +128,22 @@ sleep 0.7
 # fails silently (|| true), no net-event reaches the daemon, and
 # the journal stays empty.
 TEST_DNS="1.1.1.1"
+
+# DIAGNOSTIC: call the helper directly (bypassing the wrapper) to
+# confirm env-through-sudo reaches the helper + the helper can
+# reach the daemon. Surfaces any env-passing or socket-resolution
+# bugs before we point fingers at the wrapper.
+smoke_log "DIAG: direct helper invocation (env through sudo)"
+sudo env \
+    SHIT_HELPER="${HELPER_BIN}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
+    XDG_STATE_HOME="${XDG_STATE_HOME}" \
+    RUST_LOG=debug \
+    "${HELPER_BIN}" net-event networksetup pre --scope "${SERVICE}" \
+    2>"${SHIT_SMOKE_TMP}/diag-helper.log" || true
+smoke_log "DIAG: helper stderr (first 20 lines):"
+head -20 "${SHIT_SMOKE_TMP}/diag-helper.log" 2>/dev/null | sed 's/^/    /' >&2 || true
+
 smoke_log "wrapper bootstrap: ${WRAPPER} -setdnsservers ${SERVICE} ${TEST_DNS}"
 set +e
 # `sudo VAR=val cmd` is silently dropped on macOS by default
