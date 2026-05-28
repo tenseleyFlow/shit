@@ -983,6 +983,35 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  shell-append-undo:
+    # AU19 — `cmd >> file` append undo. C06 redirect parser ships
+    # RedirectOp::Append; AU27 daemon stash_append journals
+    # FileAppendPreStash{pre_size}; planner emits
+    # InverseOp::FileExtend; FileExecutor::apply_file_extend
+    # ftruncates back. Linux mirror of W09.18's
+    # shell-append-undo-fbsd.sh.
+    name: shell-append-undo smoke (AU19)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/shell-append-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-append-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   cd-undo:
     # AR06.1 + DR-CR-50 -- the cd-undo + precmd-queue smoke. A
     # child daemon can't mutate the parent shell's cwd, so the
