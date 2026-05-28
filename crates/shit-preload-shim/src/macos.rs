@@ -348,12 +348,83 @@ unsafe extern "C" fn my_futimes(fd: c_int, times: *const libc::timeval) -> c_int
 
 // macOS xattr signatures diverge from Linux: extra `position` arg
 // (legacy resource-fork offset, near-universally 0) and `flags` arg
-// (XATTR_NOFOLLOW etc). The `policy::notify_pre_mutation` we use
-// here is path-only (no content read) — shim-side xattr pre-image
-// capture (reading current xattr value to enable byte-identical
-// undo) is a follow-up slice (M07.B.4.1). For now we record that
-// xattr changed on this path, and daemon/planner xattr support
-// inherits from the ES producer (M03.x.XATTR).
+// (XATTR_NOFOLLOW etc).
+//
+// M07.B.4.1 — pre-syscall xattr value capture. Before the libc
+// passthrough, we call `getxattr(path, name, ...)` to read the
+// current value (if any). The shim ships it on the wire so the
+// daemon's planner can drive a byte-identical undo:
+//   setxattr undo:   removexattr (if absent before) OR setxattr-with-old-value (if present)
+//   removexattr undo: setxattr-with-old-value (if present) OR no-op (if absent)
+
+/// Read the current value of `name` on `path`. Returns
+/// `Some(bytes)` when present, `None` when the xattr doesn't
+/// exist or the read fails. macOS uses non-zero `position` only
+/// for legacy resource-fork access; modern xattrs always use 0.
+unsafe fn read_xattr_value(path: *const c_char, name: *const c_char) -> Option<Vec<u8>> {
+    if path.is_null() || name.is_null() {
+        return None;
+    }
+    // First call sizes the value. Pass NULL buffer + 0 size; if
+    // the xattr exists, return is its byte count. ENOATTR (= 93
+    // on Darwin) means absent.
+    let sz = unsafe { libc::getxattr(path, name, std::ptr::null_mut(), 0, 0, 0) };
+    if sz < 0 {
+        return None;
+    }
+    if sz == 0 {
+        return Some(Vec::new());
+    }
+    let mut buf = vec![0u8; sz as usize];
+    let got =
+        unsafe { libc::getxattr(path, name, buf.as_mut_ptr() as *mut c_void, buf.len(), 0, 0) };
+    if got < 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(buf)
+}
+
+/// fd-based variant of [`read_xattr_value`] using `fgetxattr`.
+unsafe fn read_xattr_value_fd(fd: c_int, name: *const c_char) -> Option<Vec<u8>> {
+    if name.is_null() {
+        return None;
+    }
+    let sz = unsafe { libc::fgetxattr(fd, name, std::ptr::null_mut(), 0, 0, 0) };
+    if sz < 0 {
+        return None;
+    }
+    if sz == 0 {
+        return Some(Vec::new());
+    }
+    let mut buf = vec![0u8; sz as usize];
+    let got =
+        unsafe { libc::fgetxattr(fd, name, buf.as_mut_ptr() as *mut c_void, buf.len(), 0, 0) };
+    if got < 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(buf)
+}
+
+/// Build the [`shit_proto::XattrPreImage`] payload from a captured
+/// pre-value. `name` must be a valid C string.
+unsafe fn build_xattr_pre(
+    name: *const c_char,
+    pre_value: Option<Vec<u8>>,
+) -> shit_proto::XattrPreImage {
+    let name_str = if name.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    shit_proto::XattrPreImage {
+        name: name_str,
+        value: pre_value,
+    }
+}
 
 /// Replacement for `setxattr(2)`.
 ///
@@ -367,7 +438,10 @@ unsafe extern "C" fn my_setxattr(
     position: u32,
     flags: c_int,
 ) -> c_int {
-    policy::notify_pre_mutation("setxattr", &cstr_to_string(path));
+    // M07.B.4.1: capture pre-value first.
+    let pre_value = unsafe { read_xattr_value(path, name) };
+    let xattr_pre = unsafe { build_xattr_pre(name, pre_value) };
+    policy::notify_xattr_mutation("setxattr", &cstr_to_string(path), xattr_pre);
     unsafe { libc::setxattr(path, name, value, size, position, flags) }
 }
 
@@ -384,7 +458,9 @@ unsafe extern "C" fn my_fsetxattr(
     flags: c_int,
 ) -> c_int {
     if let Some(path) = fd_to_path(fd) {
-        policy::notify_pre_mutation("fsetxattr", &path);
+        let pre_value = unsafe { read_xattr_value_fd(fd, name) };
+        let xattr_pre = unsafe { build_xattr_pre(name, pre_value) };
+        policy::notify_xattr_mutation("fsetxattr", &path, xattr_pre);
     }
     unsafe { libc::fsetxattr(fd, name, value, size, position, flags) }
 }
@@ -398,7 +474,9 @@ unsafe extern "C" fn my_removexattr(
     name: *const c_char,
     flags: c_int,
 ) -> c_int {
-    policy::notify_pre_mutation("removexattr", &cstr_to_string(path));
+    let pre_value = unsafe { read_xattr_value(path, name) };
+    let xattr_pre = unsafe { build_xattr_pre(name, pre_value) };
+    policy::notify_xattr_mutation("removexattr", &cstr_to_string(path), xattr_pre);
     unsafe { libc::removexattr(path, name, flags) }
 }
 
@@ -408,7 +486,9 @@ unsafe extern "C" fn my_removexattr(
 /// Same contract as `libc::fremovexattr`.
 unsafe extern "C" fn my_fremovexattr(fd: c_int, name: *const c_char, flags: c_int) -> c_int {
     if let Some(path) = fd_to_path(fd) {
-        policy::notify_pre_mutation("fremovexattr", &path);
+        let pre_value = unsafe { read_xattr_value_fd(fd, name) };
+        let xattr_pre = unsafe { build_xattr_pre(name, pre_value) };
+        policy::notify_xattr_mutation("fremovexattr", &path, xattr_pre);
     }
     unsafe { libc::fremovexattr(fd, name, flags) }
 }
