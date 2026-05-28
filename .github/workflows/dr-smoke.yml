@@ -150,6 +150,29 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  shitd-graceful-shutdown:
+    name: shitd-graceful-shutdown smoke (AU09)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/shitd-graceful-shutdown.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shitd-graceful-shutdown-smoke-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   hook-ipc:
     name: hook-IPC smoke
     runs-on: ubuntu-24.04
