@@ -456,6 +456,19 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         h.abort();
     }
 
+    // AU09 — kill the helper child explicitly BEFORE the tokio runtime
+    // drop. The dispatch loop runs `recv_response_with_fd` inside a
+    // `spawn_blocking` task that holds a blocking recv on the helper's
+    // SOCK_SEQPACKET fd; `abort()` cancels the outer task but the
+    // blocking thread can't be cancelled, so the runtime drop would
+    // otherwise wait until the helper exits on its own (3–5s on
+    // FreeBSD, observed empirically). Killing the helper now closes
+    // its socket end, which unblocks the recv, which lets the runtime
+    // drop in milliseconds.
+    if let Some(link) = helper_link_arc.as_ref() {
+        link.kill_helper();
+    }
+
     // AU09 — unlink IPC sockets so the on-disk inode disappearance
     // is the load-bearing signal of a clean shutdown (vs. SIGKILL,
     // which leaves them dangling). Bind-time `remove_file` covers

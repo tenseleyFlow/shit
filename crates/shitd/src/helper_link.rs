@@ -72,8 +72,14 @@ pub enum HelperLinkError {
 pub struct HelperLink {
     /// Connected SEQPACKET/STREAM fd to the running helper.
     pub conn_fd: OwnedFd,
-    /// Helper process handle. Drop kills the helper.
-    pub child: Child,
+    /// Helper process handle. Wrapped in `Mutex<Option<Child>>` so
+    /// `kill_helper(&self)` (called via `&Arc<HelperLink>`) can take +
+    /// kill + reap without `&mut self`. `Drop` is a no-op when
+    /// `kill_helper` has already consumed the child, which is the
+    /// load-bearing path for AU09 graceful shutdown: tearing down the
+    /// helper before the tokio runtime drop unblocks any
+    /// `spawn_blocking` recv that the helper still holds open.
+    child: std::sync::Mutex<Option<Child>>,
     pub helper_pid: u32,
     pub helper_uid: u32,
     pub granted: HelperCaps,
@@ -240,10 +246,32 @@ fn recv_frame_with_fd_blocking(
     }
 }
 
+impl HelperLink {
+    /// AU09 — terminate the helper child and reap it. Idempotent; safe
+    /// to call multiple times or alongside `Drop` (the inner `Option`
+    /// short-circuits the second pass). Required during graceful
+    /// shutdown so the helper's blocking-recv thread unblocks before
+    /// the daemon's tokio runtime tries to drop its `spawn_blocking`
+    /// task pool.
+    pub fn kill_helper(&self) {
+        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 impl Drop for HelperLink {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Best-effort. If `kill_helper` already consumed the child the
+        // lock holds None and this is a no-op.
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -348,7 +376,7 @@ pub fn spawn_and_handshake(
 
     Ok(HelperLink {
         conn_fd,
-        child,
+        child: std::sync::Mutex::new(Some(child)),
         helper_pid,
         helper_uid,
         granted,
