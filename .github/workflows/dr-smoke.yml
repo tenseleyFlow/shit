@@ -32,6 +32,28 @@ jobs:
         run: bash tools/audit/smoke-driver.sh verify
       - name: verify CI coverage
         run: bash tools/audit/smoke-driver.sh verify-coverage
+      - name: verify no soft-asserts in smokes (AU06)
+        # AU06 — every smoke either asserts hard or carves the gap to
+        # a tracked sprint via SMOKE header `EXCLUDED_BY:` (AU14-A's
+        # verify step enforces that EXCLUDED_BY pairs with
+        # EXCLUDED_REASON). The two banned legacy patterns:
+        #   - literal "soft-assert"
+        #   - "[FOO-pending]" tag inside smoke_log calls
+        # If you hit this gate, tighten the assertion to `smoke_fail`
+        # OR add `EXCLUDED_BY:` / `EXCLUDED_REASON:` headers pointing
+        # at the sprint that closes the gap. See AU06 spec for the
+        # decision matrix.
+        run: |
+          set +e
+          hits="$(grep -rnE 'soft-assert|\[[A-Z0-9.]+-pending\]' tests/smoke/*.sh 2>/dev/null)"
+          if [ -n "$hits" ]; then
+            echo "::error::AU06 soft-assert gate: forbidden patterns found in tests/smoke/"
+            echo "$hits"
+            echo ""
+            echo "Tighten to smoke_fail or carve with EXCLUDED_BY: <sprint-id> + EXCLUDED_REASON: <one-liner>"
+            exit 1
+          fi
+          echo "AU06 soft-assert gate: clean (0 hits)"
       - name: emit smoke-matrix.json
         run: |
           bash tools/audit/smoke-driver.sh discover > smoke-matrix.json

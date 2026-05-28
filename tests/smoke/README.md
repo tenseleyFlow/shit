@@ -63,6 +63,23 @@ close.
 The current single deferral is `git-branch-D-undo-fbsd.sh` →
 `G01.4-packed` (packed-refs branch -D path not yet implemented).
 
+### Hard-assert discipline (AU06)
+
+Inside smoke bodies, every check is either:
+
+1. **Hard**: `smoke_fail "<diagnostic>"` when the expected behavior
+   doesn't hold. This is the default.
+2. **Carved**: the *whole smoke* gets an `EXCLUDED_BY:` /
+   `EXCLUDED_REASON:` header pointing at the sprint that closes
+   the gap. The smoke still asserts hard inside; the exclusion
+   keeps it out of CI's runner buckets entirely.
+
+There is no soft-assert third option. The two banned legacy
+patterns — literal `soft-assert` text and `[FOO-pending]` tags in
+`smoke_log` calls — are gated in CI via a grep in the
+`smoke-discovery` job. If you find yourself reaching for either,
+either tighten the assertion or carve the smoke.
+
 ## Authoring a new smoke
 
 1. Copy a peer (e.g. `rm-undo-linux.sh` for a Linux file-op smoke).
