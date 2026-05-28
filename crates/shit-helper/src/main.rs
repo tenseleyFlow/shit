@@ -2399,17 +2399,24 @@ fn request_loop(
             HelperRequest::ApplyMknod {
                 session,
                 command_seq,
-                ..
+                path,
+                mode,
+                dev,
             } => {
-                tracing::warn!(
+                let outcome = apply_mknod(&path, mode, dev);
+                tracing::info!(
                     %session,
                     command_seq,
-                    "ApplyMknod received but helper runtime is not yet wired (AU22 / DR-15.1)"
+                    path = %path,
+                    mode = format!("{mode:#o}"),
+                    dev,
+                    ?outcome,
+                    "apply_mknod"
                 );
                 let _ = conn.send_response(&HelperResponse::PrivilegedOpResult {
                     session,
                     command_seq,
-                    outcome: shit_proto::PrivilegedOpOutcome::PermissionDenied,
+                    outcome,
                 });
             }
         }
@@ -2463,6 +2470,149 @@ fn apply_chown(
                 if no_dereference { "lchown" } else { "chown" }
             ),
         },
+    }
+}
+
+/// AU22 / DR-15.1 — helper-side ApplyMknod handler for Fifo +
+/// Socket kinds. `mode` is the wire's S_IFIFO/S_IFSOCK | perm_bits
+/// composite; libc::mknod expects that exact shape. `dev` is
+/// ignored for Fifo/Socket (only meaningful for BlockDevice /
+/// CharDevice, which we refuse — see CAP_SYS_ADMIN note below).
+///
+/// BlockDevice / CharDevice need CAP_SYS_ADMIN even when the
+/// helper holds CAP_MKNOD; the standard helper capset doesn't
+/// grant it. We return PermissionDenied for those kinds so the
+/// executor's error surface mirrors what an unprivileged caller
+/// would see, deferring DR-15.2 (block/char) to a separate sprint
+/// with explicit policy review.
+fn apply_mknod(path: &str, mode: u32, _dev: u64) -> shit_proto::PrivilegedOpOutcome {
+    use shit_proto::PrivilegedOpOutcome;
+    use std::os::unix::fs::FileTypeExt;
+    // libc::mode_t is u32 on Linux, u16 on macOS — cast at the
+    // boundary so bitops + comparisons against libc constants
+    // type-check on both platforms.
+    let mode_native: libc::mode_t = mode as libc::mode_t;
+    let ifmt = mode_native & libc::S_IFMT;
+    if ifmt != libc::S_IFIFO && ifmt != libc::S_IFSOCK {
+        // BlockDevice/CharDevice (S_IFBLK/S_IFCHR), Regular
+        // (S_IFREG — planner shouldn't route Regular here), or 0
+        // (caller forgot to set the kind). All refused.
+        return PrivilegedOpOutcome::PermissionDenied;
+    }
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return PrivilegedOpOutcome::Failed {
+                err: format!("path contains NUL: {e}"),
+            };
+        }
+    };
+    // EEXIST handling: if the path already exists AND is the
+    // expected kind, treat as Applied (idempotent restore — the
+    // planner might have already replayed the op, or a parallel
+    // command recreated the same path). Anything else is a real
+    // conflict and bubbles up as Failed.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        let ft = meta.file_type();
+        let already_right =
+            (ifmt == libc::S_IFIFO && ft.is_fifo()) || (ifmt == libc::S_IFSOCK && ft.is_socket());
+        if already_right {
+            return PrivilegedOpOutcome::Applied;
+        }
+        return PrivilegedOpOutcome::Failed {
+            err: format!("path exists with wrong kind: {:?}", ft),
+        };
+    }
+    // `mode` includes both file-type and perm bits; libc::mknod
+    // expects exactly that composite. Perm bits are masked by
+    // umask; set umask(0) for the syscall so the captured mode
+    // round-trips byte-identical. The helper's IPC arm is
+    // single-threaded so the umask restore-before-yield is safe.
+    let prev_umask = unsafe { libc::umask(0) };
+    let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, 0) };
+    unsafe { libc::umask(prev_umask) };
+    if rc == 0 {
+        return PrivilegedOpOutcome::Applied;
+    }
+    let errno = std::io::Error::last_os_error();
+    match errno.raw_os_error() {
+        Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+        Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
+        _ => PrivilegedOpOutcome::Failed {
+            err: format!("mknod: {errno}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod apply_mknod_tests {
+    use super::*;
+    use shit_proto::PrivilegedOpOutcome;
+    use std::os::unix::fs::FileTypeExt;
+
+    #[test]
+    fn fifo_create_at_clean_path_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a_fifo");
+        let mode = (libc::S_IFIFO as u32) | 0o644;
+        let outcome = apply_mknod(p.to_str().unwrap(), mode, 0);
+        assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
+        assert!(ft.is_fifo(), "expected fifo, got {ft:?}");
+    }
+
+    #[test]
+    fn fifo_create_at_existing_fifo_is_idempotent_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a_fifo");
+        let mode = (libc::S_IFIFO as u32) | 0o644;
+        assert_eq!(
+            apply_mknod(p.to_str().unwrap(), mode, 0),
+            PrivilegedOpOutcome::Applied
+        );
+        // Second call on the same path with the same kind — applied.
+        assert_eq!(
+            apply_mknod(p.to_str().unwrap(), mode, 0),
+            PrivilegedOpOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn refuses_block_device_kind() {
+        let outcome = apply_mknod("/tmp/au22_blk", (libc::S_IFBLK as u32) | 0o644, 0);
+        assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+    }
+
+    #[test]
+    fn refuses_zero_kind() {
+        // No file-type bits set — caller forgot to encode the kind.
+        let outcome = apply_mknod("/tmp/au22_nokind", 0o644, 0);
+        assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+    }
+
+    #[test]
+    fn fifo_create_with_missing_parent_returns_not_found() {
+        let outcome = apply_mknod(
+            "/nonexistent/au22/parent/fifo",
+            (libc::S_IFIFO as u32) | 0o644,
+            0,
+        );
+        assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
+    }
+
+    #[test]
+    fn rejects_path_with_nul_byte() {
+        let outcome = apply_mknod("/tmp/has\0nul", (libc::S_IFIFO as u32) | 0o644, 0);
+        assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn existing_regular_file_at_path_is_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("regfile");
+        std::fs::write(&p, b"x").unwrap();
+        let outcome = apply_mknod(p.to_str().unwrap(), (libc::S_IFIFO as u32) | 0o644, 0);
+        assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
     }
 }
 
