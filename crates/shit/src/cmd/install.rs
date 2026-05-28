@@ -19,12 +19,12 @@
 //!
 //! ## Lib-path resolution
 //!
-//! The wrapper looks for `libshit-preload.{so,dylib}` in (in order):
+//! The wrapper looks for `libshit_preload_shim.{so,dylib}` in (in order):
 //!
 //! 1. `--lib <path>` argument (explicit override),
-//! 2. `$XDG_DATA_HOME/shit/lib/libshit-preload.{so,dylib}` (user-scope),
-//! 3. `/usr/local/lib/shit/libshit-preload.{so,dylib}` (system-scope),
-//! 4. `$CARGO_TARGET_DIR/<profile>/libshit_preload.{so,dylib}` (dev,
+//! 2. `$XDG_DATA_HOME/shit/lib/libshit_preload_shim.{so,dylib}` (user-scope),
+//! 3. `/usr/local/lib/shit/libshit_preload_shim.{so,dylib}` (system-scope),
+//! 4. `$CARGO_TARGET_DIR/<profile>/libshit_preload_shim.{so,dylib}` (dev,
 //!    detected via `OUT_DIR` of the current build),
 //! 5. The compile-time `CARGO_MANIFEST_DIR`-relative `target/debug/`
 //!    and `target/release/` paths.
@@ -42,7 +42,7 @@ use std::process::Command;
 
 #[derive(Debug, Clone, Args)]
 pub struct InstallArgs {
-    /// Explicit path to `libshit-preload.{so,dylib}`. Overrides the
+    /// Explicit path to `libshit_preload_shim.{so,dylib}`. Overrides the
     /// default search.
     #[arg(long, value_name = "PATH")]
     pub lib: Option<PathBuf>,
@@ -66,7 +66,7 @@ pub fn run(args: InstallArgs) -> Result<()> {
         bail!("shit install: missing command (try `shit install -- <cmd> <args...>`)");
     }
     let lib_path = resolve_lib_path(args.lib.as_deref())
-        .context("could not locate libshit-preload.{so,dylib}; pass `--lib <path>` or install the daemon package")?;
+        .context("could not locate libshit_preload_shim.{so,dylib}; pass `--lib <path>` or install the daemon package")?;
     let sock_path = resolve_sock_path(args.sock.as_deref())?;
 
     let preload_env = if cfg!(target_os = "macos") {
@@ -100,7 +100,7 @@ pub fn run(args: InstallArgs) -> Result<()> {
     std::process::exit(128);
 }
 
-/// Find `libshit-preload.{so,dylib}` in the documented search order.
+/// Find `libshit_preload_shim.{so,dylib}` in the documented search order.
 fn resolve_lib_path(override_path: Option<&Path>) -> Result<PathBuf> {
     let ext = if cfg!(target_os = "macos") {
         "dylib"
@@ -117,20 +117,20 @@ fn resolve_lib_path(override_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         let mut p = PathBuf::from(xdg);
         p.push("shit/lib");
-        p.push(format!("libshit-preload.{ext}"));
+        p.push(format!("libshit_preload_shim.{ext}"));
         candidates.push(p);
     }
     if let Ok(home) = crate::home_dir() {
         let mut p = home;
         p.push(".local/share/shit/lib");
-        p.push(format!("libshit-preload.{ext}"));
+        p.push(format!("libshit_preload_shim.{ext}"));
         candidates.push(p);
     }
     candidates.push(PathBuf::from(format!(
-        "/usr/local/lib/shit/libshit-preload.{ext}"
+        "/usr/local/lib/shit/libshit_preload_shim.{ext}"
     )));
     // Dev-mode fallbacks under the workspace target dir. The cdylib
-    // crate-type emits `libshit_preload.{so,dylib}` (underscored) so
+    // crate-type emits `libshit_preload_shim.{so,dylib}` (underscored) so
     // we check both forms.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir)
@@ -142,7 +142,7 @@ fn resolve_lib_path(override_path: Option<&Path>) -> Result<PathBuf> {
             let mut p = root.clone();
             p.push("target");
             p.push(profile);
-            p.push(format!("libshit_preload.{ext}"));
+            p.push(format!("libshit_preload_shim.{ext}"));
             candidates.push(p);
         }
     }
@@ -152,7 +152,7 @@ fn resolve_lib_path(override_path: Option<&Path>) -> Result<PathBuf> {
         }
     }
     bail!(
-        "no libshit-preload.{ext} found; searched: {}",
+        "no libshit_preload_shim.{ext} found; searched: {}",
         candidates
             .iter()
             .map(|p| p.display().to_string())
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn resolve_lib_path_rejects_nonexistent_override() {
-        let p = PathBuf::from("/nonexistent/path/libshit-preload.so");
+        let p = PathBuf::from("/nonexistent/path/libshit_preload_shim.so");
         let err = resolve_lib_path(Some(&p)).unwrap_err();
         assert!(format!("{err}").contains("does not exist"));
     }

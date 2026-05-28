@@ -17,7 +17,7 @@
 //!   suitable for `eval`-prepending in bash / zsh:
 //!
 //!   ```text
-//!   LD_PRELOAD='/usr/local/lib/shit/libshit-preload.so'
+//!   LD_PRELOAD='/usr/local/lib/shit/libshit_preload_shim.so'
 //!   SHIT_PRELOAD_ACTIVE='1'
 //!   SHIT_DAEMON_SOCK='/var/run/shit/daemon.sock'
 //!   ```
@@ -60,7 +60,7 @@ pub struct AutoInjectArgs {
     /// JSON output. Mutually exclusive with `--shell`.
     #[arg(long, default_value_t = false, conflicts_with = "shell")]
     pub json: bool,
-    /// Explicit path to `libshit-preload.{so,dylib}`. The hook
+    /// Explicit path to `libshit_preload_shim.{so,dylib}`. The hook
     /// resolves this at install time and bakes it in; this flag
     /// exists for test harnesses.
     #[arg(long, value_name = "PATH")]
@@ -111,7 +111,7 @@ fn default_lib_path_for_render() -> String {
     } else {
         "so"
     };
-    format!("/usr/local/lib/shit/libshit-preload.{ext}")
+    format!("/usr/local/lib/shit/libshit_preload_shim.{ext}")
 }
 
 fn default_sock_path_for_render() -> String {

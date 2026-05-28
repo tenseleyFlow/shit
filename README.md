@@ -29,7 +29,7 @@ make ci     # everything CI runs
 
 - **`shit`** — the CLI: `shit undo`, `shit redo`, `shit list`, `shit show`, `shit pin`, `shit doctor`, …
 - **`shitd`** — a per-user daemon that owns the snapshot store, the sqlite index, the IPC sockets, and the undo planner.
-- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + an optional LD_PRELOAD shim on FreeBSD. Falls back to FSEvents-degraded on un-entitled macOS installs.
+- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + LD_PRELOAD shim on FreeBSD (the shim is the supported default; running without it is reported by `shit doctor` as the degraded `kqueue-only` tier). Falls back to FSEvents-degraded on un-entitled macOS installs.
 - **shell hooks** (bash, zsh, fish) that bracket each command with metadata events sent over a per-user Unix-domain-socket.
 
 When a command writes, renames, unlinks, or otherwise mutates a file inside a tracked process subtree, the helper captures the pre-image *before* the kernel allows the syscall to complete — using `clonefile` (APFS), `reflink` (btrfs/XFS), `zfs clone` (ZFS), hardlink, or streaming copy, picking the cheapest tier the underlying filesystem supports. Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`. When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
@@ -128,7 +128,7 @@ Each entry below has a green CI smoke. The capture mechanism column is named at 
 
 ### FreeBSD
 
-Capture tier: kqueue (`EVFILT_VNODE` NOTE_WRITE/RENAME/DELETE/ATTRIB) + optional LD_PRELOAD shim for the cross-watch / install-overwrite race. Capsicum sandbox available via `SHIT_CAPSICUM=1` (default-off in current shipping; default-on tracked in B05).
+Capture tier: kqueue (`EVFILT_VNODE` NOTE_WRITE/RENAME/DELETE/ATTRIB) + LD_PRELOAD shim for the cross-watch / install-overwrite race. The shim is the supported default; `shit doctor` reports the `kqueue-only` tier when the shim is missing and surfaces a multi-line WARN block telling you which classes of pre-image you lose. Capsicum sandbox is default-on (B05); set `SHIT_CAPSICUM=0` to opt out.
 
 | Class | Smoke |
 |---|---|

@@ -130,7 +130,8 @@ pub struct BsdReport {
     /// Live helper handshake probe result.
     pub helper_handshake: HelperHandshakeReport,
     /// True iff the LD_PRELOAD shim is installed at the expected
-    /// path (`/usr/local/lib/shit/libshit_preload.so`).
+    /// path (`/usr/local/lib/shit/libshit_preload_shim.so`), or at
+    /// the path pointed to by `SHIT_PRELOAD_SHIM_PATH` if set.
     pub preload_shim_installed: bool,
 }
 
