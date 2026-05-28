@@ -16,15 +16,16 @@
 //!
 //! ## Append vs Truncate
 //!
-//! Stage 1 (AR06.5 MVP) handles only truncate-class operators
-//! (`>`, `>|`, `2>`, `&>`, `tee` without `-a`, `dd of=`). Append-class
-//! operators (`>>`, `tee -a`, `&>>`) want the planner-side
-//! `InverseOp::FileExtend { truncate_to: pre_size }` path, which isn't
-//! emitted from `FilePreImage` events today — they'd need either an
-//! `is_append` flag on the event kind or a separate event type. Append
-//! targets surface as a per-target error rather than silently dropping;
-//! the shell ignores per-target errors and continues. The structural
-//! work is deferred (see DR-CR-55 in DEFERRED-RUNTIME.md).
+//! Truncate-class operators (`>`, `>|`, `2>`, `&>`, `tee` without
+//! `-a`, `dd of=`) journal a [`CaptureEventKind::FilePreImage`] with
+//! the file's full pre-content blob; inverse is `RestoreContent` via
+//! tmpfile-rename.
+//!
+//! Append-class operators (`>>`, `tee -a`, `&>>`) journal a
+//! [`CaptureEventKind::FileAppendPreStash`] with only the file's
+//! pre-size (no blob — the bytes that need restoring are still on
+//! disk in `[0..pre_size]`); inverse is `FileExtend { truncate_to:
+//! pre_size }` via `ftruncate(2)`. AU27 / DR-CR-55 closed this.
 
 use crate::active_commands::ActiveCommands;
 use shit_planner::CommandId;
@@ -108,13 +109,68 @@ fn stash_one(
             stash_truncate(target.path.as_str(), command, index, blob_store)
         }
         RedirectOpWire::Append | RedirectOpWire::TeeAppend => {
-            // DR-CR-55: append-class capture needs a FileExtend
-            // emission path that doesn't exist yet. Surface honestly
-            // rather than capturing-but-restoring-too-aggressively
-            // (which would clobber the user's appended lines on undo).
-            Err("append redirect capture deferred (DR-CR-55)".to_string())
+            // AU27 — Append/TeeAppend capture journals only the
+            // pre-size (no blob); inverse is FileExtend which
+            // truncates the file back at undo time. The bytes that
+            // need restoring are still on disk in [0..pre_size]; the
+            // appended bytes [pre_size..] get discarded by the
+            // truncate.
+            stash_append(target.path.as_str(), command, index)
         }
     }
+}
+
+fn stash_append(path_str: &str, command: CommandId, index: &Index) -> Result<StashOutcome, String> {
+    let path = Path::new(path_str);
+    // Fresh-file fast-path: `echo X >> /tmp/new.log` on a
+    // non-existent target. There's no pre-state to truncate
+    // back to. AR05.1-style fresh-create journaling could
+    // emit a TreeOp::Create here; deferred to a sibling
+    // sprint.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(path = %path.display(), "append target absent; nothing to pre-stash");
+            return Ok(StashOutcome::Skipped);
+        }
+        Err(e) => return Err(format!("stat: {e}")),
+    };
+    // Same special-file defense as stash_truncate — only
+    // regular files have a pre_size that means "truncate-back."
+    if !meta.file_type().is_file() {
+        return Err(format!("not a regular file ({:?})", meta.file_type()));
+    }
+    // Empty file fast-path: appending to a 0-byte file. Truncate
+    // back would be a no-op (already 0 bytes after the inverse
+    // runs IFF the truncate is the only inverse). Skip the
+    // journal entry; no work, no event.
+    if meta.size() == 0 {
+        debug!(path = %path.display(), "append target empty; nothing to pre-stash");
+        return Ok(StashOutcome::Skipped);
+    }
+    let ts = crate::server::next_ts();
+    let event = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts,
+        partial: false,
+        kind: CaptureEventKind::FileAppendPreStash {
+            inode: InodeRef::new(meta.dev(), meta.ino()),
+            path: PathBuf::from(path),
+            pre_size: meta.size(),
+        },
+    };
+    index
+        .put_event(&event)
+        .map_err(|e| format!("put_event: {e}"))?;
+    debug!(
+        path = %path.display(),
+        pre_size = meta.size(),
+        session = %command.session,
+        seq = command.seq,
+        "append pre-stashed"
+    );
+    Ok(StashOutcome::Stashed)
 }
 
 fn stash_truncate(
@@ -321,8 +377,12 @@ mod tests {
         }
     }
 
+    /// AU27 — Append targets are no longer deferred. The
+    /// stash_append path journals a FileAppendPreStash event
+    /// with the file's pre_size; the planner emits
+    /// `InverseOp::FileExtend` from that event.
     #[test]
-    fn append_target_records_per_target_error_but_does_not_fail_request() {
+    fn append_target_stashes_pre_size() {
         let (dir, blob_store, index, active) = fresh();
         let path = write_file(dir.path(), "log.txt", b"old\n");
         let cmd = CommandId {
@@ -343,9 +403,44 @@ mod tests {
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
-                assert_eq!(r.stashed, 0);
-                assert_eq!(r.errors.len(), 1);
-                assert!(r.errors[0].reason.contains("append"));
+                assert_eq!(r.stashed, 1, "stashed: got {}", r.stashed);
+                assert!(
+                    r.errors.is_empty(),
+                    "no errors expected, got {:?}",
+                    r.errors
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// AU27 — empty file fast-path: appending to a 0-byte
+    /// target produces no journal entry (no inverse needed —
+    /// truncate-to-0 of an already-0 file is a no-op).
+    #[test]
+    fn append_to_empty_file_skips_journal() {
+        let (dir, blob_store, index, active) = fresh();
+        let path = write_file(dir.path(), "empty.log", b"");
+        let cmd = CommandId {
+            session: fresh_session(),
+            seq: 1,
+        };
+        register_command(&index, cmd);
+        let resp = handle(
+            cmd.session,
+            cmd.seq,
+            vec![RedirectTargetWire {
+                op: RedirectOpWire::Append,
+                path: path.to_string_lossy().to_string(),
+            }],
+            &active,
+            &index,
+            &blob_store,
+        );
+        match resp {
+            CtlResponse::PreStashRedirectsAck(r) => {
+                assert_eq!(r.stashed, 0, "empty file shouldn't stash");
+                assert!(r.errors.is_empty(), "skip is not an error: {:?}", r.errors);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -361,6 +456,10 @@ mod tests {
             seq: 1,
         };
         register_command(&index, cmd);
+        // AU27: Truncate(good) + Truncate(missing) + Append(good)
+        // → Truncate(good) stashes, Truncate(missing) skips
+        // cleanly (file absent), Append(good) stashes.
+        // 2 stashed, 0 errors.
         let resp = handle(
             cmd.session,
             cmd.seq,
@@ -384,9 +483,8 @@ mod tests {
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
-                assert_eq!(r.stashed, 1, "stashed: got {}", r.stashed);
-                assert_eq!(r.errors.len(), 1, "errors: got {:?}", r.errors);
-                assert!(r.errors[0].reason.contains("append"));
+                assert_eq!(r.stashed, 2, "stashed: got {}", r.stashed);
+                assert!(r.errors.is_empty(), "errors: got {:?}", r.errors);
             }
             other => panic!("unexpected response: {other:?}"),
         }
