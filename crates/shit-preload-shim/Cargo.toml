@@ -9,7 +9,7 @@ authors.workspace = true
 description = "LD_PRELOAD/DYLD_INSERT_LIBRARIES libc-interposition shim for shit-helper (S10 BSD tier)"
 
 [lib]
-# `cdylib` produces libshit_preload.{so,dylib} suitable for LD_PRELOAD.
+# `cdylib` produces libshit_preload_shim.{so,dylib} suitable for LD_PRELOAD.
 # `rlib` is added so downstream Rust consumers (the `shit install`
 # wrapper, the auto-inject helper, the daemon-side install_hook
 # config) can reuse the pure-logic prefix matcher / install-pattern

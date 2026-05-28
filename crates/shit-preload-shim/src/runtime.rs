@@ -111,7 +111,7 @@ pub fn stripped_env_names() -> &'static [&'static str] {
 
 /// Produce the env-var assignments that the `shit install` wrapper
 /// (and the shell auto-injector) prepends to the user's command.
-/// `lib_path` is the absolute path to `libshit_preload.{so,dylib}`;
+/// `lib_path` is the absolute path to `libshit_preload_shim.{so,dylib}`;
 /// `sock_path` is the daemon UDS. The caller is responsible for
 /// joining each `(k, v)` into the child's environment using whatever
 /// spawn API they're driving.
