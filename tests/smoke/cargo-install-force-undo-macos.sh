@@ -137,9 +137,15 @@ sleep 0.7
 # The DYLD shim's rename interposer captures the OLD bytes as a
 # pre-image. shitd journals it. undo restores.
 smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} cargo install --force (v2) into ${CARGO_ROOT}"
+# `set +e` so a non-zero cargo exit doesn't kill the script before
+# we dump the log. (`set -e` from lib.sh is otherwise on; the Linux
+# twin has the same latent bug — works only because Linux cargo
+# doesn't fail under the shim.)
+set +e
 ( cd "${CRATE_DIR}" && DYLD_INSERT_LIBRARIES="${SHIM_LIB}" cargo install --force --root "${CARGO_ROOT}" --path . --quiet ) \
     >"${SHIT_SMOKE_TMP}/cargo-v2.log" 2>&1
 CARGO_RC=$?
+set -e
 if [ "${CARGO_RC}" -ne 0 ]; then
     smoke_log "cargo install --force log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/cargo-v2.log" >&2
