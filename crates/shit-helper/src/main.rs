@@ -2444,7 +2444,10 @@ fn apply_chown(
         Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
         Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
         _ => PrivilegedOpOutcome::Failed {
-            err: format!("{}: {errno}", if no_dereference { "lchown" } else { "chown" }),
+            err: format!(
+                "{}: {errno}",
+                if no_dereference { "lchown" } else { "chown" }
+            ),
         },
     }
 }
@@ -2462,7 +2465,11 @@ mod apply_chown_tests {
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
         let outcome = apply_chown(p.to_str().unwrap(), uid, gid, false);
-        assert_eq!(outcome, PrivilegedOpOutcome::Applied, "self-chown should succeed without CAP_CHOWN");
+        assert_eq!(
+            outcome,
+            PrivilegedOpOutcome::Applied,
+            "self-chown should succeed without CAP_CHOWN"
+        );
     }
 
     #[test]
