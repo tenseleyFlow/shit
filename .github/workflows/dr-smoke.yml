@@ -406,6 +406,32 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  route-add-undo-macos:
+    # M06.3 / DR-44 — `route add -net 192.0.2.0/24 127.0.0.1` via
+    # the route-wrapper journals a NetworkOp; `shit undo` synthesises
+    # `route delete -net 192.0.2.0/24` from the netstat diff and
+    # restores the routing table. Validates the wrapper + RouteInspector
+    # + synthesise_route + PrivilegedNetRunner end-to-end.
+    name: route-add-undo smoke (M06.3 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/route-add-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: route-add-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   kill-proc-libproc-macos:
     # M06.2 — kill <pid> via the kill wrapper journals a ProcessOp
     # event whose ProcSnapshot was sourced via libproc + KERN_PROCARGS2.
