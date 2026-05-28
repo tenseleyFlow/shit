@@ -199,6 +199,17 @@ enum Cmd {
         /// fails to ack within the timeout.
         #[arg(long, conflicts_with_all = ["json", "fix", "emit_sudoers_snippet"])]
         shutdown_daemon: bool,
+        /// AU12 — scan a path for binaries whose mutations bypass the
+        /// LD_PRELOAD shim. Today: setuid only (S_ISUID bit set).
+        /// Statically-linked detection is deferred to AU12.A. Honors
+        /// `--json` for machine-readable output. Skips the full doctor
+        /// pass — just emits the `VisibilityReport`.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["fix", "emit_sudoers_snippet", "shutdown_daemon"]
+        )]
+        visibility: Option<std::path::PathBuf>,
     },
     /// macOS power-user EndpointSecurity setup helper. Documents +
     /// applies the SIP-disable + AuthRoot-disable + AMFI-bypass +
@@ -401,6 +412,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
             emit_sudoers_snippet,
             target,
             shutdown_daemon,
+            visibility,
         } => {
             if emit_sudoers_snippet {
                 let parsed: doctor::snippet::SudoersTarget = target.parse().map_err(|e| {
@@ -414,6 +426,9 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
             }
             if shutdown_daemon {
                 return Ok(doctor::run_shutdown_daemon()?);
+            }
+            if let Some(path) = visibility {
+                return Ok(doctor::run_visibility(&path, json)?);
             }
             Ok(doctor::run(json)?)
         }
