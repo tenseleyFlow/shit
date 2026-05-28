@@ -37,3 +37,11 @@
 ))]
 #[path = "kqueue/capture.rs"]
 pub mod capture;
+
+// M07.C — re-export the codesign verify facade so integration
+// tests in `tests/` (which can only see the lib's public surface)
+// can call `verify_path` against a deliberately-corrupted helper
+// copy and assert the failure shape end-to-end.
+#[cfg(target_os = "macos")]
+#[path = "codesign_verify.rs"]
+pub mod codesign_verify;

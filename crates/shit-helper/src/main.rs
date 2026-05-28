@@ -27,6 +27,8 @@ mod capsicum_bsd;
 ))]
 mod capture;
 mod cloud;
+#[cfg(target_os = "macos")]
+mod codesign_verify;
 mod container;
 mod crash;
 mod db;
