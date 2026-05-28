@@ -280,6 +280,73 @@ unsafe extern "C" fn my_futimens(fd: c_int, times: *const libc::timespec) -> c_i
     unsafe { libc::futimens(fd, times) }
 }
 
+// macOS xattr signatures diverge from Linux: extra `position` arg
+// (legacy resource-fork offset, near-universally 0) and `flags` arg
+// (XATTR_NOFOLLOW etc). The `policy::notify_pre_mutation` we use
+// here is path-only (no content read) — shim-side xattr pre-image
+// capture (reading current xattr value to enable byte-identical
+// undo) is a follow-up slice (M07.B.4.1). For now we record that
+// xattr changed on this path, and daemon/planner xattr support
+// inherits from the ES producer (M03.x.XATTR).
+
+/// Replacement for `setxattr(2)`.
+///
+/// # Safety
+/// Same contract as `libc::setxattr`.
+unsafe extern "C" fn my_setxattr(
+    path: *const c_char,
+    name: *const c_char,
+    value: *const c_void,
+    size: libc::size_t,
+    position: u32,
+    flags: c_int,
+) -> c_int {
+    policy::notify_pre_mutation("setxattr", &cstr_to_string(path));
+    unsafe { libc::setxattr(path, name, value, size, position, flags) }
+}
+
+/// Replacement for `fsetxattr(2)`. fd → path via F_GETPATH.
+///
+/// # Safety
+/// Same contract as `libc::fsetxattr`.
+unsafe extern "C" fn my_fsetxattr(
+    fd: c_int,
+    name: *const c_char,
+    value: *const c_void,
+    size: libc::size_t,
+    position: u32,
+    flags: c_int,
+) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation("fsetxattr", &path);
+    }
+    unsafe { libc::fsetxattr(fd, name, value, size, position, flags) }
+}
+
+/// Replacement for `removexattr(2)`.
+///
+/// # Safety
+/// Same contract as `libc::removexattr`.
+unsafe extern "C" fn my_removexattr(
+    path: *const c_char,
+    name: *const c_char,
+    flags: c_int,
+) -> c_int {
+    policy::notify_pre_mutation("removexattr", &cstr_to_string(path));
+    unsafe { libc::removexattr(path, name, flags) }
+}
+
+/// Replacement for `fremovexattr(2)`. fd → path via F_GETPATH.
+///
+/// # Safety
+/// Same contract as `libc::fremovexattr`.
+unsafe extern "C" fn my_fremovexattr(fd: c_int, name: *const c_char, flags: c_int) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation("fremovexattr", &path);
+    }
+    unsafe { libc::fremovexattr(fd, name, flags) }
+}
+
 /// Best-effort fd → path via `fcntl(F_GETPATH)`. Returns `None`
 /// if the fd isn't backed by a path (anon fds, pipes, sockets)
 /// or if the call fails. macOS-specific: `F_GETPATH` writes up
@@ -420,6 +487,34 @@ static INTERPOSE_FUTIMENS: InterposeEntry = InterposeEntry {
     target: libc::futimens as *const c_void,
 };
 
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_SETXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_setxattr as *const c_void,
+    target: libc::setxattr as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FSETXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_fsetxattr as *const c_void,
+    target: libc::fsetxattr as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_REMOVEXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_removexattr as *const c_void,
+    target: libc::removexattr as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FREMOVEXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_fremovexattr as *const c_void,
+    target: libc::fremovexattr as *const c_void,
+};
+
 /// `(replacement, target)` pair the dynamic linker expects in
 /// `__DATA,__interpose`. Two `*const c_void`s, naturally aligned,
 /// equivalent to Apple's C `DYLD_INTERPOSE` macro output.
@@ -556,6 +651,40 @@ mod tests {
     }
 
     #[test]
+    fn setxattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_SETXATTR.replacement.is_null());
+        assert!(!INTERPOSE_SETXATTR.target.is_null());
+        assert_ne!(INTERPOSE_SETXATTR.replacement, INTERPOSE_SETXATTR.target);
+    }
+
+    #[test]
+    fn fsetxattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FSETXATTR.replacement.is_null());
+        assert!(!INTERPOSE_FSETXATTR.target.is_null());
+        assert_ne!(INTERPOSE_FSETXATTR.replacement, INTERPOSE_FSETXATTR.target);
+    }
+
+    #[test]
+    fn removexattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_REMOVEXATTR.replacement.is_null());
+        assert!(!INTERPOSE_REMOVEXATTR.target.is_null());
+        assert_ne!(
+            INTERPOSE_REMOVEXATTR.replacement,
+            INTERPOSE_REMOVEXATTR.target
+        );
+    }
+
+    #[test]
+    fn fremovexattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FREMOVEXATTR.replacement.is_null());
+        assert!(!INTERPOSE_FREMOVEXATTR.target.is_null());
+        assert_ne!(
+            INTERPOSE_FREMOVEXATTR.replacement,
+            INTERPOSE_FREMOVEXATTR.target
+        );
+    }
+
+    #[test]
     fn fd_to_path_returns_none_for_bad_fd() {
         // fd -1 is never valid; F_GETPATH returns -1, our helper None.
         assert!(fd_to_path(-1).is_none());
@@ -608,8 +737,13 @@ mod tests {
             // M07.B.3: utimes family
             &INTERPOSE_UTIMES,
             &INTERPOSE_FUTIMENS,
+            // M07.B.4: xattr family
+            &INTERPOSE_SETXATTR,
+            &INTERPOSE_FSETXATTR,
+            &INTERPOSE_REMOVEXATTR,
+            &INTERPOSE_FREMOVEXATTR,
         ];
-        assert_eq!(entries.len(), 15, "M07.A.2 + M07.B.1..3 interposer count");
+        assert_eq!(entries.len(), 19, "M07.A.2 + M07.B.1..4 interposer count");
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
