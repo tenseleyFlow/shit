@@ -46,7 +46,7 @@ smoke_fail() {
     # Stop the daemon so its tracing-appender's WorkerGuard drops
     # and the JSON log is fully flushed to disk. Then dump it so the
     # failure surfaces the daemon-side breadcrumbs.
-    smoke_stop_shitd
+    smoke_stop_shitd || true
     smoke_dump_daemon_logs
     exit 1
 }
@@ -139,41 +139,73 @@ smoke_start_shitd() {
 # signal doesn't hang the smoke indefinitely (smoke_fail still gets
 # a chance to fire).
 
+# AU09 — four-step graceful shutdown:
+#   (1) `shit doctor --shutdown-daemon` via the ctl socket.
+#   (2) SIGTERM after the ctl path's 2s grace window.
+#   (3) SIGKILL after another 1s.
+#   (4) verify via `kill -0`; log ZOMBIE + return non-zero on survival.
+# The pre-AU09 instrumentation (B04.6c) is preserved: every transition
+# logs a timestamped breadcrumb so cross-platform-actions runs can be
+# reconstructed from the captured stderr alone.
 smoke_stop_shitd() {
-    # === B04.6c INSTRUMENTATION ===
-    # Earlier evidence showed bash hangs forever past "stopping shitd"
-    # for service-restart, while every other smoke completes here in
-    # ~5 sec (SIGTERM ignored, SIGKILL after 5-sec backoff works).
-    # Service-restart appears to be the only smoke where SIGKILL is
-    # also deferred. Log every step so we see exactly which line
-    # blocks.
+    local zombie=0
+    local shit_bin="${SHIT_SMOKE_BIN_DIR}/shit"
     printf '[stop-shitd %s] enter (SHITD_PID=%s)\n' "$(date -u +%H:%M:%S)" "${SHITD_PID:-unset}" >&2
-    if [ -n "${SHITD_PID}" ] && kill -0 "${SHITD_PID}" 2>/dev/null; then
-        printf '[stop-shitd %s] alive — SIGTERM %s\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
-        kill -TERM "${SHITD_PID}" 2>/dev/null || true
+
+    if [ -z "${SHITD_PID:-}" ] || ! kill -0 "${SHITD_PID}" 2>/dev/null; then
+        printf '[stop-shitd %s] not alive (no SHITD_PID or kill -0 failed)\n' "$(date -u +%H:%M:%S)" >&2
+    else
         local i
-        for i in $(seq 1 50); do
-            kill -0 "${SHITD_PID}" 2>/dev/null || { printf '[stop-shitd %s] gone after SIGTERM (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
-            sleep 0.1
-        done
-        if kill -0 "${SHITD_PID}" 2>/dev/null; then
-            printf '[stop-shitd %s] still alive after 5 sec — SIGKILL %s\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
-            kill -KILL "${SHITD_PID}" 2>/dev/null || true
-            # Wait briefly for SIGKILL to take effect; sample state.
-            for i in $(seq 1 50); do
-                kill -0 "${SHITD_PID}" 2>/dev/null || { printf '[stop-shitd %s] gone after SIGKILL (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
+        # Step 1 — graceful ctl-shutdown. `shit doctor --shutdown-daemon`
+        # is idempotent (exits 0 whether the daemon acked or was already
+        # gone), so we treat its non-zero return as advisory and fall
+        # through to SIGTERM regardless.
+        if [ -x "${shit_bin}" ]; then
+            printf '[stop-shitd %s] step1 ctl-shutdown\n' "$(date -u +%H:%M:%S)" >&2
+            "${shit_bin}" doctor --shutdown-daemon >&2 2>&1 || \
+                printf '[stop-shitd %s] step1 ctl non-zero (advisory)\n' "$(date -u +%H:%M:%S)" >&2
+            for i in $(seq 1 20); do
+                kill -0 "${SHITD_PID}" 2>/dev/null || \
+                    { printf '[stop-shitd %s] step1 gone after ctl (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
                 sleep 0.1
             done
-            if kill -0 "${SHITD_PID}" 2>/dev/null; then
-                printf '[stop-shitd %s] DEFERRED-SIGKILL — process %s alive 5 sec after SIGKILL\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
-                printf '[stop-shitd %s] procstat -k:\n' "$(date -u +%H:%M:%S)" >&2
-                procstat -k "${SHITD_PID}" 2>&1 | sed 's/^/  /' >&2 || true
-                printf '[stop-shitd %s] ps state:\n' "$(date -u +%H:%M:%S)" >&2
-                ps -o pid,stat,wchan,command -p "${SHITD_PID}" 2>&1 | sed 's/^/  /' >&2 || true
-            fi
+        else
+            printf '[stop-shitd %s] step1 skipped (no shit bin at %s)\n' "$(date -u +%H:%M:%S)" "${shit_bin}" >&2
         fi
-    else
-        printf '[stop-shitd %s] not alive (kill -0 failed)\n' "$(date -u +%H:%M:%S)" >&2
+
+        # Step 2 — SIGTERM.
+        if kill -0 "${SHITD_PID}" 2>/dev/null; then
+            printf '[stop-shitd %s] step2 SIGTERM\n' "$(date -u +%H:%M:%S)" >&2
+            kill -TERM "${SHITD_PID}" 2>/dev/null || true
+            for i in $(seq 1 10); do
+                kill -0 "${SHITD_PID}" 2>/dev/null || \
+                    { printf '[stop-shitd %s] step2 gone after TERM (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
+                sleep 0.1
+            done
+        fi
+
+        # Step 3 — SIGKILL.
+        if kill -0 "${SHITD_PID}" 2>/dev/null; then
+            printf '[stop-shitd %s] step3 SIGKILL\n' "$(date -u +%H:%M:%S)" >&2
+            kill -KILL "${SHITD_PID}" 2>/dev/null || true
+            for i in $(seq 1 10); do
+                kill -0 "${SHITD_PID}" 2>/dev/null || \
+                    { printf '[stop-shitd %s] step3 gone after KILL (i=%d)\n' "$(date -u +%H:%M:%S)" "${i}" >&2; break; }
+                sleep 0.1
+            done
+        fi
+
+        # Step 4 — verify. Zombie ⇒ non-zero return; callers that care
+        # (the graceful-shutdown smoke) check it. smoke_cleanup wraps
+        # `|| true` because it must remain idempotent.
+        if kill -0 "${SHITD_PID}" 2>/dev/null; then
+            zombie=1
+            printf '[stop-shitd %s] ZOMBIE — pid %s alive after ctl+TERM+KILL\n' "$(date -u +%H:%M:%S)" "${SHITD_PID}" >&2
+            if command -v procstat >/dev/null 2>&1; then
+                procstat -k "${SHITD_PID}" 2>&1 | sed 's/^/  /' >&2 || true
+            fi
+            ps -o pid,stat,wchan,command -p "${SHITD_PID}" 2>&1 | sed 's/^/  /' >&2 || true
+        fi
     fi
     # Reap any orphaned shit-helper subprocesses. shitd spawns
     # shit-helper as a child on handshake; if shitd dies via SIGKILL
@@ -186,13 +218,18 @@ smoke_stop_shitd() {
     wait "${SHITD_PID}" 2>/dev/null || true
     printf '[stop-shitd %s] after wait; pkill shit-helper\n' "$(date -u +%H:%M:%S)" >&2
     pkill -f 'target/release/shit-helper' 2>/dev/null || true
-    printf '[stop-shitd %s] return\n' "$(date -u +%H:%M:%S)" >&2
+    pkill -f 'target/debug/shit-helper' 2>/dev/null || true
+    printf '[stop-shitd %s] return (zombie=%d)\n' "$(date -u +%H:%M:%S)" "${zombie}" >&2
+    return "${zombie}"
 }
 
 smoke_cleanup() {
     local rc=$?
     printf '[cleanup %s] enter (rc=%d)\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
-    smoke_stop_shitd
+    # AU09 — smoke_stop_shitd returns non-zero on a zombie daemon; in
+    # cleanup we always continue (the original exit code drives the
+    # smoke's final disposition, not the cleanup's).
+    smoke_stop_shitd || true
     printf '[cleanup %s] smoke_stop_shitd returned; iterating SHIT_SMOKE_PIDS\n' "$(date -u +%H:%M:%S)" >&2
     # Iterate guarded: precondition-skip paths exit before populating
     # the array, and `set -u` would explode on `"${arr[@]}"` then.

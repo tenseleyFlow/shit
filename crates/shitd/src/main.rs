@@ -421,6 +421,11 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // is a no-op in degraded mode.
     let watch_ready_for_server = helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready));
     let live_baseline_for_server = Arc::clone(&live_baseline);
+    // AU09 — capture socket paths before `cfg` moves into server::serve
+    // so we can unlink them on the shutdown path below.
+    let ctl_sock_path = cfg.ctl_socket_path.clone();
+    let hook_sock_path = cfg.hook_socket_path.clone();
+    let shim_sock_path = shim_listener::shim_socket_path(&cfg);
     let result = tokio::select! {
         r = server::serve(
             cfg,
@@ -450,6 +455,29 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     if let Some(h) = helper_dispatch_handle {
         h.abort();
     }
+
+    // AU09 — kill the helper child explicitly BEFORE the tokio runtime
+    // drop. The dispatch loop runs `recv_response_with_fd` inside a
+    // `spawn_blocking` task that holds a blocking recv on the helper's
+    // SOCK_SEQPACKET fd; `abort()` cancels the outer task but the
+    // blocking thread can't be cancelled, so the runtime drop would
+    // otherwise wait until the helper exits on its own (3–5s on
+    // FreeBSD, observed empirically). Killing the helper now closes
+    // its socket end, which unblocks the recv, which lets the runtime
+    // drop in milliseconds.
+    if let Some(link) = helper_link_arc.as_ref() {
+        link.kill_helper();
+    }
+
+    // AU09 — unlink IPC sockets so the on-disk inode disappearance
+    // is the load-bearing signal of a clean shutdown (vs. SIGKILL,
+    // which leaves them dangling). Bind-time `remove_file` covers
+    // the next-daemon-startup path; explicit unlink here covers the
+    // same-uid "is the daemon up?" probe that just checks the
+    // socket inode without trying to connect.
+    let _ = std::fs::remove_file(&ctl_sock_path);
+    let _ = std::fs::remove_file(&hook_sock_path);
+    let _ = std::fs::remove_file(&shim_sock_path);
     result
 }
 
