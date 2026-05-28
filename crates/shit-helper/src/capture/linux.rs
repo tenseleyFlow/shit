@@ -631,15 +631,25 @@ impl LinuxCaptureRuntime {
         // still carries mode/uid/gid so the daemon's marker-only
         // path emits TreeOp::Unlink with the right kind+mode for
         // the planner's RecreatePath inverse.
-        let expected_type = if ev.is_directory {
-            FileType::Directory
-        } else {
-            FileType::Regular
-        };
+        // AU29 — for non-dir unlinks we accept Regular, Fifo, and
+        // Socket as valid kinds. Pre-AU29 the check hard-coded
+        // Regular, so FIFO/Socket unlinks always race-lost (the
+        // held fd's fstat returned Fifo/Socket which != Regular)
+        // even when AU29's pre_open extension stashed an O_PATH
+        // fd. (dev, inode) match is the strong identity gate;
+        // kind-mismatch via inode reuse is a near-impossible race
+        // and isn't load-bearing for correctness here.
         let race_won = capture_fd_owned.is_some()
             && capture_dev == ev_dev_userspace
             && capture_inode == ev.inode
-            && file_type == expected_type;
+            && (if ev.is_directory {
+                file_type == FileType::Directory
+            } else {
+                matches!(
+                    file_type,
+                    FileType::Regular | FileType::Fifo | FileType::Socket
+                )
+            });
         let race_fd = capture_fd_owned;
         // Alias to keep the wire-build block below readable.
         let _ = (capture_dev, capture_inode);
@@ -1128,9 +1138,16 @@ impl LinuxCaptureRuntime {
         // post-undo. Marker-only (dev=0, inode=0) for the race-lost
         // path; same shape `handle_lsm_mkdir` already uses for its
         // PRE-creation hook visibility race.
+        //
+        // AU29 — add O_NONBLOCK so a FIFO open (mknod-routed
+        // creation) doesn't block waiting for a writer. No-op for
+        // regular files; gives O_RDONLY-style fd for FIFOs that
+        // can be fstat'd. Sockets return ENXIO and fall to the
+        // marker-only path (which still journals the TreeOpCreate
+        // wire above).
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&resolved_path)
             .ok();
 
@@ -1147,15 +1164,27 @@ impl LinuxCaptureRuntime {
                 (0, 0, FileType::Regular)
             }
         };
-        if file_type != FileType::Regular {
-            // O_NOFOLLOW caught a symlink, or something else; skip.
-            tracing::trace!(
-                path = %resolved_path.display(),
-                ?file_type,
-                "lsm create: non-regular post-stat; skipping"
-            );
-            return;
-        }
+        // AU29 — accept Fifo / Socket here (mknod routes through
+        // this same handler via on_create). Pre-AU29 the
+        // hard-coded `!= Regular` check skipped FIFOs/Sockets
+        // even when their birth was captured, so the planner
+        // never got a TreeOpCreate to invert.
+        let wire_kind = match file_type {
+            FileType::Regular => shit_proto::FileKindWire::Regular,
+            FileType::Fifo => shit_proto::FileKindWire::Fifo,
+            FileType::Socket => shit_proto::FileKindWire::Socket,
+            _ => {
+                // O_NOFOLLOW caught a symlink, dir (impossible here
+                // since process_lsm_mkdir handles that), or Other
+                // (Block/Char device, marker-only race-lost).
+                tracing::trace!(
+                    path = %resolved_path.display(),
+                    ?file_type,
+                    "lsm create: unsupported post-stat kind; skipping"
+                );
+                return;
+            }
+        };
 
         let path_str = path_to_string(&resolved_path);
         let resp = HelperResponse::TreeMutation {
@@ -1165,7 +1194,7 @@ impl LinuxCaptureRuntime {
                 dev,
                 inode,
                 path: path_str.clone(),
-                kind: shit_proto::FileKindWire::Regular,
+                kind: wire_kind,
                 mode,
             },
             ts_unix_nanos: now_unix_nanos(),
@@ -1189,7 +1218,14 @@ impl LinuxCaptureRuntime {
         if let Some(f) = opened {
             let ws = self.watches.entry(command).or_default();
             let fd_raw = f.as_raw_fd();
-            if let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw)) {
+            // AU29 — only read content bytes for regular files.
+            // FIFOs/Sockets have no bytes; read_pre_image would
+            // return an empty Vec or fail. Skip the snapshot but
+            // still stash the fd in pre_opens for the unlink
+            // race-win path.
+            if file_type == FileType::Regular
+                && let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw))
+            {
                 ws.pre_snapshots
                     .insert((dev, inode), PreSnapshot { meta, bytes });
             }
@@ -1688,6 +1724,33 @@ fn pre_open_recurse(
             pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
             continue;
         }
+        // AU29 — capture FIFOs and sockets with an O_PATH fd so
+        // the inode_unlink LSM handler can race-win when one is
+        // removed mid-session. Without this, the helper has no
+        // held fd, race_won=false, and the marker-only path emits
+        // meta_wire=None → wire mode=0 → daemon's
+        // kind_from_mode_bits falls through to Regular → executor
+        // recreates the path as a regular empty file instead of
+        // dispatching mknod via the AU22 helper-IPC route.
+        //
+        // O_PATH works on FIFO/Socket inodes without opening for
+        // I/O (no blocking write side, no socket connect). Same
+        // shape as the dir branch above; fstat returns the right
+        // mode bits via the held fd.
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() || ft.is_socket() {
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                ws.pre_opens
+                    .insert((meta.dev(), meta.ino()), OwnedFd::from(f));
+                ws.path_to_inode
+                    .insert(path.clone(), (meta.dev(), meta.ino()));
+            }
+            continue;
+        }
         if !ft.is_file() {
             continue;
         }
@@ -1902,6 +1965,8 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     let kind = match (st.st_mode as libc::mode_t) & libc::S_IFMT {
         libc::S_IFREG => FileType::Regular,
         libc::S_IFDIR => FileType::Directory,
+        libc::S_IFIFO => FileType::Fifo,
+        libc::S_IFSOCK => FileType::Socket,
         _ => FileType::Other,
     };
     Some((st.st_dev, st.st_ino, kind))
@@ -1911,6 +1976,8 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
 enum FileType {
     Regular,
     Directory,
+    Fifo,
+    Socket,
     Other,
 }
 
