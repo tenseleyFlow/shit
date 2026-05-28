@@ -190,6 +190,56 @@ unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
     unsafe { libc::mkdir(path, mode) }
 }
 
+/// Replacement for `chmod(2)`. M07.B.1.
+///
+/// Captures the path + pre-image so the planner can record the
+/// old mode and restore on undo. The `_with_content` notify also
+/// reads file bytes — wasteful for chmod-only mutations, but
+/// harmless (the planner picks `ChmodMetadata` inverse based on
+/// the event type, ignoring the bytes payload). Future tightening:
+/// a metadata-only notify variant that skips the read.
+///
+/// # Safety
+/// Same contract as `libc::chmod` — `path` must be a valid
+/// NUL-terminated C string.
+unsafe extern "C" fn my_chmod(path: *const c_char, mode: mode_t) -> c_int {
+    policy::notify_pre_mutation_with_content("chmod", &cstr_to_string(path));
+    unsafe { libc::chmod(path, mode) }
+}
+
+/// Replacement for `fchmod(2)`. Resolves the fd → path via
+/// `fcntl(F_GETPATH)` so the daemon receives a path-based event
+/// like every other interposer. Skip-notifies if F_GETPATH fails
+/// (typical for pipe / socket / anon-mmap fds, which aren't
+/// chmod targets anyway).
+///
+/// # Safety
+/// Same contract as `libc::fchmod` — `fd` must be a valid file
+/// descriptor.
+unsafe extern "C" fn my_fchmod(fd: c_int, mode: mode_t) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("fchmod", &path);
+    }
+    unsafe { libc::fchmod(fd, mode) }
+}
+
+/// Best-effort fd → path via `fcntl(F_GETPATH)`. Returns `None`
+/// if the fd isn't backed by a path (anon fds, pipes, sockets)
+/// or if the call fails. macOS-specific: `F_GETPATH` writes up
+/// to `MAXPATHLEN` (1024) bytes into the user buffer.
+fn fd_to_path(fd: c_int) -> Option<String> {
+    use libc::{F_GETPATH, MAXPATHLEN, fcntl};
+    let mut buf = [0u8; MAXPATHLEN as usize];
+    // SAFETY: buf is large enough for F_GETPATH; fcntl writes a
+    // NUL-terminated path into it on success.
+    let rc = unsafe { fcntl(fd, F_GETPATH, buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let nul = buf.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&buf[..nul]).ok().map(str::to_string)
+}
+
 /// Replacement for `mkdirat(2)`. Dirfd-relative variant.
 ///
 /// # Safety
@@ -262,6 +312,20 @@ static INTERPOSE_MKDIR: InterposeEntry = InterposeEntry {
 static INTERPOSE_MKDIRAT: InterposeEntry = InterposeEntry {
     replacement: my_mkdirat as *const c_void,
     target: libc::mkdirat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_CHMOD: InterposeEntry = InterposeEntry {
+    replacement: my_chmod as *const c_void,
+    target: libc::chmod as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHMOD: InterposeEntry = InterposeEntry {
+    replacement: my_fchmod as *const c_void,
+    target: libc::fchmod as *const c_void,
 };
 
 /// `(replacement, target)` pair the dynamic linker expects in
@@ -350,6 +414,45 @@ mod tests {
         assert_ne!(INTERPOSE_MKDIRAT.replacement, INTERPOSE_MKDIRAT.target);
     }
 
+    #[test]
+    fn chmod_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_CHMOD.replacement.is_null());
+        assert!(!INTERPOSE_CHMOD.target.is_null());
+        assert_ne!(INTERPOSE_CHMOD.replacement, INTERPOSE_CHMOD.target);
+    }
+
+    #[test]
+    fn fchmod_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHMOD.replacement.is_null());
+        assert!(!INTERPOSE_FCHMOD.target.is_null());
+        assert_ne!(INTERPOSE_FCHMOD.replacement, INTERPOSE_FCHMOD.target);
+    }
+
+    #[test]
+    fn fd_to_path_returns_none_for_bad_fd() {
+        // fd -1 is never valid; F_GETPATH returns -1, our helper None.
+        assert!(fd_to_path(-1).is_none());
+    }
+
+    #[test]
+    fn fd_to_path_resolves_open_file_to_its_path() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "hi").unwrap();
+        let p = tmp.path().to_path_buf();
+        // Open via libc::open to mirror what an interposed caller has.
+        let path_c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "open of temp file should succeed");
+        let resolved = fd_to_path(fd);
+        unsafe { libc::close(fd) };
+        let resolved = resolved.expect("F_GETPATH should resolve a real file fd");
+        // macOS canonicalizes /tmp to /private/tmp; compare via canonicalize.
+        let want = std::fs::canonicalize(&p).unwrap();
+        let got = std::fs::canonicalize(&resolved).unwrap();
+        assert_eq!(got, want);
+    }
+
     /// Cross-cutting: count of expected interpose entries.
     /// Regression gate — if someone adds a static without bumping
     /// the assertion, the test points to the omission in code
@@ -368,8 +471,11 @@ mod tests {
             &INTERPOSE_OPENAT,
             &INTERPOSE_MKDIR,
             &INTERPOSE_MKDIRAT,
+            // M07.B.1: chmod family
+            &INTERPOSE_CHMOD,
+            &INTERPOSE_FCHMOD,
         ];
-        assert_eq!(entries.len(), 8, "M07.A.2 final interposer count");
+        assert_eq!(entries.len(), 10, "M07.A.2 + M07.B.1 interposer count");
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
