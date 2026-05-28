@@ -38,6 +38,15 @@ pub struct CtlState {
     /// immediately so the shell hook doesn't block on a non-existent
     /// signal.
     pub watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
+    /// AU28 / DR-15 stage-1 — helper link for privileged-op routing.
+    /// When `Some`, `handle_undo` wraps it in a
+    /// `HelperLinkPrivilegedOpRouter` and threads it into the
+    /// `FileExecutor`, so chown ops the daemon can't perform (no
+    /// CAP_CHOWN) get dispatched to the helper. `None` in degraded
+    /// mode — the FileExecutor falls back to `NoOpPrivilegedOpRouter`
+    /// (every privileged op returns PermissionDenied; user sees the
+    /// original EPERM).
+    pub helper_link: Option<Arc<crate::helper_link::HelperLink>>,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -101,6 +110,7 @@ async fn handle_client(
         db_stash,
         active,
         watch_ready,
+        helper_link,
     } = state;
     // Length-prefix-first read so we can grow the buffer up to
     // MAX_LARGE_FRAME_SIZE only when a large payload (ContainerEvent
@@ -167,7 +177,12 @@ async fn handle_client(
         }
         CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
-        CtlRequest::Undo(req) => handle_undo(req, &index, &blob_store),
+        CtlRequest::Undo(req) => handle_undo(
+            req,
+            &index,
+            &blob_store,
+            helper_link.as_ref().map(Arc::clone),
+        ),
         CtlRequest::WaitWatchReady {
             session,
             command_seq,
@@ -574,7 +589,8 @@ impl shit_planner::BlobReader for BlobReaderShim<'_> {
 /// the operator wants enabled (a hardened deployment might disable
 /// PackageExecutor to refuse pkg rollbacks entirely).
 struct MultiTierExecutor<'a> {
-    file_executor: shit_planner::FileExecutor<'a, BlobReaderShim<'a>>,
+    file_executor:
+        shit_planner::FileExecutor<'a, BlobReaderShim<'a>, crate::priv_op_router::EitherRouter>,
     package_executor: shit_planner::executors::PackageExecutor<PrivilegedPkgRunner>,
     service_executor: shit_planner::executors::ServiceExecutor<PrivilegedSvcRunner>,
     network_executor: shit_planner::executors::NetworkExecutor<PrivilegedNetRunner>,
@@ -1077,7 +1093,12 @@ async fn handle_wait_watch_ready(
 
 /// S24.C — execute an UndoPlan derived from the most recent N completed
 /// commands. Returns a wire-friendly report; the CLI prints it as-is.
-fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlResponse {
+fn handle_undo(
+    req: UndoRequest,
+    index: &Index,
+    blob_store: &BlobStore,
+    helper_link: Option<Arc<crate::helper_link::HelperLink>>,
+) -> CtlResponse {
     use shit_planner::{
         ConflictPolicy, FileExecutor, LiveStateProbe, Orchestrator, OutcomeKind, plan,
     };
@@ -1157,8 +1178,16 @@ fn handle_undo(req: UndoRequest, index: &Index, blob_store: &BlobStore) -> CtlRe
             };
             shell_state_exec = shell_state_exec.with_apply(target);
         }
+        // AU28 — when a helper link is alive, wrap it in the
+        // privileged-op router so FileExecutor can dispatch chown
+        // (and post-AU22, mknod) requests to the helper. In
+        // degraded mode (no helper), fall back to NoOp — the
+        // executor surfaces the original EPERM as Failed{...}.
+        let priv_router = crate::priv_op_router::EitherRouter::from_optional_link(
+            helper_link.as_ref().map(Arc::clone),
+        );
         let executor = MultiTierExecutor {
-            file_executor: FileExecutor::new(&reader),
+            file_executor: FileExecutor::with_privileged_router(&reader, priv_router),
             package_executor: shit_planner::executors::PackageExecutor::new(PrivilegedPkgRunner),
             service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
             network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),

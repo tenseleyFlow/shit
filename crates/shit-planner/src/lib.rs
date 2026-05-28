@@ -49,7 +49,8 @@ pub use events::{
 pub use exec_log::{ExecLog, ExecLogError, default_dir as exec_log_default_dir, read_all};
 pub use executor::{
     BlobReadError, BlobReader, ConflictPolicy, ExecutionOutcome, ExecutionRecord, ExecutionReport,
-    InMemoryBlobReader, InverseOpExecutor, OutcomeKind, PlanSummary,
+    InMemoryBlobReader, InMemoryPrivilegedOpRouter, InverseOpExecutor, NoOpPrivilegedOpRouter,
+    OutcomeKind, PlanSummary, PrivilegedOpOutcome, PrivilegedOpRouter,
 };
 pub use executors::FileExecutor;
 pub use inode::{BlobHash, InodeRef};
