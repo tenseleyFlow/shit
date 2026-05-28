@@ -51,6 +51,16 @@ enum shit_event_kind {
      * snapshot. Closes the in-place-write gap (open(O_RDWR) +
      * write/pwrite/mmap without rename/unlink/truncate). */
     SHIT_EVT_RELEASE = 8,
+    /* AU29 — `lsm/inode_mknod` event. Fires on mkfifo(3) +
+     * mknod(2) for FIFO/Socket/Block/Char kinds (inode_create
+     * fires only for regular-file creation). Payload reuses
+     * shit_create_event; the discriminator is the S_IF bits in
+     * `e->mode`. Userspace routes through on_create →
+     * handle_lsm_create (same handler — kind derivation from
+     * mode is shared). AU22's mknod restore path consumes the
+     * resulting RecreatePath{Fifo|...} when the dentry's later
+     * removed and recreated. */
+    SHIT_EVT_MKNOD = 9,
 };
 
 /* Bounded comm length matches kernel's TASK_COMM_LEN. */
