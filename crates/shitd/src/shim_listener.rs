@@ -298,6 +298,78 @@ fn ingest_notification(
         // additive.
     }
 
+    // M07.B.5: metadata-mutation syscalls (chmod / chown / utimes /
+    // xattr families). The shim's pre-image carries the OLD
+    // mode/uid/gid/mtime; ingest as a FilePreImage event so the
+    // event lands in the journal with the BEFORE metadata fields
+    // populated. Without this branch, fchmodat / fchownat /
+    // utimensat etc. fall through to classify_tree_op (which
+    // returns None for them) and the daemon drops the event —
+    // undo has nothing to invert.
+    //
+    // Planner-side: synthesizing a metadata-restore inverse from
+    // a FilePreImage that has no companion TreeOp is the M07.B.6
+    // follow-up. This slice ships the journal correctness fix; the
+    // planner gap is surfaced explicitly so undo reports "captured
+    // but not yet restorable" rather than silently failing.
+    //
+    // Why not use the richer `MetadataChange { before, after }`
+    // event the ES producer emits? Because the shim notifies
+    // BEFORE the libc passthrough returns — a daemon-side stat to
+    // capture `after` sees the unchanged BEFORE state (the chmod
+    // hasn't fired yet on the file). Capturing `after` properly
+    // would require either (a) shim sending a post-syscall
+    // follow-up notification, or (b) the planner inferring after-
+    // state from the syscall arg shape. Both are M07.B.6 scope.
+    if matches!(
+        note.syscall.as_str(),
+        "chmod"
+            | "fchmod"
+            | "fchmodat"
+            | "chown"
+            | "fchown"
+            | "lchown"
+            | "fchownat"
+            | "utimes"
+            | "futimes"
+            | "futimens"
+            | "utimensat"
+            | "setxattr"
+            | "fsetxattr"
+            | "removexattr"
+            | "fremovexattr"
+    ) {
+        if let Some(pre) = &note.pre_image {
+            if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
+                warn!(
+                    err = %e,
+                    pid = note.pid,
+                    syscall = %note.syscall,
+                    "shim notify: metadata pre-image ingest failed"
+                );
+            } else {
+                debug!(
+                    pid = note.pid,
+                    syscall = %note.syscall,
+                    arg = %note.arg,
+                    "shim notify: metadata-mutation pre-image journaled (M07.B.5)"
+                );
+            }
+        } else {
+            // No pre-image — typical for xattr family (path-only
+            // notify today) or fd-based variants where F_GETPATH
+            // failed. Drop with a debug log; the lack of journal
+            // entry surfaces at undo as a coverage gap.
+            debug!(
+                pid = note.pid,
+                syscall = %note.syscall,
+                arg = %note.arg,
+                "shim notify: metadata-mutation without pre-image; dropping"
+            );
+        }
+        return;
+    }
+
     // W06.A.4: content syscalls with attached pre-image take the
     // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
