@@ -406,6 +406,31 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  pfctl-undo-macos:
+    # M06.4 / DR-42 — loads a benign `pass quick all` ruleset via
+    # the pfctl-wrapper, then `shit undo` reloads the captured
+    # pre-state via `/sbin/pfctl -f <stashed>`. Validates the
+    # FullReload executor path on macOS-14.
+    name: pfctl-undo smoke (M06.4 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/pfctl-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pfctl-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   route-add-undo-macos:
     # M06.3 / DR-44 — `route add -net 192.0.2.0/24 127.0.0.1` via
     # the route-wrapper journals a NetworkOp; `shit undo` synthesises
