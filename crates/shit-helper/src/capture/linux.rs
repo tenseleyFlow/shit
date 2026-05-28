@@ -141,6 +141,30 @@ struct WatchState {
     /// up the destination path here PRE-rename-handler-update and find
     /// the OLD inode, then read its pre-snapshot.
     path_to_inode: BTreeMap<PathBuf, (u64, u64)>,
+    /// AU17 — count of `send_response{_with_fd}` failures within this
+    /// watch window. Every Err returning from a daemon-IPC send that
+    /// would have shipped a CapturedPreImage / TreeMutation increments
+    /// this. Logged loudly at `on_unwatch_tree` so the operator can
+    /// see when capture events were lost mid-session (daemon socket
+    /// disrupted, helper IPC saturated).
+    ///
+    /// AU17 ships VISIBILITY only — non-zero counts emit a WARN at
+    /// session-close. Surfacing the degraded state on the wire so
+    /// `shit undo` flags it to the user is a follow-up sprint.
+    ///
+    /// Counts only TRUE wire failures (daemon socket disconnected,
+    /// write returned Err) — NOT dedupe-skips or other intentional
+    /// short-circuits.
+    silent_send_failures: u32,
+}
+
+impl WatchState {
+    /// AU17 — increment the silent-send-failure counter (saturating
+    /// at u32::MAX). Called from every `send_response{_with_fd}` Err
+    /// path in this module.
+    fn note_silent_send_failure(&mut self) {
+        self.silent_send_failures = self.silent_send_failures.saturating_add(1);
+    }
 }
 
 /// AR01.1.fix-pre-open-tree-recursion — bounded recursion depth for
@@ -262,6 +286,24 @@ impl LinuxCaptureRuntime {
                     seq = command.seq,
                     pending,
                     "unwatch_tree: dropping unresolved pending creates (parent mkdir never landed)"
+                );
+            }
+            // AU17 — surface the silent-send-failure count so the
+            // operator can see when capture events were lost mid-
+            // session (daemon socket disrupted, helper IPC saturated).
+            // The counter is incremented every time
+            // `send_response{_with_fd}` returns Err inside an LSM /
+            // fanotify handler. Zero is the normal case; non-zero
+            // means the journal is incomplete for this command.
+            // Wire + CLI warning surface (so `shit undo` flags a
+            // degraded session for the user) is deferred to a
+            // follow-up sprint — this commit ships visibility.
+            if ws.silent_send_failures > 0 {
+                tracing::warn!(
+                    session = %command.session,
+                    seq = command.seq,
+                    silent_send_failures = ws.silent_send_failures,
+                    "unwatch_tree: session capture is DEGRADED — some events were silently dropped (daemon socket failures)"
                 );
             }
         }
@@ -420,6 +462,7 @@ impl LinuxCaptureRuntime {
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "send_response_with_fd failed");
+            ws.note_silent_send_failure();
         }
 
         ws.dedupe.insert(
@@ -656,6 +699,7 @@ impl LinuxCaptureRuntime {
         };
         if let Err(e) = send_result {
             tracing::warn!(error = %e, "lsm send_response failed");
+            ws.note_silent_send_failure();
         }
 
         // (Dedupe already invalidated up-front at handler entry, so
@@ -816,6 +860,7 @@ impl LinuxCaptureRuntime {
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "lsm setattr send_response_with_fd failed");
+            ws.note_silent_send_failure();
         }
 
         ws.dedupe.insert(
@@ -951,6 +996,7 @@ impl LinuxCaptureRuntime {
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "lsm mkdir send_response failed");
+            ws.note_silent_send_failure();
         }
 
         tracing::info!(
@@ -1112,6 +1158,13 @@ impl LinuxCaptureRuntime {
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "lsm create send_response failed");
+            // AU17 — `ws` from handle_lsm_create's scope is gone;
+            // re-borrow here. Best-effort (the watch may have been
+            // unwatched mid-flight, in which case the counter has
+            // nowhere to go and we just log the warn above).
+            if let Some(ws) = self.watches.get_mut(&command) {
+                ws.note_silent_send_failure();
+            }
             return;
         }
 
@@ -1245,6 +1298,7 @@ impl LinuxCaptureRuntime {
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "lsm open send_response_with_fd failed");
+            ws.note_silent_send_failure();
         }
 
         ws.dedupe
@@ -1397,6 +1451,7 @@ impl LinuxCaptureRuntime {
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "lsm release send_response_with_fd failed");
+            ws.note_silent_send_failure();
         }
 
         ws.dedupe
@@ -1498,6 +1553,7 @@ impl LinuxCaptureRuntime {
                         .send_response_with_fd(&resp, staging_fd.as_raw_fd())
                     {
                         tracing::warn!(error = %e, "lsm rename target-pre-image send_response_with_fd failed");
+                        ws.note_silent_send_failure();
                     } else {
                         tracing::info!(
                             session = %ev.command.session,
@@ -1530,6 +1586,7 @@ impl LinuxCaptureRuntime {
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "lsm rename send_response failed");
+            ws.note_silent_send_failure();
         }
 
         tracing::info!(
@@ -2249,6 +2306,49 @@ mod tests {
         assert_eq!(ws.dedupe.len(), 1, "exactly one dedupe entry");
         let entry = ws.dedupe.values().next().unwrap();
         assert!(entry.invalidated);
+    }
+
+    /// AU17 — counter mechanism: `note_silent_send_failure` is
+    /// idempotent + saturating, and `on_unwatch_tree` reads the
+    /// final value. Each `send_response{_with_fd}` Err branch in
+    /// the handlers calls this; integration paths are mechanical
+    /// line-by-line additions, validated end-to-end by smoke
+    /// runners.
+    #[test]
+    fn silent_send_failure_counter_increments_and_saturates() {
+        let mut ws = WatchState::default();
+        assert_eq!(ws.silent_send_failures, 0);
+        ws.note_silent_send_failure();
+        ws.note_silent_send_failure();
+        ws.note_silent_send_failure();
+        assert_eq!(ws.silent_send_failures, 3);
+        // Saturate doesn't wrap.
+        ws.silent_send_failures = u32::MAX - 1;
+        ws.note_silent_send_failure();
+        ws.note_silent_send_failure();
+        ws.note_silent_send_failure();
+        assert_eq!(ws.silent_send_failures, u32::MAX);
+    }
+
+    /// AU17 — `on_unwatch_tree` logs (at warn) when the counter is
+    /// non-zero. We can't easily intercept the tracing macro in
+    /// unit tests, but we CAN verify the unwatch correctly clears
+    /// the watch state regardless of the counter.
+    #[test]
+    fn on_unwatch_tree_with_silent_failures_still_clears_state() {
+        let (mut rt, _dir, _staging) = fresh_runtime();
+        let cmd = ghost_cmd();
+        // Populate watch state + a synthetic counter value.
+        rt.on_watch_tree(cmd);
+        {
+            let ws = rt.watches.get_mut(&cmd).expect("watch state");
+            ws.silent_send_failures = 7;
+        }
+        rt.on_unwatch_tree(cmd);
+        assert!(
+            !rt.watches.contains_key(&cmd),
+            "on_unwatch_tree should clear the WatchState"
+        );
     }
 
     /// L04 — kernel→glibc dev_t conversion vector. Picked from a real
