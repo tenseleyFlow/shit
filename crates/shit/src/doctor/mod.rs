@@ -451,6 +451,7 @@ fn collect_macos() -> Option<json::MacReport> {
         helper_handshake: probe_helper_handshake(),
         es_capable,
         es_blockers,
+        dyld_shim: macos::probe_dyld_shim(),
     })
 }
 
