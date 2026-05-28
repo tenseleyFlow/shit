@@ -76,6 +76,68 @@ impl HelperCaps {
     }
 }
 
+/// Code-signature kind reported by the helper at startup
+/// (M07.C.1). macOS-specific today; other platforms send
+/// `SignatureKind::NotApplicable` via the `SelfVerifyReport`
+/// wire shape and the daemon ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignatureKind {
+    /// Ad-hoc signed (no team identifier). Local dev builds,
+    /// SIP-disabled power-user installs.
+    AdHoc,
+    /// Signed with a Developer ID Application certificate.
+    /// Production release artifacts (post-M04 with paperwork).
+    DeveloperIdApplication,
+    /// Signed but with an unrecognized authority chain.
+    /// Suspicious; daemon logs at WARN.
+    UnknownAuthority,
+    /// Unsigned binary. Pre-M04 dev builds AND tampered
+    /// binaries both land here; the daemon discriminates via
+    /// the platform's expected state.
+    Unsigned,
+    /// Reported on non-macOS platforms — `SelfVerifyReport` is
+    /// always populated on the wire for forward-compat but
+    /// non-macOS helpers carry this sentinel.
+    NotApplicable,
+}
+
+/// Self-verification report sent on the handshake (M07.C.3).
+/// macOS helper runs `codesign --verify --strict --deep` on
+/// itself + extracts metadata via `codesign -d --verbose=4`.
+/// Other platforms populate it with `NotApplicable` so the
+/// wire shape stays the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfVerifyReport {
+    /// True if the verify call succeeded. Daemon refuses the
+    /// helper handshake on `ok=false` (macOS) and logs at
+    /// ERROR; on other platforms the field is informational.
+    pub ok: bool,
+    /// When `ok=false`, the platform-specific failure detail
+    /// (e.g. `"codesign --verify: code object is not signed at all"`).
+    pub reason: Option<String>,
+    /// Apple Team Identifier (10-char string) extracted from
+    /// `codesign -d --verbose=4`. `None` for ad-hoc / unsigned
+    /// / non-macOS.
+    pub team_id: Option<String>,
+    /// Signature shape. Daemon logs at INFO; informational.
+    pub signature_kind: SignatureKind,
+}
+
+impl SelfVerifyReport {
+    /// Sentinel for platforms that don't run the codesign
+    /// check. Used by Linux + FreeBSD helpers so the field is
+    /// populated end-to-end without per-platform optionality
+    /// at the call site.
+    pub fn not_applicable() -> Self {
+        Self {
+            ok: true,
+            reason: None,
+            team_id: None,
+            signature_kind: SignatureKind::NotApplicable,
+        }
+    }
+}
+
 /// Kind of kernel auth event surfaced by the helper. Mirrors the
 /// per-platform event taxonomy at a portable level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +272,17 @@ pub enum HelperResponse {
         /// `None`, behavior unchanged from pre-3 baseline).
         #[serde(default)]
         degraded_reason: Option<String>,
+        /// M07.C.3 — code-signature self-verification result.
+        /// macOS helpers run `codesign --verify --strict --deep`
+        /// on themselves at startup and ship the result here.
+        /// Other platforms populate `SelfVerifyReport::not_applicable()`.
+        ///
+        /// serde-default with `not_applicable()` shape so
+        /// pre-M07.C helpers' acks deserialize cleanly (daemon
+        /// observes the sentinel and treats them as it would
+        /// any non-macOS platform).
+        #[serde(default = "SelfVerifyReport::not_applicable")]
+        self_verify: SelfVerifyReport,
     },
     /// One pending auth event awaiting daemon's `AuthDecision`. The
     /// content fd (when needed) is attached via SCM_RIGHTS — never
@@ -656,6 +729,7 @@ mod tests {
             helper_version: "shit-helper 0.1.0 (commit deadbeef)".into(),
             kernel_tier: "fanotify".into(),
             degraded_reason: None,
+            self_verify: SelfVerifyReport::not_applicable(),
         };
         let bytes = encode_frame(&ack).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
