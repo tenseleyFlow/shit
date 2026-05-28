@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# shit ifconfig wrapper (macOS, M06.3 / DR-44). PATH-prepended via
+# the shell hook so `ifconfig <if> up|down|alias|-alias` invocations
+# route through here. Mutating verbs fire a `net-event ifconfig
+# pre / post` bracket; query forms (`ifconfig` alone, `ifconfig
+# <if>` alone) pass through unchanged.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then
+    echo "shit-ifconfig-wrapper: loop detected (depth=$depth); refusing" >&2
+    exit 127
+fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+real=""
+for cand in /sbin/ifconfig; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+if [[ -z "$real" ]]; then
+    echo "shit-ifconfig-wrapper: real ifconfig not found at /sbin/ifconfig" >&2
+    exit 127
+fi
+
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then
+    exec "$real" "$@"
+fi
+
+# ifconfig argv: `ifconfig <interface> <verb> [args...]`. With no
+# args it dumps everything; with just an interface it queries.
+# We treat anything past arg 2 as potentially mutating (alias,
+# -alias, up, down, inet ..., delete, ...). Conservative: bracket
+# whenever there's at least 2 args.
+if [[ "$#" -ge 2 ]]; then
+    verb="$2"
+    case "$verb" in
+        up|down|alias|-alias|inet|inet6|delete|create|destroy|mtu|ether)
+            "$HELPER" net-event ifconfig pre "--verb=$verb" --scope-hint= 2>/dev/null || true
+            "$real" "$@"
+            rc=$?
+            "$HELPER" net-event ifconfig post "--verb=$verb" --scope-hint= 2>/dev/null || true
+            exit "$rc"
+            ;;
+    esac
+fi
+
+exec "$real" "$@"
