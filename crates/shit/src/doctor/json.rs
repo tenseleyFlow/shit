@@ -305,6 +305,45 @@ pub struct MacReport {
     /// CLI's `shit setup-es-mode --print` can format the same data.
     #[serde(default)]
     pub es_blockers: Vec<EsBlocker>,
+    /// M07-doctor — dyld-shim install state. Reports whether the
+    /// shim dylib exists at a known path and whether the user's
+    /// shell rc files carry the `shit dyld-hooks install` snippet.
+    /// Lets `shit doctor` surface "shim isn't installed; run `shit
+    /// dyld-hooks install`" without the user having to inspect
+    /// their rc files by hand.
+    ///
+    /// serde-default so pre-M07-doctor doctor reports deserialize
+    /// cleanly.
+    #[serde(default)]
+    pub dyld_shim: DyldShimReport,
+}
+
+/// M07-doctor — dyld-shim install-state probe. Mirrors the
+/// resolution logic in `shit dyld-hooks status` so users get
+/// the same answer from `shit doctor --json` they'd get from
+/// the dedicated subcommand.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DyldShimReport {
+    /// True if the shim dylib resolved at one of the expected
+    /// paths (env var, Homebrew prefix, repo `target/`).
+    pub shim_dylib_present: bool,
+    /// The resolved dylib path, when present.
+    pub shim_dylib_path: Option<String>,
+    /// True if at least one of the user's shell rc files
+    /// (`~/.zshrc`, `~/.bashrc`) carries the `shit dyld-hooks
+    /// install` snippet markers.
+    pub rc_snippet_installed: bool,
+    /// Per-rc-file presence breakdown. Each entry is the rc-file
+    /// path and whether the snippet is present in it.
+    pub rc_files_checked: Vec<DyldShimRcFile>,
+}
+
+/// Per-rc-file entry under [`DyldShimReport::rc_files_checked`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DyldShimRcFile {
+    pub path: String,
+    pub exists: bool,
+    pub snippet_installed: bool,
 }
 
 /// EndpointSecurity probe result.
@@ -668,6 +707,7 @@ mod tests {
             },
             es_capable: false,
             es_blockers: vec![],
+            dyld_shim: DyldShimReport::default(),
         });
         let s = serde_json::to_string(&r).expect("serialize");
         assert!(s.contains("\"runtime_capture\":\"fsevents-degraded\""));
