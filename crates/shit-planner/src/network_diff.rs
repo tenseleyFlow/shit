@@ -45,12 +45,12 @@ pub fn synthesise_diff_apply_inverse(
         NetworkTool::IpRoute => synthesise_ip_route(before_state, after_state),
         NetworkTool::IpAddr => synthesise_ip_addr(before_state, after_state),
         NetworkTool::IpLink => synthesise_ip_link(before_state, after_state),
+        NetworkTool::Networksetup => synthesise_networksetup(before_state, after_state),
         // FullReload / DiffApplyWithReset tools don't reach this
         // function; the planner gates by restore_method first.
         // DiffApply tools we haven't implemented yet land here.
         NetworkTool::Route
         | NetworkTool::Ifconfig
-        | NetworkTool::Networksetup
         | NetworkTool::Iptables
         | NetworkTool::Ip6tables
         | NetworkTool::Nft
@@ -530,6 +530,93 @@ fn canonicalize_ufw_rule(rule: &str) -> Vec<String> {
     out
 }
 
+// =================================================================
+// networksetup (macOS) — M06.1: DNS-only first ship.
+// =================================================================
+
+/// Parsed shape of a captured `networksetup -getdnsservers
+/// <service>` snapshot. The helper prepends a `# scope=<service>`
+/// header line so we know which service to target on undo without
+/// per-event scope plumbing through the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworksetupDnsSnapshot {
+    /// Network service name (e.g. "Wi-Fi", "Ethernet").
+    service: String,
+    /// DNS servers in the order networksetup reported them. Empty
+    /// when networksetup said "There aren't any DNS Servers set
+    /// on <service>." — undo of "added DNS" must restore the
+    /// empty state via the literal `empty` arg to setdnsservers.
+    servers: Vec<String>,
+}
+
+/// Parse a captured DNS snapshot. Returns None when the header
+/// line is missing or malformed (defensive — synthesizer emits
+/// no inverse, planner logs a Informational warning).
+fn parse_networksetup_dns_snapshot(bytes: &[u8]) -> Option<NetworksetupDnsSnapshot> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    let header = lines.next()?;
+    let service = header.strip_prefix("# scope=")?.to_string();
+    if service.is_empty() {
+        return None;
+    }
+    let mut servers = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // "There aren't any DNS Servers set on <service>." → no
+        // servers configured. The undo for "added DNS" is to
+        // restore that empty state via `setdnsservers <svc> empty`.
+        if trimmed.starts_with("There aren't any DNS Servers set") {
+            continue;
+        }
+        servers.push(trimmed.to_string());
+    }
+    Some(NetworksetupDnsSnapshot { service, servers })
+}
+
+fn synthesise_networksetup(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
+    let Some(pre) = parse_networksetup_dns_snapshot(before) else {
+        return Vec::new();
+    };
+    // Best-effort consistency: the pre + post snapshots should
+    // share a service (the user's `-setdnsservers <svc>` invocation
+    // didn't switch services mid-flight). When `after` doesn't
+    // parse, fall through — the undo's `setdnsservers` is still
+    // correct since we use `pre`'s service identity.
+    if let Some(post) = parse_networksetup_dns_snapshot(after)
+        && post.service != pre.service
+    {
+        // Different services in before/after → we don't have a
+        // single coherent inverse; bail. The planner will surface
+        // an Informational warning to the operator.
+        return Vec::new();
+    }
+    // If servers didn't actually change (e.g. user re-set the same
+    // list), the undo is a no-op.
+    if let Some(post) = parse_networksetup_dns_snapshot(after)
+        && post.servers == pre.servers
+    {
+        return Vec::new();
+    }
+    let mut argv = vec![
+        "networksetup".to_string(),
+        "-setdnsservers".to_string(),
+        pre.service,
+    ];
+    if pre.servers.is_empty() {
+        // The literal "empty" arg clears DNS servers on the
+        // service. networksetup uses this sentinel because passing
+        // zero positional servers is ambiguous with usage errors.
+        argv.push("empty".to_string());
+    } else {
+        argv.extend(pre.servers);
+    }
+    vec![argv]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,6 +961,84 @@ mod tests {
         let before = b"garbage with no numbered section".to_vec();
         let after = b"different garbage".to_vec();
         let inv = synthesise_ufw_inverse(&before, &after);
+        assert!(inv.is_empty());
+    }
+
+    // M06.1 — networksetup DNS synthesizer.
+
+    #[test]
+    fn networksetup_parses_scope_header_and_servers() {
+        let raw = b"# scope=Wi-Fi\n1.1.1.1\n8.8.8.8\n";
+        let snap = parse_networksetup_dns_snapshot(raw).expect("parses");
+        assert_eq!(snap.service, "Wi-Fi");
+        assert_eq!(snap.servers, vec!["1.1.1.1", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn networksetup_parses_empty_dns_form() {
+        // The literal "There aren't any DNS Servers set on Wi-Fi."
+        // is networksetup's way of saying "no DNS configured".
+        let raw = b"# scope=Wi-Fi\nThere aren't any DNS Servers set on Wi-Fi.\n";
+        let snap = parse_networksetup_dns_snapshot(raw).expect("parses");
+        assert_eq!(snap.service, "Wi-Fi");
+        assert!(snap.servers.is_empty());
+    }
+
+    #[test]
+    fn networksetup_returns_none_on_missing_header() {
+        let raw = b"1.1.1.1\n8.8.8.8\n";
+        assert!(parse_networksetup_dns_snapshot(raw).is_none());
+    }
+
+    #[test]
+    fn networksetup_synthesises_setdnsservers_with_pre_list() {
+        let before = b"# scope=Wi-Fi\n1.1.1.1\n8.8.8.8\n".to_vec();
+        let after = b"# scope=Wi-Fi\n9.9.9.9\n".to_vec();
+        let inv = synthesise_networksetup(&before, &after);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(
+            inv[0],
+            vec![
+                "networksetup",
+                "-setdnsservers",
+                "Wi-Fi",
+                "1.1.1.1",
+                "8.8.8.8"
+            ]
+        );
+    }
+
+    #[test]
+    fn networksetup_synthesises_empty_arg_when_pre_was_empty() {
+        // User added DNS to a previously-empty config; undo
+        // restores the empty state via networksetup's "empty"
+        // sentinel.
+        let before = b"# scope=Wi-Fi\nThere aren't any DNS Servers set on Wi-Fi.\n".to_vec();
+        let after = b"# scope=Wi-Fi\n1.1.1.1\n".to_vec();
+        let inv = synthesise_networksetup(&before, &after);
+        assert_eq!(
+            inv[0],
+            vec!["networksetup", "-setdnsservers", "Wi-Fi", "empty"]
+        );
+    }
+
+    #[test]
+    fn networksetup_no_op_when_servers_unchanged() {
+        let before = b"# scope=Wi-Fi\n1.1.1.1\n".to_vec();
+        let after = b"# scope=Wi-Fi\n1.1.1.1\n".to_vec();
+        let inv = synthesise_networksetup(&before, &after);
+        assert!(inv.is_empty());
+    }
+
+    #[test]
+    fn networksetup_no_inverse_on_service_switch_mid_capture() {
+        // Defensive: if somehow the pre + post snapshots scope to
+        // different services, refuse to synthesize. This shouldn't
+        // happen in practice (the wrapper passes one service per
+        // event) but the safety check costs nothing.
+        let before = b"# scope=Wi-Fi\n1.1.1.1\n".to_vec();
+        let after = b"# scope=Ethernet\n1.1.1.1\n".to_vec();
+        let inv = synthesise_networksetup(&before, &after);
         assert!(inv.is_empty());
     }
 }

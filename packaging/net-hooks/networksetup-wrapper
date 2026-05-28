@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# shit networksetup wrapper (macOS). PATH-prepended via the shell
+# hook so `networksetup -setdnsservers ...` invocations route
+# through here. Mutating verbs fire a `net-event networksetup pre /
+# post` bracket; non-mutating verbs (`-get*`, `-list*`,
+# `-print*`, `-info*`) pass through unchanged.
+#
+# M06.1 — DNS-only first ship. Wrapper handles `-setdnsservers
+# <service> <dns...>` and uses `<service>` as the scope_hint so
+# the inspector queries the right service's pre-state.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+set -u
+depth="${SHIT_WRAPPER_DEPTH:-0}"
+if [[ "$depth" -ge 2 ]]; then
+    echo "shit-networksetup-wrapper: loop detected (depth=$depth); refusing" >&2
+    exit 127
+fi
+export SHIT_WRAPPER_DEPTH=$((depth + 1))
+
+HELPER="${SHIT_HELPER:-/usr/local/bin/shit-helper}"
+self_realpath="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+real=""
+for cand in /usr/sbin/networksetup; do
+    if [[ -x "$cand" ]]; then
+        cand_real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [[ "$cand_real" != "$self_realpath" ]]; then
+            real="$cand"
+            break
+        fi
+    fi
+done
+if [[ -z "$real" ]]; then
+    echo "shit-networksetup-wrapper: real networksetup not found at /usr/sbin/networksetup" >&2
+    exit 127
+fi
+
+# Reentrancy: when an undo is running we must NOT bracket; just
+# pass through so the executor's `networksetup -setdnsservers`
+# restore call doesn't re-trigger capture.
+if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then
+    exec "$real" "$@"
+fi
+
+verb="${1:-}"
+# Service name is positional after the verb for most -set* forms.
+# Stage 1 only handles -setdnsservers; future verbs slot in here.
+service="${2:-}"
+
+mutating=0
+case "$verb" in
+    # M06.1: DNS-only first ship. Other -set*/switch* verbs are
+    # listed but fall through to exec — wiring them up is a M06.x
+    # follow-up.
+    -setdnsservers)
+        mutating=1
+        ;;
+esac
+
+if [[ "$mutating" -eq 1 && -n "$service" ]]; then
+    # Pass the service name as scope_hint so the inspector knows
+    # which service's state to capture. The helper's pre/post
+    # bracket converts to a NetEvent on the daemon's ctl socket.
+    # Strip the leading `-` from the verb (clap-friendly).
+    verb_arg="${verb#-}"
+    "$HELPER" net-event networksetup pre "--verb=$verb_arg" "--scope-hint=$service" 2>/dev/null || true
+    "$real" "$@"
+    rc=$?
+    "$HELPER" net-event networksetup post "--verb=$verb_arg" "--scope-hint=$service" 2>/dev/null || true
+    exit "$rc"
+fi
+
+# Non-mutating or unrecognized: pass through.
+exec "$real" "$@"
