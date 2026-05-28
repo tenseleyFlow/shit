@@ -23,6 +23,8 @@ use shit_proto::{
 
 pub mod ip;
 pub mod iptables;
+#[cfg(target_os = "macos")]
+pub mod networksetup;
 pub mod nft;
 pub mod pfctl;
 pub mod ufw;
@@ -44,9 +46,17 @@ fn inspector_for(t: NetToolWire) -> Option<Box<dyn NetInspector>> {
         NetToolWire::IpRoute | NetToolWire::IpAddr | NetToolWire::IpLink => {
             Some(Box::new(ip::IpInspector::for_object(t)))
         }
-        // `route`, `ifconfig`, `networksetup` inspectors are
-        // deferred — see DR-44 (sprint outcome's deferral table).
-        NetToolWire::Route | NetToolWire::Ifconfig | NetToolWire::Networksetup => None,
+        // `route` and `ifconfig` inspectors are deferred — see
+        // DR-44 (sprint outcome's deferral table). They land in
+        // M06.x followup slices.
+        NetToolWire::Route | NetToolWire::Ifconfig => None,
+        // M06.1 — `networksetup` ships DNS-only first ship.
+        // macOS-only; the cfg gate on the `networksetup` module
+        // mirrors here.
+        #[cfg(target_os = "macos")]
+        NetToolWire::Networksetup => Some(Box::new(networksetup::NetworksetupInspector)),
+        #[cfg(not(target_os = "macos"))]
+        NetToolWire::Networksetup => None,
     }
 }
 
