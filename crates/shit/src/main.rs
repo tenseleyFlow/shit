@@ -191,6 +191,14 @@ enum Cmd {
         /// `nixos`.
         #[arg(long, default_value = "generic", requires = "emit_sudoers_snippet")]
         target: String,
+        /// AU09 — graceful daemon shutdown via the ctl socket. Sends
+        /// `CtlRequest::Shutdown`, waits for `ShutdownAcked`, and
+        /// returns. The daemon tears down WatchTree subscriptions,
+        /// drains in-flight blob writes, and exits with code 0.
+        /// Exits non-zero if no daemon is reachable or the daemon
+        /// fails to ack within the timeout.
+        #[arg(long, conflicts_with_all = ["json", "fix", "emit_sudoers_snippet"])]
+        shutdown_daemon: bool,
     },
     /// macOS power-user EndpointSecurity setup helper. Documents +
     /// applies the SIP-disable + AuthRoot-disable + AMFI-bypass +
@@ -385,6 +393,7 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
             fix,
             emit_sudoers_snippet,
             target,
+            shutdown_daemon,
         } => {
             if emit_sudoers_snippet {
                 let parsed: doctor::snippet::SudoersTarget = target.parse().map_err(|e| {
@@ -395,6 +404,9 @@ fn run_cmd(cmd: Cmd) -> Result<(), CliMainErr> {
             }
             if fix {
                 return Ok(doctor::run_fix()?);
+            }
+            if shutdown_daemon {
+                return Ok(doctor::run_shutdown_daemon()?);
             }
             Ok(doctor::run(json)?)
         }

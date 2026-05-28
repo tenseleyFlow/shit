@@ -86,6 +86,65 @@ pub fn run_fix() -> anyhow::Result<()> {
     }
 }
 
+/// AU09 — graceful daemon shutdown via the ctl socket.
+///
+/// Connects to `crate::paths::default_ctl_socket_path()`, sends
+/// `CtlRequest::Shutdown`, awaits `ShutdownAcked`. Cross-platform
+/// (the server-side handler already exists; both proto variants
+/// have been in place since S20). Exits non-zero when:
+///
+/// - the ctl socket doesn't exist (no running daemon): exit 0 with
+///   a "not running" log line — graceful operation rather than an
+///   error, mirroring `shit doctor` (without `--shutdown-daemon`).
+/// - the daemon doesn't ack within the timeout: bail loud.
+/// - the daemon replies with `Error`: bail loud.
+///
+/// The daemon's [`shit_proto::CtlRequest::Shutdown`] handler signals
+/// the daemon's main loop via `shutdown.notify_one()` and then
+/// returns `ShutdownAcked` BEFORE the loop tears down; the ack is
+/// "we received your request and will exit now" rather than "we have
+/// exited." Callers that need to wait for actual process exit (lib.sh
+/// + smokes) should poll for socket disappearance after the ack.
+pub fn run_shutdown_daemon() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use shit_proto::{CtlRequest, CtlResponse, decode_frame, encode_frame};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let path = crate::paths::default_ctl_socket_path();
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            println!("daemon: not running (no ctl socket at {})", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("connect {}", path.display())),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    let frame = encode_frame(&CtlRequest::Shutdown).context("encode CtlRequest::Shutdown")?;
+    stream.write_all(&frame).context("write Shutdown request")?;
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).context("read shutdown response")?;
+    let resp: CtlResponse =
+        decode_frame(&buf[..n]).with_context(|| format!("decode response ({n} bytes)"))?;
+    match resp {
+        CtlResponse::ShutdownAcked => {
+            println!("daemon: shutdown acked");
+            Ok(())
+        }
+        CtlResponse::Error(e) => anyhow::bail!("daemon shutdown error: {e}"),
+        other => anyhow::bail!("unexpected shutdown response: {other:?}"),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn fix_linux_caps() -> anyhow::Result<()> {
     use std::process::Command;
