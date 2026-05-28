@@ -2352,17 +2352,37 @@ fn request_loop(
             HelperRequest::Handshake { .. } => {
                 tracing::warn!("unexpected duplicate Handshake; ignoring");
             }
-            // DR-15 wire surface lands here. The actual sandboxed
-            // chown / mknod implementation is gated on DR-12 (macOS
-            // entitlement) and DR-01..04 (Linux LSM); until then we
-            // refuse and surface PermissionDenied so the executor
-            // gets a clear signal.
+            // AU28 / DR-15 stage-1 — chown is wired: helper actually
+            // calls libc::chown/lchown when the daemon's
+            // HelperLinkPrivilegedOpRouter routes a chown request
+            // here. Mknod stays stubbed; AU22 lands the libc::mkfifo /
+            // libc::mknod implementation for Fifo/Socket kinds.
             HelperRequest::ApplyChown {
                 session,
                 command_seq,
-                ..
+                path,
+                uid,
+                gid,
+                no_dereference,
+            } => {
+                let outcome = apply_chown(&path, uid, gid, no_dereference);
+                tracing::info!(
+                    %session,
+                    command_seq,
+                    path = %path,
+                    uid,
+                    gid,
+                    no_dereference,
+                    ?outcome,
+                    "apply_chown"
+                );
+                let _ = conn.send_response(&HelperResponse::PrivilegedOpResult {
+                    session,
+                    command_seq,
+                    outcome,
+                });
             }
-            | HelperRequest::ApplyMknod {
+            HelperRequest::ApplyMknod {
                 session,
                 command_seq,
                 ..
@@ -2370,7 +2390,7 @@ fn request_loop(
                 tracing::warn!(
                     %session,
                     command_seq,
-                    "privileged-op request received but helper runtime is not yet wired (DR-15 stage-1)"
+                    "ApplyMknod received but helper runtime is not yet wired (AU22 / DR-15.1)"
                 );
                 let _ = conn.send_response(&HelperResponse::PrivilegedOpResult {
                     session,
@@ -2379,6 +2399,98 @@ fn request_loop(
                 });
             }
         }
+    }
+}
+
+/// AU28 — helper-side ApplyChown handler. The daemon's
+/// HelperLinkPrivilegedOpRouter dispatches a chown the daemon
+/// process can't perform itself (no CAP_CHOWN), routing it here
+/// where the helper holds CAP_CHOWN. `no_dereference == true` ->
+/// lchown(2) (used when the target is a symlink and the captured
+/// metadata is the symlink's own ownership, not its target's).
+///
+/// Path validation: the helper trusts the daemon to send only
+/// paths the daemon's planner derived from journaled events. A
+/// daemon compromise could chown arbitrary paths via this surface;
+/// the equivalent threat already exists via every other privileged
+/// helper IPC (mknod, kill targets, etc.).
+fn apply_chown(
+    path: &str,
+    uid: u32,
+    gid: u32,
+    no_dereference: bool,
+) -> shit_proto::PrivilegedOpOutcome {
+    use shit_proto::PrivilegedOpOutcome;
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return PrivilegedOpOutcome::Failed {
+                err: format!("path contains NUL: {e}"),
+            };
+        }
+    };
+    let rc = unsafe {
+        if no_dereference {
+            libc::lchown(c_path.as_ptr(), uid, gid)
+        } else {
+            libc::chown(c_path.as_ptr(), uid, gid)
+        }
+    };
+    if rc == 0 {
+        return PrivilegedOpOutcome::Applied;
+    }
+    let errno = std::io::Error::last_os_error();
+    match errno.raw_os_error() {
+        Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+        Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
+        _ => PrivilegedOpOutcome::Failed {
+            err: format!("{}: {errno}", if no_dereference { "lchown" } else { "chown" }),
+        },
+    }
+}
+
+#[cfg(test)]
+mod apply_chown_tests {
+    use super::*;
+    use shit_proto::PrivilegedOpOutcome;
+
+    #[test]
+    fn chown_to_self_uid_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("self_chown");
+        std::fs::write(&p, b"x").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let outcome = apply_chown(p.to_str().unwrap(), uid, gid, false);
+        assert_eq!(outcome, PrivilegedOpOutcome::Applied, "self-chown should succeed without CAP_CHOWN");
+    }
+
+    #[test]
+    fn chown_nonexistent_path_is_not_found() {
+        let outcome = apply_chown("/nonexistent/au28/does/not/exist", 0, 0, false);
+        assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
+    }
+
+    #[test]
+    fn chown_path_with_nul_byte_fails() {
+        // CString construction rejects interior NUL, surfacing as
+        // Failed{err}; the helper never reaches the chown syscall.
+        let outcome = apply_chown("/tmp/has\0nul", 0, 0, false);
+        assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn lchown_branch_is_reachable() {
+        // Differentiates from the dereferencing chown branch.
+        // We don't need the symlink to point at anything; lchown
+        // operates on the link itself.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("au28_link");
+        std::os::unix::fs::symlink("/nonexistent-target", &link).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let outcome = apply_chown(link.to_str().unwrap(), uid, gid, true);
+        assert_eq!(outcome, PrivilegedOpOutcome::Applied);
     }
 }
 
