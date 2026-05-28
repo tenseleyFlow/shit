@@ -109,6 +109,19 @@ fn emit_forward_for_event(
                 conflict: file_conflict(path, probe),
             });
         }
+        CaptureEventKind::FileAppendPreStash { path, .. } => {
+            // AU27 — `redo` of an append would replay the appended
+            // bytes, but the daemon only captured pre_size (no
+            // content). Forward-plan can't reconstruct the lost
+            // bytes; surface as informational.
+            warnings.push(PlanWarning::Informational {
+                tier: InverseTier::Files,
+                message: format!(
+                    "cannot redo append to {} — capture records pre-size only, not appended bytes",
+                    path.display()
+                ),
+            });
+        }
         CaptureEventKind::TreeOp(op) => emit_forward_for_tree_op(op, probe, nodes),
         CaptureEventKind::ShellStateDiff {
             pwd_before,
