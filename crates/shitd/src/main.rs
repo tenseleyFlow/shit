@@ -421,6 +421,11 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // is a no-op in degraded mode.
     let watch_ready_for_server = helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready));
     let live_baseline_for_server = Arc::clone(&live_baseline);
+    // AU09 — capture socket paths before `cfg` moves into server::serve
+    // so we can unlink them on the shutdown path below.
+    let ctl_sock_path = cfg.ctl_socket_path.clone();
+    let hook_sock_path = cfg.hook_socket_path.clone();
+    let shim_sock_path = shim_listener::shim_socket_path(&cfg);
     let result = tokio::select! {
         r = server::serve(
             cfg,
@@ -450,6 +455,16 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     if let Some(h) = helper_dispatch_handle {
         h.abort();
     }
+
+    // AU09 — unlink IPC sockets so the on-disk inode disappearance
+    // is the load-bearing signal of a clean shutdown (vs. SIGKILL,
+    // which leaves them dangling). Bind-time `remove_file` covers
+    // the next-daemon-startup path; explicit unlink here covers the
+    // same-uid "is the daemon up?" probe that just checks the
+    // socket inode without trying to connect.
+    let _ = std::fs::remove_file(&ctl_sock_path);
+    let _ = std::fs::remove_file(&hook_sock_path);
+    let _ = std::fs::remove_file(&shim_sock_path);
     result
 }
 
