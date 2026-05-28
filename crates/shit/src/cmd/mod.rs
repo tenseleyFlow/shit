@@ -14,6 +14,8 @@ pub mod ctl_client;
 pub mod db_hooks;
 pub mod descriptors;
 pub mod disable;
+#[cfg(target_os = "macos")]
+pub mod dyld_hooks;
 pub mod forget;
 pub mod gc;
 pub mod install;
