@@ -601,6 +601,62 @@ mod policy {
     /// when callers invoke mkfifo with a relative path; the daemon's
     /// undo-side executor runs from a different cwd and needs the
     /// absolute path to find what to unlink.
+    /// M07.B.4.1 — xattr-mutating syscall notification with the
+    /// pre-syscall xattr value attached. Builds a minimal
+    /// [`ShimPreImage`] (path + inode/dev/mode/uid/gid for keying,
+    /// empty `bytes` since xattr ops don't change file content)
+    /// with the `xattr` field populated. The daemon's planner uses
+    /// `xattr_pre.value` to drive an `set/removexattr` inverse on
+    /// undo.
+    pub fn notify_xattr_mutation(
+        syscall: &'static str,
+        path: &str,
+        xattr_pre: shit_proto::XattrPreImage,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        if disabled() || should_skip_path(path) {
+            return;
+        }
+        if IN_NOTIFY.with(|f| f.replace(true)) {
+            return;
+        }
+        let resolved = std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| path.to_string());
+        // Stat for inode/dev keying. Falls through with zeroed
+        // identity on stat failure — the daemon can still match
+        // by path string.
+        let (dev, inode, mode, uid, gid, size, mtime_nanos) =
+            match std::fs::symlink_metadata(&resolved) {
+                Ok(m) => (
+                    m.dev(),
+                    m.ino(),
+                    m.mode(),
+                    m.uid(),
+                    m.gid(),
+                    m.size(),
+                    m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128,
+                ),
+                Err(_) => (0, 0, 0, 0, 0, 0, 0),
+            };
+        let pre = shit_proto::ShimPreImage {
+            path: resolved.clone(),
+            dev,
+            inode,
+            mode,
+            uid,
+            gid,
+            size,
+            mtime_unix_nanos: mtime_nanos,
+            // Empty file bytes — xattr ops don't change file content.
+            bytes: Vec::new(),
+            xattr: Some(xattr_pre),
+        };
+        let _ = try_notify(syscall, &resolved, Some(pre), Vec::new(), None);
+        IN_NOTIFY.with(|f| f.set(false));
+    }
+
     pub fn notify_create(syscall: &'static str, path: &str) {
         if should_skip_path(path) {
             return;
@@ -845,6 +901,10 @@ mod policy {
             size,
             mtime_unix_nanos: meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128,
             bytes,
+            // M07.B.4.1 — content-only pre-image captures don't
+            // populate the xattr field; xattr-mutating syscalls
+            // build their own ShimPreImage with this set.
+            xattr: None,
         })
     }
 
