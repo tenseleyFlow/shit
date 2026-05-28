@@ -608,6 +608,14 @@ mod policy {
     /// with the `xattr` field populated. The daemon's planner uses
     /// `xattr_pre.value` to drive an `set/removexattr` inverse on
     /// undo.
+    // Called by the macOS interposers in `super::macos`. BSD/Linux
+    // xattr interposers don't exist in the shim today (the existing
+    // BSD path doesn't interpose xattr at all; the Linux capture
+    // tier handles it via fanotify/LSM), so the function looks
+    // dead on those targets. `#[allow(dead_code)]` here is the
+    // honest signal — when BSD/Linux gains a parallel xattr
+    // interposer, this function picks up its second caller.
+    #[allow(dead_code)]
     pub fn notify_xattr_mutation(
         syscall: &'static str,
         path: &str,
