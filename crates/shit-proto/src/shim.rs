@@ -53,6 +53,35 @@ pub struct ShimPreImage {
     pub mtime_unix_nanos: i128,
     /// File bytes at pre-mutation time. Length == `size`.
     pub bytes: Vec<u8>,
+    /// M07.B.4.1 — for xattr-mutating syscalls (setxattr /
+    /// fsetxattr / removexattr / fremovexattr), the shim
+    /// captures the (name, value) pair as seen on disk
+    /// pre-syscall. `None` means either this notification is
+    /// not for an xattr syscall, OR the shim couldn't read
+    /// xattrs (rare). When `Some(XattrPreImage{ value: None })`
+    /// the xattr did not exist pre-syscall (setxattr undo is
+    /// then "removexattr"; removexattr undo is a no-op).
+    ///
+    /// serde-default so pre-M07.B.4.1 daemons deserialize new-
+    /// shim acks (and vice versa: pre-M07.B.4.1 shims emit no
+    /// `xattr` field, new daemons see `None`).
+    #[serde(default)]
+    pub xattr: Option<XattrPreImage>,
+}
+
+/// M07.B.4.1 — pre-syscall snapshot of one extended attribute.
+/// Attached to a [`ShimPreImage`] when the shim notification is
+/// for a `setxattr` / `removexattr` family syscall.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XattrPreImage {
+    /// Xattr name as passed by the user — `com.apple.metadata:...`,
+    /// `user.shit.test`, etc. UTF-8; macOS xattrs are required to
+    /// be NUL-terminated C strings on the API surface.
+    pub name: String,
+    /// Pre-syscall value bytes. `None` means the xattr did not
+    /// exist on disk before the syscall (so a `setxattr` undo is
+    /// `removexattr` and a `removexattr` undo is a no-op).
+    pub value: Option<Vec<u8>>,
 }
 
 /// Max inline pre-image size the shim will capture. Above this the
@@ -219,6 +248,7 @@ mod tests {
                 size: 5,
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
                 bytes: b"hello".to_vec(),
+                xattr: None,
             }),
             extra_pre_images: Vec::new(),
             failure: None,
@@ -258,6 +288,74 @@ mod tests {
         }
     }
 
+    /// M07.B.4.1 — pin the xattr-pre-image wire shape on the
+    /// shim → daemon hop. Two halves: `Some(value)` (xattr
+    /// existed pre-syscall) and `None` (xattr absent pre-syscall;
+    /// undo's setxattr → removexattr OR removexattr → no-op).
+    #[test]
+    fn shim_notification_with_xattr_pre_image_round_trips() {
+        let n = ShimNotification {
+            pid: 7777,
+            syscall: "setxattr".into(),
+            arg: "/private/tmp/file.txt".into(),
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+            pre_image: Some(ShimPreImage {
+                path: "/private/tmp/file.txt".into(),
+                dev: 16777230,
+                inode: 1234,
+                mode: 0o100644,
+                uid: 501,
+                gid: 20,
+                size: 0,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                bytes: Vec::new(),
+                xattr: Some(XattrPreImage {
+                    name: "user.shit.test".into(),
+                    value: Some(b"alpha".to_vec()),
+                }),
+            }),
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let frame = encode_frame(&n).expect("encode");
+        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        assert_eq!(decoded, n);
+        let xattr = decoded.pre_image.unwrap().xattr.unwrap();
+        assert_eq!(xattr.name, "user.shit.test");
+        assert_eq!(xattr.value.as_deref(), Some(b"alpha" as &[u8]));
+    }
+
+    #[test]
+    fn shim_notification_xattr_absent_pre_image_round_trips() {
+        let n = ShimNotification {
+            pid: 7777,
+            syscall: "setxattr".into(),
+            arg: "/private/tmp/fresh.txt".into(),
+            ts_unix_nanos: 1_700_000_000_000_000_000,
+            pre_image: Some(ShimPreImage {
+                path: "/private/tmp/fresh.txt".into(),
+                dev: 16777230,
+                inode: 1234,
+                mode: 0o100644,
+                uid: 501,
+                gid: 20,
+                size: 0,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                bytes: Vec::new(),
+                xattr: Some(XattrPreImage {
+                    name: "user.shit.fresh".into(),
+                    value: None, // absent pre-syscall
+                }),
+            }),
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let frame = encode_frame(&n).expect("encode");
+        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        assert_eq!(decoded, n);
+        assert!(decoded.pre_image.unwrap().xattr.unwrap().value.is_none());
+    }
+
     #[test]
     fn shim_ack_round_trips() {
         let frame = encode_frame(&ShimAck::Allow).expect("encode");
@@ -282,6 +380,7 @@ mod tests {
                 size: bytes.len() as u64,
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
                 bytes: bytes.to_vec(),
+                xattr: None,
             }
         }
         let n = ShimNotification {

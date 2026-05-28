@@ -782,6 +782,7 @@ mod tests {
             size: 5,
             mtime_unix_nanos: 1_700_000_000_000_000_000,
             bytes: b"hello".to_vec(),
+            xattr: None,
         };
         ingest_pre_image(command, &pre, &index, &blob_store).expect("ingest");
 
