@@ -115,10 +115,17 @@ sleep 0.7
 
 # THE workload. -setdnsservers is mutating; the wrapper brackets
 # net-event pre/post around the real networksetup call.
+#
+# IMPORTANT: `sudo` clears env by default — the wrapper's helper
+# invocation would lose XDG_RUNTIME_DIR and fail to find the
+# daemon's socket. `sudo -E` preserves env so the helper can
+# reach shitd. Critical: the helper running as root MUST see the
+# user-spawned daemon's runtime dir. macos-14 GHA's `runner` user
+# has passwordless sudo configured to allow env preservation.
 TEST_DNS="1.1.1.1"
 smoke_log "wrapper bootstrap: ${WRAPPER} -setdnsservers ${SERVICE} ${TEST_DNS}"
 set +e
-sudo "${WRAPPER}" -setdnsservers "${SERVICE}" "${TEST_DNS}" \
+sudo -E "${WRAPPER}" -setdnsservers "${SERVICE}" "${TEST_DNS}" \
     >"${SHIT_SMOKE_TMP}/set.log" 2>&1
 SET_RC=$?
 set -e
