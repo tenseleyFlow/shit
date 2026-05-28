@@ -40,11 +40,20 @@ pub fn read_proc_snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
     {
         super::freebsd::snapshot(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    #[cfg(target_os = "macos")]
+    {
+        // M06.2 — libproc + KERN_PROCARGS2 sysctl. Closes DR-48 +
+        // DR-49 for the snapshot path; the kill-proc smoke now
+        // has real argv/cwd/ppid metadata on macOS, not the
+        // empty-string fallback the old "not implemented" branch
+        // produced.
+        super::macos::snapshot(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
     {
         let _ = pid;
         Err(anyhow::anyhow!(
-            "proc snapshot not implemented on this platform (DR-49 / B06)"
+            "proc snapshot not implemented on this platform (B06 stretch)"
         ))
     }
 }
@@ -52,13 +61,14 @@ pub fn read_proc_snapshot(pid: u32) -> anyhow::Result<ProcSnapshot> {
 /// Env vars worth keeping in the summary by name. The redaction
 /// pass adds more names dynamically (anything matching the S15
 /// substring set).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// M06.2 — also referenced by the macOS branch (`super::macos`).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub const ENV_WHITELIST: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "LANG", "LC_ALL", "TERM", "DISPLAY",
 ];
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn summarize_env(block: &[u8]) -> BTreeMap<String, String> {
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(super) fn summarize_env(block: &[u8]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let filter = shit_planner::EnvFilter::default();
     for chunk in block.split(|&b| b == 0) {
