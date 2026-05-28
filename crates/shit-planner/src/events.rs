@@ -507,6 +507,21 @@ pub struct ServiceState {
     pub active: bool,
     pub enabled: bool,
     pub masked: bool,
+    /// M05.2 — true when the service is KNOWN to the service manager
+    /// (loaded into launchd's domain on macOS, unit file exists on
+    /// systemctl, rc.conf entry on FreeBSD). Distinguishes "service
+    /// not loaded at all" (present=false) from "service loaded but
+    /// not running" (present=true, active=false). The launchctl
+    /// `bootstrap` verb moves present false→true; `bootout` reverses.
+    /// Without this field the planner sees both pre-bootstrap and
+    /// post-bootstrap as `active=false` and emits no inverse.
+    ///
+    /// `#[serde(default)]` so pre-M05.2 journaled events deserialize
+    /// cleanly with present=false (the conservative default —
+    /// caller's existing diff logic stays correct since absent fields
+    /// don't trip new comparisons).
+    #[serde(default)]
+    pub present: bool,
     /// Raw descriptor from the service manager (UnitFileState/ActiveState/etc.).
     /// Opaque to the planner; renders in `shit show`.
     pub raw: String,
