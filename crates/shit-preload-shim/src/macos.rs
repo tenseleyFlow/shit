@@ -190,6 +190,180 @@ unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
     unsafe { libc::mkdir(path, mode) }
 }
 
+/// Replacement for `chmod(2)`. M07.B.1.
+///
+/// Captures the path + pre-image so the planner can record the
+/// old mode and restore on undo. The `_with_content` notify also
+/// reads file bytes — wasteful for chmod-only mutations, but
+/// harmless (the planner picks `ChmodMetadata` inverse based on
+/// the event type, ignoring the bytes payload). Future tightening:
+/// a metadata-only notify variant that skips the read.
+///
+/// # Safety
+/// Same contract as `libc::chmod` — `path` must be a valid
+/// NUL-terminated C string.
+unsafe extern "C" fn my_chmod(path: *const c_char, mode: mode_t) -> c_int {
+    policy::notify_pre_mutation_with_content("chmod", &cstr_to_string(path));
+    unsafe { libc::chmod(path, mode) }
+}
+
+/// Replacement for `fchmod(2)`. Resolves the fd → path via
+/// `fcntl(F_GETPATH)` so the daemon receives a path-based event
+/// like every other interposer. Skip-notifies if F_GETPATH fails
+/// (typical for pipe / socket / anon-mmap fds, which aren't
+/// chmod targets anyway).
+///
+/// # Safety
+/// Same contract as `libc::fchmod` — `fd` must be a valid file
+/// descriptor.
+unsafe extern "C" fn my_fchmod(fd: c_int, mode: mode_t) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("fchmod", &path);
+    }
+    unsafe { libc::fchmod(fd, mode) }
+}
+
+/// Replacement for `chown(2)`. Captures path + metadata so the
+/// planner can restore the old uid/gid on undo.
+///
+/// # Safety
+/// Same contract as `libc::chown` — `path` must be a valid
+/// NUL-terminated C string.
+unsafe extern "C" fn my_chown(path: *const c_char, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    policy::notify_pre_mutation_with_content("chown", &cstr_to_string(path));
+    unsafe { libc::chown(path, uid, gid) }
+}
+
+/// Replacement for `fchown(2)`. Resolves fd→path; skip-notifies
+/// if F_GETPATH fails.
+///
+/// # Safety
+/// Same contract as `libc::fchown`.
+unsafe extern "C" fn my_fchown(fd: c_int, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("fchown", &path);
+    }
+    unsafe { libc::fchown(fd, uid, gid) }
+}
+
+/// Replacement for `lchown(2)`. Variant that operates on the
+/// symlink itself, not the target. Notification path is the
+/// same — daemon discriminates on the syscall name.
+///
+/// # Safety
+/// Same contract as `libc::lchown`.
+unsafe extern "C" fn my_lchown(path: *const c_char, uid: libc::uid_t, gid: libc::gid_t) -> c_int {
+    policy::notify_pre_mutation_with_content("lchown", &cstr_to_string(path));
+    unsafe { libc::lchown(path, uid, gid) }
+}
+
+/// Replacement for `utimes(2)`. Captures path + metadata so the
+/// planner can restore the old atime/mtime on undo.
+///
+/// # Safety
+/// Same contract as `libc::utimes` — `path` valid C string; `times`
+/// either NULL (set to current time) or pointer to 2 timevals.
+unsafe extern "C" fn my_utimes(path: *const c_char, times: *const libc::timeval) -> c_int {
+    policy::notify_pre_mutation_with_content("utimes", &cstr_to_string(path));
+    unsafe { libc::utimes(path, times) }
+}
+
+/// Replacement for `futimens(2)`. fd → path via F_GETPATH; skip-
+/// notifies if resolution fails.
+///
+/// # Safety
+/// Same contract as `libc::futimens`.
+unsafe extern "C" fn my_futimens(fd: c_int, times: *const libc::timespec) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("futimens", &path);
+    }
+    unsafe { libc::futimens(fd, times) }
+}
+
+// macOS xattr signatures diverge from Linux: extra `position` arg
+// (legacy resource-fork offset, near-universally 0) and `flags` arg
+// (XATTR_NOFOLLOW etc). The `policy::notify_pre_mutation` we use
+// here is path-only (no content read) — shim-side xattr pre-image
+// capture (reading current xattr value to enable byte-identical
+// undo) is a follow-up slice (M07.B.4.1). For now we record that
+// xattr changed on this path, and daemon/planner xattr support
+// inherits from the ES producer (M03.x.XATTR).
+
+/// Replacement for `setxattr(2)`.
+///
+/// # Safety
+/// Same contract as `libc::setxattr`.
+unsafe extern "C" fn my_setxattr(
+    path: *const c_char,
+    name: *const c_char,
+    value: *const c_void,
+    size: libc::size_t,
+    position: u32,
+    flags: c_int,
+) -> c_int {
+    policy::notify_pre_mutation("setxattr", &cstr_to_string(path));
+    unsafe { libc::setxattr(path, name, value, size, position, flags) }
+}
+
+/// Replacement for `fsetxattr(2)`. fd → path via F_GETPATH.
+///
+/// # Safety
+/// Same contract as `libc::fsetxattr`.
+unsafe extern "C" fn my_fsetxattr(
+    fd: c_int,
+    name: *const c_char,
+    value: *const c_void,
+    size: libc::size_t,
+    position: u32,
+    flags: c_int,
+) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation("fsetxattr", &path);
+    }
+    unsafe { libc::fsetxattr(fd, name, value, size, position, flags) }
+}
+
+/// Replacement for `removexattr(2)`.
+///
+/// # Safety
+/// Same contract as `libc::removexattr`.
+unsafe extern "C" fn my_removexattr(
+    path: *const c_char,
+    name: *const c_char,
+    flags: c_int,
+) -> c_int {
+    policy::notify_pre_mutation("removexattr", &cstr_to_string(path));
+    unsafe { libc::removexattr(path, name, flags) }
+}
+
+/// Replacement for `fremovexattr(2)`. fd → path via F_GETPATH.
+///
+/// # Safety
+/// Same contract as `libc::fremovexattr`.
+unsafe extern "C" fn my_fremovexattr(fd: c_int, name: *const c_char, flags: c_int) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation("fremovexattr", &path);
+    }
+    unsafe { libc::fremovexattr(fd, name, flags) }
+}
+
+/// Best-effort fd → path via `fcntl(F_GETPATH)`. Returns `None`
+/// if the fd isn't backed by a path (anon fds, pipes, sockets)
+/// or if the call fails. macOS-specific: `F_GETPATH` writes up
+/// to `MAXPATHLEN` (1024) bytes into the user buffer.
+fn fd_to_path(fd: c_int) -> Option<String> {
+    use libc::{F_GETPATH, MAXPATHLEN, fcntl};
+    let mut buf = [0u8; MAXPATHLEN as usize];
+    // SAFETY: buf is large enough for F_GETPATH; fcntl writes a
+    // NUL-terminated path into it on success.
+    let rc = unsafe { fcntl(fd, F_GETPATH, buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let nul = buf.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&buf[..nul]).ok().map(str::to_string)
+}
+
 /// Replacement for `mkdirat(2)`. Dirfd-relative variant.
 ///
 /// # Safety
@@ -262,6 +436,83 @@ static INTERPOSE_MKDIR: InterposeEntry = InterposeEntry {
 static INTERPOSE_MKDIRAT: InterposeEntry = InterposeEntry {
     replacement: my_mkdirat as *const c_void,
     target: libc::mkdirat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_CHMOD: InterposeEntry = InterposeEntry {
+    replacement: my_chmod as *const c_void,
+    target: libc::chmod as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHMOD: InterposeEntry = InterposeEntry {
+    replacement: my_fchmod as *const c_void,
+    target: libc::fchmod as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_CHOWN: InterposeEntry = InterposeEntry {
+    replacement: my_chown as *const c_void,
+    target: libc::chown as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHOWN: InterposeEntry = InterposeEntry {
+    replacement: my_fchown as *const c_void,
+    target: libc::fchown as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_LCHOWN: InterposeEntry = InterposeEntry {
+    replacement: my_lchown as *const c_void,
+    target: libc::lchown as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_UTIMES: InterposeEntry = InterposeEntry {
+    replacement: my_utimes as *const c_void,
+    target: libc::utimes as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FUTIMENS: InterposeEntry = InterposeEntry {
+    replacement: my_futimens as *const c_void,
+    target: libc::futimens as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_SETXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_setxattr as *const c_void,
+    target: libc::setxattr as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FSETXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_fsetxattr as *const c_void,
+    target: libc::fsetxattr as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_REMOVEXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_removexattr as *const c_void,
+    target: libc::removexattr as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FREMOVEXATTR: InterposeEntry = InterposeEntry {
+    replacement: my_fremovexattr as *const c_void,
+    target: libc::fremovexattr as *const c_void,
 };
 
 /// `(replacement, target)` pair the dynamic linker expects in
@@ -350,6 +601,114 @@ mod tests {
         assert_ne!(INTERPOSE_MKDIRAT.replacement, INTERPOSE_MKDIRAT.target);
     }
 
+    #[test]
+    fn chmod_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_CHMOD.replacement.is_null());
+        assert!(!INTERPOSE_CHMOD.target.is_null());
+        assert_ne!(INTERPOSE_CHMOD.replacement, INTERPOSE_CHMOD.target);
+    }
+
+    #[test]
+    fn fchmod_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHMOD.replacement.is_null());
+        assert!(!INTERPOSE_FCHMOD.target.is_null());
+        assert_ne!(INTERPOSE_FCHMOD.replacement, INTERPOSE_FCHMOD.target);
+    }
+
+    #[test]
+    fn chown_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_CHOWN.replacement.is_null());
+        assert!(!INTERPOSE_CHOWN.target.is_null());
+        assert_ne!(INTERPOSE_CHOWN.replacement, INTERPOSE_CHOWN.target);
+    }
+
+    #[test]
+    fn fchown_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHOWN.replacement.is_null());
+        assert!(!INTERPOSE_FCHOWN.target.is_null());
+        assert_ne!(INTERPOSE_FCHOWN.replacement, INTERPOSE_FCHOWN.target);
+    }
+
+    #[test]
+    fn lchown_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_LCHOWN.replacement.is_null());
+        assert!(!INTERPOSE_LCHOWN.target.is_null());
+        assert_ne!(INTERPOSE_LCHOWN.replacement, INTERPOSE_LCHOWN.target);
+    }
+
+    #[test]
+    fn utimes_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_UTIMES.replacement.is_null());
+        assert!(!INTERPOSE_UTIMES.target.is_null());
+        assert_ne!(INTERPOSE_UTIMES.replacement, INTERPOSE_UTIMES.target);
+    }
+
+    #[test]
+    fn futimens_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FUTIMENS.replacement.is_null());
+        assert!(!INTERPOSE_FUTIMENS.target.is_null());
+        assert_ne!(INTERPOSE_FUTIMENS.replacement, INTERPOSE_FUTIMENS.target);
+    }
+
+    #[test]
+    fn setxattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_SETXATTR.replacement.is_null());
+        assert!(!INTERPOSE_SETXATTR.target.is_null());
+        assert_ne!(INTERPOSE_SETXATTR.replacement, INTERPOSE_SETXATTR.target);
+    }
+
+    #[test]
+    fn fsetxattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FSETXATTR.replacement.is_null());
+        assert!(!INTERPOSE_FSETXATTR.target.is_null());
+        assert_ne!(INTERPOSE_FSETXATTR.replacement, INTERPOSE_FSETXATTR.target);
+    }
+
+    #[test]
+    fn removexattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_REMOVEXATTR.replacement.is_null());
+        assert!(!INTERPOSE_REMOVEXATTR.target.is_null());
+        assert_ne!(
+            INTERPOSE_REMOVEXATTR.replacement,
+            INTERPOSE_REMOVEXATTR.target
+        );
+    }
+
+    #[test]
+    fn fremovexattr_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FREMOVEXATTR.replacement.is_null());
+        assert!(!INTERPOSE_FREMOVEXATTR.target.is_null());
+        assert_ne!(
+            INTERPOSE_FREMOVEXATTR.replacement,
+            INTERPOSE_FREMOVEXATTR.target
+        );
+    }
+
+    #[test]
+    fn fd_to_path_returns_none_for_bad_fd() {
+        // fd -1 is never valid; F_GETPATH returns -1, our helper None.
+        assert!(fd_to_path(-1).is_none());
+    }
+
+    #[test]
+    fn fd_to_path_resolves_open_file_to_its_path() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "hi").unwrap();
+        let p = tmp.path().to_path_buf();
+        // Open via libc::open to mirror what an interposed caller has.
+        let path_c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "open of temp file should succeed");
+        let resolved = fd_to_path(fd);
+        unsafe { libc::close(fd) };
+        let resolved = resolved.expect("F_GETPATH should resolve a real file fd");
+        // macOS canonicalizes /tmp to /private/tmp; compare via canonicalize.
+        let want = std::fs::canonicalize(&p).unwrap();
+        let got = std::fs::canonicalize(&resolved).unwrap();
+        assert_eq!(got, want);
+    }
+
     /// Cross-cutting: count of expected interpose entries.
     /// Regression gate — if someone adds a static without bumping
     /// the assertion, the test points to the omission in code
@@ -368,8 +727,23 @@ mod tests {
             &INTERPOSE_OPENAT,
             &INTERPOSE_MKDIR,
             &INTERPOSE_MKDIRAT,
+            // M07.B.1: chmod family
+            &INTERPOSE_CHMOD,
+            &INTERPOSE_FCHMOD,
+            // M07.B.2: chown family
+            &INTERPOSE_CHOWN,
+            &INTERPOSE_FCHOWN,
+            &INTERPOSE_LCHOWN,
+            // M07.B.3: utimes family
+            &INTERPOSE_UTIMES,
+            &INTERPOSE_FUTIMENS,
+            // M07.B.4: xattr family
+            &INTERPOSE_SETXATTR,
+            &INTERPOSE_FSETXATTR,
+            &INTERPOSE_REMOVEXATTR,
+            &INTERPOSE_FREMOVEXATTR,
         ];
-        assert_eq!(entries.len(), 8, "M07.A.2 final interposer count");
+        assert_eq!(entries.len(), 19, "M07.A.2 + M07.B.1..4 interposer count");
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
