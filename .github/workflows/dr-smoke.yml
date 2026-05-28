@@ -406,6 +406,32 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  kill-proc-libproc-macos:
+    # M06.2 — kill <pid> via the kill wrapper journals a ProcessOp
+    # event whose ProcSnapshot was sourced via libproc + KERN_PROCARGS2.
+    # Asserts the postcard payload contains the doomed child's argv
+    # tag (proves libproc populated argv on macOS, not the prior
+    # "not implemented" empty fallback).
+    name: kill-proc-libproc smoke (M06.2 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/kill-proc-libproc-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kill-proc-libproc-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   chmod-undo-dyld-shim-macos:
     # M07.B.5 — chmod via brew gchmod (non-SIP so DYLD survives)
     # exercises the fchmodat interposer + daemon metadata-pre-image
