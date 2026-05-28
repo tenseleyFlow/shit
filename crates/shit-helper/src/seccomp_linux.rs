@@ -183,6 +183,19 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_unlinkat,  // staging cleanup
     libc::SYS_mkdirat,   // create_dir_all uses mkdirat
     libc::SYS_renameat2, // staging atomic rename if used
+    // AU28 / DR-15 stage-1 — apply_chown calls libc::chown / lchown
+    // when the daemon routes a chown-to-foreign-uid that needs
+    // CAP_CHOWN. Without these allowed, the helper SIGSYS-dies
+    // silently on the first chown request and the daemon's
+    // request_priv_op_blocking sees a 5s timeout + helper exit.
+    libc::SYS_fchownat,
+    // AU22 / DR-15.1 — apply_mknod calls libc::mknod (FIFO/Socket
+    // creation) for the restore-side mknod-via-helper path. Same
+    // failure mode as chown above if not allowed. umask is set to
+    // 0 around the mknod call so captured perm bits round-trip
+    // byte-identical.
+    libc::SYS_mknodat,
+    libc::SYS_umask,
     libc::SYS_fcntl,
     libc::SYS_mmap,
     libc::SYS_munmap,
@@ -237,8 +250,18 @@ const ALLOWED_SYSCALLS: &[i64] = &[
 /// x86_64-only syscalls. aarch64's Linux ABI dropped these in favor
 /// of newer variants we already allow above (readlinkat, epoll_pwait).
 /// The two slices are concatenated in [`build_filter`].
+// AU28/AU22 — bare chown / mknod syscalls are x86_64-only; aarch64
+// glibc translates to fchownat/mknodat (already in ALLOWED_SYSCALLS).
+// Without these allowed on x86_64, glibc's libc::chown / libc::mknod
+// SIGSYS-kills the helper depending on glibc version.
 #[cfg(target_arch = "x86_64")]
-const ALLOWED_SYSCALLS_ARCH: &[i64] = &[libc::SYS_readlink, libc::SYS_epoll_wait];
+const ALLOWED_SYSCALLS_ARCH: &[i64] = &[
+    libc::SYS_readlink,
+    libc::SYS_epoll_wait,
+    libc::SYS_chown,
+    libc::SYS_lchown,
+    libc::SYS_mknod,
+];
 
 #[cfg(not(target_arch = "x86_64"))]
 const ALLOWED_SYSCALLS_ARCH: &[i64] = &[];
