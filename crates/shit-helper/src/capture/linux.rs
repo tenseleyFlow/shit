@@ -344,13 +344,27 @@ impl LinuxCaptureRuntime {
 
         // Record the watch root itself in dir_paths so events whose
         // parent_inode == watch-root's inode resolve too.
-        let root_dev_inode = std::fs::metadata(cwd)
-            .ok()
-            .map(|m| (m.dev(), m.ino()))
-            .unwrap_or((0, 0));
-        if root_dev_inode != (0, 0) {
-            ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
-        }
+        //
+        // If stat fails we MUST NOT fall back to (0,0): a later event
+        // with parent_inode == 0 (which BPF emits on root-of-mount
+        // failures and a few other edge cases) would alias to this
+        // bogus dir_paths entry and resolve to the wrong path. Skip
+        // the insert AND the recursion so the watch surfaces zero
+        // events for this command instead of wrong ones.
+        let root_dev_inode = match std::fs::metadata(cwd) {
+            Ok(m) => (m.dev(), m.ino()),
+            Err(e) => {
+                tracing::error!(
+                    session = %command.session,
+                    seq = command.seq,
+                    cwd = %cwd.display(),
+                    err = %e,
+                    "pre_open_tree: stat(cwd) failed; skipping dir_paths root entry and recursion to avoid (0,0) aliasing"
+                );
+                return;
+            }
+        };
+        ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
 
         let mut opened = 0usize;
         let mut hit_cap = false;
@@ -2251,7 +2265,13 @@ mod tests {
         struct CwdGuard(PathBuf);
         impl Drop for CwdGuard {
             fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
+                if let Err(e) = std::env::set_current_dir(&self.0) {
+                    tracing::warn!(
+                        original = %self.0.display(),
+                        err = %e,
+                        "CwdGuard: failed to restore cwd on drop; subsequent tests may misbehave"
+                    );
+                }
             }
         }
         let original = std::env::current_dir().unwrap();

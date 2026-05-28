@@ -2008,6 +2008,67 @@ mod tests {
     }
 
     #[test]
+    fn race_loss_marker_create_still_emits_unlink_inverse() {
+        // AR01.2 race-loss marker — `handle_lsm_create` lost the
+        // post-open/fstat race; the dentry is gone by the time
+        // userspace fstats it. The helper still emits a TreeOp::Create
+        // with dev=0 / inode=0 (marker shape) so the planner has
+        // *some* event to invert. The file may or may not be on disk
+        // at undo-time; the inverse Unlink either deletes it or
+        // no-ops via the Missing-conflict path. Either way, the
+        // planner MUST NOT drop the event silently — that would
+        // leave the freshly-created file on disk post-undo.
+        let mut probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let path = PathBuf::from("/tmp/race-loss-target");
+        // Simulate: by undo time, the file is back on disk (the
+        // helper's fstat race lost, but the kernel completed the
+        // create syscall — the file exists with a real inode now).
+        // The marker's inode-0 isn't load-bearing; the path is.
+        let live_inode = InodeRef::new(1, 9999);
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: live_inode,
+                meta: meta(0),
+            },
+            None,
+        );
+
+        let cmd = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let marker_create = CaptureEvent {
+            id: EventId(1),
+            command: cmd,
+            ts: TimePoint::new(10, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(0, 0),
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0,
+            }),
+        };
+
+        let p = plan(dummy_command(), &[marker_create], &probe, &store);
+
+        let has_unlink = p
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::Unlink { path: pp } if pp == &path));
+        assert!(
+            has_unlink,
+            "race-loss marker TreeOp::Create (dev=0/inode=0) must still emit an Unlink inverse keyed by path"
+        );
+        assert!(
+            !p.has_blocking_conflicts(),
+            "race-loss marker plan should be conflict-free when the path is live on disk"
+        );
+    }
+
+    #[test]
     fn lsm_rename_target_clobber_coalesces_to_single_restore() {
         // AR01.1 follow-up — the Linux LSM `inode_rename` hook
         // produces a different shape than BSD kqueue:

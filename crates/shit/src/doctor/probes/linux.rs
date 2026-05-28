@@ -6,8 +6,10 @@
 //! Per the B03 / L05 convention, every probe:
 //!
 //! - completes in <2s total wall-time for the whole report;
-//! - is side-effect-free (no kernel state changes, no daemon
-//!   spawns that outlive the probe);
+//! - is read-only on disk. Some probes spawn short-lived,
+//!   idempotent query subprocesses (e.g. `read_systemd_unit`
+//!   shells out to `systemctl show`) — these read host state
+//!   but do not mutate it and exit before the report returns;
 //! - gracefully reports failure rather than panic. A probe that
 //!   can't determine its answer returns the "neutral" value
 //!   (`false`, empty Vec, `None`) so the JSON envelope still
