@@ -773,14 +773,21 @@ fn print_bsd_tier(bsd: &json::BsdReport) {
             bsd.zfs_datasets.join(", ")
         );
     }
-    println!(
-        "preload:  {}",
-        if bsd.preload_shim_installed {
-            "installed at /usr/local/lib/shit/libshit_preload.so"
-        } else {
-            "not installed — kqueue-only coverage; see `shit hooks install`"
-        }
-    );
+    if bsd.preload_shim_installed {
+        println!("preload:  installed at /usr/local/lib/shit/libshit_preload_shim.so");
+    } else {
+        // AU07 — surface this loud. Without the shim, BSD capture is
+        // post-hoc only (kqueue NOTE_WRITE catches *after* the write
+        // has hit disk), so unlink/rename pre-images are lost.
+        // Multi-line by design — the audit finding was that this was
+        // a single quiet line easily missed in a long doctor report.
+        println!("preload:  NOT INSTALLED — kqueue-only coverage (degraded)");
+        println!("          WARN: unlink and rename pre-images may be lost on watched cwds.");
+        println!("          Install the shim:");
+        println!("            cargo install --path crates/shit-preload-shim   # dev tree");
+        println!("            pkg install shit                                # FreeBSD (planned)");
+        println!("          The shim sits at /usr/local/lib/shit/libshit_preload_shim.so.");
+    }
     print!("helper:   ");
     if bsd.helper_handshake.ok {
         println!(
