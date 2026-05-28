@@ -32,6 +32,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 libc = { workspace = true }
+# AU12.A — `goblin` for ELF + Mach-O header parsing (detecting
+# static binaries). Minimal feature set: parse-only for the two
+# formats the visibility module cares about. `archive`, `pe`, and
+# the rest of goblin's surface stay disabled.
+goblin = { version = "0.10", default-features = false, features = ["elf32", "elf64", "mach32", "mach64", "endian_fd", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # CoreFoundation runloop + string + array types for the macOS FSEvents
