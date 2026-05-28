@@ -1444,6 +1444,12 @@ fn boot_ebpf_lsm(
     loader
         .load_lsm_rmdir()
         .map_err(|e| anyhow::anyhow!("load_lsm_rmdir failed: {e}"))?;
+    // AU29 — inode_mknod. Standard kernel hook (>=2.6); fatal-on-
+    // failure like the other inode_* hooks. Captures mkfifo/mknod
+    // for FIFO/Socket/Block/Char kinds that inode_create misses.
+    loader
+        .load_lsm_mknod()
+        .map_err(|e| anyhow::anyhow!("load_lsm_mknod failed: {e}"))?;
     // L04.2 — file_release is best-effort. The hook is present in
     // BTF on kernel 7.0+ but the CI runner matrix includes 6.8 where
     // the symbol is absent. Log + continue when the hook can't be
@@ -1488,6 +1494,9 @@ fn boot_ebpf_lsm(
     let rmdir_rb = loader
         .take_rmdir_ringbuf()
         .ok_or_else(|| anyhow::anyhow!("take_rmdir_ringbuf returned None after successful load"))?;
+    let mknod_rb = loader
+        .take_mknod_ringbuf()
+        .ok_or_else(|| anyhow::anyhow!("take_mknod_ringbuf returned None after successful load"))?;
     // L04.2 release ringbuf is None on kernels where the hook wasn't
     // loaded (see release_loaded above). Skip spawning the reader
     // in that case.
@@ -1532,6 +1541,10 @@ fn boot_ebpf_lsm(
     // G03: rmdir uses the same wire shape as unlink but routes via
     // on_rmdir → handle_lsm_unlink with is_directory=true.
     let rmdir_reader = ebpf::LsmReader::spawn_rmdir(rmdir_rb, Arc::clone(&sink), idle);
+    // AU29: mknod payload mirrors inode_create's; the dispatcher
+    // routes through on_create. handle_lsm_create's mode-aware
+    // path resolves Fifo/Socket from the S_IF bits.
+    let mknod_reader = ebpf::LsmReader::spawn_mknod(mknod_rb, Arc::clone(&sink), idle);
     // L04.2: file_release fires at last writable-fd close; the
     // handler diffs current content against the open-time
     // snapshot and emits a CapturedPreImage iff they differ.
@@ -1558,6 +1571,7 @@ fn boot_ebpf_lsm(
         symlink_reader,
         link_reader,
         rmdir_reader,
+        mknod_reader,
     ];
     if let Some(r) = release_reader {
         readers.push(r);
