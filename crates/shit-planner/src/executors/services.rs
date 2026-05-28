@@ -215,6 +215,34 @@ fn launchctl_argv(
     };
     let target = format!("{domain}/{unit}");
     let mut out = Vec::new();
+    // M05.2 — `present` diff takes precedence over `active`/`enabled`
+    // diffs because bootstrap/bootout subsumes them: bootout takes a
+    // loaded service out of the domain entirely (both
+    // disabled+inactive AS a side effect). Without this short-
+    // circuit, bootstrap of a RunAtLoad=false service shows
+    // before.present=false after.present=true with NO active/enabled
+    // diff (the post-state's "state = not running" parses as
+    // active=false, same as the pre-state's empty input), and the
+    // planner emits nothing.
+    if before.present != after.present {
+        let verb = if before.present {
+            // pre-state had service loaded; current state doesn't →
+            // reverse with bootstrap. We don't have the plist path
+            // here; the executor's invocation falls back to legacy
+            // `launchctl load` shape via the `raw` field hint
+            // (DR-37 followup; for now bootstrap-without-path
+            // fails fast and surfaces as Failed).
+            "bootstrap"
+        } else {
+            // pre-state was unloaded; current is loaded → bootout.
+            "bootout"
+        };
+        out.push(vec!["launchctl".into(), verb.into(), target.clone()]);
+        // Skip the enable/disable + active diff branches; bootout
+        // would un-set them anyway and bootstrap re-sets via the
+        // plist's own keys.
+        return out;
+    }
     // launchctl has no mask concept; skip if there's a delta there.
     if before.enabled != after.enabled {
         let verb = if before.enabled { "enable" } else { "disable" };
@@ -246,6 +274,10 @@ mod tests {
             active,
             enabled,
             masked,
+            // Tests pre-date M05.2's `present` field and were written
+            // assuming the service is loaded. Default to true so the
+            // existing active/enabled diff branches keep firing.
+            present: true,
             raw: String::new(),
         }
     }
