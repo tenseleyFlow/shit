@@ -21,6 +21,7 @@ mod lock;
 mod log_setup;
 mod net_track;
 mod pkg;
+mod priv_op_router;
 mod proc_track;
 mod redirect_track;
 mod server;
@@ -382,6 +383,11 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             // handler can short-circuit to "no helper" when we're
             // in degraded mode.
             watch_ready: helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready)),
+            // AU28 — handle_undo wraps this in a
+            // HelperLinkPrivilegedOpRouter when Some; in degraded
+            // mode (None) the FileExecutor uses NoOpPrivilegedOpRouter
+            // and chown-needing ops surface PermissionDenied.
+            helper_link: helper_link_arc.as_ref().map(Arc::clone),
         };
         tokio::spawn(async move {
             if let Err(e) = ctl::serve(&cfg, ctl_state).await {
