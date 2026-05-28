@@ -88,7 +88,6 @@ impl Conn {
     /// `MAX_HELPER_FRAME_SIZE` is well under any plausible kernel
     /// send-buffer limit. If `sendmsg` returns short, the rest is
     /// completed with plain `send(2)` (the cmsg was already delivered).
-    #[allow(dead_code)]
     pub fn send_response_with_fd(
         &self,
         msg: &HelperResponse,
