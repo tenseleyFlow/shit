@@ -60,31 +60,147 @@ pub fn run(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// AU08 — automatic remediation entry point (`shit doctor --fix`).
+/// AU08 / AU07.A — automatic remediation entry point (`shit doctor
+/// --fix`). Today:
 ///
-/// Today's scope is narrow: Linux helper file capabilities. The
-/// existing report already computes a `setcap_remediation` string;
-/// `--fix` attempts that string with `sudo -n`. On success, prints a
-/// confirmation. On failure (no NOPASSWD, no sudo, non-Linux),
-/// prints the manual command + a pointer to
-/// `--emit-sudoers-snippet`. Exits non-zero when remediation is
-/// needed but couldn't be applied; zero when nothing was wrong or
-/// the apply succeeded.
+/// - **Linux**: helper file capabilities. Existing report computes a
+///   `setcap_remediation` string; `--fix` attempts it via `sudo -n`.
+/// - **FreeBSD / *BSD**: LD_PRELOAD shim install. When the shim is
+///   missing and the build-tree artifact is reachable, offer to
+///   copy it to `/usr/local/lib/shit/libshit_preload_shim.so` via
+///   `doas`/`sudo`.
 ///
-/// Other platforms: no-op success today. AU07 (BSD shim default-on)
-/// is expected to extend this with shim-install remediation.
+/// On unsupported platforms: prints "no auto-remediation is currently
+/// implemented" and exits zero. Exits non-zero only when remediation
+/// was needed AND the apply failed.
 pub fn run_fix() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         fix_linux_caps()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        fix_bsd_shim_install()
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )))]
     {
         eprintln!(
             "shit doctor --fix: no auto-remediation is currently implemented for this platform"
         );
         Ok(())
     }
+}
+
+/// AU07.A — install the LD_PRELOAD shim from the build tree to the
+/// canonical system path. Skips when the shim is already installed.
+/// Detects `doas` / `sudo` and prefers `doas` on FreeBSD per the
+/// `feedback_hasu_preflight` convention.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn fix_bsd_shim_install() -> anyhow::Result<()> {
+    use std::process::Command;
+
+    const TARGET_DIR: &str = "/usr/local/lib/shit";
+    const TARGET_PATH: &str = "/usr/local/lib/shit/libshit_preload_shim.so";
+
+    // Idempotent: nothing to do if the canonical path is already
+    // populated. The probe's SHIT_PRELOAD_SHIM_PATH override (smokes)
+    // doesn't apply here — `--fix` works on the production install
+    // path.
+    if std::path::Path::new(TARGET_PATH).is_file() {
+        println!("shit doctor --fix: shim already installed at {TARGET_PATH}");
+        return Ok(());
+    }
+
+    // Locate the build-tree artifact. Try cwd-relative target/release
+    // first (the dev-loop case), then fall back to the shit binary's
+    // sibling directory (after `make install`, /usr/local/bin/shit
+    // has no sibling shim — that's already-installed and we'd have
+    // returned above; the sibling path exists in test harnesses).
+    let candidates = [
+        std::path::PathBuf::from("target/release/libshit_preload_shim.so"),
+        std::path::PathBuf::from("target/debug/libshit_preload_shim.so"),
+    ];
+    let src = candidates.iter().find(|p| p.is_file()).cloned();
+    let Some(src) = src else {
+        eprintln!("shit doctor --fix: shim build artifact not found.");
+        eprintln!("  Build first:  cargo build --release -p shit-preload-shim");
+        eprintln!("  Then either:  make install   (installs everything)");
+        eprintln!("  Or copy:      doas mkdir -p {TARGET_DIR} && \\");
+        eprintln!("                doas cp target/release/libshit_preload_shim.so {TARGET_PATH}");
+        anyhow::bail!("shim artifact missing — build, then re-run --fix");
+    };
+
+    // doas first, sudo fallback. FreeBSD ships doas by default in
+    // recent base; sudo is a port install.
+    let priv_cmd = if Command::new("doas")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "doas"
+    } else if Command::new("sudo")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "sudo"
+    } else {
+        eprintln!("shit doctor --fix: neither doas nor sudo on PATH.");
+        eprintln!("  Install manually:");
+        eprintln!("    mkdir -p {TARGET_DIR}");
+        eprintln!("    cp {} {TARGET_PATH}", src.display());
+        anyhow::bail!("no privileged-command wrapper available");
+    };
+
+    eprintln!(
+        "shit doctor --fix: installing shim {} → {TARGET_PATH} via {priv_cmd}",
+        src.display()
+    );
+
+    // Step 1 — mkdir -p the target dir.
+    let mkdir = Command::new(priv_cmd)
+        .args(["mkdir", "-p", TARGET_DIR])
+        .status();
+    if !matches!(&mkdir, Ok(s) if s.success()) {
+        anyhow::bail!("{priv_cmd} mkdir -p {TARGET_DIR} failed");
+    }
+
+    // Step 2 — install -m 0644.
+    let install = Command::new(priv_cmd)
+        .args([
+            "install",
+            "-m",
+            "0644",
+            src.to_str().unwrap_or(""),
+            TARGET_PATH,
+        ])
+        .status();
+    if !matches!(&install, Ok(s) if s.success()) {
+        anyhow::bail!("{priv_cmd} install -m 0644 ... {TARGET_PATH} failed");
+    }
+
+    println!("shit doctor --fix: shim installed at {TARGET_PATH}");
+    println!("  Verify with `shit doctor` — bsd.preload_shim_installed should now be true,");
+    println!("  bsd.runtime_capture should report 'kqueue+preload'.");
+    Ok(())
 }
 
 /// AU09 — graceful daemon shutdown via the ctl socket.
