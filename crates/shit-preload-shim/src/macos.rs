@@ -223,6 +223,25 @@ unsafe extern "C" fn my_fchmod(fd: c_int, mode: mode_t) -> c_int {
     unsafe { libc::fchmod(fd, mode) }
 }
 
+/// Replacement for `fchmodat(2)` (M07.B.5). This is the syscall
+/// GNU coreutils' `chmod`/`gchmod` actually issues — `nm -u
+/// /opt/homebrew/bin/gchmod` shows `_fchmodat` and nothing else
+/// from the chmod family. Without this interposer the M07.B
+/// shim coverage was silently inert against the most common
+/// invocation path.
+///
+/// # Safety
+/// Same contract as `libc::fchmodat`.
+unsafe extern "C" fn my_fchmodat(
+    dirfd: c_int,
+    pathname: *const c_char,
+    mode: mode_t,
+    flags: c_int,
+) -> c_int {
+    policy::notify_pre_mutation_with_content("fchmodat", &cstr_to_string(pathname));
+    unsafe { libc::fchmodat(dirfd, pathname, mode, flags) }
+}
+
 /// Replacement for `chown(2)`. Captures path + metadata so the
 /// planner can restore the old uid/gid on undo.
 ///
@@ -244,6 +263,23 @@ unsafe extern "C" fn my_fchown(fd: c_int, uid: libc::uid_t, gid: libc::gid_t) ->
         policy::notify_pre_mutation_with_content("fchown", &path);
     }
     unsafe { libc::fchown(fd, uid, gid) }
+}
+
+/// Replacement for `fchownat(2)` (M07.B.5). GNU coreutils'
+/// `chown`/`gchown` uses this instead of bare `chown` — same
+/// rationale as `fchmodat`.
+///
+/// # Safety
+/// Same contract as `libc::fchownat`.
+unsafe extern "C" fn my_fchownat(
+    dirfd: c_int,
+    pathname: *const c_char,
+    owner: libc::uid_t,
+    group: libc::gid_t,
+    flags: c_int,
+) -> c_int {
+    policy::notify_pre_mutation_with_content("fchownat", &cstr_to_string(pathname));
+    unsafe { libc::fchownat(dirfd, pathname, owner, group, flags) }
 }
 
 /// Replacement for `lchown(2)`. Variant that operates on the
@@ -278,6 +314,36 @@ unsafe extern "C" fn my_futimens(fd: c_int, times: *const libc::timespec) -> c_i
         policy::notify_pre_mutation_with_content("futimens", &path);
     }
     unsafe { libc::futimens(fd, times) }
+}
+
+/// Replacement for `utimensat(2)` (M07.B.5). GNU coreutils'
+/// `touch`/`gtouch` uses this — `nm -u /opt/homebrew/bin/gtouch`
+/// shows utimensat alongside utimes/futimens/futimes. macOS Apple
+/// /usr/bin/touch is SIP-stripped anyway; the gtouch path is what
+/// the dyld-hooks user PATH wraps in practice.
+///
+/// # Safety
+/// Same contract as `libc::utimensat`.
+unsafe extern "C" fn my_utimensat(
+    dirfd: c_int,
+    pathname: *const c_char,
+    times: *const libc::timespec,
+    flag: c_int,
+) -> c_int {
+    policy::notify_pre_mutation_with_content("utimensat", &cstr_to_string(pathname));
+    unsafe { libc::utimensat(dirfd, pathname, times, flag) }
+}
+
+/// Replacement for `futimes(2)` (M07.B.5). fd-only variant; same
+/// fd→path resolver as fchmod/fchown.
+///
+/// # Safety
+/// Same contract as `libc::futimes`.
+unsafe extern "C" fn my_futimes(fd: c_int, times: *const libc::timeval) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("futimes", &path);
+    }
+    unsafe { libc::futimes(fd, times) }
 }
 
 // macOS xattr signatures diverge from Linux: extra `position` arg
@@ -454,6 +520,13 @@ static INTERPOSE_FCHMOD: InterposeEntry = InterposeEntry {
 
 #[used]
 #[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHMODAT: InterposeEntry = InterposeEntry {
+    replacement: my_fchmodat as *const c_void,
+    target: libc::fchmodat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_CHOWN: InterposeEntry = InterposeEntry {
     replacement: my_chown as *const c_void,
     target: libc::chown as *const c_void,
@@ -475,6 +548,13 @@ static INTERPOSE_LCHOWN: InterposeEntry = InterposeEntry {
 
 #[used]
 #[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHOWNAT: InterposeEntry = InterposeEntry {
+    replacement: my_fchownat as *const c_void,
+    target: libc::fchownat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_UTIMES: InterposeEntry = InterposeEntry {
     replacement: my_utimes as *const c_void,
     target: libc::utimes as *const c_void,
@@ -485,6 +565,20 @@ static INTERPOSE_UTIMES: InterposeEntry = InterposeEntry {
 static INTERPOSE_FUTIMENS: InterposeEntry = InterposeEntry {
     replacement: my_futimens as *const c_void,
     target: libc::futimens as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_UTIMENSAT: InterposeEntry = InterposeEntry {
+    replacement: my_utimensat as *const c_void,
+    target: libc::utimensat as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FUTIMES: InterposeEntry = InterposeEntry {
+    replacement: my_futimes as *const c_void,
+    target: libc::futimes as *const c_void,
 };
 
 #[used]
@@ -684,6 +778,35 @@ mod tests {
         );
     }
 
+    // M07.B.5: *at variants GNU coreutils actually use.
+    #[test]
+    fn fchmodat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHMODAT.replacement.is_null());
+        assert!(!INTERPOSE_FCHMODAT.target.is_null());
+        assert_ne!(INTERPOSE_FCHMODAT.replacement, INTERPOSE_FCHMODAT.target);
+    }
+
+    #[test]
+    fn fchownat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHOWNAT.replacement.is_null());
+        assert!(!INTERPOSE_FCHOWNAT.target.is_null());
+        assert_ne!(INTERPOSE_FCHOWNAT.replacement, INTERPOSE_FCHOWNAT.target);
+    }
+
+    #[test]
+    fn utimensat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_UTIMENSAT.replacement.is_null());
+        assert!(!INTERPOSE_UTIMENSAT.target.is_null());
+        assert_ne!(INTERPOSE_UTIMENSAT.replacement, INTERPOSE_UTIMENSAT.target);
+    }
+
+    #[test]
+    fn futimes_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FUTIMES.replacement.is_null());
+        assert!(!INTERPOSE_FUTIMES.target.is_null());
+        assert_ne!(INTERPOSE_FUTIMES.replacement, INTERPOSE_FUTIMES.target);
+    }
+
     #[test]
     fn fd_to_path_returns_none_for_bad_fd() {
         // fd -1 is never valid; F_GETPATH returns -1, our helper None.
@@ -742,8 +865,13 @@ mod tests {
             &INTERPOSE_FSETXATTR,
             &INTERPOSE_REMOVEXATTR,
             &INTERPOSE_FREMOVEXATTR,
+            // M07.B.5: *at variants GNU coreutils actually use
+            &INTERPOSE_FCHMODAT,
+            &INTERPOSE_FCHOWNAT,
+            &INTERPOSE_UTIMENSAT,
+            &INTERPOSE_FUTIMES,
         ];
-        assert_eq!(entries.len(), 19, "M07.A.2 + M07.B.1..4 interposer count");
+        assert_eq!(entries.len(), 23, "M07.A.2 + M07.B.1..5 interposer count");
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
