@@ -38,8 +38,8 @@
 // `clippy::duplicated_attributes` on newer rustc.
 
 use crate::doctor::json::{
-    CodesignReport, EndpointSecurityReport, EsBlocker, FsEventsProbeReport, SandboxReport,
-    SipReport,
+    CodesignReport, DyldShimRcFile, DyldShimReport, EndpointSecurityReport, EsBlocker,
+    FsEventsProbeReport, SandboxReport, SipReport,
 };
 use std::ffi::{CString, c_void};
 use std::os::raw::c_char;
@@ -961,6 +961,137 @@ fn parse_es_probe_line(line: &str) -> EndpointSecurityReport {
         notes: vec![note],
         // overwritten by the doctor's dispatch with `probe_helper_has_es_entitlement`
         helper_has_es_entitlement: false,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M07-doctor — dyld-shim install state
+// ─────────────────────────────────────────────────────────────────────
+
+/// Marker pair the `shit dyld-hooks install` snippet wraps its
+/// rc-file content in. Kept in sync with the constants in
+/// `cmd::dyld_hooks`; duplicated here rather than referenced
+/// because importing from `cmd` into `doctor::probes` would
+/// invert the dep direction.
+const DYLD_HOOKS_SNIPPET_BEGIN: &str = "# >>> shit dyld-hooks (begin) >>>";
+
+/// Resolve the shim dylib path. Mirrors the resolution chain in
+/// `cmd::dyld_hooks::resolve_shim_path` (env var → Homebrew prefix
+/// arm64 → Homebrew prefix x86_64 → repo target/release → repo
+/// target/debug). Duplicated rather than imported to keep the
+/// `doctor` → `cmd` boundary clean.
+fn resolve_shim_dylib_path() -> Option<PathBuf> {
+    if let Some(env) = std::env::var_os("SHIT_PRELOAD_SHIM") {
+        let p = PathBuf::from(env);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for candidate in [
+        "/usr/local/lib/libshit_preload_shim.dylib",
+        "/opt/homebrew/lib/libshit_preload_shim.dylib",
+        "target/release/libshit_preload_shim.dylib",
+        "target/debug/libshit_preload_shim.dylib",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Per-rc-file probe: is the shim snippet's begin-marker present?
+/// Cheaper than the full begin+end span check; if the begin marker
+/// is there we trust the install routine wrote a complete section.
+fn rc_file_snippet_state(path: &Path) -> DyldShimRcFile {
+    let exists = path.exists();
+    let snippet_installed = if exists {
+        std::fs::read_to_string(path)
+            .map(|c| c.contains(DYLD_HOOKS_SNIPPET_BEGIN))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    DyldShimRcFile {
+        path: path.display().to_string(),
+        exists,
+        snippet_installed,
+    }
+}
+
+/// M07-doctor probe entry point. Resolves the shim dylib + checks
+/// the user's shell rc files for the `shit dyld-hooks install`
+/// snippet. No external commands; pure filesystem reads.
+pub fn probe_dyld_shim() -> DyldShimReport {
+    let dylib = resolve_shim_dylib_path();
+    let mut rc_files_checked = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for rc in [".zshrc", ".bashrc"] {
+            rc_files_checked.push(rc_file_snippet_state(&home.join(rc)));
+        }
+    }
+    let rc_snippet_installed = rc_files_checked.iter().any(|e| e.snippet_installed);
+    DyldShimReport {
+        shim_dylib_present: dylib.is_some(),
+        shim_dylib_path: dylib.as_ref().map(|p| p.display().to_string()),
+        rc_snippet_installed,
+        rc_files_checked,
+    }
+}
+
+#[cfg(test)]
+mod dyld_shim_tests {
+    use super::*;
+
+    #[test]
+    fn rc_file_snippet_state_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path().join("nonexistent_rc");
+        let e = rc_file_snippet_state(&rc);
+        assert!(!e.exists);
+        assert!(!e.snippet_installed);
+        assert_eq!(e.path, rc.display().to_string());
+    }
+
+    #[test]
+    fn rc_file_snippet_state_present_without_snippet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path().join(".zshrc");
+        std::fs::write(&rc, "alias ll='ls -l'\n").unwrap();
+        let e = rc_file_snippet_state(&rc);
+        assert!(e.exists);
+        assert!(!e.snippet_installed);
+    }
+
+    #[test]
+    fn rc_file_snippet_state_with_snippet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path().join(".zshrc");
+        let body = format!("alias ll='ls -l'\n{DYLD_HOOKS_SNIPPET_BEGIN}\n# stuff\n");
+        std::fs::write(&rc, body).unwrap();
+        let e = rc_file_snippet_state(&rc);
+        assert!(e.exists);
+        assert!(e.snippet_installed);
+    }
+
+    #[test]
+    fn probe_dyld_shim_returns_well_formed_report() {
+        // Report shape must be populated even on a stock host
+        // where nothing is installed. Don't assert specific values
+        // because the test box may or may not have the shim.
+        let report = probe_dyld_shim();
+        if report.shim_dylib_present {
+            assert!(report.shim_dylib_path.is_some());
+        } else {
+            assert!(report.shim_dylib_path.is_none());
+        }
+        // rc_files_checked is populated as long as $HOME is set
+        // (which it is during cargo test).
+        if std::env::var_os("HOME").is_some() {
+            assert_eq!(report.rc_files_checked.len(), 2);
+        }
     }
 }
 
