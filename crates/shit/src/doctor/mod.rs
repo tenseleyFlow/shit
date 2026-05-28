@@ -171,17 +171,19 @@ pub fn run_visibility(path: &Path, json: bool) -> anyhow::Result<()> {
         }
     );
     println!("  setuid bypass count:  {}", report.setuid_bypassing_shim);
-    if report.setuid_bypassing_shim > 0 {
+    println!("  static bypass count:  {}", report.static_bypassing_shim);
+    let total_bypass = report.setuid_bypassing_shim + report.static_bypassing_shim;
+    if total_bypass > 0 {
         println!();
         println!(
-            "WARN: at least {} setuid binary/binaries in this tree.",
-            report.setuid_bypassing_shim
+            "WARN: {} bypass binary/binaries in this tree ({} setuid, {} static).",
+            total_bypass, report.setuid_bypassing_shim, report.static_bypassing_shim
         );
-        println!("      Their syscalls are invisible to the LD_PRELOAD shim — the kernel");
-        println!("      strips LD_PRELOAD (rtld(1)) / DYLD_INSERT_LIBRARIES (dyld(1))");
-        println!("      on exec(2) of any setuid binary. Their mutations are captured");
-        println!("      post-hoc only via the kernel tier (LSM on Linux; nothing on");
-        println!("      macOS without EndpointSecurity entitlement; kqueue-only on BSD).");
+        println!("      setuid: kernel strips LD_PRELOAD (rtld(1)) / DYLD_INSERT_LIBRARIES");
+        println!("      (dyld(1)) on exec(2). static: no dynamic linker is invoked at all,");
+        println!("      so the shim has no entry point. Both classes' mutations are");
+        println!("      captured post-hoc only via the kernel tier (LSM on Linux; nothing");
+        println!("      on macOS without EndpointSecurity entitlement; kqueue-only on BSD).");
         println!();
         let preview = report.details.iter().take(10);
         for entry in preview {
