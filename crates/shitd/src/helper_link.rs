@@ -493,9 +493,9 @@ pub fn spawn_and_handshake(
         granted,
         kernel_tier,
         degraded_reason,
-        priv_op_waiters: PrivOpWaiters::new(std::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
+        priv_op_waiters: PrivOpWaiters::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ),
     })
 }
 
