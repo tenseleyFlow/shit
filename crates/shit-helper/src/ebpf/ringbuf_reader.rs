@@ -77,6 +77,11 @@ pub mod kind {
     pub const RENAME: u8 = 6;
     pub const RMDIR: u8 = 7;
     pub const RELEASE: u8 = 8;
+    /// AU29 — `lsm/inode_mknod`. Payload reuses CreateEvent; the
+    /// discriminator is the kind tag here so the dispatcher can
+    /// route mknod through its own handler if a future change wants
+    /// to (current behavior reuses on_create's path).
+    pub const MKNOD: u8 = 9;
 }
 
 /// `attr_valid` bits, mirror of `SHIT_ATTR_*` in common.h. Set by the
@@ -810,6 +815,13 @@ pub fn decode_create(bytes: &[u8]) -> Option<CreateEvent> {
     decode_event::<CreateEvent>(bytes, kind::CREATE)
 }
 
+/// AU29 — decode a raw ringbuf record from the mknod ringbuf as a
+/// [`CreateEvent`]. The payload shape is identical to inode_create;
+/// the differentiator is the `kind::MKNOD` tag.
+pub fn decode_mknod(bytes: &[u8]) -> Option<CreateEvent> {
+    decode_event::<CreateEvent>(bytes, kind::MKNOD)
+}
+
 /// Decode a raw ringbuf record as an [`OpenEvent`].
 pub fn decode_open(bytes: &[u8]) -> Option<OpenEvent> {
     decode_event::<OpenEvent>(bytes, kind::OPEN)
@@ -1011,6 +1023,37 @@ impl LsmReader {
                         bytes = bytes.len(),
                         first_byte = bytes.first().copied().unwrap_or(0),
                         "ringbuf record could not be decoded as CreateEvent"
+                    );
+                }
+            }),
+            idle_sleep,
+        )
+    }
+
+    /// AU29 — spawn a mknod-ringbuf reader. Wire shape is identical
+    /// to `inode_create` (the kernel hook returns the same
+    /// `(parent_inode, parent_dev, mode, name)` payload) but uses
+    /// `kind::MKNOD`. Routes through `on_create` so the userspace
+    /// `handle_lsm_create` body handles FIFOs / sockets without a
+    /// duplicate code path; the kind discriminator for the planner
+    /// comes from the wire's `mode` (S_IFMT bits).
+    pub fn spawn_mknod(
+        mknod_rb: RingBuf<MapData>,
+        sink: Arc<dyn LsmEventSink>,
+        idle_sleep: Duration,
+    ) -> Self {
+        Self::spawn_with_handler(
+            "shit-lsm-mknod",
+            mknod_rb,
+            sink,
+            Box::new(|bytes, sink| {
+                if let Some(ev) = decode_mknod(bytes) {
+                    sink.on_create(&ev);
+                } else {
+                    tracing::warn!(
+                        bytes = bytes.len(),
+                        first_byte = bytes.first().copied().unwrap_or(0),
+                        "ringbuf record could not be decoded as CreateEvent (mknod)"
                     );
                 }
             }),
