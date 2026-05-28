@@ -911,13 +911,31 @@ impl shit_planner::executors::SvcRunner for PrivilegedSvcRunner {
             Some(v) => v,
             None => return Err("empty argv".into()),
         };
-        let escalator = [
-            "/usr/local/bin/doas",
-            "/usr/local/bin/sudo",
-            "/usr/bin/sudo",
-        ]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).is_file());
+        // M05.2 — `launchctl` against a `gui/<uid>` target on macOS
+        // is unprivileged (the user manages their own LaunchAgents).
+        // Asking for sudo in a daemon context with no TTY fails with
+        // "a terminal is required" and the bootout never runs.
+        // System-domain (`system/<label>`) launchctl ops DO need
+        // root; the planner emits `system/...` targets in that case
+        // and the bare launchctl call below fails with a clear EACCES
+        // for the user to re-run as `sudo shit undo`. That failure
+        // mode is louder + more accurate than today's
+        // "sudo asks for password" silently broken state.
+        //
+        // Service tools other than launchctl (FreeBSD service(8),
+        // systemctl) still need root; keep the escalator for them.
+        let needs_elevation = cmd != "launchctl";
+        let escalator = if needs_elevation {
+            [
+                "/usr/local/bin/doas",
+                "/usr/local/bin/sudo",
+                "/usr/bin/sudo",
+            ]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+        } else {
+            None
+        };
         let mut command = match escalator {
             Some(e) => {
                 let mut c = std::process::Command::new(e);
