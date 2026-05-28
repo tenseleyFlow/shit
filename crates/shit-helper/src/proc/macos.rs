@@ -337,12 +337,10 @@ mod tests {
         // PROCARGS2 EPERM/ESRCH — both shapes are fine, but the
         // result must be well-formed.
         let bogus = 999_999_u32;
-        match snapshot(bogus) {
-            Ok(snap) => {
-                assert_eq!(snap.pid, bogus);
-                // comm/cwd/argv may all be empty since libproc rejected.
-            }
-            Err(_) => {} // fine
+        // Err is fine (libproc EPERM/ESRCH); Ok with empty fields is
+        // also fine. Only assert when we got a snapshot back.
+        if let Ok(snap) = snapshot(bogus) {
+            assert_eq!(snap.pid, bogus);
         }
     }
 
@@ -350,10 +348,7 @@ mod tests {
     fn enumerate_all_pids_includes_self() {
         let me = std::process::id();
         let pids = enumerate_all_pids().expect("enumerate");
-        assert!(
-            pids.iter().any(|&p| p == me),
-            "self pid {me} not in enumeration"
-        );
+        assert!(pids.contains(&me), "self pid {me} not in enumeration");
     }
 
     #[test]
