@@ -93,11 +93,39 @@ fn dispatch(
             super::hardlink::capture_hardlink(src_fd, src_path, blob_root, opts.source_doomed)
         }
         CowTier::StreamingCopy => super::streaming::capture_streaming(src_fd, src_path, blob_root),
-        CowTier::ZfsClone => Err(CowError::TierUnsupported {
-            tier: "zfs-clone",
-            detail: "per-file ZFS clone not supported in v1".into(),
-        }),
+        CowTier::ZfsClone => zfs_clone_dispatch(src_fd, src_path, blob_root),
     }
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn zfs_clone_dispatch(
+    src_fd: RawFd,
+    src_path: &Path,
+    blob_root: &Path,
+) -> Result<CaptureOutcome, CowError> {
+    super::zfs_clone::capture_zfs_clone(src_fd, src_path, blob_root)
+}
+
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+fn zfs_clone_dispatch(
+    _src_fd: RawFd,
+    _src_path: &Path,
+    _blob_root: &Path,
+) -> Result<CaptureOutcome, CowError> {
+    Err(CowError::TierUnsupported {
+        tier: "zfs-clone",
+        detail: "not a BSD target".into(),
+    })
 }
 
 #[cfg(target_os = "macos")]

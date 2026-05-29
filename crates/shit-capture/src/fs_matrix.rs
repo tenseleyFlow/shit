@@ -106,12 +106,32 @@ pub fn supported_tiers(fs: &FsKind) -> Vec<CowTier> {
             CowTier::Hardlink,
             CowTier::StreamingCopy,
         ],
-        FsKind::Zfs => vec![
-            // Per-file zfs clone requires a snapshot first; we don't do
-            // per-file ZFS clones in v1. Hardlink + stream only.
-            CowTier::Hardlink,
-            CowTier::StreamingCopy,
-        ],
+        FsKind::Zfs => {
+            // AU01.A: per-event clone tier on BSDs (snapshot → clone
+            // → read → destroy). Engine falls through to hardlink /
+            // streaming on non-ZFS hosts or when /sbin/zfs isn't
+            // installed. On non-BSD targets the dispatch returns
+            // TierUnsupported, so omit ZfsClone here to skip a
+            // round-trip.
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            ))]
+            {
+                vec![CowTier::ZfsClone, CowTier::Hardlink, CowTier::StreamingCopy]
+            }
+            #[cfg(not(any(
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            )))]
+            {
+                vec![CowTier::Hardlink, CowTier::StreamingCopy]
+            }
+        }
         FsKind::Ufs => vec![
             CowTier::CopyFileRange,
             CowTier::Hardlink,
@@ -393,11 +413,33 @@ mod tests {
 
     #[test]
     fn pick_tier_doomed_unlocks_hardlink_on_zfs() {
-        // ZFS preference is [Hardlink, StreamingCopy].
+        // ZFS preference:
+        //   BSDs:     [ZfsClone, Hardlink, StreamingCopy]
+        //   non-BSDs: [Hardlink, StreamingCopy]
+        // ZfsClone has no doom requirement, so on BSDs both branches
+        // pick it. On non-BSDs the doom flag is what gates Hardlink.
         let with_doom = pick_tier(&FsKind::Zfs, &FsKind::Zfs, true);
         let without = pick_tier(&FsKind::Zfs, &FsKind::Zfs, false);
-        assert_eq!(with_doom, Some(CowTier::Hardlink));
-        assert_eq!(without, Some(CowTier::StreamingCopy));
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        {
+            assert_eq!(with_doom, Some(CowTier::ZfsClone));
+            assert_eq!(without, Some(CowTier::ZfsClone));
+        }
+        #[cfg(not(any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
+        {
+            assert_eq!(with_doom, Some(CowTier::Hardlink));
+            assert_eq!(without, Some(CowTier::StreamingCopy));
+        }
     }
 
     #[test]
