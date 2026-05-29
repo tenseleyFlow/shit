@@ -130,6 +130,8 @@ Each entry below has a green CI smoke. The capture mechanism column is named at 
 
 Capture tier: kqueue (`EVFILT_VNODE` NOTE_WRITE/RENAME/DELETE/ATTRIB) + LD_PRELOAD shim for the cross-watch / install-overwrite race. The shim is the supported default; `shit doctor` reports the `kqueue-only` tier when the shim is missing and surfaces a multi-line WARN block telling you which classes of pre-image you lose. Capsicum sandbox is default-on (B05); set `SHIT_CAPSICUM=0` to opt out.
 
+Pre-image CoW tier on ZFS-backed paths: per-event `zfs clone`. The COW engine snapshots the source dataset, clones the snapshot to a hidden mountpoint (`/tmp/.shit-clones/<id>`), reads the pre-image bytes from the clone, then destroys the clone + snapshot — all per captured event. Falls through to hardlink + streaming copy when `/sbin/zfs` is missing, the path isn't on ZFS, or the dataset is `mountpoint=none|legacy`. Coverage validated by `zfs-clone-primitives-fbsd.sh` (primitives) and `zfs-clone-engine-fbsd.sh` (engine wire).
+
 | Class | Smoke |
 |---|---|
 | `rm`, `mv` (same-dir / cross-dir / dir), `ln` (sym + hard), `cp -r`, `mkdir -p`, `mkfifo` | `rm-undo-fbsd.sh`, `mv-{dir,across-dirs,noop}-undo-fbsd.sh`, `ln-{symlink,hardlink}-undo-fbsd.sh`, etc. |
