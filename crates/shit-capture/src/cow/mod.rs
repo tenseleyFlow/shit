@@ -23,6 +23,13 @@ pub mod ficlone_linux;
 pub mod hardlink;
 pub mod streaming;
 pub mod verify;
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+pub mod zfs_clone;
 
 pub use engine::{DefaultEngine, would_pick};
 pub use error::CowError;
