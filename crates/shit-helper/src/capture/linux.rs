@@ -659,6 +659,18 @@ impl LinuxCaptureRuntime {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
             let meta = fstat_meta(fd);
             (0, [0u8; 32], None, meta)
+        } else if race_won && matches!(file_type, FileType::Fifo | FileType::Socket) {
+            // AU29 follow-up — Fifo/Socket capture: O_PATH fd held
+            // by pre_open can be fstat'd for mode/uid/gid but can't
+            // be read from (O_PATH semantics). Without this branch
+            // the unlink falls into the regular-file content-read
+            // path below, read_pre_image fails, meta_wire goes to
+            // None, and the daemon's kind_from_mode_bits falls
+            // through to Regular — kind is lost and AU22's
+            // RecreatePath{Fifo} dispatch never fires.
+            let fd = race_fd.as_ref().unwrap().as_raw_fd();
+            let meta = fstat_meta(fd);
+            (0, [0u8; 32], None, meta)
         } else if race_won {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
             match (read_pre_image(fd), fstat_meta(fd)) {

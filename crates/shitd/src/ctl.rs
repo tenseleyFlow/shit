@@ -177,12 +177,31 @@ async fn handle_client(
         }
         CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
-        CtlRequest::Undo(req) => handle_undo(
-            req,
-            &index,
-            &blob_store,
-            helper_link.as_ref().map(Arc::clone),
-        ),
+        CtlRequest::Undo(req) => {
+            // AU22 — handle_undo blocks on HelperLinkPrivilegedOpRouter's
+            // synchronous mpsc::recv_timeout when a Fifo/Socket mknod
+            // restore lands. Daemon's tokio runtime is single-threaded
+            // (`new_current_thread`); running handle_undo on the worker
+            // would block the dispatch_loop async task and the helper's
+            // PrivilegedOpResult response would sit in the kernel
+            // socket buffer for the full priv-op timeout (5s) — even
+            // though the helper applied the mknod in milliseconds.
+            //
+            // Move handle_undo to spawn_blocking so the runtime worker
+            // stays free to poll dispatch_loop, which routes the
+            // response back to the router's waiter inside the timeout.
+            let index = Arc::clone(&index);
+            let blob_store = Arc::clone(&blob_store);
+            let helper_link = helper_link.as_ref().map(Arc::clone);
+            match tokio::task::spawn_blocking(move || {
+                handle_undo(req, &index, &blob_store, helper_link)
+            })
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => CtlResponse::Error(format!("undo spawn_blocking panic: {e}")),
+            }
+        }
         CtlRequest::WaitWatchReady {
             session,
             command_seq,

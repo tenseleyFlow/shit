@@ -1247,10 +1247,22 @@ fn kind_from_mode_bits(mode: u32) -> shit_planner::metadata::FileKind {
         0o040000 => FileKind::Directory,
         0o100000 => FileKind::Regular,
         0o120000 => FileKind::Symlink,
-        // FIFO / Socket / Block / Char devices — uncommon at unlink
-        // time; fall through to Regular so the planner's
-        // RecreatePath emits a regular-file inverse. The unit test
-        // suite's directory restore is the load-bearing case.
+        // AU22 — Fifo + Socket map to their own kinds so
+        // RecreatePath dispatches via PrivilegedOpRouter::mknod
+        // through the helper (which holds CAP_MKNOD). Pre-AU22
+        // these fell through to Regular and the planner emitted a
+        // Regular-file inverse, which silently lost the kind.
+        0o010000 => FileKind::Fifo,
+        0o140000 => FileKind::Socket,
+        // BlockDevice + CharDevice need CAP_SYS_ADMIN at the
+        // helper (deferred to DR-15.2); recording the kind is
+        // correct, the executor's recreate_path_inner returns the
+        // DR-15.2 deferral message when it sees these.
+        0o060000 => FileKind::BlockDevice,
+        0o020000 => FileKind::CharDevice,
+        // Unknown / no S_IF bits set — fall through to Regular as
+        // the safest restore target. (mode=0 happens when the
+        // helper lost the race to stat the unlinked inode.)
         _ => FileKind::Regular,
     }
 }
@@ -1471,6 +1483,47 @@ fn read_all_from_fd(fd: &OwnedFd, expected_size: usize) -> Result<Vec<u8>, Helpe
         offset += n as usize;
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests_kind_from_mode_bits {
+    use super::*;
+    use shit_planner::metadata::FileKind;
+
+    #[test]
+    fn directory_bits() {
+        assert_eq!(kind_from_mode_bits(0o040755), FileKind::Directory);
+    }
+    #[test]
+    fn regular_bits() {
+        assert_eq!(kind_from_mode_bits(0o100644), FileKind::Regular);
+    }
+    #[test]
+    fn symlink_bits() {
+        assert_eq!(kind_from_mode_bits(0o120777), FileKind::Symlink);
+    }
+    #[test]
+    fn fifo_bits_au22() {
+        // AU22 — pre-AU22 this returned Regular; locks in the fix.
+        assert_eq!(kind_from_mode_bits(0o010644), FileKind::Fifo);
+    }
+    #[test]
+    fn socket_bits_au22() {
+        assert_eq!(kind_from_mode_bits(0o140644), FileKind::Socket);
+    }
+    #[test]
+    fn block_device_bits() {
+        assert_eq!(kind_from_mode_bits(0o060644), FileKind::BlockDevice);
+    }
+    #[test]
+    fn char_device_bits() {
+        assert_eq!(kind_from_mode_bits(0o020644), FileKind::CharDevice);
+    }
+    #[test]
+    fn unknown_falls_through_to_regular() {
+        // mode=0 (helper lost race to stat the unlinked inode).
+        assert_eq!(kind_from_mode_bits(0), FileKind::Regular);
+    }
 }
 
 #[cfg(test)]
