@@ -194,7 +194,7 @@ fn render_file_pre_image(w: &mut dyn Write, kind_json: &str) -> std::io::Result<
         .and_then(|m| m.get("size"))
         .and_then(|v| v.as_u64());
     let size_part = match size {
-        Some(s) => format!(", {} bytes", s),
+        Some(s) => format!(", {s} bytes"),
         None => String::new(),
     };
     writeln!(w, "    path: {path}")?;
