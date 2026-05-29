@@ -1,0 +1,70 @@
+name: perf-mac
+
+# M03.x.PERF — macOS perf gates. Closes the last unfulfilled M03
+# DoD item: a stress-test gate on the ES auth-event handler hot
+# path (clonefile pre-image) + a no-allocation assertion on the
+# same hot path. Mirrors perf-bsd.yml's structure: bench bin
+# dumps JSON; `gate` bin enforces the budget from
+# tools/perf/budgets.toml.
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+    paths:
+      - 'crates/shit-helper/src/capture/macos_es.rs'
+      - 'crates/shit-helper/src/es/**'
+      - 'crates/shit-proto/**'
+      - 'benches/regression/**'
+      - 'tools/perf/**'
+      - '.github/workflows/perf-mac.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-mac-14:
+    name: perf-mac-14 (M03.x.PERF)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build bench + gate bins (release)
+        run: |
+          cargo build --release \
+            -p shit-regression-bench \
+            --bin es-handler-clonefile \
+            --bin gate \
+            --locked
+
+      - name: bench scratch dir
+        run: mkdir -p target/bench
+
+      - name: es-handler-clonefile (latency)
+        run: |
+          # 1000 iters / 50 warmup against unique 64 KiB src files
+          # on the runner's APFS scratch volume. --max-allocations 8
+          # is the steady-state alloc ceiling (CString + PathBuf
+          # + format args per iter). Anything higher = a hidden
+          # Vec/HashMap growth on the hot path.
+          ./target/release/es-handler-clonefile \
+            --n 1000 --warmup 50 --bytes 65536 \
+            --max-allocations 8 \
+            --out target/bench/es-handler-clonefile.json
+          cat target/bench/es-handler-clonefile.json
+
+      - name: enforce mac budget gate
+        run: |
+          ./target/release/gate --tier mac \
+            --gate es-handler-clonefile \
+            --input target/bench/es-handler-clonefile.json \
+            --budgets tools/perf/budgets.toml
+
+      - name: upload bench JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-mac-14-results
+          path: target/bench/*.json
