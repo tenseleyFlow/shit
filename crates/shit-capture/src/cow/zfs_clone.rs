@@ -278,9 +278,7 @@ pub fn capture_zfs_clone(
         let _ = snapshot_destroy(&snap);
         return Err(CowError::TierUnsupported {
             tier: "zfs-clone",
-            detail: format!(
-                "path {src_path:?} doesn't live under dataset mountpoint {src_mp:?}",
-            ),
+            detail: format!("path {src_path:?} doesn't live under dataset mountpoint {src_mp:?}",),
         });
     };
 

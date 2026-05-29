@@ -120,11 +120,7 @@ pub fn supported_tiers(fs: &FsKind) -> Vec<CowTier> {
                 target_os = "dragonfly",
             ))]
             {
-                vec![
-                    CowTier::ZfsClone,
-                    CowTier::Hardlink,
-                    CowTier::StreamingCopy,
-                ]
+                vec![CowTier::ZfsClone, CowTier::Hardlink, CowTier::StreamingCopy]
             }
             #[cfg(not(any(
                 target_os = "freebsd",

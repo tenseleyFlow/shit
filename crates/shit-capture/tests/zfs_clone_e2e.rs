@@ -63,7 +63,10 @@ fn capture_zfs_clone_returns_zfs_clone_tier_with_matching_bytes() {
     );
 
     let expected = shit_planner::BlobHash::from_bytes(*blake3::hash(&payload).as_bytes());
-    assert_eq!(outcome.hash, expected, "captured blob hash != streaming hash");
+    assert_eq!(
+        outcome.hash, expected,
+        "captured blob hash != streaming hash"
+    );
 
     let store = shit_store::BlobStore::open(blob_root.path()).unwrap();
     let bytes = store.get(outcome.hash).unwrap();
