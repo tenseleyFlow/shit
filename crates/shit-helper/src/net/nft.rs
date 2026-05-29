@@ -23,7 +23,7 @@ impl NetInspector for NftInspector {
     fn tool(&self) -> NetToolWire {
         NetToolWire::Nft
     }
-    fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+    fn collect_state(&self, _verb: &str, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         // `-a` (include rule handles) is a global flag; nft requires
         // it before the subcommand, not after. `nft list ruleset -a`
         // fails with "syntax error, options must be specified before

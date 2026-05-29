@@ -27,7 +27,7 @@ impl NetInspector for UfwInspector {
     fn tool(&self) -> NetToolWire {
         NetToolWire::Ufw
     }
-    fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+    fn collect_state(&self, _verb: &str, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         let verbose = run(&["status", "verbose"])?;
         let numbered = run(&["status", "numbered"])?;
         let mut out = Vec::with_capacity(verbose.len() + SEP.len() + numbered.len());
