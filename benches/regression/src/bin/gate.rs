@@ -5,12 +5,13 @@
 //! `tools/perf/budgets.toml`. Exits 0 within budget, 1 on breach,
 //! 2 on missing/unknown gate (so CI surfaces config drift loud).
 //!
-//! Usage: `gate --tier <bsd|lsm> --gate <name> --input <result.json>
+//! Usage: `gate --tier <bsd|lsm|mac> --gate <name> --input <result.json>
 //!              [--budgets <path>] [--skip-on-missing-gate]`
 //!
 //! The budgets file is sectioned by tier:
 //!   - `[[bsd.gate]]` entries are enforced when `--tier bsd`
 //!   - `[[lsm.gate]]` entries are enforced when `--tier lsm`
+//!   - `[[mac.gate]]` entries are enforced when `--tier mac` (M03.x.PERF)
 //!
 //! `--skip-on-missing-gate` lets the workflow keep running while
 //! new bins are being added; without it, an unknown `<name>` fails
@@ -51,6 +52,7 @@ struct Args {
 enum Tier {
     Bsd,
     Lsm,
+    Mac,
 }
 
 /// Sectioned budgets file. Each tier carries its own `[[<tier>.gate]]`
@@ -62,6 +64,8 @@ struct BudgetsFile {
     bsd: TierSection,
     #[serde(default)]
     lsm: TierSection,
+    #[serde(default)]
+    mac: TierSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -134,6 +138,7 @@ fn main() -> Result<()> {
     let (tier_label, tier_gates) = match args.tier {
         Tier::Bsd => ("bsd", &budgets.bsd.gate),
         Tier::Lsm => ("lsm", &budgets.lsm.gate),
+        Tier::Mac => ("mac", &budgets.mac.gate),
     };
 
     let Some(gate) = tier_gates.iter().find(|g| g.name == args.gate) else {
