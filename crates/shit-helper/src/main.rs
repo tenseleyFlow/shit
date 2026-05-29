@@ -62,14 +62,6 @@ mod sandbox;
 mod seccomp_linux;
 mod self_verify;
 mod svc;
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
-mod zfs;
-
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
