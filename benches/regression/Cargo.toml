@@ -85,6 +85,13 @@ path = "src/bin/gate.rs"
 name = "fanotify-capture"
 path = "src/bin/fanotify_capture.rs"
 
+# M03.x.PERF — macOS-only ES handler clonefile pre-image bench.
+# Non-macOS targets compile a tiny stub that prints a skipped JSON
+# placeholder so the workflow runner can invoke unconditionally.
+[[bin]]
+name = "es-handler-clonefile"
+path = "src/bin/es_handler_clonefile.rs"
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -114,3 +121,10 @@ blake3 = { workspace = true }
 [target.'cfg(target_os = "freebsd")'.dependencies]
 libc = { workspace = true }
 shit-helper = { workspace = true }
+
+# M03.x.PERF — es-handler-clonefile bench drives clonefile(2)
+# directly via libc on APFS. No shit-helper link needed because
+# the relevant inline_clonefile helper is private; the bench
+# replicates the small call surface inline.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
