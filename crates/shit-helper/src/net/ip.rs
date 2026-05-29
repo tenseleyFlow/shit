@@ -60,7 +60,7 @@ impl NetInspector for IpInspector {
             IpObject::Link => NetToolWire::IpLink,
         }
     }
-    fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+    fn collect_state(&self, _verb: &str, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         let out = Command::new("ip")
             .args(["-j", self.object.arg(), "show"])
             .output()?;

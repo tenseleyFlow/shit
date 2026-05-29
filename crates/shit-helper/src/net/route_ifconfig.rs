@@ -45,7 +45,7 @@ impl NetInspector for RouteInspector {
         NetToolWire::Route
     }
 
-    fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+    fn collect_state(&self, _verb: &str, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         // `-n` numeric (no DNS round-trips during capture), `-r`
         // dump routing tables, `-f inet` v4 family.
         let out = Command::new("netstat").args(["-nrf", "inet"]).output()?;
@@ -65,7 +65,7 @@ impl NetInspector for IfconfigInspector {
         NetToolWire::Ifconfig
     }
 
-    fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+    fn collect_state(&self, _verb: &str, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         let out = Command::new("ifconfig").arg("-a").output()?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(

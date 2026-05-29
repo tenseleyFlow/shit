@@ -1,26 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! macOS `networksetup` inspector (M06.1).
+//! macOS `networksetup` inspector (M06.1 + M06.5).
 //!
-//! Scope: DNS-only first ship. The wrapper today only brackets
-//! `-setdnsservers <service> <dns...>`; the inspector captures the
-//! pre-mutation DNS list via `networksetup -getdnsservers <service>`
-//! and ships it as the wire `before_state`. The planner's
-//! `synthesise_networksetup_inverse` reads that state and emits
-//! `["networksetup", "-setdnsservers", <service>, <dns...>]` as
-//! the inverse — restoring the prior DNS list verbatim.
+//! Supported verbs (mutating subcommands the wrapper brackets):
 //!
-//! Other `-set*` verbs (DHCP, manual-IP, location-switch) plumb
-//! through the same wrapper + inspector + planner code paths, just
-//! with different `-get*` queries; they're M06.x follow-ups.
+//! | wire `verb`             | pre-state query                 |
+//! |-------------------------|---------------------------------|
+//! | `setdnsservers` (M06.1) | `networksetup -getdnsservers <svc>` |
+//! | `setmanual`     (M06.5) | `networksetup -getinfo <svc>`       |
+//! | `setdhcp`       (M06.5) | `networksetup -getinfo <svc>`       |
+//! | `switchtolocation` (M06.5) | `networksetup -getcurrentlocation` |
 //!
-//! ## Output shape
+//! The captured bytes are prefixed with a metadata header so the
+//! planner-side synthesiser can route to the correct per-verb
+//! inverse logic without needing new fields on the
+//! `CaptureEventKind::NetworkOp` wire:
 //!
-//! `networksetup -getdnsservers <service>` returns:
-//!   - "There aren't any DNS Servers set on <service>." (no DNS configured)
-//!   - One DNS server per line, e.g. "1.1.1.1\n8.8.8.8\n"
+//! ```text
+//! # verb=<v>
+//! # scope=<service or empty>
+//! <raw -get* stdout>
+//! ```
 //!
-//! We capture the raw stdout verbatim; the planner parses it.
+//! Backcompat for M06.1: when no `# verb=` line is present the
+//! planner defaults to `setdnsservers`. The M06.1 inspector only
+//! emitted `# scope=`; that captures-on-trunk remain replayable.
 
 use std::process::Command;
 
@@ -35,43 +39,72 @@ impl NetInspector for NetworksetupInspector {
         NetToolWire::Networksetup
     }
 
-    /// `scope_hint` carries the network service name (e.g. "Wi-Fi",
-    /// "Ethernet"). The wrapper passes the service from
-    /// `-setdnsservers <service> ...`.
-    fn collect_state(&self, scope_hint: &str) -> anyhow::Result<Vec<u8>> {
-        if scope_hint.is_empty() {
-            return Err(anyhow::anyhow!(
-                "networksetup inspector: empty scope_hint (need service name)"
-            ));
-        }
-        // M06.1 — DNS-only. Other verbs (setmanual / setdhcp /
-        // switchtolocation) need different `-get*` queries; route
-        // them via a sub-verb in scope_hint in a follow-up. For
-        // Stage 1 every networksetup capture is a DNS capture.
-        let out = Command::new("networksetup")
-            .args(["-getdnsservers", scope_hint])
-            .output()?;
-        if !out.status.success() {
-            return Err(anyhow::anyhow!(
-                "networksetup -getdnsservers {} exited {:?}: {}",
-                scope_hint,
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        // M06.1 — prepend a `# scope=<service>` header so the
-        // planner's `synthesise_networksetup_inverse` knows which
-        // service to target without needing scope_hint plumbed
-        // through the wire (CaptureEventKind::NetworkOp doesn't
-        // currently carry per-event scope; adding a field there
-        // would be a wider blast radius). The synthesizer strips
-        // this prefix before parsing the DNS list. `#`-prefixed
-        // lines are not valid networksetup output, so the header
-        // is unambiguous.
-        let mut bytes = format!("# scope={scope_hint}\n").into_bytes();
-        bytes.extend_from_slice(&out.stdout);
+    /// `verb` is the stripped CLI verb (`setdnsservers`, `setmanual`,
+    /// `setdhcp`, `switchtolocation`). `scope_hint` carries the
+    /// network-service name for the per-service verbs (empty for
+    /// `switchtolocation` which is global).
+    fn collect_state(&self, verb: &str, scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+        let raw = match verb {
+            // M06.1 — DNS list.
+            "setdnsservers" => {
+                require_scope(verb, scope_hint)?;
+                run_networksetup(&["-getdnsservers", scope_hint])?
+            }
+            // M06.5 — service-level IP config (DHCP/Manual/Off/BOOTP).
+            // Both setmanual and setdhcp read the same -getinfo dump;
+            // the synthesiser parses "DHCP Configuration" vs
+            // "Manual Configuration" from the first line to pick the
+            // right inverse verb.
+            "setmanual" | "setdhcp" => {
+                require_scope(verb, scope_hint)?;
+                run_networksetup(&["-getinfo", scope_hint])?
+            }
+            // M06.5 — current location name; no service scope.
+            "switchtolocation" => run_networksetup(&["-getcurrentlocation"])?,
+            // M06.1 backcompat: unknown verbs that still reach the
+            // inspector (e.g., an empty verb from the M06.1 helper
+            // before --verb plumbing landed) fall back to DNS so
+            // existing journal entries keep replaying.
+            "" => {
+                require_scope("setdnsservers", scope_hint)?;
+                run_networksetup(&["-getdnsservers", scope_hint])?
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "networksetup inspector: unsupported verb {other:?}"
+                ));
+            }
+        };
+
+        // Prepend the metadata header. `#`-prefixed lines are not
+        // valid networksetup output, so the header is unambiguous to
+        // the parser on the planner side.
+        let mut bytes = format!("# verb={verb}\n# scope={scope_hint}\n").into_bytes();
+        bytes.extend_from_slice(&raw);
         Ok(bytes)
     }
+}
+
+fn require_scope(verb: &str, scope_hint: &str) -> anyhow::Result<()> {
+    if scope_hint.is_empty() {
+        return Err(anyhow::anyhow!(
+            "networksetup inspector: {verb} requires a service name (empty scope_hint)"
+        ));
+    }
+    Ok(())
+}
+
+fn run_networksetup(args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let out = Command::new("networksetup").args(args).output()?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "networksetup {} exited {:?}: {}",
+            args.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
 }
 
 #[cfg(test)]
@@ -84,9 +117,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_scope_hint_errors() {
-        let err = NetworksetupInspector.collect_state("").unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("empty scope_hint"), "got: {msg}");
+    fn empty_scope_hint_errors_for_per_service_verbs() {
+        for verb in ["setdnsservers", "setmanual", "setdhcp"] {
+            let err = NetworksetupInspector.collect_state(verb, "").unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("requires a service name"), "{verb}: got {msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_verb_errors() {
+        let err = NetworksetupInspector
+            .collect_state("bogus", "Wi-Fi")
+            .unwrap_err();
+        assert!(format!("{err}").contains("unsupported verb"));
     }
 }

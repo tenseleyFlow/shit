@@ -35,7 +35,14 @@ pub trait NetInspector {
     fn tool(&self) -> NetToolWire;
     /// Snapshot the tool's current state. Bytes, not text — some
     /// tools (`pfctl -s rules`) include trailing nulls.
-    fn collect_state(&self, scope_hint: &str) -> anyhow::Result<Vec<u8>>;
+    ///
+    /// `verb` carries the user's CLI verb (e.g. `setdnsservers`,
+    /// `setmanual`, `switchtolocation`) so per-tool inspectors that
+    /// support multiple verbs (M06.5 — networksetup) can dispatch
+    /// the right `-get*` query. Inspectors that only have one query
+    /// shape (iptables, nft, ufw, ip, pfctl, route, ifconfig) ignore
+    /// it.
+    fn collect_state(&self, verb: &str, scope_hint: &str) -> anyhow::Result<Vec<u8>>;
 }
 
 fn inspector_for(t: NetToolWire) -> Option<Box<dyn NetInspector>> {
@@ -104,15 +111,17 @@ pub async fn run_event(
     };
     debug_assert_eq!(inspector.tool(), tool);
 
-    let state_raw = inspector.collect_state(scope_hint).unwrap_or_else(|e| {
-        tracing::warn!(
-            tool = tool.as_str(),
-            phase = ?phase,
-            err = %e,
-            "net-event: failed to snapshot state; sending empty"
-        );
-        Vec::new()
-    });
+    let state_raw = inspector
+        .collect_state(verb, scope_hint)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                tool = tool.as_str(),
+                phase = ?phase,
+                err = %e,
+                "net-event: failed to snapshot state; sending empty"
+            );
+            Vec::new()
+        });
 
     // SAFETY: getpid/getuid always succeed.
     let pid = unsafe { libc::getpid() } as u32;

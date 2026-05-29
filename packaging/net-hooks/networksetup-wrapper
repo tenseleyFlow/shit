@@ -45,24 +45,40 @@ if [[ -n "${SHIT_DURING_UNDO:-}" ]]; then
 fi
 
 verb="${1:-}"
-# Service name is positional after the verb for most -set* forms.
-# Stage 1 only handles -setdnsservers; future verbs slot in here.
-service="${2:-}"
 
+# Classify verb. M06.5 adds setmanual/setdhcp/switchtolocation to
+# the M06.1 setdnsservers-only ship. The scope (service name vs.
+# global) differs per verb:
+#
+#   -setdnsservers <svc> <dns...>       — service = $2
+#   -setmanual <svc> <ip> <mask> <gw>   — service = $2
+#   -setdhcp <svc>                      — service = $2
+#   -switchtolocation <name>            — no service (global)
 mutating=0
+needs_service=0
 case "$verb" in
-    # M06.1: DNS-only first ship. Other -set*/switch* verbs are
-    # listed but fall through to exec — wiring them up is a M06.x
-    # follow-up.
-    -setdnsservers)
+    -setdnsservers|-setmanual|-setdhcp)
         mutating=1
+        needs_service=1
+        ;;
+    -switchtolocation)
+        mutating=1
+        needs_service=0
         ;;
 esac
 
-if [[ "$mutating" -eq 1 && -n "$service" ]]; then
-    # Pass the service name as scope_hint so the inspector knows
-    # which service's state to capture. The helper's pre/post
-    # bracket converts to a NetEvent on the daemon's ctl socket.
+if [[ "$mutating" -eq 1 ]]; then
+    service=""
+    if [[ "$needs_service" -eq 1 ]]; then
+        service="${2:-}"
+        if [[ -z "$service" ]]; then
+            # Mutating verb invoked without a service argument —
+            # the real networksetup will reject it. Pass through so
+            # the user sees the canonical error rather than us
+            # silently bracketing nothing.
+            exec "$real" "$@"
+        fi
+    fi
     # Strip the leading `-` from the verb (clap-friendly).
     verb_arg="${verb#-}"
     "$HELPER" net-event networksetup pre "--verb=$verb_arg" "--scope-hint=$service" 2>/dev/null || true

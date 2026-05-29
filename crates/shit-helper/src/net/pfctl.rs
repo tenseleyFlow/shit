@@ -51,7 +51,7 @@ impl NetInspector for PfctlInspector {
     fn tool(&self) -> NetToolWire {
         NetToolWire::Pfctl
     }
-    fn collect_state(&self, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
+    fn collect_state(&self, _verb: &str, _scope_hint: &str) -> anyhow::Result<Vec<u8>> {
         let sections: &[(&str, &[&str])] = &[("rules", &["-sr", "-a", "*"]), ("nat", &["-sn"])];
         let mut out = Vec::new();
         for (name, args) in sections {

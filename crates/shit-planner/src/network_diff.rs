@@ -527,37 +527,112 @@ fn canonicalize_ufw_rule(rule: &str) -> Vec<String> {
 }
 
 // =================================================================
-// networksetup (macOS) — M06.1: DNS-only first ship.
+// networksetup (macOS) — M06.1: DNS; M06.5: setmanual/setdhcp/
+//   switchtolocation
 // =================================================================
 
-/// Parsed shape of a captured `networksetup -getdnsservers
-/// <service>` snapshot. The helper prepends a `# scope=<service>`
-/// header line so we know which service to target on undo without
-/// per-event scope plumbing through the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NetworksetupDnsSnapshot {
-    /// Network service name (e.g. "Wi-Fi", "Ethernet").
-    service: String,
-    /// DNS servers in the order networksetup reported them. Empty
-    /// when networksetup said "There aren't any DNS Servers set
-    /// on <service>." — undo of "added DNS" must restore the
-    /// empty state via the literal `empty` arg to setdnsservers.
-    servers: Vec<String>,
+/// Parsed header block (`#`-prefixed metadata lines emitted by the
+/// inspector) plus the remaining body. Inspector layout:
+///
+/// ```text
+/// # verb=<v>
+/// # scope=<svc or empty>
+/// <raw -get* output>
+/// ```
+///
+/// M06.1 captures only emitted `# scope=` (no `# verb=`); those
+/// default to verb = `setdnsservers` for replayability.
+struct NetworksetupHeader<'a> {
+    verb: String,
+    scope: String,
+    body: Vec<&'a str>,
 }
 
-/// Parse a captured DNS snapshot. Returns None when the header
-/// line is missing or malformed (defensive — synthesizer emits
-/// no inverse, planner logs a Informational warning).
-fn parse_networksetup_dns_snapshot(bytes: &[u8]) -> Option<NetworksetupDnsSnapshot> {
+fn parse_networksetup_header(bytes: &[u8]) -> Option<NetworksetupHeader<'_>> {
     let text = std::str::from_utf8(bytes).ok()?;
-    let mut lines = text.lines();
-    let header = lines.next()?;
-    let service = header.strip_prefix("# scope=")?.to_string();
-    if service.is_empty() {
-        return None;
+    let mut verb: Option<String> = None;
+    let mut scope: Option<String> = None;
+    let mut body: Vec<&str> = Vec::new();
+    let mut header_done = false;
+    for line in text.lines() {
+        if !header_done {
+            if let Some(v) = line.strip_prefix("# verb=") {
+                verb = Some(v.to_string());
+                continue;
+            }
+            if let Some(s) = line.strip_prefix("# scope=") {
+                scope = Some(s.to_string());
+                continue;
+            }
+            // First non-header line — the body starts here.
+            header_done = true;
+        }
+        body.push(line);
     }
+    // Backcompat: M06.1 captures lack `# verb=`; assume DNS.
+    let verb = verb.unwrap_or_else(|| "setdnsservers".to_string());
+    let scope = scope.unwrap_or_default();
+    Some(NetworksetupHeader { verb, scope, body })
+}
+
+fn synthesise_networksetup(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
+    let Some(pre) = parse_networksetup_header(before) else {
+        return Vec::new();
+    };
+    // Refuse synth if the post-snapshot disagrees on verb or scope
+    // (would indicate the wrapper crossed wires mid-flight). When
+    // `after` is unparseable we still proceed — the pre-snapshot
+    // alone is sufficient for these inverses since they reproduce
+    // the prior state, not a diff.
+    if let Some(post) = parse_networksetup_header(after)
+        && (post.verb != pre.verb || post.scope != pre.scope)
+    {
+        return Vec::new();
+    }
+    match pre.verb.as_str() {
+        "setdnsservers" => synthesise_networksetup_dns(&pre, after),
+        "setmanual" | "setdhcp" => synthesise_networksetup_ipv4(&pre),
+        "switchtolocation" => synthesise_networksetup_location(&pre, after),
+        // Unknown verb — no inverse.
+        _ => Vec::new(),
+    }
+}
+
+// -----------------------------------------------------------------
+// setdnsservers (M06.1)
+// -----------------------------------------------------------------
+
+fn synthesise_networksetup_dns(pre: &NetworksetupHeader<'_>, after: &[u8]) -> Vec<Vec<String>> {
+    if pre.scope.is_empty() {
+        return Vec::new();
+    }
+    let pre_servers = parse_dns_body(&pre.body);
+    // No-op when servers didn't change.
+    if let Some(post) = parse_networksetup_header(after) {
+        let post_servers = parse_dns_body(&post.body);
+        if post_servers == pre_servers {
+            return Vec::new();
+        }
+    }
+    let mut argv = vec![
+        "networksetup".to_string(),
+        "-setdnsservers".to_string(),
+        pre.scope.clone(),
+    ];
+    if pre_servers.is_empty() {
+        // The literal "empty" arg clears DNS servers on the
+        // service. networksetup uses this sentinel because passing
+        // zero positional servers is ambiguous with usage errors.
+        argv.push("empty".to_string());
+    } else {
+        argv.extend(pre_servers);
+    }
+    vec![argv]
+}
+
+fn parse_dns_body(body: &[&str]) -> Vec<String> {
     let mut servers = Vec::new();
-    for line in lines {
+    for line in body {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -570,47 +645,134 @@ fn parse_networksetup_dns_snapshot(bytes: &[u8]) -> Option<NetworksetupDnsSnapsh
         }
         servers.push(trimmed.to_string());
     }
-    Some(NetworksetupDnsSnapshot { service, servers })
+    servers
 }
 
-fn synthesise_networksetup(before: &[u8], after: &[u8]) -> Vec<Vec<String>> {
-    let Some(pre) = parse_networksetup_dns_snapshot(before) else {
+// -----------------------------------------------------------------
+// setmanual / setdhcp (M06.5)
+// -----------------------------------------------------------------
+
+/// Parsed shape of a `networksetup -getinfo <service>` snapshot.
+/// macOS reports the first line as one of:
+///
+/// - "DHCP Configuration"
+/// - "Manual Configuration"
+/// - "BOOTP Configuration"
+/// - "Off"
+///
+/// followed by `IP address: <ip>`, `Subnet mask: <mask>`, `Router:
+/// <gw>` lines (each "none" when unset). We only synthesise
+/// inverses for DHCP and Manual — BOOTP and Off transitions fall
+/// through to "no inverse, user must restore by hand" since they
+/// have no symmetric `networksetup -setbootp` / `-setnone` verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GetinfoConfig {
+    Dhcp,
+    Manual {
+        ip: String,
+        mask: String,
+        router: String,
+    },
+    Unsupported,
+}
+
+fn parse_getinfo_body(body: &[&str]) -> GetinfoConfig {
+    let first = body.iter().find(|l| !l.trim().is_empty()).copied();
+    match first.map(str::trim) {
+        Some("DHCP Configuration") => GetinfoConfig::Dhcp,
+        Some("Manual Configuration") => {
+            let mut ip = String::new();
+            let mut mask = String::new();
+            let mut router = String::new();
+            for line in body {
+                if let Some(rest) = line.trim().strip_prefix("IP address: ") {
+                    ip = rest.trim().to_string();
+                } else if let Some(rest) = line.trim().strip_prefix("Subnet mask: ") {
+                    mask = rest.trim().to_string();
+                } else if let Some(rest) = line.trim().strip_prefix("Router: ") {
+                    router = rest.trim().to_string();
+                }
+            }
+            // "none" → planner can't construct a meaningful inverse.
+            if ip == "none" || mask == "none" {
+                return GetinfoConfig::Unsupported;
+            }
+            GetinfoConfig::Manual { ip, mask, router }
+        }
+        _ => GetinfoConfig::Unsupported,
+    }
+}
+
+fn synthesise_networksetup_ipv4(pre: &NetworksetupHeader<'_>) -> Vec<Vec<String>> {
+    if pre.scope.is_empty() {
+        return Vec::new();
+    }
+    let pre_cfg = parse_getinfo_body(&pre.body);
+    match pre_cfg {
+        GetinfoConfig::Dhcp => vec![vec![
+            "networksetup".to_string(),
+            "-setdhcp".to_string(),
+            pre.scope.clone(),
+        ]],
+        GetinfoConfig::Manual { ip, mask, router } => {
+            let mut argv = vec![
+                "networksetup".to_string(),
+                "-setmanual".to_string(),
+                pre.scope.clone(),
+                ip,
+                mask,
+            ];
+            // Router may legitimately be "none" on networks without
+            // a default gateway; networksetup -setmanual takes
+            // exactly 4 positional args, so emit "none" verbatim
+            // (the CLI accepts it).
+            argv.push(if router.is_empty() {
+                "none".to_string()
+            } else {
+                router
+            });
+            vec![argv]
+        }
+        GetinfoConfig::Unsupported => Vec::new(),
+    }
+}
+
+// -----------------------------------------------------------------
+// switchtolocation (M06.5)
+// -----------------------------------------------------------------
+
+fn synthesise_networksetup_location(
+    pre: &NetworksetupHeader<'_>,
+    after: &[u8],
+) -> Vec<Vec<String>> {
+    let pre_location = parse_location_body(&pre.body);
+    let Some(pre_location) = pre_location else {
         return Vec::new();
     };
-    // Best-effort consistency: the pre + post snapshots should
-    // share a service (the user's `-setdnsservers <svc>` invocation
-    // didn't switch services mid-flight). When `after` doesn't
-    // parse, fall through — the undo's `setdnsservers` is still
-    // correct since we use `pre`'s service identity.
-    if let Some(post) = parse_networksetup_dns_snapshot(after)
-        && post.service != pre.service
-    {
-        // Different services in before/after → we don't have a
-        // single coherent inverse; bail. The planner will surface
-        // an Informational warning to the operator.
-        return Vec::new();
-    }
-    // If servers didn't actually change (e.g. user re-set the same
-    // list), the undo is a no-op.
-    if let Some(post) = parse_networksetup_dns_snapshot(after)
-        && post.servers == pre.servers
+    // No-op when location didn't actually change.
+    if let Some(post) = parse_networksetup_header(after)
+        && let Some(post_location) = parse_location_body(&post.body)
+        && post_location == pre_location
     {
         return Vec::new();
     }
-    let mut argv = vec![
+    vec![vec![
         "networksetup".to_string(),
-        "-setdnsservers".to_string(),
-        pre.service,
-    ];
-    if pre.servers.is_empty() {
-        // The literal "empty" arg clears DNS servers on the
-        // service. networksetup uses this sentinel because passing
-        // zero positional servers is ambiguous with usage errors.
-        argv.push("empty".to_string());
-    } else {
-        argv.extend(pre.servers);
+        "-switchtolocation".to_string(),
+        pre_location,
+    ]]
+}
+
+fn parse_location_body(body: &[&str]) -> Option<String> {
+    // `-getcurrentlocation` emits the location name on a single
+    // line (trailing newline). Defensive against blank-line noise.
+    for line in body {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
     }
-    vec![argv]
+    None
 }
 
 // =================================================================
@@ -1217,11 +1379,23 @@ mod tests {
     // M06.1 — networksetup DNS synthesizer.
 
     #[test]
-    fn networksetup_parses_scope_header_and_servers() {
+    fn networksetup_parses_legacy_m06_1_header() {
+        // M06.1 captures only emitted `# scope=` (no `# verb=`).
+        // Backcompat: parser defaults verb to setdnsservers.
         let raw = b"# scope=Wi-Fi\n1.1.1.1\n8.8.8.8\n";
-        let snap = parse_networksetup_dns_snapshot(raw).expect("parses");
-        assert_eq!(snap.service, "Wi-Fi");
-        assert_eq!(snap.servers, vec!["1.1.1.1", "8.8.8.8"]);
+        let hdr = parse_networksetup_header(raw).expect("parses");
+        assert_eq!(hdr.verb, "setdnsservers");
+        assert_eq!(hdr.scope, "Wi-Fi");
+        assert_eq!(parse_dns_body(&hdr.body), vec!["1.1.1.1", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn networksetup_parses_m06_5_header() {
+        let raw = b"# verb=setdnsservers\n# scope=Wi-Fi\n1.1.1.1\n";
+        let hdr = parse_networksetup_header(raw).expect("parses");
+        assert_eq!(hdr.verb, "setdnsservers");
+        assert_eq!(hdr.scope, "Wi-Fi");
+        assert_eq!(parse_dns_body(&hdr.body), vec!["1.1.1.1"]);
     }
 
     #[test]
@@ -1229,15 +1403,8 @@ mod tests {
         // The literal "There aren't any DNS Servers set on Wi-Fi."
         // is networksetup's way of saying "no DNS configured".
         let raw = b"# scope=Wi-Fi\nThere aren't any DNS Servers set on Wi-Fi.\n";
-        let snap = parse_networksetup_dns_snapshot(raw).expect("parses");
-        assert_eq!(snap.service, "Wi-Fi");
-        assert!(snap.servers.is_empty());
-    }
-
-    #[test]
-    fn networksetup_returns_none_on_missing_header() {
-        let raw = b"1.1.1.1\n8.8.8.8\n";
-        assert!(parse_networksetup_dns_snapshot(raw).is_none());
+        let hdr = parse_networksetup_header(raw).expect("parses");
+        assert!(parse_dns_body(&hdr.body).is_empty());
     }
 
     #[test]
@@ -1485,6 +1652,153 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
     #[test]
     fn ifconfig_identical_emits_nothing() {
         let inv = synthesise_ifconfig(IFCONFIG_EN0_UP.as_bytes(), IFCONFIG_EN0_UP.as_bytes());
+        assert!(inv.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // networksetup setmanual / setdhcp (M06.5)
+    // -----------------------------------------------------------------
+
+    const GETINFO_DHCP: &str = "\
+DHCP Configuration
+IP address: 192.168.1.10
+Subnet mask: 255.255.255.0
+Router: 192.168.1.1
+Client ID:
+IPv6: Automatic
+IPv6 IP address: none
+IPv6 Router: none
+Wi-Fi ID: aa:bb:cc:dd:ee:ff
+";
+
+    const GETINFO_MANUAL: &str = "\
+Manual Configuration
+IP address: 10.99.0.5
+Subnet mask: 255.255.255.0
+Router: 10.99.0.1
+IPv6: Automatic
+IPv6 IP address: none
+IPv6 Router: none
+Wi-Fi ID: aa:bb:cc:dd:ee:ff
+";
+
+    const GETINFO_OFF: &str = "\
+Off
+IP address: none
+Subnet mask: none
+Router: none
+";
+
+    #[test]
+    fn networksetup_setmanual_undo_to_prior_dhcp() {
+        // User ran `networksetup -setmanual Wi-Fi 10.99.0.5 ...`;
+        // pre-state was DHCP. Inverse = `-setdhcp Wi-Fi`.
+        let before = format!("# verb=setmanual\n# scope=Wi-Fi\n{GETINFO_DHCP}");
+        let after = format!("# verb=setmanual\n# scope=Wi-Fi\n{GETINFO_MANUAL}");
+        let inv = synthesise_networksetup(before.as_bytes(), after.as_bytes());
+        assert_eq!(inv.len(), 1, "got {inv:?}");
+        assert_eq!(inv[0], vec!["networksetup", "-setdhcp", "Wi-Fi"]);
+    }
+
+    #[test]
+    fn networksetup_setdhcp_undo_to_prior_manual() {
+        // User ran `networksetup -setdhcp Wi-Fi`; pre-state was a
+        // static config. Inverse = `-setmanual Wi-Fi <ip> <mask> <gw>`.
+        let before = format!("# verb=setdhcp\n# scope=Wi-Fi\n{GETINFO_MANUAL}");
+        let after = format!("# verb=setdhcp\n# scope=Wi-Fi\n{GETINFO_DHCP}");
+        let inv = synthesise_networksetup(before.as_bytes(), after.as_bytes());
+        assert_eq!(inv.len(), 1, "got {inv:?}");
+        assert_eq!(
+            inv[0],
+            vec![
+                "networksetup",
+                "-setmanual",
+                "Wi-Fi",
+                "10.99.0.5",
+                "255.255.255.0",
+                "10.99.0.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn networksetup_setmanual_undo_off_state_emits_no_inverse() {
+        // Off / BOOTP / Unsupported pre-states → no symmetric verb;
+        // planner emits no inverse (warns user upstream).
+        let before = format!("# verb=setmanual\n# scope=Wi-Fi\n{GETINFO_OFF}");
+        let after = format!("# verb=setmanual\n# scope=Wi-Fi\n{GETINFO_MANUAL}");
+        let inv = synthesise_networksetup(before.as_bytes(), after.as_bytes());
+        assert!(inv.is_empty(), "expected no inverse, got {inv:?}");
+    }
+
+    #[test]
+    fn networksetup_setmanual_undo_router_none_emits_none_arg() {
+        // Some configs have no default gateway. networksetup
+        // -setmanual accepts the literal "none" for the router arg.
+        let getinfo_no_gw = "\
+Manual Configuration
+IP address: 10.99.0.5
+Subnet mask: 255.255.255.0
+Router: none
+";
+        let before = format!("# verb=setdhcp\n# scope=Wi-Fi\n{getinfo_no_gw}");
+        // After doesn't need to be meaningful for this test.
+        let after = format!("# verb=setdhcp\n# scope=Wi-Fi\n{GETINFO_DHCP}");
+        let inv = synthesise_networksetup(before.as_bytes(), after.as_bytes());
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].last().map(String::as_str), Some("none"));
+    }
+
+    #[test]
+    fn networksetup_setmanual_empty_scope_no_inverse() {
+        // Defensive: scope_hint missing → can't synthesise.
+        let before = format!("# verb=setmanual\n# scope=\n{GETINFO_DHCP}");
+        let after = format!("# verb=setmanual\n# scope=\n{GETINFO_MANUAL}");
+        let inv = synthesise_networksetup(before.as_bytes(), after.as_bytes());
+        assert!(inv.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // networksetup switchtolocation (M06.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn networksetup_switchtolocation_undo_to_prior_location() {
+        let before = b"# verb=switchtolocation\n# scope=\nAutomatic\n";
+        let after = b"# verb=switchtolocation\n# scope=\nTest Location\n";
+        let inv = synthesise_networksetup(before, after);
+        assert_eq!(inv.len(), 1, "got {inv:?}");
+        assert_eq!(
+            inv[0],
+            vec!["networksetup", "-switchtolocation", "Automatic"]
+        );
+    }
+
+    #[test]
+    fn networksetup_switchtolocation_unchanged_emits_no_inverse() {
+        let before = b"# verb=switchtolocation\n# scope=\nAutomatic\n";
+        let after = b"# verb=switchtolocation\n# scope=\nAutomatic\n";
+        let inv = synthesise_networksetup(before, after);
+        assert!(inv.is_empty());
+    }
+
+    #[test]
+    fn networksetup_switchtolocation_handles_spaces_in_name() {
+        // Location names can contain spaces (defaults to "Automatic"
+        // but users can `-createlocation "My Home"`).
+        let before = b"# verb=switchtolocation\n# scope=\nMy Home Office\n";
+        let after = b"# verb=switchtolocation\n# scope=\nCoffee Shop\n";
+        let inv = synthesise_networksetup(before, after);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0][2], "My Home Office");
+    }
+
+    #[test]
+    fn networksetup_synth_refuses_when_pre_post_verbs_disagree() {
+        // Defensive — a malformed wire shouldn't auto-synth.
+        let before = format!("# verb=setmanual\n# scope=Wi-Fi\n{GETINFO_DHCP}");
+        let after = format!("# verb=setdhcp\n# scope=Wi-Fi\n{GETINFO_MANUAL}");
+        let inv = synthesise_networksetup(before.as_bytes(), after.as_bytes());
         assert!(inv.is_empty());
     }
 }

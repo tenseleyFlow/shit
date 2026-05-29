@@ -381,6 +381,32 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  networksetup-location-undo-macos:
+    # M06.5 — `networksetup -switchtolocation <name>` → `shit undo`
+    # → original location restored. Validates the new verb-dispatch
+    # path through the wrapper + NetworksetupInspector + planner
+    # synthesise_networksetup_location. Skips on runners with only
+    # one configured location (common on default GHA macos-14).
+    name: networksetup-location-undo smoke (M06.5 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/networksetup-location-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: networksetup-location-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   networksetup-dns-undo-macos:
     # M06.1 — networksetup -setdnsservers <svc> 1.1.1.1 →
     # shit undo → DNS restored. Validates the networksetup
