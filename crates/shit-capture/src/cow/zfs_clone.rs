@@ -194,11 +194,22 @@ pub fn clone_pre_image_path(
 }
 
 /// Compute the clone target dataset name for an event. Convention:
-/// `<root_pool>/.shit-clones/<short-id>`.
-pub fn clone_dataset_name(root_pool: &str, event_id: &str) -> String {
+/// `<parent-of-source>/.shit-clones-<short-id>` — a sibling of the
+/// source dataset, not a child of a `.shit-clones/` parent dataset
+/// (which wouldn't exist on stock `zroot`).
+///
+/// `source_dataset` — the dataset the source file lives on
+/// (e.g. `zroot/tmp`). The clone lands at
+/// `zroot/.shit-clones-<id>`. Pool-root sources (`zroot`) clone to
+/// `zroot/.shit-clones-<id>` (same pool, no slash to strip).
+pub fn clone_dataset_name(source_dataset: &str, event_id: &str) -> String {
+    let parent = source_dataset
+        .rsplit_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or(source_dataset);
     let short = event_id.split('-').next().unwrap_or(event_id);
     let short = &short[..short.len().min(8)];
-    format!("{root_pool}/.shit-clones/{short}")
+    format!("{parent}/.shit-clones-{short}")
 }
 
 // ---------------------------------------------------------------
@@ -252,10 +263,9 @@ pub fn capture_zfs_clone(
     };
 
     let id = fresh_clone_id();
-    let pool = dataset.split('/').next().unwrap_or(&dataset);
     let snap_name = snapshot_name(&id, 0);
     let snap = format!("{dataset}@{snap_name}");
-    let clone_ds = clone_dataset_name(pool, &id);
+    let clone_ds = clone_dataset_name(&dataset, &id);
     let clone_mp = PathBuf::from(format!("{CLONE_MNT_ROOT}/{id}"));
 
     if let Err(e) = snapshot_create(&dataset, &snap_name) {
@@ -394,20 +404,36 @@ mod tests {
 
     #[test]
     fn clone_dataset_name_uses_short_event_id() {
-        let n = clone_dataset_name("zroot", "abc12345-deca-dafb-ad00-000000000000");
-        assert_eq!(n, "zroot/.shit-clones/abc12345");
+        // source dataset has a parent -> clone is parent's sibling.
+        let n = clone_dataset_name("zroot/tmp", "abc12345-deca-dafb-ad00-000000000000");
+        assert_eq!(n, "zroot/.shit-clones-abc12345");
+    }
+
+    #[test]
+    fn clone_dataset_name_pool_root_source() {
+        // Source is the pool root itself — no slash to strip.
+        let n = clone_dataset_name("zroot", "abc12345");
+        assert_eq!(n, "zroot/.shit-clones-abc12345");
+    }
+
+    #[test]
+    fn clone_dataset_name_nested_source() {
+        // Source is two levels deep — clone lands as a sibling of
+        // the deepest dataset.
+        let n = clone_dataset_name("zroot/home/user", "abc12345");
+        assert_eq!(n, "zroot/home/.shit-clones-abc12345");
     }
 
     #[test]
     fn clone_dataset_name_handles_short_input() {
-        let n = clone_dataset_name("rpool", "short");
-        assert_eq!(n, "rpool/.shit-clones/short");
+        let n = clone_dataset_name("rpool/data", "short");
+        assert_eq!(n, "rpool/.shit-clones-short");
     }
 
     #[test]
     fn clone_dataset_name_truncates_long_first_segment() {
-        let n = clone_dataset_name("zroot", "thisisaverylongidentifier");
-        assert_eq!(n, "zroot/.shit-clones/thisisav");
+        let n = clone_dataset_name("zroot/data", "thisisaverylongidentifier");
+        assert_eq!(n, "zroot/.shit-clones-thisisav");
     }
 
     #[test]

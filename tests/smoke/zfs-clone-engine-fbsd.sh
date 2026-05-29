@@ -81,7 +81,7 @@ cleanup_zfs_leaks() {
     # anything that matches our id prefix. capture_zfs_clone normally
     # cleans up after itself.
     /sbin/zfs list -H -o name -r "${POOL}" 2>/dev/null \
-        | grep -E "(.shit-clones/|@shit-)" \
+        | grep -E "(.shit-clones[-/]|@shit-)" \
         | xargs -I{} ${PRIV} /sbin/zfs destroy -rf {} 2>/dev/null || true
     rm -rf "${WORK_DIR}" 2>/dev/null || true
 }
@@ -136,13 +136,13 @@ fi
 # Step 3 — confirm cleanup (capture_zfs_clone's own teardown
 # should have removed clones + snapshots).
 LEAKED_SNAPS="$(/sbin/zfs list -t snapshot -H -o name -r "${SOURCE_DATASET}" 2>/dev/null | grep -c "shit-" || true)"
-LEAKED_DATASETS="$(/sbin/zfs list -H -o name -r "${POOL}" 2>/dev/null | grep -c ".shit-clones/" || true)"
+LEAKED_DATASETS="$(/sbin/zfs list -H -o name -r "${POOL}" 2>/dev/null | grep -cE "\.shit-clones[-/]" || true)"
 if [ "${LEAKED_SNAPS}" -ne 0 ]; then
     /sbin/zfs list -t snapshot -H -o name -r "${SOURCE_DATASET}" 2>/dev/null | sed 's/^/    /' >&2
     smoke_fail "${LEAKED_SNAPS} shit- snapshot(s) leaked after engine run"
 fi
 if [ "${LEAKED_DATASETS}" -ne 0 ]; then
-    /sbin/zfs list -H -o name -r "${POOL}" 2>/dev/null | grep ".shit-clones/" | sed 's/^/    /' >&2
+    /sbin/zfs list -H -o name -r "${POOL}" 2>/dev/null | grep -E "\.shit-clones[-/]" | sed 's/^/    /' >&2
     smoke_fail "${LEAKED_DATASETS} .shit-clones dataset(s) leaked after engine run"
 fi
 
