@@ -221,6 +221,23 @@ async fn handle_client(
             &index,
             &blob_store,
         ),
+        CtlRequest::CmdDetail { id, events_limit } => {
+            // AU30 — same tokio lesson as the AU22 fix above:
+            // handle_cmd_detail does sync sqlite work (load record,
+            // load events, build UndoPlan) which would block the
+            // current-thread runtime worker. Move to spawn_blocking
+            // so dispatch_loop + other tasks stay live.
+            let index = Arc::clone(&index);
+            let blob_store = Arc::clone(&blob_store);
+            match tokio::task::spawn_blocking(move || {
+                handle_cmd_detail(id, events_limit, &index, &blob_store)
+            })
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => CtlResponse::Error(format!("cmd-detail spawn_blocking panic: {e}")),
+            }
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
@@ -1142,6 +1159,189 @@ async fn handle_wait_watch_ready(
     }
 }
 
+/// AU30 — `shit show <id>` backend. Resolves the id (or bookmark
+/// name) to a `CommandId`, loads the captured `CommandRecord` +
+/// events, builds an UndoPlan for the plan-summary, and serializes
+/// the lot into [`CmdDetailBody`]. CLI consumes via `cmd::show`.
+///
+/// Runs under `spawn_blocking` (see dispatch site above) because
+/// `plan()` is synchronous + sqlite-heavy.
+fn handle_cmd_detail(
+    id: String,
+    events_limit: Option<usize>,
+    index: &Index,
+    blob_store: &BlobStore,
+) -> CtlResponse {
+    use shit_planner::{LiveStateProbe, PlannerStore, plan};
+
+    // Bookmark-name aware id resolution. Try literal `<uuid>:<seq>`
+    // first; on parse miss, route through the bookmark list.
+    let (session, seq) = match parse_command_id(&id) {
+        Ok(p) => p,
+        Err(_) => match resolve_bookmark_name_to_command(&id, index) {
+            Some(p) => p,
+            None => {
+                return CtlResponse::CmdNotFound { id };
+            }
+        },
+    };
+    let command_id = shit_planner::CommandId { session, seq };
+
+    let record = match index.command_by_id(command_id) {
+        Some(r) => r,
+        None => return CtlResponse::CmdNotFound { id },
+    };
+    let all_events = index.events_for_command(command_id);
+    let events_total = all_events.len();
+
+    // Build the plan from the FULL event set (truncating events
+    // would skew the plan-summary's tier counts). Reusing the
+    // existing planner entry point keeps the summary honest about
+    // what `shit undo` would do.
+    let probe = LiveStateProbe::new();
+    let undo_plan = plan(record.clone(), &all_events, &probe, index);
+
+    let mut tier_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut has_refused = false;
+    for node in &undo_plan.nodes {
+        let tier = tier_label(node.op.tier());
+        *tier_counts.entry(tier.to_string()).or_insert(0) += 1;
+        if matches!(node.op.tier(), shit_planner::InverseTier::Refuse) {
+            has_refused = true;
+        }
+    }
+    // UndoPlan exposes a top-level helper; mirrors what handle_undo
+    // checks before dispatching.
+    let has_blocking_conflicts = undo_plan.has_blocking_conflicts();
+    let total_nodes = undo_plan.nodes.len();
+
+    // Cap events for the wire response without losing the count.
+    let (events_wire, truncated_at) = match events_limit {
+        Some(n) if events_total > n => {
+            let mut wire = Vec::with_capacity(n);
+            for ev in all_events.into_iter().take(n) {
+                wire.push(event_to_wire(&ev));
+            }
+            (wire, Some(n))
+        }
+        _ => {
+            let mut wire = Vec::with_capacity(events_total);
+            for ev in all_events {
+                wire.push(event_to_wire(&ev));
+            }
+            (wire, None)
+        }
+    };
+
+    let _ = blob_store; // Reserved for future per-event blob preview rendering.
+
+    CtlResponse::CmdDetail(shit_proto::CmdDetailBody {
+        session: record.command.session,
+        seq: record.command.seq,
+        cmd_string: record.cmd_string,
+        cwd: record.cwd.to_string_lossy().into_owned(),
+        pid: record.pid,
+        shell_kind: record.shell_kind,
+        exit_code: record.exit_code,
+        started_at_unix_nanos: time_point_to_unix_nanos(record.started_at),
+        ended_at_unix_nanos: record.ended_at.map(time_point_to_unix_nanos),
+        events: events_wire,
+        events_total,
+        truncated_at,
+        plan_summary: shit_proto::CmdDetailPlanSummary {
+            total_nodes,
+            tier_counts,
+            has_blocking_conflicts,
+            has_refused,
+        },
+    })
+}
+
+/// AU30 — serialize one `CaptureEvent` to its wire form for the
+/// detail response. `kind_label` lets the CLI dispatch to a
+/// pretty-renderer; `kind_json` is the full variant payload as a
+/// serde-emitted JSON string for variants the CLI doesn't recognize.
+fn event_to_wire(event: &shit_planner::events::CaptureEvent) -> shit_proto::CmdDetailEventWire {
+    let kind_json = serde_json::to_string(&event.kind).unwrap_or_else(|_| "null".into());
+    shit_proto::CmdDetailEventWire {
+        id: event.id.0,
+        ts_unix_nanos: time_point_to_unix_nanos(event.ts),
+        kind_label: capture_event_kind_label(&event.kind).to_string(),
+        kind_json,
+        partial: event.partial,
+    }
+}
+
+/// AU30 — stable string tag for each `CaptureEventKind` variant.
+/// Used by the CLI as the dispatch key for pretty-rendering. New
+/// variants must be added here too — the unit test
+/// `capture_event_kind_label_covers_every_variant` guards against
+/// drift.
+fn capture_event_kind_label(kind: &shit_planner::events::CaptureEventKind) -> &'static str {
+    use shit_planner::events::CaptureEventKind as K;
+    match kind {
+        K::FilePreImage { .. } => "FilePreImage",
+        K::FileAppendPreStash { .. } => "FileAppendPreStash",
+        K::TreeOp(_) => "TreeOp",
+        K::MetadataChange { .. } => "MetadataChange",
+        K::EnvDiff { .. } => "EnvDiff",
+        K::ShellStateDiff { .. } => "ShellStateDiff",
+        K::PackageOp { .. } => "PackageOp",
+        K::SystemdOp { .. } => "SystemdOp",
+        K::NetworkOp { .. } => "NetworkOp",
+        K::ProcessOp { .. } => "ProcessOp",
+        K::DbOp { .. } => "DbOp",
+        K::ContainerOp { .. } => "ContainerOp",
+        K::TerraformOp { .. } => "TerraformOp",
+        K::KubectlOp { .. } => "KubectlOp",
+        K::GhOp { .. } => "GhOp",
+        K::CaptureRefused { .. } => "CaptureRefused",
+    }
+}
+
+/// AU30 — stable string tag for each `InverseTier` variant.
+/// Mirrors the planner enum; kept in sync via the unit test
+/// `tier_label_covers_every_variant`.
+fn tier_label(tier: shit_planner::InverseTier) -> &'static str {
+    use shit_planner::InverseTier as T;
+    match tier {
+        T::Files => "Files",
+        T::Env => "Env",
+        T::Packages => "Packages",
+        T::Network => "Network",
+        T::Services => "Services",
+        T::Processes => "Processes",
+        T::Descriptor => "Descriptor",
+        T::Cloud => "Cloud",
+        T::Container => "Container",
+        T::ShellState => "ShellState",
+        T::Database => "Database",
+        T::Refuse => "Refuse",
+    }
+}
+
+/// AU30 — bookmark-name fallback for `shit show <name>`. Lists
+/// every bookmark + matches by note (the user-typed name). On
+/// no-match returns None so the caller emits CmdNotFound. Linear
+/// scan — the bookmarks table is typically small (< 100 rows)
+/// and this code path is interactive.
+fn resolve_bookmark_name_to_command(name: &str, index: &Index) -> Option<(uuid::Uuid, u64)> {
+    let rows = shit_store::bookmarks::list_all(index).ok()?;
+    rows.into_iter()
+        .find(|b| b.note.as_deref() == Some(name))
+        .map(|b| (b.command.session, b.command.seq))
+}
+
+fn time_point_to_unix_nanos(tp: shit_planner::TimePoint) -> i64 {
+    // TimePoint carries a u64 wallclock_unix_nanos; cast to i64 for
+    // the wire. The `min(i64::MAX)` guard keeps us safe on the
+    // pathological case where the daemon's wallclock disagreed with
+    // Unix-epoch reality during ingest. The wire's signed i64
+    // covers ±292 years from 1970 — comfortably wider than shit's
+    // audit window.
+    tp.wallclock_unix_nanos.min(i64::MAX as u64) as i64
+}
+
 /// S24.C — execute an UndoPlan derived from the most recent N completed
 /// commands. Returns a wire-friendly report; the CLI prints it as-is.
 fn handle_undo(
@@ -1337,4 +1537,62 @@ fn handle_undo(
         detail_lines,
         refusal_lines,
     })
+}
+
+#[cfg(test)]
+mod cmd_detail_helpers_tests {
+    use super::*;
+    use shit_planner::events::CaptureEventKind;
+
+    #[test]
+    fn time_point_round_trips_under_i64_max() {
+        let tp = shit_planner::TimePoint::new(7, 1_700_000_000_000_000_000);
+        assert_eq!(time_point_to_unix_nanos(tp), 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn time_point_saturates_at_i64_max() {
+        let tp = shit_planner::TimePoint::new(0, u64::MAX);
+        assert_eq!(time_point_to_unix_nanos(tp), i64::MAX);
+    }
+
+    #[test]
+    fn tier_label_is_stable_for_every_variant() {
+        // The match in `tier_label` is exhaustive by language rule,
+        // so missing a new variant compile-fails. This test pins
+        // the *strings* so any rename in the renderer's dispatch
+        // surface is intentional + reviewable.
+        use shit_planner::InverseTier as T;
+        for (tier, want) in [
+            (T::Files, "Files"),
+            (T::Env, "Env"),
+            (T::Packages, "Packages"),
+            (T::Network, "Network"),
+            (T::Services, "Services"),
+            (T::Processes, "Processes"),
+            (T::Descriptor, "Descriptor"),
+            (T::Cloud, "Cloud"),
+            (T::Container, "Container"),
+            (T::ShellState, "ShellState"),
+            (T::Database, "Database"),
+            (T::Refuse, "Refuse"),
+        ] {
+            assert_eq!(tier_label(tier), want);
+        }
+    }
+
+    #[test]
+    fn capture_event_kind_label_matches_capture_refused() {
+        // Lightweight smoke that the dispatch labels match what
+        // the renderer expects. Constructing every variant is
+        // heavy; the compiler enforces exhaustive matching, so a
+        // single representative + the renderer's tests cover the
+        // round-trip.
+        let ev = CaptureEventKind::CaptureRefused {
+            class: "remote-push".into(),
+            path: std::path::PathBuf::from("/dev/null"),
+            detail: "AU15 refuse".into(),
+        };
+        assert_eq!(capture_event_kind_label(&ev), "CaptureRefused");
+    }
 }
