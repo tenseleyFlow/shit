@@ -3,6 +3,7 @@
 //! Control-plane messages exchanged on the daemon's ctl socket. Used by the
 //! `shit status` / `shit service status` paths.
 
+use crate::ShellKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -139,6 +140,25 @@ pub enum CtlRequest {
         session: uuid::Uuid,
         command_seq: u64,
         targets: Vec<RedirectTargetWire>,
+    },
+    /// AU30 — fetch the full detail body for one captured command:
+    /// top-line metadata, every CaptureEvent that fired during the
+    /// command window, and a plan summary derived from those events.
+    /// Reply is [`CtlResponse::CmdDetail`] or
+    /// [`CtlResponse::CmdNotFound`].
+    ///
+    /// `id` is parsed as `<session-uuid>:<seq>` first; on miss, the
+    /// daemon routes through the bookmark-name resolver before
+    /// returning CmdNotFound — so `shit show my-bookmark` works
+    /// without a separate round-trip.
+    ///
+    /// `events_limit` caps the events list at N; the daemon flags
+    /// `truncated_at` in the body when more events exist. Default
+    /// (None) means no cap; the CLI's default is 200.
+    CmdDetail {
+        id: String,
+        #[serde(default)]
+        events_limit: Option<usize>,
     },
 }
 
@@ -880,6 +900,89 @@ pub enum CtlResponse {
     /// unblocks on ack — a missed pre-stash falls back to the
     /// kernel tier rather than failing the user's command.
     PreStashRedirectsAck(PreStashRedirectsResult),
+    /// AU30 — reply to `CmdDetail`. Body carries the command
+    /// metadata + every event (up to `events_limit`) + plan summary.
+    CmdDetail(CmdDetailBody),
+    /// AU30 — id didn't resolve. Carries the input id so the CLI
+    /// can echo it in the error line. Distinct from `Error` so the
+    /// CLI exits non-zero with a specific exit code (vs. the
+    /// generic ctl-error path).
+    CmdNotFound {
+        id: String,
+    },
+}
+
+/// AU30 — full detail for one captured command. The CLI's
+/// `shit show <id>` renderer consumes this directly. JSON
+/// envelope (`--json`) serializes this struct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CmdDetailBody {
+    pub session: uuid::Uuid,
+    pub seq: u64,
+    /// AU26 — the literal command line the shell hook captured.
+    /// `None` for pre-AU26 captures + when the shell hook didn't
+    /// ship `--cmdline`.
+    pub cmd_string: Option<String>,
+    pub cwd: String,
+    pub pid: u32,
+    pub shell_kind: ShellKind,
+    pub exit_code: Option<i32>,
+    pub started_at_unix_nanos: i64,
+    pub ended_at_unix_nanos: Option<i64>,
+    /// Captured events in id-ascending order. Capped at
+    /// `events_limit` when the request set it; `truncated_at`
+    /// flags the cap.
+    pub events: Vec<CmdDetailEventWire>,
+    /// Total event count BEFORE capping — so the renderer can
+    /// honestly say "showing 200 of 5421 events".
+    pub events_total: usize,
+    /// `Some(n)` when the wire response was truncated AFTER n
+    /// events; renderer appends a "(truncated; use --json for the
+    /// full envelope)" note. `None` when the full set fit.
+    pub truncated_at: Option<usize>,
+    pub plan_summary: CmdDetailPlanSummary,
+}
+
+/// AU30 — per-event payload on the wire. We embed the event's
+/// `CaptureEventKind` serialized as a JSON string rather than
+/// pulling shit-planner into shit-proto. The CLI parses the
+/// `kind_json` for the variants it pretty-renders; falls through
+/// to printing the raw JSON for kinds the renderer doesn't
+/// recognize yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CmdDetailEventWire {
+    pub id: u64,
+    pub ts_unix_nanos: i64,
+    /// `serde_json::to_string`-style tag of the variant — e.g.
+    /// `"FilePreImage"`, `"ContainerOp"`, `"TreeOp"`. Matches the
+    /// internal-tag naming serde produces for the enum.
+    pub kind_label: String,
+    /// JSON-serialized event payload. The CLI deserializes per
+    /// variant for pretty rendering; unrecognized kinds get the
+    /// raw JSON printed.
+    pub kind_json: String,
+    /// `partial=true` events landed before the command's PostExec
+    /// — flagged so the renderer can mark them visually (typical:
+    /// race-loss markers from AR01.2).
+    pub partial: bool,
+}
+
+/// AU30 — plan summary derived from the planner's `plan()` over
+/// the command's events. Counts only, no per-op detail (per-op
+/// data is in the events list above; the planner derives ops
+/// from events, so duplicating both would bloat the wire).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CmdDetailPlanSummary {
+    pub total_nodes: usize,
+    /// Tier name (e.g. "Files", "Container", "Cloud") → node count.
+    /// BTreeMap so the rendered output is deterministic regardless
+    /// of insertion order.
+    pub tier_counts: BTreeMap<String, usize>,
+    pub has_blocking_conflicts: bool,
+    /// `true` when the plan included at least one Refuse node
+    /// (AU15 refuse-list catalog). Renderer surfaces a banner so
+    /// the user knows undo would have refused.
+    pub has_refused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
