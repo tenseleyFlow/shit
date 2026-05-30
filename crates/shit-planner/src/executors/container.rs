@@ -175,11 +175,42 @@ impl<R: ContainerRunner> InverseOpExecutor for ContainerExecutor<R> {
                 compose_file,
                 with_volumes: _,
             } => self.apply_compose_down(bin, project, compose_file, dry_run),
+            ContainerOp::Pull { image, resolved_id } => {
+                self.apply_pull(image, resolved_id.as_deref(), dry_run)
+            }
         }
     }
 }
 
 impl<R: ContainerRunner> ContainerExecutor<R> {
+    /// AU23 / DR-CR-51 — `docker pull` is non-destructive and
+    /// idempotent. The image is in the user's local store; the
+    /// honest inverse would be `docker rmi <image>` but that's
+    /// almost never what the user wants when they say "undo my
+    /// pull". Emit `Skipped` with a clear human-readable note;
+    /// the captured `resolved_id` lets `shit show` display which
+    /// digest landed regardless of whether the floating tag has
+    /// moved since.
+    fn apply_pull(
+        &self,
+        image: &str,
+        resolved_id: Option<&str>,
+        dry_run: bool,
+    ) -> ExecutionOutcome {
+        if dry_run {
+            return ExecutionOutcome::WouldApply;
+        }
+        let detail = match resolved_id {
+            Some(id) => format!(
+                "docker pull {image} (resolved: {id}) — informational; pull is idempotent. To remove, run `docker rmi {image}` manually."
+            ),
+            None => format!(
+                "docker pull {image} — informational; pull is idempotent. To remove, run `docker rmi {image}` manually."
+            ),
+        };
+        ExecutionOutcome::Skipped { reason: detail }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn apply_rm(
         &self,

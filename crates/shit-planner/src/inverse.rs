@@ -428,6 +428,23 @@ pub enum ContainerOp {
         /// `docker compose down -v` was used (volumes were removed).
         with_volumes: bool,
     },
+    /// AU23 / DR-CR-51 — `docker pull <image>`. Captured so
+    /// `shit show` can display the resolved manifest digest
+    /// alongside the user-typed (often floating) tag. Pulling is
+    /// idempotent + non-destructive, so the executor's reverse
+    /// path is informational-only (would emit `docker rmi <image>`
+    /// but the user almost never wants that — undo of a pull
+    /// surfaces as a Skipped note in the orchestrator).
+    ///
+    /// `image` is the user-typed reference (e.g. `alpine:latest`).
+    /// `resolved_id` is the `sha256:...` digest captured via
+    /// `docker inspect --format '{{.Id}}'` AFTER the pull
+    /// succeeded. `None` only when the post-phase handler raced
+    /// the image being immediately removed (very rare).
+    Pull {
+        image: String,
+        resolved_id: Option<String>,
+    },
 }
 
 /// C02.7: native-tool dispatch carried by `InverseOp::PackageRollback`.
