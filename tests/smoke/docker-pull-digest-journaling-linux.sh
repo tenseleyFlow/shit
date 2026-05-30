@@ -119,19 +119,10 @@ sed 's/^/    /' "${SHIT_SMOKE_TMP}/pull.log" >&2 | head -20 || true
 smoke_wait_for_event "discriminant = 'ContainerOp'" 1 10
 
 # AU23 load-bearing #2: the event must be a Pull variant with a
-# resolved_id that starts with sha256:. Query the journal directly
-# via sqlite (cheaper than parsing shit show output).
-EVENT_JSON="$(smoke_journal_query "SELECT payload FROM events WHERE discriminant = 'ContainerOp' ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo)"
-if [ -z "${EVENT_JSON}" ]; then
-    smoke_fail "no ContainerOp event payload in journal"
-fi
-smoke_log "event payload (truncated):"
-printf '%s\n' "${EVENT_JSON}" | head -c 400 | sed 's/^/    /' >&2
-echo "" >&2
-
-# Payload is postcard-encoded (binary); decode via shit show's JSON
-# envelope. AU30's CmdDetail wire serializes each event's kind to
-# JSON, so we read it from the CLI instead of parsing sqlite's blob.
+# resolved_id that starts with sha256:. The events table stores
+# the payload postcard-encoded as a BLOB; bash $(...) capture
+# truncates at the first NUL byte, so we read the kind via
+# `shit show --json` (AU30 wire) instead — same data, JSON-clean.
 CMD_ID="${SESSION}:1"
 smoke_log "shit show ${CMD_ID} --json"
 SHOW_JSON="$("${SHIT_BIN}" show --ctl-sock "${SHIT_CTL_SOCK}" "${CMD_ID}" --json 2>&1)" || {
