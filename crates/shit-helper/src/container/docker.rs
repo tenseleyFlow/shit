@@ -40,11 +40,21 @@ pub enum DockerVerb {
         /// (`docker start`); only used for the user-facing note.
         was_kill: bool,
     },
+    /// AU23 / DR-CR-51 — `docker pull <image>` / `docker image pull
+    /// <image>`. Not destructive (image is added to the local store);
+    /// captured so `shit show` can render the resolved manifest digest
+    /// alongside the user-typed (often floating) tag. Pre-phase fires
+    /// without journaling (no useful state to capture before the pull
+    /// resolves the digest); the digest comes from the helper's
+    /// post-phase handler running `docker inspect --format '{{.Id}}'`
+    /// after the real pull succeeds.
+    Pull { images: Vec<String> },
 }
 
-/// Classify an argv as a destructive docker verb. Returns `None` for
-/// read-only verbs (ps, logs, inspect, version, info, login, pull) and
-/// for argv that don't look like docker.
+/// Classify an argv as a destructive docker verb or a tracked
+/// non-destructive verb (`pull`, AU23). Returns `None` for
+/// truly-read-only verbs (ps, logs, inspect, version, info, login)
+/// and for argv that don't look like docker.
 pub fn classify_docker_argv(argv: &[String]) -> Option<DockerVerb> {
     if argv.first().map(String::as_str) != Some("docker") {
         return None;
@@ -58,6 +68,7 @@ pub fn classify_docker_argv(argv: &[String]) -> Option<DockerVerb> {
         "rmi" => classify_rmi(rest),
         "stop" => classify_stop_or_kill(rest, false),
         "kill" => classify_stop_or_kill(rest, true),
+        "pull" => classify_pull(rest),
         // `docker container <subcommand>` long form.
         "container" => match rest.first().map(String::as_str) {
             Some("rm") => classify_rm(&rest[1..]),
@@ -68,6 +79,7 @@ pub fn classify_docker_argv(argv: &[String]) -> Option<DockerVerb> {
         // `docker image <subcommand>` long form.
         "image" => match rest.first().map(String::as_str) {
             Some("rm") => classify_rmi(&rest[1..]),
+            Some("pull") => classify_pull(&rest[1..]),
             _ => None,
         },
         "volume" => match rest.first().map(String::as_str) {
@@ -213,6 +225,18 @@ fn classify_network_rm(rest: &[String]) -> Option<DockerVerb> {
     Some(DockerVerb::NetworkRm { names })
 }
 
+/// AU23 — `docker pull [opts] <image> [<image> ...]`. Each positional
+/// is an image reference (tag or digest); flags are skipped via
+/// `positionals`. Returns `None` for `docker pull` with no positional
+/// (which would error out at the real docker anyway).
+fn classify_pull(rest: &[String]) -> Option<DockerVerb> {
+    let images = positionals(rest);
+    if images.is_empty() {
+        return None;
+    }
+    Some(DockerVerb::Pull { images })
+}
+
 fn classify_stop_or_kill(rest: &[String], was_kill: bool) -> Option<DockerVerb> {
     let ids = positionals(rest);
     if ids.is_empty() {
@@ -353,7 +377,8 @@ mod tests {
 
     #[test]
     fn read_only_verbs_classify_none() {
-        for verb in ["ps", "logs", "inspect", "version", "info", "images", "pull"] {
+        // AU23: pull moved out of read-only into Pull-tracked.
+        for verb in ["ps", "logs", "inspect", "version", "info", "images"] {
             assert!(
                 classify_docker_argv(&argv(&["docker", verb])).is_none(),
                 "expected None for {verb}"
@@ -370,6 +395,55 @@ mod tests {
         assert!(classify_docker_argv(&[]).is_none());
         assert!(classify_docker_argv(&argv(&["podman", "rm", "x"])).is_none());
         assert!(classify_docker_argv(&argv(&["docker"])).is_none());
+    }
+
+    #[test]
+    fn classify_pull_single_image() {
+        let v = classify_docker_argv(&argv(&["docker", "pull", "alpine:latest"]));
+        assert_eq!(
+            v,
+            Some(DockerVerb::Pull {
+                images: vec!["alpine:latest".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn classify_pull_long_form() {
+        // `docker image pull alpine` — same shape as `docker image rm`.
+        let v = classify_docker_argv(&argv(&["docker", "image", "pull", "alpine"]));
+        assert_eq!(
+            v,
+            Some(DockerVerb::Pull {
+                images: vec!["alpine".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn classify_pull_with_flag() {
+        // `docker pull --platform linux/amd64 alpine` — flag-and-value
+        // pair gets skipped by `positionals`.
+        let v = classify_docker_argv(&argv(&[
+            "docker",
+            "pull",
+            "--platform",
+            "linux/amd64",
+            "alpine",
+        ]));
+        assert_eq!(
+            v,
+            Some(DockerVerb::Pull {
+                images: vec!["alpine".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn classify_pull_with_no_image_is_none() {
+        // `docker pull` alone would error at real docker; we surface
+        // None so the wrapper short-circuits cleanly.
+        assert!(classify_docker_argv(&argv(&["docker", "pull"])).is_none());
     }
 
     #[test]

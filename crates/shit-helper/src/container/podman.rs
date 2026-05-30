@@ -19,11 +19,29 @@ use super::docker::{DockerVerb, classify_docker_argv};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PodmanVerb {
-    Rm { ids: Vec<String>, force: bool },
-    Rmi { images: Vec<String> },
-    VolumeRm { names: Vec<String> },
-    NetworkRm { names: Vec<String> },
-    StopOrKill { ids: Vec<String>, was_kill: bool },
+    Rm {
+        ids: Vec<String>,
+        force: bool,
+    },
+    Rmi {
+        images: Vec<String>,
+    },
+    VolumeRm {
+        names: Vec<String>,
+    },
+    NetworkRm {
+        names: Vec<String>,
+    },
+    StopOrKill {
+        ids: Vec<String>,
+        was_kill: bool,
+    },
+    /// AU23 — `podman pull <image>`. Same semantics as docker pull;
+    /// helper post-handler captures the resolved digest via
+    /// `podman inspect --format '{{.Id}}'`.
+    Pull {
+        images: Vec<String>,
+    },
 }
 
 impl From<DockerVerb> for PodmanVerb {
@@ -34,6 +52,7 @@ impl From<DockerVerb> for PodmanVerb {
             DockerVerb::VolumeRm { names } => Self::VolumeRm { names },
             DockerVerb::NetworkRm { names } => Self::NetworkRm { names },
             DockerVerb::StopOrKill { ids, was_kill } => Self::StopOrKill { ids, was_kill },
+            DockerVerb::Pull { images } => Self::Pull { images },
         }
     }
 }
