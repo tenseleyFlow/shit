@@ -770,6 +770,17 @@ pub enum ContainerVerbWire {
     VolumeRm,
     NetworkRm,
     ComposeDown,
+    /// AU23 / DR-CR-51 — `docker pull <image>`. Not destructive
+    /// (the image is added to the local store; reverse would be a
+    /// `docker rmi` but pulling is idempotent so undo is
+    /// informational only). Wire surface exists so the helper's
+    /// post-phase handler can ship the resolved manifest digest
+    /// for `shit show` rendering. `extras["image"]` carries the
+    /// user-typed reference (e.g. `alpine:latest`);
+    /// `extras["resolved_id"]` carries the `sha256:...` digest
+    /// captured via `docker inspect --format '{{.Id}}'` after the
+    /// pull succeeded.
+    Pull,
 }
 
 /// AR04 PR-A — cloud / IaC tool event ship from the helper wrappers
