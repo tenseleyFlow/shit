@@ -46,4 +46,23 @@ if [ -n "$helper" ]; then
     "$helper" container-event docker pre "--target-argv=$target_argv" || true
 fi
 
-exec "$real" "$@"
+# AU23 / DR-CR-51 — fire post-hook AFTER the real docker exits so
+# verbs whose state is only available post-exec (e.g. `docker pull`'s
+# resolved manifest digest, captured via `docker inspect`) get
+# journaled. We can't `exec` if we want to run code after; capture
+# the real docker's rc, fire post (best-effort), and exit with the
+# rc the user expected. Skip the post hook on non-zero exit — a
+# failed pull has no digest to capture, and other verbs route their
+# stash through the pre hook anyway.
+#
+# `set +e` around the real-docker invocation: `set -e` at the top
+# would trip the shell out before we capture the rc when docker
+# returns non-zero (the user's case for e.g. `docker rm nonexistent`).
+set +e
+"$real" "$@"
+real_rc=$?
+set -e
+if [ "$real_rc" -eq 0 ] && [ -n "$helper" ]; then
+    "$helper" container-event docker post "--target-argv=$target_argv" || true
+fi
+exit "$real_rc"
