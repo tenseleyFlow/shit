@@ -80,6 +80,11 @@ pub const COVERAGE_CATALOG: &[CoverageClass] = &[
         since_sprint: "L03",
     },
     CoverageClass {
+        id: "fs-post-hash-drift-detection",
+        representative_smoke: "post-hash-drift-fbsd.sh",
+        since_sprint: "AU11",
+    },
+    CoverageClass {
         id: "fs-rename",
         representative_smoke: "mv-undo-linux.sh",
         since_sprint: "L03",
