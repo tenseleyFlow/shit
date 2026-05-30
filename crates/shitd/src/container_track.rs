@@ -244,6 +244,19 @@ fn build_container_op(
                 with_volumes,
             })
         }
+        ContainerVerbWire::Pull => {
+            // AU23 / DR-CR-51 — `image` is the user-typed
+            // reference (e.g. `alpine:latest`); `resolved_id` is
+            // the post-pull `docker inspect --format '{{.Id}}'`
+            // result. Pre-post handlers may ship either or both,
+            // depending on the wrapper's invocation phase.
+            let image = extras
+                .get("image")
+                .cloned()
+                .ok_or(HandleError::MissingExtra { verb, key: "image" })?;
+            let resolved_id = extras.get("resolved_id").cloned();
+            Ok(ContainerOp::Pull { image, resolved_id })
+        }
     }
 }
 
@@ -327,6 +340,50 @@ mod tests {
         assert!(matches!(
             wire_to_planner_runtime(ContainerRuntimeWire::Podman),
             ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn build_pull_extracts_image_and_resolved_id() {
+        // AU23 / DR-CR-51 — happy path: helper post-handler shipped
+        // both the user-typed tag and the resolved sha256 digest.
+        let mut extras = BTreeMap::new();
+        extras.insert("image".into(), "alpine:latest".into());
+        extras.insert("resolved_id".into(), "sha256:abc123".into());
+        let op = build_container_op(ContainerVerbWire::Pull, &extras).unwrap();
+        assert!(matches!(
+            op,
+            ContainerOp::Pull { ref image, resolved_id: Some(ref id) }
+                if image == "alpine:latest" && id == "sha256:abc123"
+        ));
+    }
+
+    #[test]
+    fn build_pull_without_resolved_id_journals_with_none() {
+        // AU23 — when `docker inspect` failed at capture time, the
+        // helper still ships an event with image only. Planner
+        // carries `resolved_id: None`; the renderer surfaces a
+        // clear "(unavailable)" note rather than dropping.
+        let mut extras = BTreeMap::new();
+        extras.insert("image".into(), "nginx:alpine".into());
+        let op = build_container_op(ContainerVerbWire::Pull, &extras).unwrap();
+        assert!(matches!(
+            op,
+            ContainerOp::Pull { ref image, resolved_id: None }
+                if image == "nginx:alpine"
+        ));
+    }
+
+    #[test]
+    fn build_pull_missing_image_returns_error() {
+        let extras = BTreeMap::new();
+        let err = build_container_op(ContainerVerbWire::Pull, &extras).unwrap_err();
+        assert!(matches!(
+            err,
+            HandleError::MissingExtra {
+                verb: ContainerVerbWire::Pull,
+                key: "image"
+            }
         ));
     }
 }
