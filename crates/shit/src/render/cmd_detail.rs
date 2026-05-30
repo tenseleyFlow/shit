@@ -354,6 +354,21 @@ fn render_container_op(w: &mut dyn Write, kind_json: &str) -> std::io::Result<()
                 let project = inner.get("project").and_then(|v| v.as_str()).unwrap_or("?");
                 writeln!(w, "    ComposeDown: project {project}")?;
             }
+            "Pull" => {
+                // AU23 / DR-CR-51 — surface the user-typed reference
+                // AND the resolved digest so `shit show` doesn't lie
+                // about which bytes landed when the floating tag has
+                // since moved upstream.
+                let image = inner.get("image").and_then(|v| v.as_str()).unwrap_or("?");
+                writeln!(w, "    Pull: {image}")?;
+                match inner.get("resolved_id").and_then(|v| v.as_str()) {
+                    Some(id) => writeln!(w, "    resolved: {id}")?,
+                    None => writeln!(
+                        w,
+                        "    resolved: (digest unavailable — inspect failed at capture time)"
+                    )?,
+                }
+            }
             _ => {
                 writeln!(w, "    {variant}:")?;
                 render_indented_json(w, inner, 6)?;
@@ -568,5 +583,54 @@ mod tests {
         body.events_total = 1;
         let out = capture_render(&body);
         assert!(out.contains("[partial]"));
+    }
+
+    #[test]
+    fn container_op_pull_renders_image_and_resolved_id() {
+        // AU23 / DR-CR-51 — `docker pull alpine:latest` event with a
+        // resolved digest should display both the floating tag the
+        // user typed AND the sha256 their bytes actually are.
+        let mut body = empty_body();
+        body.events.push(CmdDetailEventWire {
+            id: 1,
+            ts_unix_nanos: body.started_at_unix_nanos,
+            kind_label: "ContainerOp".into(),
+            kind_json: r#"{"runtime":"Docker","op":{"Pull":{"image":"alpine:latest","resolved_id":"sha256:abc123"}},"captured_config":[],"stash_image":null,"stash_tarball":null}"#.into(),
+            partial: false,
+        });
+        body.events_total = 1;
+        let out = capture_render(&body);
+        assert!(
+            out.contains("Pull: alpine:latest"),
+            "expected Pull line; got:\n{out}"
+        );
+        assert!(
+            out.contains("resolved: sha256:abc123"),
+            "expected resolved digest; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn container_op_pull_without_resolved_id_renders_unavailable_note() {
+        // AU23 — when the post-phase inspect failed (image
+        // garbage-collected mid-flight, etc.), the event lands with
+        // resolved_id=null. Renderer must still show the image
+        // reference + an honest "(unavailable)" note rather than
+        // dropping the event.
+        let mut body = empty_body();
+        body.events.push(CmdDetailEventWire {
+            id: 1,
+            ts_unix_nanos: body.started_at_unix_nanos,
+            kind_label: "ContainerOp".into(),
+            kind_json: r#"{"runtime":"Docker","op":{"Pull":{"image":"nginx:alpine","resolved_id":null}},"captured_config":[],"stash_image":null,"stash_tarball":null}"#.into(),
+            partial: false,
+        });
+        body.events_total = 1;
+        let out = capture_render(&body);
+        assert!(out.contains("Pull: nginx:alpine"));
+        assert!(
+            out.contains("digest unavailable"),
+            "expected unavailability note; got:\n{out}"
+        );
     }
 }
