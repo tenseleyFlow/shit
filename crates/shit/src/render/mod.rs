@@ -16,6 +16,7 @@
 //! `shit --json` parsing as a top-level arg that disturbs the
 //! bare-`shit` semantics.
 
+pub mod cmd_detail;
 pub mod color;
 pub mod db;
 pub mod env_diff;
