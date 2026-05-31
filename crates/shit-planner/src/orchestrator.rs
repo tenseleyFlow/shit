@@ -298,10 +298,17 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                 detail: Some(detail),
             };
         }
-        let conflict = node
-            .conflict
-            .clone()
-            .or_else(|| self.precondition_conflict(op));
+        // Honor the planner's plan-time conflict ONLY when it's a Hard
+        // drift signal (post-content-hash mismatch). Missing/Soft/Phantom
+        // from plan.rs are advisory: many inverse ops (RestoreContent,
+        // CreateHardlink, MakeDir) are explicitly designed to apply over
+        // a "missing" precondition — they CREATE the path. The
+        // existence-based precondition_conflict knows per-op rules; only
+        // override it for drift, which precondition can't see.
+        let conflict = match node.conflict.as_ref() {
+            Some(c @ Conflict::Hard { .. }) => Some(c.clone()),
+            _ => self.precondition_conflict(op),
+        };
         let outcome = match (conflict, policy) {
             (None, _) => self.executor.execute(op, dry_run, policy),
             (Some(_), ConflictPolicy::Force) => self.executor.execute(op, dry_run, policy),
