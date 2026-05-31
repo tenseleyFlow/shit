@@ -185,7 +185,6 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
 
                 for op_index in cohort_indices.iter().copied() {
                     let node = &plan.nodes[op_index];
-                    let op = &node.op;
                     let sem = std::sync::Arc::clone(&semaphore);
                     let records_slot = &records_slot;
                     let abort_flag = &abort_flag;
@@ -203,7 +202,7 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                             drop(g);
                             std::thread::yield_now();
                         }
-                        let record = self.execute_one(op_index, op, dry_run, policy);
+                        let record = self.execute_one(op_index, node, dry_run, policy);
                         // Track whether this record triggers abort.
                         if matches!(policy, ConflictPolicy::Abort)
                             && matches!(
@@ -248,13 +247,20 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
 
     /// Per-op evaluator extracted so it's shareable between the
     /// sequential `run` and the parallel `run_parallel`.
+    ///
+    /// Conflict resolution order:
+    /// 1. `node.conflict` (plan-time annotation; covers post-content
+    ///    drift detection that the existence-only precondition can't
+    ///    see).
+    /// 2. `precondition_conflict(op)` (existence/inode checks).
     fn execute_one(
         &self,
         op_index: usize,
-        op: &InverseOp,
+        node: &crate::inverse::PlanNode,
         dry_run: bool,
         policy: ConflictPolicy,
     ) -> ExecutionRecord {
+        let op = &node.op;
         if self.filtered_out(op) {
             return ExecutionRecord {
                 op_index,
@@ -292,7 +298,17 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                 detail: Some(detail),
             };
         }
-        let conflict = self.precondition_conflict(op);
+        // Honor the planner's plan-time conflict ONLY when it's a Hard
+        // drift signal (post-content-hash mismatch). Missing/Soft/Phantom
+        // from plan.rs are advisory: many inverse ops (RestoreContent,
+        // CreateHardlink, MakeDir) are explicitly designed to apply over
+        // a "missing" precondition — they CREATE the path. The
+        // existence-based precondition_conflict knows per-op rules; only
+        // override it for drift, which precondition can't see.
+        let conflict = match node.conflict.as_ref() {
+            Some(c @ Conflict::Hard { .. }) => Some(c.clone()),
+            _ => self.precondition_conflict(op),
+        };
         let outcome = match (conflict, policy) {
             (None, _) => self.executor.execute(op, dry_run, policy),
             (Some(_), ConflictPolicy::Force) => self.executor.execute(op, dry_run, policy),
@@ -324,13 +340,12 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         let mut records: Vec<ExecutionRecord> = Vec::with_capacity(plan.nodes.len());
 
         for (op_index, node) in plan.nodes.iter().enumerate() {
-            let op = &node.op;
             // DR-64 fault-injection: crash between serial ops. On
             // restart, the exec log is the source of truth for what
             // was already applied; the recovery path re-runs the
             // plan starting after the last recorded record.
             shit_proto::fault_inject::maybe_inject("orchestrator.run.before_op");
-            let record = self.execute_one(op_index, op, dry_run, policy);
+            let record = self.execute_one(op_index, node, dry_run, policy);
             shit_proto::fault_inject::maybe_inject("orchestrator.run.after_op");
             let outcome_kind = record.outcome_kind;
             records.push(record);

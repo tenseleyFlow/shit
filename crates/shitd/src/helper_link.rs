@@ -854,6 +854,7 @@ fn dispatch_response(
                 stored_bytes,
                 staging,
                 blob_store,
+                index,
                 live_baseline,
             ) {
                 tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
@@ -1324,6 +1325,7 @@ fn handle_baseline_captured(
     stored_bytes: u64,
     staging: OwnedFd,
     blob_store: &BlobStore,
+    index: &Index,
     live_baseline: &crate::baseline::LiveBaseline,
 ) -> Result<(), HelperLinkError> {
     let bytes = read_all_from_fd(&staging, stored_bytes as usize)?;
@@ -1336,13 +1338,25 @@ fn handle_baseline_captured(
             "baseline blob hash mismatch: helper claimed {claimed}, daemon computed {canonical_hash}"
         ))));
     }
-    // The blob is already content-addressed in the store. Baseline
-    // blobs don't need an index record because they aren't refed by
-    // journal events directly — they're refed by LiveBaseline cache
-    // entries, which manage their own lifecycle. When the cache is
-    // promoted into a FilePreImage, that event's
-    // `handle_captured_pre_image` path records the blob normally.
-    let _ = stat;
+    // Register the blob in the index now, at capture time. When the
+    // baseline cache later promotes this blob into a FilePreImage
+    // event (via `handle_baseline_promoted_pre_image`), the planner's
+    // `store.blob_size_hint(blob)` lookup must succeed — otherwise
+    // plan.rs's "blob no longer in store" guard fires Conflict::Missing
+    // even though the bytes are on disk, shadowing the post-hash drift
+    // check (AU11 drift detection regression observed pre-fix).
+    //
+    // Idempotent via ON CONFLICT DO NOTHING; refcount stays 0 until a
+    // FilePreImage event references it, at which point put_event bumps
+    // it. Unpromoted baseline blobs end up refcount=0 and get GC'd.
+    let ts = crate::server::next_ts();
+    index
+        .put_blob_record(canonical_hash, stat.stored_bytes, stat.compressed, ts)
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "baseline put_blob_record: {e}"
+            )))
+        })?;
     let inode_ref = InodeRef::new(dev, inode);
     // W09.21 — read user-namespace xattrs here in the daemon (not
     // the helper) because the helper runs under cap_enter(2) where
