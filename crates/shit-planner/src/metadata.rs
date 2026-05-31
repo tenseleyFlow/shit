@@ -27,6 +27,12 @@ pub struct FileMetadata {
     /// macOS/BSD). `None` means "not captured on this platform" — distinct
     /// from "no ACL".
     pub acl: Option<Vec<u8>>,
+    /// BSD/macOS `st_flags`: the chflags(2) attribute bitmap
+    /// (UF_IMMUTABLE, UF_HIDDEN, SF_NOUNLINK, …). 0 on Linux (no such
+    /// concept) and on captures predating M03.x.SETATTR — `#[serde(default)]`
+    /// keeps those decodable.
+    #[serde(default)]
+    pub flags: u32,
 }
 
 impl FileMetadata {
@@ -40,6 +46,7 @@ impl FileMetadata {
             && self.size == other.size
             && self.xattrs == other.xattrs
             && self.acl == other.acl
+            && self.flags == other.flags
     }
 }
 
@@ -91,6 +98,7 @@ mod tests {
             mtime_unix_nanos: mtime,
             xattrs: BTreeMap::new(),
             acl: None,
+            flags: 0,
         }
     }
 
