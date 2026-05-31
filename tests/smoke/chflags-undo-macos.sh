@@ -5,31 +5,37 @@
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: macos-14
 # SMOKE_TIMEOUT_SEC: 180
-# EXCLUDED_BY: M03.x.SETATTR-impl-pending
-# EXCLUDED_REASON: chflags(2) is a REAL capture gap on the M07 shim. Closing it needs FileMetadataWire.flags field (wire-shape change), chflags/fchflags interposers, daemon shim_listener routing, planner MetadataChange inverse, and chflags executor. Tracked under M03.x.SETATTR-FAMILY; this smoke documents the gap pending a dedicated implementation sprint. Re-enable by clearing this EXCLUDED_BY when the fix lands.
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
-# M03.x.SETATTR-FAMILY gap-validation smoke (chflags variant).
+# M03.x.SETATTR-FAMILY end-to-end smoke (chflags variant).
 #
-# Per `feedback-validate-gap-before-building`: before building
-# AUTH_SETFLAGS handler in macos_es.rs, write a smoke that should
-# FAIL pre-fix and verify it actually fails.
+# Workload: a tiny C binary that calls `chflags(path, UF_HIDDEN)`
+# directly. UF_HIDDEN is a user-visible-but-restorable flag (it
+# only hides the file in Finder; it doesn't prevent deletion or
+# any other operation), making it safe for CI.
 #
-# Workload: `chflags uchg <file>` sets UF_IMMUTABLE — a pure
-# metadata mutation that locks the file from modification/
-# deletion. Unlike chmod/chown (covered by M07.B.5 in the shim
-# and M03.1.I.D in ES), chflags goes through a DIFFERENT syscall
-# (`chflags(2)` not `chmod(2)`) and the M07 shim does NOT
-# interpose it.
+# We use UF_HIDDEN rather than UF_IMMUTABLE because UF_IMMUTABLE
+# would block the cleanup `rm -rf $tmpdir` (immutable files
+# refuse unlink), and SF_* would need root.
 #
-# Outcomes:
-#   A. Full undo: post-undo file has same flags as pre-mutation
-#      (i.e. no UF_IMMUTABLE). Surprising — would mean some
-#      other tier caught the change.
-#   B. Loud refusal: undo non-zero with explicit "chflags not
-#      captured" or similar.
-#   C. Silent stomp (EXPECTED): post-undo file STILL has
-#      UF_IMMUTABLE. Gap confirmed — needs AUTH_SETFLAGS
-#      handler OR a chflags shim interposer.
+# The workload binary is built fresh per-run with clang, so it
+# inherits DYLD_INSERT_LIBRARIES (ad-hoc-signed; no SIP strip).
+# /usr/bin/chflags is SIP-protected and would NOT pick up the
+# shim, which is why we build a non-SIP workload instead.
+#
+# Validation flow:
+#   1. Pre-state: file with no flags (`-`)
+#   2. Workload `set_chflags <file> UF_HIDDEN` runs under
+#      DYLD_INSERT — shim's my_chflags interposer fires
+#      `notify_pre_mutation_with_content` BEFORE the syscall,
+#      capturing st_flags=0 as the pre-state into the daemon's
+#      FilePreImage journal.
+#   3. Confirm post-mutate flags == "hidden"
+#   4. shit undo --yes runs; planner's RestoreMetadata pulls
+#      the captured FileMetadata (with flags=0) and the
+#      executor's restore_flags_only calls chflags(path, 0).
+#   5. Assert post-undo flags == "-"
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -42,8 +48,11 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 0
 fi
 
-CHFLAGS_BIN="$(command -v chflags 2>/dev/null || echo /usr/bin/chflags)"
-[ -x "${CHFLAGS_BIN}" ] || smoke_fail "chflags not found at ${CHFLAGS_BIN}"
+CLANG_BIN="$(command -v clang 2>/dev/null || true)"
+if [ -z "${CLANG_BIN}" ]; then
+    smoke_log "SKIP: clang not on PATH (need Xcode CLT)"
+    exit 0
+fi
 
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
@@ -53,30 +62,57 @@ SHIM_LIB="${SHIT_SMOKE_BIN_DIR}/libshit_preload_shim.dylib"
 [ -f "${SHIM_LIB}" ]   || smoke_fail "shim library missing at ${SHIM_LIB}"
 export SHIT_HELPER_BIN="${HELPER_BIN}"
 
-# Capture file flags via `ls -lO` (BSD ls; macOS ships it).
-# Returns a string like "-rw-r--r--  1 user staff - 12 May 31 12:34 file"
-# where "-" is the flags column when no flags are set, or "uchg" etc.
+# Capture file flags. `ls -lO` (BSD ls) emits a flags column;
+# "-" means no flags, otherwise comma-separated names like "hidden",
+# "uchg", etc.
 flags_of() {
     /bin/ls -lO "$1" 2>/dev/null | awk '{print $5}'
 }
 
 WATCHED="${SHIT_SMOKE_TMP}/watched"
-TARGET="${SHIT_SMOKE_TMP}/data/locked.txt"
+TARGET="${SHIT_SMOKE_TMP}/data/hideme.txt"
 mkdir -p "${WATCHED}" "$(dirname "${TARGET}")"
 
 printf 'pre-chflags content\n' > "${TARGET}"
 PRE_FLAGS="$(flags_of "${TARGET}")"
 smoke_log "pre-state flags: '${PRE_FLAGS}'"
-if [ "${PRE_FLAGS}" != "-" ]; then
-    smoke_fail "pre-state invariant: target file has unexpected flags '${PRE_FLAGS}' (want '-')"
-fi
+[ "${PRE_FLAGS}" = "-" ] || smoke_fail "pre-state invariant: target has unexpected flags '${PRE_FLAGS}'"
 
-# Belt-and-suspenders cleanup. UF_IMMUTABLE prevents deletion;
-# always clear it before any rm so the tmpdir tear-down works.
+# Cleanup — always clear any flags we set so rm -rf works on
+# the tmpdir. Belt-and-suspenders against UF_IMMUTABLE if a
+# future variant of this smoke uses it.
 cleanup() {
+    /usr/bin/chflags nohidden "${TARGET}" 2>/dev/null || true
     /usr/bin/chflags nouchg "${TARGET}" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Tiny C workload that calls chflags() directly. UF_HIDDEN is
+# safe — purely cosmetic, doesn't block any other operation.
+cat > "${WATCHED}/set_chflags.c" <<'CSRC'
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <path>\n", argv[0]);
+        return 2;
+    }
+    if (chflags(argv[1], UF_HIDDEN) != 0) {
+        perror("chflags");
+        return 1;
+    }
+    return 0;
+}
+CSRC
+
+"${CLANG_BIN}" -O0 -o "${WATCHED}/set_chflags" "${WATCHED}/set_chflags.c" 2> "${SHIT_SMOKE_TMP}/clang.log"
+if [ ! -x "${WATCHED}/set_chflags" ]; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/clang.log" >&2 || true
+    smoke_fail "clang failed to build set_chflags workload"
+fi
 
 smoke_start_shitd
 
@@ -95,27 +131,19 @@ cd "${WATCHED}"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
-# THE workload: chflags uchg sets UF_IMMUTABLE. Pure metadata
-# mutation via the chflags(2) syscall — no content path. The
-# M07 shim doesn't interpose chflags, so no pre-state capture
-# unless some other tier (ES with AUTH_SETFLAGS, FSEvents
-# metadata-modified) lands a usable event.
-#
-# /usr/bin/chflags is SIP-stripped → DYLD_INSERT is dropped,
-# shim doesn't load. But it doesn't matter: shim has no
-# chflags interposer anyway.
-smoke_log "${CHFLAGS_BIN} uchg ${TARGET}"
-"${CHFLAGS_BIN}" uchg "${TARGET}" > "${SHIT_SMOKE_TMP}/chflags.log" 2>&1
+smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} ${WATCHED}/set_chflags ${TARGET}"
+DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${WATCHED}/set_chflags" "${TARGET}" \
+    > "${SHIT_SMOKE_TMP}/chflags.log" 2>&1
 CHFLAGS_RC=$?
 if [ "${CHFLAGS_RC}" -ne 0 ]; then
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/chflags.log" >&2 || true
-    smoke_fail "chflags uchg failed (rc=${CHFLAGS_RC})"
+    smoke_fail "set_chflags workload failed (rc=${CHFLAGS_RC})"
 fi
 
 POST_MUTATE_FLAGS="$(flags_of "${TARGET}")"
 smoke_log "post-mutate flags: '${POST_MUTATE_FLAGS}'"
-if [ "${POST_MUTATE_FLAGS}" != "uchg" ]; then
-    smoke_fail "expected uchg flag after chflags, got '${POST_MUTATE_FLAGS}'"
+if [ "${POST_MUTATE_FLAGS}" != "hidden" ]; then
+    smoke_fail "expected hidden flag after chflags, got '${POST_MUTATE_FLAGS}'"
 fi
 
 "${SHIT_BIN}" hook-send post-exec \
@@ -124,8 +152,9 @@ sleep 1.0
 
 N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 smoke_log "journal events for command: ${N_EVENTS}"
-N_META="$(smoke_journal_count "discriminant LIKE '%Metadata%'" 2>/dev/null || echo 0)"
-smoke_log "metadata-discriminant events: ${N_META}"
+SHIM_HITS="$(grep -hc 'shim pre-mutation' "${SHIT_SMOKE_TMP}"/state/shit/log/daemon.jsonl.* 2>/dev/null || echo 0)"
+SHIM_HITS="$(printf '%s\n' ${SHIM_HITS} | awk '{s+=$1} END{print s+0}')"
+smoke_log "shim notifications observed by daemon: ${SHIM_HITS}"
 
 smoke_log "running: shit undo --yes"
 set +e
@@ -141,23 +170,23 @@ smoke_log "post-undo flags: '${POST_UNDO_FLAGS}'"
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
 if [ "${POST_UNDO_FLAGS}" = "${PRE_FLAGS}" ] && [ "${UNDO_RC}" -eq 0 ]; then
-    smoke_log "OUTCOME A — flags restored to pre-state (surprising; some tier captured it)"
-    smoke_log "PASS: chflags-undo-macos (Outcome A — gap closed by unknown path)"
+    smoke_log "OUTCOME A — flags restored to pre-state '${PRE_FLAGS}' (shim hits=${SHIM_HITS})"
+    smoke_log "PASS: chflags-undo-macos (M03.x.SETATTR-FAMILY end-to-end)"
     exit 0
 fi
 
 if [ "${UNDO_RC}" -ne 0 ] \
-    && grep -qE "chflags|uchg|setflags|refus|conflict|metadata" "${SHIT_SMOKE_TMP}/undo.log"; then
-    smoke_log "OUTCOME B — loud refusal (undo non-zero, log names the gap)"
+    && grep -qE "chflags|hidden|setflags|refus|conflict|metadata" "${SHIT_SMOKE_TMP}/undo.log"; then
+    smoke_log "OUTCOME B — loud refusal"
     smoke_log "PASS: chflags-undo-macos (Outcome B)"
     exit 0
 fi
 
-smoke_log "OUTCOME C — silent stomp (M03.x.SETATTR-FAMILY gap CONFIRMED for chflags)"
+smoke_log "OUTCOME C — silent stomp"
 smoke_log "  pre flags:        '${PRE_FLAGS}'"
 smoke_log "  post-mutate:      '${POST_MUTATE_FLAGS}'"
 smoke_log "  post-undo:        '${POST_UNDO_FLAGS}'"
 smoke_log "  undo exit:        ${UNDO_RC}"
 smoke_log "  journal events:   ${N_EVENTS}"
-smoke_log "  metadata events:  ${N_META}"
-smoke_fail "chflags undo did NOT restore pre-state flags (gap confirmed)"
+smoke_log "  shim hits:        ${SHIM_HITS}"
+smoke_fail "chflags undo did NOT restore pre-state flags"
