@@ -452,7 +452,73 @@ fn restore_metadata_inner(
         tracing::warn!(path = %path.display(), err = %e, "xattr restore reported error");
     }
 
+    // M03.x.SETATTR — restore BSD/macOS st_flags via chflags(2). Must
+    // run AFTER mtime / chmod because UF_IMMUTABLE / SF_IMMUTABLE
+    // (once set) refuse further mutations to the file's metadata. On
+    // Linux flags is always 0; restore_flags_only no-ops there.
+    //
+    // System flags (SF_*) need root; falling back to a privileged-
+    // helper round-trip for those is a follow-up. UF_* (user flags
+    // like UF_HIDDEN, UF_IMMUTABLE) work for the file's owner.
+    if let Err(e) = restore_flags_only(path, target) {
+        // Best-effort: log + continue rather than fail the whole
+        // restore. SF_* flag restoration without root is the typical
+        // benign-EPERM case; we surface it but don't block undo.
+        tracing::warn!(
+            path = %path.display(),
+            err = %e,
+            target_flags = format!("0x{:x}", target.flags),
+            "chflags restore reported error (likely needs root for system flags)"
+        );
+    }
+
     restore_mtime_only(path, target).map_err(MetadataRestoreError::Other)
+}
+
+/// M03.x.SETATTR — restore BSD/macOS `st_flags` to the captured value.
+/// No-op on Linux (no st_flags), no-op when target.flags matches current
+/// (cheap probe avoids the syscall on the common "flags didn't change"
+/// path).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Quick stat to skip when current matches captured. The chflags
+    // syscall is cheap, but skipping when unchanged avoids touching
+    // UF_IMMUTABLE-protected files when the captured pre-state
+    // already matches.
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("chflags: path contains NUL: {path:?}"))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated CString; st is owned.
+    let rc = unsafe { libc::lstat(c_path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return Err(format!(
+            "lstat for chflags-probe {path:?}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let current_flags = st.st_flags as u32;
+    if current_flags == target.flags {
+        return Ok(());
+    }
+    // SAFETY: c_path is valid; chflags takes path + flags. Apple's
+    // signature is `chflags(path: *const c_char, flags: c_uint)`.
+    let rc = unsafe { libc::chflags(c_path.as_ptr(), target.flags as libc::c_uint) };
+    if rc != 0 {
+        return Err(format!(
+            "chflags {path:?} -> 0x{:x}: {}",
+            target.flags,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn restore_flags_only(_path: &Path, _target: &crate::metadata::FileMetadata) -> Result<(), String> {
+    Ok(())
 }
 
 /// Apply mtime alone — used after a successful helper-routed chown
@@ -874,6 +940,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: std::collections::BTreeMap::new(),
             acl: None,
+            flags: 0,
         };
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
@@ -1047,6 +1114,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
             inode: InodeRef::new(1, 1),
@@ -1084,6 +1152,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
             inode: InodeRef::new(1, 1),
@@ -1124,6 +1193,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
             inode: InodeRef::new(1, 1),
@@ -1163,6 +1233,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
             inode: InodeRef::new(1, 1),

@@ -39,6 +39,10 @@ impl StateProbe for LiveStateProbe {
         let inode = InodeRef::new(meta.dev(), meta.ino());
         // mtime: MetadataExt gives sec + nsec; combine into i128.
         let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
+        // M03.x.SETATTR — pick up BSD/macOS st_flags via a raw libc
+        // stat; std::fs::Metadata doesn't expose it cross-platform.
+        // Linux has no st_flags so flags stays 0 there.
+        let flags = read_stat_flags(path);
         let fm = FileMetadata {
             mode: meta.mode(),
             uid: meta.uid(),
@@ -50,6 +54,7 @@ impl StateProbe for LiveStateProbe {
             // bottoms out at content_hash for the common case.
             xattrs: Default::default(),
             acl: None,
+            flags,
         };
         Some(ProbeStat { inode, meta: fm })
     }
@@ -61,6 +66,32 @@ impl StateProbe for LiveStateProbe {
         }
         hash_file(path).ok()
     }
+}
+
+/// M03.x.SETATTR — read BSD/macOS `st_flags` for the path. Linux has
+/// no such concept; this returns 0 there. Falls back to 0 on any
+/// stat error so the probe doesn't fail outright when flags are
+/// unreadable (caller's flag-equality check then has a known floor).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn read_stat_flags(path: &Path) -> u32 {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: c is a valid NUL-terminated CString; &mut st points to
+    // owned stack memory of the right type.
+    let rc = unsafe { libc::lstat(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return 0;
+    }
+    st.st_flags as u32
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn read_stat_flags(_path: &Path) -> u32 {
+    0
 }
 
 /// Stream the file through blake3. Used by tests and by the
