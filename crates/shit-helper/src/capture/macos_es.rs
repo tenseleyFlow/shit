@@ -200,6 +200,9 @@ pub struct PreImageRecord {
     pub uid: u32,
     pub gid: u32,
     pub mtime_unix_nanos: i128,
+    /// M03.x.SETATTR — kernel-attached st_flags at pre-syscall time.
+    /// 0 when the file has no BSD flags set.
+    pub flags: u32,
     /// True for UNLINK + RENAME-overwrite (the file at `path` is
     /// gone post-syscall, replaced by the rename source's bytes or
     /// removed entirely). Daemon uses this to journal a paired
@@ -669,6 +672,7 @@ fn handle_auth_unlink(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        flags: stat.st_flags,
         is_delete: true,
     });
 
@@ -732,6 +736,7 @@ fn handle_auth_truncate(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        flags: stat.st_flags,
         // The path still exists after the syscall; we just need to
         // restore its bytes during undo. No TreeOp::Unlink pairing.
         is_delete: false,
@@ -819,6 +824,10 @@ fn handle_auth_metadata(
         size: stat.st_size as u64,
         mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
         xattrs: std::collections::BTreeMap::new(),
+        // M03.x.SETATTR — capture st_flags for chflags undo. The ES
+        // pre-syscall stat snapshot gives us the pre-mutation flags
+        // directly; the kernel hasn't applied the chflags change yet.
+        flags: stat.st_flags,
     };
     let mut after = before.clone();
     match after_delta {
@@ -828,6 +837,7 @@ fn handle_auth_metadata(
             after.gid = new_gid;
         }
         MetaDelta::Mtime(new_ns) => after.mtime_unix_nanos = new_ns,
+        MetaDelta::Flags(new_flags) => after.flags = new_flags,
     }
 
     let ts_unix_nanos = std::time::SystemTime::now()
@@ -852,6 +862,8 @@ enum MetaDelta {
     Mode(u32),
     Owner(u32, u32),
     Mtime(i128),
+    /// M03.x.SETATTR — chflags delta (new st_flags value).
+    Flags(u32),
 }
 
 /// Kernel `FFLAGS` write-intent bits. From `<sys/fcntl.h>`:
@@ -966,6 +978,7 @@ fn handle_auth_open(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mtime_unix_nanos: (stat.st_mtime as i128) * 1_000_000_000 + (stat.st_mtime_nsec as i128),
+        flags: stat.st_flags,
         // The path survives post-open; we just captured the pre-write
         // bytes. Undo restores the bytes; no TreeOp::Unlink needed.
         is_delete: false,
@@ -1095,6 +1108,7 @@ fn handle_auth_rename(
             gid: dest_stat.st_gid,
             mtime_unix_nanos: (dest_stat.st_mtime as i128) * 1_000_000_000
                 + (dest_stat.st_mtime_nsec as i128),
+            flags: dest_stat.st_flags,
             is_delete: true,
         });
         // try_send the PreImage half; on failure short-circuit so we
@@ -1553,6 +1567,12 @@ impl PumpState {
             xattrs: crate::capture::xattr::read_user_xattrs(rec.staging_fd.as_raw_fd()),
             is_delete: rec.is_delete,
             fd_sent_via_scm: true,
+            // M03.x.SETATTR — st_flags from the kernel-attached stat
+            // taken at AUTH event time (pre-syscall). clonefile
+            // preserves flags but we capture from the original
+            // record (rec.flags) rather than the staging fd's stat
+            // because the original is what undo needs to restore.
+            flags: rec.flags,
         };
 
         if let Err(e) = self

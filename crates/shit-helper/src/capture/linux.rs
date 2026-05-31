@@ -2032,6 +2032,9 @@ impl StatMeta {
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
             xattrs: self.xattrs.clone(),
+            // Linux has no BSD-style st_flags; M03.x.SETATTR is a
+            // macOS/BSD concept (chflags). Always 0 here.
+            flags: 0,
         }
     }
 }
