@@ -499,15 +499,26 @@ fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
             std::io::Error::last_os_error()
         ));
     }
-    let current_flags = st.st_flags;
+    // `st_flags` type diverges across BSDs: Apple keeps it `c_uint`
+    // (u32); FreeBSD widened to `c_ulong` (u64 on 64-bit hosts).
+    // Coerce both to u32 for the comparison — every defined chflags
+    // constant fits in 32 bits (UF_* in the low half, SF_* in the
+    // high half of u32), so the narrowing is lossless.
+    #[cfg(target_os = "macos")]
+    let current_flags: u32 = st.st_flags;
+    #[cfg(target_os = "freebsd")]
+    let current_flags: u32 = st.st_flags as u32;
     if current_flags == target.flags {
         return Ok(());
     }
-    // SAFETY: c_path is valid; chflags takes path + flags. Apple's
-    // signature is `chflags(path: *const c_char, flags: c_uint)` and
-    // libc::c_uint is u32 on every platform we target, so target.flags
-    // (u32) passes through without a cast.
-    let rc = unsafe { libc::chflags(c_path.as_ptr(), target.flags) };
+    // SAFETY: c_path is valid; chflags takes path + flags. Same
+    // divergence: Apple chflags takes c_uint, FreeBSD takes c_ulong.
+    // `target.flags` is u32; widen only on FreeBSD.
+    #[cfg(target_os = "macos")]
+    let flags_arg: libc::c_uint = target.flags;
+    #[cfg(target_os = "freebsd")]
+    let flags_arg: libc::c_ulong = u64::from(target.flags);
+    let rc = unsafe { libc::chflags(c_path.as_ptr(), flags_arg) };
     if rc != 0 {
         return Err(format!(
             "chflags {path:?} -> 0x{:x}: {}",
