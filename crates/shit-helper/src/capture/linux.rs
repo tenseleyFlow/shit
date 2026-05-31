@@ -733,6 +733,7 @@ impl LinuxCaptureRuntime {
                 .as_ref()
                 .map(|m| m.xattrs.clone())
                 .unwrap_or_default(),
+            flags: 0,
             is_delete: true,
             fd_sent_via_scm: staging_fd.is_some(),
         };
@@ -897,6 +898,7 @@ impl LinuxCaptureRuntime {
             // BPF setattr view has no fd (kernel-event path);
             // chmod/chown don't change xattrs anyway, so empty.
             xattrs: std::collections::BTreeMap::new(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1367,6 +1369,7 @@ impl LinuxCaptureRuntime {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1520,6 +1523,7 @@ impl LinuxCaptureRuntime {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1616,7 +1620,8 @@ impl LinuxCaptureRuntime {
                         path: Some(to_path.clone()),
                         blob_hash,
                         stored_bytes: bytes.len() as u64,
-                        // AU11 — None is correct: `is_delete: true`
+                        // AU11 — None is correct: `flags: 0,
+            is_delete: true`
                         // below marks the rename target's prior
                         // contents as deleted by the rename. No
                         // post-mutation content exists for a Delete.
