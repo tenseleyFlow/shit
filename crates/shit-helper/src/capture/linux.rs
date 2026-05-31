@@ -462,6 +462,12 @@ impl LinuxCaptureRuntime {
             path: path.as_deref().map(path_to_string),
             blob_hash,
             stored_bytes: bytes.len() as u64,
+            // AU11 — None is correct on the fanotify path. We mark
+            // with `FAN_OPEN_PERM | FAN_ACCESS_PERM` (see
+            // fanotify/mark.rs), both of which fire BEFORE the
+            // kernel commits the syscall. `bytes` is therefore the
+            // pre-image; the post-mutation content lives on the
+            // LSM-release path (handle_lsm_release sets Some).
             post_content_hash: None,
             mode: meta.mode,
             uid: meta.uid,
@@ -715,6 +721,9 @@ impl LinuxCaptureRuntime {
             path: Some(resolved_path.clone()),
             blob_hash,
             stored_bytes,
+            // AU11 — None is correct: this is the LSM `inode_unlink`
+            // path, i.e. a Delete event. No post-mutation content
+            // exists because the inode is being removed.
             post_content_hash: None,
             mode: meta_wire.as_ref().map(|m| m.mode).unwrap_or(0),
             uid: meta_wire.as_ref().map(|m| m.uid).unwrap_or(0),
@@ -1346,6 +1355,12 @@ impl LinuxCaptureRuntime {
             path: Some(path_to_string(&path)),
             blob_hash,
             stored_bytes: bytes.len() as u64,
+            // AU11 — None is correct. The LSM `file_open` hook is
+            // a pre-mutation AUTH event; `bytes` come from the
+            // pre-snapshot taken at WatchTree setup, not from
+            // post-mutation content. The matching post-content
+            // hash is set on the `handle_lsm_release` path when
+            // the writer closes the fd.
             post_content_hash: None,
             mode: meta.mode,
             uid: meta.uid,
@@ -1601,6 +1616,10 @@ impl LinuxCaptureRuntime {
                         path: Some(to_path.clone()),
                         blob_hash,
                         stored_bytes: bytes.len() as u64,
+                        // AU11 — None is correct: `is_delete: true`
+                        // below marks the rename target's prior
+                        // contents as deleted by the rename. No
+                        // post-mutation content exists for a Delete.
                         post_content_hash: None,
                         mode: meta.mode,
                         uid: meta.uid,
