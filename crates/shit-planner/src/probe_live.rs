@@ -86,7 +86,7 @@ fn read_stat_flags(path: &Path) -> u32 {
     if rc != 0 {
         return 0;
     }
-    st.st_flags as u32
+    st.st_flags
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]

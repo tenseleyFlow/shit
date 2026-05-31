@@ -499,13 +499,15 @@ fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
             std::io::Error::last_os_error()
         ));
     }
-    let current_flags = st.st_flags as u32;
+    let current_flags = st.st_flags;
     if current_flags == target.flags {
         return Ok(());
     }
     // SAFETY: c_path is valid; chflags takes path + flags. Apple's
-    // signature is `chflags(path: *const c_char, flags: c_uint)`.
-    let rc = unsafe { libc::chflags(c_path.as_ptr(), target.flags as libc::c_uint) };
+    // signature is `chflags(path: *const c_char, flags: c_uint)` and
+    // libc::c_uint is u32 on every platform we target, so target.flags
+    // (u32) passes through without a cast.
+    let rc = unsafe { libc::chflags(c_path.as_ptr(), target.flags) };
     if rc != 0 {
         return Err(format!(
             "chflags {path:?} -> 0x{:x}: {}",

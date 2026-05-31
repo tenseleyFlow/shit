@@ -862,7 +862,12 @@ enum MetaDelta {
     Mode(u32),
     Owner(u32, u32),
     Mtime(i128),
-    /// M03.x.SETATTR — chflags delta (new st_flags value).
+    /// M03.x.SETATTR — chflags delta (new st_flags value). Reserved
+    /// for the future AUTH_SETFLAGS ES handler; the chflags path on
+    /// stock macOS goes through the M07 shim's chflags interposer
+    /// (not ES). Allow-dead until AUTH_SETFLAGS lands in the
+    /// subscription set.
+    #[allow(dead_code)]
     Flags(u32),
 }
 
