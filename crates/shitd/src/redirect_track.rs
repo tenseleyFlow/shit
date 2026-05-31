@@ -226,6 +226,12 @@ fn stash_truncate(
                 mtime_unix_nanos: mtime_unix_nanos(&meta),
                 xattrs: BTreeMap::new(),
                 acl: None,
+                // M03.x.SETATTR — redirect pre-stash path doesn't
+                // pull st_flags (the C06 path is shell-redirect-
+                // specific, not chflags). Default to 0; the inverse
+                // for redirect-pre-stash is FileExtend / RestoreContent,
+                // not flags-restore.
+                flags: 0,
             },
             // post_content_hash is None — we run pre-syscall and don't
             // see what bytes the about-to-run command will write.
