@@ -67,6 +67,11 @@ pub struct ShimPreImage {
     /// `xattr` field, new daemons see `None`).
     #[serde(default)]
     pub xattr: Option<XattrPreImage>,
+    /// M03.x.SETATTR — BSD/macOS st_flags at capture time. 0 on
+    /// Linux and on pre-M03.x.SETATTR shim acks; `#[serde(default)]`
+    /// keeps backward compat in both directions.
+    #[serde(default)]
+    pub flags: u32,
 }
 
 /// M07.B.4.1 — pre-syscall snapshot of one extended attribute.
@@ -249,6 +254,7 @@ mod tests {
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
                 bytes: b"hello".to_vec(),
                 xattr: None,
+                flags: 0,
             }),
             extra_pre_images: Vec::new(),
             failure: None,
@@ -308,6 +314,7 @@ mod tests {
                 gid: 20,
                 size: 0,
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
+                flags: 0,
                 bytes: Vec::new(),
                 xattr: Some(XattrPreImage {
                     name: "user.shit.test".into(),
@@ -341,6 +348,7 @@ mod tests {
                 gid: 20,
                 size: 0,
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
+                flags: 0,
                 bytes: Vec::new(),
                 xattr: Some(XattrPreImage {
                     name: "user.shit.fresh".into(),
@@ -381,6 +389,7 @@ mod tests {
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
                 bytes: bytes.to_vec(),
                 xattr: None,
+                flags: 0,
             }
         }
         let n = ShimNotification {
