@@ -928,8 +928,24 @@ mod policy {
     }
 
     /// M03.x.SETATTR — read `st_flags` for the path. BSD/macOS only;
-    /// Linux returns 0 (no chflags concept).
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    /// Linux returns 0 (no chflags concept). Apple's `st_flags` is
+    /// `c_uint` (u32); FreeBSD widened to `c_ulong` (u64). Narrow to
+    /// u32 — every defined chflags constant fits.
+    #[cfg(target_os = "macos")]
+    fn read_st_flags(path: &str) -> u32 {
+        use std::ffi::CString;
+        let Ok(c) = CString::new(path) else {
+            return 0;
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: c is a valid NUL-terminated CString; st is owned.
+        let rc = unsafe { libc::lstat(c.as_ptr(), &mut st) };
+        if rc != 0 {
+            return 0;
+        }
+        st.st_flags
+    }
+    #[cfg(target_os = "freebsd")]
     fn read_st_flags(path: &str) -> u32 {
         use std::ffi::CString;
         let Ok(c) = CString::new(path) else {
