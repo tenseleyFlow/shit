@@ -242,6 +242,43 @@ unsafe extern "C" fn my_fchmodat(
     unsafe { libc::fchmodat(dirfd, pathname, mode, flags) }
 }
 
+/// Replacement for `chflags(2)` (M03.x.SETATTR). chflags mutates the
+/// BSD/macOS `st_flags` bitmap — UF_IMMUTABLE, UF_HIDDEN, UF_NOUNLINK,
+/// SF_IMMUTABLE, etc. The M07 shim's existing chmod/chown/utimes
+/// interposers covered the "M03.1.I.D metadata family" but missed
+/// chflags because Apple keeps it in a separate syscall (the kernel's
+/// st_flags field is distinct from st_mode/st_uid/etc).
+///
+/// `notify_pre_mutation_with_content` triggers the daemon-side stat
+/// of `path` which picks up the current st_flags BEFORE the chflags
+/// call mutates it — that pre-state lands in the FilePreImage's
+/// FileMetadataWire.flags and the planner's MetadataChange inverse
+/// path restores it on undo via a synthesised `chflags <prior> <path>`.
+///
+/// Apple's libc signature: `chflags(path: *const c_char, flags: c_uint)`.
+/// (FreeBSD widens to c_ulong; macOS keeps c_uint.)
+///
+/// # Safety
+/// Same contract as `libc::chflags` — `path` must be a valid
+/// NUL-terminated C string.
+unsafe extern "C" fn my_chflags(path: *const c_char, flags: c_uint) -> c_int {
+    policy::notify_pre_mutation_with_content("chflags", &cstr_to_string(path));
+    unsafe { libc::chflags(path, flags) }
+}
+
+/// Replacement for `fchflags(2)` (M03.x.SETATTR). Fd-based variant.
+/// Resolves fd→path via `fcntl(F_GETPATH)`; skip-notifies on fds
+/// without a path (pipes, sockets — never chflags targets anyway).
+///
+/// # Safety
+/// Same contract as `libc::fchflags`.
+unsafe extern "C" fn my_fchflags(fd: c_int, flags: c_uint) -> c_int {
+    if let Some(path) = fd_to_path(fd) {
+        policy::notify_pre_mutation_with_content("fchflags", &path);
+    }
+    unsafe { libc::fchflags(fd, flags) }
+}
+
 /// Replacement for `chown(2)`. Captures path + metadata so the
 /// planner can restore the old uid/gid on undo.
 ///
@@ -605,6 +642,24 @@ static INTERPOSE_FCHMODAT: InterposeEntry = InterposeEntry {
     target: libc::fchmodat as *const c_void,
 };
 
+// M03.x.SETATTR — chflags/fchflags. Macros wrap path+fd variants of
+// the BSD-only st_flags mutation syscall (UF_IMMUTABLE, UF_HIDDEN,
+// etc.). Apple does NOT have `chflagsat`; only chflags + fchflags
+// are real symbols.
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_CHFLAGS: InterposeEntry = InterposeEntry {
+    replacement: my_chflags as *const c_void,
+    target: libc::chflags as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_FCHFLAGS: InterposeEntry = InterposeEntry {
+    replacement: my_fchflags as *const c_void,
+    target: libc::fchflags as *const c_void,
+};
+
 #[used]
 #[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_CHOWN: InterposeEntry = InterposeEntry {
@@ -888,6 +943,20 @@ mod tests {
     }
 
     #[test]
+    fn chflags_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_CHFLAGS.replacement.is_null());
+        assert!(!INTERPOSE_CHFLAGS.target.is_null());
+        assert_ne!(INTERPOSE_CHFLAGS.replacement, INTERPOSE_CHFLAGS.target);
+    }
+
+    #[test]
+    fn fchflags_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_FCHFLAGS.replacement.is_null());
+        assert!(!INTERPOSE_FCHFLAGS.target.is_null());
+        assert_ne!(INTERPOSE_FCHFLAGS.replacement, INTERPOSE_FCHFLAGS.target);
+    }
+
+    #[test]
     fn fd_to_path_returns_none_for_bad_fd() {
         // fd -1 is never valid; F_GETPATH returns -1, our helper None.
         assert!(fd_to_path(-1).is_none());
@@ -950,8 +1019,15 @@ mod tests {
             &INTERPOSE_FCHOWNAT,
             &INTERPOSE_UTIMENSAT,
             &INTERPOSE_FUTIMES,
+            // M03.x.SETATTR: chflags family
+            &INTERPOSE_CHFLAGS,
+            &INTERPOSE_FCHFLAGS,
         ];
-        assert_eq!(entries.len(), 23, "M07.A.2 + M07.B.1..5 interposer count");
+        assert_eq!(
+            entries.len(),
+            25,
+            "M07.A.2 + M07.B.1..5 + M03.x.SETATTR interposer count"
+        );
         for e in entries {
             assert!(!e.replacement.is_null());
             assert!(!e.target.is_null());
