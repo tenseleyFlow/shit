@@ -447,6 +447,9 @@ impl PumpState {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            // M03.x.SETATTR — BSD st_flags from the pre-mutation
+            // StatMeta. 0 if the file had no chflags set.
+            flags: meta.flags,
             is_delete,
             fd_sent_via_scm: true,
         };
