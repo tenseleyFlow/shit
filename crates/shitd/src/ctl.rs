@@ -1259,10 +1259,14 @@ fn handle_cmd_detail(
 
 /// AU30 — serialize one `CaptureEvent` to its wire form for the
 /// detail response. `kind_label` lets the CLI dispatch to a
-/// pretty-renderer; `kind_json` is the full variant payload as a
-/// serde-emitted JSON string for variants the CLI doesn't recognize.
+/// pretty-renderer; `kind_json` is the variant BODY only (the
+/// outer externally-tagged wrapper `{"VariantName": ...}` that
+/// serde emits by default is stripped here so the renderers can
+/// treat `kind_json` as `{...inner...}` uniformly). New variants
+/// just need a `capture_event_kind_label` entry — no per-variant
+/// serialization code.
 fn event_to_wire(event: &shit_planner::events::CaptureEvent) -> shit_proto::CmdDetailEventWire {
-    let kind_json = serde_json::to_string(&event.kind).unwrap_or_else(|_| "null".into());
+    let kind_json = serialize_kind_body(&event.kind);
     shit_proto::CmdDetailEventWire {
         id: event.id.0,
         ts_unix_nanos: time_point_to_unix_nanos(event.ts),
@@ -1270,6 +1274,39 @@ fn event_to_wire(event: &shit_planner::events::CaptureEvent) -> shit_proto::CmdD
         kind_json,
         partial: event.partial,
     }
+}
+
+/// AU30 helper: emit the variant body as JSON, stripping the
+/// externally-tagged wrapper that serde puts on enum values by
+/// default. For struct variants (`FilePreImage { ... }`) the
+/// wrapper is `{"FilePreImage": {...}}` — we return the inner
+/// `{...}`. For tuple variants (`TreeOp(TreeOp)`) the wrapper is
+/// `{"TreeOp": {"Create": {...}}}` — we return the inner
+/// `{"Create": {...}}` which the renderer handles. For unit
+/// variants (none today) the serde output would be the bare
+/// string `"VariantName"`; we return `"null"` so the renderer's
+/// JSON fallback can still parse cleanly.
+fn serialize_kind_body(kind: &shit_planner::events::CaptureEventKind) -> String {
+    let full = match serde_json::to_value(kind) {
+        Ok(v) => v,
+        Err(_) => return "null".into(),
+    };
+    let body = match full {
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            // Externally-tagged enum: take the one (key, value)
+            // pair via into_iter and ship the value.
+            map.into_iter()
+                .next()
+                .map(|(_, v)| v)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        // Unit variants serialize as a bare string — no body to
+        // ship; the renderer's kind_label dispatch carries enough
+        // info on its own.
+        serde_json::Value::String(_) => serde_json::Value::Null,
+        other => other,
+    };
+    serde_json::to_string(&body).unwrap_or_else(|_| "null".into())
 }
 
 /// AU30 — stable string tag for each `CaptureEventKind` variant.
@@ -1579,6 +1616,45 @@ mod cmd_detail_helpers_tests {
         ] {
             assert_eq!(tier_label(tier), want);
         }
+    }
+
+    #[test]
+    fn serialize_kind_body_strips_external_tag_for_struct_variant() {
+        // AU30 + AU23 regression — without the wrapper strip,
+        // ContainerOp serializes as
+        //   {"ContainerOp": {"runtime": "Docker", "op": ...}}
+        // and the renderer's `obj.get("runtime")` returns None.
+        // After strip, the body is `{"runtime": "Docker", "op": ...}`
+        // which is what render_container_op consumes.
+        use shit_planner::inverse::{ContainerOp, ContainerRuntime};
+        let ev = CaptureEventKind::ContainerOp {
+            runtime: ContainerRuntime::Docker,
+            op: ContainerOp::Pull {
+                image: "alpine:latest".into(),
+                resolved_id: Some("sha256:abc123".into()),
+            },
+            captured_config: vec![],
+            stash_image: None,
+            stash_tarball: None,
+        };
+        let body = serialize_kind_body(&ev);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let obj = v.as_object().expect("body should be a JSON object");
+        assert_eq!(obj.get("runtime").and_then(|v| v.as_str()), Some("Docker"));
+        assert!(
+            obj.contains_key("op"),
+            "body should expose `op` at top level (stripped wrapper)"
+        );
+        let op = obj.get("op").and_then(|v| v.as_object()).unwrap();
+        let pull = op.get("Pull").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(
+            pull.get("image").and_then(|v| v.as_str()),
+            Some("alpine:latest")
+        );
+        assert_eq!(
+            pull.get("resolved_id").and_then(|v| v.as_str()),
+            Some("sha256:abc123")
+        );
     }
 
     #[test]

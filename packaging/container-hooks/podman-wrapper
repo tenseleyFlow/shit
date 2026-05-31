@@ -37,4 +37,14 @@ if [ -n "$helper" ]; then
     "$helper" container-event podman pre "--target-argv=$target_argv" || true
 fi
 
-exec "$real" "$@"
+# AU23 / DR-CR-51 — fire post-hook for verbs whose state is only
+# available post-exec (`podman pull` resolved digest via
+# `podman inspect`). Same pattern as docker-wrapper above.
+set +e
+"$real" "$@"
+real_rc=$?
+set -e
+if [ "$real_rc" -eq 0 ] && [ -n "$helper" ]; then
+    "$helper" container-event podman post "--target-argv=$target_argv" || true
+fi
+exit "$real_rc"

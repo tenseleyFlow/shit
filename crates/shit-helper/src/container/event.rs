@@ -69,14 +69,22 @@ pub async fn run_event(
         return Ok(());
     }
 
-    // The wrapper only fires for `pre`; reserve `post` for future
-    // state-reconciliation needs (e.g. capturing the assigned image
-    // digest after a successful pull). Treat unknown phases as a
-    // no-op rather than an error so a misconfigured hook doesn't
-    // wedge the CLI.
-    if phase != "pre" {
-        tracing::debug!(tool, phase, "container-event: non-pre phase, ignoring");
-        return Ok(());
+    // AU23 / DR-CR-51 — the wrapper fires both `pre` and `post`.
+    // Pre handles destructive verbs (rm/rmi/volume rm/...) that need
+    // their state snapshotted BEFORE the real docker invocation.
+    // Post handles state reconciliation for verbs that need a value
+    // only available AFTER the real docker exits — concretely,
+    // `docker pull` whose resolved manifest digest comes from
+    // `docker inspect`.
+    //
+    // Anything other than these two phases is a misconfigured hook;
+    // treat as no-op rather than error so the CLI keeps working.
+    match phase {
+        "pre" | "post" => {}
+        _ => {
+            tracing::debug!(tool, phase, "container-event: unknown phase, ignoring");
+            return Ok(());
+        }
     }
 
     // The wrapper packs the user's argv after the tool name with
@@ -137,7 +145,14 @@ pub async fn run_event(
         }
     };
 
-    let Some(prepared) = prepare(tool, runtime, verb_payload) else {
+    // AU23 — phase-aware dispatch. Pre handles destructive verbs;
+    // post handles Pull's digest reconciliation. Each phase short-
+    // circuits cleanly for verbs it doesn't own.
+    let Some(prepared) = (match phase {
+        "pre" => prepare(tool, runtime, verb_payload),
+        "post" => prepare_post(tool, runtime, verb_payload),
+        _ => unreachable!("phase pre-validated above"),
+    }) else {
         return Ok(());
     };
 
@@ -211,6 +226,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Option<
             PodmanVerb::VolumeRm { names } => DockerVerb::VolumeRm { names },
             PodmanVerb::NetworkRm { names } => DockerVerb::NetworkRm { names },
             PodmanVerb::StopOrKill { ids, was_kill } => DockerVerb::StopOrKill { ids, was_kill },
+            PodmanVerb::Pull { images } => DockerVerb::Pull { images },
         },
         VerbPayload::Compose(_) => unreachable!("compose handled above"),
     };
@@ -223,7 +239,73 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Option<
         // stop/kill are restart-hint events; no destructive content
         // loss, no stash needed. PR-B does not ship them yet.
         DockerVerb::StopOrKill { .. } => None,
+        // AU23 — pull doesn't ship at the pre-phase: pre-pull we
+        // don't yet know the resolved digest, and the floating-tag
+        // alone is exactly the moving-target the audit finding
+        // wanted to fix. The post-phase handler (see
+        // `prepare_pull_post`) runs `<tool> inspect` after the real
+        // pull and emits the event with the resolved id.
+        DockerVerb::Pull { .. } => None,
     }
+}
+
+/// AU23 / DR-CR-51 — post-phase handler. Returns Some(event) only
+/// for verbs whose useful state is available AFTER the real
+/// invocation. Today that's `docker pull` / `podman pull`; future
+/// verbs can land here as small additives.
+///
+/// Compose verbs route through `prepare_compose` for the pre-only
+/// path; they don't need a post hook (the captured state is the
+/// rendered config + per-service Rm captures, both available pre).
+fn prepare_post(
+    tool: &str,
+    _runtime: ContainerRuntimeWire,
+    v: VerbPayload,
+) -> Option<PreparedEvent> {
+    let docker_verb: DockerVerb = match v {
+        VerbPayload::Docker(d) => d,
+        VerbPayload::Podman(p) => match p {
+            PodmanVerb::Rm { ids, force } => DockerVerb::Rm { ids, force },
+            PodmanVerb::Rmi { images } => DockerVerb::Rmi { images },
+            PodmanVerb::VolumeRm { names } => DockerVerb::VolumeRm { names },
+            PodmanVerb::NetworkRm { names } => DockerVerb::NetworkRm { names },
+            PodmanVerb::StopOrKill { ids, was_kill } => DockerVerb::StopOrKill { ids, was_kill },
+            PodmanVerb::Pull { images } => DockerVerb::Pull { images },
+        },
+        VerbPayload::Compose(_) => return None,
+    };
+
+    match docker_verb {
+        DockerVerb::Pull { images } => prepare_pull_post(tool, images),
+        // Every other verb's data ships at pre-phase; post is a
+        // no-op for them.
+        _ => None,
+    }
+}
+
+/// AU23 — emit one ContainerEvent per pulled image with the
+/// resolved digest captured via `<tool> inspect`. Ship even when
+/// inspect fails so the journal records the pull attempt (the
+/// renderer just shows "(digest unresolved)" in that case).
+fn prepare_pull_post(tool: &str, images: Vec<String>) -> Option<PreparedEvent> {
+    // AR03 PR-B convention: one event per invocation; first image
+    // only. Multi-image pull batching parallels AR03 PR-B's rmi
+    // batching follow-up (which AU24 covers).
+    let image = images.into_iter().next()?;
+    let resolved_id = inspect_image_digest(tool, &image);
+    let mut extras = BTreeMap::new();
+    extras.insert("image".into(), image);
+    if let Some(id) = resolved_id {
+        extras.insert("resolved_id".into(), id);
+    }
+    Some(PreparedEvent {
+        verb: ContainerVerbWire::Pull,
+        captured_config: Vec::new(),
+        stash_tarball: None,
+        stash_tarball_bytes: None,
+        stash_image: None,
+        extras,
+    })
 }
 
 fn prepare_rmi(
