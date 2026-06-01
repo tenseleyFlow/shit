@@ -1454,6 +1454,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: BTreeMap::new(),
             acl: None,
+            flags: 0,
         }
     }
 

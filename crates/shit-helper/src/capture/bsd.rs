@@ -447,6 +447,9 @@ impl PumpState {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            // M03.x.SETATTR — BSD st_flags from the pre-mutation
+            // StatMeta. 0 if the file had no chflags set.
+            flags: meta.flags,
             is_delete,
             fd_sent_via_scm: true,
         };
@@ -909,6 +912,8 @@ struct StatMeta {
     /// User-namespace xattrs read at the same point as the stat. Empty
     /// when the filesystem has none or the read failed. (W09.21)
     xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// BSD `st_flags` (chflags bitmap). 0 means no flags set.
+    flags: u32,
 }
 
 impl StatMeta {
@@ -921,6 +926,7 @@ impl StatMeta {
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
             xattrs: self.xattrs.clone(),
+            flags: self.flags,
         }
     }
 }
@@ -943,6 +949,9 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
         xattrs: crate::capture::xattr::read_user_xattrs(fd),
+        // M03.x.SETATTR — BSD st_flags (chflags bitmap). libc::stat on
+        // FreeBSD exposes st_flags directly.
+        flags: st.st_flags as u32,
     })
 }
 

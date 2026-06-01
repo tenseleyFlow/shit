@@ -338,6 +338,13 @@ fn ingest_notification(
             | "fsetxattr"
             | "removexattr"
             | "fremovexattr"
+            // M03.x.SETATTR — chflags family. Pre-image carries the
+            // OLD st_flags via FileMetadataWire.flags; ingest_pre_image
+            // routes through the same FilePreImage path as the chmod
+            // family. Planner-side, the inverse is RestoreMetadata
+            // (the executor's restore_flags_only call wraps chflags).
+            | "chflags"
+            | "fchflags"
     ) {
         if let Some(pre) = &note.pre_image {
             if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
@@ -565,6 +572,7 @@ fn ingest_pre_image(
         mtime_unix_nanos: pre.mtime_unix_nanos,
         xattrs: BTreeMap::new(),
         acl: None,
+        flags: pre.flags,
     };
     let path = PathBuf::from(&pre.path);
     let event = CaptureEvent {
@@ -783,6 +791,7 @@ mod tests {
             mtime_unix_nanos: 1_700_000_000_000_000_000,
             bytes: b"hello".to_vec(),
             xattr: None,
+            flags: 0,
         };
         ingest_pre_image(command, &pre, &index, &blob_store).expect("ingest");
 

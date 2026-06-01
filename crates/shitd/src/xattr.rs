@@ -156,6 +156,10 @@ pub fn post_exec_sweep(
         let live_mtime_nanos =
             (live_stat.mtime() as i128) * 1_000_000_000 + (live_stat.mtime_nsec() as i128);
         let inode_ref = shit_planner::InodeRef::new(live_stat.dev(), live_stat.ino());
+        // M03.x.SETATTR — the xattr-drift sweep is xattr-only; it
+        // doesn't probe st_flags. Flag-change capture flows through
+        // the dedicated MetadataChange path (M03.1.I.D + chflags-side
+        // shim interposers), not through this sweep. Leave 0 here.
         let before = shit_planner::metadata::FileMetadata {
             mode: live_mode,
             uid: live_uid,
@@ -164,6 +168,7 @@ pub fn post_exec_sweep(
             mtime_unix_nanos: live_mtime_nanos,
             xattrs: entry.xattrs.clone(),
             acl: None,
+            flags: 0,
         };
         let after = shit_planner::metadata::FileMetadata {
             mode: live_mode,
@@ -173,6 +178,7 @@ pub fn post_exec_sweep(
             mtime_unix_nanos: live_mtime_nanos,
             xattrs: current,
             acl: None,
+            flags: 0,
         };
         let ts = crate::server::next_ts();
         let event = shit_planner::events::CaptureEvent {

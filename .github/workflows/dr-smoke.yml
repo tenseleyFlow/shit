@@ -332,6 +332,32 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  chflags-undo-macos:
+    # M03.x.SETATTR-FAMILY end-to-end smoke — chflags(2) → shit undo →
+    # st_flags restored. Workload is a clang-built C binary calling
+    # chflags(path, UF_HIDDEN) under DYLD_INSERT so the shim's new
+    # my_chflags interposer fires. UF_HIDDEN is purely cosmetic
+    # (Finder-visibility only); doesn't block any other operation.
+    name: chflags-undo smoke (M03.x.SETATTR-FAMILY macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/chflags-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chflags-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   cp-clone-overwrite-undo-macos:
     # M03.x.CLONE-COPYFILE regression guard — replicates `cp -c <src>
     # <dst>` when dst exists: stat + unlink(dst) + clonefile(src, dst).

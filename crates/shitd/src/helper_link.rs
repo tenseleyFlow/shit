@@ -703,6 +703,7 @@ fn dispatch_response(
             xattrs,
             is_delete,
             fd_sent_via_scm: _,
+            flags,
         } => {
             let Some(staging) = fd else {
                 // AR01.1.fix-marker-only — when the helper lost the
@@ -784,6 +785,7 @@ fn dispatch_response(
                     gid,
                     mtime_unix_nanos,
                     baseline_xattrs,
+                    flags,
                     is_delete,
                     // AU11 — the helper's `post_content_hash` (which
                     // on BSD post-hoc kqueue is the held-fd's
@@ -815,6 +817,7 @@ fn dispatch_response(
                     gid,
                     mtime_unix_nanos,
                     xattrs,
+                    flags,
                     is_delete,
                     staging,
                 },
@@ -1093,6 +1096,9 @@ struct CapturedPreImageArgs {
     gid: u32,
     mtime_unix_nanos: i128,
     xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// M03.x.SETATTR — BSD/macOS st_flags at capture time. 0 on
+    /// Linux and on pre-M03.x.SETATTR captures.
+    flags: u32,
     is_delete: bool,
     staging: OwnedFd,
 }
@@ -1123,6 +1129,7 @@ fn handle_metadata_change(
             mtime_unix_nanos: m.mtime_unix_nanos,
             xattrs: m.xattrs,
             acl: None,
+            flags: m.flags,
         }
     }
     let inode_ref = InodeRef::new(dev, inode);
@@ -1180,6 +1187,7 @@ fn handle_captured_pre_image(
         mtime_unix_nanos: args.mtime_unix_nanos,
         xattrs: args.xattrs,
         acl: None,
+        flags: args.flags,
     };
     let path_buf: PathBuf = args.path.clone().unwrap_or_default().into();
 
@@ -1400,6 +1408,7 @@ fn handle_baseline_promoted_pre_image(
     gid: u32,
     mtime_unix_nanos: i128,
     xattrs: BTreeMap<String, Vec<u8>>,
+    flags: u32,
     is_delete: bool,
     post_content_hash: Option<[u8; 32]>,
     index: &Index,
@@ -1417,6 +1426,7 @@ fn handle_baseline_promoted_pre_image(
         // restore_metadata_inner → restore_user_xattrs.
         xattrs,
         acl: None,
+        flags,
     };
     let path_buf: PathBuf = path.clone().unwrap_or_default().into();
     let ts = crate::server::next_ts();
@@ -1615,6 +1625,7 @@ mod tests_dispatch {
             gid: 1000,
             mtime_unix_nanos: 0,
             xattrs: std::collections::BTreeMap::new(),
+            flags: 0,
             is_delete: true,
             staging: fd,
         };
@@ -1735,6 +1746,7 @@ mod tests_dispatch {
             gid: 0,
             mtime_unix_nanos: 0,
             xattrs: std::collections::BTreeMap::new(),
+            flags: 0,
             is_delete: false,
             staging: fd,
         };

@@ -474,6 +474,7 @@ impl LinuxCaptureRuntime {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            flags: 0,
             is_delete,
             fd_sent_via_scm: true,
         };
@@ -733,6 +734,7 @@ impl LinuxCaptureRuntime {
                 .as_ref()
                 .map(|m| m.xattrs.clone())
                 .unwrap_or_default(),
+            flags: 0,
             is_delete: true,
             fd_sent_via_scm: staging_fd.is_some(),
         };
@@ -897,6 +899,7 @@ impl LinuxCaptureRuntime {
             // BPF setattr view has no fd (kernel-event path);
             // chmod/chown don't change xattrs anyway, so empty.
             xattrs: std::collections::BTreeMap::new(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1367,6 +1370,7 @@ impl LinuxCaptureRuntime {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1520,6 +1524,7 @@ impl LinuxCaptureRuntime {
             gid: meta.gid,
             mtime_unix_nanos: meta.mtime_unix_nanos,
             xattrs: meta.xattrs.clone(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -1626,6 +1631,7 @@ impl LinuxCaptureRuntime {
                         gid: meta.gid,
                         mtime_unix_nanos: meta.mtime_unix_nanos,
                         xattrs: meta.xattrs.clone(),
+                        flags: 0,
                         is_delete: true,
                         fd_sent_via_scm: true,
                     };
@@ -2032,6 +2038,9 @@ impl StatMeta {
             size: self.size,
             mtime_unix_nanos: self.mtime_unix_nanos,
             xattrs: self.xattrs.clone(),
+            // Linux has no BSD-style st_flags; M03.x.SETATTR is a
+            // macOS/BSD concept (chflags). Always 0 here.
+            flags: 0,
         }
     }
 }

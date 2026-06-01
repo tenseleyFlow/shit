@@ -357,6 +357,11 @@ pub enum HelperResponse {
         /// fd via `SCM_RIGHTS`. Decoders must recvmsg with a cmsg
         /// buffer to extract the fd.
         fd_sent_via_scm: bool,
+        /// M03.x.SETATTR — BSD/macOS st_flags at capture time. 0 on
+        /// Linux (no chflags concept) and on captures pre-dating
+        /// M03.x.SETATTR; `#[serde(default)]` keeps those decodable.
+        #[serde(default)]
+        flags: u32,
     },
     /// W02.B.live-baseline — one regular file's content snapshot,
     /// captured at session-open by the helper-side baseline walker
@@ -603,6 +608,13 @@ pub struct FileMetadataWire {
     /// Empty when the filesystem has none, the xattr read failed, or
     /// the platform doesn't support xattrs.
     pub xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// M03.x.SETATTR — BSD/macOS `st_flags` bitmap (UF_IMMUTABLE,
+    /// UF_HIDDEN, SF_NOUNLINK, etc). Always 0 on Linux. `#[serde(default)]`
+    /// keeps pre-M03.x.SETATTR captures decodable: postcard treats a
+    /// missing trailing field as the default when the deserializer
+    /// reaches EOF.
+    #[serde(default)]
+    pub flags: u32,
 }
 
 /// Wire mirror of `shit_planner::FileKind`. Same enum shape.
@@ -872,6 +884,7 @@ mod tests {
                 size: 100,
                 mtime_unix_nanos: 1_700_000_000_000_000_000,
                 xattrs: std::collections::BTreeMap::new(),
+                flags: 0,
             },
             after: FileMetadataWire {
                 mode: 0o100755,
@@ -880,6 +893,7 @@ mod tests {
                 size: 100,
                 mtime_unix_nanos: 1_700_000_000_100_000_000,
                 xattrs: std::collections::BTreeMap::new(),
+                flags: 0,
             },
             ts_unix_nanos: 1_700_000_000_200_000_000,
         };
@@ -929,6 +943,7 @@ mod tests {
             },
             is_delete: true,
             fd_sent_via_scm: true,
+            flags: 0,
         };
         let bytes = encode_frame(&ev).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
@@ -952,6 +967,7 @@ mod tests {
             gid: 0,
             mtime_unix_nanos: 0,
             xattrs: std::collections::BTreeMap::new(),
+            flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
         };

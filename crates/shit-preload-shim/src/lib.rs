@@ -660,6 +660,11 @@ mod policy {
             // Empty file bytes — xattr ops don't change file content.
             bytes: Vec::new(),
             xattr: Some(xattr_pre),
+            // M03.x.SETATTR — xattr-mutation notifications don't
+            // probe st_flags (the syscall doesn't change them).
+            // Default to 0; the chflags-side path populates flags
+            // when relevant.
+            flags: 0,
         };
         let _ = try_notify(syscall, &resolved, Some(pre), Vec::new(), None);
         IN_NOTIFY.with(|f| f.set(false));
@@ -899,6 +904,11 @@ mod policy {
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| path.to_string());
+        // M03.x.SETATTR — read BSD/macOS st_flags via raw libc::lstat.
+        // std::fs::Metadata doesn't expose st_flags cross-platform;
+        // 0 on Linux (no chflags). Best-effort: on stat failure use 0
+        // (caller's RestoreMetadata diff then has a known floor).
+        let flags = read_st_flags(path);
         Some(shit_proto::ShimPreImage {
             path: resolved,
             dev: meta.dev(),
@@ -913,7 +923,45 @@ mod policy {
             // populate the xattr field; xattr-mutating syscalls
             // build their own ShimPreImage with this set.
             xattr: None,
+            flags,
         })
+    }
+
+    /// M03.x.SETATTR — read `st_flags` for the path. BSD/macOS only;
+    /// Linux returns 0 (no chflags concept). Apple's `st_flags` is
+    /// `c_uint` (u32); FreeBSD widened to `c_ulong` (u64). Narrow to
+    /// u32 — every defined chflags constant fits.
+    #[cfg(target_os = "macos")]
+    fn read_st_flags(path: &str) -> u32 {
+        use std::ffi::CString;
+        let Ok(c) = CString::new(path) else {
+            return 0;
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: c is a valid NUL-terminated CString; st is owned.
+        let rc = unsafe { libc::lstat(c.as_ptr(), &mut st) };
+        if rc != 0 {
+            return 0;
+        }
+        st.st_flags
+    }
+    #[cfg(target_os = "freebsd")]
+    fn read_st_flags(path: &str) -> u32 {
+        use std::ffi::CString;
+        let Ok(c) = CString::new(path) else {
+            return 0;
+        };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: c is a valid NUL-terminated CString; st is owned.
+        let rc = unsafe { libc::lstat(c.as_ptr(), &mut st) };
+        if rc != 0 {
+            return 0;
+        }
+        st.st_flags as u32
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    fn read_st_flags(_path: &str) -> u32 {
+        0
     }
 
     fn try_notify(

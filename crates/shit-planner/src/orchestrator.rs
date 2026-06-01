@@ -536,6 +536,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         }
     }
 
@@ -938,6 +939,7 @@ mod tests {
                             mtime_unix_nanos: 0,
                             xattrs: Default::default(),
                             acl: None,
+                            flags: 0,
                         },
                     },
                     None,

@@ -567,6 +567,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         }
     }
 
@@ -683,6 +684,7 @@ mod tests {
                     mtime_unix_nanos: 0,
                     xattrs: Default::default(),
                     acl: None,
+                    flags: 0,
                 },
                 post_content_hash: None,
                 source: crate::FilePreImageSource::Other,
@@ -718,6 +720,7 @@ mod tests {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             acl: None,
+            flags: 0,
         };
         let mut after = before.clone();
         after.mode = 0o755;
