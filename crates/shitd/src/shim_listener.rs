@@ -673,6 +673,23 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
+        "link" | "linkat" => {
+            // M03.x.LINK — hardlink: dst is a NEW path aliasing src's
+            // inode. The shim ships only dst (src is unchanged). Same
+            // executor shape as mkfifo: TreeOp::Create → inverse
+            // unlink(dst). The src remains a separate live path; we
+            // never touch it. kind=Regular matches the typical
+            // hardlink target (links to dirs are forbidden on
+            // macOS unless via special privilege).
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Regular,
+                mode: 0o644,
+            }))
+        }
         _ => None,
     }
 }
