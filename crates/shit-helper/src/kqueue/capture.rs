@@ -38,39 +38,18 @@
     target_os = "dragonfly",
 ))]
 
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::RawFd;
 
-/// Errors surfaced by [`read_pre_image`] and [`stream_copy_to_staging`].
-#[derive(Debug, thiserror::Error)]
-pub enum CaptureError {
-    #[error("pread(2): {0}")]
-    Pread(std::io::Error),
-    #[error("write(2): {0}")]
-    Write(std::io::Error),
-    #[error("openat(2): {0}")]
-    Openat(std::io::Error),
-    #[error("fstat(2): {0}")]
-    Fstat(std::io::Error),
-    #[error("inode size {0} exceeds cap (use streaming path or refuse)")]
-    TooLargeForBuffer(u64),
-}
-
-/// Soft cap on in-memory pre-image read size. Files larger than this
-/// must use [`stream_copy_to_staging`]. 64 MiB matches the project's
-/// general "small file" boundary; the inline path stays for tiny
-/// files where the per-call allocation is cheaper than the streaming
-/// setup.
-pub const PRE_IMAGE_INLINE_CAP: u64 = 64 * 1024 * 1024;
-
-/// Hard cap on the streaming path's source size. 1 GiB for this
-/// sprint (W07.A.1). The final cap (configurable, surfaced via the
-/// user-visible refusal contract) lands in W07.A.3.
-pub const STREAM_COPY_CAP: u64 = 1024 * 1024 * 1024;
-
-/// Userspace buffer size for the streaming copy. 64 KiB matches
-/// coreutils `cp` and is comfortably below readahead-defeating values
-/// on UFS / ZFS / ext4 / btrfs.
-const STREAM_COPY_CHUNK: usize = 64 * 1024;
+// AU25 — the streaming primitives + error type moved to
+// `crate::capture::streaming` so the Linux/LSM producer can share
+// them. The legacy `CaptureError` / `stream_copy_to_staging` /
+// `PRE_IMAGE_INLINE_CAP` / `STREAM_COPY_CAP` names are kept as
+// re-exports so existing BSD call sites (capture/bsd.rs,
+// kqueue/capture_tests.rs, kqueue/mod.rs) compile unchanged.
+pub use crate::capture::streaming::{
+    PRE_IMAGE_INLINE_CAP, STREAM_COPY_CAP, StreamError as CaptureError, inode_size,
+    stream_copy_to_staging_at as stream_copy_to_staging,
+};
 
 /// Read the pre-mutation content of the inode referenced by `fd`.
 ///
@@ -120,140 +99,8 @@ pub fn read_pre_image(fd: RawFd) -> Result<Vec<u8>, CaptureError> {
     Ok(out)
 }
 
-/// Stream the pre-mutation content of `src_fd` into a fresh staging
-/// file under `staging_dir_fd`, returning an `O_RDONLY` fd ready for
-/// SCM_RIGHTS, the blake3 hash of the data, and the total bytes
-/// copied.
-///
-/// Unlike [`read_pre_image`], this never materializes the file
-/// contents in a userspace `Vec<u8>` — chunks flow src_fd → 64 KiB
-/// userspace buffer → staging_fd, with blake3 incremental hashing
-/// per chunk. Suitable for files up to `cap` (callers should pass
-/// [`STREAM_COPY_CAP`] until the W07.A.3 cap-relax lands).
-///
-/// `src_fd` must be the helper's `O_RDONLY` fd from the subtree walk
-/// (same contract as [`read_pre_image`]). Reads use `pread(2)` so
-/// the fd's seek offset isn't disturbed.
-pub fn stream_copy_to_staging(
-    src_fd: RawFd,
-    staging_dir_fd: RawFd,
-    cap: u64,
-) -> Result<(OwnedFd, [u8; 32], u64), CaptureError> {
-    let size = inode_size(src_fd)?;
-    if size > cap {
-        return Err(CaptureError::TooLargeForBuffer(size));
-    }
-
-    let name = staging_name();
-    let name_c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
-        CaptureError::Openat(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "staging name NUL",
-        ))
-    })?;
-
-    // Open write handle into staging dir. O_EXCL so we never clobber
-    // a concurrent stream's file; mode 0o600 keeps pre-image content
-    // owner-only.
-    let wflags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
-    // SAFETY: staging_dir_fd alive per caller; name_c is NUL-terminated.
-    let wfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), wflags, 0o600) };
-    if wfd < 0 {
-        return Err(CaptureError::Openat(std::io::Error::last_os_error()));
-    }
-
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; STREAM_COPY_CHUNK];
-    let mut offset = 0i64;
-    let target = size as i64;
-
-    while offset < target {
-        let want = ((target - offset) as usize).min(STREAM_COPY_CHUNK);
-        // SAFETY: buf is a writable slice of len >= want; src_fd valid per caller.
-        let n = unsafe { libc::pread(src_fd, buf.as_mut_ptr().cast(), want, offset) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            unsafe { libc::close(wfd) };
-            return Err(CaptureError::Pread(err));
-        }
-        if n == 0 {
-            // File truncated under us between fstat and now. Stop
-            // and ship what we have — symmetric with read_pre_image.
-            break;
-        }
-        let n_usize = n as usize;
-        hasher.update(&buf[..n_usize]);
-
-        let mut written = 0usize;
-        while written < n_usize {
-            // SAFETY: buf valid; wfd valid until we close it below.
-            let wrc = unsafe {
-                libc::write(
-                    wfd,
-                    buf.as_ptr().add(written).cast(),
-                    (n_usize - written) as libc::size_t,
-                )
-            };
-            if wrc < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                unsafe { libc::close(wfd) };
-                return Err(CaptureError::Write(err));
-            }
-            written += wrc as usize;
-        }
-        offset += n as i64;
-    }
-
-    // fsync so the daemon's ingest reads a fully-on-disk file.
-    unsafe { libc::fsync(wfd) };
-    unsafe { libc::close(wfd) };
-
-    // Reopen read-only for the SCM_RIGHTS hand-off. Same two-step
-    // pattern as `write_to_staging` in capture/bsd.rs.
-    let rflags = libc::O_RDONLY | libc::O_CLOEXEC;
-    let rfd = unsafe { libc::openat(staging_dir_fd, name_c.as_ptr(), rflags, 0) };
-    if rfd < 0 {
-        return Err(CaptureError::Openat(std::io::Error::last_os_error()));
-    }
-
-    use std::os::fd::FromRawFd;
-    let hash = *hasher.finalize().as_bytes();
-    // SAFETY: rfd is a fresh kernel-allocated fd we now own.
-    Ok((unsafe { OwnedFd::from_raw_fd(rfd) }, hash, offset as u64))
-}
-
-/// Unique staging filename. Matches `write_to_staging`'s pattern in
-/// `capture/bsd.rs` (pid + nanos) with a `-stream` suffix so the two
-/// paths never collide in the same staging dir.
-fn staging_name() -> String {
-    format!(
-        "{}-{}-stream",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    )
-}
-
-/// Get the inode's logical size via `fstat(2)`. Used to size the
-/// pre-image buffer before reading.
-fn inode_size(fd: RawFd) -> Result<u64, CaptureError> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: fd is a valid open RawFd per caller contract; st is a
-    // valid writable struct.
-    let rc = unsafe { libc::fstat(fd, &mut st) };
-    if rc < 0 {
-        return Err(CaptureError::Fstat(std::io::Error::last_os_error()));
-    }
-    Ok(st.st_size as u64)
-}
+// `stream_copy_to_staging` + `staging_name` + `inode_size` moved
+// to `crate::capture::streaming` (AU25) and re-exported above.
 
 // Note: integration-shape tests live in `capture_tests.rs` (declared
 // from `kqueue/mod.rs`) rather than inline here so the B07.6 lib
