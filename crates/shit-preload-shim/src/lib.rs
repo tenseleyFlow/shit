@@ -100,6 +100,9 @@ core::arch::global_asm!(
     ".symver mmap, mmap@FBSD_1.0",
     // W09.10.1 — mkfifo at FBSD_1.0 (the only version libc exposes).
     ".symver mkfifo, mkfifo@FBSD_1.0",
+    // BSD link-shim parity (mirrors macOS PR #175 M03.x.LINK): close
+    // the hardlink-create capture gap. `link(2)` at FBSD_1.0.
+    ".symver link, link@FBSD_1.0",
     // FBSD_1.1 — the *at variants. modern coreutils prefer these.
     // openat ALSO lives at FBSD_1.2 (libc's newer flag-aware
     // form), but lld emits "multiple versions for X" if we tag
@@ -116,6 +119,8 @@ core::arch::global_asm!(
     ".symver renameat, renameat@FBSD_1.1",
     // W09.10.1 — mkfifoat (created in FreeBSD 8).
     ".symver mkfifoat, mkfifoat@FBSD_1.1",
+    // BSD link-shim parity — `linkat(2)` at FBSD_1.1.
+    ".symver linkat, linkat@FBSD_1.1",
 );
 
 pub mod dispatch;
@@ -310,6 +315,34 @@ mod next {
         let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"mkfifo\0") });
         unsafe {
             std::mem::transmute::<usize, unsafe extern "C" fn(*const c_char, mode_t) -> c_int>(addr)
+        }
+    }
+
+    /// BSD link-shim parity — `link(2)`. Creates a new hardlink
+    /// `new` pointing at the inode of `old`. Mirrors macOS M03.x.LINK
+    /// (PR #175): without an interposer, the daemon never sees the
+    /// new alias and undo can't unlink it. Daemon handles `arg=new`
+    /// as a TreeOp::Create whose inverse is `unlink(new)`.
+    pub fn real_link() -> unsafe extern "C" fn(*const c_char, *const c_char) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"link\0") });
+        unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(*const c_char, *const c_char) -> c_int>(
+                addr,
+            )
+        }
+    }
+
+    /// BSD link-shim parity — `linkat(2)`. Dirfd-relative variant.
+    pub fn real_linkat()
+    -> unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_int) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"linkat\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_int) -> c_int,
+            >(addr)
         }
     }
 
@@ -1299,6 +1332,65 @@ mod interposers {
             return unsafe { libc::mkfifoat(dirfd, path, mode) };
         }
         unsafe { real(dirfd, path, mode) }
+    }
+
+    /// `link(2)` interposer — creates a new hardlink `new` pointing
+    /// at the inode of `old`. BSD kqueue `NOTE_WRITE` on the parent
+    /// directory DOES fire for hardlink creation, but the helper's
+    /// dir-diff treats the new alias as an unknown inode and can't
+    /// classify it as a hardlink-create without the syscall name.
+    /// Notifying here lets the daemon journal a `TreeOp::Create`
+    /// whose inverse is `unlink(new)` (the existing aliased file
+    /// stays untouched). Mirrors macOS M03.x.LINK (PR #175).
+    ///
+    /// # Safety
+    /// `old` and `new` must be valid C strings.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn link(old: *const c_char, new: *const c_char) -> c_int {
+        // Notify with the NEW path — that's what the daemon's
+        // shim_listener TreeOp::Create handler expects (see
+        // shim_listener.rs::"link" | "linkat" arm). The old path
+        // is unchanged; we don't need to journal it.
+        policy::notify_create("link", &cstr_to_string(new));
+        let real = next::real_link();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::link(old, new) };
+        }
+        unsafe { real(old, new) }
+    }
+
+    /// `linkat(2)` interposer — dirfd-relative variant of `link(2)`.
+    /// The `flags` argument carries AT_SYMLINK_FOLLOW (FreeBSD,
+    /// macOS); we don't inspect it because the journal/undo flow
+    /// is identical regardless of symlink-following semantics on
+    /// the source: the destination is still a new directory entry
+    /// whose inverse is `unlink(new)`.
+    ///
+    /// `newpath` may be relative to `newdirfd`. We pass it through
+    /// to `notify_create`, which canonicalizes via `realpath(3)`;
+    /// `realpath` fails on a not-yet-existing path so it falls
+    /// back to the raw string. For the common `newdirfd=AT_FDCWD`
+    /// case this yields a CWD-relative path that the daemon resolves
+    /// the same way; for the rare per-dirfd case the daemon's
+    /// `inode_of` falls through to the sentinel and the executor's
+    /// `unlink` reverse handles the missing-inode case fine.
+    ///
+    /// # Safety
+    /// `oldpath` and `newpath` must be valid C strings.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn linkat(
+        olddirfd: c_int,
+        oldpath: *const c_char,
+        newdirfd: c_int,
+        newpath: *const c_char,
+        flags: c_int,
+    ) -> c_int {
+        policy::notify_create("linkat", &cstr_to_string(newpath));
+        let real = next::real_linkat();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::linkat(olddirfd, oldpath, newdirfd, newpath, flags) };
+        }
+        unsafe { real(olddirfd, oldpath, newdirfd, newpath, flags) }
     }
 
     /// `truncate(2)` interposer.
