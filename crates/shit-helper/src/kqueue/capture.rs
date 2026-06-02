@@ -40,16 +40,29 @@
 
 use std::os::fd::RawFd;
 
-// AU25 — the streaming primitives + error type moved to
-// `crate::capture::streaming` so the Linux/LSM producer can share
-// them. The legacy `CaptureError` / `stream_copy_to_staging` /
-// `PRE_IMAGE_INLINE_CAP` / `STREAM_COPY_CAP` names are kept as
-// re-exports so existing BSD call sites (capture/bsd.rs,
-// kqueue/capture_tests.rs, kqueue/mod.rs) compile unchanged.
-pub use crate::capture::streaming::{
-    PRE_IMAGE_INLINE_CAP, STREAM_COPY_CAP, StreamError as CaptureError, inode_size,
-    stream_copy_to_staging_at as stream_copy_to_staging,
-};
+/// Errors surfaced by [`read_pre_image`].
+///
+/// AU25: streaming variants live in
+/// [`crate::capture::streaming::StreamError`]; this enum stays
+/// self-contained here because the B07.6 lib facade mounts
+/// `kqueue/capture.rs` as the top-level `pub mod capture` — so
+/// this file cannot reference `crate::capture::streaming::*`
+/// (under the lib build that path resolves into this very file's
+/// children).
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("pread(2): {0}")]
+    Pread(std::io::Error),
+    #[error("fstat(2): {0}")]
+    Fstat(std::io::Error),
+    #[error("inode size {0} exceeds cap (use streaming path or refuse)")]
+    TooLargeForBuffer(u64),
+}
+
+/// Soft cap on in-memory pre-image read size. Files larger than this
+/// must use the streaming path
+/// ([`crate::capture::streaming::stream_copy_to_staging_at`]).
+pub const PRE_IMAGE_INLINE_CAP: u64 = 64 * 1024 * 1024;
 
 /// Read the pre-mutation content of the inode referenced by `fd`.
 ///
@@ -59,8 +72,8 @@ pub use crate::capture::streaming::{
 /// the fd's seek offset (other code paths may rely on the fd).
 ///
 /// Returns the full file content. For files >`PRE_IMAGE_INLINE_CAP`,
-/// returns [`CaptureError::TooLargeForBuffer`] — S24 will plumb a
-/// streaming variant for those.
+/// returns [`CaptureError::TooLargeForBuffer`] — callers route
+/// large files through the streaming path.
 pub fn read_pre_image(fd: RawFd) -> Result<Vec<u8>, CaptureError> {
     let size = inode_size(fd)?;
     if size > PRE_IMAGE_INLINE_CAP {
@@ -99,8 +112,15 @@ pub fn read_pre_image(fd: RawFd) -> Result<Vec<u8>, CaptureError> {
     Ok(out)
 }
 
-// `stream_copy_to_staging` + `staging_name` + `inode_size` moved
-// to `crate::capture::streaming` (AU25) and re-exported above.
+fn inode_size(fd: RawFd) -> Result<u64, CaptureError> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a valid open RawFd per caller contract.
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc < 0 {
+        return Err(CaptureError::Fstat(std::io::Error::last_os_error()));
+    }
+    Ok(st.st_size as u64)
+}
 
 // Note: integration-shape tests live in `capture_tests.rs` (declared
 // from `kqueue/mod.rs`) rather than inline here so the B07.6 lib
