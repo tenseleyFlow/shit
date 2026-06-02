@@ -190,6 +190,32 @@ unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
     unsafe { libc::mkdir(path, mode) }
 }
 
+/// Replacement for `mkfifo(3)` (M03.x.CREATE). Creates a FIFO
+/// special file at `path`. The shim notifies a Create event so
+/// the daemon journals TreeOp::Create; inverse is `unlink(path)`.
+/// mkfifo(3) is a libc wrapper around `mknod(2)` with S_IFIFO
+/// mode bits, but on macOS it exists as a discrete libc symbol
+/// that gets dispatched separately from mknod.
+///
+/// # Safety
+/// Same contract as `libc::mkfifo` — `path` must be a valid
+/// NUL-terminated C string.
+unsafe extern "C" fn my_mkfifo(path: *const c_char, mode: mode_t) -> c_int {
+    policy::notify_create("mkfifo", &cstr_to_string(path));
+    unsafe { libc::mkfifo(path, mode) }
+}
+
+/// Replacement for `mkfifoat(2)` (M03.x.CREATE). The *at variant
+/// — same semantics as `mkfifo` but with a `dirfd` for relative
+/// path resolution.
+///
+/// # Safety
+/// Same contract as `libc::mkfifoat`.
+unsafe extern "C" fn my_mkfifoat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
+    policy::notify_create("mkfifoat", &cstr_to_string(path));
+    unsafe { libc::mkfifoat(dirfd, path, mode) }
+}
+
 /// Replacement for `link(2)` (M03.x.LINK). Creates a hardlink:
 /// `dst` becomes a new path aliasing `src`'s inode. The src
 /// persists; only the new dst path needs undoing via unlink.
@@ -659,6 +685,23 @@ static INTERPOSE_MKDIRAT: InterposeEntry = InterposeEntry {
     target: libc::mkdirat as *const c_void,
 };
 
+// M03.x.CREATE — mkfifo family. FIFO-creating syscalls; daemon
+// already classifies "mkfifo"/"mkfifoat" → TreeOp::Create. Just
+// needed shim coverage.
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_MKFIFO: InterposeEntry = InterposeEntry {
+    replacement: my_mkfifo as *const c_void,
+    target: libc::mkfifo as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_MKFIFOAT: InterposeEntry = InterposeEntry {
+    replacement: my_mkfifoat as *const c_void,
+    target: libc::mkfifoat as *const c_void,
+};
+
 // M03.x.LINK — hardlink family. Inverse is unlink(dst) (same shape
 // as TreeOp::Create); src is unchanged so no pre-image needed.
 #[used]
@@ -1011,6 +1054,20 @@ mod tests {
     }
 
     #[test]
+    fn mkfifo_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_MKFIFO.replacement.is_null());
+        assert!(!INTERPOSE_MKFIFO.target.is_null());
+        assert_ne!(INTERPOSE_MKFIFO.replacement, INTERPOSE_MKFIFO.target);
+    }
+
+    #[test]
+    fn mkfifoat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_MKFIFOAT.replacement.is_null());
+        assert!(!INTERPOSE_MKFIFOAT.target.is_null());
+        assert_ne!(INTERPOSE_MKFIFOAT.replacement, INTERPOSE_MKFIFOAT.target);
+    }
+
+    #[test]
     fn link_interposer_pair_is_populated() {
         assert!(!INTERPOSE_LINK.replacement.is_null());
         assert!(!INTERPOSE_LINK.target.is_null());
@@ -1093,11 +1150,14 @@ mod tests {
             // M03.x.LINK: hardlink family
             &INTERPOSE_LINK,
             &INTERPOSE_LINKAT,
+            // M03.x.CREATE: mkfifo family
+            &INTERPOSE_MKFIFO,
+            &INTERPOSE_MKFIFOAT,
         ];
         assert_eq!(
             entries.len(),
-            27,
-            "M07.A.2 + M07.B.1..5 + M03.x.SETATTR + M03.x.LINK interposer count"
+            29,
+            "M07.A.2 + M07.B.1..5 + M03.x.SETATTR + M03.x.LINK + M03.x.CREATE interposer count"
         );
         for e in entries {
             assert!(!e.replacement.is_null());
