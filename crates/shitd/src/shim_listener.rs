@@ -564,13 +564,28 @@ fn ingest_pre_image(
         .put_blob_record(blob_hash, stat.stored_bytes, stat.compressed, ts)
         .map_err(|e| anyhow::anyhow!("put_blob_record: {e}"))?;
     let inode = InodeRef::new(pre.dev, pre.inode);
+    // M03.x.XATTR-MUTATE — build the FULL captured xattrs target.
+    // The shim only captures the ONE xattr being mutated (via
+    // `pre.xattr`) — the file's other xattrs (com.apple.provenance,
+    // user.*, etc.) aren't shipped on the wire. If we left them out
+    // of target.xattrs, the planner's RestoreMetadata "delete
+    // orphans" loop would remove every xattr not in target on undo.
+    //
+    // Strategy: read the file's CURRENT xattrs daemon-side, then
+    // overlay the shim's pre-value for the specific xattr the
+    // syscall is mutating. There's a small race (microseconds
+    // between shim-notify and this read); workloads that mutate
+    // multiple xattrs concurrently might lose attribution for
+    // ones not the syscall's primary target. Acceptable for v1;
+    // a future hardening could have the shim capture all xattrs.
+    let xattrs = build_xattrs_target(&pre.path, pre.xattr.as_ref());
     let meta = FileMetadata {
         mode: pre.mode,
         uid: pre.uid,
         gid: pre.gid,
         size: pre.size,
         mtime_unix_nanos: pre.mtime_unix_nanos,
-        xattrs: BTreeMap::new(),
+        xattrs,
         acl: None,
         flags: pre.flags,
     };
@@ -669,6 +684,143 @@ fn inode_of(path: &str) -> Option<InodeRef> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path).ok()?;
     Some(InodeRef::new(meta.dev(), meta.ino()))
+}
+
+/// M03.x.XATTR-MUTATE — build the target xattr map for a captured
+/// shim pre-image. Reads the file's CURRENT xattrs daemon-side as
+/// the baseline, then overlays the shim's captured pre-value for
+/// the specific xattr being mutated (or removes it from the target
+/// if `value: None` — i.e. xattr didn't exist pre-syscall).
+///
+/// This is what the planner's `restore_user_xattrs` converges to:
+///   - target has key+value → setxattr to restore the value
+///   - target lacks a key the current file has → removexattr
+///
+/// Daemon read happens shortly after shim notify; race window is
+/// microseconds. Workloads that mutate xattrs concurrently from
+/// multiple processes might lose attribution for non-primary
+/// xattrs. Acceptable for v1.
+fn build_xattrs_target(
+    path: &str,
+    xattr_pre: Option<&shit_proto::XattrPreImage>,
+) -> BTreeMap<String, Vec<u8>> {
+    let mut target = read_all_user_xattrs(path);
+    if let Some(xpre) = xattr_pre {
+        match &xpre.value {
+            Some(v) => {
+                // Pre-syscall the xattr existed with this value.
+                // Overlay so target reflects pre-state, not the
+                // (possibly post-mutation) value from the daemon's
+                // own read.
+                target.insert(xpre.name.clone(), v.clone());
+            }
+            None => {
+                // Pre-syscall the xattr did NOT exist. Drop it
+                // from target so the restore loop's delete-orphans
+                // path removes it.
+                target.remove(&xpre.name);
+            }
+        }
+    }
+    target
+}
+
+/// Read all user-namespace xattrs at `path`. macOS uses
+/// `listxattr` + `getxattr`; FreeBSD reuses the existing
+/// `crate::xattr::read_user_xattrs_at_path` helper; other
+/// platforms return empty (the M07 shim is macOS-only and the
+/// kqueue capture tier on FreeBSD doesn't go through this path).
+#[cfg(target_os = "macos")]
+fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
+    use std::ffi::CString;
+    let Ok(c_path) = CString::new(path) else {
+        return BTreeMap::new();
+    };
+    // First call sizes the buffer. XATTR_NOFOLLOW so we operate on
+    // the symlink itself if `path` is one (matches the shim's
+    // capture site which uses symlink_metadata).
+    let list_size = unsafe {
+        libc::listxattr(
+            c_path.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if list_size <= 0 {
+        return BTreeMap::new();
+    }
+    let mut name_buf = vec![0u8; list_size as usize];
+    let n = unsafe {
+        libc::listxattr(
+            c_path.as_ptr(),
+            name_buf.as_mut_ptr().cast(),
+            name_buf.len(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if n <= 0 {
+        return BTreeMap::new();
+    }
+    let mut out = BTreeMap::new();
+    // listxattr returns NUL-separated name list.
+    for raw in name_buf[..n as usize].split(|&b| b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(name) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        // Skip system xattrs the planner shouldn't try to restore.
+        // com.apple.* are kernel/Finder-managed; the user didn't
+        // set them with `xattr -w`.
+        if name.starts_with("com.apple.") {
+            continue;
+        }
+        let Ok(c_name) = CString::new(name) else {
+            continue;
+        };
+        let val_size = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        if val_size < 0 {
+            continue;
+        }
+        let mut val = vec![0u8; val_size as usize];
+        let got = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                val.as_mut_ptr().cast(),
+                val.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        if got < 0 {
+            continue;
+        }
+        val.truncate(got as usize);
+        out.insert(name.to_string(), val);
+    }
+    out
+}
+
+#[cfg(target_os = "freebsd")]
+fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
+    crate::xattr::read_user_xattrs_at_path(std::path::Path::new(path))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn read_all_user_xattrs(_path: &str) -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::new()
 }
 
 /// Resolve the shim socket path. Default is sibling to the hook socket
