@@ -190,6 +190,44 @@ unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
     unsafe { libc::mkdir(path, mode) }
 }
 
+/// Replacement for `link(2)` (M03.x.LINK). Creates a hardlink:
+/// `dst` becomes a new path aliasing `src`'s inode. The src
+/// persists; only the new dst path needs undoing via unlink.
+///
+/// We notify on dst (the new path), not src — src is unchanged
+/// by the syscall. The wire shape is the same as mkdir's: a
+/// `TreeOp::Create` whose inverse is `unlink(dst)`.
+///
+/// # Safety
+/// Same contract as `libc::link` — both paths must be valid
+/// NUL-terminated C strings.
+unsafe extern "C" fn my_link(src: *const c_char, dst: *const c_char) -> c_int {
+    let _ = src;
+    policy::notify_create("link", &cstr_to_string(dst));
+    unsafe { libc::link(src, dst) }
+}
+
+/// Replacement for `linkat(2)` (M03.x.LINK). The *at variant
+/// `linkat(srcfd, src, dstfd, dst, flags)` resolves both paths
+/// relative to their respective fds (or AT_FDCWD). We notify on
+/// the dst path only — same semantics as `my_link`.
+///
+/// AT_SYMLINK_FOLLOW vs AT_SYMLINK_NOFOLLOW affects whether src
+/// follows symlinks; doesn't change the dst-create shape.
+///
+/// # Safety
+/// Same contract as `libc::linkat`.
+unsafe extern "C" fn my_linkat(
+    srcfd: c_int,
+    src: *const c_char,
+    dstfd: c_int,
+    dst: *const c_char,
+    flags: c_int,
+) -> c_int {
+    policy::notify_create("linkat", &cstr_to_string(dst));
+    unsafe { libc::linkat(srcfd, src, dstfd, dst, flags) }
+}
+
 /// Replacement for `chmod(2)`. M07.B.1.
 ///
 /// Captures the path + pre-image so the planner can record the
@@ -621,6 +659,22 @@ static INTERPOSE_MKDIRAT: InterposeEntry = InterposeEntry {
     target: libc::mkdirat as *const c_void,
 };
 
+// M03.x.LINK — hardlink family. Inverse is unlink(dst) (same shape
+// as TreeOp::Create); src is unchanged so no pre-image needed.
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_LINK: InterposeEntry = InterposeEntry {
+    replacement: my_link as *const c_void,
+    target: libc::link as *const c_void,
+};
+
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_LINKAT: InterposeEntry = InterposeEntry {
+    replacement: my_linkat as *const c_void,
+    target: libc::linkat as *const c_void,
+};
+
 #[used]
 #[unsafe(link_section = "__DATA,__interpose")]
 static INTERPOSE_CHMOD: InterposeEntry = InterposeEntry {
@@ -957,6 +1011,20 @@ mod tests {
     }
 
     #[test]
+    fn link_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_LINK.replacement.is_null());
+        assert!(!INTERPOSE_LINK.target.is_null());
+        assert_ne!(INTERPOSE_LINK.replacement, INTERPOSE_LINK.target);
+    }
+
+    #[test]
+    fn linkat_interposer_pair_is_populated() {
+        assert!(!INTERPOSE_LINKAT.replacement.is_null());
+        assert!(!INTERPOSE_LINKAT.target.is_null());
+        assert_ne!(INTERPOSE_LINKAT.replacement, INTERPOSE_LINKAT.target);
+    }
+
+    #[test]
     fn fd_to_path_returns_none_for_bad_fd() {
         // fd -1 is never valid; F_GETPATH returns -1, our helper None.
         assert!(fd_to_path(-1).is_none());
@@ -1022,11 +1090,14 @@ mod tests {
             // M03.x.SETATTR: chflags family
             &INTERPOSE_CHFLAGS,
             &INTERPOSE_FCHFLAGS,
+            // M03.x.LINK: hardlink family
+            &INTERPOSE_LINK,
+            &INTERPOSE_LINKAT,
         ];
         assert_eq!(
             entries.len(),
-            25,
-            "M07.A.2 + M07.B.1..5 + M03.x.SETATTR interposer count"
+            27,
+            "M07.A.2 + M07.B.1..5 + M03.x.SETATTR + M03.x.LINK interposer count"
         );
         for e in entries {
             assert!(!e.replacement.is_null());
