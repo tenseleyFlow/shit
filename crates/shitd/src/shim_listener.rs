@@ -690,6 +690,25 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
+        "mkdir" | "mkdirat" => {
+            // M03.x.CREATE — mkdir for out-of-watch paths. In-watch
+            // mkdirs are already caught by the kqueue dir-diff /
+            // FSEvents path; this arm handles the out-of-watch case
+            // (e.g. `make install` creates /usr/local/foo from a
+            // watched cwd) which the shim's my_mkdir notifies but
+            // the daemon previously dropped as "syscall not
+            // classifiable". TreeOp::Create's executor reverse is
+            // `rmdir` (planner picks rmdir vs unlink based on
+            // FileKind::Directory).
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Directory,
+                mode: 0o755,
+            }))
+        }
         _ => None,
     }
 }
