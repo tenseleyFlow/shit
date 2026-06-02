@@ -21,6 +21,7 @@
 //! destination fd. No per-call allocation grows with file size.
 
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 /// Errors surfaced by the streaming pre-image path. BSD's
