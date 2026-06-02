@@ -5,8 +5,8 @@
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: macos-14
 # SMOKE_TIMEOUT_SEC: 180
-# EXCLUDED_BY:
-# EXCLUDED_REASON:
+# EXCLUDED_BY: M03.x.CREATE-mkdir-planner-coord-pending
+# EXCLUDED_REASON: Initial attempt at routing mkdir/mkdirat → TreeOp::Create{Directory} caused cargo-install-force-undo regression (applied=42 conflicts=6, cargo's incidental parent dirs rmdir-recursive'd alongside FilePreImage restores for files inside). Closing properly needs planner-side coordination — when a Create's path is a Directory AND any other inverse in the plan targets a path UNDER that directory, the rmdir should attempt empty-only (no recursive fallback). Smoke documents the gap; re-enable by clearing this EXCLUDED_BY when the planner coordination lands.
 #
 # M03.x.CREATE (mkdir out-of-watch portion) gap-validation smoke.
 #

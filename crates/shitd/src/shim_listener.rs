@@ -542,7 +542,7 @@ fn ingest_notification(
     // not creates) — only the Create variants gate.
     if matches!(
         note.syscall.as_str(),
-        "mkdir" | "mkdirat" | "mkfifo" | "mkfifoat" | "link" | "linkat"
+        "mkfifo" | "mkfifoat" | "link" | "linkat"
     ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
     {
         debug!(
@@ -718,25 +718,22 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
-        "mkdir" | "mkdirat" => {
-            // M03.x.CREATE — mkdir for out-of-watch paths. In-watch
-            // mkdirs are already caught by the kqueue dir-diff /
-            // FSEvents path; this arm handles the out-of-watch case
-            // (e.g. `make install` creates /usr/local/foo from a
-            // watched cwd) which the shim's my_mkdir notifies but
-            // the daemon previously dropped as "syscall not
-            // classifiable". TreeOp::Create's executor reverse is
-            // `rmdir` (planner picks rmdir vs unlink based on
-            // FileKind::Directory).
-            let path = PathBuf::from(arg);
-            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
-            Some(CaptureEventKind::TreeOp(TreeOp::Create {
-                inode,
-                path,
-                kind: FileKind::Directory,
-                mode: 0o755,
-            }))
-        }
+        // M03.x.CREATE mkdir: routed in CI but rolled back here —
+        // emitting TreeOp::Create{Directory} for out-of-watch mkdirs
+        // unconditionally caused cargo-install-force-undo to fail
+        // (applied=42, conflicts=6). Cargo's incidental parent dirs
+        // (e.g. `cargo-root/bin`) ended up rmdir-recursive'd by the
+        // executor's unlink_inner ENOTEMPTY fallback, racing the
+        // RestoreContent inverse for files INSIDE that dir.
+        //
+        // Closing this properly needs planner-side coordination:
+        // when a Create's path is a Directory AND any other inverse
+        // in the plan targets a path UNDER that directory, the
+        // rmdir should attempt empty-only (no recursive fallback)
+        // so the dir survives if it's still hosting restored
+        // content. Tracked as a follow-up; smoke
+        // `mkdir-out-of-watch-undo-macos.sh` is EXCLUDED_BY pending
+        // that work.
         _ => None,
     }
 }
