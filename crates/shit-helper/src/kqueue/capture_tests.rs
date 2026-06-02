@@ -18,6 +18,13 @@
 ))]
 
 use super::capture::*;
+// AU25 — stream_copy_to_staging + STREAM_COPY_CAP moved to the
+// shared capture::streaming module so Linux can consume them.
+// kqueue/mod.rs re-exports under the legacy names. The streaming
+// fn returns StreamError (kqueue/capture.rs's CaptureError covers
+// only the BSD inline read_pre_image variants).
+use super::{STREAM_COPY_CAP, stream_copy_to_staging};
+use crate::capture::streaming::StreamError;
 use crate::kqueue::{init, register_subtree};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
@@ -251,7 +258,7 @@ fn stream_rejects_above_cap_without_writing() {
     let err = stream_copy_to_staging(src_f.as_raw_fd(), staging_dir_fd.as_raw_fd(), 512)
         .expect_err("cap=512 against 1024-byte file should refuse");
     match err {
-        CaptureError::TooLargeForBuffer(n) => assert_eq!(n, 1024),
+        StreamError::TooLargeForBuffer(n) => assert_eq!(n, 1024),
         other => panic!("expected TooLargeForBuffer, got {other:?}"),
     }
 

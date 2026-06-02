@@ -42,6 +42,9 @@ pub enum StreamError {
     ))]
     #[error("openat(2): {0}")]
     Openat(std::io::Error),
+    /// Surfaced by [`stream_copy_to_staging_path`] (Linux's
+    /// path-based variant). BSD uses [`StreamError::Openat`].
+    #[cfg(target_os = "linux")]
     #[error("open(2): {0}")]
     Open(std::io::Error),
     #[error("fstat(2): {0}")]
@@ -50,19 +53,10 @@ pub enum StreamError {
     TooLargeForBuffer(u64),
 }
 
-/// Soft cap on in-memory pre-image reads. Files larger than this
-/// must take the streaming path. 64 MiB matches the project's
-/// general "small file" boundary; the inline `Vec<u8>` path stays
-/// for tiny files where the per-call allocation is cheaper than
-/// the streaming setup. BSD-only — Linux's small-file inline path
-/// uses [`super::linux::MAX_PRE_IMAGE_BYTES`] directly.
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
-pub const PRE_IMAGE_INLINE_CAP: u64 = 64 * 1024 * 1024;
+// PRE_IMAGE_INLINE_CAP lives in `kqueue/capture.rs` (BSD's
+// small-file inline `read_pre_image` boundary) — keeping it there
+// keeps the B07.6 lib facade self-contained. Linux's inline-vs-
+// stream boundary is [`super::linux::MAX_PRE_IMAGE_BYTES`].
 
 /// Hard cap on the streaming path's source size. 1 GiB on both
 /// BSD (W07.A.1) and Linux (AU25.3). Files above this cap skip
@@ -236,6 +230,7 @@ pub fn stream_copy_to_staging_at(
 /// the producer is not Capsicum-sandboxed. A symlink-race here
 /// would require an attacker who can write to that owner-only
 /// staging dir, which already implies code-exec as the helper user.
+#[cfg(target_os = "linux")]
 pub fn stream_copy_to_staging_path(
     src_fd: RawFd,
     staging_dir: &Path,
@@ -293,7 +288,10 @@ pub fn stream_copy_to_staging_path(
     Ok((unsafe { OwnedFd::from_raw_fd(rfd) }, hash, copied))
 }
 
-#[cfg(test)]
+// Tests exercise the Linux Path-based variant; gated to keep the
+// BSD compile path warning-clean (Openat / stream_copy_to_staging_at
+// is BSD-only and covered by `kqueue/capture_tests.rs`).
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
