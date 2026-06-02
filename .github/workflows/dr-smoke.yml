@@ -1089,6 +1089,38 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  docker-rmi-multi-target-undo:
+    # AU24 / DR-CR-52 — `docker rmi <a> <b> <c>` produces N events
+    # under the same command window; `shit undo` restores all N.
+    # Pre-AU24 prepare_rmi took only the first positional and silently
+    # dropped the rest. Validate-the-gap counterpart to the single-image
+    # docker-rmi-undo smoke; pins the post-AU24 batch contract.
+    name: docker-rmi-multi-target-undo smoke (AU24)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: docker preflight
+        run: |
+          docker version
+          docker info --format '{{.ServerVersion}}'
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/docker-rmi-multi-target-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-rmi-multi-target-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   docker-volume-rm-undo:
     # AR03.3 -- validates the container-runtime VolumeRm capture +
     # restore path. `docker volume rm <vol>` ships a gzipped tarball

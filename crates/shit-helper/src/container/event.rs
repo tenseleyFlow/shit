@@ -148,42 +148,60 @@ pub async fn run_event(
     // AU23 — phase-aware dispatch. Pre handles destructive verbs;
     // post handles Pull's digest reconciliation. Each phase short-
     // circuits cleanly for verbs it doesn't own.
-    let Some(prepared) = (match phase {
+    //
+    // AU24 / DR-CR-52 — `prepare` returns Vec<PreparedEvent> so a
+    // single CLI invocation with N positionals (e.g.
+    // `docker rmi alpine ubuntu busybox`) journals N events under
+    // the same command_seq. Pre-AU24 only the first positional
+    // shipped; the rest were silently dropped — destructive verbs
+    // would partially restore on `shit undo`.
+    let prepared = match phase {
         "pre" => prepare(tool, runtime, verb_payload),
         "post" => prepare_post(tool, runtime, verb_payload),
         _ => unreachable!("phase pre-validated above"),
-    }) else {
-        return Ok(());
     };
+    if prepared.is_empty() {
+        return Ok(());
+    }
 
     // SAFETY: getpid/getuid always succeed.
     let pid = unsafe { libc::getpid() } as u32;
     let uid = unsafe { libc::getuid() };
-
-    let req = ContainerEventReq {
-        runtime,
-        verb: prepared.verb,
-        captured_config: prepared.captured_config,
-        stash_image: prepared.stash_image,
-        stash_tarball: prepared.stash_tarball,
-        stash_tarball_bytes: prepared.stash_tarball_bytes,
-        extras: prepared.extras,
-        pid,
-        uid,
-    };
 
     let ctl = match ctl_sock {
         Some(p) => p.to_path_buf(),
         None => default_ctl_socket_path(),
     };
 
-    if let Err(e) = send_event(&ctl, &req) {
-        tracing::warn!(
-            tool,
-            ctl = %ctl.display(),
-            err = %e,
-            "container-event: ship to daemon failed; continuing"
-        );
+    // Ship each prepared event sequentially. Same command_seq
+    // (resolved daemon-side via pid → active command window), so
+    // the daemon journals them as N entries under one command and
+    // `shit undo` plans them as a single cohort.
+    for one in prepared {
+        let req = ContainerEventReq {
+            runtime,
+            verb: one.verb,
+            captured_config: one.captured_config,
+            stash_image: one.stash_image,
+            stash_tarball: one.stash_tarball,
+            stash_tarball_bytes: one.stash_tarball_bytes,
+            extras: one.extras,
+            pid,
+            uid,
+        };
+        if let Err(e) = send_event(&ctl, &req) {
+            tracing::warn!(
+                tool,
+                ctl = %ctl.display(),
+                err = %e,
+                "container-event: ship to daemon failed; continuing"
+            );
+            // Best-effort per-target; a daemon disconnect on event 1
+            // shouldn't silently drop events 2..N either, but
+            // shipping them after a known failure is also pointless.
+            // Bail.
+            break;
+        }
     }
     Ok(())
 }
@@ -209,11 +227,14 @@ struct PreparedEvent {
     extras: BTreeMap<String, String>,
 }
 
-fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Option<PreparedEvent> {
+/// AU24 — returns Vec<PreparedEvent> so a multi-target invocation
+/// (`docker rmi a b c`) ships N events. Pre-AU24 returned
+/// Option<PreparedEvent> and silently dropped non-first positionals.
+fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Vec<PreparedEvent> {
     // Compose verbs are a separate enum shape; route them out first
     // so the docker-verb normalisation below stays uniform.
     if let VerbPayload::Compose(c) = v {
-        return prepare_compose(tool, c);
+        return prepare_compose(tool, c).into_iter().collect();
     }
 
     // Both docker and podman share the same verb enum after argv
@@ -233,19 +254,19 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Option<
 
     match docker_verb {
         DockerVerb::Rmi { images } => prepare_rmi(tool, runtime, images),
-        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force),
+        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force).into_iter().collect(),
         DockerVerb::VolumeRm { names } => prepare_volume_rm(tool, names),
         DockerVerb::NetworkRm { names } => prepare_network_rm(tool, names),
         // stop/kill are restart-hint events; no destructive content
         // loss, no stash needed. PR-B does not ship them yet.
-        DockerVerb::StopOrKill { .. } => None,
+        DockerVerb::StopOrKill { .. } => Vec::new(),
         // AU23 — pull doesn't ship at the pre-phase: pre-pull we
         // don't yet know the resolved digest, and the floating-tag
         // alone is exactly the moving-target the audit finding
         // wanted to fix. The post-phase handler (see
         // `prepare_pull_post`) runs `<tool> inspect` after the real
         // pull and emits the event with the resolved id.
-        DockerVerb::Pull { .. } => None,
+        DockerVerb::Pull { .. } => Vec::new(),
     }
 }
 
@@ -257,11 +278,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Option<
 /// Compose verbs route through `prepare_compose` for the pre-only
 /// path; they don't need a post hook (the captured state is the
 /// rendered config + per-service Rm captures, both available pre).
-fn prepare_post(
-    tool: &str,
-    _runtime: ContainerRuntimeWire,
-    v: VerbPayload,
-) -> Option<PreparedEvent> {
+fn prepare_post(tool: &str, _runtime: ContainerRuntimeWire, v: VerbPayload) -> Vec<PreparedEvent> {
     let docker_verb: DockerVerb = match v {
         VerbPayload::Docker(d) => d,
         VerbPayload::Podman(p) => match p {
@@ -272,14 +289,14 @@ fn prepare_post(
             PodmanVerb::StopOrKill { ids, was_kill } => DockerVerb::StopOrKill { ids, was_kill },
             PodmanVerb::Pull { images } => DockerVerb::Pull { images },
         },
-        VerbPayload::Compose(_) => return None,
+        VerbPayload::Compose(_) => return Vec::new(),
     };
 
     match docker_verb {
         DockerVerb::Pull { images } => prepare_pull_post(tool, images),
         // Every other verb's data ships at pre-phase; post is a
         // no-op for them.
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -287,36 +304,55 @@ fn prepare_post(
 /// resolved digest captured via `<tool> inspect`. Ship even when
 /// inspect fails so the journal records the pull attempt (the
 /// renderer just shows "(digest unresolved)" in that case).
-fn prepare_pull_post(tool: &str, images: Vec<String>) -> Option<PreparedEvent> {
-    // AR03 PR-B convention: one event per invocation; first image
-    // only. Multi-image pull batching parallels AR03 PR-B's rmi
-    // batching follow-up (which AU24 covers).
-    let image = images.into_iter().next()?;
+///
+/// AU24 / DR-CR-52 — N images produce N events under the same
+/// command_seq. Mirrors the rmi multi-target shape.
+fn prepare_pull_post(tool: &str, images: Vec<String>) -> Vec<PreparedEvent> {
+    images
+        .into_iter()
+        .map(|image| prepare_pull_post_one(tool, image))
+        .collect()
+}
+
+fn prepare_pull_post_one(tool: &str, image: String) -> PreparedEvent {
     let resolved_id = inspect_image_digest(tool, &image);
     let mut extras = BTreeMap::new();
     extras.insert("image".into(), image);
     if let Some(id) = resolved_id {
         extras.insert("resolved_id".into(), id);
     }
-    Some(PreparedEvent {
+    PreparedEvent {
         verb: ContainerVerbWire::Pull,
         captured_config: Vec::new(),
         stash_tarball: None,
         stash_tarball_bytes: None,
         stash_image: None,
         extras,
-    })
+    }
 }
 
+/// AU24 / DR-CR-52 — `docker rmi <a> <b> <c>` produces three
+/// `PreparedEvent`s, one per image. Each is independently stashed
+/// (via `docker save <image>`) and shipped under the shared
+/// command_seq the daemon resolves from the helper's pid. Pre-AU24
+/// only the first positional was processed; the rest were silently
+/// dropped — `shit undo` could only restore one of N.
 fn prepare_rmi(
     tool: &str,
     _runtime: ContainerRuntimeWire,
     images: Vec<String>,
-) -> Option<PreparedEvent> {
-    // AR03 PR-B: ship one event per invocation, image[0] only. Batch
-    // multi-image rmi is a DR follow-up.
-    let image = images.into_iter().next()?;
+) -> Vec<PreparedEvent> {
+    images
+        .into_iter()
+        .map(|image| prepare_rmi_one(tool, image))
+        .collect()
+}
 
+/// AU24 helper — per-image rmi capture. Always returns one
+/// `PreparedEvent` (degraded stash on `docker save` failure /
+/// over-cap tarball still ships the event so `shit show` records
+/// the rm attempt; undo surfaces as Skipped informational).
+fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
     // Capture optional digest for the inverse-restore planner.
     let digest = inspect_image_digest(tool, &image);
 
@@ -334,14 +370,14 @@ fn prepare_rmi(
             if let Some(d) = digest {
                 extras.insert("digest".into(), d);
             }
-            return Some(PreparedEvent {
+            return PreparedEvent {
                 verb: ContainerVerbWire::Rmi,
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
                 stash_image: None,
                 extras,
-            });
+            };
         }
     };
 
@@ -361,14 +397,14 @@ fn prepare_rmi(
         if let Some(d) = digest {
             extras.insert("digest".into(), d);
         }
-        return Some(PreparedEvent {
+        return PreparedEvent {
             verb: ContainerVerbWire::Rmi,
             captured_config: Vec::new(),
             stash_tarball: None,
             stash_tarball_bytes: None,
             stash_image: None,
             extras,
-        });
+        };
     }
 
     let hash = *blake3::hash(&bytes).as_bytes();
@@ -379,14 +415,14 @@ fn prepare_rmi(
         extras.insert("digest".into(), d);
     }
 
-    Some(PreparedEvent {
+    PreparedEvent {
         verb: ContainerVerbWire::Rmi,
         captured_config: Vec::new(),
         stash_tarball: Some(hash),
         stash_tarball_bytes: Some(bytes),
         stash_image: None,
         extras,
-    })
+    }
 }
 
 /// Run `{tool} save <image>` and return the tarball bytes.
@@ -480,23 +516,30 @@ fn docker_network_inspect(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
 /// frame. Daemon-side [`ContainerExecutor::apply_network_rm`] parses
 /// the JSON and feeds it through [`synthesize_network_create`] to
 /// rebuild the `docker network create` argv.
-fn prepare_network_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
-    // PR-B (AR03.4): one event per invocation; multi-name `docker
-    // network rm n1 n2` is a follow-up.
-    let name = names.into_iter().next()?;
+///
+/// AU24 / DR-CR-52 — multi-name `docker network rm n1 n2 n3`
+/// produces N events under the shared command_seq, same shape as
+/// rmi and pull batching.
+fn prepare_network_rm(tool: &str, names: Vec<String>) -> Vec<PreparedEvent> {
+    names
+        .into_iter()
+        .map(|name| prepare_network_rm_one(tool, name))
+        .collect()
+}
 
+fn prepare_network_rm_one(tool: &str, name: String) -> PreparedEvent {
     let mut extras = BTreeMap::new();
     extras.insert("name".into(), name.clone());
 
     match docker_network_inspect(tool, &name) {
-        Ok(json_bytes) => Some(PreparedEvent {
+        Ok(json_bytes) => PreparedEvent {
             verb: ContainerVerbWire::NetworkRm,
             captured_config: json_bytes,
             stash_tarball: None,
             stash_tarball_bytes: None,
             stash_image: None,
             extras,
-        }),
+        },
         Err(e) => {
             tracing::warn!(
                 tool,
@@ -504,14 +547,14 @@ fn prepare_network_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
                 err = %e,
                 "container-event: network inspect failed; event will ship without captured_config"
             );
-            Some(PreparedEvent {
+            PreparedEvent {
                 verb: ContainerVerbWire::NetworkRm,
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
                 stash_image: None,
                 extras,
-            })
+            }
         }
     }
 }
@@ -791,11 +834,17 @@ fn default_project_name(compose_file_abs: &str) -> String {
         .collect()
 }
 
-fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
-    // PR-B (AR03.3): one event per invocation; multi-name `docker
-    // volume rm v1 v2 v3` is a follow-up.
-    let name = names.into_iter().next()?;
+/// AU24 / DR-CR-52 — `docker volume rm v1 v2 v3` produces N
+/// independently-stashed events under the shared command_seq.
+/// Each volume gets its own `docker volume create` + tar capture.
+fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Vec<PreparedEvent> {
+    names
+        .into_iter()
+        .map(|name| prepare_volume_rm_one(tool, name))
+        .collect()
+}
 
+fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
     let driver = inspect_volume_driver(tool, &name);
 
     let bytes = match docker_volume_tar(tool, &name) {
@@ -812,14 +861,14 @@ fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
             if let Some(d) = driver {
                 extras.insert("driver".into(), d);
             }
-            return Some(PreparedEvent {
+            return PreparedEvent {
                 verb: ContainerVerbWire::VolumeRm,
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
                 stash_image: None,
                 extras,
-            });
+            };
         }
     };
 
@@ -836,14 +885,14 @@ fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
         if let Some(d) = driver {
             extras.insert("driver".into(), d);
         }
-        return Some(PreparedEvent {
+        return PreparedEvent {
             verb: ContainerVerbWire::VolumeRm,
             captured_config: Vec::new(),
             stash_tarball: None,
             stash_tarball_bytes: None,
             stash_image: None,
             extras,
-        });
+        };
     }
 
     let hash = *blake3::hash(&bytes).as_bytes();
@@ -854,14 +903,14 @@ fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Option<PreparedEvent> {
         extras.insert("driver".into(), d);
     }
 
-    Some(PreparedEvent {
+    PreparedEvent {
         verb: ContainerVerbWire::VolumeRm,
         captured_config: Vec::new(),
         stash_tarball: Some(hash),
         stash_tarball_bytes: Some(bytes),
         stash_image: None,
         extras,
-    })
+    }
 }
 
 /// Best-effort `{tool} inspect --format='{{.Id}}' <image>` to record
@@ -1041,7 +1090,9 @@ mod tests {
         // the event still ships with the volume name in extras so the
         // daemon can journal an informational entry.
         let tool = "shit-test-no-such-docker-binary";
-        let prepared = prepare_volume_rm(tool, vec!["pgdata".into()]).unwrap();
+        let prepared = prepare_volume_rm(tool, vec!["pgdata".into()]);
+        assert_eq!(prepared.len(), 1);
+        let prepared = &prepared[0];
         assert!(matches!(prepared.verb, ContainerVerbWire::VolumeRm));
         assert_eq!(
             prepared.extras.get("name").map(String::as_str),
@@ -1052,12 +1103,27 @@ mod tests {
     }
 
     #[test]
-    fn prepare_stop_or_kill_returns_none() {
+    fn prepare_volume_rm_multi_name_produces_one_event_per_volume() {
+        // AU24 / DR-CR-52: `docker volume rm v1 v2 v3` produces three
+        // independent events, one per name. Pre-AU24 only v1 would have
+        // been processed and v2/v3 silently dropped.
+        let tool = "shit-test-no-such-docker-binary";
+        let prepared = prepare_volume_rm(tool, vec!["v1".into(), "v2".into(), "v3".into()]);
+        assert_eq!(prepared.len(), 3);
+        let names: Vec<&str> = prepared
+            .iter()
+            .map(|p| p.extras.get("name").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["v1", "v2", "v3"]);
+    }
+
+    #[test]
+    fn prepare_stop_or_kill_returns_empty() {
         let v = VerbPayload::Docker(DockerVerb::StopOrKill {
             ids: vec!["web".into()],
             was_kill: false,
         });
-        assert!(prepare("docker", ContainerRuntimeWire::Docker, v).is_none());
+        assert!(prepare("docker", ContainerRuntimeWire::Docker, v).is_empty());
     }
 
     #[test]
@@ -1066,7 +1132,9 @@ mod tests {
         // name in extras and empty captured_config (informational
         // journal entry; undo would refuse cleanly).
         let tool = "shit-test-no-such-docker-binary";
-        let prepared = prepare_network_rm(tool, vec!["frontend".into()]).unwrap();
+        let prepared = prepare_network_rm(tool, vec!["frontend".into()]);
+        assert_eq!(prepared.len(), 1);
+        let prepared = &prepared[0];
         assert!(matches!(prepared.verb, ContainerVerbWire::NetworkRm));
         assert_eq!(
             prepared.extras.get("name").map(String::as_str),
@@ -1077,12 +1145,43 @@ mod tests {
     }
 
     #[test]
+    fn prepare_network_rm_multi_name_produces_one_event_per_network() {
+        // AU24 / DR-CR-52: parity with multi-name volume rm and rmi.
+        let tool = "shit-test-no-such-docker-binary";
+        let prepared = prepare_network_rm(tool, vec!["n1".into(), "n2".into()]);
+        assert_eq!(prepared.len(), 2);
+        let names: Vec<&str> = prepared
+            .iter()
+            .map(|p| p.extras.get("name").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["n1", "n2"]);
+    }
+
+    #[test]
+    fn prepare_pull_post_multi_image_produces_one_event_per_image() {
+        // AU24 / DR-CR-52: `docker pull a b c` produces three events.
+        // inspect fails (no docker on PATH) so resolved_id is absent —
+        // the events still ship with the image name so the journal
+        // records the pull attempt.
+        let tool = "shit-test-no-such-docker-binary";
+        let prepared = prepare_pull_post(tool, vec!["alpine:3.20".into(), "busybox:1.36".into()]);
+        assert_eq!(prepared.len(), 2);
+        for p in &prepared {
+            assert!(matches!(p.verb, ContainerVerbWire::Pull));
+            assert!(p.extras.contains_key("image"));
+            assert!(!p.extras.contains_key("resolved_id"));
+        }
+    }
+
+    #[test]
     fn prepare_podman_rm_maps_to_docker_shape() {
         let v = VerbPayload::Podman(PodmanVerb::Rm {
             ids: vec!["c1".into()],
             force: false,
         });
-        let p = prepare("podman", ContainerRuntimeWire::Podman, v).unwrap();
+        let prepared = prepare("podman", ContainerRuntimeWire::Podman, v);
+        assert_eq!(prepared.len(), 1);
+        let p = &prepared[0];
         assert!(matches!(p.verb, ContainerVerbWire::Rm));
         assert_eq!(p.extras.get("id").map(String::as_str), Some("c1"));
         assert_eq!(
