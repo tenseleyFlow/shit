@@ -103,6 +103,11 @@ core::arch::global_asm!(
     // BSD link-shim parity (mirrors macOS PR #175 M03.x.LINK): close
     // the hardlink-create capture gap. `link(2)` at FBSD_1.0.
     ".symver link, link@FBSD_1.0",
+    // B10 — xattr-mutation shim parity (mirrors macOS PR #174
+    // M03.x.XATTR-MUTATE). FreeBSD's extattr_* family lives at
+    // FBSD_1.0 (libc base since FreeBSD 5).
+    ".symver extattr_set_file, extattr_set_file@FBSD_1.0",
+    ".symver extattr_delete_file, extattr_delete_file@FBSD_1.0",
     // FBSD_1.1 — the *at variants. modern coreutils prefer these.
     // openat ALSO lives at FBSD_1.2 (libc's newer flag-aware
     // form), but lld emits "multiple versions for X" if we tag
@@ -342,6 +347,68 @@ mod next {
             std::mem::transmute::<
                 usize,
                 unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_int) -> c_int,
+            >(addr)
+        }
+    }
+
+    /// B10 — FreeBSD `extattr_set_file(2)`. Sets an extended
+    /// attribute on the file at `path`. Namespace passes as
+    /// `attrnamespace` (1=USER, 2=SYSTEM). Returns bytes written
+    /// on success, -1 on error.
+    #[cfg(target_os = "freebsd")]
+    pub fn real_extattr_set_file()
+    -> unsafe extern "C" fn(*const c_char, c_int, *const c_char, *const c_void, size_t) -> ssize_t
+    {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"extattr_set_file\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(
+                    *const c_char,
+                    c_int,
+                    *const c_char,
+                    *const c_void,
+                    size_t,
+                ) -> ssize_t,
+            >(addr)
+        }
+    }
+
+    /// B10 — FreeBSD `extattr_delete_file(2)`. Returns 0 / -1.
+    #[cfg(target_os = "freebsd")]
+    pub fn real_extattr_delete_file()
+    -> unsafe extern "C" fn(*const c_char, c_int, *const c_char) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"extattr_delete_file\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(*const c_char, c_int, *const c_char) -> c_int,
+            >(addr)
+        }
+    }
+
+    /// B10 — FreeBSD `extattr_get_file(2)`. Used pre-syscall to
+    /// snapshot the current value before the interposed call
+    /// mutates it. Returns byte count read (or required when
+    /// `data` is NULL) on success, -1 on error.
+    #[cfg(target_os = "freebsd")]
+    pub fn real_extattr_get_file()
+    -> unsafe extern "C" fn(*const c_char, c_int, *const c_char, *mut c_void, size_t) -> ssize_t
+    {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"extattr_get_file\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(
+                    *const c_char,
+                    c_int,
+                    *const c_char,
+                    *mut c_void,
+                    size_t,
+                ) -> ssize_t,
             >(addr)
         }
     }
@@ -1391,6 +1458,126 @@ mod interposers {
             return unsafe { libc::linkat(olddirfd, oldpath, newdirfd, newpath, flags) };
         }
         unsafe { real(olddirfd, oldpath, newdirfd, newpath, flags) }
+    }
+
+    // B10 — FreeBSD `extattr_*` xattr-mutation interposers. Mirrors
+    // macOS PR #174 (M03.x.XATTR-MUTATE). FreeBSD's xattr API
+    // diverges from Linux/macOS: namespace is a separate `int`
+    // argument (1=USER, 2=SYSTEM), name has no platform-style
+    // prefix. We normalize on the wire by pre-encoding the
+    // namespace into the name ("user.foo" / "system.foo") so the
+    // daemon's existing setxattr/removexattr handlers (PR #174)
+    // route them without a per-platform branch.
+
+    /// Pre-encode FreeBSD's separate namespace argument into a
+    /// macOS-style namespace.name string.
+    #[cfg(target_os = "freebsd")]
+    fn extattr_ns_name(ns: c_int, name: *const c_char) -> String {
+        let prefix = match ns {
+            1 => "user.",
+            2 => "system.",
+            _ => "",
+        };
+        format!("{}{}", prefix, cstr_to_string(name))
+    }
+
+    /// Read the pre-mutation xattr value via `extattr_get_file(2)`.
+    /// Returns `None` when the xattr doesn't exist (ENOATTR) or
+    /// the read fails — the daemon overlay treats `None` as
+    /// "absent pre-syscall", so set→delete and delete→noop undo
+    /// paths come out right.
+    #[cfg(target_os = "freebsd")]
+    unsafe fn read_extattr_value(
+        path: *const c_char,
+        ns: c_int,
+        name: *const c_char,
+    ) -> Option<Vec<u8>> {
+        if path.is_null() || name.is_null() {
+            return None;
+        }
+        let real_get = next::real_extattr_get_file();
+        if next::is_zero(next::as_usize(real_get)) {
+            return None;
+        }
+        let sz = unsafe { real_get(path, ns, name, std::ptr::null_mut(), 0) };
+        if sz < 0 {
+            return None;
+        }
+        if sz == 0 {
+            return Some(Vec::new());
+        }
+        let mut buf = vec![0u8; sz as usize];
+        let got = unsafe {
+            real_get(
+                path,
+                ns,
+                name,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as size_t,
+            )
+        };
+        if got < 0 {
+            return None;
+        }
+        buf.truncate(got as usize);
+        Some(buf)
+    }
+
+    /// `extattr_set_file(2)` interposer. Captures the pre-mutation
+    /// value before the syscall hits the kernel; ships it via
+    /// [`shit_proto::XattrPreImage`] so the planner can drive an
+    /// undo that either restores the old value (when present) or
+    /// removes the xattr (when absent pre-syscall).
+    ///
+    /// # Safety
+    /// `path` and `name` must be valid C strings per
+    /// `extattr_set_file(2)`'s contract.
+    #[cfg(target_os = "freebsd")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn extattr_set_file(
+        path: *const c_char,
+        attrnamespace: c_int,
+        attrname: *const c_char,
+        data: *const c_void,
+        nbytes: size_t,
+    ) -> ssize_t {
+        let pre_value = unsafe { read_extattr_value(path, attrnamespace, attrname) };
+        let xattr_pre = shit_proto::XattrPreImage {
+            name: extattr_ns_name(attrnamespace, attrname),
+            value: pre_value,
+        };
+        policy::notify_xattr_mutation("setxattr", &cstr_to_string(path), xattr_pre);
+        let real = next::real_extattr_set_file();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::extattr_set_file(path, attrnamespace, attrname, data, nbytes) };
+        }
+        unsafe { real(path, attrnamespace, attrname, data, nbytes) }
+    }
+
+    /// `extattr_delete_file(2)` interposer. Captures the
+    /// pre-mutation value (the xattr being deleted) so undo can
+    /// restore it via setxattr.
+    ///
+    /// # Safety
+    /// `path` and `name` must be valid C strings.
+    #[cfg(target_os = "freebsd")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn extattr_delete_file(
+        path: *const c_char,
+        attrnamespace: c_int,
+        attrname: *const c_char,
+    ) -> c_int {
+        let pre_value = unsafe { read_extattr_value(path, attrnamespace, attrname) };
+        let xattr_pre = shit_proto::XattrPreImage {
+            name: extattr_ns_name(attrnamespace, attrname),
+            value: pre_value,
+        };
+        policy::notify_xattr_mutation("removexattr", &cstr_to_string(path), xattr_pre);
+        let real = next::real_extattr_delete_file();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::extattr_delete_file(path, attrnamespace, attrname) };
+        }
+        unsafe { real(path, attrnamespace, attrname) }
     }
 
     /// `truncate(2)` interposer.
