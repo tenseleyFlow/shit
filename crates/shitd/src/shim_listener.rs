@@ -538,15 +538,17 @@ fn ingest_notification(
     // channel for mkfifo even in-watch. Gating it here would cause
     // the existing mkfifo-undo-fbsd smoke to lose its only signal.
     //
-    // link/linkat ARE gated — kqueue NOTE_WRITE on the dst's parent
-    // fires for hardlink creation (it appears as a fresh dirent),
-    // so in-watch link gets dir-diff coverage; the shim's notify
-    // would duplicate.
+    // link/linkat + mkdir/mkdirat ARE gated — kqueue NOTE_WRITE on
+    // the dst's parent dir fires for hardlink/directory creation
+    // (both appear as a fresh dirent), so in-watch versions get
+    // dir-diff coverage; the shim's notify would duplicate.
     //
     // Unlink/Rename pass through (they describe in-place mutations,
     // not creates) — only the Create variants gate.
-    if matches!(note.syscall.as_str(), "link" | "linkat")
-        && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    if matches!(
+        note.syscall.as_str(),
+        "link" | "linkat" | "mkdir" | "mkdirat"
+    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
     {
         debug!(
             pid = note.pid,
@@ -721,22 +723,28 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
-        // M03.x.CREATE mkdir: routed in CI but rolled back here —
-        // emitting TreeOp::Create{Directory} for out-of-watch mkdirs
-        // unconditionally caused cargo-install-force-undo to fail
-        // (applied=42, conflicts=6). Cargo's incidental parent dirs
-        // (e.g. `cargo-root/bin`) ended up rmdir-recursive'd by the
-        // executor's unlink_inner ENOTEMPTY fallback, racing the
-        // RestoreContent inverse for files INSIDE that dir.
-        //
-        // Closing this properly needs planner-side coordination:
-        // when a Create's path is a Directory AND any other inverse
-        // in the plan targets a path UNDER that directory, the
-        // rmdir should attempt empty-only (no recursive fallback)
-        // so the dir survives if it's still hosting restored
-        // content. Tracked as a follow-up; smoke
-        // `mkdir-out-of-watch-undo-macos.sh` is EXCLUDED_BY pending
-        // that work.
+        "mkdir" | "mkdirat" => {
+            // M03.x.CREATE mkdir — restored after planner-coord fix.
+            // Initial attempt caused cargo-install-force-undo to fail
+            // because cargo creates incidental parent dirs out-of-watch
+            // (e.g. `cargo-root/bin`); emitting TreeOp::Create cascaded
+            // into the executor's rmdir-on-ENOTEMPTY fallback that
+            // clobbered RestoreContent for files inside.
+            //
+            // Closed by planner-side analysis: classify_replace_paths
+            // now populates `dirs_with_restored_content_inside` and
+            // emit_for_tree_op for TreeOp::Create skips the Unlink
+            // inverse when the dir contains a FilePreImage target.
+            // The dir + restored content stay in place after undo.
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Directory,
+                mode: 0o755,
+            }))
+        }
         _ => None,
     }
 }
