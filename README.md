@@ -40,6 +40,8 @@ Honesty principle: any command class we cannot mechanically reverse goes in the 
 
 Each entry below has a green CI smoke. The capture mechanism column is named at the kernel surface that fires, not the user-facing tool. "LSM" means the helper's eBPF program is attached to the named hook (`bpf_lsm_<hook>`); "shim" means the LD_PRELOAD shim in `crates/shit-preload-shim/`; "wrapper" means a packaging wrapper script in `packaging/` that brackets the real binary with `shit-helper <tool>-event`.
 
+A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tier-agnostic** — they branch on the runtime platform inside the script and run unchanged on Linux, FreeBSD, and macOS. The smoke-driver auto-buckets them into every available CI runner.
+
 ### Linux
 
 **Filesystem mutations** (eBPF-LSM tier — requires `lsm=bpf` in `/sys/kernel/security/lsm` + `cap_bpf,cap_perfmon,cap_sys_admin` on the helper):
@@ -211,7 +213,7 @@ These should work in practice once the underlying mechanism is wired (no archite
 
 | Capability | Linux (lsm=bpf) | Linux (no LSM) | FreeBSD | macOS (entitled ES) | macOS (FSEvents) |
 |---|---|---|---|---|---|
-| filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | ✅ EndpointSecurity AUTH events | ⚠️ post-hoc only, no pre-image |
+| filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release†) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | ✅ EndpointSecurity AUTH events | ⚠️ post-hoc only, no pre-image |
 | pre-image via CoW | ✅ reflink/btrfs/XFS/zfs | ✅ same | ✅ zfs clone / hardlink | ✅ APFS clonefile | ✅ APFS clonefile |
 | LD_PRELOAD shim | ✅ install-pattern auto-inject | ✅ same | ✅ | ✅ DYLD interposer (M07.A install + M07.B.5 chmod smoke); SIP binaries excluded by Apple | ✅ same |
 | package undo | ✅ apt, dnf | ✅ same | ✅ pkg | ✅ brew | ✅ brew |
@@ -222,6 +224,8 @@ These should work in practice once the underlying mechanism is wired (no archite
 | shell hook | ✅ bash, zsh, fish | ✅ same | ✅ bash | ⚠️ shell hooks untested | ⚠️ shell hooks untested |
 
 ✅ has a green CI smoke today; ⚠️ structurally plausible but unpinned; ❌ not yet built.
+
+† `file_release` is the in-place-write capture hook; on Linux ≥ 7.0 the LSM chain entry takes an extra `mnt_idmap` arg and the helper picks the right v1/v2 entry-point at load time via a BTF probe. Older kernels (< 7.0) use the legacy single-arg signature. A verifier-rejected attach on either fork degrades the helper to the fanotify-perm fallback rather than crashing.
 
 ## Coverage matrix in JSON
 
