@@ -172,6 +172,19 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+    /// M03.x.CREATE — directories created by this command that have
+    /// a FilePreImage event for some path INSIDE them. Restoring the
+    /// pre-image content puts bytes back inside the dir; if the dir's
+    /// own Unlink inverse then ran (with the executor's recursive
+    /// fallback on ENOTEMPTY), it would clobber the restored content.
+    /// Suppress the Unlink — the directory stays around with the
+    /// restored file inside it. Set at classify_replace_paths time
+    /// by ancestor-matching every FilePreImage path against the
+    /// command's Create'd Directory set.
+    ///
+    /// This closed the cargo-install-force-undo regression that PR
+    /// #177's initial mkdir classifier surfaced.
+    dirs_with_restored_content_inside: HashSet<PathBuf>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
@@ -179,6 +192,9 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
     let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
+    // M03.x.CREATE — Created Directories specifically (subset of `creates`).
+    // Used after the scan to compute `dirs_with_restored_content_inside`.
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
     // G01.B.3 — paths whose FilePreImage carries a strong "pre-command
     // snapshot" guarantee (set by capture paths that walk the watched
     // subtree at PreExec, like W02.B's LiveBaseline on FreeBSD). The
@@ -212,8 +228,14 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
                     pre_command_pre_images.insert(path.clone());
                 }
             }
-            CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
+            CaptureEventKind::TreeOp(TreeOp::Create { path, kind, .. }) => {
                 creates.insert(path.clone());
+                // M03.x.CREATE — track Created Directories separately
+                // so we can detect "dir + restored content inside" at
+                // emission time and suppress the dir's Unlink inverse.
+                if *kind == crate::metadata::FileKind::Directory {
+                    created_dirs.insert(path.clone());
+                }
             }
             CaptureEventKind::TreeOp(TreeOp::Unlink { path, inode, .. }) => {
                 unlinks.insert(path.clone());
@@ -550,6 +572,27 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
+    // M03.x.CREATE — compute the "Created Directory has restored
+    // content inside" set. For each FilePreImage path, walk its
+    // ancestors and mark any that are in `created_dirs`. At Unlink
+    // emit time for TreeOp::Create, the planner skips Unlink for
+    // any path in this set so the dir survives + the restored
+    // content stays put.
+    //
+    // Only `pre_images` (genuine restored content) gates this. Other
+    // event kinds (Create+Unlink fresh files) still want the dir's
+    // Unlink + the executor's recursive-fallback for the W01.B
+    // git-commit-inside-Create'd-dir case.
+    let mut dirs_with_restored_content_inside: HashSet<PathBuf> = HashSet::new();
+    for pi in &pre_images {
+        let mut ancestor = pi.parent();
+        while let Some(anc) = ancestor {
+            if created_dirs.contains(anc) {
+                dirs_with_restored_content_inside.insert(anc.to_path_buf());
+            }
+            ancestor = anc.parent();
+        }
+    }
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -557,6 +600,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
+        dirs_with_restored_content_inside,
     }
 }
 
@@ -1274,6 +1318,16 @@ fn emit_for_tree_op(
             // rewrite the original bytes; an Unlink here would race
             // and delete the file the user actually wants restored.
             if class.spurious_creates_with_preimage.contains(path) {
+                return;
+            }
+            // M03.x.CREATE: this Created Directory contains a path
+            // with a FilePreImage that RestoreContent will put back.
+            // Emitting Unlink would trigger the executor's recursive
+            // rmdir-on-ENOTEMPTY fallback, clobbering the restored
+            // content. Leave the dir + content in place; the
+            // surrounding watched-cwd's kqueue / FSEvents path catches
+            // any cleanup the user expects.
+            if class.dirs_with_restored_content_inside.contains(path) {
                 return;
             }
             // The user's command created this path; inverse is unlink.
