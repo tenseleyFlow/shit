@@ -42,8 +42,14 @@ pub mod proc;
 pub mod tree;
 pub mod vnode;
 
-pub use capture::{
-    CaptureError, PRE_IMAGE_INLINE_CAP, STREAM_COPY_CAP, read_pre_image, stream_copy_to_staging,
+pub use capture::{CaptureError, PRE_IMAGE_INLINE_CAP, read_pre_image};
+// AU25 — streaming primitives moved to crate::capture::streaming so
+// the Linux/LSM producer can share them. Re-exported under the
+// legacy `kqueue::*` names for existing BSD callers (capture/bsd.rs).
+// This re-export only compiles under main.rs (the B07.6 lib facade
+// mounts kqueue/capture.rs directly and never reaches this file).
+pub use crate::capture::streaming::{
+    STREAM_COPY_CAP, stream_copy_to_staging_at as stream_copy_to_staging,
 };
 pub use drain::{
     DEFAULT_CAPACITY, DrainError, DrainEvent, DrainHandle, DrainSession, spawn as spawn_drain,

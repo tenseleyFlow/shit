@@ -51,14 +51,17 @@ use std::sync::Arc;
 use shit_planner::events::CommandId;
 use shit_proto::HelperResponse;
 
+use crate::capture::streaming::{STREAM_COPY_CAP, StreamError, stream_copy_to_staging_path};
 use crate::ipc::Conn;
 
 /// Bounded pre-image read size. Larger files ALLOW without capture
-/// and log `partial=true` on the event (L04 may revisit). 256 MiB is
-/// the open question default from L01 design notes — small enough to
-/// avoid OOM under hostile inputs, large enough to catch real
-/// user-edit-huge-file scenarios.
-pub const MAX_PRE_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+/// and log `partial=true` on the event.
+///
+/// AU25 — bumped from 256 MiB to 1 GiB (= [`STREAM_COPY_CAP`]) now
+/// that the LSM capture path streams through a 64 KiB buffer
+/// instead of materializing the whole file into `Vec<u8>`. The cap
+/// is a wall-clock + disk-budget guard, not a memory guard.
+pub const MAX_PRE_IMAGE_BYTES: usize = STREAM_COPY_CAP as usize;
 
 /// Per-CommandId capture state. Lazy: created on the first event for
 /// a tracked command and dropped when the command's
@@ -679,20 +682,33 @@ impl LinuxCaptureRuntime {
             let meta = fstat_meta(fd);
             (0, [0u8; 32], None, meta)
         } else if race_won {
+            // AU25 — single-pass streaming capture. Pre-AU25 this
+            // three-stepped through `read_pre_image` (materialize
+            // file into Vec<u8>) → `blake3_of` → `write_to_staging`
+            // (write same Vec to disk). For >32 MiB files that
+            // round-tripped 32–256 MiB through userspace memory per
+            // event; >256 MiB files hit the cap and skipped
+            // capture entirely. Now: src_fd → 64 KiB chunked
+            // pread + in-flight blake3 + write directly to staging.
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
-            match (read_pre_image(fd), fstat_meta(fd)) {
-                (Ok(bytes), Some(meta)) => {
-                    let hash = blake3_of(&bytes);
-                    match write_to_staging(&self.staging_dir, &bytes) {
-                        Ok(staging) => (bytes.len() as u64, hash, Some(staging), Some(meta)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "lsm staging write failed");
-                            (0, [0u8; 32], None, None)
-                        }
-                    }
+            let meta = fstat_meta(fd);
+            match (
+                stream_copy_to_staging_path(fd, &self.staging_dir, MAX_PRE_IMAGE_BYTES as u64),
+                meta,
+            ) {
+                (Ok((staging, hash, bytes)), Some(meta)) => {
+                    (bytes, hash, Some(staging), Some(meta))
+                }
+                (Err(StreamError::TooLargeForBuffer(n)), _) => {
+                    tracing::warn!(
+                        size = n,
+                        cap = MAX_PRE_IMAGE_BYTES,
+                        "lsm pre-image exceeds cap; marker-only CapturedPreImage"
+                    );
+                    (0, [0u8; 32], None, None)
                 }
                 (Err(e), _) => {
-                    tracing::warn!(error = %e, "lsm pre-image read failed");
+                    tracing::warn!(error = %e, "lsm pre-image stream failed");
                     (0, [0u8; 32], None, None)
                 }
                 (Ok(_), None) => (0, [0u8; 32], None, None),

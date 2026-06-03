@@ -41,3 +41,18 @@ pub mod macos_es;
 // xattr capture is consumed by the BSD, Linux, and macOS producers
 // (macOS via M03.x.XATTR — reads off the staging fd post-clonefile).
 pub mod xattr;
+
+// Streaming pre-image primitives shared between BSD/kqueue and
+// Linux/LSM (AU25). macOS has its own streaming impl in
+// `macos_es.rs` (M03.x.STREAMING) — a future sprint may consolidate
+// onto this module. The `pread(2)` + `openat(2)` + blake3 dance is
+// portable; the module is cfg-gated only because macOS doesn't use
+// it today.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+pub mod streaming;
