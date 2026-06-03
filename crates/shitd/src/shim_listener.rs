@@ -526,24 +526,27 @@ fn ingest_notification(
         return;
     };
 
-    // M03.x.CREATE: gate Create-style classifications on out-of-watch,
-    // mirroring the speculative-Create gating above for open/openat
-    // (W09.12). In-watch creates (mkdir/mkfifo/link/linkat under a
-    // tracked cwd subtree) are observed by the kqueue dir-diff /
-    // FSEvents path too; emitting an extra TreeOp::Create here would
-    // produce duplicate Unlink inverses on undo. Cargo install
-    // (PR #177 surface) creates dozens of in-watch dirs during the
-    // compile + install phases — without this gate, undo emits N
-    // extra rmdir inverses that race / conflict with the real
-    // rename-restore for the binary itself, ending up unlinking
-    // the binary instead of restoring its prior bytes.
+    // M03.x.CREATE / M03.x.LINK: gate Create-style classifications
+    // on out-of-watch, mirroring the speculative-Create gating above
+    // for open/openat (W09.12). In-watch creates that ALSO fire on
+    // kqueue NOTE_WRITE / FSEvents would produce duplicate Unlink
+    // inverses if we journal them shim-side too.
+    //
+    // **mkfifo/mkfifoat are NOT gated** — per the W09.10.1 commit
+    // comment, kqueue NOTE_WRITE on the parent dir doesn't fire for
+    // FIFO / special-file creation. The shim is the ONLY observation
+    // channel for mkfifo even in-watch. Gating it here would cause
+    // the existing mkfifo-undo-fbsd smoke to lose its only signal.
+    //
+    // link/linkat ARE gated — kqueue NOTE_WRITE on the dst's parent
+    // fires for hardlink creation (it appears as a fresh dirent),
+    // so in-watch link gets dir-diff coverage; the shim's notify
+    // would duplicate.
     //
     // Unlink/Rename pass through (they describe in-place mutations,
     // not creates) — only the Create variants gate.
-    if matches!(
-        note.syscall.as_str(),
-        "mkfifo" | "mkfifoat" | "link" | "linkat"
-    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    if matches!(note.syscall.as_str(), "link" | "linkat")
+        && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
     {
         debug!(
             pid = note.pid,
