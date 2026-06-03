@@ -526,6 +526,37 @@ fn ingest_notification(
         return;
     };
 
+    // M03.x.CREATE / M03.x.LINK: gate Create-style classifications
+    // on out-of-watch, mirroring the speculative-Create gating above
+    // for open/openat (W09.12). In-watch creates that ALSO fire on
+    // kqueue NOTE_WRITE / FSEvents would produce duplicate Unlink
+    // inverses if we journal them shim-side too.
+    //
+    // **mkfifo/mkfifoat are NOT gated** — per the W09.10.1 commit
+    // comment, kqueue NOTE_WRITE on the parent dir doesn't fire for
+    // FIFO / special-file creation. The shim is the ONLY observation
+    // channel for mkfifo even in-watch. Gating it here would cause
+    // the existing mkfifo-undo-fbsd smoke to lose its only signal.
+    //
+    // link/linkat ARE gated — kqueue NOTE_WRITE on the dst's parent
+    // fires for hardlink creation (it appears as a fresh dirent),
+    // so in-watch link gets dir-diff coverage; the shim's notify
+    // would duplicate.
+    //
+    // Unlink/Rename pass through (they describe in-place mutations,
+    // not creates) — only the Create variants gate.
+    if matches!(note.syscall.as_str(), "link" | "linkat")
+        && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    {
+        debug!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            "shim notify: Create path is in-watch; defer to kqueue dir-diff"
+        );
+        return;
+    }
+
     let ts = crate::server::next_ts();
     let event = CaptureEvent {
         id: EventId(0),
@@ -690,6 +721,22 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
+        // M03.x.CREATE mkdir: routed in CI but rolled back here —
+        // emitting TreeOp::Create{Directory} for out-of-watch mkdirs
+        // unconditionally caused cargo-install-force-undo to fail
+        // (applied=42, conflicts=6). Cargo's incidental parent dirs
+        // (e.g. `cargo-root/bin`) ended up rmdir-recursive'd by the
+        // executor's unlink_inner ENOTEMPTY fallback, racing the
+        // RestoreContent inverse for files INSIDE that dir.
+        //
+        // Closing this properly needs planner-side coordination:
+        // when a Create's path is a Directory AND any other inverse
+        // in the plan targets a path UNDER that directory, the
+        // rmdir should attempt empty-only (no recursive fallback)
+        // so the dir survives if it's still hosting restored
+        // content. Tracked as a follow-up; smoke
+        // `mkdir-out-of-watch-undo-macos.sh` is EXCLUDED_BY pending
+        // that work.
         _ => None,
     }
 }
