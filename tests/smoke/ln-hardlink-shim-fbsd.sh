@@ -93,32 +93,38 @@ sleep 0.5
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
 sleep 0.8
 
-# Assertion: daemon's shim_listener emitted a tracing line carrying
-# `syscall = "link"`. That's the deterministic signal the shim
-# notification reached the daemon. The events table doesn't expose
-# the syscall name as a column (it's serialized into `payload`), so
-# we check the log instead.
-SHITD_LOG_PATH="${SHIT_SMOKE_TMP}/shitd.log"
-if ! grep -q 'syscall="link"' "${SHITD_LOG_PATH}" 2>/dev/null \
-    && ! grep -q 'syscall=link' "${SHITD_LOG_PATH}" 2>/dev/null; then
-    smoke_log "regression — no shim 'link' tracing line in shitd.log"
-    smoke_log "recent shim-related log lines:"
-    grep -i "shim\|preload\|notify" "${SHITD_LOG_PATH}" 2>/dev/null | tail -10 | sed 's/^/    /' >&2 || true
-    smoke_fail "expected daemon log to contain 'syscall = \"link\"' (or unquoted variant)"
+# Assertion: daemon journaled a shim-sourced notification with
+# syscall=link or syscall=linkat. The events table doesn't expose
+# the syscall name as a column (it's in `payload`), so we grep the
+# daemon's JSON log instead. `ln(1)` from FreeBSD's coreutils calls
+# `linkat(2)` (the *at variant); older callers may use `link(2)` —
+# both interposers ship in this PR, so either should fire.
+JSON_LOG="$(ls "${XDG_STATE_HOME}/shit/log/daemon.jsonl"* 2>/dev/null | head -1)"
+if [ -z "${JSON_LOG}" ] || [ ! -f "${JSON_LOG}" ]; then
+    smoke_fail "daemon JSON log not found under \${XDG_STATE_HOME}/shit/log/"
 fi
-smoke_log "gate: daemon log shows shim 'link' tracing line"
+if ! grep -qE '"syscall":"linkat?"' "${JSON_LOG}"; then
+    smoke_log "regression — no shim 'link'/'linkat' notification in daemon log"
+    smoke_log "all shim-related lines:"
+    grep -i shim "${JSON_LOG}" | tail -10 | sed 's/^/    /' >&2 || true
+    smoke_fail "expected daemon JSON log to journal shim 'link' or 'linkat' notification"
+fi
+LINK_COUNT="$(grep -cE '"syscall":"linkat?"' "${JSON_LOG}" 2>/dev/null || echo 0)"
+smoke_log "gate: daemon journaled ${LINK_COUNT} shim link/linkat notification(s)"
 
-# Sanity gate: a TreeOp::Create event landed for the link path.
-# This confirms the journal wire wasn't broken by the shim path
-# even though we're not asserting on a 'source' column.
+# Sanity gate: a TreeOpCreate event landed for the link path. This
+# confirms the journal wire wasn't broken by the shim path even
+# though we're not asserting on a 'source' column (the event may
+# come from either the shim notify or the kqueue dir-diff path —
+# both reach this discriminant).
 TREE_CREATE_COUNT="$(
-    smoke_journal_count "discriminant = 'TreeOp' AND path LIKE '%link'" 2>/dev/null || echo 0
+    smoke_journal_count "discriminant = 'TreeOpCreate' AND path LIKE '%link'" 2>/dev/null || echo 0
 )"
-smoke_log "TreeOp events for ${LINK}: ${TREE_CREATE_COUNT}"
+smoke_log "TreeOpCreate events for ${LINK}: ${TREE_CREATE_COUNT}"
 if [ "${TREE_CREATE_COUNT}" -lt 1 ]; then
-    smoke_fail "expected at least one TreeOp event for ${LINK}; got 0"
+    smoke_fail "expected at least one TreeOpCreate event for ${LINK}; got 0"
 fi
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: ln-hardlink-shim-fbsd (${SHIM_LINK_COUNT} shim-sourced 'link' event(s))"
+smoke_log "PASS: ln-hardlink-shim-fbsd (${LINK_COUNT} shim notification(s), ${TREE_CREATE_COUNT} TreeOpCreate event(s))"
