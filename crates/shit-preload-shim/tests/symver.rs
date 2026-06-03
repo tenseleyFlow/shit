@@ -38,6 +38,10 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
     // B08 — link/linkat shim parity (mirrors macOS PR #175).
     // `link` is at FBSD_1.0; `linkat` is at FBSD_1.1.
     ("link", "FBSD_1.0"),
+    // B10 — xattr-mutation shim parity (mirrors macOS PR #174).
+    // FreeBSD's extattr_* family lives at FBSD_1.0.
+    ("extattr_set_file", "FBSD_1.0"),
+    ("extattr_delete_file", "FBSD_1.0"),
     // *at variants are at FBSD_1.1 in libc. openat also exists
     // at FBSD_1.2 but lld won't let us tag the same source
     // symbol twice (multiple-versions error when rlib links
