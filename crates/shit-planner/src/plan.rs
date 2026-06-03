@@ -573,18 +573,37 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         }
     }
     // M03.x.CREATE — compute the "Created Directory has restored
-    // content inside" set. For each FilePreImage path, walk its
-    // ancestors and mark any that are in `created_dirs`. At Unlink
-    // emit time for TreeOp::Create, the planner skips Unlink for
-    // any path in this set so the dir survives + the restored
-    // content stays put.
+    // content inside" set. Only count FilePreImage paths whose
+    // inverse will actually be RestoreContent at emit time — i.e.
+    // paths that:
+    //   - have a FilePreImage event, AND
+    //   - are NOT in atomic_replace_paths (those already handle
+    //     restore via the Rename+PreImage shape; their dir parents
+    //     aren't Created in the same command),
+    //   - are NOT in transient_paths (Create + Unlink + PreImage
+    //     shape for paths that didn't pre-exist; the FilePreImage's
+    //     bytes are mid-command state, not pre-command state — no
+    //     RestoreContent inverse fires),
+    //   - are NOT in spurious_creates_with_preimage (M03.x.OPEN-UNDO
+    //     FSEvents race — handled by suppressing the Create's Unlink
+    //     directly, not via dir-level coordination).
     //
-    // Only `pre_images` (genuine restored content) gates this. Other
-    // event kinds (Create+Unlink fresh files) still want the dir's
-    // Unlink + the executor's recursive-fallback for the W01.B
-    // git-commit-inside-Create'd-dir case.
+    // The key case the W01.B comment in unlink_inner described —
+    // cargo build creating target/ + fresh-create files inside —
+    // produces FilePreImage events with EMPTY pre-images (file
+    // didn't exist pre-command), which classify into transient_paths
+    // when a matching Unlink also fires. Without this filter, my
+    // fix would suppress target/'s Unlink and leave fresh-build
+    // dirs around after undo.
     let mut dirs_with_restored_content_inside: HashSet<PathBuf> = HashSet::new();
     for pi in &pre_images {
+        // Filter to paths that genuinely have RestoreContent inverses.
+        if atomic.contains(pi)
+            || transient.contains(pi)
+            || spurious_creates_with_preimage.contains(pi)
+        {
+            continue;
+        }
         let mut ancestor = pi.parent();
         while let Some(anc) = ancestor {
             if created_dirs.contains(anc) {
