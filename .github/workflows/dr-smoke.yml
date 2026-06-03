@@ -444,6 +444,35 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  mkdir-out-of-watch-undo-macos:
+    # M03.x.CREATE (mkdir portion) end-to-end smoke — mkdir(path)
+    # against an OUT-OF-WATCH path → shit undo removes it. Validates
+    # the mkdir/mkdirat classifier arm + the new planner-side
+    # `dirs_with_restored_content_inside` analysis that suppresses
+    # the dir's Unlink when a FilePreImage targets a path inside.
+    # The earlier attempt at this lacked the planner coord and
+    # broke cargo-install-force-undo — that's the smoke this PR's
+    # fix also keeps green.
+    name: mkdir-out-of-watch-undo smoke (M03.x.CREATE mkdir macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/mkdir-out-of-watch-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkdir-out-of-watch-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   link-undo-macos:
     # M03.x.LINK end-to-end smoke — link(src, dst) hardlink → shit
     # undo → dst removed, src untouched. Validates the new my_link
