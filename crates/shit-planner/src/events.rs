@@ -138,7 +138,17 @@ impl FilePreImageSource {
 
 /// Variant payload of [`CaptureEvent`]. New tiers grow this enum; existing
 /// variants are stable on-the-wire (postcard schema evolution rules apply).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// HD-01 — `EnumDiscriminants` generates a fieldless companion enum
+/// [`CaptureEventKindDiscriminants`] that exhausts every variant by
+/// name. The renderer-coverage test in `crates/shit/tests/render_*`
+/// iterates it via `strum::IntoEnumIterator` and fails if any
+/// variant is missing both a render branch in
+/// `shit::render::cmd_detail::render_event` AND an explicit entry
+/// on that test's `JSON_ONLY_ALLOWLIST`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(derive(strum::EnumIter, strum::IntoStaticStr))]
+#[strum_discriminants(name(CaptureEventKindDiscriminants))]
 pub enum CaptureEventKind {
     /// Captured pre-mutation content + metadata of a file. The file existed
     /// before the syscall; we recorded its bytes (`blob`) and stat fields.
@@ -407,7 +417,14 @@ fn default_unlink_mode_event() -> u32 {
     0o100644
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// HD-01 — see [`CaptureEventKind`] for the parallel rationale.
+/// The renderer's TreeOp sub-dispatch (`render_tree_op` in
+/// `shit::render::cmd_detail`) has its own `_ =>` fallback; the
+/// coverage test iterates [`TreeOpDiscriminants`] to keep that
+/// sub-dispatch honest too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(derive(strum::EnumIter, strum::IntoStaticStr))]
+#[strum_discriminants(name(TreeOpDiscriminants))]
 pub enum TreeOp {
     Create {
         inode: InodeRef,

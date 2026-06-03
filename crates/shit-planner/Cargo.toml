@@ -22,6 +22,10 @@ nix = { workspace = true }
 libc = { workspace = true }
 blake3 = { workspace = true }
 globset = { workspace = true }
+# HD-01 — `CaptureEventKind` carries an `EnumDiscriminants` companion
+# enum so renderer-coverage tests (`crates/shit/tests/render_*`) can
+# iterate every variant + assert each has a render branch.
+strum = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
