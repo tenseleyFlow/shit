@@ -55,8 +55,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
-        with:
-          targets: x86_64-unknown-freebsd
+      - name: install freebsd cross-target rlibs
+        # dtolnay/rust-toolchain@1.85's `targets:` parameter has been
+        # observed to skip the std/core rlib drop for cross-targets
+        # (E0463 "can't find crate for `core`"); explicit rustup
+        # target add is the load-bearing step.
+        run: rustup target add x86_64-unknown-freebsd
       - uses: Swatinem/rust-cache@v2
       - name: cargo check --lib -p shit-helper --target x86_64-unknown-freebsd
         run: cargo check --lib -p shit-helper --target x86_64-unknown-freebsd
