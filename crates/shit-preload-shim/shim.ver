@@ -8,8 +8,10 @@
  *
  * Versions surveyed (FreeBSD 14.4 `objdump -T /lib/libc.so.7`):
  *   FBSD_1.0  — open, unlink, rename, truncate, ftruncate,
- *               pwrite, mmap
- *   FBSD_1.1  — openat, unlinkat, renameat  (the *at variants)
+ *               pwrite, mmap, mkfifo, link, extattr_set_file,
+ *               extattr_delete_file, chflags
+ *   FBSD_1.1  — openat, unlinkat, renameat, mkfifoat, linkat
+ *   FBSD_1.3  — chflagsat (B09; modern callers use this directly)
  *
  * Note: libc's `openat` ALSO has a `FBSD_1.2` (newer flag-aware
  * form) but lld errors with "multiple versions for openat" if
@@ -32,3 +34,4 @@
  */
 FBSD_1.0 { };
 FBSD_1.1 { };
+FBSD_1.3 { };
