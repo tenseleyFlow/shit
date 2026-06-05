@@ -41,6 +41,26 @@ jobs:
       - name: build (release)
         run: cargo build --workspace --release
 
+  helper-lib-bsd-cross-check:
+    # HD-02 — fast pre-screen for the B07.6 lib facade's
+    # self-containment contract. Cross-compiles just the
+    # `shit_helper` lib (the bench's link surface, mounting
+    # `kqueue/capture.rs` via #[path]) for x86_64-unknown-freebsd
+    # from a Linux runner. A `crate::X` import that resolves under
+    # main.rs but not under the lib facade fails here in ~30s
+    # instead of the 3 minutes the native `freebsd-14` job takes.
+    # See `crates/shit-helper/src/lib.rs` rustdoc for the contract.
+    name: helper lib facade BSD cross-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+        with:
+          targets: x86_64-unknown-freebsd
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check --lib -p shit-helper --target x86_64-unknown-freebsd
+        run: cargo check --lib -p shit-helper --target x86_64-unknown-freebsd
+
   freebsd:
     name: freebsd-14
     runs-on: ubuntu-24.04
