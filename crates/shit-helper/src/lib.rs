@@ -28,6 +28,29 @@
 //! from a non-bin context, prefer factoring the leaf logic into a
 //! separate crate over expanding this facade — the dual-target
 //! pattern wears thin fast.
+//!
+//! # Adding a new `#[path]` mount
+//!
+//! HD-02 made this contract explicit after AU25 burned three CI
+//! round-trips to find it:
+//!
+//! 1. The mounted file MUST be self-contained against
+//!    main.rs-tree imports. No `use crate::X` for `X` outside
+//!    the file's own definitions; no `use super::X` that
+//!    resolves up into the bin's mod tree. External-crate
+//!    imports (`shit_proto`, `serde`, `libc`, etc.) are fine —
+//!    they resolve through Cargo.toml.
+//! 2. Add a `# HD-02 — self-containment contract` section to the
+//!    file's `//!` block (see `kqueue/capture.rs` for the
+//!    canonical wording).
+//! 3. The CI's `helper-lib-bsd-cross-check` job builds this lib
+//!    facade for `x86_64-unknown-freebsd` from a Linux runner and
+//!    will catch a `crate::` violation in ~30s instead of the 3
+//!    minutes the native `freebsd-14` job takes.
+//!
+//! Symptom of a violation: `error[E0432]: unresolved import
+//! 'crate::X'`. macOS / Linux pre-flight CANNOT see it because
+//! they don't compile the lib facade for the relevant cfg.
 
 #[cfg(any(
     target_os = "freebsd",
