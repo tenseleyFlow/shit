@@ -49,3 +49,6 @@ core-foundation-sys = "0.8"
 [dev-dependencies]
 tempfile = "3.10"
 filetime = "0.2"
+# HD-01 — integration test iterates CaptureEventKindDiscriminants to
+# enforce renderer coverage. Test-only dep; no shipped binary cost.
+strum = { workspace = true }

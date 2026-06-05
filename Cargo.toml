@@ -55,6 +55,9 @@ vergen-gitcl = { version = "1.0", features = ["build", "cargo", "rustc"] }
 toml = "0.9"
 proptest = "1.6"
 bitflags = "2.6"
+# HD-01 — discriminant iteration for renderer-coverage tests. Derive-only;
+# no runtime cost beyond the generated companion enum + IntoStaticStr impl.
+strum = { version = "0.27", default-features = false, features = ["derive"] }
 
 shit-desc = { path = "crates/shit-desc" }
 shit-helper = { path = "crates/shit-helper" }
