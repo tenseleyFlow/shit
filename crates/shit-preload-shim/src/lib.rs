@@ -108,6 +108,18 @@ core::arch::global_asm!(
     // FBSD_1.0 (libc base since FreeBSD 5).
     ".symver extattr_set_file, extattr_set_file@FBSD_1.0",
     ".symver extattr_delete_file, extattr_delete_file@FBSD_1.0",
+    // B09 — chflags shim parity (mirrors macOS PR #171
+    // M03.x.SETATTR-FAMILY). FreeBSD has no portable `fd -> path`
+    // (no F_GETPATH); fd-based `fchflags` mutations are covered
+    // by kqueue NOTE_ATTRIB on the vnode plus the helper-side
+    // baseline. `chflags(2)` at FBSD_1.0.
+    //
+    // `chflagsat(2)` at FBSD_1.3 — the load-bearing one in
+    // practice. /bin/chflags(8) and modern callers bypass the
+    // libc chflags wrapper and call chflagsat directly. Without
+    // this we don't intercept the syscall at all.
+    ".symver chflags, chflags@FBSD_1.0",
+    ".symver chflagsat, chflagsat@FBSD_1.3",
     // FBSD_1.1 — the *at variants. modern coreutils prefer these.
     // openat ALSO lives at FBSD_1.2 (libc's newer flag-aware
     // form), but lld emits "multiple versions for X" if we tag
@@ -409,6 +421,36 @@ mod next {
                     *mut c_void,
                     size_t,
                 ) -> ssize_t,
+            >(addr)
+        }
+    }
+
+    /// B09 — FreeBSD `chflags(2)`. Mutates the file's `st_flags`
+    /// bitmap (UF_IMMUTABLE, UF_HIDDEN, SF_*, …). FreeBSD widens
+    /// the second arg to `c_ulong`; macOS keeps it `c_uint`.
+    #[cfg(target_os = "freebsd")]
+    pub fn real_chflags() -> unsafe extern "C" fn(*const c_char, libc::c_ulong) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"chflags\0") });
+        unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(*const c_char, libc::c_ulong) -> c_int>(
+                addr,
+            )
+        }
+    }
+
+    /// B09 — FreeBSD `chflagsat(2)`. Dirfd-relative variant; the
+    /// one /bin/chflags(8) actually calls. `atflag` is 0 or
+    /// AT_SYMLINK_NOFOLLOW.
+    #[cfg(target_os = "freebsd")]
+    pub fn real_chflagsat()
+    -> unsafe extern "C" fn(c_int, *const c_char, libc::c_ulong, c_int) -> c_int {
+        static SYM: OnceLock<usize> = OnceLock::new();
+        let addr = *SYM.get_or_init(|| unsafe { dlsym_next(b"chflagsat\0") });
+        unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(c_int, *const c_char, libc::c_ulong, c_int) -> c_int,
             >(addr)
         }
     }
@@ -1578,6 +1620,66 @@ mod interposers {
             return unsafe { libc::extattr_delete_file(path, attrnamespace, attrname) };
         }
         unsafe { real(path, attrnamespace, attrname) }
+    }
+
+    /// B09 — `chflags(2)` interposer. Mutates the BSD `st_flags`
+    /// bitmap (UF_IMMUTABLE, UF_HIDDEN, SF_NOUNLINK, …). Mirrors
+    /// macOS PR #171 (M03.x.SETATTR-FAMILY): `notify_pre_mutation_with_content`
+    /// snapshots the current st_flags via `read_st_flags` BEFORE
+    /// the syscall fires, so the FilePreImage's FileMetadataWire.flags
+    /// carries the pre-chflags value. The daemon classifier
+    /// (`shim_listener.rs::"chflags"`) routes the pre-image through
+    /// the same FilePreImage path as chmod; the planner's
+    /// RestoreMetadata inverse wraps `restore_flags_only` which
+    /// re-issues `chflags(path, prior)`.
+    ///
+    /// FreeBSD's chflags signature: `int chflags(const char *path,
+    /// unsigned long flags)`. macOS keeps `c_uint`; FreeBSD widened
+    /// to `c_ulong` — the actual flag bits all fit in u32 but the
+    /// ABI demands the wider arg.
+    ///
+    /// # Safety
+    /// `path` must be a valid NUL-terminated C string.
+    #[cfg(target_os = "freebsd")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn chflags(path: *const c_char, flags: libc::c_ulong) -> c_int {
+        policy::notify_pre_mutation_with_content("chflags", &cstr_to_string(path));
+        let real = next::real_chflags();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::chflags(path, flags) };
+        }
+        unsafe { real(path, flags) }
+    }
+
+    /// `chflagsat(2)` interposer — the dirfd-relative variant.
+    /// This is the load-bearing one in practice: /bin/chflags(8)
+    /// and modern callers go directly through chflagsat instead
+    /// of the libc chflags wrapper. The daemon's classifier
+    /// (shim_listener.rs::"chflags") routes both syscall names
+    /// through the same path; we use "chflags" on the wire so
+    /// the daemon doesn't need a new arm.
+    ///
+    /// For `dirfd=AT_FDCWD` (the common case — what chflags(8)
+    /// uses), `path` is interpreted relative to cwd. For per-dirfd
+    /// callers, we ship `path` as-is and let the daemon's pid→cwd
+    /// resolution handle relative paths.
+    ///
+    /// # Safety
+    /// `path` must be a valid NUL-terminated C string.
+    #[cfg(target_os = "freebsd")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn chflagsat(
+        dirfd: c_int,
+        path: *const c_char,
+        flags: libc::c_ulong,
+        atflag: c_int,
+    ) -> c_int {
+        policy::notify_pre_mutation_with_content("chflags", &cstr_to_string(path));
+        let real = next::real_chflagsat();
+        if next::is_zero(next::as_usize(real)) {
+            return unsafe { libc::chflagsat(dirfd, path, flags, atflag) };
+        }
+        unsafe { real(dirfd, path, flags, atflag) }
     }
 
     /// `truncate(2)` interposer.
