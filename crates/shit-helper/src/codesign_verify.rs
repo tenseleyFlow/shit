@@ -25,6 +25,18 @@
 //! (`shitd::helper_link`) refuses the helper and logs at ERROR.
 //! On non-hardened-runtime dev builds (`flags=0x0`) the verify
 //! passes with `signature_kind=AdHoc`.
+//!
+//! # HD-02 — self-containment contract
+//!
+//! This file is `#[path]`-mounted by `crates/shit-helper/src/lib.rs`
+//! as `pub mod codesign_verify` so integration tests in `tests/`
+//! (which see only the lib's public surface) can call
+//! `verify_path` against a deliberately-corrupted helper copy.
+//! **Do not** add `use crate::X` for `X` outside this file or
+//! `use super::X` — under the lib build, `crate::` is `lib.rs`'s
+//! mod tree, not `main.rs`'s. External-crate imports (`shit_proto`,
+//! `std`) are fine; they resolve through Cargo.toml. See
+//! `kqueue/capture.rs` for the same contract.
 
 use std::path::PathBuf;
 use std::process::Command;

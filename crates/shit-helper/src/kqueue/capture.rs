@@ -30,6 +30,26 @@
 //!   NOTE_WRITE events) closes that gap.
 //!
 //! Documented in `.docs/audits/bsd-coverage.md`.
+//!
+//! # HD-02 — self-containment contract
+//!
+//! This file is `#[path]`-mounted by `crates/shit-helper/src/lib.rs`
+//! as `pub mod capture` so the B07.6 perf bench can link
+//! `shit_helper::capture::*` without spawning the full helper. **Do
+//! not** add `use crate::X` for `X` outside this file's own
+//! definitions, `use super::X` for siblings in the main.rs mod
+//! tree, or anything else that resolves through the helper's bin
+//! module graph — under the lib facade build, `crate::` refers to
+//! `lib.rs`'s tree, NOT to `main.rs`'s, and such imports fail to
+//! resolve with no warning on macOS / Linux pre-flight.
+//!
+//! Symptom of a violation: `error[E0432]: unresolved import
+//! 'crate::X'` only on the `freebsd-14` + `perf-bsd-14` CI jobs
+//! after a 3-minute build. AU25 cost three round-trips on exactly
+//! this. If you need to factor shared logic out, do it in a way
+//! that keeps this file leaf-only — re-export from `kqueue/mod.rs`
+//! (main.rs-only) for the bin callers; the lib facade is allowed
+//! to be a strict subset.
 
 #![cfg(any(
     target_os = "freebsd",
