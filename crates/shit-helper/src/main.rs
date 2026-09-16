@@ -1649,6 +1649,77 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
     }
 }
 
+/// What to do when the automatically selected eBPF-LSM tier fails
+/// during its real load/attach step.
+///
+/// Keep this decision separate from the loader and reader setup so
+/// the safety-sensitive distinction between an operator-forced tier
+/// and automatic tier selection stays directly unit-testable.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LsmLoadFailureAction {
+    /// The operator explicitly required eBPF-LSM; never silently use
+    /// a different tier.
+    FailForced,
+    /// Automatic selection may fall back to the already-open
+    /// fanotify client.
+    StartFanotify,
+    /// Neither kernel capture path can be made live. Abort before
+    /// the helper handshake rather than advertising readiness.
+    FailNoFallback,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn lsm_load_failure_action(
+    forced_tier: Option<&str>,
+    have_fanotify_fd: bool,
+) -> LsmLoadFailureAction {
+    if forced_tier == Some("ebpf-lsm") {
+        LsmLoadFailureAction::FailForced
+    } else if have_fanotify_fd {
+        LsmLoadFailureAction::StartFanotify
+    } else {
+        LsmLoadFailureAction::FailNoFallback
+    }
+}
+
+#[cfg(test)]
+mod lsm_load_failure_action_tests {
+    use super::{LsmLoadFailureAction, lsm_load_failure_action};
+
+    #[test]
+    fn automatic_selection_falls_back_when_fanotify_is_available() {
+        assert_eq!(
+            lsm_load_failure_action(None, true),
+            LsmLoadFailureAction::StartFanotify
+        );
+    }
+
+    #[test]
+    fn forced_ebpf_never_falls_back() {
+        assert_eq!(
+            lsm_load_failure_action(Some("ebpf-lsm"), true),
+            LsmLoadFailureAction::FailForced
+        );
+    }
+
+    #[test]
+    fn automatic_selection_fails_when_no_capture_fallback_exists() {
+        assert_eq!(
+            lsm_load_failure_action(None, false),
+            LsmLoadFailureAction::FailNoFallback
+        );
+    }
+
+    #[test]
+    fn unrelated_override_does_not_disable_safe_fallback() {
+        assert_eq!(
+            lsm_load_failure_action(Some("unknown-tier"), true),
+            LsmLoadFailureAction::StartFanotify
+        );
+    }
+}
+
 async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let shutdown = Arc::new(Notify::new());
 
@@ -1677,52 +1748,35 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // on the linux-kernel-capture matrix; fix is to make
     // handshake-complete genuinely mean "capture is live".
     //
-    // Exactly one of fanotify / ebpf-lsm gets wired per-boot —
-    // `pick_linux_tier` already chose above. The fanotify branch
-    // mirrors L01; the ebpf-lsm branch is L04's promotion path.
+    // Exactly one of fanotify / ebpf-lsm gets wired per-boot.
+    // `pick_linux_tier` chooses the preference; an automatic eBPF
+    // load failure can still activate the already-open fanotify fd.
+    // The fanotify branch mirrors L01; the ebpf-lsm branch is L04's
+    // promotion path.
     //
     // Both readers feed the SAME `LinuxCaptureRuntime` instance. The
-    // unused fd from the other tier (e.g. the fanotify_fd when tier
-    // is EbpfLsm) is left open and harmless — the kernel-side mark
-    // table is empty so no events arrive.
+    // unused fd from the other tier (the fanotify fd after a
+    // successful eBPF boot) is dropped once startup is resolved.
     #[cfg(target_os = "linux")]
     let (fanotify_state, lsm_state) = {
         let staging_dir = cli.state_dir.join("helper-staging");
-        let capture_rt = match capture::linux::LinuxCaptureRuntime::new(
-            staging_dir,
-            Arc::clone(&conn),
-        ) {
-            Ok(rt) => Some(Arc::new(std::sync::Mutex::new(rt))),
-            Err(e) => {
-                tracing::warn!(err = %e, "linux capture runtime failed to init; reader will ALLOW without capture");
-                None
-            }
+        let capture_rt = if matches!(setup.tier, CaptureTier::Degraded) {
+            None
+        } else {
+            let rt = capture::linux::LinuxCaptureRuntime::new(staging_dir, Arc::clone(&conn))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "linux capture runtime failed to initialize; refusing to advertise live capture: {e}"
+                    )
+                })?;
+            Some(Arc::new(std::sync::Mutex::new(rt)))
         };
 
-        // Fanotify branch — current default tier or fallback path.
-        let fanotify_state: Option<fanotify::runtime::FanotifyState> = if matches!(
+        let mut fanotify_fd = setup.fanotify_fd;
+        let mut start_fanotify = matches!(
             setup.tier,
             CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred
-        ) {
-            setup.fanotify_fd.map(|fd| {
-                let mut state = fanotify::runtime::FanotifyState::new(fd);
-                if let Some(rt) = capture_rt.clone() {
-                    state = state.with_capture_runtime(rt);
-                }
-                let reader_state = state.clone();
-                std::thread::Builder::new()
-                    .name("fanotify-reader".into())
-                    .spawn(move || fanotify::runtime::reader_thread(reader_state))
-                    .expect("spawn fanotify reader");
-                state
-            })
-        } else {
-            tracing::info!(
-                tier = setup.tier.label(),
-                "skipping fanotify reader for this tier"
-            );
-            None
-        };
+        );
 
         // eBPF-LSM branch — L04. Load + attach happens here while
         // the helper still has CAP_BPF + CAP_PERFMON (before
@@ -1740,16 +1794,65 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             match boot_ebpf_lsm(capture_rt.clone(), excluded) {
                 Ok(state) => Some(state),
                 Err(e) => {
-                    tracing::error!(err = %e, "ebpf-lsm load failed; this tier is unusable on this boot");
-                    if std::env::var("SHIT_FORCE_TIER").as_deref() == Ok("ebpf-lsm") {
-                        return Err(anyhow::anyhow!(
-                            "SHIT_FORCE_TIER=ebpf-lsm but load failed: {e}"
-                        ));
+                    let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
+                    match lsm_load_failure_action(forced_tier.as_deref(), fanotify_fd.is_some()) {
+                        LsmLoadFailureAction::FailForced => {
+                            return Err(anyhow::anyhow!(
+                                "SHIT_FORCE_TIER=ebpf-lsm but load failed: {e}"
+                            ));
+                        }
+                        LsmLoadFailureAction::StartFanotify => {
+                            tracing::warn!(
+                                err = %e,
+                                "ebpf-lsm load failed; starting fanotify fallback"
+                            );
+                            start_fanotify = true;
+                        }
+                        LsmLoadFailureAction::FailNoFallback => {
+                            return Err(anyhow::anyhow!(
+                                "ebpf-lsm load failed and fanotify is unavailable; refusing to complete the helper handshake without live Linux capture: {e}"
+                            ));
+                        }
                     }
                     None
                 }
             }
         } else {
+            None
+        };
+
+        // Start fanotify only after the eBPF load result is known so
+        // automatic selection can actually fall back. Reaching this
+        // branch without the fd violates the tier-selection invariant;
+        // fail before the handshake instead of claiming capture is live.
+        let fanotify_state: Option<fanotify::runtime::FanotifyState> = if start_fanotify {
+            let fd = fanotify_fd.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fanotify capture selected but no fanotify fd is available; refusing to complete the helper handshake"
+                )
+            })?;
+            let rt = capture_rt.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fanotify capture selected without a capture runtime; refusing to complete the helper handshake"
+                )
+            })?;
+            let state = fanotify::runtime::FanotifyState::new(fd).with_capture_runtime(rt);
+            let reader_state = state.clone();
+            std::thread::Builder::new()
+                .name("fanotify-reader".into())
+                .spawn(move || fanotify::runtime::reader_thread(reader_state))
+                .expect("spawn fanotify reader");
+            tracing::info!(
+                tier = CaptureTier::Fanotify.label(),
+                fallback_from_ebpf = matches!(setup.tier, CaptureTier::EbpfLsm),
+                "kernel capture tier active"
+            );
+            Some(state)
+        } else {
+            tracing::info!(
+                tier = setup.tier.label(),
+                "skipping fanotify reader for this tier"
+            );
             None
         };
 
