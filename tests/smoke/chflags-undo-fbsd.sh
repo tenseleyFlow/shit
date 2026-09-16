@@ -8,32 +8,19 @@
 # EXCLUDED_BY:
 # EXCLUDED_REASON:
 #
-# B09 — assert that LD_PRELOAD shim's `chflags(2)` /
-# `chflagsat(2)` interposers emit a daemon-side notification
-# whose pre-image carries the OLD st_flags (via `read_st_flags`).
+# B09 — exercise the full FreeBSD chflags undo path: metadata-only
+# preload-shim pre-image → RestoreFlags plan node → daemon-side
+# chflags(2). The field-specific inverse avoids unrelated chown/chmod
+# calls, so the helper's Capsicum sandbox is not involved.
 #
-# This is the producer-side parity check for macOS PR #171
-# (M03.x.SETATTR-FAMILY chflags). End-to-end undo is validated
-# by the macOS `chflags-undo-macos.sh` smoke (APFS supports
-# st_flags natively, no capsicum). The BSD daemon classifier
-# (shim_listener.rs:346 "chflags"), planner inverse op, and
-# executor `restore_flags_only` (file.rs:483) all already live
-# in trunk — they were authored cross-platform by M03.x.SETATTR.
-# B09's only delta is the BSD-side shim interposers.
+# Why a direct chflags(2) C workload: modern /bin/chflags traverses with
+# dirfd-relative chflagsat(2), while the v1 shim wire has no dirfd field.
+# The interposer deliberately skips shapes it cannot faithfully replay.
+# This smoke therefore exercises the supported absolute-path API directly.
 #
-# Why path-only (no fchflags): FreeBSD has no portable `fd -> path`
-# (no F_GETPATH). Fd-based mutations are covered by kqueue
-# NOTE_ATTRIB on the underlying vnode.
-#
-# Why no round-trip gate: matches setxattr-shim-fbsd.sh's pattern
-# — under capsicum-default-on (B05), the helper's chown(2) call
-# in RestoreMetadata returns ENOTCAPABLE (errno 94); the
-# FilePreImage carries full metadata so the inverse touches
-# uid/gid/mode/mtime/flags. Restoring chflags-only safely
-# under capsicum is a daemon/planner fix (out of B09 scope —
-# follow-up to introduce a flags-only inverse op when only flags
-# diverge). The shim-emission gate is the load-bearing producer-
-# side check; that's what B09 ships.
+# UFS supports user flags and must round-trip. OpenZFS may return
+# EOPNOTSUPP; there the producer notification remains a useful gate,
+# but the mutation/undo assertions are explicitly skipped.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -54,8 +41,6 @@ SHIM_LIB="${SHIT_SMOKE_BIN_DIR}/libshit_preload_shim.so"
 [ -f "${SHIM_LIB}" ]   || smoke_fail "preload shim .so missing at ${SHIM_LIB}"
 export SHIT_HELPER_BIN="${HELPER_BIN}"
 
-smoke_start_shitd
-
 WATCHED="${SHIT_SMOKE_TMP}/watched"
 mkdir -p "${WATCHED}"
 cd "${WATCHED}"
@@ -63,16 +48,41 @@ cd "${WATCHED}"
 TARGET="${WATCHED}/target.txt"
 printf 'shim-chflags-test\n' > "${TARGET}"
 
-# FS-capability probe: if chflags returns EOPNOTSUPP (e.g.
-# OpenZFS on FreeBSD), the syscall can't be round-tripped but
-# the SHIM still fires its pre-syscall notification — we still
-# exercise the producer-side parity path. Detect it up-front so
-# the post-mutation assertions can branch correctly.
+CC_BIN="$(command -v cc 2>/dev/null || true)"
+[ -n "${CC_BIN}" ] || smoke_fail "cc not on PATH"
+cat > "${WATCHED}/set_chflags.c" <<'CSRC'
+#include <stdio.h>
+#include <sys/stat.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <path>\n", argv[0]);
+        return 2;
+    }
+    if (chflags(argv[1], UF_NODUMP) != 0) {
+        perror("chflags");
+        return 1;
+    }
+    return 0;
+}
+CSRC
+"${CC_BIN}" -O0 -o "${WATCHED}/set_chflags" "${WATCHED}/set_chflags.c" \
+    2> "${SHIT_SMOKE_TMP}/cc.log"
+[ -x "${WATCHED}/set_chflags" ] || smoke_fail "cc failed to build chflags workload"
+
+# FS-capability probe. Use UF_NODUMP rather than UF_IMMUTABLE so a
+# failed undo never makes smoke cleanup itself fail.
 SUPPORTS_CHFLAGS=1
-if ! /bin/chflags 0 "${TARGET}" 2>/dev/null; then
+if "${WATCHED}/set_chflags" "${TARGET}" 2>/dev/null; then
+    /bin/chflags 0 "${TARGET}" 2>/dev/null \
+        || smoke_fail "could not clear probe flag"
+else
     SUPPORTS_CHFLAGS=0
     smoke_log "note: chflags returns EOPNOTSUPP on this FS (likely ZFS); shim-emission gate is the load-bearing check"
 fi
+PRE_FLAGS="$(stat -f '%Of' "${TARGET}")"
+
+smoke_start_shitd
 
 SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 PID="$$"
@@ -86,19 +96,22 @@ PID="$$"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.3
 
-# Workload — set UF_IMMUTABLE (uchg / 0x2) under LD_PRELOAD.
-# chflags(8) calls chflags(2) directly (path-based). We use
-# UF_IMMUTABLE because root + securelevel constraints don't
-# apply to UF_* flags. If the FS doesn't support chflags, the
-# syscall fails but the shim's pre-syscall notification has
-# already reached the daemon — which is what we're testing.
-smoke_log "workload: LD_PRELOAD=${SHIM_LIB} chflags uchg ${TARGET}"
-LD_PRELOAD="${SHIM_LIB}" /bin/chflags uchg "${TARGET}" 2>/dev/null || true
+# Workload — call chflags(2) with an absolute path under LD_PRELOAD.
+# If the FS doesn't support flags, the syscall fails after the shim
+# notification, so the producer gate remains meaningful.
+smoke_log "workload: LD_PRELOAD=${SHIM_LIB} ${WATCHED}/set_chflags ${TARGET}"
+set +e
+LD_PRELOAD="${SHIM_LIB}" "${WATCHED}/set_chflags" "${TARGET}" 2>/dev/null
+CHFLAGS_RC=$?
+set -e
 sleep 0.5
 
 if [ "${SUPPORTS_CHFLAGS}" -eq 1 ]; then
     POST_FLAGS="$(stat -f '%Of' "${TARGET}")"
-    smoke_log "post-flags=${POST_FLAGS} (expect 2 = UF_IMMUTABLE)"
+    smoke_log "pre-flags=${PRE_FLAGS} post-flags=${POST_FLAGS}"
+    [ "${CHFLAGS_RC}" -eq 0 ] || smoke_fail "chflags nodump exited ${CHFLAGS_RC} on a supported FS"
+    [ "${POST_FLAGS}" != "${PRE_FLAGS}" ] \
+        || smoke_fail "chflags nodump did not change flags (${PRE_FLAGS})"
 fi
 
 "${SHIT_BIN}" hook-send post-exec \
@@ -112,7 +125,8 @@ if [ -z "${JSON_LOG}" ] || [ ! -f "${JSON_LOG}" ]; then
     smoke_fail "daemon JSON log not found under \${XDG_STATE_HOME}/shit/log/"
 fi
 
-SHIM_COUNT="$(grep -cE '"syscall":"chflags"' "${JSON_LOG}" 2>/dev/null || echo 0)"
+SHIM_COUNT="$(grep -cE '"syscall":"chflags"' "${JSON_LOG}" 2>/dev/null || true)"
+SHIM_COUNT="${SHIM_COUNT:-0}"
 smoke_log "shim notifications: chflags=${SHIM_COUNT}"
 
 if [ "${SHIM_COUNT}" -lt 1 ]; then
@@ -121,16 +135,29 @@ if [ "${SHIM_COUNT}" -lt 1 ]; then
     smoke_fail "expected at least 1 'chflags' notification; got ${SHIM_COUNT}"
 fi
 
-# If the FS supports chflags (CI UFS does; shit-fbsd ZFS doesn't),
-# at least clear the immutable flag so the smoke cleanup can
-# remove the file. Round-trip via `shit undo` is intentionally
-# NOT exercised — capsicum-default-on blocks the chown step in
-# RestoreMetadata; cleaning that up is a separate sprint (see
-# the "Why no round-trip gate" header comment).
-if [ "${SUPPORTS_CHFLAGS}" -eq 1 ] && [ "${POST_FLAGS}" = "2" ]; then
-    /bin/chflags 0 "${TARGET}" 2>/dev/null || true
+if [ "${SUPPORTS_CHFLAGS}" -eq 0 ]; then
+    "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
+    smoke_log "SKIP: chflags round-trip unsupported on this FS (producer gate saw ${SHIM_COUNT} notifications)"
+    exit 0
 fi
+
+smoke_log "running: shit undo --yes"
+set +e
+"${SHIT_BIN}" undo --yes > "${SHIT_SMOKE_TMP}/undo.log" 2>&1
+UNDO_RC=$?
+set -e
+smoke_log "shit undo --yes exit=${UNDO_RC}"
+/usr/bin/sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+
+FINAL_FLAGS="$(stat -f '%Of' "${TARGET}")"
+smoke_log "final-flags=${FINAL_FLAGS}"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: chflags-undo-fbsd (${SHIM_COUNT} chflags shim notifications)"
+[ "${UNDO_RC}" -eq 0 ] || smoke_fail "shit undo exited ${UNDO_RC}"
+grep -qE 'applied=[1-9][0-9]*' "${SHIT_SMOKE_TMP}/undo.log" \
+    || smoke_fail "undo reported no applied operations"
+[ "${FINAL_FLAGS}" = "${PRE_FLAGS}" ] \
+    || smoke_fail "flags mismatch after undo: got ${FINAL_FLAGS}, want ${PRE_FLAGS}"
+
+smoke_log "PASS: chflags-undo-fbsd (flags ${PRE_FLAGS} -> ${POST_FLAGS} -> ${FINAL_FLAGS}; ${SHIM_COUNT} notifications)"

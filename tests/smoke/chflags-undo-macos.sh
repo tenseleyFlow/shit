@@ -28,13 +28,13 @@
 #   1. Pre-state: file with no flags (`-`)
 #   2. Workload `set_chflags <file> UF_HIDDEN` runs under
 #      DYLD_INSERT — shim's my_chflags interposer fires
-#      `notify_pre_mutation_with_content` BEFORE the syscall,
+#      `notify_flags_mutation` BEFORE the syscall,
 #      capturing st_flags=0 as the pre-state into the daemon's
-#      FilePreImage journal.
+#      metadata-only FilePreImage journal.
 #   3. Confirm post-mutate flags == "hidden"
-#   4. shit undo --yes runs; planner's RestoreMetadata pulls
-#      the captured FileMetadata (with flags=0) and the
-#      executor's restore_flags_only calls chflags(path, 0).
+#   4. shit undo --yes runs; planner emits RestoreFlags and the
+#      field-specific executor calls chflags(path, 0) without
+#      unrelated ownership/mode/xattr syscalls.
 #   5. Assert post-undo flags == "-"
 
 # shellcheck disable=SC2154
@@ -82,8 +82,11 @@ smoke_log "pre-state flags: '${PRE_FLAGS}'"
 # the tmpdir. Belt-and-suspenders against UF_IMMUTABLE if a
 # future variant of this smoke uses it.
 cleanup() {
+    local rc=$?
+    trap - EXIT
     /usr/bin/chflags nohidden "${TARGET}" 2>/dev/null || true
     /usr/bin/chflags nouchg "${TARGET}" 2>/dev/null || true
+    smoke_cleanup "${rc}"
 }
 trap cleanup EXIT
 
@@ -155,6 +158,7 @@ smoke_log "journal events for command: ${N_EVENTS}"
 SHIM_HITS="$(grep -hc 'shim pre-mutation' "${SHIT_SMOKE_TMP}"/state/shit/log/daemon.jsonl.* 2>/dev/null || echo 0)"
 SHIM_HITS="$(printf '%s\n' ${SHIM_HITS} | awk '{s+=$1} END{print s+0}')"
 smoke_log "shim notifications observed by daemon: ${SHIM_HITS}"
+[ "${SHIM_HITS}" -ge 1 ] || smoke_fail "expected at least one shim notification"
 
 smoke_log "running: shit undo --yes"
 set +e
@@ -169,24 +173,8 @@ smoke_log "post-undo flags: '${POST_UNDO_FLAGS}'"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-if [ "${POST_UNDO_FLAGS}" = "${PRE_FLAGS}" ] && [ "${UNDO_RC}" -eq 0 ]; then
-    smoke_log "OUTCOME A — flags restored to pre-state '${PRE_FLAGS}' (shim hits=${SHIM_HITS})"
-    smoke_log "PASS: chflags-undo-macos (M03.x.SETATTR-FAMILY end-to-end)"
-    exit 0
-fi
+[ "${UNDO_RC}" -eq 0 ] || smoke_fail "shit undo exited ${UNDO_RC}"
+[ "${POST_UNDO_FLAGS}" = "${PRE_FLAGS}" ] \
+    || smoke_fail "flags mismatch after undo: got '${POST_UNDO_FLAGS}', want '${PRE_FLAGS}'"
 
-if [ "${UNDO_RC}" -ne 0 ] \
-    && grep -qE "chflags|hidden|setflags|refus|conflict|metadata" "${SHIT_SMOKE_TMP}/undo.log"; then
-    smoke_log "OUTCOME B — loud refusal"
-    smoke_log "PASS: chflags-undo-macos (Outcome B)"
-    exit 0
-fi
-
-smoke_log "OUTCOME C — silent stomp"
-smoke_log "  pre flags:        '${PRE_FLAGS}'"
-smoke_log "  post-mutate:      '${POST_MUTATE_FLAGS}'"
-smoke_log "  post-undo:        '${POST_UNDO_FLAGS}'"
-smoke_log "  undo exit:        ${UNDO_RC}"
-smoke_log "  journal events:   ${N_EVENTS}"
-smoke_log "  shim hits:        ${SHIM_HITS}"
-smoke_fail "chflags undo did NOT restore pre-state flags"
+smoke_log "PASS: chflags-undo-macos (flags restored to '${PRE_FLAGS}'; shim hits=${SHIM_HITS})"
