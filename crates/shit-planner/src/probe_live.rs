@@ -86,15 +86,14 @@ fn read_stat_flags(path: &Path) -> u32 {
     if rc != 0 {
         return 0;
     }
-    // `st_flags` type diverges across BSDs: Apple is u32, FreeBSD u64.
-    // Coerce both to u32 — every defined chflags constant fits.
+    // libc exposes `st_flags` as u32 on both Apple and FreeBSD.
     #[cfg(target_os = "macos")]
     {
         st.st_flags
     }
     #[cfg(target_os = "freebsd")]
     {
-        st.st_flags as u32
+        st.st_flags
     }
 }
 

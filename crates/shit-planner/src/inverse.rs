@@ -264,6 +264,22 @@ pub enum InverseOp {
         reason: String,
         remediation: Option<String>,
     },
+    /// B09 — restore only the BSD/macOS `st_flags` bitmap. This is
+    /// intentionally narrower than `RestoreMetadata`: a chflags-only
+    /// mutation must not issue unrelated chown/chmod/xattr operations.
+    /// Execution keeps the captured inode guard. If the same command
+    /// later unlinked the last name and undo recreated it with a fresh
+    /// inode, flags restoration refuses rather than risk changing an
+    /// unrelated replacement; execution-provenance tracking is needed
+    /// to safely cover that compound case.
+    ///
+    /// Keep new variants appended: postcard encodes enum discriminants
+    /// positionally and persisted plans may contain older values.
+    RestoreFlags {
+        inode: InodeRef,
+        path: PathBuf,
+        flags: u32,
+    },
 }
 
 /// C03: kubectl verb captured against a single resource (or a
@@ -536,6 +552,7 @@ impl InverseOp {
         match self {
             Self::RestoreContent { path, .. }
             | Self::RestoreMetadata { path, .. }
+            | Self::RestoreFlags { path, .. }
             | Self::Unlink { path, .. }
             | Self::RecreatePath { path, .. }
             | Self::CreateSymlink { path, .. }
@@ -563,9 +580,9 @@ impl InverseOp {
     /// Inode this op targets, if any. Used for conflict detection.
     pub fn primary_inode(&self) -> Option<InodeRef> {
         match self {
-            Self::RestoreContent { inode, .. } | Self::RestoreMetadata { inode, .. } => {
-                Some(*inode)
-            }
+            Self::RestoreContent { inode, .. }
+            | Self::RestoreMetadata { inode, .. }
+            | Self::RestoreFlags { inode, .. } => Some(*inode),
             _ => None,
         }
     }
@@ -575,6 +592,7 @@ impl InverseOp {
         match self {
             Self::RestoreContent { .. }
             | Self::RestoreMetadata { .. }
+            | Self::RestoreFlags { .. }
             | Self::Unlink { .. }
             | Self::RecreatePath { .. }
             | Self::Rename { .. }
@@ -779,6 +797,18 @@ mod tests {
             inode: dummy_inode(),
             path: PathBuf::from("/tmp/x"),
             target: dummy_meta(),
+        };
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    #[test]
+    fn restore_flags_postcard_roundtrip() {
+        let op = InverseOp::RestoreFlags {
+            inode: dummy_inode(),
+            path: PathBuf::from("/tmp/flags"),
+            flags: 0x8002,
         };
         let bytes = postcard::to_allocvec(&op).unwrap();
         let back: InverseOp = postcard::from_bytes(&bytes).unwrap();

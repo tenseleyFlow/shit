@@ -438,11 +438,9 @@ unsafe extern "C" fn my_fchmodat(
 /// chflags because Apple keeps it in a separate syscall (the kernel's
 /// st_flags field is distinct from st_mode/st_uid/etc).
 ///
-/// `notify_pre_mutation_with_content` triggers the daemon-side stat
-/// of `path` which picks up the current st_flags BEFORE the chflags
-/// call mutates it — that pre-state lands in the FilePreImage's
-/// FileMetadataWire.flags and the planner's MetadataChange inverse
-/// path restores it on undo via a synthesised `chflags <prior> <path>`.
+/// `notify_flags_mutation` captures the current st_flags BEFORE the
+/// chflags call mutates it and emits a metadata-only pre-image. The
+/// planner restores it through the dedicated flags inverse.
 ///
 /// Apple's libc signature: `chflags(path: *const c_char, flags: c_uint)`.
 /// (FreeBSD widens to c_ulong; macOS keeps c_uint.)
@@ -451,7 +449,7 @@ unsafe extern "C" fn my_fchmodat(
 /// Same contract as `libc::chflags` — `path` must be a valid
 /// NUL-terminated C string.
 unsafe extern "C" fn my_chflags(path: *const c_char, flags: c_uint) -> c_int {
-    policy::notify_pre_mutation_with_content("chflags", &cstr_to_string(path));
+    policy::notify_flags_mutation("chflags", &cstr_to_string(path));
     unsafe { libc::chflags(path, flags) }
 }
 
@@ -463,7 +461,7 @@ unsafe extern "C" fn my_chflags(path: *const c_char, flags: c_uint) -> c_int {
 /// Same contract as `libc::fchflags`.
 unsafe extern "C" fn my_fchflags(fd: c_int, flags: c_uint) -> c_int {
     if let Some(path) = fd_to_path(fd) {
-        policy::notify_pre_mutation_with_content("fchflags", &path);
+        policy::notify_flags_mutation("fchflags", &path);
     }
     unsafe { libc::fchflags(fd, flags) }
 }
