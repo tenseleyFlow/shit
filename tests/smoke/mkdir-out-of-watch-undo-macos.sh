@@ -5,28 +5,26 @@
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: macos-14
 # SMOKE_TIMEOUT_SEC: 180
-# EXCLUDED_BY: M03.x.CREATE-mkdir-planner-coord-pending
-# EXCLUDED_REASON: Initial attempt at routing mkdir/mkdirat → TreeOp::Create{Directory} caused cargo-install-force-undo regression (applied=42 conflicts=6, cargo's incidental parent dirs rmdir-recursive'd alongside FilePreImage restores for files inside). Closing properly needs planner-side coordination — when a Create's path is a Directory AND any other inverse in the plan targets a path UNDER that directory, the rmdir should attempt empty-only (no recursive fallback). Smoke documents the gap; re-enable by clearing this EXCLUDED_BY when the planner coordination lands.
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
-# M03.x.CREATE (mkdir out-of-watch portion) gap-validation smoke.
+# M03.x.CREATE (mkdir out-of-watch portion) regression smoke.
 #
 # Workload: a tiny C binary that calls `mkdir(path, 0o755)` against
 # a path OUTSIDE the watched cwd subtree. The shim's `my_mkdir`
-# interposer DOES fire (M07.A.2 landed it), but the daemon's
-# `classify_tree_op` doesn't handle "mkdir" syscalls — only
-# "mkfifo"/"link"/"linkat"/rename/unlink. So shim notifies are
-# dropped silently for mkdir.
+# interposer reports the path only after mkdir succeeds, and the
+# daemon classifies it as TreeOp::Create{Directory}.
 #
-# On in-watch mkdirs the kqueue dir-diff path (in baseline) catches
-# the create (so the gap is invisible in normal workloads). On
-# out-of-watch mkdirs (e.g. `make install` creating /usr/local/
-# subdirs, or any mkdir outside the user's cwd subtree) the
-# journal never sees it.
+# In-watch mkdirs remain owned by kqueue/FSEvents dir-diff to avoid
+# duplicate inverses. Out-of-watch mkdirs (e.g. `make install`
+# creating /usr/local subdirs) depend on this shim notification.
+# `cargo-install-force-undo-macos.sh` is the paired false-positive
+# guard: failed mkdir(EEXIST) calls must not create directory inverses.
 #
 # Outcomes:
 #   A. Full undo: out-of-watch dir removed
 #   B. Loud refusal
-#   C. Silent stomp (EXPECTED pre-fix) — dir survives undo
+#   C. Silent stomp (regression) — dir survives undo
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
