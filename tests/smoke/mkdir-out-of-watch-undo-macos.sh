@@ -21,10 +21,9 @@
 # `cargo-install-force-undo-macos.sh` is the paired false-positive
 # guard: failed mkdir(EEXIST) calls must not create directory inverses.
 #
-# Outcomes:
-#   A. Full undo: out-of-watch dir removed
-#   B. Loud refusal
-#   C. Silent stomp (regression) — dir survives undo
+# Required outcome: full undo removes the out-of-watch directory.
+# A refusal or surviving directory is a regression now that successful
+# mkdir notifications are classified as TreeOp::Create{Directory}.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -123,6 +122,8 @@ N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 SHIM_HITS="$(grep -hc 'shim pre-mutation' "${SHIT_SMOKE_TMP}"/state/shit/log/daemon.jsonl.* 2>/dev/null || echo 0)"
 SHIM_HITS="$(printf '%s\n' ${SHIM_HITS} | awk '{s+=$1} END{print s+0}')"
 smoke_log "journal events: ${N_EVENTS}; shim hits: ${SHIM_HITS}"
+[ "${N_EVENTS}" -ge 1 ] || smoke_fail "expected at least one journal event"
+[ "${SHIM_HITS}" -ge 1 ] || smoke_fail "expected at least one shim notification"
 
 smoke_log "running: shit undo --yes"
 set +e
@@ -134,26 +135,9 @@ sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-DIR_GONE=no
-[ ! -e "${TARGET}" ] && DIR_GONE=yes
-smoke_log "post-undo dir gone: ${DIR_GONE}"
+[ "${UNDO_RC}" -eq 0 ] || smoke_fail "shit undo exited ${UNDO_RC}"
+grep -qE 'applied=[1-9][0-9]*' "${SHIT_SMOKE_TMP}/undo.log" \
+    || smoke_fail "undo reported no applied operations"
+[ ! -e "${TARGET}" ] || smoke_fail "mkdir undo left ${TARGET} behind"
 
-if [ "${DIR_GONE}" = "yes" ] && [ "${UNDO_RC}" -eq 0 ]; then
-    smoke_log "OUTCOME A — out-of-watch dir removed by undo (shim hits=${SHIM_HITS})"
-    smoke_log "PASS: mkdir-out-of-watch-undo-macos (M03.x.CREATE mkdir portion)"
-    exit 0
-fi
-
-if [ "${UNDO_RC}" -ne 0 ] \
-    && grep -qE "mkdir|newdir|out-of-watch|refus|conflict" "${SHIT_SMOKE_TMP}/undo.log"; then
-    smoke_log "OUTCOME B — loud refusal"
-    smoke_log "PASS: mkdir-out-of-watch-undo-macos (Outcome B)"
-    exit 0
-fi
-
-smoke_log "OUTCOME C — silent stomp (gap confirmed)"
-smoke_log "  dir gone:       ${DIR_GONE}"
-smoke_log "  undo exit:      ${UNDO_RC}"
-smoke_log "  journal events: ${N_EVENTS}"
-smoke_log "  shim hits:      ${SHIM_HITS}"
-smoke_fail "mkdir undo did NOT remove the out-of-watch dir"
+smoke_log "PASS: mkdir-out-of-watch-undo-macos (directory removed; shim hits=${SHIM_HITS})"
