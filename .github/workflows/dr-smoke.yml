@@ -358,6 +358,30 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  mkdir-out-of-watch-undo-macos:
+    # M03.x.CREATE regression guard. The target is deliberately outside
+    # the watched cwd, so only the successful post-syscall DYLD shim
+    # notification can produce the directory's Unlink inverse.
+    name: mkdir-out-of-watch undo smoke (M03.x.CREATE macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/mkdir-out-of-watch-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkdir-out-of-watch-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   cp-clone-overwrite-undo-macos:
     # M03.x.CLONE-COPYFILE regression guard — replicates `cp -c <src>
     # <dst>` when dst exists: stat + unlink(dst) + clonefile(src, dst).
@@ -2271,17 +2295,9 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
-  # B04+B05 — FreeBSD smoke regression net. Runs all 10 BSD smokes
-  # inside a FreeBSD-14 VM. Single VM, many smokes (job-per-smoke
-  # would cost ~10 minutes per smoke in VM boot alone). One unit
-  # covers:
-  #   - file tier: rm-undo / mkdir-undo / chmod-undo / touch-edit-undo
-  #   - package tier: pkg-install-undo (via doas)
-  #   - service tier: service-restart-undo (cron via doas)
-  #   - network tier: pfctl-add-undo / pfctl-flush-undo (pf via doas)
-  #   - process tier: kill-proc-undo (pkill -f resolved by sysctl(KERN_PROC_*))
-  #   - sandbox: capsicum-default-on (B05: helper enters cap_enter, full
-  #     rm-undo pipeline works inside the capability sandbox)
+  # B04+B05 — FreeBSD smoke regression net. Runs every runnable
+  # freebsd-vm smoke discovered by smoke-driver inside one FreeBSD-14
+  # VM; job-per-smoke would pay the VM boot cost for every script.
   #
   # Doctor JSON pre-flight gates the smoke run — if the CI image's
   # FreeBSD lacks a working kqueue we skip cleanly and fail the job
@@ -2291,7 +2307,7 @@ jobs:
   freebsd-smoke:
     name: freebsd-smoke (B04)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: BSD smoke matrix inside FreeBSD 14
