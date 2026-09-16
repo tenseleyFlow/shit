@@ -20,11 +20,14 @@
 //!         │ send ControlAttach   ─ ControlDetach: shrink state
 //!         ▼                      ─ Shutdown: clean exit
 //!   (control channel) ───────────┘
+//!         ▲                            │
+//!         └── attach + baseline result ───┘
 //! ```
 //!
 //! State mutations happen *only* on the pump thread — no locks needed.
 //! The control channel and the drain channel are both `sync_channel(N)`
-//! and the pump alternates `try_recv` on them.
+//! and the pump alternates `try_recv` on them. A `WatchTree` caller waits
+//! on a per-attach completion channel before it may emit `WatchTreeReady`.
 //!
 //! **Stage-1 limits the producer to a single watched subtree per
 //! CommandId.** Recursive lazy expansion on directory NOTE_WRITE
@@ -43,7 +46,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, channel, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -53,8 +56,8 @@ use uuid::Uuid;
 
 use crate::ipc::Conn;
 use crate::kqueue::{
-    DrainEvent, DrainSession, KqueueFd, STREAM_COPY_CAP, TrackedSubtree, VnodeEventKind,
-    init as kqueue_init, register_subtree, register_subtree_at, spawn_drain,
+    DrainEvent, DrainSession, KqueueError, KqueueFd, STREAM_COPY_CAP, TrackedSubtree,
+    VnodeEventKind, init as kqueue_init, register_subtree, register_subtree_at, spawn_drain,
     stream_copy_to_staging,
 };
 
@@ -66,11 +69,38 @@ enum ControlMsg {
     Attach {
         command: CommandId,
         root_path: PathBuf,
+        /// One-shot completion sent only after the subtree is registered,
+        /// its metadata maps are populated, and the live-baseline walk has
+        /// finished. The request loop must not emit WatchTreeReady before
+        /// receiving this result.
+        completion: std::sync::mpsc::Sender<Result<(), CaptureAttachError>>,
     },
     Detach {
         command: CommandId,
     },
     Shutdown,
+}
+
+/// Failure to make a BSD command watch capture-ready.
+///
+/// Kept attach-specific so the readiness fix does not silently broaden
+/// AU16 into changing detach/shutdown semantics in the same patch.
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureAttachError {
+    #[error("could not resolve cwd for root pid {root_pid}")]
+    CwdUnavailable { root_pid: u32 },
+    #[error("BSD capture control channel is full")]
+    ControlChannelFull,
+    #[error("BSD capture control channel is closed")]
+    ControlChannelClosed,
+    #[error("BSD capture pump dropped the attach completion channel")]
+    CompletionChannelClosed,
+    #[error("register kqueue subtree at {root_path:?}: {source}")]
+    RegisterSubtree {
+        root_path: PathBuf,
+        #[source]
+        source: KqueueError,
+    },
 }
 
 /// Producer state owned by the pump thread.
@@ -179,24 +209,20 @@ impl PumpState {
         }
     }
 
-    fn attach(&mut self, kq: &KqueueFd, command: CommandId, root_path: &Path) {
+    fn attach(
+        &mut self,
+        kq: &KqueueFd,
+        command: CommandId,
+        root_path: &Path,
+    ) -> Result<(), CaptureAttachError> {
         let subtree_result = match &self.slash_fd {
             Some(slash) => register_subtree_at(kq, slash.as_raw_fd(), root_path, DEFAULT_DEPTH),
             None => register_subtree(kq, root_path, DEFAULT_DEPTH),
         };
-        let subtree = match subtree_result {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    %command.session,
-                    seq = command.seq,
-                    path = %root_path.display(),
-                    error = %e,
-                    "register_subtree failed; watch dropped",
-                );
-                return;
-            }
-        };
+        let subtree = subtree_result.map_err(|source| CaptureAttachError::RegisterSubtree {
+            root_path: root_path.to_path_buf(),
+            source,
+        })?;
         // Index every tracked fd → CommandId so the pump can resolve
         // DrainEvent::Vnode { fd, .. } to its watch.
         for raw in tracked_fds(&subtree) {
@@ -291,6 +317,7 @@ impl PumpState {
                 meta_baselines,
             },
         );
+        Ok(())
     }
 
     fn detach(&mut self, command: CommandId) {
@@ -863,18 +890,12 @@ fn file_mode_for(path: &Path) -> Option<u32> {
     Some(meta.mode())
 }
 
-fn tracked_fds(_subtree: &TrackedSubtree) -> Vec<RawFd> {
-    // TrackedSubtree doesn't currently expose its fds; we use
-    // path_for_fd in reverse via a small scan. The fd range we care
-    // about (0..1024) covers normal helper-process descriptor usage
-    // with margin.
-    let mut out = Vec::new();
-    for fd in 0..1024 {
-        if _subtree.path_for_fd(fd).is_some() {
-            out.push(fd);
-        }
-    }
-    out
+fn tracked_fds(subtree: &TrackedSubtree) -> Vec<RawFd> {
+    // Iterate the owned entries directly. Scanning an assumed fd range
+    // lost every watch whose kernel-assigned descriptor was >= 1024,
+    // making readiness untruthful for large trees or helpers that
+    // already held many descriptors.
+    subtree.iter_entries().map(|(fd, _)| fd).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1214,43 +1235,43 @@ impl CaptureControl {
     /// legacy sysctl(KERN_PROC_CWD) resolver for the helper's-own-pid
     /// path; cross-pid resolves are blocked under cap_enter so that
     /// path effectively requires `cwd_path` to be non-empty.
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32, cwd_path: &str) {
+    pub fn on_watch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        root_pid: u32,
+        cwd_path: &str,
+    ) -> Result<(), CaptureAttachError> {
         let path = if !cwd_path.is_empty() {
             PathBuf::from(cwd_path)
         } else {
             match super::cwd::resolve_pid_cwd(root_pid) {
                 Some(p) => p,
                 None => {
-                    tracing::warn!(
-                        %session,
-                        command_seq,
-                        root_pid,
-                        "could not resolve root_pid cwd and no cwd_path provided; watch dropped",
-                    );
-                    return;
+                    return Err(CaptureAttachError::CwdUnavailable { root_pid });
                 }
             }
         };
-        // AU16 — was `let _ = self.tx.try_send(...)`; silent drop
-        // meant a saturated or disconnected pump made the WatchTree
-        // disappear with zero diagnostic signal. Log loudly on Err
-        // (matches the macOS sibling at capture/macos.rs:121-131).
-        // The call site can't repair, but the operator now sees the
-        // failure in helper logs.
-        if let Err(e) = self.tx.try_send(ControlMsg::Attach {
+        let (completion_tx, completion_rx) = channel();
+        let msg = ControlMsg::Attach {
             command: CommandId {
                 session,
                 seq: command_seq,
             },
             root_path: path,
-        }) {
-            tracing::warn!(
-                %session,
-                command_seq,
-                err = %e,
-                "bsd capture control channel full or closed; WatchTree dropped"
-            );
-        }
+            completion: completion_tx,
+        };
+        self.tx.try_send(msg).map_err(|err| match err {
+            TrySendError::Full(_) => CaptureAttachError::ControlChannelFull,
+            TrySendError::Disconnected(_) => CaptureAttachError::ControlChannelClosed,
+        })?;
+
+        // The pump sends this only after registration, baseline emission,
+        // and insertion into its live watch map. This synchronization is
+        // what makes the request loop's later WatchTreeReady truthful.
+        completion_rx
+            .recv()
+            .map_err(|_| CaptureAttachError::CompletionChannelClosed)?
     }
 
     pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
@@ -1330,8 +1351,20 @@ fn pump(
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
-            Ok(ControlMsg::Attach { command, root_path }) => {
-                state.attach(&kq, command, &root_path);
+            Ok(ControlMsg::Attach {
+                command,
+                root_path,
+                completion,
+            }) => {
+                let result = state.attach(&kq, command, &root_path);
+                if completion.send(result).is_err() {
+                    tracing::warn!(
+                        %command.session,
+                        seq = command.seq,
+                        path = %root_path.display(),
+                        "BSD watch attach completed after requester disappeared"
+                    );
+                }
                 continue;
             }
             Ok(ControlMsg::Detach { command }) => {
@@ -1372,6 +1405,87 @@ fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_tree_waits_until_the_pump_reports_capture_ready() {
+        let (tx, rx) = sync_channel::<ControlMsg>(1);
+        let control = CaptureControl { tx };
+        let session = Uuid::nil();
+
+        let waiter = std::thread::spawn(move || {
+            control.on_watch_tree(session, 17, 4242, "/tmp/capture-root")
+        });
+
+        let ControlMsg::Attach {
+            command,
+            root_path,
+            completion,
+        } = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("capture pump should receive attach")
+        else {
+            panic!("expected attach control message");
+        };
+        assert_eq!(command.session, session);
+        assert_eq!(command.seq, 17);
+        assert_eq!(root_path, PathBuf::from("/tmp/capture-root"));
+
+        // Receiving the Attach is not readiness: the caller remains
+        // blocked until registration and the baseline have both ended.
+        assert!(!waiter.is_finished());
+        completion
+            .send(Ok(()))
+            .expect("watch request should still be waiting");
+        assert!(waiter.join().expect("watch request panicked").is_ok());
+    }
+
+    #[test]
+    fn watch_tree_propagates_the_pump_attach_failure() {
+        let (tx, rx) = sync_channel::<ControlMsg>(1);
+        let control = CaptureControl { tx };
+        let failed_root = PathBuf::from("/missing/capture-root");
+
+        let waiter = std::thread::spawn(move || {
+            control.on_watch_tree(Uuid::nil(), 23, 5252, "/missing/capture-root")
+        });
+
+        let ControlMsg::Attach { completion, .. } = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("capture pump should receive attach")
+        else {
+            panic!("expected attach control message");
+        };
+        completion
+            .send(Err(CaptureAttachError::RegisterSubtree {
+                root_path: failed_root.clone(),
+                source: KqueueError::NotImplemented("test attach failure"),
+            }))
+            .expect("watch request should still be waiting");
+
+        match waiter.join().expect("watch request panicked") {
+            Err(CaptureAttachError::RegisterSubtree { root_path, source }) => {
+                assert_eq!(root_path, failed_root);
+                assert!(matches!(
+                    source,
+                    KqueueError::NotImplemented("test attach failure")
+                ));
+            }
+            other => panic!("unexpected watch result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_tree_reports_a_closed_control_channel() {
+        let (tx, rx) = sync_channel::<ControlMsg>(1);
+        drop(rx);
+        let control = CaptureControl { tx };
+
+        let result = control.on_watch_tree(Uuid::nil(), 29, 6262, "/tmp/capture-root");
+        assert!(matches!(
+            result,
+            Err(CaptureAttachError::ControlChannelClosed)
+        ));
+    }
 
     #[test]
     fn fstat_returns_regular_for_open_file_and_directory_for_open_dir() {
