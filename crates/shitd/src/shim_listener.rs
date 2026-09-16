@@ -538,15 +538,17 @@ fn ingest_notification(
     // channel for mkfifo even in-watch. Gating it here would cause
     // the existing mkfifo-undo-fbsd smoke to lose its only signal.
     //
-    // link/linkat ARE gated — kqueue NOTE_WRITE on the dst's parent
-    // fires for hardlink creation (it appears as a fresh dirent),
-    // so in-watch link gets dir-diff coverage; the shim's notify
-    // would duplicate.
+    // link/linkat + mkdir/mkdirat ARE gated — kqueue NOTE_WRITE on
+    // the destination's parent fires when either creates a fresh
+    // dirent, so in-watch mutations get dir-diff coverage and the
+    // shim's notification would duplicate it.
     //
     // Unlink/Rename pass through (they describe in-place mutations,
     // not creates) — only the Create variants gate.
-    if matches!(note.syscall.as_str(), "link" | "linkat")
-        && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    if matches!(
+        note.syscall.as_str(),
+        "link" | "linkat" | "mkdir" | "mkdirat"
+    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
     {
         debug!(
             pid = note.pid,
@@ -721,22 +723,21 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
-        // M03.x.CREATE mkdir: routed in CI but rolled back here —
-        // emitting TreeOp::Create{Directory} for out-of-watch mkdirs
-        // unconditionally caused cargo-install-force-undo to fail
-        // (applied=42, conflicts=6). Cargo's incidental parent dirs
-        // (e.g. `cargo-root/bin`) ended up rmdir-recursive'd by the
-        // executor's unlink_inner ENOTEMPTY fallback, racing the
-        // RestoreContent inverse for files INSIDE that dir.
-        //
-        // Closing this properly needs planner-side coordination:
-        // when a Create's path is a Directory AND any other inverse
-        // in the plan targets a path UNDER that directory, the
-        // rmdir should attempt empty-only (no recursive fallback)
-        // so the dir survives if it's still hosting restored
-        // content. Tracked as a follow-up; smoke
-        // `mkdir-out-of-watch-undo-macos.sh` is EXCLUDED_BY pending
-        // that work.
+        "mkdir" | "mkdirat" => {
+            // M03.x.CREATE — create notifications are emitted only
+            // after mkdir succeeds. In particular, mkdir -p calls
+            // that return EEXIST no longer fabricate Create events
+            // for pre-existing parent directories. In-watch creates
+            // are gated above; this classifies the out-of-watch path.
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Directory,
+                mode: 0o755,
+            }))
+        }
         _ => None,
     }
 }
@@ -911,6 +912,28 @@ mod tests {
 
     fn fresh_blob_store(tmp: &std::path::Path) -> Arc<BlobStore> {
         Arc::new(BlobStore::open(tmp.join("blobs")).unwrap())
+    }
+
+    #[test]
+    fn mkdir_notifications_classify_as_directory_creates() {
+        for syscall in ["mkdir", "mkdirat"] {
+            let path = format!("/tmp/shit-{syscall}-does-not-exist");
+            let event = classify_tree_op(syscall, &path).expect("mkdir must be classifiable");
+
+            match event {
+                CaptureEventKind::TreeOp(TreeOp::Create {
+                    path: event_path,
+                    kind,
+                    mode,
+                    ..
+                }) => {
+                    assert_eq!(event_path, PathBuf::from(&path));
+                    assert_eq!(kind, FileKind::Directory);
+                    assert_eq!(mode, 0o755);
+                }
+                other => panic!("unexpected mkdir classification: {other:?}"),
+            }
+        }
     }
 
     /// Spawn a one-shot listener, connect a sync client, send a
