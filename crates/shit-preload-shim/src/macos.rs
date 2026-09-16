@@ -29,6 +29,7 @@
 
 use super::policy;
 use libc::{O_RDWR, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, c_void, mode_t};
+use std::path::{Path, PathBuf};
 
 /// Materialize a NUL-terminated C string into an owned `String` for
 /// the policy notification. Returns empty on NULL or invalid UTF-8
@@ -44,11 +45,134 @@ fn cstr_to_string(path: *const c_char) -> String {
     bytes.to_string_lossy().into_owned()
 }
 
-// Interposer set for M07.A: install-event coverage. Each replacement
-// notifies `policy` (fail-open: socket missing / daemon down / 50ms
-// ack timeout all swallow silently) then forwards to the libc symbol.
-// Filter logic for open/openat (write-mode only) mirrors the BSD/Linux
-// interposers' policy choices.
+/// Resolve a path-taking `*at` call's target against its dirfd.
+///
+/// The destination is resolved before the syscall by canonicalizing its
+/// existing parent and appending the final basename lexically. Resolving the
+/// final name after success would introduce a race: another thread could
+/// replace it with a symlink before `canonicalize`, misattributing the Create.
+///
+/// For a relative path with a real dirfd, interpreting it relative to the
+/// shimmed process's cwd is wrong: `mkdirat(fd, "child", ...)` targets
+/// `<fd>/child`, regardless of cwd. `F_GETPATH` supplies that missing base.
+///
+/// Resolution failures preserve the best available path and attach AU10's
+/// structured failure marker. The daemon can then journal both the partial
+/// Create and a refusal instead of silently losing a successful mutation.
+fn resolve_created_path_at(dirfd: c_int, path: &str) -> (String, Option<shit_proto::ShimFailure>) {
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else if dirfd == libc::AT_FDCWD {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(error) => {
+                return create_path_base_failure(path, format!("getcwd failed: {error}"));
+            }
+        }
+    } else {
+        match fd_to_path(dirfd) {
+            Some(base) => PathBuf::from(base).join(path),
+            None => {
+                return create_path_base_failure(
+                    path,
+                    format!("F_GETPATH failed for dirfd {dirfd}"),
+                );
+            }
+        }
+    };
+
+    // Run AU10's canonical-parent + lexical-basename resolution before the
+    // syscall. If canonicalization fails, this returns the absolute candidate
+    // plus ShimFailure::CanonicalizeFailed rather than dropping the event.
+    let candidate = candidate.to_string_lossy().into_owned();
+    policy::canonicalize_or_raw(&candidate, "path")
+}
+
+fn create_path_base_failure(
+    path: &Path,
+    detail: String,
+) -> (String, Option<shit_proto::ShimFailure>) {
+    let attempted_path = path.to_string_lossy().into_owned();
+    let failure = shit_proto::ShimFailure::CanonicalizeFailed {
+        which_arg: "path".to_string(),
+        attempted_path: attempted_path.clone(),
+        error_chain: detail,
+    };
+    (attempted_path, Some(failure))
+}
+
+/// Run a create-like syscall, then notify only when it actually succeeded.
+///
+/// `create`, `resolve_path`, and `notify` are parameters so unit tests can pin
+/// the ordering and failure gate without opening the daemon socket. Production
+/// wrappers all route through [`call_path_create`] below.
+fn call_create_and_notify_with<Create, Resolve, Notify>(
+    syscall: &'static str,
+    create: Create,
+    resolve_path: Resolve,
+    notify: Notify,
+) -> c_int
+where
+    Create: FnOnce() -> c_int,
+    Resolve: FnOnce() -> (String, Option<shit_proto::ShimFailure>),
+    Notify: FnOnce(&'static str, &str, Option<shit_proto::ShimFailure>),
+{
+    // Resolve before mutation. In addition to avoiding final-name races, this
+    // captures AT_FDCWD before another thread can change the process cwd.
+    let (resolved_path, failure) = resolve_path();
+    let result = create();
+    if result == 0 {
+        notify(syscall, &resolved_path, failure);
+    }
+    result
+}
+
+/// Testable adapter for create-only path syscalls.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string during path resolution and
+/// remain valid until `create` returns, matching the wrapped libc contract.
+unsafe fn call_path_create_with<Create, Notify>(
+    syscall: &'static str,
+    dirfd: c_int,
+    path: *const c_char,
+    create: Create,
+    notify: Notify,
+) -> c_int
+where
+    Create: FnOnce() -> c_int,
+    Notify: FnOnce(&'static str, &str, Option<shit_proto::ShimFailure>),
+{
+    call_create_and_notify_with(
+        syscall,
+        create,
+        || resolve_created_path_at(dirfd, &cstr_to_string(path)),
+        notify,
+    )
+}
+
+/// Production form of [`call_path_create_with`].
+///
+/// # Safety
+/// Same pointer-lifetime requirement as [`call_path_create_with`].
+unsafe fn call_path_create<Create>(
+    syscall: &'static str,
+    dirfd: c_int,
+    path: *const c_char,
+    create: Create,
+) -> c_int
+where
+    Create: FnOnce() -> c_int,
+{
+    unsafe { call_path_create_with(syscall, dirfd, path, create, policy::notify_create_resolved) }
+}
+
+// Interposer set for M07.A: install-event coverage. Destructive replacements
+// notify before mutation so they can capture a pre-image. Create-only
+// replacements call libc first and notify only on success; otherwise a failed
+// `mkdir(existing)` would journal a false Create inverse. Notifications remain
+// fail-open (socket missing / daemon down / timeout are swallowed).
 
 /// Replacement for `unlink(2)`.
 ///
@@ -183,11 +307,9 @@ unsafe extern "C" fn rust_shim_openat(
 /// # Safety
 /// Same contract as `libc::mkdir`.
 unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
-    // `notify_create` carries the new path without a pre-image (the
-    // path doesn't exist pre-syscall). Daemon journals a TreeOp::Create
-    // whose inverse is `rmdir` (or `unlink` on the planner side).
-    policy::notify_create("mkdir", &cstr_to_string(path));
-    unsafe { libc::mkdir(path, mode) }
+    // Notify after success: mkdir commonly returns EEXIST while recursively
+    // ensuring a parent tree, and that is not evidence the command created it.
+    unsafe { call_path_create("mkdir", libc::AT_FDCWD, path, || libc::mkdir(path, mode)) }
 }
 
 /// Replacement for `mkfifo(3)` (M03.x.CREATE). Creates a FIFO
@@ -201,8 +323,7 @@ unsafe extern "C" fn my_mkdir(path: *const c_char, mode: mode_t) -> c_int {
 /// Same contract as `libc::mkfifo` — `path` must be a valid
 /// NUL-terminated C string.
 unsafe extern "C" fn my_mkfifo(path: *const c_char, mode: mode_t) -> c_int {
-    policy::notify_create("mkfifo", &cstr_to_string(path));
-    unsafe { libc::mkfifo(path, mode) }
+    unsafe { call_path_create("mkfifo", libc::AT_FDCWD, path, || libc::mkfifo(path, mode)) }
 }
 
 /// Replacement for `mkfifoat(2)` (M03.x.CREATE). The *at variant
@@ -212,8 +333,11 @@ unsafe extern "C" fn my_mkfifo(path: *const c_char, mode: mode_t) -> c_int {
 /// # Safety
 /// Same contract as `libc::mkfifoat`.
 unsafe extern "C" fn my_mkfifoat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
-    policy::notify_create("mkfifoat", &cstr_to_string(path));
-    unsafe { libc::mkfifoat(dirfd, path, mode) }
+    unsafe {
+        call_path_create("mkfifoat", dirfd, path, || {
+            libc::mkfifoat(dirfd, path, mode)
+        })
+    }
 }
 
 /// Replacement for `link(2)` (M03.x.LINK). Creates a hardlink:
@@ -228,9 +352,7 @@ unsafe extern "C" fn my_mkfifoat(dirfd: c_int, path: *const c_char, mode: mode_t
 /// Same contract as `libc::link` — both paths must be valid
 /// NUL-terminated C strings.
 unsafe extern "C" fn my_link(src: *const c_char, dst: *const c_char) -> c_int {
-    let _ = src;
-    policy::notify_create("link", &cstr_to_string(dst));
-    unsafe { libc::link(src, dst) }
+    unsafe { call_path_create("link", libc::AT_FDCWD, dst, || libc::link(src, dst)) }
 }
 
 /// Replacement for `linkat(2)` (M03.x.LINK). The *at variant
@@ -250,8 +372,11 @@ unsafe extern "C" fn my_linkat(
     dst: *const c_char,
     flags: c_int,
 ) -> c_int {
-    policy::notify_create("linkat", &cstr_to_string(dst));
-    unsafe { libc::linkat(srcfd, src, dstfd, dst, flags) }
+    unsafe {
+        call_path_create("linkat", dstfd, dst, || {
+            libc::linkat(srcfd, src, dstfd, dst, flags)
+        })
+    }
 }
 
 /// Replacement for `chmod(2)`. M07.B.1.
@@ -616,8 +741,7 @@ fn fd_to_path(fd: c_int) -> Option<String> {
 /// # Safety
 /// Same contract as `libc::mkdirat`.
 unsafe extern "C" fn my_mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
-    policy::notify_create("mkdirat", &cstr_to_string(path));
-    unsafe { libc::mkdirat(dirfd, path, mode) }
+    unsafe { call_path_create("mkdirat", dirfd, path, || libc::mkdirat(dirfd, path, mode)) }
 }
 
 /// `__DATA,__interpose` table entry for `unlink`. The dynamic
@@ -1104,6 +1228,231 @@ mod tests {
         let want = std::fs::canonicalize(&p).unwrap();
         let got = std::fs::canonicalize(&resolved).unwrap();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn failed_mkdir_existing_emits_no_create_notification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = std::ffi::CString::new(tmp.path().to_str().unwrap()).unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "mkdir",
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                || libc::mkdir(path.as_ptr(), 0o755),
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+
+        assert_eq!(result, -1);
+        assert_eq!(errno, Some(libc::EEXIST));
+        assert!(
+            notifications.is_empty(),
+            "mkdir(existing) must not journal a Create"
+        );
+    }
+
+    #[test]
+    fn failed_mkdirat_existing_emits_no_create_notification() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("existing")).unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let path = std::ffi::CString::new("existing").unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "mkdirat",
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                || libc::mkdirat(dir.as_raw_fd(), path.as_ptr(), 0o755),
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+
+        assert_eq!(result, -1);
+        assert_eq!(errno, Some(libc::EEXIST));
+        assert!(
+            notifications.is_empty(),
+            "mkdirat(existing) must not journal a Create"
+        );
+    }
+
+    #[test]
+    fn failed_mkfifo_existing_emits_no_create_notification() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = std::ffi::CString::new(tmp.path().to_str().unwrap()).unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "mkfifo",
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                || libc::mkfifo(path.as_ptr(), 0o600),
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+
+        assert_eq!(result, -1);
+        assert!(
+            notifications.is_empty(),
+            "mkfifo(existing) must not journal a Create"
+        );
+    }
+
+    #[test]
+    fn failed_link_existing_destination_emits_no_create_notification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_path = tmp.path().join("source");
+        let destination_path = tmp.path().join("destination");
+        std::fs::write(&source_path, b"source").unwrap();
+        std::fs::write(&destination_path, b"destination").unwrap();
+        let source = std::ffi::CString::new(source_path.to_str().unwrap()).unwrap();
+        let destination = std::ffi::CString::new(destination_path.to_str().unwrap()).unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "link",
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                || libc::link(source.as_ptr(), destination.as_ptr()),
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+
+        assert_eq!(result, -1);
+        assert!(
+            notifications.is_empty(),
+            "link(existing-destination) must not journal a Create"
+        );
+    }
+
+    #[test]
+    fn successful_mkdirat_notification_uses_dirfd_path() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let path = std::ffi::CString::new("created-via-dirfd").unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "mkdirat",
+                dir.as_raw_fd(),
+                path.as_ptr(),
+                || libc::mkdirat(dir.as_raw_fd(), path.as_ptr(), 0o755),
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+
+        assert_eq!(result, 0);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, "mkdirat");
+        let expected = std::fs::canonicalize(tmp.path().join("created-via-dirfd")).unwrap();
+        assert_eq!(Path::new(&notifications[0].1), expected);
+        assert!(notifications[0].2.is_none());
+    }
+
+    #[test]
+    fn successful_linkat_notification_uses_destination_dirfd() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir_path = tmp.path().join("source-dir");
+        let destination_dir_path = tmp.path().join("destination-dir");
+        std::fs::create_dir(&source_dir_path).unwrap();
+        std::fs::create_dir(&destination_dir_path).unwrap();
+        std::fs::write(source_dir_path.join("source"), b"content").unwrap();
+        let source_dir = std::fs::File::open(&source_dir_path).unwrap();
+        let destination_dir = std::fs::File::open(&destination_dir_path).unwrap();
+        let source = std::ffi::CString::new("source").unwrap();
+        let destination = std::ffi::CString::new("destination").unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "linkat",
+                destination_dir.as_raw_fd(),
+                destination.as_ptr(),
+                || {
+                    libc::linkat(
+                        source_dir.as_raw_fd(),
+                        source.as_ptr(),
+                        destination_dir.as_raw_fd(),
+                        destination.as_ptr(),
+                        0,
+                    )
+                },
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+
+        assert_eq!(result, 0);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, "linkat");
+        let expected = std::fs::canonicalize(destination_dir_path.join("destination")).unwrap();
+        assert_eq!(Path::new(&notifications[0].1), expected);
+        assert!(notifications[0].2.is_none());
+    }
+
+    #[test]
+    fn successful_create_notification_preserves_absolute_fallback_and_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let candidate = tmp.path().join("missing-parent").join("child");
+        let path = std::ffi::CString::new(candidate.to_str().unwrap()).unwrap();
+        let mut notifications = Vec::new();
+
+        let result = unsafe {
+            call_path_create_with(
+                "mkdir",
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                || 0,
+                |syscall, path, failure| {
+                    notifications.push((syscall.to_string(), path.to_string(), failure));
+                },
+            )
+        };
+
+        assert_eq!(result, 0);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, "mkdir");
+        assert_eq!(Path::new(&notifications[0].1), candidate);
+        match notifications[0]
+            .2
+            .as_ref()
+            .expect("failed canonicalization must remain observable")
+        {
+            shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg,
+                attempted_path,
+                ..
+            } => {
+                assert_eq!(which_arg, "path");
+                assert_eq!(Path::new(attempted_path), candidate);
+            }
+        }
     }
 
     /// Cross-cutting: count of expected interpose entries.

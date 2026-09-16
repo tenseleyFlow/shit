@@ -812,6 +812,10 @@ mod policy {
         IN_NOTIFY.with(|f| f.set(false));
     }
 
+    // macOS create-only wrappers use `notify_create_resolved` so they can
+    // preserve the dirfd-resolved path and its structured AU10 failure.
+    // Linux/BSD still call this canonicalizing form.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn notify_create(syscall: &'static str, path: &str) {
         if should_skip_path(path) {
             return;
@@ -826,6 +830,23 @@ mod policy {
             return;
         }
         notify_inner_with_failure(syscall, &abs, None, failure);
+    }
+
+    /// macOS create-only interposers resolve the canonical parent + lexical
+    /// basename before calling libc, then notify only after libc succeeds.
+    /// Trust that already-absolute destination here: canonicalizing the final
+    /// name post-syscall could follow a replacement raced in by another thread
+    /// and journal an inverse for the wrong path.
+    #[cfg(target_os = "macos")]
+    pub(super) fn notify_create_resolved(
+        syscall: &'static str,
+        path: &str,
+        failure: Option<shit_proto::ShimFailure>,
+    ) {
+        if should_skip_path(path) {
+            return;
+        }
+        notify_inner_with_failure(syscall, path, None, failure);
     }
 
     /// W09.11 — paths whose mutations are NOT user-visible state
