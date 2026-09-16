@@ -2281,20 +2281,32 @@ fn request_loop(
                     target_os = "openbsd",
                     target_os = "dragonfly",
                 ))]
-                if let Some(ctrl) = &bsd_capture {
-                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                {
+                    let Some(ctrl) = &bsd_capture else {
+                        tracing::error!(
+                            %session,
+                            command_seq,
+                            "BSD capture runtime unavailable; withholding WatchTreeReady"
+                        );
+                        continue;
+                    };
+                    if let Err(e) = ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path) {
+                        tracing::error!(
+                            err = %e,
+                            %session,
+                            command_seq,
+                            root_pid,
+                            cwd_path = %cwd_path,
+                            "BSD watch attach failed; withholding WatchTreeReady"
+                        );
+                        continue;
+                    }
                     tracing::info!(
                         %session,
                         command_seq,
                         root_pid,
                         cwd_path = %cwd_path,
-                        "watch_tree dispatched to bsd capture"
-                    );
-                } else {
-                    tracing::debug!(
-                        %session,
-                        command_seq,
-                        "watch_tree ignored — no bsd capture (degraded)"
+                        "BSD watch registered and baseline complete"
                     );
                 }
                 #[cfg(target_os = "macos")]
