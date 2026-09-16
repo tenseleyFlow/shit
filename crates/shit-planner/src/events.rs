@@ -118,6 +118,15 @@ pub enum FilePreImageSource {
     /// capture alone.
     #[default]
     Other,
+    /// The captured metadata came from a `chflags` / `fchflags`
+    /// interposer before the syscall ran. The inline bytes are an
+    /// implementation detail of the shim wire; the planner must emit
+    /// only a flags restore for this source, not content or broad
+    /// metadata restores.
+    ///
+    /// Keep new variants appended: postcard encodes enum discriminants
+    /// positionally and persisted journals may contain older values.
+    ShimFlagsPreMutation,
 }
 
 impl FilePreImageSource {

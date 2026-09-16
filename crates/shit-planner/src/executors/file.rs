@@ -3,8 +3,8 @@
 //! File-tier executor (S11 stage 1 skeleton).
 //!
 //! Handles every [`InverseTier::Files`](crate::inverse::InverseTier::Files)
-//! variant: `RestoreContent`, `RestoreMetadata`, `Unlink`, `RecreatePath`,
-//! `Rename`, `CreateSymlink`.
+//! variant: `RestoreContent`, `RestoreMetadata`, `RestoreFlags`, `Unlink`,
+//! `RecreatePath`, `Rename`, `CreateSymlink`.
 //!
 //! ## Stage progression
 //!
@@ -81,6 +81,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
         match op {
             InverseOp::RestoreContent { .. } => self.apply_restore_content(op),
             InverseOp::RestoreMetadata { .. } => self.apply_restore_metadata(op),
+            InverseOp::RestoreFlags { .. } => self.apply_restore_flags(op),
             InverseOp::Unlink { .. } => self.apply_unlink(op),
             InverseOp::RecreatePath { .. } => self.apply_recreate_path(op),
             InverseOp::Rename { .. } => self.apply_rename(op),
@@ -216,6 +217,18 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                 }
             }
             Err(MetadataRestoreError::Other(e)) => ExecutionOutcome::Failed { err: e },
+        }
+    }
+
+    fn apply_restore_flags(&self, op: &InverseOp) -> ExecutionOutcome {
+        let InverseOp::RestoreFlags { path, flags, .. } = op else {
+            return ExecutionOutcome::Failed {
+                err: "apply_restore_flags: wrong variant".into(),
+            };
+        };
+        match restore_flags_value(path, *flags) {
+            Ok(()) => ExecutionOutcome::Applied,
+            Err(err) => ExecutionOutcome::Failed { err },
         }
     }
 
@@ -455,12 +468,14 @@ fn restore_metadata_inner(
     // M03.x.SETATTR — restore BSD/macOS st_flags via chflags(2). Must
     // run AFTER mtime / chmod because UF_IMMUTABLE / SF_IMMUTABLE
     // (once set) refuse further mutations to the file's metadata. On
-    // Linux flags is always 0; restore_flags_only no-ops there.
+    // Linux has no st_flags; this block is compiled only on the two
+    // platforms whose libc exposes chflags.
     //
     // System flags (SF_*) need root; falling back to a privileged-
     // helper round-trip for those is a follow-up. UF_* (user flags
     // like UF_HIDDEN, UF_IMMUTABLE) work for the file's owner.
-    if let Err(e) = restore_flags_only(path, target) {
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    if let Err(e) = restore_flags_value(path, target.flags) {
         // Best-effort: log + continue rather than fail the whole
         // restore. SF_* flag restoration without root is the typical
         // benign-EPERM case; we surface it but don't block undo.
@@ -480,7 +495,7 @@ fn restore_metadata_inner(
 /// (cheap probe avoids the syscall on the common "flags didn't change"
 /// path).
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Result<(), String> {
+fn restore_flags_value(path: &Path, target_flags: u32) -> Result<(), String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -499,30 +514,26 @@ fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
             std::io::Error::last_os_error()
         ));
     }
-    // `st_flags` type diverges across BSDs: Apple keeps it `c_uint`
-    // (u32); FreeBSD widened to `c_ulong` (u64 on 64-bit hosts).
-    // Coerce both to u32 for the comparison — every defined chflags
-    // constant fits in 32 bits (UF_* in the low half, SF_* in the
-    // high half of u32), so the narrowing is lossless.
+    // libc exposes `st_flags` as u32 on both Apple and FreeBSD.
     #[cfg(target_os = "macos")]
     let current_flags: u32 = st.st_flags;
     #[cfg(target_os = "freebsd")]
-    let current_flags: u32 = st.st_flags as u32;
-    if current_flags == target.flags {
+    let current_flags: u32 = st.st_flags;
+    if current_flags == target_flags {
         return Ok(());
     }
     // SAFETY: c_path is valid; chflags takes path + flags. Same
     // divergence: Apple chflags takes c_uint, FreeBSD takes c_ulong.
     // `target.flags` is u32; widen only on FreeBSD.
     #[cfg(target_os = "macos")]
-    let flags_arg: libc::c_uint = target.flags;
+    let flags_arg: libc::c_uint = target_flags;
     #[cfg(target_os = "freebsd")]
-    let flags_arg: libc::c_ulong = u64::from(target.flags);
+    let flags_arg: libc::c_ulong = u64::from(target_flags);
     let rc = unsafe { libc::chflags(c_path.as_ptr(), flags_arg) };
     if rc != 0 {
         return Err(format!(
             "chflags {path:?} -> 0x{:x}: {}",
-            target.flags,
+            target_flags,
             std::io::Error::last_os_error()
         ));
     }
@@ -530,8 +541,8 @@ fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-fn restore_flags_only(_path: &Path, _target: &crate::metadata::FileMetadata) -> Result<(), String> {
-    Ok(())
+fn restore_flags_value(_path: &Path, _target_flags: u32) -> Result<(), String> {
+    Err("RestoreFlags is unsupported on this operating system".into())
 }
 
 /// Apply mtime alone — used after a successful helper-routed chown
@@ -727,6 +738,57 @@ mod tests {
             e.execute(&op, true, ConflictPolicy::default()),
             ExecutionOutcome::WouldApply
         );
+    }
+
+    #[test]
+    fn restore_flags_is_a_file_tier_dry_run() {
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RestoreFlags {
+            inode: InodeRef::new(1, 1),
+            path: PathBuf::from("/tmp/flags"),
+            flags: 0,
+        };
+        assert!(e.supports(&op));
+        assert_eq!(
+            e.execute(&op, true, ConflictPolicy::default()),
+            ExecutionOutcome::WouldApply
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn restore_flags_dispatches_on_supported_platform() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("flags");
+        std::fs::write(&path, b"x").expect("write");
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RestoreFlags {
+            inode: InodeRef::new(1, 1),
+            path,
+            flags: 0,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    #[test]
+    fn restore_flags_fails_honestly_on_unsupported_platform() {
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::RestoreFlags {
+            inode: InodeRef::new(1, 1),
+            path: PathBuf::from("/tmp/flags"),
+            flags: 0,
+        };
+        assert!(matches!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Failed { err } if err.contains("unsupported")
+        ));
     }
 
     #[test]

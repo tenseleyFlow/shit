@@ -406,6 +406,18 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                     })
                 }
             }
+            InverseOp::RestoreFlags { inode, path, .. } => match self.probe.stat(path) {
+                None => Some(Conflict::Missing {
+                    detail: format!("{path:?} no longer exists"),
+                }),
+                Some(stat) if stat.inode != *inode => Some(Conflict::Phantom {
+                    detail: format!(
+                        "{path:?} now refers to inode {:?}, expected {:?}",
+                        stat.inode, inode
+                    ),
+                }),
+                Some(_) => None,
+            },
             InverseOp::RecreatePath { path, kind, .. } => {
                 // G03 — a RecreatePath{Directory} that lands AFTER a
                 // child's RestoreContent has had to mkdir -p this path
@@ -568,6 +580,36 @@ mod tests {
         let r = orc.run(&plan, false, ConflictPolicy::Abort);
         assert_eq!(r.records.len(), 1);
         assert_eq!(r.records[0].outcome_kind, OutcomeKind::ConflictMissing);
+    }
+
+    #[test]
+    fn restore_flags_refuses_replacement_inode_at_execute_time() {
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let path = PathBuf::from("/tmp/replaced-flags-target");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 2),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let orc = Orchestrator::new(&exec, &probe);
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreFlags {
+                inode: InodeRef::new(1, 1),
+                path,
+                flags: 0,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        let report = orc.run(&plan, false, ConflictPolicy::Abort);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::ConflictPhantom);
     }
 
     #[test]
