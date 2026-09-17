@@ -267,7 +267,7 @@ fn render_tree_op(w: &mut dyn Write, kind_json: &str) -> std::io::Result<()> {
     };
     if let Some((variant, inner)) = obj.iter().next() {
         match variant.as_str() {
-            "Create" | "Unlink" | "SymlinkRemoved" => {
+            "Create" | "Unlink" | "SymlinkRemoved" | "SymlinkRemovedIdentified" => {
                 let path = inner
                     .get("path")
                     .and_then(|v| v.as_str())

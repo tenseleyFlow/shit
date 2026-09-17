@@ -503,10 +503,12 @@ fn to_op_wire(op: RedirectOp) -> RedirectOpWire {
 
 /// Block until the daemon confirms helper-side capture readiness for
 /// (session, command_seq), or the timeout fires. Connection failures
-/// degrade silently: a fresh shell with no daemon yet shouldn't fail
-/// PreExec at the hook layer (the user's command would have run
-/// without capture anyway -- we're not making it worse). The hook
-/// has already journaled the PreExec via the datagram path.
+/// remain fail-open at the shell boundary: a fresh shell with no daemon yet
+/// must not prevent the user's command from running. When the daemon is
+/// reachable, every not-ready outcome is durably recorded as a command-atomic
+/// capture refusal before this call returns. If the daemon itself is
+/// unreachable, no process is available to persist that refusal; this is an
+/// explicit availability-over-capture limitation of the current hook model.
 fn wait_watch_ready(p: &PostSend) -> Result<()> {
     let req = CtlRequest::WaitWatchReady {
         session: p.session,
@@ -523,10 +525,9 @@ fn wait_watch_ready(p: &PostSend) -> Result<()> {
             ready: false,
             reason,
         } => {
-            // Don't fail the hook -- the command will run with
-            // possibly-degraded capture. The daemon will have logged
-            // why; the shell user doesn't need a scary error here.
-            // (`reason` ends up in our stderr for debug visibility.)
+            // Don't fail the hook -- the command still runs, but the daemon
+            // has made this command non-undoable by journaling CaptureRefused.
+            // Surface the reason for immediate operator visibility.
             eprintln!(
                 "shit: PreExec wait-watch-ready returned not-ready (reason: {})",
                 reason.as_deref().unwrap_or("?")

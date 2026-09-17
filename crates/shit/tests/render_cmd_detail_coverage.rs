@@ -99,6 +99,7 @@ const RENDERED_TREE_OPS: &[&str] = &[
     "Link",
     "Symlink",
     "SymlinkRemoved",
+    "SymlinkRemovedIdentified",
 ];
 
 #[test]

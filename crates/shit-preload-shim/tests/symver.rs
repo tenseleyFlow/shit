@@ -13,7 +13,7 @@
 //! statically.
 //!
 //! The test is FreeBSD-only (the `.symver` block is cfg-gated to
-//! BSD and Linux doesn't need versioned exports), and runs at
+//! FreeBSD and Linux/other BSDs don't use these version names), and runs at
 //! `cargo test --release -p shit-preload-shim --test symver`.
 
 #![cfg(target_os = "freebsd")]
@@ -28,6 +28,8 @@ use std::process::Command;
 const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
     ("open", "FBSD_1.0"),
     ("unlink", "FBSD_1.0"),
+    ("rmdir", "FBSD_1.0"),
+    ("remove", "FBSD_1.0"),
     ("rename", "FBSD_1.0"),
     ("truncate", "FBSD_1.0"),
     ("ftruncate", "FBSD_1.0"),

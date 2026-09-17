@@ -34,6 +34,35 @@ use shit_proto::{
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::Mutex;
+
+/// Bound a producer's time inside a blocking socket write. In particular, an
+/// `UnwatchTree` drain must be able to fail closed instead of hanging forever
+/// when the daemon is alive but no longer consuming helper responses.
+const SEND_TIMEOUT_SECS: libc::time_t = 1;
+
+fn set_send_timeout(fd: RawFd) -> std::io::Result<()> {
+    let timeout = libc::timeval {
+        tv_sec: SEND_TIMEOUT_SECS,
+        tv_usec: 0,
+    };
+    // SAFETY: `timeout` is a live `timeval`, its byte size is passed exactly,
+    // and `fd` remains owned by the caller for the duration of setsockopt.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            std::ptr::from_ref(&timeout).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnError {
@@ -55,6 +84,11 @@ pub enum ConnError {
 #[derive(Debug)]
 pub struct Conn {
     fd: OwnedFd,
+    /// macOS uses a STREAM socket, so one logical frame can require more than
+    /// one `send(2)` call. Capture producers share this connection across
+    /// threads; without a connection-wide lock, frame tails (and SCM_RIGHTS)
+    /// can interleave and corrupt the daemon's stream.
+    send_lock: Mutex<()>,
 }
 
 impl Conn {
@@ -63,18 +97,39 @@ impl Conn {
         self.fd.as_raw_fd()
     }
 
-    /// Send a `HelperResponse` to the daemon.
-    pub fn send_response(&self, msg: &HelperResponse) -> Result<(), ConnError> {
-        let frame = encode_frame(msg)?;
-        let mut sent = 0;
+    /// A timed-out write may have placed only a frame prefix on macOS's
+    /// STREAM transport. The peer cannot safely resynchronize, so every send
+    /// failure permanently shuts down this connection.
+    fn poison_after_send_failure(&self) {
+        let _ = shutdown(self.fd.as_raw_fd(), Shutdown::Both);
+    }
+
+    fn send_tail(&self, frame: &[u8], mut sent: usize) -> Result<(), ConnError> {
         while sent < frame.len() {
-            let n = send(self.fd.as_raw_fd(), &frame[sent..], MsgFlags::empty())?;
+            let n = match send(self.fd.as_raw_fd(), &frame[sent..], MsgFlags::empty()) {
+                Ok(n) => n,
+                Err(error) => {
+                    self.poison_after_send_failure();
+                    return Err(error.into());
+                }
+            };
             if n == 0 {
+                self.poison_after_send_failure();
                 return Err(ConnError::PeerClosed);
             }
             sent += n;
         }
         Ok(())
+    }
+
+    /// Send a `HelperResponse` to the daemon.
+    pub fn send_response(&self, msg: &HelperResponse) -> Result<(), ConnError> {
+        let _send_guard = self
+            .send_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let frame = encode_frame(msg)?;
+        self.send_tail(&frame, 0)
     }
 
     /// Send a `HelperResponse` with a single `RawFd` attached via
@@ -93,44 +148,39 @@ impl Conn {
         msg: &HelperResponse,
         attach: RawFd,
     ) -> Result<(), ConnError> {
+        let _send_guard = self
+            .send_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let frame = encode_frame(msg)?;
         let iov = [std::io::IoSlice::new(&frame)];
         let fds = [attach];
         let cmsgs = [ControlMessage::ScmRights(&fds)];
         // SAFETY (the nix wrapper): iov + cmsgs outlive the call; fd is
         // owned by us; we don't take an address (None).
-        let n = sendmsg::<()>(self.fd.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None)?;
+        let n = match sendmsg::<()>(self.fd.as_raw_fd(), &iov, &cmsgs, MsgFlags::empty(), None) {
+            Ok(n) => n,
+            Err(error) => {
+                self.poison_after_send_failure();
+                return Err(error.into());
+            }
+        };
         if n == 0 {
+            self.poison_after_send_failure();
             return Err(ConnError::PeerClosed);
         }
-        let mut sent = n;
-        while sent < frame.len() {
-            let m = send(self.fd.as_raw_fd(), &frame[sent..], MsgFlags::empty())?;
-            if m == 0 {
-                return Err(ConnError::PeerClosed);
-            }
-            sent += m;
-        }
-        Ok(())
+        self.send_tail(&frame, n)
     }
 
     /// Send a `HelperRequest` (used by tests + the daemon-side stub).
     #[allow(dead_code)]
     pub fn send_request(&self, msg: &HelperRequest) -> Result<(), ConnError> {
+        let _send_guard = self
+            .send_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let frame = encode_frame(msg)?;
-        let mut sent = 0;
-        while sent < frame.len() {
-            let n = send(
-                self.fd.as_raw_fd(),
-                &frame[sent..],
-                nix::sys::socket::MsgFlags::empty(),
-            )?;
-            if n == 0 {
-                return Err(ConnError::PeerClosed);
-            }
-            sent += n;
-        }
-        Ok(())
+        self.send_tail(&frame, 0)
     }
 
     /// Receive one `HelperRequest` frame. SEQPACKET preserves boundaries
@@ -310,7 +360,10 @@ impl Conn {
     /// already has an accepted SEQPACKET fd from `accept(2)`.
     #[allow(dead_code)]
     pub fn from_fd(fd: OwnedFd) -> Self {
-        Self { fd }
+        Self {
+            fd,
+            send_lock: Mutex::new(()),
+        }
     }
 }
 
@@ -327,7 +380,11 @@ pub async fn connect_seqpacket(path: &Path) -> Result<Conn, ConnError> {
     )?;
     let addr = UnixAddr::new(path)?;
     nix::sys::socket::connect(fd.as_raw_fd(), &addr)?;
-    Ok(Conn { fd })
+    set_send_timeout(fd.as_raw_fd())?;
+    Ok(Conn {
+        fd,
+        send_lock: Mutex::new(()),
+    })
 }
 
 /// Back-compat alias for the S06.3 stub.
@@ -346,7 +403,7 @@ pub fn socketpair() -> Result<(Conn, Conn), ConnError> {
         None,
         SockFlag::empty(),
     )?;
-    Ok((Conn { fd: a }, Conn { fd: b }))
+    Ok((Conn::from_fd(a), Conn::from_fd(b)))
 }
 
 #[cfg(test)]

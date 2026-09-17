@@ -71,6 +71,7 @@ impl ActiveCommands {
     /// Returns `true` if the command was removed; `false` if it was
     /// already gone (orphan PostExec — already logged as a warning
     /// elsewhere).
+    #[allow(dead_code)]
     pub fn remove(&self, shell_pid: u32, command: CommandId) -> bool {
         let Ok(mut g) = self.inner.lock() else {
             return false;
@@ -84,6 +85,41 @@ impl ActiveCommands {
         stack.remove(idx);
         if stack.is_empty() {
             g.remove(&shell_pid);
+        }
+        true
+    }
+
+    /// Find the shell pid that owns an exact command. This is a recovery path
+    /// for PostExec when the durable command row could not be read; normal
+    /// finalization already has the pid from `CommandRecord`.
+    pub fn shell_pid_for(&self, command: CommandId) -> Option<u32> {
+        let g = self.inner.lock().ok()?;
+        g.iter()
+            .find_map(|(pid, stack)| stack.contains(&command).then_some(*pid))
+    }
+
+    /// Remove an exact command without requiring its shell pid. Used only on
+    /// close/error paths so a missing durable command row cannot leave stale
+    /// attribution state behind.
+    pub fn remove_command(&self, command: CommandId) -> bool {
+        let Ok(mut g) = self.inner.lock() else {
+            return false;
+        };
+        let owner = g.iter().find_map(|(pid, stack)| {
+            stack
+                .iter()
+                .position(|candidate| *candidate == command)
+                .map(|index| (*pid, index))
+        });
+        let Some((pid, index)) = owner else {
+            return false;
+        };
+        let stack = g
+            .get_mut(&pid)
+            .expect("owner was discovered while holding the same map lock");
+        stack.remove(index);
+        if stack.is_empty() {
+            g.remove(&pid);
         }
         true
     }
@@ -124,6 +160,22 @@ impl ActiveCommands {
             .map(|g| g.values().map(|v| v.len()).sum())
             .unwrap_or(0)
     }
+
+    /// Deterministic, de-duplicated snapshot of every command currently in
+    /// flight. Used by process-wide capture health failures (for example, a
+    /// helper disconnect) that must refuse all affected commands at once.
+    pub fn snapshot(&self) -> Vec<CommandId> {
+        self.inner
+            .lock()
+            .map(|g| {
+                g.values()
+                    .flat_map(|stack| stack.iter().copied())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +210,19 @@ mod tests {
         assert!(!a.remove(1234, cmd(2)));
         // Wrong pid.
         assert!(!a.remove(9999, cmd(1)));
+    }
+
+    #[test]
+    fn command_keyed_lookup_and_removal_do_not_need_durable_pid() {
+        let a = ActiveCommands::new();
+        a.insert(1234, cmd(1));
+        a.insert(1234, cmd(2));
+        assert_eq!(a.shell_pid_for(cmd(1)), Some(1234));
+        assert!(a.remove_command(cmd(1)));
+        assert_eq!(a.shell_pid_for(cmd(1)), None);
+        assert_eq!(a.shell_pid_for(cmd(2)), Some(1234));
+        assert!(a.remove_command(cmd(2)));
+        assert_eq!(a.tracked_shell_count(), 0);
     }
 
     #[test]
@@ -251,5 +316,16 @@ mod tests {
         }
         h.join().unwrap();
         assert_eq!(a.active_command_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_is_deduplicated_and_deterministic() {
+        let a = ActiveCommands::new();
+        a.insert(2000, cmd(3));
+        a.insert(1000, cmd(2));
+        a.insert(1000, cmd(1));
+        a.insert(3000, cmd(2));
+
+        assert_eq!(a.snapshot(), vec![cmd(1), cmd(2), cmd(3)]);
     }
 }

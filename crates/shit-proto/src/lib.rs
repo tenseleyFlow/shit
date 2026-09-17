@@ -118,6 +118,8 @@ pub use helper::{
 };
 pub use shim::{
     SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage, XattrPreImage,
+    decode_shim_notification_frame, decode_shim_notification_frame_large,
+    encode_shim_notification_frame, encode_shim_notification_frame_large,
 };
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.

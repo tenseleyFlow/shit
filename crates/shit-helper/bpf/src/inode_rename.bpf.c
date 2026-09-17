@@ -54,6 +54,7 @@ int BPF_PROG(shit_inode_rename,
     struct shit_rename_event *e =
         bpf_ringbuf_reserve(&rename_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return 0;
     }
 

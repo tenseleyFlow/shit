@@ -170,6 +170,16 @@ pub struct es_event_fork_t {
     pub _reserved: [u8; 64],
 }
 
+/// Prefix-complete `es_event_exec_t`. The post-exec target carries the new
+/// pidversion and credentials; the remaining bytes preserve the SDK ABI
+/// without exposing version-gated fields that this capture path does not use.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_exec_t {
+    pub target: *const es_process_t,
+    pub _remaining: [u8; 80],
+}
+
 /// `es_destination_type_t` discriminant for `es_event_rename_t.destination`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +205,6 @@ impl es_destination_type_t {
 pub struct es_event_rename_new_path_t {
     pub dir: *const es_file_t,
     pub filename: es_string_token_t,
-    pub filename_truncated: bool,
 }
 
 /// `es_event_rename_t.destination` union. The active variant is
@@ -296,6 +305,7 @@ pub struct es_event_utimes_t {
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub union es_events_t {
+    pub exec: std::mem::ManuallyDrop<es_event_exec_t>,
     pub unlink: std::mem::ManuallyDrop<es_event_unlink_t>,
     pub rename: std::mem::ManuallyDrop<es_event_rename_t>,
     pub truncate: std::mem::ManuallyDrop<es_event_truncate_t>,
@@ -332,16 +342,37 @@ impl es_action_type_t {
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct es_event_id_t {
-    pub _opaque: [u64; 4],
+    pub _opaque: [u8; 32],
 }
 
-/// `es_result_t` from ESMessage.h — the result variant of the
-/// action union for NOTIFY events. We don't access it in M03.1.G;
-/// `[u64; 4]` matches Apple's documented size.
+/// `es_result_type_t` discriminates the result union in a NOTIFY message.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct es_result_type_t(pub u32);
+
+impl es_result_type_t {
+    pub const AUTH: Self = Self(0);
+    pub const FLAGS: Self = Self(1);
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub union es_result_value_t {
+    pub auth: u32,
+    pub flags: u32,
+    pub reserved: [u8; 32],
+}
+
+/// `es_result_t` from ESMessage.h — the authorization result carried by a
+/// NOTIFY message.  Its C size is 36 bytes with 4-byte alignment.  Modeling
+/// this exactly is important: the containing action union begins at offset 60
+/// and `event_type` begins at offset 96 in Apple's `es_message_t`.
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct es_result_t {
-    pub _opaque: [u64; 4],
+    pub result_type: es_result_type_t,
+    pub result: es_result_value_t,
 }
 
 /// `es_message_t.action` union — auth event id or notify result.
@@ -352,14 +383,20 @@ pub union es_action_t {
     pub notify: std::mem::ManuallyDrop<es_result_t>,
 }
 
+/// `es_thread_t` became available in message version 4.  The stable thread
+/// id is the strongest field Apple exposes for pairing an AUTH request with
+/// its later NOTIFY event; the opaque auth id is not repeated in NOTIFY.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_thread_t {
+    pub thread_id: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // es_message_t — top-level message (prefix layout only)
 // ─────────────────────────────────────────────────────────────────────
 
-/// `es_message_t` from ESMessage.h, prefix layout up to and including
-/// the `event` union. Trailing fields (thread_id, global_seq_num,
-/// version-specific additions) exist in the kernel memory but we
-/// don't access them, so they're omitted from this struct.
+/// `es_message_t` from ESMessage.h through the version-4 correlation fields.
 ///
 /// All field offsets up to `event` MUST match Apple's exactly, or
 /// our decode reads garbage. The reference for the layout is
@@ -378,6 +415,8 @@ pub struct es_message_t {
     pub action: es_action_t,
     pub event_type: super::sys::es_event_type_t,
     pub event: es_events_t,
+    pub thread: *const es_thread_t,
+    pub global_seq_num: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -424,6 +463,60 @@ impl<'a> EsMessage<'a> {
         unsafe { (*self.raw).event_type }
     }
 
+    /// EndpointSecurity message ABI version.
+    pub fn version(&self) -> u32 {
+        // SAFETY: `raw` is valid for this wrapper's lifetime.
+        unsafe { (*self.raw).version }
+    }
+
+    /// Kernel monotonic timestamp at which this event was generated.
+    pub fn mach_time(&self) -> u64 {
+        // SAFETY: part of the base message layout in every version.
+        unsafe { (*self.raw).mach_time }
+    }
+
+    /// Per-client global sequence number, available in version 4+.
+    pub fn global_seq_num(&self) -> Option<u64> {
+        (self.version() >= 4).then(|| {
+            // SAFETY: the field exists for message version >= 4.
+            unsafe { (*self.raw).global_seq_num }
+        })
+    }
+
+    /// Kernel thread id for message-version 4 and newer.  Returning `None`
+    /// for older messages deliberately prevents weak AUTH/NOTIFY pairing.
+    pub fn thread_id(&self) -> Option<u64> {
+        if self.version() < 4 {
+            return None;
+        }
+        // SAFETY: the field exists for version >= 4; Apple permits NULL when
+        // a thread is not applicable.
+        unsafe { (*self.raw).thread.as_ref().map(|thread| thread.thread_id) }
+    }
+
+    /// Authorization result attached to a NOTIFY message.
+    ///
+    /// `Ok(true/false)` is used by ordinary AUTH-result events.  `Err(flags)`
+    /// represents AUTH_OPEN's flags result.  AUTH messages and malformed
+    /// discriminants return `None`.
+    pub fn notify_result(&self) -> Option<Result<bool, u32>> {
+        // SAFETY: `raw` is valid and reading the action discriminant precedes
+        // selecting the union member.
+        unsafe {
+            if (*self.raw).action_type != es_action_type_t::NOTIFY {
+                return None;
+            }
+            let result = &*(&(*self.raw).action.notify as *const _ as *const es_result_t);
+            if result.result_type == es_result_type_t::AUTH {
+                Some(Ok(result.result.auth == 0))
+            } else if result.result_type == es_result_type_t::FLAGS {
+                Some(Err(result.result.flags))
+            } else {
+                None
+            }
+        }
+    }
+
     /// `audit_token_t` of the process that took the action. The
     /// kernel-stable identity; used by M03.1.H tree-filtering.
     ///
@@ -446,7 +539,9 @@ impl<'a> EsMessage<'a> {
     /// `Some(&es_event_unlink_t)` iff `event_type == AUTH_UNLINK`.
     /// Reading any other variant via the union would be UB.
     pub fn as_unlink(&self) -> Option<&'a es_event_unlink_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_UNLINK {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_UNLINK
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_UNLINK
+        {
             return None;
         }
         // SAFETY: discriminant check above guarantees the union
@@ -485,7 +580,9 @@ impl<'a> EsMessage<'a> {
 
     /// `Some(&es_event_rename_t)` iff `event_type == AUTH_RENAME`.
     pub fn as_rename(&self) -> Option<&'a es_event_rename_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_RENAME {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_RENAME
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_RENAME
+        {
             return None;
         }
         // SAFETY: discriminant guarantees the union variant.
@@ -494,7 +591,9 @@ impl<'a> EsMessage<'a> {
 
     /// `Some(&es_event_truncate_t)` iff `event_type == AUTH_TRUNCATE`.
     pub fn as_truncate(&self) -> Option<&'a es_event_truncate_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_TRUNCATE {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_TRUNCATE
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_TRUNCATE
+        {
             return None;
         }
         // SAFETY: discriminant guarantees the union variant.
@@ -503,7 +602,9 @@ impl<'a> EsMessage<'a> {
 
     /// `Some(&es_event_open_t)` iff `event_type == AUTH_OPEN`.
     pub fn as_open(&self) -> Option<&'a es_event_open_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_OPEN {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_OPEN
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_OPEN
+        {
             return None;
         }
         // SAFETY: discriminant guarantees the union variant.
@@ -511,7 +612,9 @@ impl<'a> EsMessage<'a> {
     }
 
     pub fn as_setmode(&self) -> Option<&'a es_event_setmode_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_SETMODE {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_SETMODE
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_SETMODE
+        {
             return None;
         }
         // SAFETY: discriminant guarantees the union variant.
@@ -519,7 +622,9 @@ impl<'a> EsMessage<'a> {
     }
 
     pub fn as_setowner(&self) -> Option<&'a es_event_setowner_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_SETOWNER {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_SETOWNER
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_SETOWNER
+        {
             return None;
         }
         // SAFETY: discriminant guarantees the union variant.
@@ -527,7 +632,9 @@ impl<'a> EsMessage<'a> {
     }
 
     pub fn as_utimes(&self) -> Option<&'a es_event_utimes_t> {
-        if self.event_type() != super::sys::es_event_type_t::AUTH_UTIMES {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_UTIMES
+            && self.event_type() != super::sys::es_event_type_t::NOTIFY_UTIMES
+        {
             return None;
         }
         // SAFETY: discriminant guarantees the union variant.
@@ -579,6 +686,21 @@ impl<'a> EsMessage<'a> {
         // SAFETY: child is non-null *const es_process_t valid for
         // the message lifetime; audit_token at offset 0.
         unsafe { Some((*event.child).audit_token) }
+    }
+
+    /// Post-exec identity from `NOTIFY_EXEC`. Unlike `msg.process`, which is
+    /// the pre-exec process, this token contains the new pidversion and any
+    /// set-id credential transition.
+    pub fn exec_target_audit_token(&self) -> Option<audit_token_t> {
+        if self.event_type() != super::sys::es_event_type_t::NOTIFY_EXEC {
+            return None;
+        }
+        // SAFETY: the discriminant selects `event.exec`; `target` is declared
+        // non-null by EndpointSecurity but is still checked defensively.
+        unsafe {
+            let event = &*(&(*self.raw).event.exec as *const _ as *const es_event_exec_t);
+            event.target.as_ref().map(|target| target.audit_token)
+        }
     }
 }
 
@@ -712,6 +834,26 @@ mod tests {
         // this catches it.
         assert_eq!(es_action_type_t::AUTH.0, 0);
         assert_eq!(es_action_type_t::NOTIFY.0, 1);
+    }
+
+    #[test]
+    fn message_v4_layout_matches_endpointsecurity_header() {
+        // Values verified against the macOS SDK's ESMessage.h with clang's
+        // record-layout dump.  In particular, es_result_t is 36 (not 32)
+        // bytes and the reduced event union must retain Apple's 104-byte
+        // extent or the v4 thread/global sequence fields shift.
+        assert_eq!(std::mem::size_of::<es_result_t>(), 36);
+        assert_eq!(std::mem::align_of::<es_result_t>(), 4);
+        assert_eq!(std::mem::size_of::<es_action_t>(), 36);
+        assert_eq!(std::mem::size_of::<es_event_rename_new_path_t>(), 24);
+        assert_eq!(std::mem::size_of::<es_event_rename_t>(), 104);
+        assert_eq!(std::mem::size_of::<es_event_exec_t>(), 88);
+        assert_eq!(std::mem::size_of::<es_events_t>(), 104);
+        assert_eq!(std::mem::offset_of!(es_message_t, event_type), 96);
+        assert_eq!(std::mem::offset_of!(es_message_t, event), 104);
+        assert_eq!(std::mem::offset_of!(es_message_t, thread), 208);
+        assert_eq!(std::mem::offset_of!(es_message_t, global_seq_num), 216);
+        assert_eq!(std::mem::size_of::<es_message_t>(), 224);
     }
 
     #[test]

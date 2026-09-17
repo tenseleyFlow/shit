@@ -5,8 +5,8 @@
 //! Invariants exercised:
 //!
 //! 1. **Determinism** — plan() is a pure function. Same input → same output.
-//! 2. **Partial drop** — number of partial events in input equals the dropped
-//!    count in the resulting `PartialEvents` warning.
+//! 2. **Partial refusal** — any partial event makes undo and forward planning
+//!    refusal-only; its count remains visible in `PartialEvents`.
 //! 3. **Blob/restore coherence** — every `RestoreContent` op either has its
 //!    blob in the store or carries a `Missing` conflict.
 //! 4. **Reverse-chronological order** — for any two non-partial events e1 < e2
@@ -20,6 +20,7 @@ use shit_planner::events::{CaptureEvent, CaptureEventKind, CommandId, EventId, T
 use shit_planner::inode::{BlobHash, InodeRef};
 use shit_planner::inverse::{Conflict, InverseOp, PlanWarning, UndoPlan};
 use shit_planner::metadata::FileMetadata;
+use shit_planner::plan_forward::plan_forward;
 use shit_planner::probe::ProbeStat;
 use shit_planner::probe::mock::InMemoryProbe;
 use shit_planner::store::mock::InMemoryStore;
@@ -179,7 +180,7 @@ proptest! {
     }
 
     #[test]
-    fn partial_count_matches_drop_warning(events in arb_events(16), partial_mask in proptest::collection::vec(any::<bool>(), 0..16)) {
+    fn partial_input_is_refusal_only_and_warning_count_matches(events in arb_events(16), partial_mask in proptest::collection::vec(any::<bool>(), 0..16)) {
         let mut events = events.clone();
         let mut partial_count = 0;
         for (ev, flag) in events.iter_mut().zip(partial_mask.into_iter()) {
@@ -189,15 +190,37 @@ proptest! {
             }
         }
         let (probe, store) = populate_probe_and_store(&events);
-        let p = plan(closed_record(), &events, &probe, &store);
-        let dropped = p.warnings.iter().find_map(|w| match w {
-            PlanWarning::PartialEvents { dropped } => Some(*dropped),
-            _ => None,
-        });
-        if partial_count == 0 {
-            prop_assert!(dropped.is_none(), "no partial events but warning present: {:?}", dropped);
-        } else {
-            prop_assert_eq!(dropped, Some(partial_count), "warning count != input partial count");
+        let plans = [
+            plan(closed_record(), &events, &probe, &store),
+            plan_forward(closed_record(), &events, &probe, &store),
+        ];
+        for planned in plans {
+            let dropped = planned.warnings.iter().find_map(|warning| match warning {
+                PlanWarning::PartialEvents { dropped } => Some(*dropped),
+                _ => None,
+            });
+            if partial_count == 0 {
+                prop_assert!(
+                    dropped.is_none(),
+                    "no partial events but warning present: {:?}",
+                    dropped
+                );
+            } else {
+                prop_assert_eq!(
+                    dropped,
+                    Some(partial_count),
+                    "warning count != input partial count"
+                );
+                prop_assert!(!planned.nodes.is_empty(), "partial input produced an empty plan");
+                prop_assert!(
+                    planned
+                        .nodes
+                        .iter()
+                        .all(|node| matches!(node.op, InverseOp::Refuse { .. })),
+                    "partial input produced actionable nodes: {:?}",
+                    planned.nodes
+                );
+            }
         }
     }
 

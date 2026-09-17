@@ -14,9 +14,9 @@
 # CapturedMetadataChange event carrying `before`/`after` mode bits
 # the daemon can invert. Same skip-checks as the other ES smokes.
 #
-# We test chmod specifically because it's the canonical metadata
-# event; AUTH_SETOWNER/AUTH_UTIMES share the same handler path so
-# this smoke is representative of all three.
+# We test chmod specifically because it's the canonical actionable metadata
+# event. AUTH_SETOWNER shares this CapturedMetadataChange path; AUTH_UTIMES is
+# deliberately routed to CaptureRefused until atime is captured and restored.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -114,11 +114,10 @@ if [ "${NEW_MODE}" != "755" ]; then
 fi
 smoke_log "post-chmod mode = ${NEW_MODE} ✓"
 
-# We don't exercise `shit undo` here — the metadata-change invert
-# path in the planner (apply old uid/gid/mode/mtime via chmod/chown/
-# utimes) is a daemon-side concern this slice doesn't touch. The
-# acceptance criterion for I.D is: producer captures + journals
-# the change, ES correctly observes chmod via AUTH_SETMODE.
+# This smoke isolates entitled-ES capture and does not exercise `shit undo`.
+# Planner/executor tests cover restoring the old mode/owner metadata; timestamp
+# calls remain explicit refusals until atime is modeled. The acceptance
+# criterion here is that ES observes chmod via AUTH_SETMODE and journals it.
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 smoke_log "PASS: es-chmod-metadata-macos (M03.1.I.D — chmod capture acceptance)"

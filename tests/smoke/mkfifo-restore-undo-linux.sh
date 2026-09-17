@@ -6,27 +6,23 @@
 # SMOKE_RUNNER_HINT: self-hosted-lsm
 # SMOKE_TIMEOUT_SEC: 120
 #
-# AU22.4 — load-bearing smoke for the mknod-via-helper restore
-# path (DR-15.1).
+# Linux LSM deleted-FIFO honesty gate.
 #
 # Workload:
 # - Pre-create a named pipe BEFORE pre-exec so pre_open_tree
 #   captures the inode as a Fifo (mode bits S_IFIFO|perm).
 # - `rm` the fifo inside the watched session. The inode_unlink
-#   LSM hook fires; the helper journals a CapturedPreImage marker
-#   carrying kind=Fifo + mode.
-# - `shit undo --yes` outside the session. Planner emits
-#   InverseOp::RecreatePath { kind: Fifo, mode: ... }. The
-#   FileExecutor's AU22 branch dispatches via
-#   PrivilegedOpRouter::mknod → HelperLinkPrivilegedOpRouter →
-#   HelperLink::request_priv_op_blocking → helper's apply_mknod
-#   → libc::mknod(S_IFIFO | perm, 0).
+#   LSM hook fires; the helper sends a typed metadata-only deletion
+#   marker carrying kind=Fifo.
+# - The daemon journals CaptureRefused because FileMetadataWire does
+#   not yet carry every field needed for exact replay. The planner
+#   refuses the whole command instead of dispatching helper mknod.
 #
 # Assertions:
-# - fifo restored (path is a fifo again, mode matches).
-# - daemon log contains `apply_mknod` info line proving the wire
-#   was hot end-to-end (catches a regression where the dispatch
-#   silently NoOps).
+# - the path-specific CaptureRefused event is present and no
+#   actionable TreeOpUnlink was synthesized;
+# - undo exits non-zero, renders the refusal, and reports applied=0;
+# - the deleted FIFO stays absent and apply_mknod never runs.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -50,9 +46,9 @@ if [ ! -r /sys/kernel/security/lsm ]; then
     exit 0
 fi
 HELPER_CAPS="$(getcap "${HELPER_BIN}" 2>/dev/null || true)"
-for required in cap_bpf cap_perfmon cap_sys_admin cap_mknod; do
+for required in cap_bpf cap_perfmon cap_sys_admin; do
     if ! printf '%s' "${HELPER_CAPS}" | grep -q "${required}"; then
-        smoke_log "FAIL: helper lacks ${required}; setcap cap_mknod,cap_bpf,cap_perfmon,cap_sys_admin+ep ${HELPER_BIN}"
+        smoke_log "FAIL: helper lacks ${required}; setcap cap_bpf,cap_perfmon,cap_sys_admin+ep ${HELPER_BIN}"
         exit 1
     fi
 done
@@ -92,41 +88,46 @@ sleep 0.5
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
 
-# Marker-only CapturedPreImage path (dirs and Fifos both go
-# through journal_unlink_idempotent → TreeOpUnlink discriminant).
-smoke_wait_for_event "discriminant = 'TreeOpUnlink'" 1 10
+# The typed marker must become a refusal, never the old lossy unlink inverse.
+smoke_wait_for_event \
+    "discriminant = 'CaptureRefused' AND path LIKE '%/au22_pre_pipe'" 1 10
 
-"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_fail "shit undo --yes exited non-zero"
-}
-
-if [ ! -p "${FIFO}" ]; then
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    if [ -e "${FIFO}" ]; then
-        smoke_fail "${FIFO} restored but wrong kind ($(stat -c %F "${FIFO}"))"
-    fi
-    smoke_fail "fifo not restored: ${FIFO}"
-fi
-RESTORED_MODE="$(python3 -c "import os; print(oct(os.stat('${FIFO}').st_mode & 0o777))")"
-if [ "${RESTORED_MODE}" != "${PRE_MODE}" ]; then
-    smoke_fail "restored fifo mode wrong: pre=${PRE_MODE} restored=${RESTORED_MODE}"
+N_ACTIONABLE="$(smoke_journal_count "discriminant = 'TreeOpUnlink' AND path LIKE '%/au22_pre_pipe'")"
+if [ "${N_ACTIONABLE}" -ne 0 ]; then
+    smoke_fail "FIFO deletion also journaled ${N_ACTIONABLE} actionable TreeOpUnlink event(s)"
 fi
 
-# AU22 load-bearing assertion: the helper's apply_mknod handler
-# MUST have logged its emit line. Without this, a regression
-# where EitherRouter::mknod silently returns Applied without
-# actually dispatching would pass (the fifo would not exist
-# post-undo but my -p check above catches that — the log grep
-# catches a different regression: a stub that lies about success).
-if ! grep -F "apply_mknod" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
+if ! grep -F "lsm-unlink deletion evidence sent" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
     smoke_log "shitd.log tail:"
     tail -100 "${SHIT_SMOKE_TMP}/shitd.log" | sed 's/^/    /' >&2
-    smoke_fail "helper apply_mknod did not run; 'apply_mknod' missing from shitd.log"
+    smoke_fail "LSM inode_unlink handler did not emit FIFO deletion evidence"
 fi
-smoke_log "helper apply_mknod confirmed fired (DR-15.1 wire hot end-to-end)"
+
+UNDO_RC=0
+"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || UNDO_RC=$?
+if [ "${UNDO_RC}" -eq 0 ]; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "deleted-FIFO CaptureRefused unexpectedly exited 0"
+fi
+
+if ! grep -qiE "Refused|capture-incomplete|metadata-only deletion marker" "${SHIT_SMOKE_TMP}/undo.log"; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "undo failed without surfacing the FIFO capture refusal"
+fi
+if ! grep -q "applied=0" "${SHIT_SMOKE_TMP}/undo.log"; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "refused FIFO undo reported an applied inverse"
+fi
+
+# A recreated FIFO or any other path kind would be a lossy synthesis.
+if [ -e "${FIFO}" ]; then
+    smoke_fail "refused undo synthesized a replacement at ${FIFO}"
+fi
+if grep -F "apply_mknod" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
+    smoke_fail "helper apply_mknod ran despite command-atomic CaptureRefused"
+fi
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: mkfifo-restore-undo-linux (fifo restored to mode ${RESTORED_MODE} via helper-IPC mknod)"
+smoke_log "PASS: mkfifo-restore-undo-linux (LSM evidence captured; undo refused atomically; no FIFO synthesized; pre-mode was ${PRE_MODE})"

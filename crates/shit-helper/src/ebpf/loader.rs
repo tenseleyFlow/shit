@@ -152,6 +152,15 @@ const RINGBUF_RMDIR_EVENTS: &str = "rmdir_events";
 const RINGBUF_RELEASE_EVENTS: &str = "release_events";
 const RINGBUF_MKNOD_EVENTS: &str = "mknod_events";
 
+/// Every LSM object carries a private one-element ARRAY with this name.
+/// Its u64 value is atomically incremented whenever that object's
+/// `bpf_ringbuf_reserve` fails.  Keeping the counter outside the ringbuf is
+/// essential: a full ringbuf cannot reliably report its own overflow.
+const RINGBUF_LOSS_COUNT: &str = "ringbuf_loss_count";
+
+/// Userspace handle for one object's monotonic ring-buffer loss counter.
+pub type RingbufLossCounter = aya::maps::Array<aya::maps::MapData, u64>;
+
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
 /// the helper whether it's worth invoking `load`.
@@ -225,6 +234,11 @@ impl std::fmt::Debug for EbpfLoader {
 }
 
 impl EbpfLoader {
+    fn take_loss_counter(bpf: Option<&mut aya::Ebpf>) -> Option<RingbufLossCounter> {
+        let map = bpf?.take_map(RINGBUF_LOSS_COUNT)?;
+        aya::maps::Array::try_from(map).ok()
+    }
+
     pub fn new() -> Self {
         Self {
             bpf: None,
@@ -376,8 +390,8 @@ impl EbpfLoader {
     /// unlinkat on the box. Mitigation: the program (a) always
     /// returns 0 (allow), (b) uses BPF_CORE_READ for every
     /// kernel-struct field, (c) is straight-line code with no
-    /// loops, and (d) drops events silently when the ringbuf
-    /// fills rather than returning non-zero. See the .bpf.c
+    /// loops, and (d) allows on ringbuf pressure while incrementing
+    /// an out-of-band loss counter. See the .bpf.c
     /// comment block for the full contract.
     pub fn load_lsm_unlink(&mut self) -> Result<(), EbpfError> {
         let outcome = self.probe();
@@ -523,6 +537,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_setattr_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.setattr_bpf.as_mut())
+    }
+
     /// L04 phase 4 — Load + attach the `lsm/inode_mkdir` program.
     /// Same contract as [`Self::load_lsm_unlink`]; ringbufs
     /// `(parent_inode, basename, mode)` for every `mkdir(2)` call.
@@ -580,6 +598,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_mkdir_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.mkdir_bpf.as_mut())
+    }
+
     /// L04 phase 5 — Load + attach the `lsm/inode_create` program.
     pub fn load_lsm_create(&mut self) -> Result<(), EbpfError> {
         let outcome = self.probe();
@@ -633,6 +655,10 @@ impl EbpfLoader {
         let bpf = self.create_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_CREATE_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    pub fn take_create_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.create_bpf.as_mut())
     }
 
     /// L04.1 — Load + attach `lsm/file_open`. Pre-filters to
@@ -692,6 +718,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_open_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.open_bpf.as_mut())
+    }
+
     /// L04.1 — Load + attach `lsm/inode_rename`.
     pub fn load_lsm_rename(&mut self) -> Result<(), EbpfError> {
         let outcome = self.probe();
@@ -747,6 +777,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_rename_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.rename_bpf.as_mut())
+    }
+
     /// DR-CR-55 — Load + attach the `lsm/inode_symlink` program.
     /// Emits a `shit_create_event` shape into `symlink_events`;
     /// userspace routes through the same on_create sink as
@@ -797,6 +831,10 @@ impl EbpfLoader {
         let bpf = self.symlink_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_SYMLINK_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    pub fn take_symlink_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.symlink_bpf.as_mut())
     }
 
     /// DR-CR-55 — Load + attach the `lsm/inode_link` program.
@@ -852,6 +890,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_link_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.link_bpf.as_mut())
+    }
+
     /// G03 — Load + attach the `lsm/inode_rmdir` program. Closes the
     /// `unlinkat(AT_REMOVEDIR)` gap left by inode_unlink alone:
     /// `git clean -fd` (and any other tool that removes empty
@@ -904,6 +946,10 @@ impl EbpfLoader {
         let bpf = self.rmdir_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_RMDIR_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    pub fn take_rmdir_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.rmdir_bpf.as_mut())
     }
 
     /// L04.2 — Load + attach the `lsm/file_release` program. Closes
@@ -961,6 +1007,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_release_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.release_bpf.as_mut())
+    }
+
     /// AU29 — Load + attach the `lsm/inode_mknod` program. Captures
     /// `mkfifo(3)` and `mknod(2)` for FIFO/Socket kinds, which
     /// `inode_create` doesn't see (it fires only on regular-file
@@ -1016,6 +1066,10 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
+    pub fn take_mknod_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.mknod_bpf.as_mut())
+    }
+
     /// L04 — Take the `unlink_events` ringbuf for the userspace
     /// consumer. Returns `None` if the loader isn't loaded yet, or
     /// if the ringbuf has already been taken. The loader retains
@@ -1026,6 +1080,10 @@ impl EbpfLoader {
         let bpf = self.bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_UNLINK_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    pub fn take_unlink_loss_counter(&mut self) -> Option<RingbufLossCounter> {
+        Self::take_loss_counter(self.bpf.as_mut())
     }
 }
 

@@ -52,6 +52,7 @@ int BPF_PROG(shit_inode_symlink,
     struct shit_create_event *e =
         bpf_ringbuf_reserve(&symlink_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return 0;
     }
 

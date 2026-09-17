@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SMOKE_NAME: fsevents-fallback-macos
 # SMOKE_PLATFORM: macos
-# SMOKE_TIER_REQUIRED: mocked-es
+# SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: macos-14
 # SMOKE_TIMEOUT_SEC: 300
-# EXCLUDED_BY: M03-vm-runner
-# EXCLUDED_REASON: macOS smokes need a signed binary on a Tart VM; GH-hosted macos-14 runner cannot satisfy the EndpointSecurity entitlement 
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
 # M01 / M01.A smoke — macOS FSEvents-degraded capture end-to-end.
 #
@@ -24,10 +24,11 @@
 #    pre-exec's (session, seq).
 #
 # What this does NOT assert (deferred to M03 / later):
-# - Byte-identical content restore via `shit undo`. FSEvents-
-#   degraded has no pre-image — undo can only invert tree shape
-#   (delete what was created; cannot recreate what was deleted
-#   without content). That's the M03 ES path.
+# - Any executable inverse via `shit undo`. FSEvents is post-hoc and
+#   cannot prove the pre-state, so its events are deliberately partial:
+#   visible for diagnosis, and command-refusing if they remain in the
+#   journal. Authoritative undo comes from Endpoint Security or the
+#   preload shim.
 # - The `(degraded)` label flowing through `shit list` text output.
 #   The events ARE journaled with the degraded semantics; the CLI's
 #   list renderer surfaces them once M02 wires the doctor-side
@@ -125,11 +126,6 @@ smoke_log "PreExec seq=${SEQ} pid=${PID} cwd=${SCRATCH}"
     --shell bash \
     --sock "${SHIT_HOOK_SOCK}"
 
-# FSEvents needs ~200-300ms to attach the stream after the helper
-# receives the WatchTree dispatch. Without this settle, the first
-# mutation races the kernel registration and the event is missed.
-sleep 0.5
-
 TARGET="${SCRATCH}/hello.txt"
 smoke_log "create ${TARGET}"
 printf 'fsevents canary\n' >"${TARGET}"
@@ -137,14 +133,14 @@ printf 'fsevents canary\n' >"${TARGET}"
 # Wait for the TreeOpCreate event. FSEvents may report Create alone
 # or Create+Modified flag combos — both decode to TreeOpWire::Create
 # in the producer, which the daemon ingests as TreeOpCreate.
-smoke_wait_for_event "discriminant = 'TreeOpCreate'" 1 10
-smoke_log "TreeOpCreate journaled ✓"
+smoke_wait_for_event "discriminant = 'TreeOpCreate' AND path = '${TARGET}' AND partial = 1" 1 10
+smoke_log "partial TreeOpCreate journaled ✓"
 
 smoke_log "remove ${TARGET}"
 rm "${TARGET}"
 
-smoke_wait_for_event "discriminant = 'TreeOpUnlink'" 1 10
-smoke_log "TreeOpUnlink journaled ✓"
+smoke_wait_for_event "discriminant = 'TreeOpUnlink' AND path = '${TARGET}' AND partial = 1" 1 10
+smoke_log "partial TreeOpUnlink journaled ✓"
 
 smoke_log "PostExec seq=${SEQ} exit=0"
 "${SHIT_BIN}" hook-send post-exec \
@@ -160,28 +156,25 @@ smoke_log "PostExec seq=${SEQ} exit=0"
 # Verify the M02 DoD: `shit doctor --json | jq .macos.runtime_capture`
 # returns one of the documented enum values. This is the literal CI
 # release gate from the M02 sprint.
-if ! command -v jq >/dev/null 2>&1; then
-    smoke_log "jq not present; skipping M02 doctor-uplift assertion"
+command -v jq >/dev/null 2>&1 || smoke_fail "jq is required for the M02 doctor assertion"
+if ! "${SHIT_BIN}" doctor --json >"${SHIT_SMOKE_TMP}/doctor.json" 2>&1; then
+    smoke_log "doctor output:"
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/doctor.json" >&2
+    smoke_fail "shit doctor --json exited non-zero"
+fi
+if ! jq -e '.macos.runtime_capture == "endpoint-security" or .macos.runtime_capture == "fsevents-degraded"' \
+        "${SHIT_SMOKE_TMP}/doctor.json" >/dev/null; then
+    smoke_log "doctor.json .macos block:"
+    jq '.macos' "${SHIT_SMOKE_TMP}/doctor.json" | sed 's/^/    /' >&2
+    smoke_fail "doctor JSON .macos.runtime_capture is not one of the M02 enum values"
+fi
+smoke_log "shit doctor --json .macos.runtime_capture ✓"
+# FSEvents probe should be functional on any modern Mac; flag if not.
+if ! jq -e '.macos.fsevents.functional' "${SHIT_SMOKE_TMP}/doctor.json" >/dev/null; then
+    smoke_log "WARNING: doctor FSEvents probe reported not-functional"
+    jq '.macos.fsevents' "${SHIT_SMOKE_TMP}/doctor.json" | sed 's/^/    /'
 else
-    if ! "${SHIT_BIN}" doctor --json >"${SHIT_SMOKE_TMP}/doctor.json" 2>&1; then
-        smoke_log "doctor output:"
-        sed 's/^/    /' "${SHIT_SMOKE_TMP}/doctor.json" >&2
-        smoke_fail "shit doctor --json exited non-zero"
-    fi
-    if ! jq -e '.macos.runtime_capture == "endpoint-security" or .macos.runtime_capture == "fsevents-degraded"' \
-            "${SHIT_SMOKE_TMP}/doctor.json" >/dev/null; then
-        smoke_log "doctor.json .macos block:"
-        jq '.macos' "${SHIT_SMOKE_TMP}/doctor.json" | sed 's/^/    /' >&2
-        smoke_fail "doctor JSON .macos.runtime_capture is not one of the M02 enum values"
-    fi
-    smoke_log "shit doctor --json .macos.runtime_capture ✓"
-    # FSEvents probe should be functional on any modern Mac; flag if not.
-    if ! jq -e '.macos.fsevents.functional' "${SHIT_SMOKE_TMP}/doctor.json" >/dev/null; then
-        smoke_log "WARNING: doctor FSEvents probe reported not-functional"
-        jq '.macos.fsevents' "${SHIT_SMOKE_TMP}/doctor.json" | sed 's/^/    /'
-    else
-        smoke_log "shit doctor --json .macos.fsevents.functional ✓"
-    fi
+    smoke_log "shit doctor --json .macos.fsevents.functional ✓"
 fi
 
 smoke_log "PASS: fsevents-fallback-macos (M01 + M01.A + M02 doctor uplift)"

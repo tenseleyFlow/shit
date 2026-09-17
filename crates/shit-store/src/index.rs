@@ -605,7 +605,7 @@ fn update_path_history_with_conn(
                 params![path.to_string_lossy(), ts.logical as i64],
             )?;
         }
-        T::SymlinkRemoved { path, .. } => {
+        T::SymlinkRemoved { path, .. } | T::SymlinkRemovedIdentified { path, .. } => {
             // W09.16.1 — close the path-history row for the OLD
             // symlink at this path. A paired Create event for the
             // NEW symlink at the same path opens a fresh row.
@@ -726,6 +726,12 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
                     None,
                     Some(path.to_string_lossy().into_owned()),
                     "TreeOpSymlinkRemoved",
+                ),
+                T::SymlinkRemovedIdentified { inode, path, .. } => (
+                    Some(inode.dev as i64),
+                    Some(inode.inode as i64),
+                    Some(path.to_string_lossy().into_owned()),
+                    "TreeOpSymlinkRemovedIdentified",
                 ),
             };
             Denormalized {

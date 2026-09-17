@@ -4,7 +4,7 @@
 //!
 //! Handles every [`InverseTier::Files`](crate::inverse::InverseTier::Files)
 //! variant: `RestoreContent`, `RestoreMetadata`, `RestoreFlags`, `Unlink`,
-//! `RecreatePath`, `Rename`, `CreateSymlink`.
+//! `RecreatePath`, `Rename`, `CreateSymlink`, and append truncate-back ops.
 //!
 //! ## Stage progression
 //!
@@ -18,27 +18,72 @@
 //!
 //! ## Privileged ops
 //!
-//! When the captured `uid`/`gid` differs from the runtime uid the
-//! executor would need `CAP_CHOWN`/`CAP_FOWNER` (or root) to apply.
-//! Stage 1 returns `Failed { err: "needs helper-IPC privileged-op
-//! routing (DR-15)" }` for those — no silent failure.
+//! Metadata replay uses descriptor-only syscalls. When `fchown` needs
+//! `CAP_CHOWN`/root, replay fails closed: the current helper route accepts a
+//! pathname and cannot preserve the verified descriptor identity. The router
+//! remains available for non-metadata operations such as `mknod`.
 
-use std::fs;
+use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::executor::{
     BlobReader, ConflictPolicy, ExecutionOutcome, InverseOpExecutor, NoOpPrivilegedOpRouter,
     PrivilegedOpOutcome, PrivilegedOpRouter,
 };
-use crate::inode::BlobHash;
-use crate::inverse::{InverseOp, InverseTier};
+use crate::inode::{BlobHash, InodeRef};
+use crate::inverse::{Conflict, InverseOp, InverseTier};
+
+/// Every filesystem address in a persisted inverse must be absolute. Relative
+/// symlink *contents* remain valid, but a relative operation path would be
+/// interpreted from the future undo process's cwd and could mutate unrelated
+/// data. This is the final guard for old, malformed, or corrupt journals.
+fn first_relative_file_operand(op: &InverseOp) -> Option<&Path> {
+    match op {
+        InverseOp::RestoreContent { path, .. }
+        | InverseOp::RestoreMetadata { path, .. }
+        | InverseOp::RestoreFlags { path, .. }
+        | InverseOp::Unlink { path }
+        | InverseOp::RecreatePath { path, .. }
+        | InverseOp::CreateSymlink { path, .. }
+        | InverseOp::FileExtend { path, .. }
+        | InverseOp::FileExtendGuarded { path, .. } => {
+            (!path.is_absolute()).then_some(path.as_path())
+        }
+        InverseOp::Rename { from, to } => [from.as_path(), to.as_path()]
+            .into_iter()
+            .find(|path| !path.is_absolute()),
+        InverseOp::CreateHardlink { source, target } => [source.as_path(), target.as_path()]
+            .into_iter()
+            .find(|path| !path.is_absolute()),
+        _ => None,
+    }
+}
 
 /// File-tier executor. Cheap to construct; holds a reference to the
 /// blob reader so per-op calls don't pass it through.
 pub struct FileExecutor<'a, R: BlobReader, P: PrivilegedOpRouter = NoOpPrivilegedOpRouter> {
     blob_reader: &'a R,
     privileged_router: P,
+    /// Descriptor-backed provenance for files installed by RestoreContent.
+    /// The descriptor pins the actual inode, preventing inode-number reuse
+    /// from turning provenance into authority over an unrelated object. A
+    /// dry-run records only a projected replacement marker.
+    restored_targets: Mutex<HashMap<(PathBuf, InodeRef), RestoredTarget>>,
+}
+
+enum RestoredTarget {
+    Open(File),
+    Projected,
+}
+
+enum PreparedTarget {
+    Open(File),
+    Projected,
 }
 
 impl<'a, R: BlobReader> FileExecutor<'a, R, NoOpPrivilegedOpRouter> {
@@ -49,6 +94,7 @@ impl<'a, R: BlobReader> FileExecutor<'a, R, NoOpPrivilegedOpRouter> {
         Self {
             blob_reader,
             privileged_router: NoOpPrivilegedOpRouter,
+            restored_targets: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -60,11 +106,24 @@ impl<'a, R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'a, R, P> {
         Self {
             blob_reader,
             privileged_router,
+            restored_targets: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_, R, P> {
+    fn begin_plan_execution(&self, _dry_run: bool) {
+        if let Ok(mut provenance) = self.restored_targets.lock() {
+            provenance.clear();
+        }
+    }
+
+    fn finish_plan_execution(&self) {
+        if let Ok(mut provenance) = self.restored_targets.lock() {
+            provenance.clear();
+        }
+    }
+
     fn supports(&self, op: &InverseOp) -> bool {
         op.tier() == InverseTier::Files
     }
@@ -75,19 +134,31 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
                 err: format!("FileExecutor cannot execute op of tier {:?}", op.tier()),
             };
         }
-        if dry_run {
-            return ExecutionOutcome::WouldApply;
+        if let Some(path) = first_relative_file_operand(op) {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "refusing relative filesystem path {:?}; undo targets must be absolute",
+                    path
+                ),
+            };
+        }
+        // Persisted pre-guard append plans remain decodable, but cannot be
+        // executed safely because they carry no captured inode. Report that
+        // limitation even in dry-run mode; claiming WouldApply would be a lie.
+        if matches!(op, InverseOp::FileExtend { .. }) {
+            return self.apply_file_extend(op);
         }
         match op {
-            InverseOp::RestoreContent { .. } => self.apply_restore_content(op),
-            InverseOp::RestoreMetadata { .. } => self.apply_restore_metadata(op),
-            InverseOp::RestoreFlags { .. } => self.apply_restore_flags(op),
+            InverseOp::RestoreContent { .. } => self.apply_restore_content(op, dry_run),
+            InverseOp::RestoreMetadata { .. } => self.apply_restore_metadata(op, dry_run),
+            InverseOp::RestoreFlags { .. } => self.apply_restore_flags(op, dry_run),
+            InverseOp::FileExtendGuarded { .. } => self.apply_file_extend_guarded(op, dry_run),
+            _ if dry_run => ExecutionOutcome::WouldApply,
             InverseOp::Unlink { .. } => self.apply_unlink(op),
             InverseOp::RecreatePath { .. } => self.apply_recreate_path(op),
             InverseOp::Rename { .. } => self.apply_rename(op),
             InverseOp::CreateSymlink { .. } => self.apply_create_symlink(op),
             InverseOp::CreateHardlink { .. } => self.apply_create_hardlink(op),
-            InverseOp::FileExtend { .. } => self.apply_file_extend(op),
             other => ExecutionOutcome::Failed {
                 err: format!(
                     "FileExecutor: unexpected variant {other:?} after supports() said yes — bug?"
@@ -98,16 +169,67 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
 }
 
 impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
-    fn apply_restore_content(&self, op: &InverseOp) -> ExecutionOutcome {
-        let InverseOp::RestoreContent { path, blob, .. } = op else {
+    fn apply_restore_content(&self, op: &InverseOp, dry_run: bool) -> ExecutionOutcome {
+        let InverseOp::RestoreContent { inode, path, blob } = op else {
             return ExecutionOutcome::Failed {
                 err: "apply_restore_content: wrong variant".into(),
             };
         };
+        if dry_run {
+            if let Err(e) = self.validate_restore_content(path, blob) {
+                return ExecutionOutcome::Failed { err: e };
+            }
+            let Ok(mut provenance) = self.restored_targets.lock() else {
+                return ExecutionOutcome::Failed {
+                    err: format!(
+                        "restored-target provenance lock poisoned while validating {path:?}"
+                    ),
+                };
+            };
+            provenance.insert((path.clone(), *inode), RestoredTarget::Projected);
+            return ExecutionOutcome::WouldApply;
+        }
         match self.restore_content_inner(path, blob) {
-            Ok(()) => ExecutionOutcome::Applied,
+            Ok(restored_file) => {
+                let Ok(mut provenance) = self.restored_targets.lock() else {
+                    return ExecutionOutcome::Failed {
+                        err: format!(
+                            "restored-target provenance lock poisoned after restoring {path:?}"
+                        ),
+                    };
+                };
+                provenance.insert((path.clone(), *inode), RestoredTarget::Open(restored_file));
+                ExecutionOutcome::Applied
+            }
             Err(e) => ExecutionOutcome::Failed { err: e },
         }
+    }
+
+    fn validate_restore_content(&self, path: &Path, blob: &BlobHash) -> Result<(), String> {
+        self.blob_reader
+            .read(blob)
+            .map_err(|e| format!("blob read for {path:?}: {e}"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("path {path:?} has no parent dir; cannot place tmpfile"))?;
+
+        // An existing non-directory parent and an existing directory target
+        // cannot be replaced by the regular-file tmpfile rename used below.
+        if let Ok(meta) = fs::metadata(parent)
+            && !meta.file_type().is_dir()
+        {
+            return Err(format!(
+                "restore parent {parent:?} exists but is not a directory"
+            ));
+        }
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.file_type().is_dir()
+        {
+            return Err(format!(
+                "restore target {path:?} is a directory; refusing regular-file replacement"
+            ));
+        }
+        Ok(())
     }
 
     /// Atomic write: read blob → tmpfile in same dir → fsync → rename.
@@ -116,7 +238,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
     /// rename breaks the hardlink relationship. Stage 1 documents that
     /// limitation; the hardlink path lands in stage 2 (gated on
     /// integration with the live state probe — S11.6/11.7).
-    fn restore_content_inner(&self, path: &Path, blob: &BlobHash) -> Result<(), String> {
+    fn restore_content_inner(&self, path: &Path, blob: &BlobHash) -> Result<File, String> {
         let bytes = self
             .blob_reader
             .read(blob)
@@ -145,17 +267,25 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         let tmp_path: PathBuf = parent.join(tmp_name);
 
         // Write + fsync the tmpfile.
-        let write_result = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
+        let write_result = (|| -> std::io::Result<File> {
+            let mut f = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&tmp_path)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
-            Ok(())
+            Ok(f)
         })();
-        if let Err(e) = write_result {
-            // Best-effort cleanup of partial tmpfile.
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("tmpfile write {tmp_path:?}: {e}"));
-        }
+        let restored_file = match write_result {
+            Ok(file) => file,
+            Err(e) => {
+                // Best-effort cleanup of partial tmpfile.
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!("tmpfile write {tmp_path:?}: {e}"));
+            }
+        };
 
         // Atomic rename. On the same filesystem this overwrites the
         // target atomically. Cross-filesystem rename returns EXDEV and
@@ -164,72 +294,104 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             let _ = fs::remove_file(&tmp_path);
             return Err(format!("rename {tmp_path:?} -> {path:?}: {e}"));
         }
-        Ok(())
+        let restored_meta = restored_file
+            .metadata()
+            .map_err(|e| format!("fstat restored target {path:?}: {e}"))?;
+        let restored_inode = InodeRef::new(restored_meta.dev(), restored_meta.ino());
+        match live_inode(path) {
+            Ok(live) if live == restored_inode => Ok(restored_file),
+            Ok(live) => Err(format!(
+                "restore target {path:?} changed immediately after rename: live inode {live}, restored inode {restored_inode}"
+            )),
+            Err(e) => Err(format!("lstat restored target {path:?} after rename: {e}")),
+        }
     }
 
-    fn apply_restore_metadata(&self, op: &InverseOp) -> ExecutionOutcome {
-        let InverseOp::RestoreMetadata { path, target, .. } = op else {
+    fn apply_restore_metadata(&self, op: &InverseOp, dry_run: bool) -> ExecutionOutcome {
+        let InverseOp::RestoreMetadata {
+            inode,
+            path,
+            target,
+        } = op
+        else {
             return ExecutionOutcome::Failed {
                 err: "apply_restore_metadata: wrong variant".into(),
             };
         };
-        match restore_metadata_inner(path, target) {
-            Ok(()) => ExecutionOutcome::Applied,
-            Err(MetadataRestoreError::ChownNeedsPrivilege { uid, gid }) => {
-                // DR-15: retry via the helper IPC router. The helper
-                // does the chown; the daemon finishes mode + mtime
-                // here. W09.13 — chmod MUST run after chown so that
-                // setuid/setgid bits in `target.mode` survive (chown
-                // strips them).
-                match self.privileged_router.chown(path, uid, gid, false) {
-                    PrivilegedOpOutcome::Applied => {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode_only = target.mode & 0o7777;
-                        let perms = std::fs::Permissions::from_mode(mode_only);
-                        if let Err(e) = fs::set_permissions(path, perms) {
-                            return ExecutionOutcome::Failed {
-                                err: format!("chmod {path:?} -> {mode_only:o}: {e}"),
-                            };
-                        }
-                        match restore_mtime_only(path, target) {
-                            Ok(()) => ExecutionOutcome::Applied,
-                            Err(e) => ExecutionOutcome::Failed { err: e },
-                        }
-                    }
-                    PrivilegedOpOutcome::OutOfScope => ExecutionOutcome::Failed {
-                        err: format!(
-                            "chown {path:?} -> uid={uid} gid={gid}: helper refused (out of session scope)"
-                        ),
-                    },
-                    PrivilegedOpOutcome::PermissionDenied => ExecutionOutcome::Failed {
-                        err: format!(
-                            "chown {path:?} -> uid={uid} gid={gid}: EPERM (helper also lacks privilege)"
-                        ),
-                    },
-                    PrivilegedOpOutcome::NotFound => ExecutionOutcome::Failed {
-                        err: format!(
-                            "chown {path:?}: ENOENT (path vanished between capture and undo)"
-                        ),
-                    },
-                    PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
-                        err: format!("chown {path:?} via helper: {err}"),
-                    },
-                }
-            }
-            Err(MetadataRestoreError::Other(e)) => ExecutionOutcome::Failed { err: e },
+        let prepared = match self.prepare_inode_target(path, *inode, dry_run) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        match prepared {
+            PreparedTarget::Projected => ExecutionOutcome::WouldApply,
+            PreparedTarget::Open(_) if dry_run => ExecutionOutcome::WouldApply,
+            PreparedTarget::Open(file) => match restore_metadata_fd(&file, path, target) {
+                Ok(()) => ExecutionOutcome::Applied,
+                Err(err) => ExecutionOutcome::Failed { err },
+            },
         }
     }
 
-    fn apply_restore_flags(&self, op: &InverseOp) -> ExecutionOutcome {
-        let InverseOp::RestoreFlags { path, flags, .. } = op else {
+    fn apply_restore_flags(&self, op: &InverseOp, dry_run: bool) -> ExecutionOutcome {
+        let InverseOp::RestoreFlags { inode, path, flags } = op else {
             return ExecutionOutcome::Failed {
                 err: "apply_restore_flags: wrong variant".into(),
             };
         };
-        match restore_flags_value(path, *flags) {
-            Ok(()) => ExecutionOutcome::Applied,
-            Err(err) => ExecutionOutcome::Failed { err },
+        let prepared = match self.prepare_inode_target(path, *inode, dry_run) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        if let Err(err) = flags_supported() {
+            return ExecutionOutcome::Failed { err };
         }
+        match prepared {
+            PreparedTarget::Projected => ExecutionOutcome::WouldApply,
+            PreparedTarget::Open(_) if dry_run => ExecutionOutcome::WouldApply,
+            PreparedTarget::Open(file) => match restore_flags_fd(&file, path, *flags) {
+                Ok(()) => ExecutionOutcome::Applied,
+                Err(err) => ExecutionOutcome::Failed { err },
+            },
+        }
+    }
+
+    /// Acquire the one descriptor on which identity is checked and metadata
+    /// is mutated. A retained RestoreContent descriptor is authoritative only
+    /// while the live pathname still names that pinned inode.
+    fn prepare_inode_target(
+        &self,
+        path: &Path,
+        expected_inode: InodeRef,
+        dry_run: bool,
+    ) -> Result<PreparedTarget, ExecutionOutcome> {
+        let retained = {
+            let provenance =
+                self.restored_targets
+                    .lock()
+                    .map_err(|_| ExecutionOutcome::Failed {
+                        err: format!("restored-target provenance lock poisoned for {path:?}"),
+                    })?;
+            match provenance.get(&(path.to_path_buf(), expected_inode)) {
+                Some(RestoredTarget::Projected) if dry_run => Some(PreparedTarget::Projected),
+                Some(RestoredTarget::Open(file)) => {
+                    Some(PreparedTarget::Open(file.try_clone().map_err(|e| {
+                        ExecutionOutcome::Failed {
+                            err: format!("dup retained restore descriptor for {path:?}: {e}"),
+                        }
+                    })?))
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(PreparedTarget::Projected) = retained {
+            return Ok(PreparedTarget::Projected);
+        }
+        if let Some(PreparedTarget::Open(file)) = retained {
+            verify_retained_path(&file, path)?;
+            return Ok(PreparedTarget::Open(file));
+        }
+        open_verified_target(path, expected_inode).map(PreparedTarget::Open)
     }
 
     fn apply_unlink(&self, op: &InverseOp) -> ExecutionOutcome {
@@ -351,207 +513,308 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         }
     }
 
-    /// C06.6: truncate a file back to its pre-append size. The
-    /// capture path stashed `truncate_to` as a single `stat` call —
-    /// dramatically cheaper than reading the entire file just to
-    /// emit a no-op restore for the bytes the user never touched.
-    /// Append-only ops are the common case (logs, command output
-    /// captured via `>>`).
+    /// Legacy C06 append plans did not persist the captured inode. They remain
+    /// deserializable for journal/exec-log compatibility, but executing one
+    /// could truncate a replacement file at the same path, so fail closed.
     fn apply_file_extend(&self, op: &InverseOp) -> ExecutionOutcome {
-        let InverseOp::FileExtend { path, truncate_to } = op else {
+        let InverseOp::FileExtend { path, .. } = op else {
             return ExecutionOutcome::Failed {
                 err: "apply_file_extend: wrong variant".into(),
             };
         };
-        // Defensive size check: if the current file is SHORTER than
-        // truncate_to, something has rewritten the file out from
-        // under us (another process truncated; the redirect
-        // semantics differ from what the capture assumed). Refuse —
-        // truncating UP would write zero bytes the user never put
-        // there.
-        match fs::metadata(path) {
-            Ok(m) if m.len() < *truncate_to => {
-                return ExecutionOutcome::Failed {
-                    err: format!(
-                        "FileExtend: current size {} < pre-append size {}; refusing to grow \
-                         file with zeros (something else truncated the file since capture)",
-                        m.len(),
-                        truncate_to,
-                    ),
+        ExecutionOutcome::Failed {
+            err: format!(
+                "FileExtend: refusing legacy append undo for {path:?}: persisted operation lacks \
+                 a captured inode; regenerate the undo plan from a new capture"
+            ),
+        }
+    }
+
+    fn apply_file_extend_guarded(&self, op: &InverseOp, dry_run: bool) -> ExecutionOutcome {
+        let InverseOp::FileExtendGuarded {
+            inode,
+            path,
+            truncate_to,
+        } = op
+        else {
+            return ExecutionOutcome::Failed {
+                err: "apply_file_extend_guarded: wrong variant".into(),
+            };
+        };
+        self.truncate_open_file(path, *truncate_to, *inode, dry_run)
+    }
+
+    /// Open the target without truncation, then validate its identity and size
+    /// from that same descriptor immediately before `ftruncate`. Checking the
+    /// descriptor (rather than `stat(path)` followed by `open(path)`) closes
+    /// the pathname replacement race: even if the name changes after open, we
+    /// cannot truncate the replacement inode.
+    fn truncate_open_file(
+        &self,
+        path: &Path,
+        truncate_to: u64,
+        expected_inode: InodeRef,
+        dry_run: bool,
+    ) -> ExecutionOutcome {
+        if let Err(outcome) = validate_safe_target_kind(path, false) {
+            return outcome;
+        }
+        // `write(true)` does not truncate on open; only the later `set_len`
+        // mutates the descriptor.
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return ExecutionOutcome::Conflict {
+                    kind: Conflict::Missing {
+                        detail: format!("{path:?} no longer exists"),
+                    },
                 };
             }
-            Ok(_) => {}
             Err(e) => {
                 return ExecutionOutcome::Failed {
-                    err: format!("FileExtend: stat {path:?}: {e}"),
+                    err: format!("FileExtendGuarded: open {path:?}: {e}"),
                 };
             }
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                return ExecutionOutcome::Failed {
+                    err: format!("FileExtendGuarded: fstat {path:?}: {e}"),
+                };
+            }
+        };
+
+        if !metadata.file_type().is_file() {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "FileExtendGuarded: refusing non-regular target {path:?} (mode {:o})",
+                    metadata.mode()
+                ),
+            };
         }
-        // Open RW + ftruncate. `OpenOptions::write(true)` doesn't
-        // truncate the existing content (no `truncate(true)`); the
-        // explicit `set_len` does the truncate-back.
-        match fs::OpenOptions::new().write(true).open(path) {
-            Ok(f) => match f.set_len(*truncate_to) {
-                Ok(()) => ExecutionOutcome::Applied,
-                Err(e) => ExecutionOutcome::Failed {
-                    err: format!("FileExtend: truncate {path:?} to {truncate_to}: {e}"),
+        let actual = InodeRef::new(metadata.dev(), metadata.ino());
+        if actual != expected_inode {
+            return ExecutionOutcome::Conflict {
+                kind: Conflict::Phantom {
+                    detail: format!(
+                        "{path:?} now refers to inode {actual}, expected {expected_inode}; refusing truncate"
+                    ),
                 },
-            },
+            };
+        }
+
+        // If the file is now shorter than the captured pre-append size,
+        // truncating UP would manufacture zero bytes that the user never put
+        // there. This check and the mutation use the same descriptor.
+        if metadata.len() < truncate_to {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "FileExtendGuarded: current size {} < pre-append size {}; refusing to grow \
+                     file with zeros (something else truncated the file since capture)",
+                    metadata.len(),
+                    truncate_to,
+                ),
+            };
+        }
+
+        if dry_run {
+            return ExecutionOutcome::WouldApply;
+        }
+
+        match file.set_len(truncate_to) {
+            Ok(()) => ExecutionOutcome::Applied,
             Err(e) => ExecutionOutcome::Failed {
-                err: format!("FileExtend: open {path:?}: {e}"),
+                err: format!("FileExtendGuarded: truncate {path:?} to {truncate_to}: {e}"),
             },
         }
     }
 }
 
-/// Categorised metadata-restore failure. `ChownNeedsPrivilege` is the
-/// DR-15 signal: caller (the executor) retries via the helper IPC
-/// router, then finishes the mtime half via [`restore_mtime_only`].
-/// Everything else is a hard failure with a human-readable message.
-#[derive(Debug)]
-pub(crate) enum MetadataRestoreError {
-    ChownNeedsPrivilege { uid: u32, gid: u32 },
-    Other(String),
+fn live_inode(path: &Path) -> std::io::Result<InodeRef> {
+    let meta = fs::symlink_metadata(path)?;
+    Ok(InodeRef::new(meta.dev(), meta.ino()))
 }
 
-/// Restore chown + mode + mtime. On EPERM during chown, returns
-/// [`MetadataRestoreError::ChownNeedsPrivilege`] so the executor can
-/// route through the helper; any other error becomes `Other(err)`.
-///
-/// **Order matters**: chown MUST run before chmod. POSIX `chown(2)`
-/// strips `S_ISUID`/`S_ISGID` from regular files for security
-/// (so a setuid-root binary can't be re-owned to a regular user and
-/// keep its powers). FreeBSD enforces this; Linux enforces it unless
-/// the calling process holds `CAP_FSETID`. If we chmod first and chown
-/// second, the restored setuid/setgid bits get cleared by the chown —
-/// the W09.13 setuid-restore bug. chown-then-chmod keeps the final
-/// mode authoritative.
-fn restore_metadata_inner(
-    path: &Path,
-    target: &crate::metadata::FileMetadata,
-) -> Result<(), MetadataRestoreError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let uid = Some(nix::unistd::Uid::from_raw(target.uid));
-    let gid = Some(nix::unistd::Gid::from_raw(target.gid));
-    match nix::unistd::chown(path, uid, gid) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::EPERM) => {
-            return Err(MetadataRestoreError::ChownNeedsPrivilege {
-                uid: target.uid,
-                gid: target.gid,
+fn validate_safe_target_kind(path: &Path, allow_directory: bool) -> Result<(), ExecutionOutcome> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ExecutionOutcome::Conflict {
+                kind: Conflict::Missing {
+                    detail: format!("{path:?} no longer exists"),
+                },
             });
         }
-        Err(other) => {
-            return Err(MetadataRestoreError::Other(format!(
-                "chown {path:?} -> uid={} gid={}: {other}",
-                target.uid, target.gid
-            )));
+        Err(e) => {
+            return Err(ExecutionOutcome::Failed {
+                err: format!("lstat {path:?} before descriptor open: {e}"),
+            });
         }
+    };
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        return Err(ExecutionOutcome::Failed {
+            err: format!("refusing unsafe symlink target {path:?}"),
+        });
     }
-
-    let mode_only = target.mode & 0o7777;
-    let perms = std::fs::Permissions::from_mode(mode_only);
-    fs::set_permissions(path, perms).map_err(|e| {
-        MetadataRestoreError::Other(format!("chmod {path:?} -> {mode_only:o}: {e}"))
-    })?;
-
-    // W09.21 — converge xattrs to the captured set. After chmod
-    // because some FSes refuse xattr ops on a 0o000-permission file
-    // owned by another uid; chmod first ensures we can write the
-    // attribute. Best-effort: individual op failures are warn-logged
-    // and don't fail the whole restore (see [`xattr::restore_user_xattrs`]).
-    if let Err(e) = crate::executors::xattr::restore_user_xattrs(path, &target.xattrs) {
-        tracing::warn!(path = %path.display(), err = %e, "xattr restore reported error");
-    }
-
-    // M03.x.SETATTR — restore BSD/macOS st_flags via chflags(2). Must
-    // run AFTER mtime / chmod because UF_IMMUTABLE / SF_IMMUTABLE
-    // (once set) refuse further mutations to the file's metadata. On
-    // Linux has no st_flags; this block is compiled only on the two
-    // platforms whose libc exposes chflags.
-    //
-    // System flags (SF_*) need root; falling back to a privileged-
-    // helper round-trip for those is a follow-up. UF_* (user flags
-    // like UF_HIDDEN, UF_IMMUTABLE) work for the file's owner.
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    if let Err(e) = restore_flags_value(path, target.flags) {
-        // Best-effort: log + continue rather than fail the whole
-        // restore. SF_* flag restoration without root is the typical
-        // benign-EPERM case; we surface it but don't block undo.
-        tracing::warn!(
-            path = %path.display(),
-            err = %e,
-            target_flags = format!("0x{:x}", target.flags),
-            "chflags restore reported error (likely needs root for system flags)"
-        );
-    }
-
-    restore_mtime_only(path, target).map_err(MetadataRestoreError::Other)
-}
-
-/// M03.x.SETATTR — restore BSD/macOS `st_flags` to the captured value.
-/// No-op on Linux (no st_flags), no-op when target.flags matches current
-/// (cheap probe avoids the syscall on the common "flags didn't change"
-/// path).
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn restore_flags_value(path: &Path, target_flags: u32) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    // Quick stat to skip when current matches captured. The chflags
-    // syscall is cheap, but skipping when unchanged avoids touching
-    // UF_IMMUTABLE-protected files when the captured pre-state
-    // already matches.
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| format!("chflags: path contains NUL: {path:?}"))?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: c_path is a valid NUL-terminated CString; st is owned.
-    let rc = unsafe { libc::lstat(c_path.as_ptr(), &mut st) };
-    if rc != 0 {
-        return Err(format!(
-            "lstat for chflags-probe {path:?}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // libc exposes `st_flags` as u32 on both Apple and FreeBSD.
-    #[cfg(target_os = "macos")]
-    let current_flags: u32 = st.st_flags;
-    #[cfg(target_os = "freebsd")]
-    let current_flags: u32 = st.st_flags;
-    if current_flags == target_flags {
-        return Ok(());
-    }
-    // SAFETY: c_path is valid; chflags takes path + flags. Same
-    // divergence: Apple chflags takes c_uint, FreeBSD takes c_ulong.
-    // `target.flags` is u32; widen only on FreeBSD.
-    #[cfg(target_os = "macos")]
-    let flags_arg: libc::c_uint = target_flags;
-    #[cfg(target_os = "freebsd")]
-    let flags_arg: libc::c_ulong = u64::from(target_flags);
-    let rc = unsafe { libc::chflags(c_path.as_ptr(), flags_arg) };
-    if rc != 0 {
-        return Err(format!(
-            "chflags {path:?} -> 0x{:x}: {}",
-            target_flags,
-            std::io::Error::last_os_error()
-        ));
+    if !kind.is_file() && !(allow_directory && kind.is_dir()) {
+        return Err(ExecutionOutcome::Failed {
+            err: format!(
+                "refusing unsafe special target {path:?} (mode {:o})",
+                meta.mode()
+            ),
+        });
     }
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-fn restore_flags_value(_path: &Path, _target_flags: u32) -> Result<(), String> {
-    Err("RestoreFlags is unsupported on this operating system".into())
+/// Open exactly once without following a final symlink, then establish both
+/// safe-kind and inode identity from that descriptor. All mutations use the
+/// returned descriptor, never `path`.
+fn open_verified_target(path: &Path, expected_inode: InodeRef) -> Result<File, ExecutionOutcome> {
+    validate_safe_target_kind(path, true)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ExecutionOutcome::Conflict {
+                    kind: Conflict::Missing {
+                        detail: format!("{path:?} vanished before descriptor open"),
+                    },
+                }
+            } else {
+                ExecutionOutcome::Failed {
+                    err: format!(
+                        "open {path:?} with O_NOFOLLOW for metadata restore: {e}; refusing unopenable target"
+                    ),
+                }
+            }
+        })?;
+    let meta = file.metadata().map_err(|e| ExecutionOutcome::Failed {
+        err: format!("fstat metadata target {path:?}: {e}"),
+    })?;
+    if !meta.file_type().is_file() && !meta.file_type().is_dir() {
+        return Err(ExecutionOutcome::Failed {
+            err: format!(
+                "refusing unsafe special target {path:?} after open (mode {:o})",
+                meta.mode()
+            ),
+        });
+    }
+    let actual = InodeRef::new(meta.dev(), meta.ino());
+    if actual != expected_inode {
+        return Err(ExecutionOutcome::Conflict {
+            kind: Conflict::Phantom {
+                detail: format!(
+                    "{path:?} opened as inode {actual}, expected {expected_inode}; refusing inode-addressed mutation"
+                ),
+            },
+        });
+    }
+    Ok(file)
 }
 
-/// Apply mtime alone — used after a successful helper-routed chown
-/// to finish the metadata-restore sequence.
-fn restore_mtime_only(path: &Path, target: &crate::metadata::FileMetadata) -> Result<(), String> {
+fn verify_retained_path(file: &File, path: &Path) -> Result<(), ExecutionOutcome> {
+    let fd_meta = file.metadata().map_err(|e| ExecutionOutcome::Failed {
+        err: format!("fstat retained restore descriptor for {path:?}: {e}"),
+    })?;
+    if !fd_meta.file_type().is_file() {
+        return Err(ExecutionOutcome::Failed {
+            err: format!("retained RestoreContent target {path:?} is not a regular file"),
+        });
+    }
+    validate_safe_target_kind(path, false)?;
+    let live = live_inode(path).map_err(|e| ExecutionOutcome::Failed {
+        err: format!("lstat retained restore path {path:?}: {e}"),
+    })?;
+    let retained = InodeRef::new(fd_meta.dev(), fd_meta.ino());
+    if live != retained {
+        return Err(ExecutionOutcome::Conflict {
+            kind: Conflict::Phantom {
+                detail: format!(
+                    "{path:?} no longer names the inode installed by RestoreContent ({retained}); refusing metadata replay"
+                ),
+            },
+        });
+    }
+    Ok(())
+}
+
+/// Restore ownership, mode, xattrs, timestamp, and finally BSD flags through
+/// one already-verified descriptor. `fchown` EPERM fails closed: the existing
+/// privileged router is pathname-only and cannot safely preserve identity.
+fn restore_metadata_fd(
+    file: &File,
+    path: &Path,
+    target: &crate::metadata::FileMetadata,
+) -> Result<(), String> {
+    let fd = file.as_raw_fd();
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    clear_blocking_flags_fd(file, path)?;
+
+    let current = file
+        .metadata()
+        .map_err(|e| format!("fstat metadata target {path:?}: {e}"))?;
+    if current.uid() != target.uid || current.gid() != target.gid {
+        let uid = Some(nix::unistd::Uid::from_raw(target.uid));
+        let gid = Some(nix::unistd::Gid::from_raw(target.gid));
+        nix::unistd::fchown(fd, uid, gid).map_err(|e| {
+            if e == nix::errno::Errno::EPERM {
+                format!(
+                    "fchown {path:?} -> uid={} gid={}: EPERM; refusing unsafe path-based helper fallback",
+                    target.uid, target.gid
+                )
+            } else {
+                format!(
+                    "fchown {path:?} -> uid={} gid={}: {e}",
+                    target.uid, target.gid
+                )
+            }
+        })?;
+    }
+
+    // Every list/get/set/delete syscall is bound to this descriptor and every
+    // error is fatal: reporting Applied after partial xattr convergence would
+    // be false. Do this before final fchmod because xattr mutation can clear
+    // set-id bits on some kernels.
+    crate::executors::xattr::restore_user_xattrs_fd(fd, path, &target.xattrs)
+        .map_err(|e| format!("fd xattr restore for {path:?}: {e}"))?;
+
+    restore_mtime_fd(file, path, target)?;
+
+    // chown and xattr mutation can clear setuid/setgid, so the captured mode
+    // is the final mutation before immutable/append flags are installed.
+    let mode_only = target.mode & 0o7777;
+    nix::sys::stat::fchmod(
+        fd,
+        nix::sys::stat::Mode::from_bits_truncate(mode_only as libc::mode_t),
+    )
+    .map_err(|e| format!("fchmod {path:?} -> {mode_only:o}: {e}"))?;
+
+    // Immutable/append flags are always last: setting them earlier can make
+    // fchmod, fxattr, or futimens fail on the very descriptor we verified.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    restore_flags_fd(file, path, target.flags)?;
+    Ok(())
+}
+
+fn restore_mtime_fd(
+    file: &File,
+    path: &Path,
+    target: &crate::metadata::FileMetadata,
+) -> Result<(), String> {
     if target.mtime_unix_nanos == 0 {
         return Ok(());
     }
-    use nix::sys::stat::utimensat;
+    use nix::sys::stat::futimens;
     use nix::sys::time::TimeSpec;
     let secs = target.mtime_unix_nanos.div_euclid(1_000_000_000);
     let nsecs = target.mtime_unix_nanos.rem_euclid(1_000_000_000);
@@ -559,14 +822,84 @@ fn restore_mtime_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
     let nsecs_i64: i64 = nsecs.try_into().unwrap_or(0);
     let ts = TimeSpec::new(secs_i64, nsecs_i64);
     let omit = TimeSpec::new(0, libc::UTIME_OMIT);
-    utimensat(
-        None,
-        path,
-        &omit,
-        &ts,
-        nix::sys::stat::UtimensatFlags::FollowSymlink,
-    )
-    .map_err(|e| format!("utimensat {path:?}: {e}"))
+    futimens(file.as_raw_fd(), &omit, &ts).map_err(|e| format!("futimens {path:?}: {e}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn current_flags_fd(file: &File, path: &Path) -> Result<u32, String> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns a live descriptor and `st` is writable.
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
+        return Err(format!(
+            "fstat for fchflags probe {path:?}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(st.st_flags as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn set_flags_fd(file: &File, path: &Path, flags: u32) -> Result<(), String> {
+    // SAFETY: `file` owns a live descriptor; flags has libc's exact width.
+    if unsafe { libc::fchflags(file.as_raw_fd(), flags as libc::c_uint) } != 0 {
+        return Err(format!(
+            "fchflags {path:?} -> 0x{flags:x}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "freebsd")]
+fn set_flags_fd(file: &File, path: &Path, flags: u32) -> Result<(), String> {
+    // SAFETY: `file` owns a live descriptor; widening u32 is lossless.
+    if unsafe { libc::fchflags(file.as_raw_fd(), libc::c_ulong::from(flags)) } != 0 {
+        return Err(format!(
+            "fchflags {path:?} -> 0x{flags:x}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn clear_blocking_flags_fd(file: &File, path: &Path) -> Result<(), String> {
+    let current = current_flags_fd(file, path)?;
+    #[cfg(target_os = "macos")]
+    let blocking = libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+    #[cfg(target_os = "freebsd")]
+    let blocking = (libc::UF_IMMUTABLE as u32)
+        | (libc::UF_APPEND as u32)
+        | (libc::SF_IMMUTABLE as u32)
+        | (libc::SF_APPEND as u32);
+    let writable = current & !blocking;
+    if writable != current {
+        set_flags_fd(file, path, writable)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn restore_flags_fd(file: &File, path: &Path, target_flags: u32) -> Result<(), String> {
+    if current_flags_fd(file, path)? == target_flags {
+        return Ok(());
+    }
+    set_flags_fd(file, path, target_flags)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn restore_flags_fd(_file: &File, _path: &Path, _target_flags: u32) -> Result<(), String> {
+    Err("RestoreFlags is unsupported on this operating system".into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn flags_supported() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn flags_supported() -> Result<(), String> {
+    Err("RestoreFlags is unsupported on this operating system".into())
 }
 
 /// Remove `path`. Auto-detects file-vs-directory via lstat so the
@@ -709,6 +1042,10 @@ mod tests {
         }
     }
 
+    fn actual_inode(path: &Path) -> InodeRef {
+        live_inode(path).expect("lstat test fixture")
+    }
+
     #[test]
     fn supports_only_file_tier() {
         let r = InMemoryBlobReader::new();
@@ -726,13 +1063,15 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_short_circuits_to_would_apply() {
-        let r = InMemoryBlobReader::new();
+    fn dry_run_validates_blob_then_reports_would_apply() {
+        let blob = BlobHash::from_bytes([0; 32]);
+        let mut r = InMemoryBlobReader::new();
+        r.insert(blob, b"captured".to_vec());
         let e = FileExecutor::new(&r);
         let op = InverseOp::RestoreContent {
             inode: InodeRef::new(1, 1),
             path: PathBuf::from("/tmp/x"),
-            blob: BlobHash::from_bytes([0; 32]),
+            blob,
         };
         assert_eq!(
             e.execute(&op, true, ConflictPolicy::default()),
@@ -741,19 +1080,123 @@ mod tests {
     }
 
     #[test]
+    fn rejects_relative_operands_for_every_file_inverse_shape() {
+        use crate::metadata::{FileKind, FileMetadata};
+        use std::collections::BTreeMap;
+
+        let inode = InodeRef::new(1, 1);
+        let blob = BlobHash::from_bytes([0; 32]);
+        let meta = FileMetadata {
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            mtime_unix_nanos: 0,
+            xattrs: BTreeMap::new(),
+            acl: None,
+            flags: 0,
+        };
+        let ops = vec![
+            InverseOp::RestoreContent {
+                inode,
+                path: "relative".into(),
+                blob,
+            },
+            InverseOp::RestoreMetadata {
+                inode,
+                path: "relative".into(),
+                target: meta,
+            },
+            InverseOp::RestoreFlags {
+                inode,
+                path: "relative".into(),
+                flags: 0,
+            },
+            InverseOp::Unlink {
+                path: "relative".into(),
+            },
+            InverseOp::RecreatePath {
+                path: "relative".into(),
+                kind: FileKind::Regular,
+                mode: 0o644,
+            },
+            InverseOp::Rename {
+                from: "relative".into(),
+                to: "/absolute".into(),
+            },
+            InverseOp::CreateSymlink {
+                target: "../valid-relative-target".into(),
+                path: "relative".into(),
+            },
+            InverseOp::CreateHardlink {
+                source: "relative".into(),
+                target: "/absolute".into(),
+            },
+            InverseOp::FileExtend {
+                path: "relative".into(),
+                truncate_to: 0,
+            },
+            InverseOp::FileExtendGuarded {
+                inode,
+                path: "relative".into(),
+                truncate_to: 0,
+            },
+        ];
+
+        for op in &ops {
+            assert!(
+                first_relative_file_operand(op).is_some(),
+                "relative operand escaped guard: {op:?}"
+            );
+        }
+
+        let valid_relative_symlink_target = InverseOp::CreateSymlink {
+            target: "../target".into(),
+            path: "/absolute/link".into(),
+        };
+        assert!(first_relative_file_operand(&valid_relative_symlink_target).is_none());
+    }
+
+    #[test]
+    fn execute_refuses_relative_path_before_dispatch() {
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let out = e.execute(
+            &InverseOp::Unlink {
+                path: "must-not-be-unlinked".into(),
+            },
+            false,
+            ConflictPolicy::default(),
+        );
+        assert!(matches!(
+            out,
+            ExecutionOutcome::Failed { err } if err.contains("refusing relative filesystem path")
+        ));
+    }
+
+    #[test]
     fn restore_flags_is_a_file_tier_dry_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("flags-dry-run");
+        std::fs::write(&path, b"x").expect("write");
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::RestoreFlags {
-            inode: InodeRef::new(1, 1),
-            path: PathBuf::from("/tmp/flags"),
+            inode: actual_inode(&path),
+            path,
             flags: 0,
         };
         assert!(e.supports(&op));
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         assert_eq!(
             e.execute(&op, true, ConflictPolicy::default()),
             ExecutionOutcome::WouldApply
         );
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        assert!(matches!(
+            e.execute(&op, true, ConflictPolicy::default()),
+            ExecutionOutcome::Failed { err } if err.contains("unsupported")
+        ));
     }
 
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -765,8 +1208,8 @@ mod tests {
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::RestoreFlags {
-            inode: InodeRef::new(1, 1),
-            path,
+            inode: actual_inode(&path),
+            path: path.clone(),
             flags: 0,
         };
         assert_eq!(
@@ -778,11 +1221,14 @@ mod tests {
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     #[test]
     fn restore_flags_fails_honestly_on_unsupported_platform() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("flags");
+        std::fs::write(&path, b"x").expect("write");
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::RestoreFlags {
-            inode: InodeRef::new(1, 1),
-            path: PathBuf::from("/tmp/flags"),
+            inode: actual_inode(&path),
+            path,
             flags: 0,
         };
         assert!(matches!(
@@ -792,14 +1238,36 @@ mod tests {
     }
 
     #[test]
-    fn file_extend_truncates_file_back_to_pre_size() {
+    fn legacy_file_extend_fails_closed_without_mutating() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let target = tmpdir.path().join("log");
-        // Pre: 8 bytes. Post (after `>>`): 32 bytes. Reverse: truncate to 8.
         std::fs::write(&target, vec![0u8; 32]).unwrap();
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::FileExtend {
+            path: target.clone(),
+            truncate_to: 8,
+        };
+        for dry_run in [true, false] {
+            assert!(matches!(
+                e.execute(&op, dry_run, ConflictPolicy::Force),
+                ExecutionOutcome::Failed { err }
+                    if err.contains("lacks a captured inode") && err.contains("regenerate")
+            ));
+            assert_eq!(std::fs::metadata(&target).unwrap().len(), 32);
+        }
+    }
+
+    #[test]
+    fn guarded_file_extend_truncates_matching_inode() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("log");
+        std::fs::write(&target, vec![0u8; 32]).unwrap();
+        let captured_inode = actual_inode(&target);
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::FileExtendGuarded {
+            inode: captured_inode,
             path: target.clone(),
             truncate_to: 8,
         };
@@ -811,7 +1279,47 @@ mod tests {
     }
 
     #[test]
-    fn file_extend_refuses_to_grow_with_zeros() {
+    fn guarded_file_extend_force_refuses_replacement_inode() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("log");
+        let original = tmpdir.path().join("log.rotated");
+        std::fs::write(&target, b"captured inode plus appended bytes").unwrap();
+        let captured_inode = actual_inode(&target);
+
+        // Keep the captured inode allocated so the new file cannot reuse its
+        // inode number, then replace the path with unrelated user data.
+        std::fs::rename(&target, &original).unwrap();
+        std::fs::write(&target, b"replacement must remain intact").unwrap();
+        assert_ne!(actual_inode(&target), captured_inode);
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::FileExtendGuarded {
+            inode: captured_inode,
+            path: target.clone(),
+            truncate_to: 8,
+        };
+        for dry_run in [true, false] {
+            let out = e.execute(&op, dry_run, ConflictPolicy::Force);
+            assert!(matches!(
+                out,
+                ExecutionOutcome::Conflict {
+                    kind: Conflict::Phantom { .. }
+                }
+            ));
+        }
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"replacement must remain intact"
+        );
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"captured inode plus appended bytes"
+        );
+    }
+
+    #[test]
+    fn guarded_file_extend_refuses_to_grow_with_zeros() {
         // If something truncated the file shorter than truncate_to
         // since capture, refusing is the right answer — we'd be
         // appending zeros the user never wrote.
@@ -820,42 +1328,52 @@ mod tests {
         std::fs::write(&target, vec![0u8; 4]).unwrap(); // current = 4
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
-        let op = InverseOp::FileExtend {
+        let op = InverseOp::FileExtendGuarded {
+            inode: actual_inode(&target),
             path: target.clone(),
             truncate_to: 16, // would grow with zeros
         };
-        match e.execute(&op, false, ConflictPolicy::default()) {
-            ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("refusing to grow"), "got: {err}");
+        for dry_run in [true, false] {
+            match e.execute(&op, dry_run, ConflictPolicy::default()) {
+                ExecutionOutcome::Failed { err } => {
+                    assert!(err.contains("refusing to grow"), "got: {err}");
+                }
+                other => panic!("expected Failed, got {other:?}"),
             }
-            other => panic!("expected Failed, got {other:?}"),
         }
         // File was not modified.
         assert_eq!(std::fs::metadata(&target).unwrap().len(), 4);
     }
 
     #[test]
-    fn file_extend_missing_path_returns_failed() {
+    fn guarded_file_extend_missing_path_returns_conflict() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let target = tmpdir.path().join("ghost");
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
-        let op = InverseOp::FileExtend {
+        let op = InverseOp::FileExtendGuarded {
+            inode: InodeRef::new(1, 1),
             path: target,
             truncate_to: 0,
         };
         let out = e.execute(&op, false, ConflictPolicy::default());
-        assert!(matches!(out, ExecutionOutcome::Failed { .. }));
+        assert!(matches!(
+            out,
+            ExecutionOutcome::Conflict {
+                kind: Conflict::Missing { .. }
+            }
+        ));
     }
 
     #[test]
-    fn file_extend_to_zero_makes_file_empty() {
+    fn guarded_file_extend_to_zero_makes_file_empty() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let target = tmpdir.path().join("log");
         std::fs::write(&target, b"some content here").unwrap();
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
-        let op = InverseOp::FileExtend {
+        let op = InverseOp::FileExtendGuarded {
+            inode: actual_inode(&target),
             path: target.clone(),
             truncate_to: 0,
         };
@@ -999,6 +1517,14 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let target = tmpdir.path().join("setuid-binary");
         std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        // Some filesystems/sandboxes refuse or silently strip set-id bits for
+        // unprivileged callers. Probe that capability so this remains an
+        // ordering test rather than a host-policy test.
+        if std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o4755)).is_err()
+            || std::fs::metadata(&target).unwrap().permissions().mode() & 0o4000 == 0
+        {
+            return;
+        }
         // Start with 0o755 (no setuid). Capture the current uid/gid;
         // we'll "chown to self" which is the only chown we can do
         // unprivileged but still triggers the kernel's setuid-strip
@@ -1020,7 +1546,7 @@ mod tests {
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::RestoreMetadata {
-            inode: InodeRef::new(0, 0),
+            inode: actual_inode(&target),
             path: target.clone(),
             target: target_meta,
         };
@@ -1170,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_metadata_restores_mode() {
+    fn restore_metadata_restores_mode_on_same_inode() {
         use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let target = tmpdir.path().join("perms");
@@ -1192,7 +1718,7 @@ mod tests {
             flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
-            inode: InodeRef::new(1, 1),
+            inode: actual_inode(&target),
             path: target.clone(),
             target: captured,
         };
@@ -1203,12 +1729,354 @@ mod tests {
         assert_eq!(m, 0o600);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn restore_metadata_propagates_fd_xattr_errors_before_final_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("xattr-error");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let live = std::fs::metadata(&target).unwrap();
+        let mut xattrs = std::collections::BTreeMap::new();
+        xattrs.insert("bad\0name".to_string(), b"value".to_vec());
+        let metadata = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: live.uid(),
+            gid: live.gid(),
+            size: live.len(),
+            mtime_unix_nanos: 0,
+            xattrs,
+            acl: None,
+            flags: 0,
+        };
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let outcome = exec.execute(
+            &InverseOp::RestoreMetadata {
+                inode: actual_inode(&target),
+                path: target.clone(),
+                target: metadata,
+            },
+            false,
+            ConflictPolicy::Abort,
+        );
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Failed { err }
+                if err.contains("xattr") && err.contains("unrepresentable")
+        ));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640,
+            "fchmod must not run after xattr convergence failed"
+        );
+    }
+
+    #[test]
+    fn restore_metadata_refuses_replacement_inode_even_with_force() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("metadata-target");
+        let displaced = tmpdir.path().join("metadata-target.old");
+        std::fs::write(&target, b"captured inode").unwrap();
+        let captured_inode = actual_inode(&target);
+
+        // Replace the pathname with a distinct inode after capture.
+        std::fs::rename(&target, &displaced).unwrap();
+        std::fs::write(&target, b"unrelated replacement").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert_ne!(actual_inode(&target), captured_inode);
+
+        let live = std::fs::metadata(&target).unwrap();
+        let target_meta = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: std::os::unix::fs::MetadataExt::uid(&live),
+            gid: std::os::unix::fs::MetadataExt::gid(&live),
+            size: live.len(),
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+            flags: 0,
+        };
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let outcome = exec.execute(
+            &InverseOp::RestoreMetadata {
+                inode: captured_inode,
+                path: target.clone(),
+                target: target_meta,
+            },
+            false,
+            ConflictPolicy::Force,
+        );
+
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Conflict {
+                kind: Conflict::Phantom { .. }
+            }
+        ));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640,
+            "the unrelated replacement must remain untouched"
+        );
+    }
+
+    #[test]
+    fn metadata_accepts_inode_installed_by_matching_content_restore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("paired-restore");
+        std::fs::write(&target, b"post-command bytes").unwrap();
+        let captured_inode = actual_inode(&target);
+
+        let blob = BlobHash::from_bytes([0x5a; 32]);
+        let mut reader = InMemoryBlobReader::new();
+        reader.insert(blob, b"pre-command bytes".to_vec());
+        let exec = FileExecutor::new(&reader);
+        assert_eq!(
+            exec.execute(
+                &InverseOp::RestoreContent {
+                    inode: captured_inode,
+                    path: target.clone(),
+                    blob,
+                },
+                false,
+                ConflictPolicy::Abort,
+            ),
+            ExecutionOutcome::Applied
+        );
+        let restored_inode = actual_inode(&target);
+        assert_ne!(restored_inode, captured_inode);
+
+        let live = std::fs::metadata(&target).unwrap();
+        let metadata = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: std::os::unix::fs::MetadataExt::uid(&live),
+            gid: std::os::unix::fs::MetadataExt::gid(&live),
+            size: live.len(),
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+            flags: 0,
+        };
+        assert_eq!(
+            exec.execute(
+                &InverseOp::RestoreMetadata {
+                    inode: captured_inode,
+                    path: target.clone(),
+                    target: metadata,
+                },
+                false,
+                ConflictPolicy::Abort,
+            ),
+            ExecutionOutcome::Applied
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn dry_run_models_content_then_metadata_without_mutating() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("paired-dry-run");
+        std::fs::write(&target, b"post-command bytes").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let captured_inode = InodeRef::new(u64::MAX - 1, u64::MAX - 2);
+        let blob = BlobHash::from_bytes([0x6b; 32]);
+        let mut reader = InMemoryBlobReader::new();
+        reader.insert(blob, b"pre-command bytes".to_vec());
+        let exec = FileExecutor::new(&reader);
+        assert_eq!(
+            exec.execute(
+                &InverseOp::RestoreContent {
+                    inode: captured_inode,
+                    path: target.clone(),
+                    blob,
+                },
+                true,
+                ConflictPolicy::Force,
+            ),
+            ExecutionOutcome::WouldApply
+        );
+
+        let live = std::fs::metadata(&target).unwrap();
+        let metadata = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: live.uid(),
+            gid: live.gid(),
+            size: live.len(),
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+            flags: 0,
+        };
+        assert_eq!(
+            exec.execute(
+                &InverseOp::RestoreMetadata {
+                    inode: captured_inode,
+                    path: target.clone(),
+                    target: metadata,
+                },
+                true,
+                ConflictPolicy::Force,
+            ),
+            ExecutionOutcome::WouldApply
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"post-command bytes");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn retained_content_descriptor_refuses_later_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("paired-race");
+        let displaced = tmpdir.path().join("paired-race.displaced");
+        std::fs::write(&target, b"post-command").unwrap();
+        let captured_inode = actual_inode(&target);
+
+        let blob = BlobHash::from_bytes([0x7c; 32]);
+        let mut reader = InMemoryBlobReader::new();
+        reader.insert(blob, b"restored bytes".to_vec());
+        let exec = FileExecutor::new(&reader);
+        assert_eq!(
+            exec.execute(
+                &InverseOp::RestoreContent {
+                    inode: captured_inode,
+                    path: target.clone(),
+                    blob,
+                },
+                false,
+                ConflictPolicy::Abort,
+            ),
+            ExecutionOutcome::Applied
+        );
+
+        std::fs::rename(&target, &displaced).unwrap();
+        std::fs::write(&target, b"unrelated replacement").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let live = std::fs::metadata(&target).unwrap();
+        let metadata = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: live.uid(),
+            gid: live.gid(),
+            size: live.len(),
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+            flags: 0,
+        };
+        let outcome = exec.execute(
+            &InverseOp::RestoreMetadata {
+                inode: captured_inode,
+                path: target.clone(),
+                target: metadata,
+            },
+            false,
+            ConflictPolicy::Force,
+        );
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Conflict {
+                kind: Conflict::Phantom { .. }
+            }
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"unrelated replacement");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn restore_metadata_refuses_symlink_without_touching_referent() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let referent = tmpdir.path().join("referent");
+        let link = tmpdir.path().join("link");
+        std::fs::write(&referent, b"data").unwrap();
+        std::fs::set_permissions(&referent, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&referent, &link).unwrap();
+        let referent_meta = std::fs::metadata(&referent).unwrap();
+        let target = crate::metadata::FileMetadata {
+            mode: 0o100600,
+            uid: referent_meta.uid(),
+            gid: referent_meta.gid(),
+            size: referent_meta.len(),
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+            flags: 0,
+        };
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let op = InverseOp::RestoreMetadata {
+            inode: actual_inode(&link),
+            path: link,
+            target,
+        };
+        for dry_run in [true, false] {
+            assert!(matches!(
+                exec.execute(&op, dry_run, ConflictPolicy::Force),
+                ExecutionOutcome::Failed { err } if err.contains("symlink")
+            ));
+        }
+        assert_eq!(
+            std::fs::metadata(&referent).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn restore_flags_runtime_guard_refuses_replacement_inode() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("flags-target");
+        let displaced = tmpdir.path().join("flags-target.old");
+        std::fs::write(&target, b"captured inode").unwrap();
+        let captured_inode = actual_inode(&target);
+        std::fs::rename(&target, displaced).unwrap();
+        std::fs::write(&target, b"replacement").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let outcome = exec.execute(
+            &InverseOp::RestoreFlags {
+                inode: captured_inode,
+                path: target,
+                flags: 0,
+            },
+            false,
+            ConflictPolicy::Force,
+        );
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Conflict {
+                kind: Conflict::Phantom { .. }
+            }
+        ));
+    }
+
     #[test]
     fn restore_metadata_to_different_uid_without_router_surfaces_eperm() {
-        // Unprivileged tests can't chown to a uid we don't own, so
-        // this exercises the EPERM → no-op-router PermissionDenied
-        // path. With a real helper-IPC router the chown would
-        // succeed; without one, the EPERM propagates as Failed.
+        // Unprivileged tests can't fchown to a uid we don't own. The
+        // descriptor-safe implementation fails closed on EPERM because the
+        // existing privileged router accepts only a pathname.
         if nix::unistd::geteuid().is_root() {
             return;
         }
@@ -1230,7 +2098,7 @@ mod tests {
             flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
-            inode: InodeRef::new(1, 1),
+            inode: actual_inode(&target),
             path: target.clone(),
             target: captured,
         };
@@ -1244,11 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_metadata_with_router_retries_via_chown_route() {
-        // DR-15: when the local chown EPERMs, the executor falls
-        // back to the privileged-op router. With the in-memory
-        // router returning Applied, the overall outcome is Applied
-        // and the router records the call.
+    fn restore_metadata_never_falls_back_to_path_chown_router() {
         if nix::unistd::geteuid().is_root() {
             return;
         }
@@ -1271,24 +2135,24 @@ mod tests {
             flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
-            inode: InodeRef::new(1, 1),
+            inode: actual_inode(&target),
             path: target.clone(),
             target: captured,
         };
         let outcome = exec.execute(&op, false, ConflictPolicy::default());
-        assert_eq!(outcome, ExecutionOutcome::Applied);
-        let log = exec.privileged_router.chown_log();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].0, target);
-        assert_eq!(log[0].1, 0);
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Failed { err }
+                if err.contains("EPERM") && err.contains("unsafe path-based helper fallback")
+        ));
         assert!(
-            !log[0].3,
-            "no_dereference should be false for a regular file"
+            exec.privileged_router.chown_log().is_empty(),
+            "descriptor replay must not hand a pathname to the chown router"
         );
     }
 
     #[test]
-    fn restore_metadata_with_router_out_of_scope_surfaces_clear_error() {
+    fn restore_metadata_path_router_outcome_cannot_override_fchown_failure() {
         if nix::unistd::geteuid().is_root() {
             return;
         }
@@ -1311,16 +2175,20 @@ mod tests {
             flags: 0,
         };
         let op = InverseOp::RestoreMetadata {
-            inode: InodeRef::new(1, 1),
-            path: target,
+            inode: actual_inode(&target),
+            path: target.clone(),
             target: captured,
         };
         match exec.execute(&op, false, ConflictPolicy::default()) {
             ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("out of session scope"), "got: {err}");
+                assert!(
+                    err.contains("unsafe path-based helper fallback"),
+                    "got: {err}"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+        assert!(exec.privileged_router.chown_log().is_empty());
     }
 
     #[test]

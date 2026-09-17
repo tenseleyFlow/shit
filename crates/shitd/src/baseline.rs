@@ -51,9 +51,34 @@ pub enum WalkState {
     /// inodes it observed at session-open time.
     Ready,
     /// Walker failed (permission error, filesystem disappeared,
-    /// size cap exceeded). The baseline is empty; pre-image
-    /// capture falls back to layer 3 (S24.4 NOTE_WRITE read).
+    /// size cap exceeded). The baseline is empty and must never be
+    /// promoted: BSD NOTE_WRITE is post-mutation and cannot provide a
+    /// safe fallback pre-image.
     Failed,
+}
+
+/// Complete pre-command state returned by an authoritative baseline
+/// promotion. Keeping this tuple together prevents callers from accidentally
+/// combining pre-command bytes with metadata read after a kqueue event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselinePreImage {
+    pub blob: BlobHash,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_unix_nanos: i128,
+    pub xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    pub flags: u32,
+}
+
+/// Result of asking a ready baseline to promote one inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaselinePromotion {
+    Promoted(BaselinePreImage),
+    /// The command already promoted this inode. A repeated NOTE_WRITE is
+    /// harmless and must not be mistaken for a missing baseline.
+    AlreadyPromoted,
 }
 
 /// One entry per (cwd, inode) pair. Sized to be cheap to clone for
@@ -68,11 +93,17 @@ pub struct BaselineEntry {
     /// content) — if the inode has the same number but size or
     /// blob differ at PostExec, we re-baseline.
     pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_unix_nanos: i128,
     /// User-namespace extended attributes captured at baseline time
     /// (W09.21 capsicum fix). Captured here in the daemon because
     /// the helper runs under `cap_enter(2)` where `extattr_*_fd` is
     /// blocked at the syscall level. See `xattr.rs` for the why.
     pub xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// BSD `st_flags` captured before the command started.
+    pub flags: u32,
     /// True from the first `promote()` of this inode within a
     /// command's window until the next PostExec re-baseline. While
     /// stale the entry's `blob` is no longer the live pre-image
@@ -87,38 +118,53 @@ pub struct BaselineEntry {
 }
 
 impl BaselineEntry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inode: InodeRef,
         blob: BlobHash,
         size: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime_unix_nanos: i128,
         xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+        flags: u32,
     ) -> Self {
         Self {
             inode,
             blob,
             size,
+            mode,
+            uid,
+            gid,
+            mtime_unix_nanos,
             xattrs,
+            flags,
             stale: false,
             stale_for_command: None,
         }
     }
 
-    /// Mark stale on first promotion within a command. Returns the
-    /// blob + xattrs the caller should emit in the FilePreImage's
-    /// FileMetadata. Returns `None` when already stale for this
-    /// command (no double-emit).
-    pub fn mark_stale(
-        &mut self,
-        command: CommandId,
-    ) -> Option<(BlobHash, std::collections::BTreeMap<String, Vec<u8>>)> {
+    /// Mark stale on first promotion within a command and return the complete
+    /// pre-command state. A repeated event for the same command is distinct
+    /// from a missing inode so the caller can drop it without refusing undo.
+    pub fn mark_stale(&mut self, command: CommandId) -> BaselinePromotion {
         if self.stale && self.stale_for_command == Some(command) {
-            return None;
+            return BaselinePromotion::AlreadyPromoted;
         }
-        let pre_image = self.blob;
-        let xattrs = self.xattrs.clone();
+        let pre_image = BaselinePreImage {
+            blob: self.blob,
+            size: self.size,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            mtime_unix_nanos: self.mtime_unix_nanos,
+            xattrs: self.xattrs.clone(),
+            flags: self.flags,
+        };
         self.stale = true;
         self.stale_for_command = Some(command);
-        Some((pre_image, xattrs))
+        BaselinePromotion::Promoted(pre_image)
     }
 }
 
@@ -127,6 +173,10 @@ impl BaselineEntry {
 pub struct BaselineCacheEntry {
     pub cwd: PathBuf,
     pub state: RwLock<WalkState>,
+    /// Command whose baseline frames currently populate this cache. Prevents
+    /// two interleaved WatchTree walks for one cwd from being merged into a
+    /// falsely authoritative snapshot.
+    walk_command: RwLock<Option<CommandId>>,
     /// Inode-keyed map. NOTE_WRITE arrives with a path; we look up
     /// the inode via `stat()` (cheap) and dispatch here.
     pub by_inode: RwLock<HashMap<InodeRef, BaselineEntry>>,
@@ -141,9 +191,35 @@ impl BaselineCacheEntry {
         Self {
             cwd,
             state: RwLock::new(WalkState::Pending),
+            walk_command: RwLock::new(None),
             by_inode: RwLock::new(HashMap::new()),
             by_path: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Start (or continue) the baseline generation for `command`. A new walk
+    /// clears every entry from the previous generation, including paths that
+    /// disappeared between commands. Interleaved pending walks are refused.
+    pub fn begin_walk(&self, command: CommandId) -> Result<(), CommandId> {
+        let mut state = self.state.write().unwrap();
+        let mut active = self.walk_command.write().unwrap();
+        if *active == Some(command) {
+            return Ok(());
+        }
+        if *state == WalkState::Pending
+            && let Some(other) = *active
+        {
+            return Err(other);
+        }
+        self.by_inode.write().unwrap().clear();
+        self.by_path.write().unwrap().clear();
+        *state = WalkState::Pending;
+        *active = Some(command);
+        Ok(())
+    }
+
+    pub fn is_walk_for(&self, command: CommandId) -> bool {
+        *self.walk_command.read().unwrap() == Some(command)
     }
 
     /// Insert (or refresh) a baseline entry for `path → inode`.
@@ -167,14 +243,13 @@ impl BaselineCacheEntry {
     ///
     /// Caller is responsible for emitting the actual FilePreImage
     /// event; this method only flips the in-memory state.
-    pub fn promote(
-        &self,
-        inode: InodeRef,
-        command: CommandId,
-    ) -> Option<(BlobHash, std::collections::BTreeMap<String, Vec<u8>>)> {
+    pub fn promote(&self, inode: InodeRef, command: CommandId) -> Option<BaselinePromotion> {
+        if self.state() != WalkState::Ready {
+            return None;
+        }
         let mut map = self.by_inode.write().unwrap();
         let entry = map.get_mut(&inode)?;
-        entry.mark_stale(command)
+        Some(entry.mark_stale(command))
     }
 
     /// PostExec sweep: clear the stale flag on entries that flipped
@@ -210,6 +285,8 @@ impl BaselineCacheEntry {
     /// layer 3).
     pub fn mark_failed(&self) {
         *self.state.write().unwrap() = WalkState::Failed;
+        self.by_inode.write().unwrap().clear();
+        self.by_path.write().unwrap().clear();
     }
 
     pub fn state(&self) -> WalkState {
@@ -305,6 +382,20 @@ impl LiveBaseline {
         None
     }
 
+    /// Find the most-specific watched cwd containing `path`. This is used for
+    /// kqueue events whose inode was absent from a ready baseline (normally a
+    /// file created during the current command), where inode lookup cannot
+    /// identify the owning cache.
+    pub fn get_cwd_for_path(&self, path: &Path) -> Option<Arc<BaselineCacheEntry>> {
+        let map = self.by_cwd.read().unwrap();
+        map.iter()
+            .filter(|(cwd, cache)| {
+                path.starts_with(cwd.as_path()) && cache.state() == WalkState::Ready
+            })
+            .max_by_key(|(cwd, _)| cwd.components().count())
+            .map(|(_, cache)| Arc::clone(cache))
+    }
+
     pub fn cached_cwd_count(&self) -> usize {
         self.by_cwd.read().unwrap().len()
     }
@@ -320,7 +411,8 @@ impl LiveBaseline {
     /// `path` is expected to be absolute. Caller's responsibility.
     pub fn path_in_watched_subtree(&self, path: &Path) -> bool {
         let map = self.by_cwd.read().unwrap();
-        map.keys().any(|cwd| path.starts_with(cwd))
+        map.iter()
+            .any(|(cwd, cache)| cache.state() == WalkState::Ready && path.starts_with(cwd))
     }
 }
 
@@ -341,7 +433,12 @@ mod tests {
             InodeRef::new(1, inode_num),
             BlobHash::from_bytes([blob_byte; 32]),
             42,
+            0o100640,
+            1001,
+            1002,
+            1_700_000_000_123_456_789,
             std::collections::BTreeMap::new(),
+            0x2,
         )
     }
 
@@ -366,22 +463,30 @@ mod tests {
     fn promote_returns_blob_first_time_only() {
         let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
         cache.insert(PathBuf::from("/tmp/x/foo"), entry(100, 0xAA));
+        cache.mark_ready();
 
-        // First promote within the command: returns (blob, xattrs).
+        // First promote within the command returns the complete baseline.
         let promote1 = cache.promote(InodeRef::new(1, 100), cmd(1));
-        assert!(promote1.is_some());
-        let (blob1, xattrs1) = promote1.unwrap();
-        assert_eq!(blob1.0, [0xAA; 32]);
-        assert!(xattrs1.is_empty());
+        let Some(BaselinePromotion::Promoted(pre)) = promote1 else {
+            panic!("expected first promotion");
+        };
+        assert_eq!(pre.blob.0, [0xAA; 32]);
+        assert_eq!(pre.mode, 0o100640);
+        assert_eq!(pre.uid, 1001);
+        assert_eq!(pre.gid, 1002);
+        assert_eq!(pre.mtime_unix_nanos, 1_700_000_000_123_456_789);
+        assert_eq!(pre.flags, 0x2);
+        assert!(pre.xattrs.is_empty());
 
-        // Same command, same inode: returns None (no double-emit).
+        // Same command, same inode is not confused with a cache miss.
         let blob2 = cache.promote(InodeRef::new(1, 100), cmd(1));
-        assert!(blob2.is_none());
+        assert_eq!(blob2, Some(BaselinePromotion::AlreadyPromoted));
     }
 
     #[test]
     fn promote_for_unknown_inode_returns_none() {
         let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
+        cache.mark_ready();
         // No insert.
         let blob = cache.promote(InodeRef::new(1, 100), cmd(1));
         assert!(blob.is_none());
@@ -393,6 +498,7 @@ mod tests {
         cache.insert(PathBuf::from("/tmp/x/a"), entry(100, 0xAA));
         cache.insert(PathBuf::from("/tmp/x/b"), entry(200, 0xBB));
         cache.insert(PathBuf::from("/tmp/x/c"), entry(300, 0xCC));
+        cache.mark_ready();
 
         // Flip 100 and 300 stale for command 1; 200 stays clean.
         cache.promote(InodeRef::new(1, 100), cmd(1));
@@ -414,6 +520,7 @@ mod tests {
         let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
         cache.insert(PathBuf::from("/tmp/x/a"), entry(100, 0xAA));
         cache.insert(PathBuf::from("/tmp/x/b"), entry(200, 0xBB));
+        cache.mark_ready();
 
         cache.promote(InodeRef::new(1, 100), cmd(1));
         cache.promote(InodeRef::new(1, 200), cmd(2));
@@ -431,6 +538,7 @@ mod tests {
     fn second_command_can_repromote_after_drain() {
         let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
         cache.insert(PathBuf::from("/tmp/x/a"), entry(100, 0xAA));
+        cache.mark_ready();
 
         // Command 1 promotes.
         assert!(cache.promote(InodeRef::new(1, 100), cmd(1)).is_some());
@@ -444,7 +552,10 @@ mod tests {
         // wires that in.)
         let promote2 = cache.promote(InodeRef::new(1, 100), cmd(2));
         assert!(promote2.is_some());
-        assert_eq!(promote2.unwrap().0.0, [0xAA; 32]);
+        let Some(BaselinePromotion::Promoted(pre)) = promote2 else {
+            panic!("expected second-command promotion");
+        };
+        assert_eq!(pre.blob.0, [0xAA; 32]);
     }
 
     #[test]
@@ -492,5 +603,51 @@ mod tests {
         // Failed transition is allowed too (e.g., partial walk + error).
         cache.mark_failed();
         assert_eq!(cache.state(), WalkState::Failed);
+    }
+
+    #[test]
+    fn pending_or_failed_baseline_never_promotes_and_failure_discards_entries() {
+        let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
+        cache.insert(PathBuf::from("/tmp/x/a"), entry(100, 0xAA));
+        assert_eq!(cache.promote(InodeRef::new(1, 100), cmd(1)), None);
+
+        cache.mark_failed();
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.promote(InodeRef::new(1, 100), cmd(1)), None);
+    }
+
+    #[test]
+    fn path_lookup_ignores_failed_cache_and_chooses_most_specific_ready_cwd() {
+        let baselines = LiveBaseline::new();
+        let outer = baselines.entry_for_cwd(Path::new("/tmp/work"));
+        outer.mark_ready();
+        let inner = baselines.entry_for_cwd(Path::new("/tmp/work/nested"));
+        inner.mark_ready();
+        let failed = baselines.entry_for_cwd(Path::new("/tmp/failed"));
+        failed.mark_failed();
+
+        let found = baselines
+            .get_cwd_for_path(Path::new("/tmp/work/nested/file"))
+            .expect("ready containing cwd");
+        assert!(Arc::ptr_eq(&found, &inner));
+        assert!(
+            baselines
+                .get_cwd_for_path(Path::new("/tmp/failed/file"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn new_walk_replaces_prior_generation_and_interleaved_walk_is_rejected() {
+        let cache = BaselineCacheEntry::new(PathBuf::from("/tmp/x"));
+        cache.begin_walk(cmd(1)).unwrap();
+        cache.insert(PathBuf::from("/tmp/x/old"), entry(100, 0xAA));
+        assert_eq!(cache.begin_walk(cmd(2)), Err(cmd(1)));
+        cache.mark_ready();
+
+        cache.begin_walk(cmd(2)).unwrap();
+        assert_eq!(cache.state(), WalkState::Pending);
+        assert_eq!(cache.entry_count(), 0);
+        assert!(cache.get_inode(InodeRef::new(1, 100)).is_none());
     }
 }

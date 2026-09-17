@@ -43,8 +43,9 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -151,14 +152,46 @@ struct WatchState {
     /// see when capture events were lost mid-session (daemon socket
     /// disrupted, helper IPC saturated).
     ///
-    /// AU17 ships VISIBILITY only — non-zero counts emit a WARN at
-    /// session-close. Surfacing the degraded state on the wire so
-    /// `shit undo` flags it to the user is a follow-up sprint.
+    /// At session-close a non-zero count is emitted as a command-scoped
+    /// `CaptureRefused` in addition to the warning. If the link is
+    /// permanently gone that final refusal cannot be delivered; the error
+    /// is logged and daemon-side helper liveness remains the backstop.
     ///
     /// Counts only TRUE wire failures (daemon socket disconnected,
     /// write returned Err) — NOT dedupe-skips or other intentional
     /// short-circuits.
     silent_send_failures: u32,
+    /// Last post-mutation content hash successfully emitted by
+    /// `file_release` for each inode. This is deliberately separate
+    /// from `dedupe`: `file_open` records the pre-image in `dedupe`,
+    /// but release must still enrich that capture with the final hash.
+    /// Repeated closes with unchanged bytes do not need duplicate wire
+    /// events; a later distinct hash is emitted again.
+    last_post_hash: BTreeMap<(u64, u64), [u8; 32]>,
+}
+
+#[derive(Debug, Default)]
+struct BaselineWalkReport {
+    issues: BTreeMap<&'static str, usize>,
+}
+
+impl BaselineWalkReport {
+    fn note(&mut self, issue: &'static str) {
+        *self.issues.entry(issue).or_default() += 1;
+    }
+
+    fn into_result(self) -> Result<(), String> {
+        if self.issues.is_empty() {
+            return Ok(());
+        }
+        let detail = self
+            .issues
+            .into_iter()
+            .map(|(issue, count)| format!("{issue} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("watch baseline incomplete: {detail}"))
+    }
 }
 
 impl WatchState {
@@ -198,7 +231,7 @@ struct PreSnapshot {
 }
 
 /// AR01.3 follow-up: queued create event waiting for its parent dir
-/// to register in `dir_paths`. Owned-data flavor (basename is `String`)
+/// to register in `dir_paths`. Owned-data flavor (basename is `OsString`)
 /// because we may outlive the BPF ringbuf reader's borrowed buffer.
 #[derive(Debug, Clone)]
 struct PendingCreate {
@@ -206,7 +239,7 @@ struct PendingCreate {
     pid: u32,
     parent_dev: u64,
     parent_inode: u64,
-    basename: String,
+    basename: OsString,
     mode: u32,
 }
 
@@ -270,6 +303,14 @@ impl LinuxCaptureRuntime {
         self.watches.entry(command).or_default();
     }
 
+    /// Roll back a WatchTree setup that never became ready. Unlike
+    /// `on_unwatch_tree`, this does not diagnose pending runtime events:
+    /// the caller already emits the attach/baseline refusal that explains
+    /// why this command was never safely watched.
+    pub fn cancel_watch_tree(&mut self, command: CommandId) {
+        self.watches.remove(&command);
+    }
+
     /// Stop watching. Drops the dedupe state and closes all
     /// pre-opened fds; subsequent events for this command's pids
     /// fall through `handle_event` without capture (the TreeMap will
@@ -281,7 +322,7 @@ impl LinuxCaptureRuntime {
     /// investigate the lost mkdir) and drop them with the rest of
     /// the WatchState.
     pub fn on_unwatch_tree(&mut self, command: CommandId) {
-        if let Some(ws) = self.watches.get(&command) {
+        if let Some(ws) = self.watches.get_mut(&command) {
             let pending = ws.pending_creates.values().map(|v| v.len()).sum::<usize>();
             if pending > 0 {
                 tracing::warn!(
@@ -290,6 +331,21 @@ impl LinuxCaptureRuntime {
                     pending,
                     "unwatch_tree: dropping unresolved pending creates (parent mkdir never landed)"
                 );
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    command,
+                    None,
+                    format!(
+                        "capture incomplete: {pending} create event(s) could not be resolved by parent inode before command close"
+                    ),
+                ) {
+                    tracing::error!(
+                        %error,
+                        session = %command.session,
+                        seq = command.seq,
+                        "unwatch_tree: permanent IPC failure prevented pending-create refusal delivery"
+                    );
+                }
             }
             // AU17 — surface the silent-send-failure count so the
             // operator can see when capture events were lost mid-
@@ -298,16 +354,29 @@ impl LinuxCaptureRuntime {
             // `send_response{_with_fd}` returns Err inside an LSM /
             // fanotify handler. Zero is the normal case; non-zero
             // means the journal is incomplete for this command.
-            // Wire + CLI warning surface (so `shit undo` flags a
-            // degraded session for the user) is deferred to a
-            // follow-up sprint — this commit ships visibility.
             if ws.silent_send_failures > 0 {
+                let failures = ws.silent_send_failures;
                 tracing::warn!(
                     session = %command.session,
                     seq = command.seq,
-                    silent_send_failures = ws.silent_send_failures,
+                    silent_send_failures = failures,
                     "unwatch_tree: session capture is DEGRADED — some events were silently dropped (daemon socket failures)"
                 );
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    command,
+                    None,
+                    format!(
+                        "capture transport lost {failures} event(s) before command close; undo evidence is incomplete"
+                    ),
+                ) {
+                    tracing::error!(
+                        %error,
+                        session = %command.session,
+                        seq = command.seq,
+                        "unwatch_tree: permanent IPC failure prevented transport-loss refusal delivery"
+                    );
+                }
             }
         }
         self.watches.remove(&command);
@@ -329,16 +398,17 @@ impl LinuxCaptureRuntime {
     /// can resolve `(parent_dev, parent_inode, basename)` into an
     /// absolute path for files in subdirectories.
     ///
-    /// Best-effort: per-file open errors (EACCES on protected files,
-    /// ELOOP on dangling symlinks) are skipped silently. The walker
-    /// continues so a single denied entry doesn't disable capture
-    /// for the rest.
+    /// The walker continues after per-entry errors to collect as much
+    /// baseline state as possible, but records every truncation. Any
+    /// depth/file cap, cross-filesystem omission, permission error, or
+    /// unavailable snapshot makes the returned result incomplete; the
+    /// caller journals a refusal and withholds readiness.
     ///
     /// Caller invariant: must be called BEFORE the watched command's
     /// preexec returns userspace control. The L04 main.rs WatchTree
     /// handler does this synchronously between `tree.watch()` and
     /// returning the response.
-    pub fn pre_open_tree(&mut self, command: CommandId, cwd: &Path) {
+    pub fn pre_open_tree(&mut self, command: CommandId, cwd: &Path) -> Result<(), String> {
         let ws = self.watches.entry(command).or_default();
         // Record the watch root so LSM handlers can resolve
         // basename → absolute path without /proc/<pid>/cwd. See
@@ -354,8 +424,8 @@ impl LinuxCaptureRuntime {
         // bogus dir_paths entry and resolve to the wrong path. Skip
         // the insert AND the recursion so the watch surfaces zero
         // events for this command instead of wrong ones.
-        let root_dev_inode = match std::fs::metadata(cwd) {
-            Ok(m) => (m.dev(), m.ino()),
+        let root_metadata = match std::fs::metadata(cwd) {
+            Ok(metadata) => metadata,
             Err(e) => {
                 tracing::error!(
                     session = %command.session,
@@ -364,14 +434,27 @@ impl LinuxCaptureRuntime {
                     err = %e,
                     "pre_open_tree: stat(cwd) failed; skipping dir_paths root entry and recursion to avoid (0,0) aliasing"
                 );
-                return;
+                return Err(format!("watch baseline root stat failed: {e}"));
             }
         };
+        if !root_metadata.is_dir() {
+            return Err("watch baseline root is not a directory".to_string());
+        }
+        let root_dev_inode = (root_metadata.dev(), root_metadata.ino());
         ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
 
         let mut opened = 0usize;
         let mut hit_cap = false;
-        pre_open_recurse(ws, cwd, root_dev_inode.0, 0, &mut opened, &mut hit_cap);
+        let mut report = BaselineWalkReport::default();
+        pre_open_recurse(
+            ws,
+            cwd,
+            root_dev_inode.0,
+            0,
+            &mut opened,
+            &mut hit_cap,
+            &mut report,
+        );
 
         tracing::info!(
             session = %command.session,
@@ -382,6 +465,7 @@ impl LinuxCaptureRuntime {
             hit_cap,
             "pre_open_tree complete"
         );
+        report.into_result()
     }
 
     /// Called by the fanotify reader thread per event. Returns once
@@ -433,10 +517,35 @@ impl LinuxCaptureRuntime {
             return;
         }
 
+        let Some(path) = path_for_kernel_fd(ev.fd) else {
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                None,
+                "kernel-provided fd could not be resolved to an undo path",
+            ) {
+                tracing::warn!(%error, "fanotify path-resolution refusal send failed");
+                ws.note_silent_send_failure();
+            }
+            return;
+        };
+        let Some(path_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &path) else {
+            return;
+        };
+
         let bytes = match read_pre_image(ev.fd) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(fd = ev.fd, error = %e, "pre-image read failed");
+                if let Err(send_error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    Some(path_wire.clone()),
+                    format!("regular-file pre-image read failed: {e}"),
+                ) {
+                    tracing::warn!(error = %send_error, "fanotify capture refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
@@ -444,6 +553,15 @@ impl LinuxCaptureRuntime {
             Some(m) => m,
             None => {
                 tracing::warn!(fd = ev.fd, "fstat_meta failed");
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    Some(path_wire.clone()),
+                    "regular-file metadata became unavailable during capture",
+                ) {
+                    tracing::warn!(%error, "fanotify metadata refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
@@ -452,17 +570,25 @@ impl LinuxCaptureRuntime {
             Ok(fd) => fd,
             Err(e) => {
                 tracing::warn!(error = %e, "staging write failed");
+                if let Err(send_error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    Some(path_wire.clone()),
+                    format!("regular-file staging write failed: {e}"),
+                ) {
+                    tracing::warn!(error = %send_error, "fanotify staging refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
-        let path = path_for_kernel_fd(ev.fd);
 
         let resp = HelperResponse::CapturedPreImage {
             session: ev.command.session,
             seq: ev.command.seq,
             dev,
             inode,
-            path: path.as_deref().map(path_to_string),
+            path: Some(path_wire),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             // AU11 — None is correct on the fanotify path. We mark
@@ -523,12 +649,12 @@ impl LinuxCaptureRuntime {
     ///   * Read pre-image bytes, blake3, write to staging, send
     ///     CapturedPreImage with the staging fd — same as fanotify.
     ///
-    /// If loss (open returned ENOENT, or fstat (dev, inode) mismatch):
-    ///
-    ///   * Send a marker CapturedPreImage with `stored_bytes = 0` and
-    ///     `fd_sent_via_scm = false`. The daemon journals the unlink
-    ///     and looks for a prior pre-image blob for the same
-    ///     (dev, inode) to use as the restoration source.
+    /// If loss (open returned ENOENT, fstat identity mismatch, content is
+    /// unreadable, or the blob exceeds the cap), send `CaptureRefused`.
+    /// A failed regular-file capture must never be represented as an empty
+    /// pre-image. Directories and FIFOs use the distinct typed
+    /// `CapturedDeletionMarker` variant so the daemon can refuse explicitly
+    /// until complete directory/FIFO metadata replay is modeled.
     ///
     /// Dedupe: this method bypasses the dedupe map's "already
     /// captured" gate (Delete events always emit) so the daemon sees
@@ -581,9 +707,23 @@ impl LinuxCaptureRuntime {
             tracing::warn!(
                 pid = ev.pid,
                 parent_inode = ev.parent_inode,
-                basename = ev.basename,
+                basename = ?ev.basename,
                 "lsm unlink: parent_inode not in dir_paths; dropping event"
             );
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                None,
+                "deleted path could not be resolved from its parent inode",
+            ) {
+                tracing::warn!(%error, "lsm unlink unresolved-path refusal send failed");
+                ws.note_silent_send_failure();
+            }
+            return;
+        };
+        let Some(resolved_path_wire) =
+            path_to_wire_or_refuse(&self.conn, ev.command, &resolved_path)
+        else {
             return;
         };
 
@@ -664,23 +804,43 @@ impl LinuxCaptureRuntime {
         // Alias to keep the wire-build block below readable.
         let _ = (capture_dev, capture_inode);
 
-        let (stored_bytes, blob_hash, staging_fd, meta_wire) = if race_won && ev.is_directory {
+        enum DeleteEvidence {
+            Content {
+                stored_bytes: u64,
+                blob_hash: [u8; 32],
+                staging_fd: OwnedFd,
+                metadata: StatMeta,
+            },
+            MetadataOnly(StatMeta),
+            Refused(String),
+        }
+
+        let evidence = if race_won && ev.is_directory {
             // G03 — dir capture: fstat for metadata only, no bytes.
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
-            let meta = fstat_meta(fd);
-            (0, [0u8; 32], None, meta)
-        } else if race_won && matches!(file_type, FileType::Fifo | FileType::Socket) {
-            // AU29 follow-up — Fifo/Socket capture: O_PATH fd held
-            // by pre_open can be fstat'd for mode/uid/gid but can't
-            // be read from (O_PATH semantics). Without this branch
-            // the unlink falls into the regular-file content-read
-            // path below, read_pre_image fails, meta_wire goes to
-            // None, and the daemon's kind_from_mode_bits falls
-            // through to Regular — kind is lost and AU22's
-            // RecreatePath{Fifo} dispatch never fires.
+            match fstat_meta(fd) {
+                Some(meta) => DeleteEvidence::MetadataOnly(meta),
+                None => DeleteEvidence::Refused(
+                    "directory metadata became unavailable before deletion capture".into(),
+                ),
+            }
+        } else if race_won && file_type == FileType::Fifo {
+            // FIFOs have no content bytes to restore. The held O_PATH fd is
+            // authoritative for identity and metadata, so this is a genuine
+            // metadata-only marker rather than a failed content capture.
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
-            let meta = fstat_meta(fd);
-            (0, [0u8; 32], None, meta)
+            match fstat_meta(fd) {
+                Some(meta) => DeleteEvidence::MetadataOnly(meta),
+                None => DeleteEvidence::Refused(
+                    "FIFO metadata became unavailable before deletion capture".into(),
+                ),
+            }
+        } else if race_won && file_type == FileType::Socket {
+            // A pathname socket cannot be reconstructed safely from stat
+            // metadata alone (there is no peer/bind state on the wire).
+            DeleteEvidence::Refused(
+                "Unix-domain socket deletion has no safe metadata-only inverse".into(),
+            )
         } else if race_won {
             // AU25 — single-pass streaming capture. Pre-AU25 this
             // three-stepped through `read_pre_image` (materialize
@@ -696,69 +856,108 @@ impl LinuxCaptureRuntime {
                 stream_copy_to_staging_path(fd, &self.staging_dir, MAX_PRE_IMAGE_BYTES as u64),
                 meta,
             ) {
-                (Ok((staging, hash, bytes)), Some(meta)) => {
-                    (bytes, hash, Some(staging), Some(meta))
+                (Ok((staging_fd, blob_hash, stored_bytes)), Some(metadata)) => {
+                    DeleteEvidence::Content {
+                        stored_bytes,
+                        blob_hash,
+                        staging_fd,
+                        metadata,
+                    }
                 }
                 (Err(StreamError::TooLargeForBuffer(n)), _) => {
                     tracing::warn!(
                         size = n,
                         cap = MAX_PRE_IMAGE_BYTES,
-                        "lsm pre-image exceeds cap; marker-only CapturedPreImage"
+                        "lsm pre-image exceeds cap; refusing capture"
                     );
-                    (0, [0u8; 32], None, None)
+                    DeleteEvidence::Refused(format!(
+                        "regular-file pre-image size {n} exceeds capture cap {MAX_PRE_IMAGE_BYTES}"
+                    ))
                 }
                 (Err(e), _) => {
                     tracing::warn!(error = %e, "lsm pre-image stream failed");
-                    (0, [0u8; 32], None, None)
+                    DeleteEvidence::Refused(format!("regular-file pre-image stream failed: {e}"))
                 }
-                (Ok(_), None) => (0, [0u8; 32], None, None),
+                (Ok(_), None) => DeleteEvidence::Refused(
+                    "regular-file metadata became unavailable during capture".into(),
+                ),
             }
         } else {
             tracing::info!(
                 pid = ev.pid,
                 dev = ev.dev,
                 inode = ev.inode,
-                basename = ev.basename,
+                basename = ?ev.basename,
                 is_directory = ev.is_directory,
-                "lsm unlink race lost — marker-only CapturedPreImage"
+                "lsm unlink race lost — refusing capture"
             );
-            (0, [0u8; 32], None, None)
+            DeleteEvidence::Refused(
+                "pre-image fd was unavailable or no longer matched the deleted inode".into(),
+            )
         };
 
-        // Build wire. If we lost the race, `meta_wire` is None — set
-        // mode/uid/gid/mtime to 0; the daemon's Delete-restore path
-        // does not rely on these for marker-only events.
-        let resp = HelperResponse::CapturedPreImage {
-            session: ev.command.session,
-            seq: ev.command.seq,
-            // Daemon side compares against PreExec's cwd_dev which is
-            // glibc-encoded; send the converted value.
-            dev: ev_dev_userspace,
-            inode: ev.inode,
-            path: Some(resolved_path.clone()),
-            blob_hash,
-            stored_bytes,
-            // AU11 — None is correct: this is the LSM `inode_unlink`
-            // path, i.e. a Delete event. No post-mutation content
-            // exists because the inode is being removed.
-            post_content_hash: None,
-            mode: meta_wire.as_ref().map(|m| m.mode).unwrap_or(0),
-            uid: meta_wire.as_ref().map(|m| m.uid).unwrap_or(0),
-            gid: meta_wire.as_ref().map(|m| m.gid).unwrap_or(0),
-            mtime_unix_nanos: meta_wire.as_ref().map(|m| m.mtime_unix_nanos).unwrap_or(0),
-            xattrs: meta_wire
-                .as_ref()
-                .map(|m| m.xattrs.clone())
-                .unwrap_or_default(),
-            flags: 0,
-            is_delete: true,
-            fd_sent_via_scm: staging_fd.is_some(),
-        };
-
-        let send_result = if let Some(ref fd) = staging_fd {
-            self.conn.send_response_with_fd(&resp, fd.as_raw_fd())
-        } else {
-            self.conn.send_response(&resp)
+        let (send_result, stored_bytes, evidence_kind) = match evidence {
+            DeleteEvidence::Content {
+                stored_bytes,
+                blob_hash,
+                staging_fd,
+                metadata,
+            } => {
+                let resp = HelperResponse::CapturedPreImage {
+                    session: ev.command.session,
+                    seq: ev.command.seq,
+                    // Daemon side compares against PreExec's cwd_dev which is
+                    // glibc-encoded; send the converted value.
+                    dev: ev_dev_userspace,
+                    inode: ev.inode,
+                    path: Some(resolved_path_wire.clone()),
+                    blob_hash,
+                    stored_bytes,
+                    post_content_hash: None,
+                    mode: metadata.mode,
+                    uid: metadata.uid,
+                    gid: metadata.gid,
+                    mtime_unix_nanos: metadata.mtime_unix_nanos,
+                    xattrs: metadata.xattrs,
+                    flags: 0,
+                    is_delete: true,
+                    fd_sent_via_scm: true,
+                };
+                (
+                    self.conn
+                        .send_response_with_fd(&resp, staging_fd.as_raw_fd()),
+                    stored_bytes,
+                    "content",
+                )
+            }
+            DeleteEvidence::MetadataOnly(metadata) => {
+                let resp = HelperResponse::CapturedDeletionMarker {
+                    session: ev.command.session,
+                    seq: ev.command.seq,
+                    dev: ev_dev_userspace,
+                    inode: ev.inode,
+                    path: resolved_path_wire.clone(),
+                    metadata: shit_proto::FileMetadataWire {
+                        mode: metadata.mode,
+                        uid: metadata.uid,
+                        gid: metadata.gid,
+                        size: metadata.size,
+                        mtime_unix_nanos: metadata.mtime_unix_nanos,
+                        xattrs: metadata.xattrs,
+                        flags: 0,
+                    },
+                };
+                (self.conn.send_response(&resp), 0, "metadata-only")
+            }
+            DeleteEvidence::Refused(detail) => {
+                let resp = HelperResponse::CaptureRefused {
+                    session: ev.command.session,
+                    seq: ev.command.seq,
+                    path: Some(resolved_path_wire.clone()),
+                    detail,
+                };
+                (self.conn.send_response(&resp), 0, "refused")
+            }
         };
         if let Err(e) = send_result {
             tracing::warn!(error = %e, "lsm send_response failed");
@@ -779,9 +978,10 @@ impl LinuxCaptureRuntime {
             race_won,
             fd_source,
             stored_bytes,
-            basename = ev.basename,
-            path = %resolved_path,
-            "lsm-unlink CapturedPreImage sent",
+            evidence_kind,
+            basename = ?ev.basename,
+            path = %resolved_path.display(),
+            "lsm-unlink deletion evidence sent",
         );
     }
 
@@ -819,6 +1019,28 @@ impl LinuxCaptureRuntime {
             return;
         }
 
+        // `FileMetadataWire` has no atime field. A touch/utimens operation
+        // carrying ATTR_ATIME therefore cannot be represented exactly; do
+        // not silently journal a metadata inverse that restores only mtime.
+        if ev.attr_valid & crate::ebpf::ringbuf_reader::attr::ATIME != 0 {
+            let native_path = resolve_inode_to_path(ws, ev_dev_userspace, ev.inode);
+            let wire_path = native_path.as_deref().and_then(path_to_string);
+            let detail = if native_path.is_some() && wire_path.is_none() {
+                "timestamp mutation changes atime, which is not captured; native path is also not representable as UTF-8"
+            } else {
+                "timestamp mutation changes atime, which is not captured by FileMetadataWire"
+            };
+            if let Err(error) = send_capture_refused(&self.conn, ev.command, wire_path, detail) {
+                tracing::warn!(%error, "lsm setattr atime refusal send failed");
+                ws.note_silent_send_failure();
+            }
+            ws.dedupe.insert(
+                (ev_dev_userspace, ev.inode),
+                DedupeEntry { invalidated: false },
+            );
+            return;
+        }
+
         // Read pre-change bytes from the in-memory SNAPSHOT, NOT
         // from the live fd.
         //
@@ -843,8 +1065,19 @@ impl LinuxCaptureRuntime {
                 dev_kernel = ev.dev,
                 dev_userspace = ev_dev_userspace,
                 inode = ev.inode,
-                "lsm setattr: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
+                "lsm setattr: no pre-snapshot; refusing (file not in WatchTree's cwd or too large)"
             );
+            let native_path = resolve_inode_to_path(ws, ev_dev_userspace, ev.inode);
+            let wire_path = native_path.as_deref().and_then(path_to_string);
+            let detail = if native_path.is_some() && wire_path.is_none() {
+                "pre-mutation snapshot unavailable and native path is not representable as UTF-8"
+            } else {
+                "pre-mutation snapshot unavailable (outside baseline, unreadable, or over capture cap)"
+            };
+            if let Err(error) = send_capture_refused(&self.conn, ev.command, wire_path, detail) {
+                tracing::warn!(%error, "lsm setattr missing-snapshot refusal send failed");
+                ws.note_silent_send_failure();
+            }
             // Mark dedupe so reuse-after-event re-captures.
             ws.dedupe.insert(
                 (ev_dev_userspace, ev.inode),
@@ -858,6 +1091,17 @@ impl LinuxCaptureRuntime {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "lsm setattr staging write failed");
+                let native_path = resolve_inode_to_path(ws, ev_dev_userspace, ev.inode);
+                let wire_path = native_path.as_deref().and_then(path_to_string);
+                if let Err(send_error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    wire_path,
+                    format!("pre-image staging write failed: {e}"),
+                ) {
+                    tracing::warn!(error = %send_error, "lsm setattr staging refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
@@ -883,8 +1127,20 @@ impl LinuxCaptureRuntime {
                     inode = ev.inode,
                     "lsm setattr: path resolution failed (pre_opens fd + path_to_inode reverse both miss); dropping event"
                 );
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    None,
+                    "pre-image was captured but its replay path could not be resolved",
+                ) {
+                    tracing::warn!(%error, "lsm setattr unresolved-path refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
+        };
+        let Some(path_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &path) else {
+            return;
         };
 
         let resp = HelperResponse::CapturedPreImage {
@@ -892,7 +1148,7 @@ impl LinuxCaptureRuntime {
             seq: ev.command.seq,
             dev: ev_dev_userspace,
             inode: ev.inode,
-            path: Some(path_to_string(&path)),
+            path: Some(path_wire),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             // AU11 — `post_content_hash: None` is correct here. The
@@ -965,7 +1221,7 @@ impl LinuxCaptureRuntime {
         // ACTIVELY WRONG for nested mkdirs (see AR01.4 forensics in
         // handle_lsm_unlink); drop the event on miss instead.
         let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
-        let Some(resolved_dir_str) = resolve_via_parent(
+        let Some(resolved_dir) = resolve_via_parent(
             &ws.dir_paths,
             parent_dev_userspace,
             ev.parent_inode,
@@ -975,12 +1231,24 @@ impl LinuxCaptureRuntime {
                 pid = ev.pid,
                 parent_dev = parent_dev_userspace,
                 parent_inode = ev.parent_inode,
-                basename = ev.basename,
+                basename = ?ev.basename,
                 "lsm mkdir: parent_inode not in dir_paths; dropping event"
             );
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                None,
+                "mkdir path could not be resolved from its parent inode",
+            ) {
+                tracing::warn!(%error, "lsm mkdir unresolved-path refusal send failed");
+                ws.note_silent_send_failure();
+            }
             return;
         };
-        let resolved_dir = PathBuf::from(&resolved_dir_str);
+        let Some(resolved_dir_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &resolved_dir)
+        else {
+            return;
+        };
 
         // Stat to grab the (dev, inode) of the freshly-created dir.
         //
@@ -993,11 +1261,10 @@ impl LinuxCaptureRuntime {
         // visible is bounded (microseconds in the typical path);
         // retry with a small budget rather than dropping the event.
         //
-        // If the stat still fails after the retry budget, emit a
-        // marker-only TreeMutation (dev=0, inode=0). The daemon's
-        // undo path resolves the dir via `path` -- it doesn't strictly
-        // need the (dev, inode) tuple, that's only for invariant
-        // checking. Marker-only beats dropping silently.
+        // If the stat still fails after the retry budget, the directory
+        // may already have been removed. A path-only Create would be an
+        // unsafe guess: it could cancel an unrelated Unlink at the same
+        // pathname. Refuse explicitly instead.
         use std::os::unix::fs::MetadataExt;
         let stat_result = (|| {
             // Up to 10 ms total: 20 iterations at 0.5 ms each. The
@@ -1020,18 +1287,26 @@ impl LinuxCaptureRuntime {
                 tracing::warn!(
                     path = %resolved_dir.display(),
                     "lsm mkdir: post-stat not visible within 10ms retry budget; \
-                     emitting marker-only (dev=0, inode=0)"
+                     refusing path-only create evidence"
                 );
-                (0, 0)
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    Some(resolved_dir_wire),
+                    "mkdir completed but its kernel identity was unavailable before the path disappeared",
+                ) {
+                    tracing::warn!(%error, "lsm mkdir identity refusal send failed");
+                    ws.note_silent_send_failure();
+                }
+                return;
             }
         };
 
         // AR01.1.fix-path-via-parent-inode — register the new dir's
         // (dev, inode) → path so subsequent nested events (e.g. git's
         // `.git/objects/02/abc...` create-then-write into the just-
-        // -mkdir'd `02`) resolve correctly. Skip the marker-only case
-        // (dev=0, inode=0); without a real (dev, inode) we can't key
-        // the lookup anyway.
+        // -mkdir'd `02`) resolve correctly. Identity-unavailable cases
+        // returned a refusal above and never reach this map.
         //
         // AR01.3 follow-up: after registering, drain any pending
         // create events whose parent_inode just became resolvable.
@@ -1039,12 +1314,8 @@ impl LinuxCaptureRuntime {
         // can arrive before their parent's mkdir handler; queue +
         // drain here ensures every create still gets a TreeOpCreate
         // journaled.
-        let drained = if dev != 0 {
-            ws.dir_paths.insert((dev, inode), resolved_dir.clone());
-            ws.pending_creates.remove(&(dev, inode)).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        ws.dir_paths.insert((dev, inode), resolved_dir.clone());
+        let drained = ws.pending_creates.remove(&(dev, inode)).unwrap_or_default();
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
@@ -1052,11 +1323,12 @@ impl LinuxCaptureRuntime {
             op: shit_proto::TreeOpWire::Create {
                 dev,
                 inode,
-                path: path_to_string(&resolved_dir),
+                path: resolved_dir_wire,
                 kind: shit_proto::FileKindWire::Directory,
                 mode: ev.mode,
             },
             ts_unix_nanos: now_unix_nanos(),
+            partial: false,
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "lsm mkdir send_response failed");
@@ -1109,7 +1381,7 @@ impl LinuxCaptureRuntime {
         // -- the inode + basename are unrecoverable to a real path
         // without the parent context.
         let parent_dev_userspace = kernel_dev_to_userspace(ev.parent_dev);
-        let resolved_path_str = match resolve_via_parent(
+        let resolved_path = match resolve_via_parent(
             &ws.dir_paths,
             parent_dev_userspace,
             ev.parent_inode,
@@ -1128,7 +1400,7 @@ impl LinuxCaptureRuntime {
                     pid = ev.pid,
                     parent_dev = parent_dev_userspace,
                     parent_inode = ev.parent_inode,
-                    basename = ev.basename,
+                    basename = ?ev.basename,
                     "lsm create: parent_inode not in dir_paths; queuing for retry"
                 );
                 ws.pending_creates
@@ -1139,14 +1411,12 @@ impl LinuxCaptureRuntime {
                         pid: ev.pid,
                         parent_dev: parent_dev_userspace,
                         parent_inode: ev.parent_inode,
-                        basename: ev.basename.to_string(),
+                        basename: ev.basename.to_os_string(),
                         mode: ev.mode,
                     });
                 return;
             }
         };
-        let resolved_path = PathBuf::from(&resolved_path_str);
-
         // Note: the `ws` borrow from above goes out of scope at the
         // call below -- process_lsm_create_resolved re-borrows.
         self.process_lsm_create_resolved(ev.command, ev.pid, resolved_path, ev.mode);
@@ -1157,11 +1427,10 @@ impl LinuxCaptureRuntime {
     /// it for queued create events whose parent has just registered
     /// in `dir_paths`.
     ///
-    /// Open + stat the resolved path (race-loss tolerated via marker-
-    /// only TreeOpCreate), journal the Create event, and on open
-    /// success stash the fd + snapshot + reverse indices + dedupe
-    /// entry. Same semantics as the inline body that lived in
-    /// handle_lsm_create pre-AR01.3.
+    /// Open + stat the resolved path, journal an exact-identity Create,
+    /// and on open success stash the fd + snapshot + reverse indices +
+    /// dedupe entry. If the entry disappears before identity capture,
+    /// emit `CaptureRefused` instead of a path-only marker.
     fn process_lsm_create_resolved(
         &mut self,
         command: CommandId,
@@ -1172,36 +1441,69 @@ impl LinuxCaptureRuntime {
         // AR01.2 race: for `touch foo; rm foo` style workloads the
         // userspace handler may race against an immediate unlink --
         // by the time we open(O_NOFOLLOW), the dentry is gone and
-        // we get ENOENT. We MUST still journal a TreeOpCreate so the
-        // planner can emit an Unlink inverse; otherwise touch-edit
-        // round-trips leave the freshly-created file on disk
-        // post-undo. Marker-only (dev=0, inode=0) for the race-lost
-        // path; same shape `handle_lsm_mkdir` already uses for its
-        // PRE-creation hook visibility race.
+        // we get ENOENT. Never journal a `(0, 0)` path-only Create:
+        // it can be paired with an unrelated deletion at the same path.
+        // The event is explicitly refused when no kernel identity can
+        // be recovered.
         //
         // AU29 — add O_NONBLOCK so a FIFO open (mknod-routed
         // creation) doesn't block waiting for a writer. No-op for
         // regular files; gives O_RDONLY-style fd for FIFOs that
         // can be fstat'd. Sockets return ENXIO and fall to the
-        // marker-only path (which still journals the TreeOpCreate
-        // wire above).
+        // identity-only path when a readable fd is unavailable.
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&resolved_path)
             .ok();
 
-        let (dev, inode, file_type) = match opened
+        let Some(path_str) = path_to_wire_or_refuse(&self.conn, command, &resolved_path) else {
+            return;
+        };
+        let observed_identity = opened
             .as_ref()
             .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()))
-        {
+            .or_else(|| {
+                let metadata = std::fs::symlink_metadata(&resolved_path).ok()?;
+                let file_type = metadata.file_type();
+                let kind = if file_type.is_file() {
+                    FileType::Regular
+                } else if file_type.is_dir() {
+                    FileType::Directory
+                } else if file_type.is_symlink() {
+                    FileType::Symlink
+                } else if file_type.is_fifo() {
+                    FileType::Fifo
+                } else if file_type.is_socket() {
+                    FileType::Socket
+                } else if file_type.is_block_device() {
+                    FileType::BlockDevice
+                } else if file_type.is_char_device() {
+                    FileType::CharDevice
+                } else {
+                    FileType::Other
+                };
+                Some((metadata.dev(), metadata.ino(), kind))
+            });
+        let (dev, inode, file_type) = match observed_identity {
             Some(t) => t,
             None => {
                 tracing::warn!(
                     path = %resolved_path.display(),
-                    "lsm create: post-open/fstat race lost; emitting marker TreeOpCreate (dev=0, inode=0)"
+                    "lsm create: post-open/fstat race lost; refusing path-only create evidence"
                 );
-                (0, 0, FileType::Regular)
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    command,
+                    Some(path_str),
+                    "created entry disappeared before its kernel identity could be captured",
+                ) {
+                    tracing::warn!(%error, "lsm create identity refusal send failed");
+                    if let Some(ws) = self.watches.get_mut(&command) {
+                        ws.note_silent_send_failure();
+                    }
+                }
+                return;
             }
         };
         // AU29 — accept Fifo / Socket here (mknod routes through
@@ -1211,22 +1513,33 @@ impl LinuxCaptureRuntime {
         // never got a TreeOpCreate to invert.
         let wire_kind = match file_type {
             FileType::Regular => shit_proto::FileKindWire::Regular,
+            FileType::Directory => shit_proto::FileKindWire::Directory,
+            FileType::Symlink => shit_proto::FileKindWire::Symlink,
             FileType::Fifo => shit_proto::FileKindWire::Fifo,
             FileType::Socket => shit_proto::FileKindWire::Socket,
+            FileType::BlockDevice => shit_proto::FileKindWire::BlockDevice,
+            FileType::CharDevice => shit_proto::FileKindWire::CharDevice,
             _ => {
-                // O_NOFOLLOW caught a symlink, dir (impossible here
-                // since process_lsm_mkdir handles that), or Other
-                // (Block/Char device, marker-only race-lost).
-                tracing::trace!(
+                tracing::warn!(
                     path = %resolved_path.display(),
                     ?file_type,
-                    "lsm create: unsupported post-stat kind; skipping"
+                    "lsm create: unsupported post-stat kind; refusing"
                 );
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    command,
+                    Some(path_str),
+                    "created entry has an unsupported filesystem kind",
+                ) {
+                    tracing::warn!(%error, "lsm create unsupported-kind refusal send failed");
+                    if let Some(ws) = self.watches.get_mut(&command) {
+                        ws.note_silent_send_failure();
+                    }
+                }
                 return;
             }
         };
 
-        let path_str = path_to_string(&resolved_path);
         let resp = HelperResponse::TreeMutation {
             session: command.session,
             seq: command.seq,
@@ -1238,6 +1551,7 @@ impl LinuxCaptureRuntime {
                 mode,
             },
             ts_unix_nanos: now_unix_nanos(),
+            partial: false,
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "lsm create send_response failed");
@@ -1252,9 +1566,8 @@ impl LinuxCaptureRuntime {
         }
 
         // If we won the open race, do the L04.1 snapshot + fd-stash.
-        // If we lost (marker-only above), skip — there's no fd to
-        // stash, no bytes to snapshot, and subsequent open/setattr
-        // handlers for inode=0 won't hit the snapshot cache anyway.
+        // A metadata-only identity observation still journals the exact
+        // Create above but has no fd to retain.
         if let Some(f) = opened {
             let ws = self.watches.entry(command).or_default();
             let fd_raw = f.as_raw_fd();
@@ -1337,8 +1650,19 @@ impl LinuxCaptureRuntime {
                 dev_kernel = ev.dev,
                 dev_userspace = ev_dev,
                 inode = ev.inode,
-                "lsm open: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
+                "lsm open: no pre-snapshot; refusing (file not in WatchTree's cwd or too large)"
             );
+            let native_path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+            let wire_path = native_path.as_deref().and_then(path_to_string);
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                wire_path,
+                "pre-mutation snapshot unavailable (outside baseline, unreadable, or over capture cap)",
+            ) {
+                tracing::warn!(%error, "lsm open missing-snapshot refusal send failed");
+                ws.note_silent_send_failure();
+            }
             return;
         };
         let bytes = snap.bytes;
@@ -1348,6 +1672,17 @@ impl LinuxCaptureRuntime {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "lsm open staging write failed");
+                let native_path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+                let wire_path = native_path.as_deref().and_then(path_to_string);
+                if let Err(send_error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    wire_path,
+                    format!("pre-image staging write failed: {e}"),
+                ) {
+                    tracing::warn!(error = %send_error, "lsm open staging refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
@@ -1362,8 +1697,20 @@ impl LinuxCaptureRuntime {
                     inode = ev.inode,
                     "lsm open: path resolution failed; dropping event"
                 );
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    None,
+                    "pre-image was captured but its replay path could not be resolved",
+                ) {
+                    tracing::warn!(%error, "lsm open unresolved-path refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
+        };
+        let Some(path_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &path) else {
+            return;
         };
 
         let resp = HelperResponse::CapturedPreImage {
@@ -1371,7 +1718,7 @@ impl LinuxCaptureRuntime {
             seq: ev.command.seq,
             dev: ev_dev,
             inode: ev.inode,
-            path: Some(path_to_string(&path)),
+            path: Some(path_wire),
             blob_hash,
             stored_bytes: bytes.len() as u64,
             // AU11 — None is correct. The LSM `file_open` hook is
@@ -1419,12 +1766,14 @@ impl LinuxCaptureRuntime {
     /// Fires once per writable last-fd-close (incl. final mmap
     /// unmap). Flow:
     ///
-    /// 1. Look up `pre_snapshots[(dev, inode)]`. Miss → drop. The
-    ///    file wasn't in the watch tree at PreExec; outside our
-    ///    undo surface.
-    /// 2. Check dedupe. If another handler (unlink, setattr, open)
-    ///    already captured for this inode in the watch window,
-    ///    skip — that handler's bytes are authoritative.
+    /// 1. Look up `pre_snapshots[(dev, inode)]`. A miss means the
+    ///    post-write observation cannot be paired with trustworthy old bytes,
+    ///    so refuse the command rather than silently treating it as outside
+    ///    the undo surface.
+    /// 2. Do not use pre-image dedupe here. `file_open` normally
+    ///    captured the same inode first, but its event necessarily has
+    ///    no post hash. Release enriches that evidence for conflict
+    ///    detection and only suppresses an identical post hash.
     /// 3. Re-hash the file's current bytes via the held
     ///    `pre_opens` fd. Compare to the snapshot's hash.
     /// 4. Match → no actual mutation (writable open with no
@@ -1439,29 +1788,28 @@ impl LinuxCaptureRuntime {
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
-        // Dedupe: another LSM handler may have already captured
-        // for this (dev, inode) in this watch window. First handler
-        // wins; release defers.
-        if !should_capture_dedupe(&ws.dedupe, (ev_dev, ev.inode)) {
-            tracing::trace!(
-                dev = ev_dev,
-                inode = ev.inode,
-                "lsm release: dedupe hit; skipping"
-            );
-            return;
-        }
-
         // Snapshot lookup. Miss means the file wasn't in the tree
-        // at pre_open_tree (created mid-session, outside the cwd
-        // tree, or too large for the cap). Either way, nothing to
-        // diff against — drop silently.
+        // at pre_open_tree (created mid-session, outside the cwd tree, or too
+        // large for the cap). Either way, nothing can be diffed safely, so
+        // emit a command-atomic refusal.
         let Some(snap) = ws.pre_snapshots.get(&(ev_dev, ev.inode)).cloned() else {
             tracing::trace!(
                 dev_kernel = ev.dev,
                 dev_userspace = ev_dev,
                 inode = ev.inode,
-                "lsm release: no pre-snapshot; dropping"
+                "lsm release: no pre-snapshot; refusing"
             );
+            let native_path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+            let wire_path = native_path.as_deref().and_then(path_to_string);
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                wire_path,
+                "post-write observation has no trustworthy pre-mutation snapshot",
+            ) {
+                tracing::warn!(%error, "lsm release missing-snapshot refusal send failed");
+                ws.note_silent_send_failure();
+            }
             return;
         };
 
@@ -1473,6 +1821,17 @@ impl LinuxCaptureRuntime {
                 inode = ev.inode,
                 "lsm release: pre-snapshot present but no held fd; dropping"
             );
+            let native_path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+            let wire_path = native_path.as_deref().and_then(path_to_string);
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                wire_path,
+                "post-state fd unavailable; capture completeness cannot be verified",
+            ) {
+                tracing::warn!(%error, "lsm release missing-fd refusal send failed");
+                ws.note_silent_send_failure();
+            }
             return;
         };
         let raw_fd = held_fd.as_raw_fd();
@@ -1488,6 +1847,17 @@ impl LinuxCaptureRuntime {
                     error = %e,
                     "lsm release: read_pre_image failed; dropping"
                 );
+                let native_path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+                let wire_path = native_path.as_deref().and_then(path_to_string);
+                if let Err(send_error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    wire_path,
+                    format!("post-state content read failed: {e}"),
+                ) {
+                    tracing::warn!(error = %send_error, "lsm release read refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
@@ -1501,6 +1871,14 @@ impl LinuxCaptureRuntime {
             );
             return;
         }
+        if ws.last_post_hash.get(&(ev_dev, ev.inode)) == Some(&post_hash) {
+            tracing::trace!(
+                dev = ev_dev,
+                inode = ev.inode,
+                "lsm release: identical post hash already emitted"
+            );
+            return;
+        }
 
         // Content changed. Emit pre-image with the open-time
         // snapshot bytes and the post-state hash.
@@ -1510,6 +1888,17 @@ impl LinuxCaptureRuntime {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "lsm release staging write failed");
+                let native_path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+                let wire_path = native_path.as_deref().and_then(path_to_string);
+                if let Err(send_error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    wire_path,
+                    format!("pre-image staging write failed: {e}"),
+                ) {
+                    tracing::warn!(error = %send_error, "lsm release staging refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
         };
@@ -1522,8 +1911,20 @@ impl LinuxCaptureRuntime {
                     inode = ev.inode,
                     "lsm release: path resolution failed; dropping event"
                 );
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    None,
+                    "pre-image was captured but its replay path could not be resolved",
+                ) {
+                    tracing::warn!(%error, "lsm release unresolved-path refusal send failed");
+                    ws.note_silent_send_failure();
+                }
                 return;
             }
+        };
+        let Some(path_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &path) else {
+            return;
         };
 
         let resp = HelperResponse::CapturedPreImage {
@@ -1531,7 +1932,7 @@ impl LinuxCaptureRuntime {
             seq: ev.command.seq,
             dev: ev_dev,
             inode: ev.inode,
-            path: Some(path_to_string(&path)),
+            path: Some(path_wire),
             blob_hash: pre_hash,
             stored_bytes: pre_bytes.len() as u64,
             post_content_hash: Some(post_hash),
@@ -1544,16 +1945,22 @@ impl LinuxCaptureRuntime {
             is_delete: false,
             fd_sent_via_scm: true,
         };
-        if let Err(e) = self
+        let sent = if let Err(e) = self
             .conn
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "lsm release send_response_with_fd failed");
             ws.note_silent_send_failure();
-        }
+            false
+        } else {
+            true
+        };
 
         ws.dedupe
             .insert((ev_dev, ev.inode), DedupeEntry { invalidated: false });
+        if sent {
+            ws.last_post_hash.insert((ev_dev, ev.inode), post_hash);
+        }
 
         tracing::info!(
             session = %ev.command.session,
@@ -1588,9 +1995,18 @@ impl LinuxCaptureRuntime {
             tracing::warn!(
                 pid = ev.pid,
                 old_parent_inode = ev.old_parent_inode,
-                basename = ev.old_basename,
+                basename = ?ev.old_basename,
                 "lsm rename: old_parent_inode not in dir_paths; dropping event"
             );
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                None,
+                "rename source path could not be resolved from its parent inode",
+            ) {
+                tracing::warn!(%error, "lsm rename source-path refusal send failed");
+                ws.note_silent_send_failure();
+            }
             return;
         };
         let Some(to_path) =
@@ -1599,9 +2015,25 @@ impl LinuxCaptureRuntime {
             tracing::warn!(
                 pid = ev.pid,
                 new_parent_inode = ev.new_parent_inode,
-                basename = ev.new_basename,
+                basename = ?ev.new_basename,
                 "lsm rename: new_parent_inode not in dir_paths; dropping event"
             );
+            if let Err(error) = send_capture_refused(
+                &self.conn,
+                ev.command,
+                None,
+                "rename destination path could not be resolved from its parent inode",
+            ) {
+                tracing::warn!(%error, "lsm rename destination-path refusal send failed");
+                ws.note_silent_send_failure();
+            }
+            return;
+        };
+        let Some(from_path_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &from_path)
+        else {
+            return;
+        };
+        let Some(to_path_wire) = path_to_wire_or_refuse(&self.conn, ev.command, &to_path) else {
             return;
         };
 
@@ -1620,10 +2052,19 @@ impl LinuxCaptureRuntime {
         // No-clobber renames (creating a fresh name) miss in
         // path_to_inode; that's the correct behavior -- nothing to
         // capture.
-        let to_path_buf = PathBuf::from(&to_path);
-        if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path_buf)
-            && let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned()
-        {
+        if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path) {
+            let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned() else {
+                if let Err(error) = send_capture_refused(
+                    &self.conn,
+                    ev.command,
+                    Some(to_path_wire.clone()),
+                    "rename would replace a destination whose pre-image snapshot is unavailable",
+                ) {
+                    tracing::warn!(%error, "lsm rename missing-snapshot refusal send failed");
+                    ws.note_silent_send_failure();
+                }
+                return;
+            };
             let bytes = snap.bytes;
             let meta = snap.meta;
             let blob_hash = blake3_of(&bytes);
@@ -1634,7 +2075,7 @@ impl LinuxCaptureRuntime {
                         seq: ev.command.seq,
                         dev: old_dev,
                         inode: old_inode,
-                        path: Some(to_path.clone()),
+                        path: Some(to_path_wire.clone()),
                         blob_hash,
                         stored_bytes: bytes.len() as u64,
                         // AU11 — None is correct: `is_delete: true`
@@ -1665,13 +2106,23 @@ impl LinuxCaptureRuntime {
                             old_dev,
                             old_inode,
                             bytes = bytes.len(),
-                            path = %to_path,
+                            path = %to_path.display(),
                             "lsm-rename target pre-image CapturedPreImage sent"
                         );
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "lsm rename target staging write failed");
+                    if let Err(send_error) = send_capture_refused(
+                        &self.conn,
+                        ev.command,
+                        Some(to_path_wire.clone()),
+                        format!("rename destination pre-image staging write failed: {e}"),
+                    ) {
+                        tracing::warn!(error = %send_error, "lsm rename staging refusal send failed");
+                        ws.note_silent_send_failure();
+                    }
+                    return;
                 }
             }
         }
@@ -1680,12 +2131,13 @@ impl LinuxCaptureRuntime {
             session: ev.command.session,
             seq: ev.command.seq,
             op: shit_proto::TreeOpWire::Rename {
-                from: from_path.clone(),
-                to: to_path.clone(),
+                from: from_path_wire,
+                to: to_path_wire,
                 dev: ev_dev,
                 inode: ev.inode,
             },
             ts_unix_nanos: now_unix_nanos(),
+            partial: false,
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "lsm rename send_response failed");
@@ -1698,8 +2150,8 @@ impl LinuxCaptureRuntime {
             pid = ev.pid,
             dev = ev_dev,
             inode = ev.inode,
-            from = %from_path,
-            to = %to_path,
+            from = %from_path.display(),
+            to = %to_path.display(),
             "lsm-rename TreeMutation sent",
         );
     }
@@ -1719,30 +2171,45 @@ fn pre_open_recurse(
     depth: usize,
     opened: &mut usize,
     hit_cap: &mut bool,
+    report: &mut BaselineWalkReport,
 ) {
     if depth >= PRE_OPEN_TREE_DEPTH_LIMIT {
+        report.note("directory depth limit reached");
         return;
     }
     if *opened >= PRE_OPEN_TREE_MAX_FILES {
         *hit_cap = true;
+        report.note("regular-file count limit reached");
         return;
     }
     let read = match std::fs::read_dir(dir) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), err = %e, "pre_open_tree: read_dir failed");
+            report.note("directory could not be read");
             return;
         }
     };
-    for ent in read.flatten() {
+    for ent in read {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(_) => {
+                report.note("directory entry could not be read");
+                continue;
+            }
+        };
         if *opened >= PRE_OPEN_TREE_MAX_FILES {
             *hit_cap = true;
+            report.note("regular-file count limit reached");
             return;
         }
         let path = ent.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                report.note("directory entry metadata unavailable");
+                continue;
+            }
         };
         let ft = meta.file_type();
         if ft.is_symlink() {
@@ -1751,6 +2218,7 @@ fn pre_open_recurse(
         if ft.is_dir() {
             // Cross-fs guard: don't recurse into a submount.
             if meta.dev() != root_dev {
+                report.note("cross-filesystem subtree skipped");
                 continue;
             }
             ws.dir_paths.insert((meta.dev(), meta.ino()), path.clone());
@@ -1773,8 +2241,10 @@ fn pre_open_recurse(
                     .insert((meta.dev(), meta.ino()), OwnedFd::from(f));
                 ws.path_to_inode
                     .insert(path.clone(), (meta.dev(), meta.ino()));
+            } else {
+                report.note("directory fd could not be opened");
             }
-            pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
+            pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap, report);
             continue;
         }
         // AU29 — capture FIFOs and sockets with an O_PATH fd so
@@ -1790,7 +2260,6 @@ fn pre_open_recurse(
         // I/O (no blocking write side, no socket connect). Same
         // shape as the dir branch above; fstat returns the right
         // mode bits via the held fd.
-        use std::os::unix::fs::FileTypeExt;
         if ft.is_fifo() || ft.is_socket() {
             if let Ok(f) = std::fs::OpenOptions::new()
                 .read(true)
@@ -1801,10 +2270,13 @@ fn pre_open_recurse(
                     .insert((meta.dev(), meta.ino()), OwnedFd::from(f));
                 ws.path_to_inode
                     .insert(path.clone(), (meta.dev(), meta.ino()));
+            } else {
+                report.note("special-file fd could not be opened");
             }
             continue;
         }
         if !ft.is_file() {
+            report.note("unsupported filesystem entry skipped");
             continue;
         }
         let f = match std::fs::OpenOptions::new()
@@ -1813,16 +2285,21 @@ fn pre_open_recurse(
             .open(&path)
         {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => {
+                report.note("regular file could not be opened");
+                continue;
+            }
         };
         let fd = f.as_raw_fd();
         let Some((dev, inode, FileType::Regular)) = fstat_dev_inode_kind(fd) else {
+            report.note("regular-file identity unavailable");
             continue;
         };
         if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
             ws.pre_snapshots
                 .insert((dev, inode), PreSnapshot { meta, bytes });
         } else {
+            report.note("regular-file snapshot unavailable");
             tracing::trace!(
                 dev,
                 inode,
@@ -1873,10 +2350,10 @@ fn resolve_via_parent(
     ws_dir_paths: &BTreeMap<(u64, u64), PathBuf>,
     parent_dev: u64,
     parent_inode: u64,
-    basename: &str,
-) -> Option<String> {
+    basename: &OsStr,
+) -> Option<PathBuf> {
     let parent = ws_dir_paths.get(&(parent_dev, parent_inode))?;
-    Some(path_to_string(&parent.join(basename)))
+    Some(parent.join(basename))
 }
 
 /// View into an `lsm/inode_unlink` event as the BPF ringbuf reader
@@ -1889,13 +2366,12 @@ pub struct LsmUnlinkView<'a> {
     pub dev: u64,
     pub inode: u64,
     pub parent_inode: u64,
-    pub basename: &'a str,
+    pub basename: &'a OsStr,
     /// G03 — set when this event came from the `inode_rmdir` LSM
     /// hook rather than `inode_unlink`. The handler skips bytes-
-    /// capture (directories have no content) and emits a marker
-    /// CapturedPreImage with the dir's mode so the daemon's
-    /// kind_from_mode_bits derives `Directory` and the planner's
-    /// RecreatePath emits the right inverse.
+    /// capture (directories have no content) and emits a typed deletion
+    /// marker. The daemon currently turns that marker into an explicit
+    /// refusal rather than pretending mode-only reconstruction is complete.
     pub is_directory: bool,
 }
 
@@ -1929,7 +2405,7 @@ pub struct LsmMkdirView<'a> {
     pub parent_dev: u64,
     pub parent_inode: u64,
     pub mode: u32,
-    pub basename: &'a str,
+    pub basename: &'a OsStr,
 }
 
 /// View into an `lsm/inode_create` event. Same shape as
@@ -1944,7 +2420,7 @@ pub struct LsmCreateView<'a> {
     pub parent_dev: u64,
     pub parent_inode: u64,
     pub mode: u32,
-    pub basename: &'a str,
+    pub basename: &'a OsStr,
 }
 
 /// L04.1 — View into an `lsm/file_open` event. BPF already filtered
@@ -1985,8 +2461,8 @@ pub struct LsmRenameView<'a> {
     pub inode: u64,
     pub old_parent_inode: u64,
     pub new_parent_inode: u64,
-    pub old_basename: &'a str,
-    pub new_basename: &'a str,
+    pub old_basename: &'a OsStr,
+    pub new_basename: &'a OsStr,
 }
 
 /// Decide whether the producer should emit a pre-image capture for
@@ -2018,8 +2494,11 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     let kind = match (st.st_mode as libc::mode_t) & libc::S_IFMT {
         libc::S_IFREG => FileType::Regular,
         libc::S_IFDIR => FileType::Directory,
+        libc::S_IFLNK => FileType::Symlink,
         libc::S_IFIFO => FileType::Fifo,
         libc::S_IFSOCK => FileType::Socket,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFCHR => FileType::CharDevice,
         _ => FileType::Other,
     };
     Some((st.st_dev, st.st_ino, kind))
@@ -2029,8 +2508,11 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
 enum FileType {
     Regular,
     Directory,
+    Symlink,
     Fifo,
     Socket,
+    BlockDevice,
+    CharDevice,
     Other,
 }
 
@@ -2076,7 +2558,7 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         gid: st.st_gid,
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
-        xattrs: crate::capture::xattr::read_user_xattrs(fd),
+        xattrs: crate::capture::xattr::try_read_user_xattrs(fd).ok()?,
     })
 }
 
@@ -2110,9 +2592,10 @@ fn resolve_inode_to_path(ws: &WatchState, dev: u64, inode: u64) -> Option<PathBu
         // files. Trim that so the journal stores a real path; the file
         // may have been re-created at the same path or we may be
         // capturing a rename-source whose name we want intact.
-        let s = p.to_string_lossy();
-        if let Some(stripped) = s.strip_suffix(" (deleted)") {
-            return Some(PathBuf::from(stripped));
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = p.as_os_str().as_bytes();
+        if let Some(stripped) = bytes.strip_suffix(b" (deleted)") {
+            return Some(std::ffi::OsString::from_vec(stripped.to_vec()).into());
         }
         return Some(p);
     }
@@ -2208,9 +2691,40 @@ fn write_to_staging(dir: &Path, bytes: &[u8]) -> std::io::Result<OwnedFd> {
     Ok(f.into())
 }
 
-fn path_to_string(p: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+fn path_to_string(p: &Path) -> Option<String> {
+    p.to_str().map(ToOwned::to_owned)
+}
+
+fn send_capture_refused(
+    conn: &Conn,
+    command: CommandId,
+    path: Option<String>,
+    detail: impl Into<String>,
+) -> Result<(), crate::ipc::ConnError> {
+    conn.send_response(&HelperResponse::CaptureRefused {
+        session: command.session,
+        seq: command.seq,
+        path,
+        detail: detail.into(),
+    })
+}
+
+/// Convert a native POSIX path for the UTF-8 helper wire. Lossy conversion is
+/// forbidden because an inverse aimed at a U+FFFD-substituted pathname can
+/// mutate a different file. Emit an explicit, non-actionable refusal instead.
+fn path_to_wire_or_refuse(conn: &Conn, command: CommandId, path: &Path) -> Option<String> {
+    if let Some(path) = path_to_string(path) {
+        return Some(path);
+    }
+    if let Err(error) = send_capture_refused(
+        conn,
+        command,
+        None,
+        "native path is not representable as UTF-8",
+    ) {
+        tracing::warn!(%error, "failed to send non-UTF-8-path CaptureRefused");
+    }
+    None
 }
 
 fn now_unix_nanos() -> u64 {
@@ -2235,6 +2749,19 @@ mod tests {
         let (a, _b) = crate::ipc::socketpair().expect("socketpair");
         let rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
         (rt, dir, staging)
+    }
+
+    fn runtime_with_peer() -> (
+        LinuxCaptureRuntime,
+        crate::ipc::Conn,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (a, b) = crate::ipc::socketpair().expect("socketpair");
+        let rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        (rt, b, dir, staging)
     }
 
     fn ghost_cmd() -> CommandId {
@@ -2407,7 +2934,7 @@ mod tests {
             dev,
             inode,
             parent_inode: 0,
-            basename,
+            basename: OsStr::new(basename),
             is_directory: false,
         };
 
@@ -2439,7 +2966,7 @@ mod tests {
             dev: 0xdead_beef,
             inode: 0xcafe_babe,
             parent_inode: 0,
-            basename: "this-file-does-not-exist-anywhere.xyz",
+            basename: OsStr::new("this-file-does-not-exist-anywhere.xyz"),
             is_directory: false,
         };
 
@@ -2449,6 +2976,102 @@ mod tests {
         assert_eq!(ws.dedupe.len(), 1, "exactly one dedupe entry");
         let entry = ws.dedupe.values().next().unwrap();
         assert!(entry.invalidated);
+    }
+
+    #[test]
+    fn lsm_regular_unlink_race_loss_emits_capture_refused() {
+        let (mut rt, peer, dir, _staging) = runtime_with_peer();
+        let cmd = ghost_cmd();
+        let root = std::fs::metadata(dir.path()).unwrap();
+        rt.watches
+            .entry(cmd)
+            .or_default()
+            .dir_paths
+            .insert((root.dev(), root.ino()), dir.path().to_path_buf());
+
+        rt.handle_lsm_unlink(&LsmUnlinkView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: userspace_to_kernel_dev(root.dev()),
+            inode: u64::MAX - 1,
+            parent_inode: root.ino(),
+            basename: OsStr::new("already-gone.bin"),
+            is_directory: false,
+        });
+
+        let response = peer.recv_response().unwrap();
+        assert!(matches!(
+            response,
+            HelperResponse::CaptureRefused { path: Some(path), .. }
+                if path.ends_with("/already-gone.bin")
+        ));
+    }
+
+    #[test]
+    fn lsm_directory_unlink_emits_typed_deletion_marker() {
+        let (mut rt, peer, dir, _staging) = runtime_with_peer();
+        let cmd = ghost_cmd();
+        let child = dir.path().join("empty-dir");
+        std::fs::create_dir(&child).unwrap();
+        let root = std::fs::metadata(dir.path()).unwrap();
+        let child_meta = std::fs::metadata(&child).unwrap();
+        let child_fd = std::fs::File::open(&child).unwrap();
+        let ws = rt.watches.entry(cmd).or_default();
+        ws.dir_paths
+            .insert((root.dev(), root.ino()), dir.path().to_path_buf());
+        ws.pre_opens
+            .insert((child_meta.dev(), child_meta.ino()), child_fd.into());
+
+        rt.handle_lsm_unlink(&LsmUnlinkView {
+            command: cmd,
+            pid: std::process::id(),
+            dev: userspace_to_kernel_dev(child_meta.dev()),
+            inode: child_meta.ino(),
+            parent_inode: root.ino(),
+            basename: OsStr::new("empty-dir"),
+            is_directory: true,
+        });
+
+        let response = peer.recv_response().unwrap();
+        assert!(matches!(
+            response,
+            HelperResponse::CapturedDeletionMarker { metadata, .. }
+                if metadata.mode & libc::S_IFMT == libc::S_IFDIR
+        ));
+    }
+
+    #[test]
+    fn non_utf8_native_path_emits_refusal_without_replacement_target() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (a, peer) = crate::ipc::socketpair().expect("socketpair");
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/bad-\xff".to_vec()));
+        assert_eq!(path_to_wire_or_refuse(&a, ghost_cmd(), &path), None);
+        assert!(matches!(
+            peer.recv_response().unwrap(),
+            HelperResponse::CaptureRefused { path: None, detail, .. }
+                if detail.contains("not representable as UTF-8")
+        ));
+    }
+
+    #[test]
+    fn create_race_loss_refuses_instead_of_path_only_marker() {
+        let (mut rt, peer, dir, _staging) = runtime_with_peer();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        let vanished = dir.path().join("already-vanished");
+
+        rt.process_lsm_create_resolved(cmd, std::process::id(), vanished.clone(), 0o100644);
+
+        assert!(matches!(
+            peer.recv_response().unwrap(),
+            HelperResponse::CaptureRefused {
+                path: Some(path),
+                detail,
+                ..
+            } if path == vanished.to_str().unwrap()
+                && detail.contains("kernel identity")
+        ));
     }
 
     /// AU17 — counter mechanism: `note_silent_send_failure` is
@@ -2494,6 +3117,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn on_unwatch_tree_surfaces_silent_failures_as_refusal() {
+        let (mut rt, peer, _dir, _staging) = runtime_with_peer();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        rt.watches.get_mut(&cmd).unwrap().silent_send_failures = 3;
+
+        rt.on_unwatch_tree(cmd);
+
+        assert!(matches!(
+            peer.recv_response().unwrap(),
+            HelperResponse::CaptureRefused {
+                session,
+                seq,
+                path: None,
+                detail,
+            } if session == cmd.session && seq == cmd.seq && detail.contains("lost 3 event")
+        ));
+        assert!(!rt.watches.contains_key(&cmd));
+    }
+
     /// L04 — kernel→glibc dev_t conversion vector. Picked from a real
     /// hasu observation: kernel `0x800002` (major=8 minor=2) maps to
     /// glibc `0x802` (== `2050` decimal, as seen on PreExec's cwd_dev
@@ -2535,9 +3179,19 @@ mod tests {
 
         let mut opened = 0usize;
         let mut hit_cap = false;
-        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+        let mut report = BaselineWalkReport::default();
+        pre_open_recurse(
+            &mut ws,
+            root,
+            root_dev,
+            0,
+            &mut opened,
+            &mut hit_cap,
+            &mut report,
+        );
 
         assert!(!hit_cap, "should not have hit max-files cap");
+        assert!(report.issues.is_empty(), "unexpected issues: {report:?}");
         // 4 regular files were created; all should be snapshotted.
         assert_eq!(opened, 4, "expected 4 files snapshotted, got {opened}");
         assert_eq!(
@@ -2600,23 +3254,29 @@ mod tests {
 
         // Top-level file: parent is the watch root.
         assert_eq!(
-            resolve_via_parent(&dir_paths, 64, 100, "README.md").as_deref(),
-            Some("/tmp/repo/README.md")
+            resolve_via_parent(&dir_paths, 64, 100, OsStr::new("README.md")).as_deref(),
+            Some(Path::new("/tmp/repo/README.md"))
         );
         // Nested under .git/.
         assert_eq!(
-            resolve_via_parent(&dir_paths, 64, 200, "index.lock").as_deref(),
-            Some("/tmp/repo/.git/index.lock")
+            resolve_via_parent(&dir_paths, 64, 200, OsStr::new("index.lock")).as_deref(),
+            Some(Path::new("/tmp/repo/.git/index.lock"))
         );
         // Deeply nested.
         assert_eq!(
-            resolve_via_parent(&dir_paths, 64, 300, "abc123").as_deref(),
-            Some("/tmp/repo/.git/objects/02/abc123")
+            resolve_via_parent(&dir_paths, 64, 300, OsStr::new("abc123")).as_deref(),
+            Some(Path::new("/tmp/repo/.git/objects/02/abc123"))
         );
         // Unknown parent inode → None (caller falls back).
-        assert_eq!(resolve_via_parent(&dir_paths, 64, 999, "missing"), None);
+        assert_eq!(
+            resolve_via_parent(&dir_paths, 64, 999, OsStr::new("missing")),
+            None
+        );
         // Wrong dev (e.g. submount) → None.
-        assert_eq!(resolve_via_parent(&dir_paths, 65, 100, "README.md"), None);
+        assert_eq!(
+            resolve_via_parent(&dir_paths, 65, 100, OsStr::new("README.md")),
+            None
+        );
     }
 
     /// AR01.1.fix-pre-open-tree-recursion — depth cap is enforced.
@@ -2642,7 +3302,16 @@ mod tests {
 
         let mut opened = 0usize;
         let mut hit_cap = false;
-        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+        let mut report = BaselineWalkReport::default();
+        pre_open_recurse(
+            &mut ws,
+            root,
+            root_dev,
+            0,
+            &mut opened,
+            &mut hit_cap,
+            &mut report,
+        );
 
         // Depth limit is 8; leaf.txt is at depth 10. Should not be opened.
         assert_eq!(
@@ -2659,6 +3328,10 @@ mod tests {
             ws.dir_paths.len() <= 9,
             "must not exceed depth limit; got {} dirs",
             ws.dir_paths.len()
+        );
+        assert!(
+            report.issues.contains_key("directory depth limit reached"),
+            "depth truncation must make readiness incomplete: {report:?}"
         );
     }
 
@@ -2678,13 +3351,14 @@ mod tests {
         pre_bytes: &[u8],
     ) -> (
         LinuxCaptureRuntime,
+        crate::ipc::Conn,
         tempfile::TempDir,
         tempfile::TempDir,
         PathBuf,
         u64,
         u64,
     ) {
-        let (mut rt, dir, staging) = fresh_runtime();
+        let (mut rt, peer, dir, staging) = runtime_with_peer();
         let path = dir.path().join("probe.txt");
         std::fs::write(&path, pre_bytes).unwrap();
         let f = std::fs::OpenOptions::new()
@@ -2710,7 +3384,7 @@ mod tests {
             .insert((dev_userspace, inode), OwnedFd::from(f));
         ws.path_to_inode
             .insert(path.clone(), (dev_userspace, inode));
-        (rt, dir, staging, path, dev_userspace, inode)
+        (rt, peer, dir, staging, path, dev_userspace, inode)
     }
 
     /// Re-encode a userspace dev as the kernel `(major<<20)|minor`
@@ -2731,7 +3405,7 @@ mod tests {
     #[test]
     fn handle_lsm_release_emits_on_content_diff() {
         let cmd = ghost_cmd();
-        let (mut rt, _dir, _staging, path, dev_userspace, inode) =
+        let (mut rt, peer, _dir, _staging, path, dev_userspace, inode) =
             release_test_setup(cmd, b"before-bytes");
 
         // Mutate in place — no rename, no truncate.
@@ -2746,6 +3420,14 @@ mod tests {
             f_flags: 0o002, // O_RDWR
         };
         rt.handle_lsm_release(&view);
+
+        assert!(matches!(
+            peer.recv_response().unwrap(),
+            HelperResponse::CapturedPreImage {
+                post_content_hash: Some(_),
+                ..
+            }
+        ));
 
         let ws = rt.watches.get(&cmd).expect("watch state");
         // Dedupe entry inserted, NOT invalidated (it's a content
@@ -2765,7 +3447,7 @@ mod tests {
     #[test]
     fn handle_lsm_release_skips_when_unchanged() {
         let cmd = ghost_cmd();
-        let (mut rt, _dir, _staging, _path, dev_userspace, inode) =
+        let (mut rt, _peer, _dir, _staging, _path, dev_userspace, inode) =
             release_test_setup(cmd, b"identical-bytes");
 
         // No write — content matches snapshot.
@@ -2787,12 +3469,14 @@ mod tests {
         );
     }
 
-    /// L04.2 — dedupe-hit path: another handler already captured for
-    /// this inode → release skips without re-reading.
+    /// L04.2 — an open-time pre-image must not suppress the
+    /// release-time post hash. The test runtime intentionally has a
+    /// closed peer; observing a send failure proves release reached
+    /// the wire path instead of returning at the pre-image dedupe gate.
     #[test]
-    fn handle_lsm_release_skips_when_already_captured() {
+    fn handle_lsm_release_bypasses_preimage_dedupe() {
         let cmd = ghost_cmd();
-        let (mut rt, _dir, _staging, path, dev_userspace, inode) =
+        let (mut rt, peer, _dir, _staging, path, dev_userspace, inode) =
             release_test_setup(cmd, b"original");
 
         // Mark dedupe as if an earlier handler captured.
@@ -2802,8 +3486,7 @@ mod tests {
                 .insert((dev_userspace, inode), DedupeEntry { invalidated: false });
         }
 
-        // Mutate content to make sure the early-return is the only
-        // reason no work happens.
+        // Mutate content so release must emit the enriched event.
         std::fs::write(&path, b"mutated-but-deduped").unwrap();
 
         let view = LsmReleaseView {
@@ -2817,8 +3500,15 @@ mod tests {
         rt.handle_lsm_release(&view);
 
         let ws = rt.watches.get(&cmd).expect("watch state");
-        // Still exactly one entry; release didn't add a duplicate.
         assert_eq!(ws.dedupe.len(), 1, "exactly one dedupe entry");
+        assert_eq!(ws.silent_send_failures, 0);
+        assert!(matches!(
+            peer.recv_response().unwrap(),
+            HelperResponse::CapturedPreImage {
+                post_content_hash: Some(_),
+                ..
+            }
+        ));
     }
 
     /// L04.2 — miss path: file wasn't in pre_open_tree's snapshot

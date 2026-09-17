@@ -2,8 +2,7 @@
 
 //! Build script for `shit-preload-shim`.
 //!
-//! On FreeBSD (and the other BSDs we ship the LD_PRELOAD path for),
-//! base utilities link against libc with versioned symbol imports
+//! On FreeBSD, base utilities link against libc with versioned symbol imports
 //! — `open@FBSD_1.0`, `unlink@FBSD_1.0`, etc. The rtld resolver
 //! looks up the SPECIFIC versioned symbol when binding the PLT.
 //!
@@ -21,12 +20,9 @@
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    // BSD: versioned-symbol script for the FBSD_1.x exports.
-    let bsd = matches!(
-        target_os.as_str(),
-        "freebsd" | "netbsd" | "openbsd" | "dragonfly"
-    );
-    if bsd {
+    // FreeBSD only: NetBSD/OpenBSD/DragonFly use their own unversioned symbol
+    // namespaces and must not inherit FBSD_* aliases or definitions.
+    if target_os == "freebsd" {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
         let ver_script = format!("{manifest_dir}/shim.ver");
         println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={ver_script}");

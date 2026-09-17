@@ -186,6 +186,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // open; consulted by the CapturedPreImage ingest path to swap
     // post-write content for the genuine pre-content captured here.
     let live_baseline = Arc::new(baseline::LiveBaseline::new());
+    // DR-25 prereq: the in-memory active-command map. Construct it before the
+    // helper dispatch loop so an unexpected helper disconnect can durably
+    // refuse every command that was in flight at the time of the loss.
+    let active = Arc::new(active_commands::ActiveCommands::new());
 
     // S24.A — spawn shit-helper and start its dispatch loop. Best-
     // effort: if the helper binary isn't discoverable or the
@@ -200,6 +204,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // handler returns ready=false / "no helper" early without
     // touching the map in that case.
     let watch_ready = Arc::new(watch_ready::WatchReadyMap::new());
+    let finalization_blocks = Arc::new(server::FinalizationBlocks::default());
 
     let (helper_link_arc, helper_dispatch_handle): (
         Option<Arc<helper_link::HelperLink>>,
@@ -236,6 +241,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let dispatch_shutdown = Arc::clone(&shutdown);
                         let dispatch_watch_ready = Arc::clone(&watch_ready);
                         let dispatch_stats = Arc::clone(&stats);
+                        let dispatch_active = Arc::clone(&active);
                         let handle = tokio::spawn(async move {
                             if let Err(e) = helper_link::dispatch_loop(
                                 dispatch_link,
@@ -245,6 +251,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                                 dispatch_shutdown,
                                 dispatch_watch_ready,
                                 dispatch_stats,
+                                dispatch_active,
                             )
                             .await
                             {
@@ -303,10 +310,6 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let net_stash = Arc::new(net_track::NetPreStash::new());
     let proc_stash = Arc::new(proc_track::ProcPreStash::new());
     let db_stash = Arc::new(db_track::DbPreStash::new());
-    // DR-25 prereq: the in-memory active-command map. Owns the
-    // shell_pid → (session, seq) lookup tier-event handlers use to
-    // attribute pkg/env/svc/net/proc/db events to a live command.
-    let active = Arc::new(active_commands::ActiveCommands::new());
     let pkg_janitor = {
         let pkg_stash = Arc::clone(&pkg_stash);
         let env_stash = Arc::clone(&env_stash);
@@ -383,6 +386,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             // handler can short-circuit to "no helper" when we're
             // in degraded mode.
             watch_ready: helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready)),
+            finalization_blocks: Arc::clone(&finalization_blocks),
             // AU28 — handle_undo wraps this in a
             // HelperLinkPrivilegedOpRouter when Some; in degraded
             // mode (None) the FileExecutor uses NoOpPrivilegedOpRouter
@@ -443,6 +447,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             helper_link_for_server,
             watch_ready_for_server,
             live_baseline_for_server,
+            finalization_blocks,
         ) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");

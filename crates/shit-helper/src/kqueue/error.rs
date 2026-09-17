@@ -20,6 +20,13 @@ pub enum KqueueError {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    #[error("fstat({path:?}): {source}")]
+    Stat {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("subtree walk at {root_path:?} was incomplete; refusing a partial watch")]
+    IncompleteSubtree { root_path: std::path::PathBuf },
     #[error("not implemented in stage 1: {0}")]
     NotImplemented(&'static str),
 }

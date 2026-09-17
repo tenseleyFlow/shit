@@ -8,20 +8,13 @@
 # EXCLUDED_BY: 
 # EXCLUDED_REASON: 
 #
-# G01.5 smoke — `git clean -fd` deletes untracked files and
-# (with `-d`) untracked directories. `shit undo` recreates
-# everything byte-identical.
+# `git clean -fd` command-atomic refusal smoke.
 #
-# File path: covered by W09.5 unlink-with-pre-image atomic-replace,
-# extended by G01.3 to also cover gone-at-undo.
-#
-# Directory path: G01.5 predicted-gap area. `unlinkat(AT_REMOVEDIR)`
-# fires the LSM unlink hook, but the helper's fstat-on-fd returns
-# FileType::Directory which fails the `file_type == Regular` check
-# → marker-only event with no pre-image bytes (dirs don't have
-# content). The planner then emits RecreatePath{kind: Regular,
-# mode: 0o100644} — wrong; restores a regular file where a dir
-# should be. Fix path lands in this PR if the smoke confirms.
+# The regular-file unlinks have complete content pre-images, but the final
+# directory removals have metadata-only evidence that cannot yet reproduce
+# all directory metadata. Those typed markers become CaptureRefused. The
+# planner must then refuse the entire command: applying only the regular-file
+# inverses would leave a misleading half-restored tree.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -64,21 +57,10 @@ mkdir -p "${REPO}/junk/nested"
 echo "charlie" > "${REPO}/junk/c.txt"
 echo "delta"   > "${REPO}/junk/nested/d.txt"
 
-# G02 — pin a non-default mode on `junk/` so we can assert the
-# planner restores the captured mode (not the pre-G02 hard-coded
-# 0o755 from the executor's mkdir-p fallback). 0o750 has both
-# group + other diffs from 0o755, so a regression that loses kind
-# OR mode surfaces here.
+# Pin a non-default mode so the metadata-only marker is nontrivial; the
+# current model still cannot claim that this is the complete pre-state.
 chmod 0750 "${REPO}/junk"
-DIR_MODE_BEFORE="$(stat -c '%a' "${REPO}/junk")"
-smoke_log "pre-clean dir mode: junk=${DIR_MODE_BEFORE}"
-
-# Sha each untracked file so we can assert byte-identity after undo.
-SHA_A="$(sha256sum "${REPO}/untracked-a.txt" | cut -d' ' -f1)"
-SHA_B="$(sha256sum "${REPO}/untracked-b.txt" | cut -d' ' -f1)"
-SHA_C="$(sha256sum "${REPO}/junk/c.txt" | cut -d' ' -f1)"
-SHA_D="$(sha256sum "${REPO}/junk/nested/d.txt" | cut -d' ' -f1)"
-smoke_log "untracked: a=${SHA_A:0:8} b=${SHA_B:0:8} c=${SHA_C:0:8} d=${SHA_D:0:8}"
+smoke_log "pre-clean dir mode: junk=$(stat -c '%a' "${REPO}/junk")"
 
 smoke_start_shitd
 
@@ -112,63 +94,48 @@ sleep 1
 smoke_wait_for_event "discriminant = 'FilePreImage'" 1 10
 NUM_PRE="$(smoke_journal_count "discriminant = 'FilePreImage'")"
 smoke_log "FilePreImage events: ${NUM_PRE}"
+smoke_wait_for_event "discriminant = 'CaptureRefused' AND path LIKE '%/junk%'" 1 10
+NUM_REFUSED="$(smoke_journal_count "discriminant = 'CaptureRefused' AND path LIKE '%/junk%'")"
+smoke_log "directory CaptureRefused events: ${NUM_REFUSED}"
 
-smoke_log "running: shit undo --yes"
-"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
+# The top-level directory marker must not also become an actionable unlink.
+N_LOSSY_DIR_OPS="$(smoke_journal_count "discriminant = 'TreeOpUnlink' AND path LIKE '%/junk'")"
+if [ "${N_LOSSY_DIR_OPS}" -ne 0 ]; then
+    smoke_fail "git clean directory also journaled ${N_LOSSY_DIR_OPS} lossy TreeOpUnlink event(s)"
+fi
+
+smoke_log "running: shit undo --yes (expecting command-atomic refusal)"
+UNDO_RC=0
+"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || UNDO_RC=$?
+if [ "${UNDO_RC}" -eq 0 ]; then
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_journal_query "SELECT id, discriminant, path FROM events ORDER BY id;" 2>/dev/null \
         | sed 's/^/    /' >&2 || true
-    smoke_fail "shit undo exited non-zero"
-}
+    smoke_fail "git clean CaptureRefused unexpectedly exited 0"
+fi
 
-# Assertions: every file restored byte-identical, dirs back.
-check_file() {
-    local path="$1" expected="$2"
-    [ -f "${path}" ] || { smoke_log "missing: ${path}"; return 1; }
-    local got
-    got="$(sha256sum "${path}" | cut -d' ' -f1)"
-    [ "${got}" = "${expected}" ] || {
-        smoke_log "sha mismatch ${path}: expected=${expected} got=${got}"
-        return 1
-    }
-    return 0
-}
-
-ok=1
-check_file "${REPO}/untracked-a.txt" "${SHA_A}" || ok=0
-check_file "${REPO}/untracked-b.txt" "${SHA_B}" || ok=0
-[ -d "${REPO}/junk" ]              || { smoke_log "missing dir: junk"; ok=0; }
-[ -d "${REPO}/junk/nested" ]       || { smoke_log "missing dir: junk/nested"; ok=0; }
-check_file "${REPO}/junk/c.txt" "${SHA_C}"            || ok=0
-check_file "${REPO}/junk/nested/d.txt" "${SHA_D}"     || ok=0
-
-if [ "${ok}" != "1" ]; then
+if ! grep -qiE "Refused|capture-incomplete|metadata-only deletion marker" "${SHIT_SMOKE_TMP}/undo.log"; then
     smoke_log "undo log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_log "journal contents:"
-    smoke_journal_query "SELECT id, discriminant, path FROM events ORDER BY id;" 2>/dev/null \
-        | sed 's/^/    /' >&2 || true
-    smoke_log "current tree:"
-    find "${REPO}" -name '.git' -prune -o -print 2>/dev/null | sed 's/^/    /' >&2 || true
-    smoke_fail "clean -fd undo didn't restore all entries"
+    smoke_fail "undo failed without surfacing the git-clean directory refusal"
+fi
+if ! grep -q "applied=0" "${SHIT_SMOKE_TMP}/undo.log"; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "command-atomic refusal still applied one or more file inverses"
 fi
 
-# G03 — the captured mode now flows end-to-end. The
-# inode_rmdir LSM hook fires for `unlinkat(AT_REMOVEDIR)` on
-# junk/, the helper fstat's the held fd for mode bits, emits
-# a marker CapturedPreImage, the daemon's kind_from_mode_bits
-# converts to FileKind::Directory, and the planner emits
-# RecreatePath{Directory, <captured mode>} which the executor
-# applies via mkdir + chmod.
-DIR_MODE_AFTER="$(stat -c '%a' "${REPO}/junk")"
-if [ "${DIR_MODE_AFTER}" != "${DIR_MODE_BEFORE}" ]; then
-    smoke_log "dir mode mismatch on junk/: expected=${DIR_MODE_BEFORE} got=${DIR_MODE_AFTER}"
-    smoke_log "(pre-G03 this would be 0o755 from mkdir-p fallback; post-G03 the captured 0o750 must survive)"
-    smoke_fail "captured directory mode not restored"
-fi
-smoke_log "dir mode restored: junk=${DIR_MODE_AFTER} == captured ${DIR_MODE_BEFORE}"
+# None of the otherwise-actionable regular-file pre-images may be replayed.
+# Every path removed by git clean must remain absent after the refusal.
+for p in untracked-a.txt untracked-b.txt junk junk/nested junk/c.txt junk/nested/d.txt; do
+    if [ -e "${REPO}/${p}" ]; then
+        smoke_log "unexpected post-refusal path: ${REPO}/${p}"
+        find "${REPO}" -name '.git' -prune -o -print 2>/dev/null | sed 's/^/    /' >&2 || true
+        smoke_fail "git-clean refusal applied a partial or lossy inverse"
+    fi
+done
+[ -f "${REPO}/tracked.txt" ] || smoke_fail "refused undo perturbed tracked.txt"
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: git-clean-fd-undo-linux (files + dirs restored, ${NUM_PRE} pre-images)"
+smoke_log "PASS: git-clean-fd-undo-linux (${NUM_PRE} file pre-images suppressed by ${NUM_REFUSED} directory refusal(s); no partial inverse applied)"

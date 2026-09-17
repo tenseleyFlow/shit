@@ -38,6 +38,10 @@ pub struct CtlState {
     /// immediately so the shell hook doesn't block on a non-existent
     /// signal.
     pub watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
+    /// Close gate shared with the hook server. A readiness timeout is only a
+    /// safe fail-open boundary when its `CaptureRefused` fallback is durable;
+    /// otherwise PostExec must leave the command open and retry the refusal.
+    pub finalization_blocks: Arc<crate::server::FinalizationBlocks>,
     /// AU28 / DR-15 stage-1 — helper link for privileged-op routing.
     /// When `Some`, `handle_undo` wraps it in a
     /// `HelperLinkPrivilegedOpRouter` and threads it into the
@@ -110,6 +114,7 @@ async fn handle_client(
         db_stash,
         active,
         watch_ready,
+        finalization_blocks,
         helper_link,
     } = state;
     // Length-prefix-first read so we can grow the buffer up to
@@ -207,7 +212,15 @@ async fn handle_client(
             command_seq,
             timeout_ms,
         } => {
-            handle_wait_watch_ready(session, command_seq, timeout_ms, watch_ready.as_deref()).await
+            handle_wait_watch_ready(
+                session,
+                command_seq,
+                timeout_ms,
+                watch_ready.as_deref(),
+                &index,
+                &finalization_blocks,
+            )
+            .await
         }
         CtlRequest::PreStashRedirects {
             session,
@@ -1114,9 +1127,10 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
 /// Blocks the calling ctl client (typically `shit hook-send pre-exec`
 /// from a shell PreExec hook) until the helper has signaled
 /// `HelperResponse::WatchTreeReady` for the specified (session,
-/// command_seq) -- which means kernel-tier capture is genuinely set
-/// up and the user's command can safely run without racing the
-/// helper's watch_tree handling.
+/// command_seq), or until capture is known to have failed. The shell hooks are
+/// fail-open, so a false response does not prevent the user's command from
+/// running; every false path must first persist a `CaptureRefused` event so a
+/// later undo cannot treat incomplete evidence as authoritative.
 ///
 /// Returns:
 /// - `WatchReady { ready: true, reason: None }` on success.
@@ -1130,32 +1144,85 @@ async fn handle_wait_watch_ready(
     command_seq: u64,
     timeout_ms: u32,
     watch_ready: Option<&crate::watch_ready::WatchReadyMap>,
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
 ) -> CtlResponse {
+    let cmd = shit_planner::events::CommandId {
+        session,
+        seq: command_seq,
+    };
     let Some(map) = watch_ready else {
+        journal_watch_readiness_refusal(index, finalization_blocks, cmd, "no helper");
         return CtlResponse::WatchReady {
             ready: false,
             reason: Some("no helper".to_string()),
         };
     };
-    let cmd = shit_planner::events::CommandId {
-        session,
-        seq: command_seq,
-    };
     let rx = map.await_ready(cmd);
     let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(())) => CtlResponse::WatchReady {
+        Ok(Ok(Ok(()))) => CtlResponse::WatchReady {
             ready: true,
             reason: None,
         },
-        Ok(Err(_canceled)) => CtlResponse::WatchReady {
+        Ok(Ok(Err(reason))) => CtlResponse::WatchReady {
             ready: false,
-            reason: Some("canceled".to_string()),
+            reason: Some(reason),
         },
-        Err(_) => CtlResponse::WatchReady {
-            ready: false,
-            reason: Some("timeout".to_string()),
-        },
+        Ok(Err(_canceled)) => {
+            journal_watch_readiness_refusal(index, finalization_blocks, cmd, "canceled");
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some("canceled".to_string()),
+            }
+        }
+        Err(_) => {
+            map.mark_failed(cmd, "timeout");
+            journal_watch_readiness_refusal(index, finalization_blocks, cmd, "timeout");
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some("timeout".to_string()),
+            }
+        }
+    }
+}
+
+fn journal_watch_readiness_refusal(
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
+    command: shit_planner::events::CommandId,
+    reason: &str,
+) {
+    let path = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+        .map(|record| record.cwd);
+    let detail = format!("capture watch was not ready before command execution: {reason}");
+    // Install the close gate before touching SQLite so PostExec cannot race a
+    // failed refusal write and expose this command as complete.
+    finalization_blocks.insert(
+        command,
+        format!("watch-readiness refusal was not yet durable: {detail}"),
+    );
+    if let Err(e) = crate::helper_link::journal_helper_capture_refused(index, command, path, detail)
+    {
+        // A concurrent successful close retry is allowed to clear the gate.
+        // Re-inserting after our own failed write is conservative if those
+        // operations cross: the next duplicate PostExec simply retries.
+        finalization_blocks.insert(
+            command,
+            format!("watch-readiness CaptureRefused journal failed: {e}"),
+        );
+        warn!(
+            err = %e,
+            session = %command.session,
+            command_seq = command.seq,
+            reason,
+            "watch-readiness CaptureRefused journal failed"
+        );
+    } else {
+        // Any durable command-scoped CaptureRefused is sufficient to make the
+        // entire undo fail closed, even if another producer supplied the
+        // original in-memory block reason.
+        finalization_blocks.clear(command);
     }
 }
 
@@ -1579,7 +1646,148 @@ fn handle_undo(
 #[cfg(test)]
 mod cmd_detail_helpers_tests {
     use super::*;
-    use shit_planner::events::CaptureEventKind;
+    use shit_planner::events::{CaptureEventKind, CommandId, CommandRecord};
+    use shit_planner::{PlannerStore, TimePoint};
+
+    fn readiness_fixture(seq: u64) -> (tempfile::TempDir, Index, CommandId) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path().join("db.sqlite")).unwrap();
+        let command = CommandId {
+            session: uuid::Uuid::from_u128(0x51_17),
+            seq,
+        };
+        index
+            .put_session(
+                command.session,
+                "bash",
+                1000,
+                Some("/dev/null"),
+                TimePoint::new(1, 1),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("touch evidence".into()),
+                cwd: "/tmp/readiness-cwd".into(),
+                pid: 1001,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(2, 2),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        (dir, index, command)
+    }
+
+    #[tokio::test]
+    async fn no_helper_readiness_is_a_durable_command_refusal() {
+        let (_dir, index, command) = readiness_fixture(41);
+        let blocks = crate::server::FinalizationBlocks::default();
+        let response =
+            handle_wait_watch_ready(command.session, command.seq, 10, None, &index, &blocks).await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some(reason),
+            } if reason == "no helper"
+        ));
+        let events = index.events_for_command(command);
+        assert!(matches!(
+            &events[..],
+            [shit_planner::CaptureEvent {
+                kind: CaptureEventKind::CaptureRefused { path, detail, .. },
+                ..
+            }] if path == Path::new("/tmp/readiness-cwd")
+                && detail.contains("no helper")
+        ));
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_is_a_durable_command_refusal() {
+        let (_dir, index, command) = readiness_fixture(42);
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let blocks = crate::server::FinalizationBlocks::default();
+        let response =
+            handle_wait_watch_ready(command.session, command.seq, 0, Some(&map), &index, &blocks)
+                .await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some(reason),
+            } if reason == "timeout"
+        ));
+        assert!(index.events_for_command(command).iter().any(|event| {
+            matches!(
+                &event.kind,
+                CaptureEventKind::CaptureRefused { detail, .. }
+                    if detail.contains("timeout")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn ready_watch_does_not_add_a_refusal() {
+        let (_dir, index, command) = readiness_fixture(43);
+        let map = crate::watch_ready::WatchReadyMap::new();
+        map.mark_ready(command);
+        let blocks = crate::server::FinalizationBlocks::default();
+        let response = handle_wait_watch_ready(
+            command.session,
+            command.seq,
+            10,
+            Some(&map),
+            &index,
+            &blocks,
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: true,
+                reason: None,
+            }
+        ));
+        assert!(index.events_for_command(command).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_readiness_refusal_blocks_command_finalization() {
+        let (_dir, index, command) = readiness_fixture(44);
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_readiness_refusal
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'CaptureRefused'
+                 BEGIN SELECT RAISE(FAIL, 'injected readiness refusal failure'); END;",
+            )
+            .unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let blocks = crate::server::FinalizationBlocks::default();
+
+        let response =
+            handle_wait_watch_ready(command.session, command.seq, 0, Some(&map), &index, &blocks)
+                .await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some(reason),
+            } if reason == "timeout"
+        ));
+        assert!(blocks.get(command).is_some());
+        assert!(index.events_for_command(command).is_empty());
+    }
 
     #[test]
     fn time_point_round_trips_under_i64_max() {

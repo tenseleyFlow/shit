@@ -73,12 +73,27 @@ impl es_event_type_t {
     pub const AUTH_RENAME: Self = Self(6);
     pub const AUTH_UNLINK: Self = Self(8);
     pub const AUTH_TRUNCATE: Self = Self(40);
-    /// Metadata-mutation events (M03.1.I.D). Each fires AUTH-style;
-    /// the producer emits a `CapturedMetadataChange` event with a
-    /// stat-snapshot taken BEFORE the syscall commits.
+    /// Metadata-mutation events (M03.1.I.D). Each fires AUTH-style. The
+    /// capture producer currently reports these families as non-actionable
+    /// after successful NOTIFY because the inverse schema cannot represent
+    /// all mode/ACL/ownership/timestamp side effects safely.
     pub const AUTH_SETMODE: Self = Self(48);
     pub const AUTH_SETOWNER: Self = Self(49);
-    pub const AUTH_UTIMES: Self = Self(60);
+    pub const AUTH_UTIMES: Self = Self(58);
+
+    /// Post-authorization notifications for the mutation families above.
+    /// AUTH messages describe an attempted syscall; these NOTIFY messages are
+    /// the first point at which the ES client knows that authorization was
+    /// granted and the kernel completed the operation.  The capture producer
+    /// stages pre-images at AUTH time and commits them only after the matching
+    /// NOTIFY event arrives.
+    pub const NOTIFY_OPEN: Self = Self(10);
+    pub const NOTIFY_RENAME: Self = Self(25);
+    pub const NOTIFY_SETMODE: Self = Self(29);
+    pub const NOTIFY_SETOWNER: Self = Self(30);
+    pub const NOTIFY_UNLINK: Self = Self(32);
+    pub const NOTIFY_TRUNCATE: Self = Self(41);
+    pub const NOTIFY_UTIMES: Self = Self(59);
 
     /// NOTIFY events — no response required, just informational.
     /// M03.1.E uses NOTIFY_EXEC for the subscribe-deliver smoke;
@@ -525,8 +540,8 @@ unsafe extern "C" {
     /// Respond to an AUTH event. Must be called within ~5 seconds of
     /// delivery or the kernel kills the client. `cache=true` lets
     /// the kernel reuse the answer for identical subsequent
-    /// invocations (cheaper); we use true for the ALLOW path since
-    /// the answer doesn't depend on per-call state.
+    /// invocations. Capture-dependent callers must pass false: a cached
+    /// ALLOW would suppress later AUTH snapshots and break undo.
     ///
     /// Return type is `es_respond_result_t` (u32) but we treat it as
     /// `es_return_t` here — the variant set differs slightly but
@@ -616,6 +631,18 @@ mod tests {
         // es_return_t — same drift-check for the generic enum.
         assert_eq!(es_return_t::SUCCESS.0, 0);
         assert_eq!(es_return_t::ERROR.0, 1);
+    }
+
+    #[test]
+    fn paired_notify_event_discriminants_match_apple() {
+        assert_eq!(es_event_type_t::NOTIFY_OPEN.0, 10);
+        assert_eq!(es_event_type_t::NOTIFY_RENAME.0, 25);
+        assert_eq!(es_event_type_t::NOTIFY_SETMODE.0, 29);
+        assert_eq!(es_event_type_t::NOTIFY_SETOWNER.0, 30);
+        assert_eq!(es_event_type_t::NOTIFY_UNLINK.0, 32);
+        assert_eq!(es_event_type_t::NOTIFY_TRUNCATE.0, 41);
+        assert_eq!(es_event_type_t::AUTH_UTIMES.0, 58);
+        assert_eq!(es_event_type_t::NOTIFY_UTIMES.0, 59);
     }
 
     #[test]

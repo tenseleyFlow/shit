@@ -69,7 +69,8 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         }
         InverseOp::RestoreContent { path, inode, .. }
         | InverseOp::RestoreMetadata { path, inode, .. }
-        | InverseOp::RestoreFlags { path, inode, .. } => {
+        | InverseOp::RestoreFlags { path, inode, .. }
+        | InverseOp::FileExtendGuarded { path, inode, .. } => {
             out.push(TouchKey::Path(path.clone()));
             out.push(TouchKey::Inode(*inode));
         }

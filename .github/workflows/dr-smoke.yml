@@ -358,6 +358,36 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  fsevents-fallback-macos:
+    # The unentitled hosted runner is the intended environment: this
+    # proves the truthful FSEvents-degraded fallback when EndpointSecurity
+    # cannot initialize.
+    name: FSEvents degraded fallback smoke (M01/M02 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: verify runtime prerequisites
+        run: |
+          test -x /usr/bin/python3
+          command -v sqlite3
+          command -v jq
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/fsevents-fallback-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsevents-fallback-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+            /tmp/shit-smoke.*/doctor.json
+
   mkdir-out-of-watch-undo-macos:
     # M03.x.CREATE regression guard. The target is deliberately outside
     # the watched cwd, so only the successful post-syscall DYLD shim
@@ -2192,11 +2222,12 @@ jobs:
 
       - name: setcap helper
         run: |
-          # AU22 adds cap_mknod to the capset so mkfifo-restore-undo-linux
-          # (and any future Fifo/Socket restore path) can dispatch
-          # libc::mknod via helper-IPC. cap_mknod is the standard
-          # POSIX-capability gate for mknod(2) with FIFO/SOCK kinds;
-          # block/char devices still need CAP_SYS_ADMIN (DR-15.2).
+          # Keep cap_mknod on the helper so the privileged mknod IPC route
+          # remains available for future exact FIFO replay. The current
+          # mkfifo-restore-undo-linux smoke intentionally gates
+          # CaptureRefused: metadata-only deletion evidence is not complete
+          # enough to invoke this route safely. FIFO creation undo only
+          # unlinks the newly-created path and remains supported.
           sudo setcap cap_mknod,cap_sys_admin,cap_bpf,cap_perfmon+ep \
             target/release/shit-helper
           getcap target/release/shit-helper

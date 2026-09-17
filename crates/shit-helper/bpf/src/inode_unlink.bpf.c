@@ -18,9 +18,9 @@
  *   - Strict CO-RE via BPF_CORE_READ for every kernel-struct field.
  *   - No unbounded loops. The program is straight-line code.
  *   - Always returns 0 ("allow"). Cannot deny syscalls.
- *   - The ringbuf reserve can fail under load — we drop the event
- *     silently rather than block or return non-zero. Tracking gap:
- *     drops surface via the ringbuf overflow counter (DR coming).
+ *   - The ringbuf reserve can fail under load — we allow the syscall
+ *     but atomically increment an out-of-band loss counter. Userspace
+ *     turns every observed loss into command-scoped capture refusals.
  *
  * The shipped .bpf.o lives in `crates/shit-helper/bpf/build/` and is
  * `include_bytes!`'d by the userspace loader. Regenerate via the
@@ -63,6 +63,7 @@ int BPF_PROG(shit_inode_unlink, struct inode *dir, struct dentry *dentry)
     if (!e) {
         /* Ringbuf full. Drop the event but always ALLOW the syscall
          * — LSM hooks that block under pressure can wedge the box. */
+        shit_note_ringbuf_loss();
         return 0;
     }
 

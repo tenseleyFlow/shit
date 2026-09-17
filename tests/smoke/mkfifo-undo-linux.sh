@@ -12,9 +12,9 @@
 # `shit undo` (inverse of Create = Unlink). The capture side
 # already supports this (inode_create LSM hook); the assertion is
 # that the round-trip completes — proves the *create* leg of the
-# Fifo lifecycle works as a baseline before mkfifo-restore-undo
-# tests the *restore* leg (AU22's load-bearing path through the
-# new helper-IPC mknod router).
+# Fifo lifecycle remains supported. Deleting a pre-existing FIFO is
+# a different shape: mkfifo-restore-undo-linux currently gates an
+# explicit refusal until complete FIFO metadata replay is modeled.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
