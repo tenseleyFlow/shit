@@ -156,8 +156,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
         if let Some(path) = first_relative_file_operand(op) {
             return ExecutionOutcome::Failed {
                 err: format!(
-                    "refusing relative filesystem path {:?}; undo targets must be absolute",
-                    path
+                    "refusing relative filesystem path {path:?}; undo targets must be absolute"
                 ),
             };
         }
@@ -721,7 +720,7 @@ fn validate_safe_target_kind(path: &Path, allow_directory: bool) -> Result<(), E
             err: format!("refusing unsafe symlink target {path:?}"),
         });
     }
-    if !kind.is_file() && !(allow_directory && kind.is_dir()) {
+    if !(kind.is_file() || allow_directory && kind.is_dir()) {
         return Err(ExecutionOutcome::Failed {
             err: format!(
                 "refusing unsafe special target {path:?} (mode {:o})",

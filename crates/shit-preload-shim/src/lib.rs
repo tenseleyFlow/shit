@@ -1725,7 +1725,7 @@ mod policy {
                 let failure = shit_proto::ShimFailure::CanonicalizeFailed {
                     which_arg: which_arg.to_string(),
                     attempted_path: path.to_string(),
-                    error_chain: format!("dirfd {dirfd} resolved to non-absolute base {:?}", base),
+                    error_chain: format!("dirfd {dirfd} resolved to non-absolute base {base:?}"),
                 };
                 return (path.to_string(), Some(failure));
             }
