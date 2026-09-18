@@ -22,7 +22,7 @@
 #   (/opt/homebrew/bin/python3 on arm64, /usr/local/bin on x86).
 #
 # Per-run isolation: unique package name + $HOME pointed at the
-# smoke tmpdir so ~/.local is per-run.
+# smoke tmpdir so the macOS Python user base is per-run.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -142,6 +142,10 @@ INSTALLED_MOD="${PY_USER_SITE}/${MOD_NAME}.py"
 [ -f "${INSTALLED_MOD}" ] || smoke_fail "module file not found at ${INSTALLED_MOD}"
 V1_SHA="$(sha256_of "${INSTALLED_MOD}")"
 smoke_log "pre-state: v1 module at ${INSTALLED_MOD}, sha=${V1_SHA:0:16}..."
+# The shim compares canonical mutation paths. Darwin presents TMPDIR as
+# /var/folders while canonicalization resolves it through /private/var/folders,
+# so pass the canonical user base just like `shit install`/auto-inject do.
+PY_USER_BASE_REAL="$(cd "${PY_USER_BASE}" && pwd -P)"
 
 # v2 source + version bump.
 cat > "${PKG_DIR}/${MOD_NAME}.py" <<'EOF'
@@ -171,8 +175,12 @@ sleep 0.7
 # THE workload. DYLD_INSERT the shim. pip's wheel installer does
 # the same rename-into-place pattern as on Linux; same shim
 # interposers fire.
-smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} pip install ${PIP_FLAGS} --force-reinstall --no-cache-dir (v2)"
-( cd "${PKG_DIR}" && DYLD_INSERT_LIBRARIES="${SHIM_LIB}" ${PIP_BIN} install ${PIP_FLAGS} --force-reinstall --no-cache-dir . ) \
+smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} SHIT_INSTALL_PREFIXES=${PY_USER_BASE_REAL} pip install ${PIP_FLAGS} --force-reinstall --no-cache-dir (v2)"
+( cd "${PKG_DIR}" && \
+    DYLD_INSERT_LIBRARIES="${SHIM_LIB}" \
+    SHIT_PRELOAD_ACTIVE=1 \
+    SHIT_INSTALL_PREFIXES="${PY_USER_BASE_REAL}" \
+    ${PIP_BIN} install ${PIP_FLAGS} --force-reinstall --no-cache-dir . ) \
     >"${SHIT_SMOKE_TMP}/pip-v2.log" 2>&1
 PIP_RC=$?
 if [ "${PIP_RC}" -ne 0 ]; then

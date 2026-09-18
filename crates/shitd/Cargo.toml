@@ -31,6 +31,7 @@ vergen-gitcl = { workspace = true }
 shit-proto = { workspace = true }
 shit-store = { workspace = true }
 shit-planner = { workspace = true }
+shit-shell = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -45,6 +46,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+blake3 = { workspace = true }
+postcard = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }

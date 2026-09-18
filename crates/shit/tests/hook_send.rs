@@ -5,11 +5,18 @@
 
 use shit_proto::{HookMessage, ShellKind, decode_frame};
 use std::os::unix::net::UnixDatagram;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
 fn shit_bin() -> &'static str {
     env!("CARGO_BIN_EXE_shit")
+}
+
+fn shit_command(config_root: &Path) -> Command {
+    let mut command = Command::new(shit_bin());
+    command.env("XDG_CONFIG_HOME", config_root.join("config"));
+    command
 }
 
 fn listener_at(sock: &std::path::Path) -> UnixDatagram {
@@ -30,7 +37,7 @@ fn preexec_round_trips_through_cli() {
     let sock = tmp.path().join("test.sock");
     let listener = listener_at(&sock);
 
-    let status = Command::new(shit_bin())
+    let status = shit_command(tmp.path())
         .args([
             "hook-send",
             "pre-exec",
@@ -83,7 +90,7 @@ fn preexec_cmdline_plumbs_through_to_wire() {
     let sock = tmp.path().join("test.sock");
     let listener = listener_at(&sock);
 
-    let status = Command::new(shit_bin())
+    let status = shit_command(tmp.path())
         .args([
             "hook-send",
             "pre-exec",
@@ -129,7 +136,7 @@ fn postexec_round_trips_through_cli() {
     let sock = tmp.path().join("test.sock");
     let listener = listener_at(&sock);
 
-    let status = Command::new(shit_bin())
+    let status = shit_command(tmp.path())
         .args([
             "hook-send",
             "post-exec",
@@ -161,7 +168,7 @@ fn session_open_close_round_trip() {
     let sock = tmp.path().join("test.sock");
     let listener = listener_at(&sock);
 
-    let status = Command::new(shit_bin())
+    let status = shit_command(tmp.path())
         .args([
             "hook-send",
             "session-open",
@@ -194,7 +201,7 @@ fn session_open_close_round_trip() {
         m => panic!("expected SessionOpen, got {m:?}"),
     }
 
-    let status = Command::new(shit_bin())
+    let status = shit_command(tmp.path())
         .args([
             "hook-send",
             "session-close",

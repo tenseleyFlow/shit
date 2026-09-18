@@ -8,15 +8,14 @@
 # EXCLUDED_BY: M03-vm-runner
 # EXCLUDED_REASON: macOS smokes need a signed binary on a Tart VM; GH-hosted macos-14 runner cannot satisfy the EndpointSecurity entitlement 
 #
-# M03.1.I.D end-to-end smoke — macOS ES metadata-mutation capture.
+# M03.1.I.D end-to-end smoke — macOS ES metadata-mutation refusal.
 #
-# Validates that AUTH_SETMODE (chmod) fires + the producer emits a
-# CapturedMetadataChange event carrying `before`/`after` mode bits
-# the daemon can invert. Same skip-checks as the other ES smokes.
+# Validates that AUTH_SETMODE (chmod) fires and the producer emits a durable
+# CaptureRefused event. The broad metadata inverse cannot yet represent every
+# mode/ACL side effect, so it must never be presented as actionable.
 #
-# We test chmod specifically because it's the canonical actionable metadata
-# event. AUTH_SETOWNER shares this CapturedMetadataChange path; AUTH_UTIMES is
-# deliberately routed to CaptureRefused until atime is captured and restored.
+# AUTH_SETOWNER shares this fail-closed path. AUTH_UTIMES is also refused until
+# atime is captured and restored.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -104,8 +103,13 @@ sleep 0.5
     --exit-code 0 \
     --sock "${SHIT_HOOK_SOCK}"
 
-smoke_wait_for_event "discriminant = 'MetadataChange'" 1 10
-smoke_log "MetadataChange journaled ✓"
+smoke_wait_for_event "discriminant = 'CaptureRefused' AND path LIKE '%/data.txt'" 1 10
+smoke_log "CaptureRefused journaled ✓"
+
+N_ACTIONABLE="$(smoke_journal_count "discriminant = 'MetadataChange' AND path LIKE '%/data.txt'")"
+if [ "${N_ACTIONABLE}" -ne 0 ]; then
+    smoke_fail "AUTH_SETMODE produced ${N_ACTIONABLE} actionable MetadataChange event(s)"
+fi
 
 # Sanity: post-chmod mode reflects the change.
 NEW_MODE="$(stat -f '%Lp' "${FILE}")"
@@ -114,10 +118,9 @@ if [ "${NEW_MODE}" != "755" ]; then
 fi
 smoke_log "post-chmod mode = ${NEW_MODE} ✓"
 
-# This smoke isolates entitled-ES capture and does not exercise `shit undo`.
-# Planner/executor tests cover restoring the old mode/owner metadata; timestamp
-# calls remain explicit refusals until atime is modeled. The acceptance
-# criterion here is that ES observes chmod via AUTH_SETMODE and journals it.
+# This smoke isolates entitled-ES observation and does not exercise `shit
+# undo`. The acceptance criterion is that successful AUTH_SETMODE is recorded
+# as a command-atomic refusal and never as a lossy inverse.
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
-smoke_log "PASS: es-chmod-metadata-macos (M03.1.I.D — chmod capture acceptance)"
+smoke_log "PASS: es-chmod-metadata-macos (M03.1.I.D — chmod refusal is explicit)"

@@ -16,11 +16,12 @@ pub mod compose;
 pub mod docker;
 pub mod event;
 pub mod podman;
+mod staging;
 
 #[allow(unused_imports)]
 pub use compose::{ComposeVerb, classify_compose_argv};
 #[allow(unused_imports)]
 pub use docker::{DockerVerb, classify_docker_argv};
-pub use event::run_event;
+pub use event::{finalize_batch, prepare_batch, run_event};
 #[allow(unused_imports)]
 pub use podman::{PodmanVerb, classify_podman_argv};

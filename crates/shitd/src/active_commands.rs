@@ -59,11 +59,19 @@ impl ActiveCommands {
     }
 
     /// Record that a new command has started on `shell_pid`.
-    pub fn insert(&self, shell_pid: u32, command: CommandId) {
+    ///
+    /// Returns `false` when the exact command identity is already active under
+    /// any shell. Duplicate PreExec delivery must not create a second stack
+    /// entry that survives the matching PostExec.
+    pub fn insert(&self, shell_pid: u32, command: CommandId) -> bool {
         let Ok(mut g) = self.inner.lock() else {
-            return;
+            return false;
         };
+        if g.values().any(|stack| stack.contains(&command)) {
+            return false;
+        }
         g.entry(shell_pid).or_default().push(command);
+        true
     }
 
     /// Remove a command on PostExec. Matches by `(session, seq)` so
@@ -145,6 +153,25 @@ impl ActiveCommands {
         None
     }
 
+    /// Verify that `emitter_pid` descends from the shell that owns one exact
+    /// command identity. Unlike [`Self::resolve_by_descendant`], this does not
+    /// select the top of a shell's active stack: an exported command identity
+    /// carried by a background wrapper must continue to bind to that command
+    /// even after a newer foreground `PreExec` is pushed.
+    pub fn resolve_exact_by_descendant(
+        &self,
+        emitter_pid: u32,
+        expected: CommandId,
+    ) -> Option<CommandId> {
+        let chain = ancestor_chain(emitter_pid);
+        let g = self.inner.lock().ok()?;
+        chain.into_iter().find_map(|pid| {
+            g.get(&pid)
+                .is_some_and(|stack| stack.contains(&expected))
+                .then_some(expected)
+        })
+    }
+
     /// Number of shell pids currently with an active command. For
     /// metrics / debug only. Wired to `shit metrics` in a later DR.
     #[allow(dead_code)]
@@ -193,12 +220,24 @@ mod tests {
     #[test]
     fn insert_and_remove_round_trip() {
         let a = ActiveCommands::new();
-        a.insert(1234, cmd(1));
+        assert!(a.insert(1234, cmd(1)));
         assert_eq!(a.tracked_shell_count(), 1);
         assert_eq!(a.active_command_count(), 1);
         assert!(a.remove(1234, cmd(1)));
         assert_eq!(a.tracked_shell_count(), 0);
         assert_eq!(a.active_command_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_command_identity_is_not_pushed_twice() {
+        let a = ActiveCommands::new();
+        assert!(a.insert(1234, cmd(1)));
+        assert!(!a.insert(1234, cmd(1)));
+        assert!(!a.insert(5678, cmd(1)));
+        assert_eq!(a.active_command_count(), 1);
+        assert!(a.remove_command(cmd(1)));
+        assert_eq!(a.active_command_count(), 0);
+        assert!(!a.remove_command(cmd(1)));
     }
 
     #[test]
@@ -264,6 +303,27 @@ mod tests {
         a.insert(pid, cmd(2));
         a.insert(pid, cmd(3));
         assert_eq!(a.resolve_by_descendant(pid), Some(cmd(3)));
+    }
+
+    #[test]
+    fn exact_resolution_binds_background_identity_not_stack_top() {
+        let a = ActiveCommands::new();
+        let shell_pid = std::process::id();
+        let background = cmd(1);
+        let foreground = cmd(2);
+        a.insert(shell_pid, background);
+        a.insert(shell_pid, foreground);
+
+        assert_eq!(a.resolve_by_descendant(shell_pid), Some(foreground));
+        assert_eq!(
+            a.resolve_exact_by_descendant(shell_pid, background),
+            Some(background)
+        );
+        assert_eq!(
+            a.resolve_exact_by_descendant(shell_pid, foreground),
+            Some(foreground)
+        );
+        assert_eq!(a.resolve_exact_by_descendant(shell_pid, cmd(3)), None);
     }
 
     #[test]

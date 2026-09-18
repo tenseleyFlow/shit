@@ -272,10 +272,8 @@ enum Mode {
     /// path; rm / volume-rm / network-rm / compose-down ride the
     /// same subcommand but per-verb capture is filled in incrementally.
     ///
-    /// `target_argv` is everything the user passed after the tool
-    /// name, newline-separated (`docker rmi alpine` →
-    /// `target_argv="rmi\nalpine"`). The subcommand routes argv
-    /// through the existing `container::docker::classify_docker_argv`.
+    /// Wrappers pass the user's argv losslessly as NUL-delimited stdin.
+    /// `--target-argv` remains as a compatibility path for older wrappers.
     #[command(name = "container-event")]
     ContainerEvent {
         /// Container runtime / tool identifier
@@ -288,7 +286,40 @@ enum Mode {
         /// User's argv after the tool name, newline-separated.
         #[arg(long, default_value = "")]
         target_argv: String,
+        /// Read the user's argv from stdin as NUL-terminated UTF-8 fields.
+        #[arg(long)]
+        target_argv_nul_stdin: bool,
         /// Override the daemon ctl-socket path.
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
+    /// Prepare one atomic destructive-container batch. On success prints one
+    /// opaque `v3-rmi1:<uuid>` token; the wrapper must retain it and invoke
+    /// `container-finalize` after the real runtime exits. An empty stdout
+    /// means the argv is non-destructive and no finalize call is needed.
+    #[command(name = "container-prepare")]
+    ContainerPrepare {
+        tool: String,
+        #[arg(long, default_value = "")]
+        target_argv: String,
+        #[arg(long)]
+        target_argv_nul_stdin: bool,
+        #[arg(long)]
+        ctl_sock: Option<PathBuf>,
+    },
+    /// Finalize a token returned by `container-prepare`, using the real
+    /// runtime exit code plus target-by-target postcondition probes.
+    #[command(name = "container-finalize")]
+    ContainerFinalize {
+        tool: String,
+        #[arg(long)]
+        batch_id: uuid::Uuid,
+        #[arg(long)]
+        exit_code: i32,
+        #[arg(long, default_value = "")]
+        target_argv: String,
+        #[arg(long)]
+        target_argv_nul_stdin: bool,
         #[arg(long)]
         ctl_sock: Option<PathBuf>,
     },
@@ -592,6 +623,50 @@ impl SidecarConfig {
     }
 }
 
+fn read_nul_terminated_argv_from_stdin() -> anyhow::Result<Vec<String>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            anyhow::anyhow!("read NUL-delimited container argv from stdin: {error}")
+        })?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.pop() != Some(0) {
+        anyhow::bail!("NUL-delimited container argv ended without a NUL terminator");
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .map(|field| {
+            std::str::from_utf8(field)
+                .map(str::to_owned)
+                .map_err(|error| anyhow::anyhow!("container argv is not valid UTF-8: {error}"))
+        })
+        .collect()
+}
+
+fn read_container_argv(
+    target_argv: String,
+    target_argv_nul_stdin: bool,
+) -> anyhow::Result<Vec<String>> {
+    if target_argv_nul_stdin {
+        if !target_argv.is_empty() {
+            anyhow::bail!("--target-argv and --target-argv-nul-stdin cannot be used together");
+        }
+        read_nul_terminated_argv_from_stdin()
+    } else if target_argv.is_empty() {
+        Ok(Vec::new())
+    } else {
+        // Compatibility for wrappers predating the lossless stdin transport.
+        // Empty and newline-bearing arguments cannot be represented here.
+        Ok(target_argv.split('\n').map(str::to_string).collect())
+    }
+}
+
 /// Dispatch a transient subcommand. These never enter the sidecar
 /// runtime; they run, do one IPC round-trip, and exit.
 async fn run_mode(mode: Mode) -> anyhow::Result<()> {
@@ -642,8 +717,44 @@ async fn run_mode(mode: Mode) -> anyhow::Result<()> {
             tool,
             phase,
             target_argv,
+            target_argv_nul_stdin,
             ctl_sock,
-        } => container::run_event(&tool, &phase, &target_argv, ctl_sock.as_deref()).await,
+        } => {
+            let target_args = read_container_argv(target_argv, target_argv_nul_stdin)?;
+            container::run_event(&tool, &phase, &target_args, ctl_sock.as_deref()).await
+        }
+        Mode::ContainerPrepare {
+            tool,
+            target_argv,
+            target_argv_nul_stdin,
+            ctl_sock,
+        } => {
+            let target_args = read_container_argv(target_argv, target_argv_nul_stdin)?;
+            if let Some(batch_id) =
+                container::prepare_batch(&tool, &target_args, ctl_sock.as_deref()).await?
+            {
+                println!("v3-rmi1:{batch_id}");
+            }
+            Ok(())
+        }
+        Mode::ContainerFinalize {
+            tool,
+            batch_id,
+            exit_code,
+            target_argv,
+            target_argv_nul_stdin,
+            ctl_sock,
+        } => {
+            let target_args = read_container_argv(target_argv, target_argv_nul_stdin)?;
+            container::finalize_batch(
+                &tool,
+                batch_id,
+                exit_code,
+                &target_args,
+                ctl_sock.as_deref(),
+            )
+            .await
+        }
         Mode::CloudEvent {
             tool,
             phase,
@@ -1230,6 +1341,12 @@ pub enum CaptureTier {
     Degraded,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveCapture {
+    report: handshake::ActiveCaptureTier,
+    caps: shit_proto::HelperCaps,
+}
+
 impl CaptureTier {
     pub fn label(&self) -> &'static str {
         match self {
@@ -1245,6 +1362,91 @@ impl CaptureTier {
             CaptureTier::ZfsSnapshot => "zfs-snapshot (S10 coarse pre-mutation)",
             CaptureTier::Degraded => "degraded (log-only)",
         }
+    }
+
+    /// Stable protocol spelling for the producer that is actually live.
+    /// Keep these values aligned with daemon-side dispatch checks.
+    fn handshake_name(self) -> &'static str {
+        match self {
+            CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred => "fanotify",
+            CaptureTier::EbpfLsm => "bpf-lsm",
+            CaptureTier::EndpointSecurity => "endpoint-security",
+            CaptureTier::FsEventsDegraded => "fsevents-degraded",
+            CaptureTier::KqueueOnly | CaptureTier::KqueuePreloadShim => "kqueue",
+            CaptureTier::ZfsSnapshot => "zfs-snapshot",
+            CaptureTier::Degraded => "degraded",
+        }
+    }
+
+    fn handshake_report(self, degraded_reason: Option<String>) -> handshake::ActiveCaptureTier {
+        handshake::ActiveCaptureTier::new(self.handshake_name(), degraded_reason)
+    }
+
+    fn active_capture(self, degraded_reason: Option<String>, package_hook: bool) -> ActiveCapture {
+        let (watch_tree, auth_subscribe) = match self {
+            CaptureTier::Fanotify
+            | CaptureTier::EbpfLsm
+            | CaptureTier::EbpfLsmAvailableButDeferred
+            | CaptureTier::EndpointSecurity => (true, true),
+            CaptureTier::FsEventsDegraded
+            | CaptureTier::KqueueOnly
+            | CaptureTier::KqueuePreloadShim
+            | CaptureTier::ZfsSnapshot => (true, false),
+            CaptureTier::Degraded => (false, false),
+        };
+        ActiveCapture {
+            report: self.handshake_report(degraded_reason),
+            caps: shit_proto::HelperCaps {
+                watch_tree,
+                auth_subscribe,
+                package_hook,
+            },
+        }
+    }
+}
+
+/// Resolve macOS from producer startup results, not the earlier ES probe.
+/// `None` means that producer reached its live startup boundary; `Some` is the
+/// exact startup failure retained for the degraded handshake report.
+#[cfg(any(target_os = "macos", test))]
+fn resolve_macos_active_capture(
+    fsevents_error: Option<String>,
+    endpoint_security_error: Option<String>,
+    package_hook: bool,
+) -> Result<ActiveCapture, String> {
+    match (fsevents_error, endpoint_security_error) {
+        (None, None) => Ok(CaptureTier::EndpointSecurity.active_capture(None, package_hook)),
+        (None, Some(es_error)) => Ok(CaptureTier::FsEventsDegraded.active_capture(
+            Some(format!(
+                "EndpointSecurity producer startup failed: {es_error}; FSEvents is active"
+            )),
+            package_hook,
+        )),
+        (Some(fsevents_error), None) => Err(format!(
+            "mandatory macOS FSEvents producer failed to start: {fsevents_error}; EndpointSecurity started but WatchTree readiness requires both producers"
+        )),
+        (Some(fsevents_error), Some(es_error)) => Err(format!(
+            "no usable macOS capture runtime started: EndpointSecurity: {es_error}; FSEvents: {fsevents_error}"
+        )),
+    }
+}
+
+/// BSD's helper-side producer is kqueue. ZFS and preload availability are
+/// preference/augmentation probes, not proof that a producer started.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    test,
+))]
+fn resolve_bsd_active_capture(
+    bsd_runtime_error: Option<String>,
+    package_hook: bool,
+) -> Result<ActiveCapture, String> {
+    match bsd_runtime_error {
+        None => Ok(CaptureTier::KqueueOnly.active_capture(None, package_hook)),
+        Some(error) => Err(format!("BSD kqueue producer startup failed: {error}")),
     }
 }
 
@@ -1291,7 +1493,8 @@ fn privileged_setup() -> PrivilegedSetup {
             caps: shit_proto::HelperCaps {
                 watch_tree: true,
                 // FSEvents is post-hoc — no syscall-blocking primitive.
-                // M03's EndpointSecurity tier flips this to true.
+                // Runtime resolution flips this to true only after the
+                // EndpointSecurity producer has actually started.
                 auth_subscribe: false,
                 package_hook: false,
             },
@@ -1813,9 +2016,13 @@ mod linux_capture_startup_tests {
 
     #[test]
     fn automatic_ebpf_failure_selects_fanotify_reader() {
+        let active =
+            resolve_linux_capture_startup(CaptureTier::EbpfLsm, false, None, true).unwrap();
+        assert_eq!(active, CaptureTier::Fanotify);
         assert_eq!(
-            resolve_linux_capture_startup(CaptureTier::EbpfLsm, false, None, true),
-            Ok(CaptureTier::Fanotify)
+            active.handshake_report(None).kernel_tier,
+            "fanotify",
+            "the ack must report the fallback that started, not the preferred eBPF tier"
         );
     }
 
@@ -1837,9 +2044,22 @@ mod linux_capture_startup_tests {
 
     #[test]
     fn successful_ebpf_boot_keeps_ebpf_active() {
-        assert_eq!(
-            resolve_linux_capture_startup(CaptureTier::EbpfLsm, true, Some("ebpf-lsm"), true),
-            Ok(CaptureTier::EbpfLsm)
+        let active =
+            resolve_linux_capture_startup(CaptureTier::EbpfLsm, true, Some("ebpf-lsm"), true)
+                .unwrap();
+        assert_eq!(active, CaptureTier::EbpfLsm);
+        assert_eq!(active.handshake_report(None).kernel_tier, "bpf-lsm");
+    }
+
+    #[test]
+    fn successful_ebpf_boot_without_fanotify_resolves_live_auth_caps() {
+        let tier = resolve_linux_capture_startup(CaptureTier::EbpfLsm, true, None, false).unwrap();
+        let active = tier.active_capture(None, false);
+        assert_eq!(active.report.kernel_tier, "bpf-lsm");
+        assert!(active.caps.watch_tree);
+        assert!(
+            active.caps.auth_subscribe,
+            "live eBPF-LSM must not inherit degraded caps from failed fanotify setup"
         );
     }
 
@@ -1865,6 +2085,70 @@ mod linux_capture_startup_tests {
     }
 }
 
+#[cfg(test)]
+mod active_capture_handshake_tests {
+    use super::{resolve_bsd_active_capture, resolve_macos_active_capture};
+
+    #[test]
+    fn macos_reports_endpoint_security_only_when_both_required_producers_started() {
+        let active = resolve_macos_active_capture(None, None, false).unwrap();
+        assert_eq!(active.report.kernel_tier, "endpoint-security");
+        assert_eq!(active.report.degraded_reason, None);
+        assert!(active.caps.watch_tree);
+        assert!(
+            active.caps.auth_subscribe,
+            "a successfully started ES producer must override stale probe-time caps"
+        );
+    }
+
+    #[test]
+    fn macos_reports_exact_fsevents_fallback_after_es_start_failure() {
+        let active = resolve_macos_active_capture(None, Some("NotEntitled".into()), false).unwrap();
+        assert_eq!(active.report.kernel_tier, "fsevents-degraded");
+        assert_eq!(
+            active.report.degraded_reason.as_deref(),
+            Some("EndpointSecurity producer startup failed: NotEntitled; FSEvents is active")
+        );
+        assert!(active.caps.watch_tree);
+        assert!(!active.caps.auth_subscribe);
+    }
+
+    #[test]
+    fn macos_refuses_ack_when_mandatory_fsevents_did_not_start() {
+        let error = resolve_macos_active_capture(Some("stream unavailable".into()), None, false)
+            .unwrap_err();
+        assert!(error.contains("mandatory macOS FSEvents producer failed to start"));
+        assert!(error.contains("EndpointSecurity started"));
+
+        let error = resolve_macos_active_capture(
+            Some("stream unavailable".into()),
+            Some("NotEntitled".into()),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("no usable macOS capture runtime started"));
+    }
+
+    #[test]
+    fn bsd_reports_kqueue_only_after_runtime_start() {
+        let active = resolve_bsd_active_capture(None, false).unwrap();
+        assert_eq!(active.report.kernel_tier, "kqueue");
+        assert_eq!(active.report.degraded_reason, None);
+        assert!(active.caps.watch_tree);
+        assert!(!active.caps.auth_subscribe);
+    }
+
+    #[test]
+    fn bsd_refuses_ack_when_kqueue_runtime_did_not_start() {
+        let error =
+            resolve_bsd_active_capture(Some("kqueue init failed".into()), false).unwrap_err();
+        assert_eq!(
+            error,
+            "BSD kqueue producer startup failed: kqueue init failed"
+        );
+    }
+}
+
 async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let shutdown = Arc::new(Notify::new());
 
@@ -1882,8 +2166,39 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         "connected to daemon ipc socket"
     );
 
+    // Authenticate both the socket peer and its Handshake payload before any
+    // privileged filesystem cleanup or capture producer startup. The ACK is
+    // deliberately deferred until those producers reach their live boundary.
+    let authenticated =
+        match handshake::authenticate_helper_side(&conn, cli.daemon_pid, cli.daemon_uid) {
+            Ok(authenticated) => authenticated,
+            Err(error) => {
+                tracing::error!(err = %error, "handshake authentication failed; exiting");
+                return Err(anyhow::anyhow!("handshake authentication failed: {error}"));
+            }
+        };
+    let daemon_pid = authenticated.daemon_pid();
+    let daemon_uid = authenticated.daemon_uid();
+
+    // Remove pathname-backed staging files left by pre-unlink helper builds
+    // before seccomp / Capsicum entry. The cleanup is deliberately shallow
+    // and fd-relative: only owner-matched regular files with the helper's
+    // legacy numeric name are unlinked, and the dedicated directory is
+    // required to be owned by the authenticated daemon uid with mode 0700.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    capture::streaming::prepare_staging_dir(&cli.state_dir.join("helper-staging"), daemon_uid)
+        .map_err(|error| {
+            anyhow::anyhow!("helper staging directory failed secure startup cleanup: {error}")
+        })?;
+
     // Spawn the kernel-tier reader BEFORE the handshake completes.
-    // Once `handshake::perform_helper_side` returns, the daemon is
+    // Once `handshake::acknowledge_helper_side` returns, the daemon is
     // free to dispatch `WatchTree` / `PreExec` (and on the shell side,
     // the smoke's mutation may run any moment). If we hadn't loaded
     // BPF programs / spawned the fanotify reader by then, the kernel
@@ -1892,6 +2207,12 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // landed us with 0 captured events across every L02/L03 smoke
     // on the linux-kernel-capture matrix; fix is to make
     // handshake-complete genuinely mean "capture is live".
+    //
+    // HandshakeAck must also remain the first helper response. Every producer
+    // starts with an empty command/watch table, and the daemon cannot send
+    // WatchTree until it receives the ack, so these pre-handshake threads may
+    // observe host activity but cannot attribute or emit a protocol message.
+    // Preserve that invariant when adding producer-wide health messages.
     //
     // Exactly one of fanotify / ebpf-lsm gets wired per-boot.
     // `pick_linux_tier` chooses the preference; an automatic eBPF
@@ -1903,7 +2224,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // unused fd from the other tier (the fanotify fd after a
     // successful eBPF boot) is dropped once startup is resolved.
     #[cfg(target_os = "linux")]
-    let (fanotify_state, lsm_state) = {
+    let (fanotify_state, lsm_state, active_capture) = {
         let staging_dir = cli.state_dir.join("helper-staging");
         let capture_rt = if matches!(setup.tier, CaptureTier::Degraded) {
             None
@@ -1932,7 +2253,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 // file ops would otherwise be journaled as user-visible
                 // mutations. Daemon's blob-staging rename was the
                 // load-bearing miss surfaced by L04.1.
-                let excluded = vec![std::process::id(), cli.daemon_pid];
+                let excluded = vec![std::process::id(), daemon_pid];
                 match boot_ebpf_lsm(capture_rt.clone(), Arc::clone(&conn), excluded) {
                     Ok(state) => (Some(state), None),
                     Err(e) => (None, Some(e)),
@@ -2040,23 +2361,22 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             None
         };
 
-        (fanotify_state, lsm_state)
-    };
-
-    let outcome =
-        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, setup.caps) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(err = %e, "handshake failed; exiting");
-                return Err(anyhow::anyhow!("handshake failed: {e}"));
-            }
+        let degraded_reason = if matches!(active_tier, CaptureTier::Fanotify) {
+            ebpf_load_error.as_ref().map(|error| {
+                format!("eBPF-LSM producer startup failed: {error}; fanotify is active")
+            })
+        } else if matches!(active_tier, CaptureTier::Degraded) {
+            Some("no Linux kernel capture producer started".to_string())
+        } else {
+            None
         };
-    tracing::info!(
-        daemon_pid = outcome.daemon_pid,
-        daemon_uid = outcome.daemon_uid,
-        granted = ?outcome.granted,
-        "handshake complete"
-    );
+
+        (
+            fanotify_state,
+            lsm_state,
+            active_tier.active_capture(degraded_reason, setup.caps.package_hook),
+        )
+    };
 
     // B05 Phase B — pre-cap_enter `O_DIRECTORY` open of `/`.
     // capsicum's `cap_enter(2)` forbids absolute-path opens once
@@ -2103,19 +2423,31 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         target_os = "openbsd",
         target_os = "dragonfly",
     ))]
-    let bsd_capture: Option<capture::bsd::CaptureControl> = {
+    let (bsd_capture, bsd_runtime_error): (
+        Option<capture::bsd::CaptureControl>,
+        Option<String>,
+    ) = {
         let staging_dir = cli.state_dir.join("helper-staging");
         match capture::bsd::spawn(Arc::clone(&conn), staging_dir, slash_fd.clone()) {
             Ok((ctrl, _join)) => {
                 tracing::info!("bsd capture runtime spawned");
-                Some(ctrl)
+                (Some(ctrl), None)
             }
             Err(e) => {
-                tracing::warn!(err = %e, "bsd capture runtime failed to start; continuing without it");
-                None
+                tracing::error!(err = %e, "bsd capture runtime failed to start");
+                (None, Some(e.to_string()))
             }
         }
     };
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    ))]
+    let active_capture = resolve_bsd_active_capture(bsd_runtime_error, setup.caps.package_hook)
+        .map_err(|error| anyhow::anyhow!("{error}; refusing to complete the helper handshake"))?;
 
     // M01.A: macOS FSEvents-degraded capture producer. Mirrors the
     // BSD spawn shape.
@@ -2129,18 +2461,21 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // (or, in production, with the entitlement); on a stock dev mac
     // it returns NotEntitled and we proceed FSEvents-only.
     #[cfg(target_os = "macos")]
-    let macos_capture: Option<capture::macos::CaptureControl> = {
+    let (macos_capture, fsevents_start_error): (
+        Option<capture::macos::CaptureControl>,
+        Option<String>,
+    ) = {
         match capture::macos::spawn(Arc::clone(&conn)) {
             Ok((ctrl, _join)) => {
                 tracing::info!("macos fsevents capture runtime spawned");
-                Some(ctrl)
+                (Some(ctrl), None)
             }
             Err(e) => {
                 tracing::warn!(
                     err = %e,
-                    "macos fsevents capture runtime failed to start; continuing without it"
+                    "macos fsevents capture runtime failed to start"
                 );
-                None
+                (None, Some(e.to_string()))
             }
         }
     };
@@ -2151,17 +2486,15 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // the already-live FSEvents producer; an apparently-live dead ES handle is
     // never allowed to participate in WatchTreeReady.
     #[cfg(target_os = "macos")]
-    let macos_es_capture: Option<capture::macos_es::CaptureControl> = {
+    let (macos_es_capture, endpoint_security_start_error): (
+        Option<capture::macos_es::CaptureControl>,
+        Option<String>,
+    ) = {
         let staging_dir = cli.state_dir.join("helper-staging");
-        match capture::macos_es::spawn(
-            Arc::clone(&conn),
-            staging_dir,
-            outcome.daemon_pid,
-            outcome.daemon_uid,
-        ) {
+        match capture::macos_es::spawn(Arc::clone(&conn), staging_dir, daemon_pid, daemon_uid) {
             Ok((ctrl, _join)) => {
                 tracing::info!("macos endpoint-security capture runtime spawned");
-                Some(ctrl)
+                (Some(ctrl), None)
             }
             Err(e) => {
                 tracing::warn!(
@@ -2169,10 +2502,52 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                     "macos endpoint-security capture runtime failed to start; \
                      continuing with FSEvents only"
                 );
-                None
+                (None, Some(e.to_string()))
             }
         }
     };
+
+    #[cfg(target_os = "macos")]
+    let active_capture = resolve_macos_active_capture(
+        fsevents_start_error,
+        endpoint_security_start_error,
+        setup.caps.package_hook,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}; refusing to complete the helper handshake"))?;
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "macos",
+    )))]
+    let active_capture = CaptureTier::Degraded.active_capture(
+        Some("this platform has no capture producer".to_string()),
+        setup.caps.package_hook,
+    );
+
+    let outcome = match handshake::acknowledge_helper_side(
+        &conn,
+        authenticated,
+        active_capture.caps,
+        active_capture.report,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(err = %e, "handshake failed; exiting");
+            return Err(anyhow::anyhow!("handshake failed: {e}"));
+        }
+    };
+    tracing::info!(
+        daemon_pid = outcome.daemon_pid,
+        daemon_uid = outcome.daemon_uid,
+        granted = ?outcome.granted,
+        kernel_tier = %outcome.kernel_tier,
+        degraded_reason = outcome.degraded_reason.as_deref().unwrap_or(""),
+        "handshake complete"
+    );
 
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;

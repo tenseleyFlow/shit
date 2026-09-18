@@ -1438,7 +1438,7 @@ fn dispatch_response(
                 }
             };
             if let Err(e) = handle_baseline_captured(
-                session,
+                command,
                 cwd_path,
                 dev,
                 inode,
@@ -2074,16 +2074,23 @@ fn handle_captured_pre_image(
     })?;
     let path_buf = strict_absolute_replay_path(raw_path, "CapturedPreImage path")
         .map_err(|detail| HelperLinkError::Io(std::io::Error::other(detail)))?;
-    let bytes = read_all_from_fd(&args.staging, args.stored_bytes)?;
-    let (canonical_hash, stat) = blob_store
-        .put(&bytes)
-        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("blob put: {e}"))))?;
     let claimed = BlobHash(args.blob_hash);
-    if canonical_hash != claimed {
-        return Err(HelperLinkError::Io(std::io::Error::other(format!(
-            "captured pre-image hash mismatch: helper claimed {claimed}, daemon computed {canonical_hash}"
-        ))));
-    }
+    let mut staging_reader =
+        PositionedStableFdReader::new(&args.staging, args.stored_bytes, MAX_CAPTURE_FD_BYTES)?;
+    let publication = blob_store.shared_guard();
+    let (canonical_hash, stat) = publication
+        .put_verified_exact(
+            &mut staging_reader,
+            claimed,
+            args.stored_bytes,
+            MAX_CAPTURE_FD_BYTES,
+        )
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "captured pre-image blob ingest: {e}"
+            )))
+        })?;
+    staging_reader.finish()?;
     let ts = crate::server::next_ts();
     index
         .put_blob_record(canonical_hash, stat.stored_bytes, stat.compressed, ts)
@@ -2133,6 +2140,7 @@ fn handle_captured_pre_image(
     index
         .put_event(&pre_image)
         .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
+    drop(publication);
 
     if args.is_delete {
         // G02: inherit kind+mode from the captured pre-image's
@@ -2533,6 +2541,15 @@ mod tree_dedup_tests {
         }
     }
 
+    fn fsevents_placeholder_unlink() -> TreeOp {
+        TreeOp::Unlink {
+            inode: InodeRef::new(0, 0),
+            path: "/tmp/link".into(),
+            kind: FileKind::Regular,
+            mode: 0o644,
+        }
+    }
+
     fn relink_removed_inode() -> TreeOp {
         TreeOp::Link {
             source: InodeRef::new(7, 11),
@@ -2770,6 +2787,55 @@ mod tree_dedup_tests {
         assert_eq!(events.len(), 1, "{events:#?}");
         assert!(!events[0].partial);
     }
+
+    #[test]
+    fn fsevents_placeholder_unlink_does_not_coalesce_with_rich_shim_symlink_removal() {
+        for (seq, partial_first) in [(7, true), (8, false)] {
+            let (_dir, index, command) = fixture(seq);
+            let observations = if partial_first {
+                [
+                    (
+                        fsevents_placeholder_unlink(),
+                        TreeSignalSource::HelperMutation,
+                        true,
+                    ),
+                    (symlink_removed(), TreeSignalSource::Shim, false),
+                ]
+            } else {
+                [
+                    (symlink_removed(), TreeSignalSource::Shim, false),
+                    (
+                        fsevents_placeholder_unlink(),
+                        TreeSignalSource::HelperMutation,
+                        true,
+                    ),
+                ]
+            };
+
+            for (ordinal, (op, source, partial)) in observations.into_iter().enumerate() {
+                assert_eq!(
+                    journal_tree_op(
+                        &index,
+                        command,
+                        TimePoint::new(ordinal as u64 + 1, 0),
+                        op,
+                        source,
+                        partial,
+                    )
+                    .unwrap(),
+                    TreeJournalOutcome::Journaled
+                );
+            }
+
+            let events = index.events_for_command(command);
+            assert_eq!(events.len(), 2, "{events:#?}");
+            assert_eq!(events.iter().filter(|event| event.partial).count(), 1);
+            assert!(events.iter().any(|event| matches!(
+                event.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified { .. })
+            )));
+        }
+    }
 }
 
 /// W02.B.live-baseline step 3 — ingest one BaselineCaptured message.
@@ -2781,7 +2847,7 @@ mod tree_dedup_tests {
 /// `CapturedPreImage`'s baseline-swap path.
 #[allow(clippy::too_many_arguments)]
 fn handle_baseline_captured(
-    session: uuid::Uuid,
+    command: CommandId,
     cwd: std::path::PathBuf,
     dev: u64,
     inode: u64,
@@ -2798,16 +2864,21 @@ fn handle_baseline_captured(
     index: &Index,
     live_baseline: &crate::baseline::LiveBaseline,
 ) -> Result<(), HelperLinkError> {
-    let bytes = read_all_from_fd(&staging, stored_bytes)?;
-    let (canonical_hash, stat) = blob_store
-        .put(&bytes)
-        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("blob put: {e}"))))?;
     let claimed = BlobHash(blob_hash_claimed);
-    if canonical_hash != claimed {
-        return Err(HelperLinkError::Io(std::io::Error::other(format!(
-            "baseline blob hash mismatch: helper claimed {claimed}, daemon computed {canonical_hash}"
-        ))));
-    }
+    let mut staging_reader =
+        PositionedStableFdReader::new(&staging, stored_bytes, MAX_CAPTURE_FD_BYTES)?;
+    let publication = blob_store.shared_guard();
+    let (canonical_hash, stat) = publication
+        .put_verified_exact(
+            &mut staging_reader,
+            claimed,
+            stored_bytes,
+            MAX_CAPTURE_FD_BYTES,
+        )
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!("baseline blob ingest: {e}")))
+        })?;
+    staging_reader.finish()?;
     // Register the blob in the index now, at capture time. When the
     // baseline cache later promotes this blob into a FilePreImage
     // event (via `handle_baseline_promoted_pre_image`), the planner's
@@ -2817,8 +2888,10 @@ fn handle_baseline_captured(
     // check (AU11 drift detection regression observed pre-fix).
     //
     // Idempotent via ON CONFLICT DO NOTHING; refcount stays 0 until a
-    // FilePreImage event references it, at which point put_event bumps
-    // it. Unpromoted baseline blobs end up refcount=0 and get GC'd.
+    // FilePreImage event references it. A command-scoped lease protects that
+    // zero-refcount interval. Promotion atomically bumps the refcount and
+    // consumes this exact lease; successful command finish clears any
+    // baseline leases that were never promoted.
     let ts = crate::server::next_ts();
     index
         .put_blob_record(canonical_hash, stat.stored_bytes, stat.compressed, ts)
@@ -2827,6 +2900,14 @@ fn handle_baseline_captured(
                 "baseline put_blob_record: {e}"
             )))
         })?;
+    index
+        .create_blob_lease(canonical_hash, command, ts)
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "baseline create_blob_lease: {e}"
+            )))
+        })?;
+    drop(publication);
     let inode_ref = InodeRef::new(dev, inode);
     // W09.21 — read user-namespace xattrs here in the daemon (not
     // the helper) because the helper runs under cap_enter(2) where
@@ -2855,7 +2936,8 @@ fn handle_baseline_captured(
     let cache = live_baseline.entry_for_cwd(&cwd);
     cache.insert(path.clone(), entry);
     tracing::debug!(
-        %session,
+        session = %command.session,
+        seq = command.seq,
         dev,
         inode,
         path = %path.display(),
@@ -2964,82 +3046,150 @@ fn handle_baseline_promoted_pre_image(
 
 const MAX_CAPTURE_FD_BYTES: u64 = 1024 * 1024 * 1024;
 
-fn read_all_from_fd(fd: &OwnedFd, expected_size: u64) -> Result<Vec<u8>, HelperLinkError> {
-    if expected_size > MAX_CAPTURE_FD_BYTES {
-        return Err(HelperLinkError::Io(std::io::Error::other(format!(
-            "captured fd declared {expected_size} bytes, above the {MAX_CAPTURE_FD_BYTES}-byte ingest cap"
-        ))));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagingFdIdentity {
+    dev: u64,
+    inode: u64,
+    size: u64,
+    file_type: libc::mode_t,
+}
+
+fn staging_fd_identity(fd: RawFd) -> std::io::Result<StagingFdIdentity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is borrowed by the caller for this operation and `stat`
+    // points at writable storage of the exact type required by fstat(2).
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    let expected_size = usize::try_from(expected_size).map_err(|_| {
-        HelperLinkError::Io(std::io::Error::other(
-            "captured fd length does not fit this platform's address space",
+    let size = u64::try_from(stat.st_size).map_err(|_| {
+        std::io::Error::other(format!(
+            "captured SCM_RIGHTS fd reports a negative length ({})",
+            stat.st_size
         ))
     })?;
+    Ok(StagingFdIdentity {
+        dev: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        size,
+        file_type: stat.st_mode & libc::S_IFMT,
+    })
+}
 
-    let mut before: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` remains owned for this call and `before` is writable.
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut before) } < 0 {
-        return Err(HelperLinkError::Io(std::io::Error::last_os_error()));
-    }
-    if before.st_mode & libc::S_IFMT != libc::S_IFREG {
-        return Err(HelperLinkError::Io(std::io::Error::other(
-            "captured SCM_RIGHTS fd is not a regular staging file",
-        )));
-    }
-    if before.st_size < 0 || before.st_size as u64 != expected_size as u64 {
-        return Err(HelperLinkError::Io(std::io::Error::other(format!(
-            "captured fd length mismatch: wire declared {expected_size}, fd reports {}",
-            before.st_size
-        ))));
-    }
+/// Positioned, identity-checked view of an SCM_RIGHTS staging file.
+///
+/// `pread(2)` avoids trusting or mutating the sender's open-file-description
+/// offset. Reaching EOF performs the post-read fstat before EOF is reported to
+/// the blob store, so the store cannot publish bytes from an fd whose identity
+/// or length changed during ingest.
+struct PositionedStableFdReader<'a> {
+    fd: &'a OwnedFd,
+    before: StagingFdIdentity,
+    expected_size: u64,
+    offset: u64,
+    post_read_verified: bool,
+}
 
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(expected_size).map_err(|e| {
-        HelperLinkError::Io(std::io::Error::other(format!(
-            "unable to reserve {expected_size} bytes for captured fd: {e}"
-        )))
-    })?;
-    buf.resize(expected_size, 0);
-    let mut offset: usize = 0;
-    while offset < expected_size {
-        // SAFETY: buf is a valid writable slice; fd is owned for the
-        // call duration.
-        let n = unsafe {
-            libc::pread(
-                fd.as_raw_fd(),
-                buf[offset..].as_mut_ptr().cast(),
-                expected_size - offset,
-                offset as i64,
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(HelperLinkError::Io(err));
-        }
-        if n == 0 {
-            return Err(HelperLinkError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("captured fd ended after {offset} bytes; wire declared {expected_size}"),
+impl<'a> PositionedStableFdReader<'a> {
+    fn new(fd: &'a OwnedFd, expected_size: u64, max_size: u64) -> std::io::Result<Self> {
+        if expected_size > max_size {
+            return Err(std::io::Error::other(format!(
+                "captured fd declared {expected_size} bytes, above the {max_size}-byte ingest cap"
             )));
         }
-        offset += n as usize;
+        let before = staging_fd_identity(fd.as_raw_fd())?;
+        if before.file_type != libc::S_IFREG {
+            return Err(std::io::Error::other(
+                "captured SCM_RIGHTS fd is not a regular staging file",
+            ));
+        }
+        if before.size != expected_size {
+            return Err(std::io::Error::other(format!(
+                "captured fd length mismatch: wire declared {expected_size}, fd reports {}",
+                before.size
+            )));
+        }
+        Ok(Self {
+            fd,
+            before,
+            expected_size,
+            offset: 0,
+            post_read_verified: false,
+        })
     }
 
-    let mut after: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` remains owned for this call and `after` is writable.
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut after) } < 0 {
-        return Err(HelperLinkError::Io(std::io::Error::last_os_error()));
+    fn verify_post_read_identity(&mut self) -> std::io::Result<()> {
+        let after = staging_fd_identity(self.fd.as_raw_fd())?;
+        if after.file_type != libc::S_IFREG || after != self.before {
+            return Err(std::io::Error::other(
+                "captured fd identity or length changed during ingest",
+            ));
+        }
+        self.post_read_verified = true;
+        Ok(())
     }
-    if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size)
-    {
-        return Err(HelperLinkError::Io(std::io::Error::other(
-            "captured fd identity or length changed during ingest",
-        )));
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if !self.post_read_verified {
+            let mut probe = [0_u8; 1];
+            if std::io::Read::read(&mut self, &mut probe)? != 0 {
+                return Err(std::io::Error::other(format!(
+                    "captured fd exceeded its declared {}-byte length",
+                    self.expected_size
+                )));
+            }
+        }
+        if self.offset != self.expected_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "captured fd ended after {} bytes; wire declared {}",
+                    self.offset, self.expected_size
+                ),
+            ));
+        }
+        Ok(())
     }
-    Ok(buf)
+}
+
+impl std::io::Read for PositionedStableFdReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.post_read_verified {
+            return Ok(0);
+        }
+        let offset: libc::off_t = self.offset.try_into().map_err(|_| {
+            std::io::Error::other("captured fd offset does not fit the platform's off_t")
+        })?;
+        loop {
+            // SAFETY: `buffer` is valid writable memory for `buffer.len()`
+            // bytes, `fd` remains owned for this call, and `offset` was
+            // checked to fit off_t.
+            let read = unsafe {
+                libc::pread(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    offset,
+                )
+            };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if read == 0 {
+                self.verify_post_read_identity()?;
+                return Ok(0);
+            }
+            let read = read as usize;
+            self.offset = self
+                .offset
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("captured fd offset overflow"))?;
+            return Ok(read);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3126,6 +3276,13 @@ mod tests_dispatch {
         // lifetime. Test-only; OS reclaims on process exit.
         std::mem::forget(dir);
         f.into()
+    }
+
+    fn tmp_staging_rw_fd(content: &[u8]) -> OwnedFd {
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, content).unwrap();
+        file.sync_all().unwrap();
+        file.into()
     }
 
     fn register_test_command(index: &Index, session: Uuid, seq: u64, cwd: &str) -> CommandId {
@@ -3749,6 +3906,100 @@ mod tests_dispatch {
     }
 
     #[test]
+    fn baseline_capture_lease_is_consumed_by_promotion_event() {
+        use std::os::unix::fs::MetadataExt;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let cwd = store_dir.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let path = cwd.join("file");
+        let bytes = b"authoritative pre-command bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xB504);
+        let command = register_test_command(&index, session, 44, cwd.to_str().unwrap());
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let cache = live_baseline.entry_for_cwd(&cwd);
+        cache.begin_walk(command).unwrap();
+        let blob = shit_planner::hash_file(&path).unwrap();
+
+        handle_baseline_captured(
+            command,
+            cwd,
+            metadata.dev(),
+            metadata.ino(),
+            path.clone(),
+            *blob.as_bytes(),
+            bytes.len() as u64,
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            (metadata.mtime() as i128) * 1_000_000_000 + metadata.mtime_nsec() as i128,
+            0,
+            tmp_staging_fd(bytes),
+            &blob_store,
+            &index,
+            &live_baseline,
+        )
+        .unwrap();
+
+        assert!(index.has_blob_lease(blob, command).unwrap());
+        let refcount_before: i64 = index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                [blob.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount_before, 0);
+
+        cache.mark_ready();
+        let Some(crate::baseline::BaselinePromotion::Promoted(pre_image)) =
+            cache.promote(InodeRef::new(metadata.dev(), metadata.ino()), command)
+        else {
+            panic!("ready baseline did not promote");
+        };
+        handle_baseline_promoted_pre_image(
+            command.session,
+            command.seq,
+            metadata.dev(),
+            metadata.ino(),
+            Some(path.to_string_lossy().into_owned()),
+            pre_image,
+            false,
+            None,
+            &index,
+        )
+        .unwrap();
+
+        assert!(!index.has_blob_lease(blob, command).unwrap());
+        let refcount_after: i64 = index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                [blob.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount_after, 1);
+        assert!(matches!(
+            &index.events_for_command(command)[..],
+            [CaptureEvent {
+                kind: CaptureEventKind::FilePreImage { blob: event_blob, .. },
+                ..
+            }] if *event_blob == blob
+        ));
+    }
+
+    #[test]
     fn baseline_promotion_uses_only_pre_command_metadata() {
         let store_dir = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
@@ -4207,7 +4458,7 @@ mod tests_dispatch {
             seq: 2,
             dev: 0,
             inode: 0,
-            path: None,
+            path: Some("/tmp/hash-mismatch".into()),
             blob_hash: bogus_claim,
             stored_bytes: bytes.len() as u64,
             post_content_hash: None,
@@ -4222,5 +4473,140 @@ mod tests_dispatch {
         };
         let err = handle_captured_pre_image(args, &index, &blob_store, "kqueue");
         assert!(err.is_err(), "expected hash-mismatch refusal");
+        let actual = BlobHash(*blake3::hash(bytes).as_bytes());
+        assert!(!blob_store.contains(&actual));
+        assert!(!blob_store.contains(&BlobHash(bogus_claim)));
+        assert_eq!(
+            std::fs::read_dir(blob_store.root().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn positioned_staging_reader_preserves_sender_offset() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let payload = vec![b'P'; 3 * 64 * 1024 + 29];
+        let hash = BlobHash(*blake3::hash(&payload).as_bytes());
+        let fd = tmp_staging_rw_fd(&payload);
+        // SAFETY: fd is live and 7 is within this regular staging file.
+        assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 7, libc::SEEK_SET) }, 7);
+
+        let mut reader =
+            PositionedStableFdReader::new(&fd, payload.len() as u64, MAX_CAPTURE_FD_BYTES).unwrap();
+        let publication = blob_store.shared_guard();
+        publication
+            .put_verified_exact(
+                &mut reader,
+                hash,
+                payload.len() as u64,
+                MAX_CAPTURE_FD_BYTES,
+            )
+            .unwrap();
+        reader.finish().unwrap();
+        // SAFETY: querying a live fd's current offset has no side effects.
+        assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) }, 7);
+        assert_eq!(publication.get(hash).unwrap(), payload);
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_initial_size_mismatch() {
+        let payload = b"wire-size-mismatch";
+        let fd = tmp_staging_rw_fd(payload);
+        let error = match PositionedStableFdReader::new(
+            &fd,
+            payload.len() as u64 + 1,
+            MAX_CAPTURE_FD_BYTES,
+        ) {
+            Ok(_) => panic!("mismatched staging length was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("length mismatch"), "{error}");
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_non_regular_fd() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let error = match PositionedStableFdReader::new(&fd, 0, MAX_CAPTURE_FD_BYTES) {
+            Ok(_) => panic!("socket staging fd was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not a regular"), "{error}");
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_size_mutation_without_residue() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let payload = vec![b'M'; 128 * 1024 + 11];
+        let hash = BlobHash(*blake3::hash(&payload).as_bytes());
+        let fd = tmp_staging_rw_fd(&payload);
+        let mut reader =
+            PositionedStableFdReader::new(&fd, payload.len() as u64, MAX_CAPTURE_FD_BYTES).unwrap();
+        // SAFETY: fd is a live writable regular tempfile.
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 64 * 1024) }, 0);
+
+        let publication = blob_store.shared_guard();
+        assert!(
+            publication
+                .put_verified_exact(
+                    &mut reader,
+                    hash,
+                    payload.len() as u64,
+                    MAX_CAPTURE_FD_BYTES,
+                )
+                .is_err()
+        );
+        assert!(!publication.contains(&hash));
+        assert_eq!(
+            std::fs::read_dir(blob_store.root().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_identity_swap_without_residue() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let original_bytes = vec![b'A'; 96 * 1024 + 7];
+        let replacement_bytes = vec![b'B'; original_bytes.len()];
+        let original_hash = BlobHash(*blake3::hash(&original_bytes).as_bytes());
+        let replacement_hash = BlobHash(*blake3::hash(&replacement_bytes).as_bytes());
+        let fd = tmp_staging_rw_fd(&original_bytes);
+        let replacement = tmp_staging_rw_fd(&replacement_bytes);
+        let mut reader =
+            PositionedStableFdReader::new(&fd, original_bytes.len() as u64, MAX_CAPTURE_FD_BYTES)
+                .unwrap();
+        // SAFETY: both descriptors are live. dup2 atomically replaces the
+        // descriptor owned by `fd`; that OwnedFd remains its sole owner.
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), fd.as_raw_fd()) },
+            fd.as_raw_fd()
+        );
+
+        let publication = blob_store.shared_guard();
+        assert!(
+            publication
+                .put_verified_exact(
+                    &mut reader,
+                    original_hash,
+                    original_bytes.len() as u64,
+                    MAX_CAPTURE_FD_BYTES,
+                )
+                .is_err()
+        );
+        assert!(!publication.contains(&original_hash));
+        assert!(!publication.contains(&replacement_hash));
+        assert_eq!(
+            std::fs::read_dir(blob_store.root().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

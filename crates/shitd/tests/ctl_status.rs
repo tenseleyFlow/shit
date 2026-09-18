@@ -66,6 +66,7 @@ log_level = "warn"
     let child = Command::new(shitd_bin())
         .arg("--config")
         .arg(&cfg)
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
         // S24.A: this test exercises the ctl socket, not the helper
         // tier. Skip the helper spawn so a slow handshake never times
         // out the ctl-socket-readiness wait.

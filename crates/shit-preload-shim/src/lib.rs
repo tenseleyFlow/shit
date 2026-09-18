@@ -504,6 +504,72 @@ mod policy {
 
     use std::sync::OnceLock;
 
+    /// Install wrappers opt into a prefix-bounded capture scope by exporting
+    /// `SHIT_INSTALL_PREFIXES`. Direct/manual preload users that omit the
+    /// variable retain the existing all-path behavior used by the generic BSD
+    /// and macOS capture tier. A present-but-empty or non-UTF-8 value matches
+    /// nothing (fail closed).
+    #[derive(Debug)]
+    enum CaptureScope {
+        Unrestricted,
+        Prefixes(crate::prefix_match::PrefixSet),
+    }
+
+    impl CaptureScope {
+        fn from_encoded(encoded: Option<&str>) -> Self {
+            match encoded {
+                None => Self::Unrestricted,
+                Some(encoded) => Self::Prefixes(crate::prefix_match::PrefixSet::new(
+                    encoded.split(':').filter(|prefix| !prefix.is_empty()),
+                )),
+            }
+        }
+
+        fn allows(&self, path: &str) -> bool {
+            match self {
+                Self::Unrestricted => true,
+                Self::Prefixes(prefixes) => prefixes.matches_str(path),
+            }
+        }
+
+        fn allows_any(&self, paths: &[&str]) -> bool {
+            paths.iter().any(|path| self.allows(path))
+        }
+
+        /// Fd-backed writes are filtered only when the descriptor's path was
+        /// resolved authoritatively. An unresolved fd must stay observable:
+        /// dropping it would silently miss a target mutation on FreeBSD hosts
+        /// without procfs (or during an fd/path race).
+        fn allows_fd_path(&self, resolved_path: Option<&str>) -> bool {
+            resolved_path.is_none_or(|path| self.allows(path))
+        }
+    }
+
+    fn capture_scope() -> &'static CaptureScope {
+        static SCOPE: OnceLock<CaptureScope> = OnceLock::new();
+        SCOPE.get_or_init(|| {
+            let encoded = std::env::var_os(crate::dispatch::SHIT_INSTALL_PREFIXES_ENV);
+            match encoded.as_deref().and_then(std::ffi::OsStr::to_str) {
+                Some(encoded) => CaptureScope::from_encoded(Some(encoded)),
+                None if encoded.is_none() => CaptureScope::Unrestricted,
+                None => CaptureScope::from_encoded(Some("")),
+            }
+        })
+    }
+
+    fn capture_scope_allows(path: &str) -> bool {
+        capture_scope().allows(path)
+    }
+
+    fn capture_scope_allows_any(paths: &[&str]) -> bool {
+        capture_scope().allows_any(paths)
+    }
+
+    fn capture_scope_allows_fd(fd: libc::c_int) -> bool {
+        let resolved = dirfd_base_path(fd).and_then(|path| canonical_path(&path).ok());
+        capture_scope().allows_fd_path(resolved.as_deref())
+    }
+
     /// True when the shim is muted via `SHIT_SHIM_DISABLE=1`. Cached
     /// after the first call so the env probe happens once per process.
     pub fn disabled() -> bool {
@@ -577,7 +643,11 @@ mod policy {
         syscall: &'static str,
         arg: &str,
     ) -> Option<PreparedNotification> {
-        if should_skip_path(arg) {
+        let allowed = arg
+            .strip_prefix("fd:")
+            .and_then(|fd| fd.parse::<libc::c_int>().ok())
+            .map_or_else(|| capture_scope_allows(arg), capture_scope_allows_fd);
+        if should_skip_path(arg) || !allowed {
             return None;
         }
         prepare_inner_with_failure(syscall, arg, None, None)
@@ -667,6 +737,9 @@ mod policy {
         resolved: &str,
         failure: Option<shit_proto::ShimFailure>,
     ) -> Option<PreparedNotification> {
+        if failure.is_none() && !capture_scope_allows(resolved) {
+            return None;
+        }
         // A resolution failure is refusal-only. Capturing the unresolved raw
         // spelling could read a different cwd entry and compound the error.
         if failure.is_some() {
@@ -696,10 +769,14 @@ mod policy {
         } else {
             canonicalize_or_raw(path, "path")
         };
+        let resolved_cleanly = resolution_failure.is_none();
         let failure = resolution_failure.or(Some(shit_proto::ShimFailure::UnsupportedOperation {
             attempted_path: resolved.clone(),
             reason,
         }));
+        if resolved_cleanly && (should_skip_path(&resolved) || !capture_scope_allows(&resolved)) {
+            return None;
+        }
         prepare_inner_with_failure(syscall, &resolved, None, failure)
     }
 
@@ -719,10 +796,14 @@ mod policy {
             return None;
         }
         let (resolved, resolution_failure) = resolve_path_at(dirfd, path, "path", preserve_leaf);
+        let resolved_cleanly = resolution_failure.is_none();
         let failure = resolution_failure.or(Some(shit_proto::ShimFailure::UnsupportedOperation {
             attempted_path: resolved.clone(),
             reason,
         }));
+        if resolved_cleanly && (should_skip_path(&resolved) || !capture_scope_allows(&resolved)) {
+            return None;
+        }
         prepare_inner_with_failure(syscall, &resolved, None, failure)
     }
 
@@ -768,6 +849,11 @@ mod policy {
         resolved: String,
         resolution_failure: Option<shit_proto::ShimFailure>,
     ) -> Option<PreparedNotification> {
+        if resolution_failure.is_none()
+            && (should_skip_path(&resolved) || !capture_scope_allows(&resolved))
+        {
+            return None;
+        }
         let _guard = NotifyGuard::enter()?;
         if let Some(failure) = resolution_failure {
             return Some(PreparedNotification {
@@ -825,6 +911,9 @@ mod policy {
         }
         let _guard = NotifyGuard::enter()?;
         let (resolved, failure) = canonicalize_or_raw(path, "path");
+        if failure.is_none() && (should_skip_path(&resolved) || !capture_scope_allows(&resolved)) {
+            return None;
+        }
         if let Some(failure) = failure {
             return Some(PreparedNotification {
                 syscall,
@@ -971,6 +1060,12 @@ mod policy {
     ) -> Option<PreparedNotification> {
         let (from_abs, from_failure) = resolve_path_at(fromfd, from, "from", true);
         let (to_abs, to_failure) = resolve_path_at(tofd, to, "to", true);
+        if from_failure.is_none()
+            && to_failure.is_none()
+            && !capture_scope_allows_any(&[&from_abs, &to_abs])
+        {
+            return None;
+        }
         let arg = format!("{from_abs}\t{to_abs}");
         let failure =
             from_failure
@@ -988,6 +1083,12 @@ mod policy {
         to_abs: &str,
         failure: Option<shit_proto::ShimFailure>,
     ) -> Option<PreparedNotification> {
+        if failure.is_none() && (should_skip_path(from_abs) || should_skip_path(to_abs)) {
+            return None;
+        }
+        if failure.is_none() && !capture_scope_allows_any(&[from_abs, to_abs]) {
+            return None;
+        }
         // W09.8: an exact rename-to-self is a syscall no-op. Do not attempt to
         // infer the same result by separately statting two distinct pathnames:
         // either entry can be replaced between those probes and the eventual
@@ -1264,6 +1365,11 @@ mod policy {
         }
         let _guard = NotifyGuard::enter()?;
         let (resolved, path_failure) = canonicalize_or_raw(path, "path");
+        if path_failure.is_none()
+            && (should_skip_path(&resolved) || !capture_scope_allows(&resolved))
+        {
+            return None;
+        }
         let failure = path_failure.or_else(|| {
             xattr_pre
                 .name
@@ -1328,7 +1434,7 @@ mod policy {
     ) -> Option<PreparedNotification> {
         use std::os::fd::FromRawFd as _;
 
-        if disabled() || should_skip_path(path) {
+        if disabled() || should_skip_path(path) || !capture_scope_allows(path) {
             return None;
         }
         let _guard = NotifyGuard::enter()?;
@@ -1388,7 +1494,7 @@ mod policy {
         path: &str,
         failure: Option<shit_proto::ShimFailure>,
     ) {
-        if should_skip_path(path) {
+        if should_skip_path(path) || (failure.is_none() && !capture_scope_allows(path)) {
             return;
         }
         notify_inner_with_failure(syscall, path, None, failure);
@@ -2253,6 +2359,82 @@ mod policy {
         Unavailable(String),
     }
 
+    /// Capture the lexical target and identity of a symlink without following
+    /// it. A symlink has no readable file-content stream, but its `readlink`
+    /// bytes are the complete payload needed by `CreateSymlink` during undo.
+    ///
+    /// This remains a pathname capture because portable POSIX does not offer a
+    /// descriptor that can be read with `readlink(2)`. Bracketing two target
+    /// reads with metadata probes makes a concurrent replacement fail closed
+    /// instead of combining one link's identity with another link's target.
+    fn capture_symlink_pre_image(path: &str, before: std::fs::Metadata) -> PreImageCapture {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let target_before = match std::fs::read_link(path) {
+            Ok(target) => target,
+            Err(error) => {
+                return PreImageCapture::Unavailable(format!(
+                    "symlink target read failed: {error}"
+                ));
+            }
+        };
+        let middle = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return PreImageCapture::Unavailable(format!(
+                    "symlink metadata recheck failed: {error}"
+                ));
+            }
+        };
+        let target_after = match std::fs::read_link(path) {
+            Ok(target) => target,
+            Err(error) => {
+                return PreImageCapture::Unavailable(format!(
+                    "symlink target recheck failed: {error}"
+                ));
+            }
+        };
+        let after = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return PreImageCapture::Unavailable(format!(
+                    "post-read symlink metadata probe failed: {error}"
+                ));
+            }
+        };
+
+        if !middle.file_type().is_symlink()
+            || !after.file_type().is_symlink()
+            || !metadata_is_stable(&before, &middle, 0, 0)
+            || !metadata_is_stable(&middle, &after, 0, 0)
+            || target_before != target_after
+        {
+            return PreImageCapture::Unavailable(
+                "symlink changed while its lexical target was being captured".to_string(),
+            );
+        }
+
+        let target = target_before.as_os_str().as_bytes().to_vec();
+        PreImageCapture::Captured(shit_proto::ShimPreImage {
+            path: path.to_string(),
+            dev: before.dev(),
+            inode: before.ino(),
+            mode: before.mode(),
+            uid: before.uid(),
+            gid: before.gid(),
+            size: target.len() as u64,
+            mtime_unix_nanos: before.mtime() as i128 * 1_000_000_000 + before.mtime_nsec() as i128,
+            bytes: target,
+            xattr: None,
+            // Symlink recreation currently restores the lexical target, not
+            // inode flags or xattrs. Keep those fields explicitly empty
+            // rather than following the referent to fabricate metadata.
+            flags: 0,
+            xattrs: Some(std::collections::BTreeMap::new()),
+        })
+    }
+
     /// Capture `path` from one descriptor opened without following the final
     /// symlink. Metadata and bytes must describe that same open file: path
     /// probes before/after a separate `std::fs::read` can otherwise combine
@@ -2404,13 +2586,44 @@ mod policy {
     /// produced. `None, None` is reserved for a genuinely absent path, which
     /// is the only shape callers may classify as a fresh destination/create.
     pub(super) fn capture_pre_image_or_failure(
-        _syscall: &'static str,
+        syscall: &'static str,
         path: &str,
     ) -> (
         Option<shit_proto::ShimPreImage>,
         Option<shit_proto::ShimFailure>,
     ) {
-        match capture_pre_image(path) {
+        // Namespace-deletion syscalls can represent a symlink completely as
+        // (identity, lexical target), and the daemon maps that marker to
+        // SymlinkRemovedIdentified. Do not enable this for rename destination
+        // pre-images: restoring an overwritten symlink is a distinct compound
+        // inverse and must remain a refusal until that shape is modeled.
+        //
+        // For non-symlinks (and a racy initial ENOENT), let the nofollow open
+        // below make the authoritative absent/captured decision. A concurrent
+        // creator must not be mistaken for a fresh path and later unlinked by
+        // undo.
+        let capture = if matches!(syscall, "unlink" | "unlinkat" | "remove") {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    capture_symlink_pre_image(path, metadata)
+                }
+                Ok(metadata) if metadata.file_type().is_file() => capture_pre_image(path),
+                Ok(metadata) => {
+                    use std::os::unix::fs::MetadataExt as _;
+                    PreImageCapture::Unavailable(format!(
+                        "deletion target is not a regular file or symlink (mode={:#o})",
+                        metadata.mode()
+                    ))
+                }
+                // A failed lstat is not authoritative: the nofollow open can
+                // still distinguish a genuine absence from a transient path
+                // lookup failure without ever following the final component.
+                Err(_) => capture_pre_image(path),
+            }
+        } else {
+            capture_pre_image(path)
+        };
+        match capture {
             PreImageCapture::Captured(pre_image) => (Some(pre_image), None),
             PreImageCapture::Absent => (None, None),
             PreImageCapture::Unavailable(reason) => (
@@ -2549,6 +2762,56 @@ mod policy {
         use super::*;
 
         #[test]
+        fn install_scope_excludes_build_churn_and_keeps_targets() {
+            let scope = CaptureScope::from_encoded(Some(
+                "/usr/local:/Users/u/Library/Python:/Users/u/.cargo/bin",
+            ));
+
+            assert!(scope.allows("/Users/u/Library/Python/3.14/bin/tool"));
+            assert!(scope.allows("/Users/u/Library/Python/3.14/lib/python/site-packages/pkg.py"));
+            assert!(!scope.allows("/private/tmp/pip-build/wheel/pkg.py"));
+            assert!(!scope.allows("/Users/u/src/pkg/build/lib/pkg.py"));
+        }
+
+        #[test]
+        fn install_scope_keeps_cross_boundary_rename() {
+            let scope = CaptureScope::from_encoded(Some("/Users/u/Library/Python"));
+
+            assert!(scope.allows_any(&[
+                "/private/tmp/pip-build/pkg.py",
+                "/Users/u/Library/Python/3.14/lib/python/site-packages/pkg.py",
+            ]));
+            assert!(scope.allows_any(&[
+                "/Users/u/Library/Python/3.14/lib/python/site-packages/pkg.py",
+                "/private/tmp/pip-old/pkg.py",
+            ]));
+            assert!(!scope.allows_any(&["/private/tmp/pip-build/a", "/private/tmp/pip-build/b",]));
+        }
+
+        #[test]
+        fn absent_scope_is_legacy_unrestricted_but_empty_scope_denies_all() {
+            let unrestricted = CaptureScope::from_encoded(None);
+            assert!(unrestricted.allows("/any/user/path"));
+
+            let empty = CaptureScope::from_encoded(Some(""));
+            assert!(!empty.allows("/usr/local/bin/tool"));
+        }
+
+        #[test]
+        fn install_scope_filters_known_fd_paths_but_retains_unresolved_fds() {
+            let scope = CaptureScope::from_encoded(Some("/Users/u/Library/Python"));
+
+            assert!(scope.allows_fd_path(Some(
+                "/Users/u/Library/Python/3.14/lib/python/site-packages/pkg.py"
+            )));
+            assert!(!scope.allows_fd_path(Some("/private/tmp/pip-build/pkg.py")));
+            assert!(
+                scope.allows_fd_path(None),
+                "an unresolved fd cannot be proven out of install scope"
+            );
+        }
+
+        #[test]
         fn recursive_payload_budget_reserves_large_frame_overhead() {
             let payload_budget = shit_proto::SHIM_INLINE_PREIMAGE_CAP
                 + XATTR_CAPTURE_CAP as u64
@@ -2608,26 +2871,47 @@ mod policy {
         }
 
         #[test]
-        fn non_regular_and_symlink_targets_are_explicit_refusals() {
-            use std::os::unix::fs::symlink;
-
+        fn non_regular_targets_are_explicit_refusals() {
             let tmp = tempfile::tempdir().expect("tempdir");
             let directory = tmp.path().join("directory");
             std::fs::create_dir(&directory).expect("create directory");
+
+            let (pre_image, failure) = capture_pre_image_or_failure(
+                "unlink",
+                directory.to_str().expect("UTF-8 temp path"),
+            );
+            assert!(pre_image.is_none());
+            assert!(matches!(
+                failure,
+                Some(shit_proto::ShimFailure::PreImageUnavailable { .. })
+            ));
+        }
+
+        #[test]
+        fn symlink_target_is_captured_lexically_without_following() {
+            use std::os::unix::fs::{MetadataExt as _, symlink};
+
+            let tmp = tempfile::tempdir().expect("tempdir");
             let target = tmp.path().join("target");
             let link = tmp.path().join("link");
             std::fs::write(&target, b"target").expect("write symlink target");
-            symlink(&target, &link).expect("create symlink");
+            symlink("target", &link).expect("create relative symlink");
 
-            for path in [&directory, &link] {
-                let (pre_image, failure) =
-                    capture_pre_image_or_failure("unlink", path.to_str().expect("UTF-8 temp path"));
-                assert!(pre_image.is_none());
-                assert!(matches!(
-                    failure,
-                    Some(shit_proto::ShimFailure::PreImageUnavailable { .. })
-                ));
-            }
+            let (pre_image, failure) =
+                capture_pre_image_or_failure("unlink", link.to_str().expect("UTF-8 temp path"));
+            let pre_image = pre_image.expect("symlink deletion marker");
+            assert!(failure.is_none());
+            assert_eq!(pre_image.bytes, b"target");
+            assert_eq!(pre_image.mode & libc::S_IFMT as u32, libc::S_IFLNK as u32);
+            assert_ne!(pre_image.inode, std::fs::metadata(&target).unwrap().ino());
+
+            let (rename_pre_image, rename_failure) =
+                capture_pre_image_or_failure("rename", link.to_str().expect("UTF-8 temp path"));
+            assert!(rename_pre_image.is_none());
+            assert!(matches!(
+                rename_failure,
+                Some(shit_proto::ShimFailure::PreImageUnavailable { .. })
+            ));
         }
 
         #[test]

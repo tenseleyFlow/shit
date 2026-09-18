@@ -8,21 +8,10 @@
 # EXCLUDED_BY: 
 # EXCLUDED_REASON: 
 #
-# AR03.6 / DR-CR-53 smoke — `docker compose down; shit undo` brings
-# the project back up via `docker compose up -d`.
-#
-# Exercises:
-#   1. Helper's prepare_compose_down: from a `docker compose down`
-#      invocation through the docker-wrapper (v2 plugin form), packs
-#      project + compose_file into extras. The classifier handles
-#      both `docker compose ...` (via the docker wrapper's fall-
-#      through to classify_compose_argv) and `docker-compose ...`
-#      (v1 standalone via docker-compose-wrapper).
-#   2. Daemon container_track handler builds ContainerOp::ComposeDown
-#      from the extras.
-#   3. Executor's apply_compose_down runs `docker compose -f <file>
-#      -p <project> up -d`.
-#   4. Both services come back up post-undo.
+# AR03.6 / DR-CR-53 fail-closed smoke. Compose-down is outside the
+# current atomic capture policy, so the wrapper must exit 125 before
+# invoking the real runtime. Both services must remain running, and
+# the command must not own a CONFIRMED container capture batch.
 #
 # Uses the v2 plugin form via docker-wrapper (which is what ships on
 # ubuntu-24.04). Tests the docker-compose-wrapper path separately
@@ -82,7 +71,14 @@ docker pull busybox:1.36 >/dev/null 2>&1 || smoke_fail "docker pull busybox fail
 cleanup_compose() {
     SHIT_DURING_UNDO=1 docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" down >/dev/null 2>&1 || true
 }
-trap 'cleanup_compose' EXIT
+
+cleanup_on_exit() {
+    local rc=$?
+    trap - EXIT
+    cleanup_compose
+    smoke_cleanup "${rc}"
+}
+trap cleanup_on_exit EXIT
 
 smoke_log "starting compose project=${PROJECT_NAME} file=${COMPOSE_FILE}"
 ( cd "${PROJECT_DIR}" && docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" up -d ) \
@@ -90,7 +86,7 @@ smoke_log "starting compose project=${PROJECT_NAME} file=${COMPOSE_FILE}"
     || smoke_fail "docker compose up failed"
 
 # Sanity: both services running.
-running_count_pre="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" ps --status running --format json 2>/dev/null | grep -c '"State"' || true)"
+running_count_pre="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" ps --services --status running 2>/dev/null | wc -l | tr -d '[:space:]')"
 if [ "${running_count_pre}" -lt 2 ]; then
     smoke_fail "expected 2 running services pre-down, got ${running_count_pre}"
 fi
@@ -119,49 +115,43 @@ smoke_log "PreExec seq=1 pid=${PID}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "${PROJECT_DIR}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} down (via wrapper)"
+smoke_log "docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} down (expected fail-closed refusal)"
 export SHIT_HOOK_DEBUG=1
-if ! ( cd "${PROJECT_DIR}" && docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" down ) \
-    >"${SHIT_SMOKE_TMP}/down.log" 2>&1; then
-    smoke_log "down.log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/down.log" >&2
-    smoke_fail "docker compose down exited non-zero"
-fi
-smoke_log "down.log (informational; down succeeded):"
+set +e
+( cd "${PROJECT_DIR}" && docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" down ) \
+    >"${SHIT_SMOKE_TMP}/down.log" 2>&1
+down_rc=$?
+set -e
+smoke_log "down.log (expected refusal):"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/down.log" >&2
-
-# Confirm services are gone.
-running_count_post_down="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" ps --status running --format json 2>/dev/null | grep -c '"State"' || true)"
-if [ "${running_count_post_down}" -ne 0 ]; then
-    smoke_fail "expected 0 running services post-down, got ${running_count_post_down}"
+if [ "${down_rc}" -ne 125 ]; then
+    smoke_fail "expected docker compose down wrapper to exit 125, got ${down_rc}"
 fi
 
-smoke_log "PostExec seq=1"
-"${SHIT_BIN}" hook-send post-exec \
-    --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
-
-smoke_wait_for_event "discriminant = 'ContainerOp'" 1 10
-
-smoke_log "running: shit undo --yes"
-"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_fail "shit undo --yes exited non-zero"
-}
-
-# Post-undo: both services back up.
-running_count_post_undo="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" ps --status running --format json 2>/dev/null | grep -c '"State"' || true)"
-if [ "${running_count_post_undo}" -lt 2 ]; then
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+# The real runtime must never have stopped the project.
+running_count_after_refusal="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" ps --services --status running 2>/dev/null | wc -l | tr -d '[:space:]')"
+if [ "${running_count_after_refusal}" -lt 2 ]; then
     smoke_log "ps output:"
     docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" ps 2>&1 | sed 's/^/    /' >&2
-    smoke_fail "expected 2 running services post-undo, got ${running_count_post_undo}"
+    smoke_fail "compose project changed despite refusal: ${running_count_after_refusal} service(s) running"
 fi
-smoke_log "post-undo: ${running_count_post_undo} services running (compose project restored)"
+smoke_log "compose project remained intact with ${running_count_after_refusal} services running"
+
+smoke_log "PostExec seq=1 exit=${down_rc}"
+"${SHIT_BIN}" hook-send post-exec \
+    --session "${SESSION}" --seq 1 --exit-code "${down_rc}" --sock "${SHIT_HOOK_SOCK}"
+
+SESSION_HEX="${SESSION//-/}"
+if ! actionable_batches="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batches WHERE session = X'${SESSION_HEX}' AND seq = 1 AND state IN ('CONFIRMED', 'FINALIZED');" 2>/dev/null)"; then
+    smoke_fail "could not query container_capture_batches"
+fi
+if [ "${actionable_batches:-0}" -ne 0 ]; then
+    smoke_fail "unsupported docker compose down produced ${actionable_batches} actionable batch(es)"
+fi
+smoke_log "actionable container batches: 0"
 
 smoke_log "session close"
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: docker-compose-down-undo-linux (${PROJECT_NAME} restored via shit undo)"
+smoke_log "PASS: docker-compose-down-undo-linux (exit 125; ${PROJECT_NAME} intact; no actionable batch)"

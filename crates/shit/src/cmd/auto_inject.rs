@@ -20,6 +20,7 @@
 //!   LD_PRELOAD='/usr/local/lib/shit/libshit_preload_shim.so'
 //!   SHIT_PRELOAD_ACTIVE='1'
 //!   SHIT_DAEMON_SOCK='/var/run/shit/daemon.sock'
+//!   SHIT_INSTALL_PREFIXES='/usr/local:/home/user/.local'
 //!   ```
 //!
 //! - `--shell fish`: fish-syntax env assignments. The hook wraps the
@@ -30,6 +31,7 @@
 //!   own command-runner harness for tests).
 
 use clap::{Args, ValueEnum};
+use shit_preload_shim::dispatch::SHIT_INSTALL_PREFIXES_ENV;
 use shit_preload_shim::install_pattern::{InstallPattern, classify_install_argv};
 use shit_preload_shim::runtime::{
     DYLD_INSERT_LIBRARIES_ENV, LD_PRELOAD_ENV, SHIT_DAEMON_SOCK_ENV, SHIT_PRELOAD_ACTIVE_ENV,
@@ -87,7 +89,9 @@ pub fn run(args: AutoInjectArgs) -> Result<(), CliError> {
         .sock
         .clone()
         .unwrap_or_else(default_sock_path_for_render);
-    let assignments = build_assignments(&lib, &sock);
+    let prefixes = super::install::resolve_install_prefixes()?;
+    let prefixes = super::install::encode_install_prefixes(&prefixes)?;
+    let assignments = build_assignments(&lib, &sock, &prefixes);
     if args.json {
         render_json(pattern, &assignments)?;
     } else {
@@ -120,7 +124,7 @@ fn default_sock_path_for_render() -> String {
         .to_string()
 }
 
-fn build_assignments(lib: &str, sock: &str) -> Vec<(&'static str, String)> {
+fn build_assignments(lib: &str, sock: &str, prefixes: &str) -> Vec<(&'static str, String)> {
     let preload_env = if cfg!(target_os = "macos") {
         DYLD_INSERT_LIBRARIES_ENV
     } else {
@@ -130,6 +134,7 @@ fn build_assignments(lib: &str, sock: &str) -> Vec<(&'static str, String)> {
         (preload_env, lib.to_string()),
         (SHIT_PRELOAD_ACTIVE_ENV, "1".to_string()),
         (SHIT_DAEMON_SOCK_ENV, sock.to_string()),
+        (SHIT_INSTALL_PREFIXES_ENV, prefixes.to_string()),
     ]
 }
 
@@ -200,9 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn build_assignments_contains_all_three_vars() {
-        let a = build_assignments("/lib.so", "/sock");
-        assert_eq!(a.len(), 3);
+    fn build_assignments_contains_loader_runtime_and_scope_vars() {
+        let a = build_assignments("/lib.so", "/sock", "/usr/local:/home/u/.local");
+        assert_eq!(a.len(), 4);
         let names: Vec<&str> = a.iter().map(|(k, _)| *k).collect();
         if cfg!(target_os = "macos") {
             assert!(names.contains(&DYLD_INSERT_LIBRARIES_ENV));
@@ -211,6 +216,13 @@ mod tests {
         }
         assert!(names.contains(&SHIT_PRELOAD_ACTIVE_ENV));
         assert!(names.contains(&SHIT_DAEMON_SOCK_ENV));
+        assert!(names.contains(&SHIT_INSTALL_PREFIXES_ENV));
+        assert_eq!(
+            a.iter()
+                .find(|(name, _)| *name == SHIT_INSTALL_PREFIXES_ENV)
+                .map(|(_, value)| value.as_str()),
+            Some("/usr/local:/home/u/.local")
+        );
     }
 
     #[test]

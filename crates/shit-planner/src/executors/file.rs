@@ -29,7 +29,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::executor::{
     BlobReader, ConflictPolicy, ExecutionOutcome, InverseOpExecutor, NoOpPrivilegedOpRouter,
@@ -74,6 +74,10 @@ pub struct FileExecutor<'a, R: BlobReader, P: PrivilegedOpRouter = NoOpPrivilege
     /// from turning provenance into authority over an unrelated object. A
     /// dry-run records only a projected replacement marker.
     restored_targets: Mutex<HashMap<(PathBuf, InodeRef), RestoredTarget>>,
+    /// Validated content bytes pinned for one plan. RestoreContent execution
+    /// uses these bytes so blob GC/corruption after preflight cannot turn a
+    /// previously valid later node into a partial-undo failure.
+    preflighted_blobs: Mutex<HashMap<BlobHash, Arc<[u8]>>>,
 }
 
 enum RestoredTarget {
@@ -95,6 +99,7 @@ impl<'a, R: BlobReader> FileExecutor<'a, R, NoOpPrivilegedOpRouter> {
             blob_reader,
             privileged_router: NoOpPrivilegedOpRouter,
             restored_targets: Mutex::new(HashMap::new()),
+            preflighted_blobs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -107,6 +112,7 @@ impl<'a, R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'a, R, P> {
             blob_reader,
             privileged_router,
             restored_targets: Mutex::new(HashMap::new()),
+            preflighted_blobs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -116,12 +122,25 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
         if let Ok(mut provenance) = self.restored_targets.lock() {
             provenance.clear();
         }
+        if let Ok(mut blobs) = self.preflighted_blobs.lock() {
+            blobs.clear();
+        }
     }
 
     fn finish_plan_execution(&self) {
         if let Ok(mut provenance) = self.restored_targets.lock() {
             provenance.clear();
         }
+        if let Ok(mut blobs) = self.preflighted_blobs.lock() {
+            blobs.clear();
+        }
+    }
+
+    fn preflight(&self, op: &InverseOp) -> Result<(), String> {
+        if let InverseOp::RestoreContent { path, blob, .. } = op {
+            self.preflight_restore_content(path, blob)?;
+        }
+        Ok(())
     }
 
     fn supports(&self, op: &InverseOp) -> bool {
@@ -205,10 +224,53 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         }
     }
 
-    fn validate_restore_content(&self, path: &Path, blob: &BlobHash) -> Result<(), String> {
-        self.blob_reader
+    fn preflight_restore_content(&self, path: &Path, blob: &BlobHash) -> Result<(), String> {
+        self.validate_restore_target(path)?;
+        {
+            let blobs = self
+                .preflighted_blobs
+                .lock()
+                .map_err(|_| "file preflight blob cache lock poisoned".to_string())?;
+            if blobs.contains_key(blob) {
+                return Ok(());
+            }
+        }
+
+        let bytes = self
+            .blob_reader
             .read(blob)
             .map_err(|e| format!("blob read for {path:?}: {e}"))?;
+        self.preflighted_blobs
+            .lock()
+            .map_err(|_| "file preflight blob cache lock poisoned".to_string())?
+            .insert(*blob, Arc::from(bytes));
+        Ok(())
+    }
+
+    /// Prefer bytes pinned by whole-plan preflight. Direct executor callers
+    /// that do not use lifecycle hooks retain the historical live-read path.
+    fn preflighted_or_live_blob(&self, path: &Path, blob: &BlobHash) -> Result<Arc<[u8]>, String> {
+        if let Some(bytes) = self
+            .preflighted_blobs
+            .lock()
+            .map_err(|_| "file preflight blob cache lock poisoned".to_string())?
+            .get(blob)
+            .cloned()
+        {
+            return Ok(bytes);
+        }
+        self.blob_reader
+            .read(blob)
+            .map(Arc::from)
+            .map_err(|e| format!("blob read for {path:?}: {e}"))
+    }
+
+    fn validate_restore_content(&self, path: &Path, blob: &BlobHash) -> Result<(), String> {
+        self.preflighted_or_live_blob(path, blob)?;
+        self.validate_restore_target(path)
+    }
+
+    fn validate_restore_target(&self, path: &Path) -> Result<(), String> {
         let parent = path
             .parent()
             .ok_or_else(|| format!("path {path:?} has no parent dir; cannot place tmpfile"))?;
@@ -239,10 +301,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
     /// limitation; the hardlink path lands in stage 2 (gated on
     /// integration with the live state probe — S11.6/11.7).
     fn restore_content_inner(&self, path: &Path, blob: &BlobHash) -> Result<File, String> {
-        let bytes = self
-            .blob_reader
-            .read(blob)
-            .map_err(|e| format!("blob read for {path:?}: {e}"))?;
+        let bytes = self.preflighted_or_live_blob(path, blob)?;
 
         let parent = path
             .parent()
@@ -274,7 +333,7 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                 .create_new(true)
                 .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
                 .open(&tmp_path)?;
-            f.write_all(&bytes)?;
+            f.write_all(bytes.as_ref())?;
             f.sync_all()?;
             Ok(f)
         })();

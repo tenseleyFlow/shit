@@ -74,6 +74,16 @@ impl EnvPreStash {
         g.remove(&key)
     }
 
+    /// Whether a command still needs its post-command environment snapshot.
+    /// PostExec uses this as a conservative compatibility check for older
+    /// shell hooks that sent their close notification before PostExecEnv.
+    pub fn contains(&self, key: CommandId) -> bool {
+        self.inner
+            .lock()
+            .map(|stash| stash.contains_key(&key))
+            .unwrap_or(true)
+    }
+
     /// Drop entries older than `PRE_STASH_TTL`. Returns the number
     /// evicted.
     pub fn sweep_expired(&self) -> usize {
@@ -115,6 +125,10 @@ pub enum PostOutcome {
         removed: usize,
         modified: usize,
     },
+    /// A non-empty diff existed, but its event could not be made durable.
+    /// The caller must persist a command-scoped refusal or leave the command
+    /// open; treating this as `Changed` would publish partial capture.
+    JournalFailed(String),
 }
 
 /// Handle a PreExecEnv message: stash the pre-block.
@@ -187,8 +201,19 @@ pub fn handle_post(
         partial: false,
         kind,
     };
-    match index.put_event(&ev) {
-        Ok(eid) => tracing::info!(
+    let eid = match index.put_event(&ev) {
+        Ok(eid) => eid,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                session = %key.session,
+                seq = key.seq,
+                "env-post journal write failed"
+            );
+            return PostOutcome::JournalFailed(e.to_string());
+        }
+    };
+    tracing::info!(
             session = %key.session,
             seq = key.seq,
             %eid,
@@ -196,14 +221,7 @@ pub fn handle_post(
             removed = diff.removed.len(),
             modified = diff.modified.len(),
             "env-post journaled (DR-32)"
-        ),
-        Err(e) => tracing::warn!(
-            err = %e,
-            session = %key.session,
-            seq = key.seq,
-            "env-post journal write failed"
-        ),
-    }
+    );
     PostOutcome::Changed {
         pre_hash: pre.env_hash,
         post_hash,
@@ -254,8 +272,10 @@ mod tests {
         let stash = EnvPreStash::new();
         let block = b"FOO=bar\0BAZ=qux".to_vec();
         handle_pre(&stash, cid(), block.clone());
+        assert!(stash.contains(cid()));
         let outcome = handle_post(&stash, cid(), &block, &EnvFilter::default(), &idx);
         assert_eq!(outcome, PostOutcome::Unchanged);
+        assert!(!stash.contains(cid()));
         assert_eq!(stash.len(), 0, "Post drains the stash");
         // No event journaled.
         assert_eq!(idx.events_for_command(cid()).len(), 0);
@@ -309,6 +329,28 @@ mod tests {
         let outcome = handle_post(&stash, cid(), b"FOO=bar", &EnvFilter::default(), &idx);
         assert_eq!(outcome, PostOutcome::Orphan);
         assert_eq!(idx.events_for_command(cid()).len(), 0);
+    }
+
+    #[test]
+    fn changed_post_reports_journal_failure() {
+        let (_tmp, idx) = fixture();
+        idx.conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_env_diff
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'EnvDiff'
+                 BEGIN SELECT RAISE(FAIL, 'injected env failure'); END;",
+            )
+            .unwrap();
+        let stash = EnvPreStash::new();
+        handle_pre(&stash, cid(), b"FOO=old".to_vec());
+        let outcome = handle_post(&stash, cid(), b"FOO=new", &EnvFilter::default(), &idx);
+        assert!(
+            matches!(outcome, PostOutcome::JournalFailed(ref detail) if detail.contains("injected env failure"))
+        );
+        assert!(idx.events_for_command(cid()).is_empty());
     }
 
     #[test]

@@ -11,6 +11,7 @@
 use shit_proto::ShellKind;
 use std::path::{Path, PathBuf};
 
+pub mod container_wrappers;
 pub mod redirect;
 pub mod snippet;
 pub mod state;
@@ -164,6 +165,193 @@ mod tests {
         assert!(body.contains("/tmp/shit-1000.sock"));
         assert!(!body.contains("@@SHIT_BIN@@"));
         assert!(!body.contains("@@SHIT_SOCK@@"));
+    }
+
+    #[test]
+    fn post_capture_messages_precede_command_close_in_every_template() {
+        let params = InstallParams {
+            shit_bin: PathBuf::from("/usr/local/bin/shit"),
+            socket_path: PathBuf::from("/tmp/shit.sock"),
+        };
+        for shell in [ShellKind::Bash, ShellKind::Zsh, ShellKind::Fish] {
+            let body = render_template(shell, &params).unwrap();
+            let post_shell = body
+                .find("hook-send post-exec-shell-state")
+                .expect("post shell-state capture");
+            let post_env = body
+                .find("hook-send post-exec-env")
+                .expect("post env capture");
+            let close = body
+                .find("hook-send post-exec \\")
+                .expect("PostExec close message");
+            assert!(
+                post_shell < close,
+                "{shell:?}: shell state must precede close"
+            );
+            assert!(post_env < close, "{shell:?}: env must precede close");
+            assert!(
+                body.contains("_SHIT_PREPARED_SEQ"),
+                "{shell:?}: hook failures must gate close"
+            );
+            assert!(
+                body.contains("_SHIT_PREPARED_SEQ=-1") || body.contains("_SHIT_PREPARED_SEQ -1"),
+                "{shell:?}: startup prompt must not close synthetic sequence zero"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_prestash_is_ordered_and_uses_the_live_command_in_every_template() {
+        let params = InstallParams {
+            shit_bin: PathBuf::from("/usr/local/bin/shit"),
+            socket_path: PathBuf::from("/tmp/shit.sock"),
+        };
+        for shell in [ShellKind::Bash, ShellKind::Zsh, ShellKind::Fish] {
+            let body = render_template(shell, &params).unwrap();
+            let pre_exec = body
+                .find("hook-send pre-exec \\")
+                .expect("PreExec command open");
+            let shell_state = body
+                .find("hook-send pre-exec-shell-state")
+                .expect("pre-command shell state");
+            let redirects = body
+                .find("hook-send pre-exec-redirects")
+                .expect("synchronous redirect pre-stash");
+            let prepared = match shell {
+                ShellKind::Bash | ShellKind::Zsh => body
+                    .find("_SHIT_PREPARED_SEQ=$_SHIT_SEQ")
+                    .expect("prepared close marker"),
+                ShellKind::Fish => body
+                    .find("set _SHIT_PREPARED_SEQ $_SHIT_SEQ")
+                    .expect("prepared close marker"),
+                ShellKind::Unknown => unreachable!(),
+            };
+            assert!(
+                pre_exec < shell_state && shell_state < redirects && redirects < prepared,
+                "{shell:?}: redirect pre-stash must run after command open and before execution is marked prepared"
+            );
+
+            let redirect_call = &body[redirects..body.len().min(redirects + 400)];
+            let (seq, cmdline) = match shell {
+                ShellKind::Bash => ("--seq \"$_SHIT_SEQ\"", "--cmdline \"$BASH_COMMAND\""),
+                ShellKind::Zsh => ("--seq \"$_SHIT_SEQ\"", "--cmdline \"${1:-}\""),
+                ShellKind::Fish => ("--seq $_SHIT_SEQ", "--cmdline \"$_shit_cmdline\""),
+                ShellKind::Unknown => unreachable!(),
+            };
+            assert!(
+                redirect_call.contains(seq),
+                "{shell:?}: redirect request must use the current command sequence"
+            );
+            assert!(
+                redirect_call.contains(cmdline),
+                "{shell:?}: redirect request must preserve the shell's live command text"
+            );
+        }
+    }
+
+    #[test]
+    fn companion_failure_is_recovered_before_any_later_sequence() {
+        let params = InstallParams {
+            shit_bin: PathBuf::from("/definitely/missing/shit"),
+            socket_path: PathBuf::from("/tmp/shit.sock"),
+        };
+        for shell in [ShellKind::Bash, ShellKind::Zsh, ShellKind::Fish] {
+            let body = render_template(shell, &params).unwrap();
+            let redirect = body
+                .find("hook-send pre-exec-redirects")
+                .expect("redirect pre-stash call");
+            let prepared = match shell {
+                ShellKind::Bash | ShellKind::Zsh => body
+                    .find("_SHIT_PREPARED_SEQ=$_SHIT_SEQ")
+                    .expect("prepared close marker"),
+                ShellKind::Fish => body
+                    .find("set _SHIT_PREPARED_SEQ $_SHIT_SEQ")
+                    .expect("prepared close marker"),
+                ShellKind::Unknown => unreachable!(),
+            };
+            let failure_path = &body[redirect..prepared];
+            match shell {
+                ShellKind::Bash | ShellKind::Zsh => {
+                    assert!(failure_path.contains("__shit_mark_failed"));
+                    assert!(failure_path.contains("return 0"));
+                    assert!(!failure_path.contains("|| true"));
+                }
+                ShellKind::Fish => {
+                    assert!(failure_path.contains("__shit_mark_failed"));
+                    assert!(failure_path.contains("return 0"));
+                    assert!(!failure_path.contains("or true"));
+                }
+                ShellKind::Unknown => unreachable!(),
+            }
+
+            assert!(
+                body.contains("hook-send refuse-and-close"),
+                "{shell:?}: failures need a synchronous durable close path"
+            );
+            assert!(
+                body.contains("_SHIT_FAILED_SEQ"),
+                "{shell:?}: a failed sequence must survive across prompt cycles"
+            );
+
+            let recovery_call = body
+                .find("__shit_refuse_and_close_failed")
+                .expect("recovery helper definition");
+            let pre_increment = match shell {
+                ShellKind::Bash | ShellKind::Zsh => {
+                    body.find("_SHIT_SEQ=$((").expect("sequence increment")
+                }
+                ShellKind::Fish => body
+                    .find("set _SHIT_SEQ (math")
+                    .expect("sequence increment"),
+                ShellKind::Unknown => unreachable!(),
+            };
+            assert!(
+                recovery_call < pre_increment,
+                "{shell:?}: recovery must be available before a new sequence opens"
+            );
+        }
+    }
+
+    #[test]
+    fn session_and_sequence_are_exported_to_mutating_descendants() {
+        let params = InstallParams {
+            shit_bin: PathBuf::from("/usr/local/bin/shit"),
+            socket_path: PathBuf::from("/tmp/shit.sock"),
+        };
+        let bash = render_template(ShellKind::Bash, &params).unwrap();
+        assert!(bash.contains("export _SHIT_SESSION"));
+        assert!(bash.contains("export _SHIT_SEQ=0"));
+
+        let zsh = render_template(ShellKind::Zsh, &params).unwrap();
+        assert!(zsh.contains("export _SHIT_SESSION"));
+        assert!(zsh.contains("export _SHIT_SEQ"));
+
+        let fish = render_template(ShellKind::Fish, &params).unwrap();
+        assert!(fish.contains("set -gx _SHIT_SESSION"));
+        assert!(fish.contains("set -gx _SHIT_SEQ"));
+    }
+
+    #[test]
+    fn every_template_activates_the_wrapper_directory_on_path() {
+        let params = InstallParams {
+            shit_bin: PathBuf::from("/usr/local/bin/shit"),
+            socket_path: PathBuf::from("/tmp/shit.sock"),
+        };
+        for shell in [ShellKind::Bash, ShellKind::Zsh, ShellKind::Fish] {
+            let body = render_template(shell, &params).unwrap();
+            assert!(
+                body.contains("_SHIT_HOOK_BIN_DIR"),
+                "{shell:?}: wrapper directory variable missing"
+            );
+            assert!(
+                body.contains("shit/bin"),
+                "{shell:?}: wrapper directory is not constructed"
+            );
+            assert!(
+                body.contains("PATH"),
+                "{shell:?}: wrapper directory is not activated"
+            );
+        }
     }
 
     #[test]

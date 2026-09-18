@@ -8,25 +8,10 @@
 # EXCLUDED_BY: 
 # EXCLUDED_REASON: 
 #
-# AR10.9 / AR03.1 smoke — `docker rm -f <container>; shit undo`
-# restores the container with its image + name + env + ports + mounts
-# + restart policy preserved.
-#
-# This is the marquee test for the full Rm reverse-synthesis path
-# (DR-CR-22). Validates:
-#   1. Helper's prepare_rm: `docker inspect` → captured_config JSON,
-#      detects .State.Running, `docker commit` to a `shit-stash-*`
-#      tag so in-place rootfs writes round-trip.
-#   2. Daemon ingests via container_track::handle (no tarball stash;
-#      captured_config carries the JSON, stash_image carries the
-#      commit tag).
-#   3. Executor's apply_rm: parses inspect JSON, verifies stash
-#      image exists, walks ~15 options through synthesize_container_run,
-#      and runs `docker run -d --name ... -p ... -e ... -v ... <stash>`.
-#   4. The restored container has the same effective config (name,
-#      image-source = stash, env vars, port bindings, mounts, restart
-#      policy) AND any in-place rootfs writes the user made before
-#      the rm.
+# AR10.9 / AR03.1 fail-closed smoke. Container removal is not in the
+# atomic capture policy yet, so the wrapper must refuse `docker rm`
+# before invoking the real runtime. This pins exit 125, proves the
+# container/rootfs remain intact, and rejects any actionable batch.
 #
 # Skips cleanly when docker isn't available. ubuntu-24.04 hosted
 # runners have docker.
@@ -65,16 +50,20 @@ ROOTFS_PROBE="rootfs-probe-content-$(date +%s)"
 cleanup_container() {
     SHIT_DURING_UNDO=1 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
     SHIT_DURING_UNDO=1 docker volume rm "${VOL_NAME}" >/dev/null 2>&1 || true
-    # Clean up any shit-stash-* images this run created.
-    SHIT_DURING_UNDO=1 docker images --filter "reference=shit-stash-*" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-        | xargs -r docker rmi -f 2>/dev/null || true
 }
-trap 'cleanup_container' EXIT
+
+cleanup_on_exit() {
+    local rc=$?
+    trap - EXIT
+    cleanup_container
+    smoke_cleanup "${rc}"
+}
+trap cleanup_on_exit EXIT
 
 # Pre-state: launch a realistic container — busybox (small) with a
 # port binding, an env var, a named volume mount, and a restart policy.
-# Then write a probe file to the rootfs so we can validate the stash-
-# commit preserves in-place writes.
+# Then write a probe file to the rootfs so refusal can prove the real
+# runtime never mutated the container.
 smoke_log "creating volume ${VOL_NAME}"
 docker volume create "${VOL_NAME}" >/dev/null \
     || smoke_fail "docker volume create failed"
@@ -95,8 +84,8 @@ docker run -d \
     >/dev/null \
     || smoke_fail "docker run failed"
 
-# In-place rootfs write so we can prove the stash-commit captures it
-# (the original busybox image doesn't have this file).
+# In-place rootfs write gives the refusal check an identity probe that
+# the original busybox image does not contain.
 docker exec "${CONTAINER_NAME}" sh -c "echo '${ROOTFS_PROBE}' > /tmp/rootfs-probe.txt" \
     || smoke_fail "docker exec write failed"
 
@@ -138,92 +127,44 @@ smoke_log "PreExec seq=1 pid=${PID}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "$(pwd)" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "docker rm -f ${CONTAINER_NAME} (via wrapper)"
+smoke_log "docker rm -f ${CONTAINER_NAME} (expected fail-closed refusal)"
 export SHIT_HOOK_DEBUG=1
-if ! docker rm -f "${CONTAINER_NAME}" >"${SHIT_SMOKE_TMP}/rm.log" 2>&1; then
-    smoke_log "rm.log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/rm.log" >&2
-    smoke_fail "docker rm -f ${CONTAINER_NAME} exited non-zero"
-fi
-smoke_log "rm.log (informational; rm succeeded):"
+set +e
+docker rm -f "${CONTAINER_NAME}" >"${SHIT_SMOKE_TMP}/rm.log" 2>&1
+rm_rc=$?
+set -e
+smoke_log "rm.log (expected refusal):"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/rm.log" >&2
-
-# Confirm gone.
-if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-    smoke_fail "${CONTAINER_NAME} still present after rm"
+if [ "${rm_rc}" -ne 125 ]; then
+    smoke_fail "expected docker rm wrapper to exit 125, got ${rm_rc}"
 fi
 
-smoke_log "PostExec seq=1"
-"${SHIT_BIN}" hook-send post-exec \
-    --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
-
-smoke_wait_for_event "discriminant = 'ContainerOp'" 1 10
-
-smoke_log "running: shit undo --yes"
-"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_fail "shit undo --yes exited non-zero"
-}
-
-# Post-undo assertions: container exists, env preserved, port bound,
-# volume mounted, restart policy honored, rootfs probe survived via
-# the stash-commit.
+# The real runtime must never have seen the destructive command.
 if ! docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_fail "${CONTAINER_NAME} still missing after undo — Rm reverse didn't recreate"
+    smoke_fail "${CONTAINER_NAME} was removed despite fail-closed policy"
 fi
 
-post_image="$(SHIT_DURING_UNDO=1 docker inspect "${CONTAINER_NAME}" --format '{{.Config.Image}}' 2>/dev/null)"
-case "${post_image}" in
-    shit-stash-*)
-        smoke_log "container image is the stash-commit: ${post_image} (preserves in-place writes)"
-        ;;
-    *)
-        smoke_fail "expected stash-commit image; got '${post_image}' (rootfs writes would be lost)"
-        ;;
-esac
-
-post_env="$(SHIT_DURING_UNDO=1 docker inspect "${CONTAINER_NAME}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
-if ! printf '%s' "${post_env}" | grep -qF "${ENV_PROBE}"; then
-    smoke_log "post-undo env list:"
-    printf '%s' "${post_env}" | sed 's/^/    /' >&2
-    smoke_fail "env var ${ENV_PROBE} not preserved across rm/undo"
-fi
-smoke_log "env var preserved: ${ENV_PROBE}"
-
-post_port="$(SHIT_DURING_UNDO=1 docker inspect "${CONTAINER_NAME}" --format '{{(index (index .HostConfig.PortBindings "9999/tcp") 0).HostPort}}' 2>/dev/null)"
-if [ "${post_port}" != "${HOST_PORT}" ]; then
-    smoke_fail "port binding lost: pre=${HOST_PORT} post=${post_port}"
-fi
-smoke_log "port binding preserved: ${HOST_PORT}:9999/tcp"
-
-post_mount="$(SHIT_DURING_UNDO=1 docker inspect "${CONTAINER_NAME}" --format '{{range .Mounts}}{{.Name}}->{{.Destination}}{{end}}' 2>/dev/null)"
-if [ "${post_mount}" != "${VOL_NAME}->/data" ]; then
-    smoke_fail "volume mount lost: expected '${VOL_NAME}->/data' got '${post_mount}'"
-fi
-smoke_log "volume mount preserved: ${post_mount}"
-
-post_restart="$(SHIT_DURING_UNDO=1 docker inspect "${CONTAINER_NAME}" --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null)"
-if [ "${post_restart}" != "unless-stopped" ]; then
-    smoke_fail "restart policy lost: expected 'unless-stopped' got '${post_restart}'"
-fi
-smoke_log "restart policy preserved: ${post_restart}"
-
-# The marquee assertion: in-place rootfs writes survived via the
-# stash-commit. Without the commit, the restored container would
-# be a fresh busybox without our probe file.
 post_rootfs="$(SHIT_DURING_UNDO=1 docker exec "${CONTAINER_NAME}" cat /tmp/rootfs-probe.txt 2>/dev/null)"
 if [ "${post_rootfs}" != "${ROOTFS_PROBE}" ]; then
-    smoke_log "post-undo rootfs probe read:"
-    printf '  %s\n' "${post_rootfs}" >&2
-    smoke_fail "rootfs probe lost across rm/undo — stash-commit didn't preserve in-place writes"
+    smoke_fail "rootfs changed despite refusal: got '${post_rootfs}'"
 fi
-smoke_log "rootfs probe preserved across stash-commit: '${post_rootfs}'"
+smoke_log "container and rootfs remained intact after refusal"
+
+smoke_log "PostExec seq=1 exit=${rm_rc}"
+"${SHIT_BIN}" hook-send post-exec \
+    --session "${SESSION}" --seq 1 --exit-code "${rm_rc}" --sock "${SHIT_HOOK_SOCK}"
+
+SESSION_HEX="${SESSION//-/}"
+if ! actionable_batches="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batches WHERE session = X'${SESSION_HEX}' AND seq = 1 AND state IN ('CONFIRMED', 'FINALIZED');" 2>/dev/null)"; then
+    smoke_fail "could not query container_capture_batches"
+fi
+if [ "${actionable_batches:-0}" -ne 0 ]; then
+    smoke_fail "unsupported docker rm produced ${actionable_batches} actionable batch(es)"
+fi
+smoke_log "actionable container batches: 0"
 
 smoke_log "session close"
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: docker-rm-undo-linux (${CONTAINER_NAME}: image+env+port+mount+restart+rootfs all round-trip)"
+smoke_log "PASS: docker-rm-undo-linux (exit 125; ${CONTAINER_NAME} intact; no actionable batch)"

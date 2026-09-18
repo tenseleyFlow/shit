@@ -28,17 +28,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Inline pre-image payload for content-mutating syscalls. Carried in
-/// `ShimNotification::pre_image` when the shim was able to read the
-/// file's pre-mutation state. None when:
-///   - the target path doesn't exist (e.g. `open(O_CREAT|O_EXCL)`),
-///   - the file exceeds [`SHIM_INLINE_PREIMAGE_CAP`],
-///   - the read itself failed (permissions, EIO).
+/// `ShimNotification::pre_image` when the shim positively captured the file's
+/// pre-mutation state. `None` represents a proven-absent target (for example
+/// `open(O_CREAT|O_EXCL)`) or a syscall shape that needs no byte pre-image.
 ///
 /// W06.A.4 ships inline-only. A streaming SCM_RIGHTS variant for files
-/// over the cap is a follow-up; for now over-cap files log a warning
-/// and we proceed without a pre-image (planner emits a
-/// Conflict::Missing at undo time, surfacing the gap to the user
-/// rather than silently dropping it).
+/// over the cap is a follow-up. Over-cap, unreadable, raced, or unsupported
+/// existing targets are represented by [`ShimFailure::PreImageUnavailable`];
+/// the daemon journals `CaptureRefused` so the command cannot yield a partial
+/// executable undo plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShimPreImage {
     /// Resolved (absolute) path the shim read content from. For

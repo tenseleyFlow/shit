@@ -27,6 +27,76 @@ pub enum IndexError {
     Encode(#[from] postcard::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("event or lease references missing blob row: {0}")]
+    MissingBlob(BlobHash),
+    #[error("blob refcount invariant failed for {hash} while {operation}")]
+    BlobRefcountInvariant {
+        hash: BlobHash,
+        operation: &'static str,
+    },
+    #[error("malformed blob hash while {operation}: expected 32 bytes, found {actual_len}")]
+    MalformedBlobHash {
+        operation: &'static str,
+        actual_len: usize,
+    },
+    #[error("command is missing or not open: {session}/{seq}")]
+    CommandNotOpen { session: Uuid, seq: u64 },
+    #[error("invalid container capture batch {batch_id}: {reason}")]
+    InvalidContainerBatch { batch_id: Uuid, reason: String },
+    #[error("container capture batch id was reused with conflicting contents: {batch_id}")]
+    ContainerBatchConflict { batch_id: Uuid },
+    #[error("container capture batch does not exist: {batch_id}")]
+    ContainerBatchNotFound { batch_id: Uuid },
+    #[error("container capture batch {batch_id} failed integrity validation: {reason}")]
+    ContainerBatchIntegrity { batch_id: Uuid, reason: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StoredEventIntegrityError {
+    #[error("sqlite while validating stored events: {0}")]
+    Sql(#[from] rusqlite::Error),
+    #[error("stored event row {id} failed integrity validation: {reason}")]
+    Invalid { id: i64, reason: String },
+}
+
+/// Release one event-owned blob reference, rejecting corrupt accounting.
+///
+/// Callers must invoke this inside the same transaction that removes the
+/// owning event. A zero-row update means either that the blob row is missing
+/// or that its count is already exhausted; both conditions abort the caller's
+/// transaction rather than silently losing the event-to-blob relationship.
+pub(crate) fn decrement_event_blob_ref(
+    tx: &rusqlite::Transaction<'_>,
+    raw_hash: &[u8],
+    operation: &'static str,
+) -> Result<(), IndexError> {
+    let bytes: [u8; 32] = raw_hash
+        .try_into()
+        .map_err(|_| IndexError::MalformedBlobHash {
+            operation,
+            actual_len: raw_hash.len(),
+        })?;
+    let hash = BlobHash::from_bytes(bytes);
+    let decremented = tx.execute(
+        "UPDATE blobs SET refcount = refcount - 1
+         WHERE hash = ?1 AND refcount > 0",
+        params![raw_hash],
+    )?;
+    if decremented == 1 {
+        return Ok(());
+    }
+
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT refcount FROM blobs WHERE hash = ?1",
+            params![raw_hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_none() {
+        return Err(IndexError::MissingBlob(hash));
+    }
+    Err(IndexError::BlobRefcountInvariant { hash, operation })
 }
 
 /// The sqlite-backed index. One process opens the DB writeable; everything
@@ -74,6 +144,49 @@ impl Index {
         &self.path
     }
 
+    /// Newest persisted wall timestamp that can own or age retained data.
+    ///
+    /// The daemon uses this once at startup to keep its anchored wall clock
+    /// from moving behind durable history and to detect implausible restart
+    /// jumps before enabling age-based GC. TTL/expiry columns are deliberately
+    /// excluded: they describe the future and are not observations of time.
+    pub fn latest_wallclock_unix_nanos(&self) -> Result<Option<u64>, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let journal_max: Option<i64> = conn.query_row(
+            "SELECT MAX(wall) FROM (
+                 SELECT MAX(opened_wall_nanos) AS wall FROM sessions
+                 UNION ALL SELECT MAX(closed_wall_nanos) FROM sessions
+                 UNION ALL SELECT MAX(started_wall_nanos) FROM commands
+                 UNION ALL SELECT MAX(ended_wall_nanos) FROM commands
+                 UNION ALL SELECT MAX(ts_wall_nanos) FROM events
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let stash_max_secs: Option<i64> = conn.query_row(
+            "SELECT MAX(retain_from_unix_secs) FROM container_stashes",
+            [],
+            |row| row.get(0),
+        )?;
+        let container_finalized_max_secs: Option<i64> = conn.query_row(
+            "SELECT MAX(finalized_unix_secs) FROM container_capture_batches",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let journal = journal_max.and_then(|value| u64::try_from(value).ok());
+        let stash = stash_max_secs
+            .and_then(|value| u64::try_from(value).ok())
+            .map(|seconds| seconds.saturating_mul(1_000_000_000));
+        let container_finalized = container_finalized_max_secs
+            .and_then(|value| u64::try_from(value).ok())
+            .map(|seconds| seconds.saturating_mul(1_000_000_000));
+        Ok([journal, stash, container_finalized]
+            .into_iter()
+            .flatten()
+            .max())
+    }
+
     /// Idempotent: inserts the session row or replaces it (ON CONFLICT REPLACE).
     /// Sessions are write-once in practice but we don't enforce that here —
     /// the daemon can re-send open with no harm.
@@ -117,27 +230,19 @@ impl Index {
         Ok(())
     }
 
+    /// Insert a command record exactly once.
+    ///
+    /// This compatibility primitive is intentionally insert-only. Runtime
+    /// command lifecycle code should use [`Self::begin_command`] followed by
+    /// [`Self::finish_command`]; keeping this method non-upserting prevents a
+    /// stale record from reopening or resurrecting a command identity.
     pub fn put_command(&self, cmd: &CommandRecord) -> Result<(), IndexError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            // AU26: COALESCE(excluded.cmd_string, cmd_string) means
-            // a later upsert with cmd_string=None does NOT clobber a
-            // previously-recorded Some value. The PreExec hook writes
-            // the string first; tier-event handlers (pkg/env/svc/net/
-            // proc/db) upsert with cmd_string=None when they amend
-            // CommandRecord state — that mustn't overwrite the real
-            // string. The PreExec path can still set cmd_string from
-            // None to Some (and vice-versa only if it explicitly
-            // ships a real None — which it never does).
             "INSERT INTO commands (session, seq, cmd_string, cwd, pid, shell_kind,
                                    started_logical, started_wall_nanos,
                                    ended_logical, ended_wall_nanos, exit_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(session, seq) DO UPDATE SET
-                cmd_string = COALESCE(excluded.cmd_string, cmd_string),
-                ended_logical = excluded.ended_logical,
-                ended_wall_nanos = excluded.ended_wall_nanos,
-                exit_code = excluded.exit_code",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 cmd.command.session.as_bytes().as_slice(),
                 cmd.command.seq as i64,
@@ -155,8 +260,75 @@ impl Index {
         Ok(())
     }
 
+    /// Begin a command if and only if its `(session, seq)` identity has never
+    /// been used. Returns `false` for both an active duplicate and a replay of
+    /// a completed identity; neither case is allowed to overwrite old state.
+    pub fn begin_command(&self, cmd: &CommandRecord) -> Result<bool, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT INTO commands (session, seq, cmd_string, cwd, pid, shell_kind,
+                                   started_logical, started_wall_nanos,
+                                   ended_logical, ended_wall_nanos, exit_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)
+             ON CONFLICT(session, seq) DO NOTHING",
+            params![
+                cmd.command.session.as_bytes().as_slice(),
+                cmd.command.seq as i64,
+                cmd.cmd_string.as_deref(),
+                cmd.cwd.to_string_lossy(),
+                cmd.pid as i64,
+                cmd.shell_kind.as_str(),
+                cmd.started_at.logical as i64,
+                cmd.started_at.wallclock_unix_nanos as i64,
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// Finish one existing open command. This is update-only: a command that
+    /// was concurrently reaped, never began, or already finished is left
+    /// untouched and returns `false` rather than being inserted/upserted.
+    pub fn finish_command(
+        &self,
+        command: CommandId,
+        ended_at: TimePoint,
+        exit_code: i32,
+    ) -> Result<bool, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        // A backgrounded prepare request can overlap the shell's PostExec. Do
+        // not revoke a PREPARED batch here: daemon validation may still be in
+        // flight and may atomically confirm it after this close. The helper is
+        // authorized only after it receives the resulting CONFIRMED reply;
+        // PREPARED members remain partial/non-actionable. Startup recovery
+        // refuses genuinely abandoned prepared batches before producers start.
+        let updated = tx.execute(
+            "UPDATE commands
+             SET ended_logical = ?3, ended_wall_nanos = ?4, exit_code = ?5
+             WHERE session = ?1 AND seq = ?2
+               AND ended_logical IS NULL AND ended_wall_nanos IS NULL",
+            params![
+                command.session.as_bytes().as_slice(),
+                command.seq as i64,
+                ended_at.logical as i64,
+                ended_at.wallclock_unix_nanos as i64,
+                exit_code,
+            ],
+        )?;
+        if updated == 1 {
+            tx.execute(
+                "DELETE FROM blob_leases WHERE session = ?1 AND seq = ?2",
+                params![command.session.as_bytes().as_slice(), command.seq as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated == 1)
+    }
+
     /// Insert one event. Returns the assigned `EventId`. Increments any
-    /// referenced blob's refcount.
+    /// event-owned blob's refcount. Container tarballs are indexed in the
+    /// event for lookup, but their shorter-lived `container_stashes` row is
+    /// their sole physical owner.
     pub fn put_event(&self, event: &CaptureEvent) -> Result<EventId, IndexError> {
         let payload = postcard::to_allocvec(event)?;
         let denorm = denormalize(&event.kind);
@@ -186,10 +358,24 @@ impl Index {
             ],
         )?;
         let id = tx.last_insert_rowid();
-        if let Some(blob) = denorm.blob_hash.as_ref() {
-            tx.execute(
+        if event_owns_blob(&event.kind)
+            && let Some(blob) = denorm.blob_hash.as_ref()
+        {
+            let bumped = tx.execute(
                 "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
                 params![blob.as_bytes().as_slice()],
+            )?;
+            if bumped != 1 {
+                return Err(IndexError::MissingBlob(**blob));
+            }
+            tx.execute(
+                "DELETE FROM blob_leases
+                 WHERE hash = ?1 AND session = ?2 AND seq = ?3",
+                params![
+                    blob.as_bytes().as_slice(),
+                    event.command.session.as_bytes().as_slice(),
+                    event.command.seq as i64,
+                ],
             )?;
         }
         update_path_history_with_conn(&tx, &event.kind, event.ts)?;
@@ -220,6 +406,10 @@ impl Index {
             )?;
             let mut bump =
                 tx.prepare("UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1")?;
+            let mut consume_lease = tx.prepare(
+                "DELETE FROM blob_leases
+                 WHERE hash = ?1 AND session = ?2 AND seq = ?3",
+            )?;
             for ev in events {
                 let payload = postcard::to_allocvec(ev)?;
                 let denorm = denormalize(&ev.kind);
@@ -242,8 +432,18 @@ impl Index {
                 ])?;
                 let id = tx.last_insert_rowid();
                 ids.push(EventId(id as u64));
-                if let Some(blob) = denorm.blob_hash.as_ref() {
-                    bump.execute(params![blob.as_bytes().as_slice()])?;
+                if event_owns_blob(&ev.kind)
+                    && let Some(blob) = denorm.blob_hash.as_ref()
+                {
+                    let bumped = bump.execute(params![blob.as_bytes().as_slice()])?;
+                    if bumped != 1 {
+                        return Err(IndexError::MissingBlob(**blob));
+                    }
+                    consume_lease.execute(params![
+                        blob.as_bytes().as_slice(),
+                        ev.command.session.as_bytes().as_slice(),
+                        ev.command.seq as i64,
+                    ])?;
                 }
                 update_path_history_with_conn(&tx, &ev.kind, ev.ts)?;
             }
@@ -257,8 +457,11 @@ impl Index {
         Ok(ids)
     }
 
-    /// Record a blob's existence in the index. Idempotent; refcount is
-    /// initialized to 0 and incremented by event inserts that reference it.
+    /// Record a blob's existence in the index. Refcount is initialized to 0
+    /// and incremented by event/stash owners. Re-publishing the same content
+    /// refreshes physical metadata while preserving refcount and the original
+    /// creation time; this repairs conservative startup placeholders after
+    /// their missing/corrupt bytes are written again.
     pub fn put_blob_record(
         &self,
         hash: BlobHash,
@@ -270,7 +473,9 @@ impl Index {
         conn.execute(
             "INSERT INTO blobs (hash, size, compressed, refcount, created_logical)
              VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(hash) DO NOTHING",
+             ON CONFLICT(hash) DO UPDATE SET
+                 size = excluded.size,
+                 compressed = excluded.compressed",
             params![
                 hash.as_bytes().as_slice(),
                 size as i64,
@@ -279,6 +484,92 @@ impl Index {
             ],
         )?;
         Ok(())
+    }
+
+    /// Protect a zero-refcount baseline blob while its command is open.
+    /// Idempotent for the same `(hash, command)` tuple; returns whether a new
+    /// lease row was inserted. Missing blobs and non-open commands are errors
+    /// rather than silently creating an ineffective lease.
+    pub fn create_blob_lease(
+        &self,
+        hash: BlobHash,
+        command: CommandId,
+        created: TimePoint,
+    ) -> Result<bool, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let blob_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?1)",
+            params![hash.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if !blob_exists {
+            return Err(IndexError::MissingBlob(hash));
+        }
+        let command_open: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands
+                 WHERE session = ?1 AND seq = ?2
+                   AND ended_logical IS NULL AND ended_wall_nanos IS NULL
+             )",
+            params![command.session.as_bytes().as_slice(), command.seq as i64],
+            |row| row.get(0),
+        )?;
+        if !command_open {
+            return Err(IndexError::CommandNotOpen {
+                session: command.session,
+                seq: command.seq,
+            });
+        }
+        let inserted = tx.execute(
+            "INSERT INTO blob_leases (hash, session, seq, created_logical)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hash, session, seq) DO NOTHING",
+            params![
+                hash.as_bytes().as_slice(),
+                command.session.as_bytes().as_slice(),
+                command.seq as i64,
+                created.logical as i64,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(inserted == 1)
+    }
+
+    pub fn has_blob_lease(&self, hash: BlobHash, command: CommandId) -> Result<bool, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM blob_leases
+                 WHERE hash = ?1 AND session = ?2 AND seq = ?3
+             )",
+            params![
+                hash.as_bytes().as_slice(),
+                command.session.as_bytes().as_slice(),
+                command.seq as i64,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(IndexError::from)
+    }
+
+    /// Clear every baseline lease owned by one command. Event publication and
+    /// successful command finish use narrower transactional forms internally.
+    pub fn clear_blob_leases_for_command(&self, command: CommandId) -> Result<usize, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM blob_leases WHERE session = ?1 AND seq = ?2",
+            params![command.session.as_bytes().as_slice(), command.seq as i64],
+        )
+        .map_err(IndexError::from)
+    }
+
+    /// Startup recovery hook. The daemon may call this before starting any
+    /// capture workers; leases are process-lifetime protection, not history.
+    pub fn clear_all_blob_leases(&self) -> Result<usize, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM blob_leases", [])
+            .map_err(IndexError::from)
     }
 
     /// Update the path-history table for a TreeOp event. Called by
@@ -305,31 +596,47 @@ impl Index {
     /// refcounts for every FilePreImage event the command owned. The blob
     /// files themselves are not deleted here — that's the GC sweep (S13);
     /// this just makes the refcount drop to zero so a sweeper can find them.
-    /// Returns the number of events dropped.
+    /// Returns the number of rows dropped. A command with a PREPARED or
+    /// CONFIRMED container batch is retained unchanged because authorization
+    /// may still be pending or the runtime may still be running. REFUSED and
+    /// FINALIZED commands return to normal retention.
     pub fn drop_command(&self, id: CommandId) -> Result<usize, IndexError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        // First decrement refcounts for every blob this command referenced.
-        let blobs_dropped = {
+        let has_container_batch: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM container_capture_batches
+                 WHERE session = ?1 AND seq = ?2
+                   AND state IN ('PREPARED', 'CONFIRMED')
+             )",
+            params![id.session.as_bytes().as_slice(), id.seq as i64],
+            |row| row.get(0),
+        )?;
+        if has_container_batch {
+            tx.commit()?;
+            return Ok(0);
+        }
+        // First decrement refcounts for every blob this command owned.
+        // ContainerOp keeps its hash as historical metadata, but the
+        // independently retained container_stashes row is the physical owner.
+        {
             let mut stmt = tx.prepare(
                 "SELECT blob_hash FROM events
-                 WHERE session = ?1 AND seq = ?2 AND blob_hash IS NOT NULL",
+                 WHERE session = ?1 AND seq = ?2
+                   AND discriminant = 'FilePreImage'
+                   AND blob_hash IS NOT NULL
+                 ORDER BY id",
             )?;
             let hashes: Vec<Vec<u8>> = stmt
                 .query_map(
                     params![id.session.as_bytes().as_slice(), id.seq as i64],
                     |row| row.get::<_, Vec<u8>>(0),
                 )?
-                .filter_map(Result::ok)
-                .collect();
+                .collect::<Result<_, _>>()?;
             for h in &hashes {
-                tx.execute(
-                    "UPDATE blobs SET refcount = MAX(refcount - 1, 0) WHERE hash = ?1",
-                    params![h.as_slice()],
-                )?;
+                decrement_event_blob_ref(&tx, h, "dropping command")?;
             }
-            hashes.len()
-        };
+        }
         let removed = tx.execute(
             "DELETE FROM events WHERE session = ?1 AND seq = ?2",
             params![id.session.as_bytes().as_slice(), id.seq as i64],
@@ -337,7 +644,6 @@ impl Index {
             "DELETE FROM commands WHERE session = ?1 AND seq = ?2",
             params![id.session.as_bytes().as_slice(), id.seq as i64],
         )?;
-        let _ = blobs_dropped;
         tx.commit()?;
         Ok(removed)
     }
@@ -346,7 +652,25 @@ impl Index {
     /// this to identify deletable blob files.
     pub fn unreferenced_blobs(&self) -> Result<Vec<BlobHash>, IndexError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT hash FROM blobs WHERE refcount = 0")?;
+        let mut stmt = conn.prepare(
+            "SELECT b.hash FROM blobs b
+             WHERE b.refcount = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM events e
+                   WHERE e.blob_hash = b.hash
+                     AND e.discriminant = 'FilePreImage'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM blob_leases l WHERE l.hash = b.hash
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM container_stashes s WHERE s.blob_hash = b.hash
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM chunks c
+                   WHERE c.hash = b.hash AND c.materialized != 0
+               )",
+        )?;
         let rows = stmt.query_map([], |row| {
             let bytes: Vec<u8> = row.get(0)?;
             let mut h = [0u8; 32];
@@ -363,17 +687,34 @@ impl Index {
             h.copy_from_slice(&bytes);
             Ok(BlobHash::from_bytes(h))
         })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Remove a blob's index row. Caller is responsible for having already
-    /// removed the on-disk file. Refuses to drop blobs with refcount > 0
-    /// (defense in depth — the sweeper should only target zero-refcount
-    /// rows).
+    /// Atomically recheck and remove a blob's index row. On success, the GC
+    /// caller is responsible for subsequently unlinking the on-disk file while
+    /// retaining exclusive blob lifecycle ownership. Refuses blobs with an
+    /// event/stash refcount, baseline lease, or container-stash owner.
     pub fn drop_blob_record(&self, hash: BlobHash) -> Result<bool, IndexError> {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
-            "DELETE FROM blobs WHERE hash = ?1 AND refcount = 0",
+            "DELETE FROM blobs
+             WHERE hash = ?1 AND refcount = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM events
+                   WHERE events.blob_hash = blobs.hash
+                     AND events.discriminant = 'FilePreImage'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM blob_leases WHERE blob_leases.hash = blobs.hash
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM container_stashes
+                   WHERE container_stashes.blob_hash = blobs.hash
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM chunks
+                   WHERE chunks.hash = blobs.hash AND chunks.materialized != 0
+               )",
             params![hash.as_bytes().as_slice()],
         )?;
         Ok(removed > 0)
@@ -641,16 +982,16 @@ fn resolve_path_at(conn: &Connection, path: &Path, at: TimePoint) -> Option<Inod
     .flatten()
 }
 
-struct Denormalized<'a> {
-    discriminant: &'static str,
-    dev: Option<i64>,
-    inode: Option<i64>,
-    path: Option<String>,
-    blob_hash: Option<&'a BlobHash>,
-    post_content_hash: Option<&'a BlobHash>,
+pub(crate) struct Denormalized<'a> {
+    pub(crate) discriminant: &'static str,
+    pub(crate) dev: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) path: Option<String>,
+    pub(crate) blob_hash: Option<&'a BlobHash>,
+    pub(crate) post_content_hash: Option<&'a BlobHash>,
 }
 
-fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
+pub(crate) fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
     use CaptureEventKind as K;
     use shit_planner::TreeOp as T;
     match kind {
@@ -849,6 +1190,89 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
     }
 }
 
+/// Whether the event itself owns the denormalized blob reference.
+///
+/// ContainerOp deliberately returns false: its tarball hash remains in the
+/// journal for diagnosis and a useful "expired" refusal, while the separate
+/// `container_stashes` row owns the archive bytes. PREPARED/CONFIRMED stashes
+/// are protected, while FINALIZED stashes age from their durable runtime-
+/// completion retention origin.
+fn event_owns_blob(kind: &CaptureEventKind) -> bool {
+    matches!(kind, CaptureEventKind::FilePreImage { .. })
+}
+
+/// Decode every persisted event and cross-check the columns used by lookup,
+/// GC, recovery, and clock seeding against the canonical payload.
+///
+/// A mismatch is not repaired from either side: choosing the wrong side could
+/// make a partial journal actionable. Startup instead refuses before any
+/// reconciliation mutation, preserving the evidence for diagnosis.
+pub(crate) fn validate_stored_events(conn: &Connection) -> Result<(), StoredEventIntegrityError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session, seq, ts_logical, ts_wall_nanos, partial,
+                discriminant, dev, inode, path, blob_hash, post_content_hash,
+                payload
+         FROM events ORDER BY id",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let invalid = |reason: String| StoredEventIntegrityError::Invalid { id, reason };
+        let payload: Vec<u8> = row.get(12)?;
+        let event: CaptureEvent = postcard::from_bytes(&payload)
+            .map_err(|error| invalid(format!("payload decode failed: {error}")))?;
+        let denorm = denormalize(&event.kind);
+
+        let session: Vec<u8> = row.get(1)?;
+        if session.as_slice() != event.command.session.as_bytes() {
+            return Err(invalid("session column disagrees with payload".into()));
+        }
+        let seq: i64 = row.get(2)?;
+        if seq != event.command.seq as i64 {
+            return Err(invalid("sequence column disagrees with payload".into()));
+        }
+        let ts_logical: i64 = row.get(3)?;
+        let ts_wall_nanos: i64 = row.get(4)?;
+        if ts_logical != event.ts.logical as i64
+            || ts_wall_nanos != event.ts.wallclock_unix_nanos as i64
+        {
+            return Err(invalid("timestamp columns disagree with payload".into()));
+        }
+        let partial: i64 = row.get(5)?;
+        if partial != i64::from(event.partial) {
+            return Err(invalid("partial column disagrees with payload".into()));
+        }
+        let discriminant: String = row.get(6)?;
+        if discriminant != denorm.discriminant {
+            return Err(invalid("discriminant column disagrees with payload".into()));
+        }
+        let dev: Option<i64> = row.get(7)?;
+        let inode: Option<i64> = row.get(8)?;
+        if dev != denorm.dev || inode != denorm.inode {
+            return Err(invalid("inode columns disagree with payload".into()));
+        }
+        let path: Option<String> = row.get(9)?;
+        if path != denorm.path {
+            return Err(invalid("path column disagrees with payload".into()));
+        }
+        let blob_hash: Option<Vec<u8>> = row.get(10)?;
+        let expected_blob = denorm.blob_hash.map(|hash| hash.as_bytes().as_slice());
+        if blob_hash.as_deref() != expected_blob {
+            return Err(invalid("blob hash column disagrees with payload".into()));
+        }
+        let post_content_hash: Option<Vec<u8>> = row.get(11)?;
+        let expected_post = denorm
+            .post_content_hash
+            .map(|hash| hash.as_bytes().as_slice());
+        if post_content_hash.as_deref() != expected_post {
+            return Err(invalid(
+                "post-content hash column disagrees with payload".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn collect_events(
     conn: &Connection,
     sql: &str,
@@ -859,7 +1283,10 @@ fn collect_events(
         Err(_) => return Vec::new(),
     };
     match stmt.query_map(params, decode_event_row) {
-        Ok(it) => it.filter_map(Result::ok).collect(),
+        // One corrupt row must invalidate the whole query. Returning the
+        // remaining rows would let the planner build a destructive partial
+        // undo from incomplete evidence.
+        Ok(it) => it.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -877,36 +1304,75 @@ fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<CaptureEvent> {
     // the planner's reverse-chronological sort would be unstable —
     // bug surfaced by the rm-undo smoke (S24.C).
     ev.id = shit_planner::events::EventId(id as u64);
+    // Container captures are a two-phase protocol. A destructive event is
+    // actionable only when its *whole* batch has a valid CONFIRMED/FINALIZED
+    // mapping.
+    // This overlay also protects pre-v6 legacy rows: even if their historical
+    // payload says `partial=false`, no proof of runtime success exists. Pull
+    // is non-destructive and deliberately exempt.
+    let batch_confirmed: bool = row.get("container_batch_confirmed")?;
+    if matches!(
+        &ev.kind,
+        CaptureEventKind::ContainerOp { op, .. }
+            if !matches!(op, shit_planner::ContainerOp::Pull { .. })
+    ) && !batch_confirmed
+    {
+        ev.partial = true;
+    }
     Ok(ev)
+}
+
+fn corrupt_journal_refusal(command: CommandId) -> Vec<CaptureEvent> {
+    vec![CaptureEvent {
+        id: EventId(0),
+        command,
+        ts: TimePoint::new(0, 0),
+        partial: true,
+        kind: CaptureEventKind::CaptureRefused {
+            class: "event-journal-corrupt".into(),
+            path: PathBuf::from("/.shit-event-journal-corrupt"),
+            detail: "stored event rows could not be decoded; refusing command-wide planning".into(),
+        },
+    }]
 }
 
 impl PlannerStore for Index {
     fn events_for_command(&self, command: CommandId) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, payload FROM events
-             WHERE session = ?1 AND seq = ?2
-             ORDER BY ts_logical, id",
+            "SELECT e.id, e.payload,
+                    (confirmed.event_id IS NOT NULL) AS container_batch_confirmed
+             FROM events e
+             LEFT JOIN confirmed_container_capture_events confirmed
+               ON confirmed.event_id = e.id
+             WHERE e.session = ?1 AND e.seq = ?2
+             ORDER BY e.ts_logical, e.id",
         ) {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => return corrupt_journal_refusal(command),
         };
         let rows = stmt.query_map(
             params![command.session.as_bytes().as_slice(), command.seq as i64],
             decode_event_row,
         );
         match rows {
-            Ok(it) => it.filter_map(Result::ok).collect(),
-            Err(_) => Vec::new(),
+            Ok(it) => it
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_else(|_| corrupt_journal_refusal(command)),
+            Err(_) => corrupt_journal_refusal(command),
         }
     }
 
     fn events_for_session(&self, session: Uuid, seq_range: SeqRange) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, payload FROM events
-             WHERE session = ?1 AND seq >= ?2 AND seq < ?3
-             ORDER BY seq, ts_logical, id",
+            "SELECT e.id, e.payload,
+                    (confirmed.event_id IS NOT NULL) AS container_batch_confirmed
+             FROM events e
+             LEFT JOIN confirmed_container_capture_events confirmed
+               ON confirmed.event_id = e.id
+             WHERE e.session = ?1 AND e.seq >= ?2 AND e.seq < ?3
+             ORDER BY e.seq, e.ts_logical, e.id",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -920,7 +1386,7 @@ impl PlannerStore for Index {
             decode_event_row,
         );
         match rows {
-            Ok(it) => it.filter_map(Result::ok).collect(),
+            Ok(it) => it.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     }
@@ -928,9 +1394,13 @@ impl PlannerStore for Index {
     fn events_touching_inode(&self, inode: InodeRef, since: TimePoint) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, payload FROM events
-             WHERE dev = ?1 AND inode = ?2 AND ts_logical >= ?3
-             ORDER BY ts_logical, id",
+            "SELECT e.id, e.payload,
+                    (confirmed.event_id IS NOT NULL) AS container_batch_confirmed
+             FROM events e
+             LEFT JOIN confirmed_container_capture_events confirmed
+               ON confirmed.event_id = e.id
+             WHERE e.dev = ?1 AND e.inode = ?2 AND e.ts_logical >= ?3
+             ORDER BY e.ts_logical, e.id",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -940,7 +1410,7 @@ impl PlannerStore for Index {
             decode_event_row,
         );
         match rows {
-            Ok(it) => it.filter_map(Result::ok).collect(),
+            Ok(it) => it.collect::<Result<Vec<_>, _>>().unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     }
@@ -956,16 +1426,25 @@ impl PlannerStore for Index {
         match inode_at {
             Some(i) => collect_events(
                 &conn,
-                "SELECT id, payload FROM events
-                 WHERE ts_logical <= ?1 AND (path = ?2 OR (dev = ?3 AND inode = ?4))
-                 ORDER BY ts_logical, id",
+                "SELECT e.id, e.payload,
+                        (confirmed.event_id IS NOT NULL) AS container_batch_confirmed
+                 FROM events e
+                 LEFT JOIN confirmed_container_capture_events confirmed
+                   ON confirmed.event_id = e.id
+                 WHERE e.ts_logical <= ?1
+                   AND (e.path = ?2 OR (e.dev = ?3 AND e.inode = ?4))
+                 ORDER BY e.ts_logical, e.id",
                 params![at.logical as i64, path_str, i.dev as i64, i.inode as i64,],
             ),
             None => collect_events(
                 &conn,
-                "SELECT id, payload FROM events
-                 WHERE ts_logical <= ?1 AND path = ?2
-                 ORDER BY ts_logical, id",
+                "SELECT e.id, e.payload,
+                        (confirmed.event_id IS NOT NULL) AS container_batch_confirmed
+                 FROM events e
+                 LEFT JOIN confirmed_container_capture_events confirmed
+                   ON confirmed.event_id = e.id
+                 WHERE e.ts_logical <= ?1 AND e.path = ?2
+                 ORDER BY e.ts_logical, e.id",
                 params![at.logical as i64, path_str],
             ),
         }
@@ -1031,7 +1510,12 @@ impl PlannerStore for Index {
     fn event_by_id(&self, id: EventId) -> Option<CaptureEvent> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, payload FROM events WHERE id = ?1",
+            "SELECT e.id, e.payload,
+                    (confirmed.event_id IS NOT NULL) AS container_batch_confirmed
+             FROM events e
+             LEFT JOIN confirmed_container_capture_events confirmed
+               ON confirmed.event_id = e.id
+             WHERE e.id = ?1",
             params![id.0 as i64],
             decode_event_row,
         )
@@ -1094,6 +1578,31 @@ mod tests {
         }
     }
 
+    fn begin_sample_command(index: &Index, session: Uuid, seq: u64) -> CommandId {
+        let mut command = sample_command(session, seq);
+        command.ended_at = None;
+        command.exit_code = None;
+        assert!(index.begin_command(&command).unwrap());
+        command.command
+    }
+
+    fn preimage_event(command: CommandId, blob: BlobHash, logical: u64) -> CaptureEvent {
+        CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: TimePoint::new(logical, logical * 1000),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, logical),
+                path: PathBuf::from(format!("/lease-{logical}")),
+                blob,
+                meta: meta(),
+                post_content_hash: None,
+                source: shit_planner::FilePreImageSource::Other,
+            },
+        }
+    }
+
     #[test]
     fn open_creates_db_with_schema() {
         let (_dir, idx) = open_index();
@@ -1119,6 +1628,83 @@ mod tests {
     }
 
     #[test]
+    fn latest_wallclock_covers_journal_and_container_stash_observations() {
+        let (_dir, idx) = open_index();
+        assert_eq!(idx.latest_wallclock_unix_nanos().unwrap(), None);
+
+        let session = Uuid::from_bytes([0x42; 16]);
+        idx.put_session(session, "bash", 1, None, TimePoint::new(1, 100))
+            .unwrap();
+        let command = CommandId { session, seq: 1 };
+        let mut record = sample_command(session, 1);
+        record.started_at = TimePoint::new(2, 200);
+        record.ended_at = None;
+        record.exit_code = None;
+        assert!(idx.begin_command(&record).unwrap());
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: TimePoint::new(3, 300),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "test".into(),
+                path: PathBuf::from("/tmp/test"),
+                detail: "test".into(),
+            },
+        })
+        .unwrap();
+        assert!(
+            idx.finish_command(command, TimePoint::new(4, 250), 0)
+                .unwrap()
+        );
+        assert_eq!(idx.latest_wallclock_unix_nanos().unwrap(), Some(300));
+
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO blobs (hash, size, compressed, refcount, created_logical)
+                 VALUES (?1, 1, 0, 1, 5)",
+                [[7_u8; 32].as_slice()],
+            )
+            .unwrap();
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO container_stashes
+                 (blob_hash, kind, runtime, name, size_bytes, created_unix_secs,
+                  retain_from_unix_secs)
+                 VALUES (?1, 0, 'docker', 'test', 1, 2, 2)",
+                [[7_u8; 32].as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            idx.latest_wallclock_unix_nanos().unwrap(),
+            Some(2_000_000_000)
+        );
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO container_capture_batches
+                 (batch_id, session, seq, request_hash, event_count, state,
+                  finalized_unix_secs)
+                 VALUES (?1, ?2, 1, ?3, 1, 'FINALIZED', 3)",
+                params![
+                    [0x43_u8; 16].as_slice(),
+                    session.as_bytes().as_slice(),
+                    [0x43_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            idx.latest_wallclock_unix_nanos().unwrap(),
+            Some(3_000_000_000)
+        );
+    }
+
+    #[test]
     fn command_round_trip() {
         let (_dir, idx) = open_index();
         let session = Uuid::nil();
@@ -1137,6 +1723,108 @@ mod tests {
         assert_eq!(got.cmd_string, cmd.cmd_string);
         assert_eq!(got.pid, cmd.pid);
         assert_eq!(got.exit_code, cmd.exit_code);
+    }
+
+    #[test]
+    fn begin_is_insert_only_and_cannot_reopen_finished_identity() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let mut cmd = sample_command(session, 11);
+        cmd.ended_at = None;
+        cmd.exit_code = None;
+
+        assert!(idx.begin_command(&cmd).unwrap());
+        let ended_at = TimePoint::new(12, 12_000);
+        assert!(idx.finish_command(cmd.command, ended_at, 7).unwrap());
+        assert!(!idx.begin_command(&cmd).unwrap());
+
+        let stored = idx.command_by_id(cmd.command).unwrap();
+        assert_eq!(stored.ended_at, Some(ended_at));
+        assert_eq!(stored.exit_code, Some(7));
+    }
+
+    #[test]
+    fn finish_is_update_only_and_cannot_resurrect_missing_row() {
+        let (_dir, idx) = open_index();
+        let missing = CommandId {
+            session: Uuid::nil(),
+            seq: 404,
+        };
+
+        assert!(
+            !idx.finish_command(missing, TimePoint::new(1, 1), 0)
+                .unwrap()
+        );
+        assert!(idx.command_by_id(missing).is_none());
+    }
+
+    #[test]
+    fn finish_is_conditional_on_command_still_being_open() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let mut cmd = sample_command(session, 12);
+        cmd.ended_at = None;
+        cmd.exit_code = None;
+        assert!(idx.begin_command(&cmd).unwrap());
+
+        assert!(
+            idx.finish_command(cmd.command, TimePoint::new(13, 13_000), 0)
+                .unwrap()
+        );
+        assert!(
+            !idx.finish_command(cmd.command, TimePoint::new(14, 14_000), 9)
+                .unwrap()
+        );
+        let stored = idx.command_by_id(cmd.command).unwrap();
+        assert_eq!(stored.ended_at, Some(TimePoint::new(13, 13_000)));
+        assert_eq!(stored.exit_code, Some(0));
+    }
+
+    #[test]
+    fn finish_clears_leases_only_when_terminal_update_matches() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 13);
+        let blob = BlobHash::from_bytes([0x13; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(1, 0))
+            .unwrap();
+        assert!(
+            idx.create_blob_lease(blob, command, TimePoint::new(2, 0))
+                .unwrap()
+        );
+
+        assert!(
+            idx.finish_command(command, TimePoint::new(3, 0), 0)
+                .unwrap()
+        );
+        assert!(!idx.has_blob_lease(blob, command).unwrap());
+
+        // Simulate a stale/corrupt post-finish lease. A replayed finish must
+        // not clear state because its terminal UPDATE did not match.
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO blob_leases (hash, session, seq, created_logical)
+                 VALUES (?1, ?2, ?3, 4)",
+                params![
+                    blob.as_bytes().as_slice(),
+                    command.session.as_bytes().as_slice(),
+                    command.seq as i64,
+                ],
+            )
+            .unwrap();
+        assert!(
+            !idx.finish_command(command, TimePoint::new(5, 0), 9)
+                .unwrap()
+        );
+        assert!(idx.has_blob_lease(blob, command).unwrap());
     }
 
     #[test]
@@ -1198,6 +1886,39 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_event_query_returns_command_wide_refusal_not_partial_rows() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = CommandId { session, seq: 1 };
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        let blob = BlobHash::from_bytes([0xBC; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_event(&preimage_event(command, blob, 1)).unwrap();
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE events SET payload = X'00'
+                 WHERE session = ?1 AND seq = ?2",
+                params![session.as_bytes().as_slice(), 1_i64],
+            )
+            .unwrap();
+
+        let events = idx.events_for_command(command);
+        assert!(matches!(
+            events.as_slice(),
+            [CaptureEvent {
+                partial: true,
+                kind: CaptureEventKind::CaptureRefused { class, .. },
+                ..
+            }] if class == "event-journal-corrupt"
+        ));
+    }
+
+    #[test]
     fn blob_refcount_increments_on_event_insert() {
         let (_dir, idx) = open_index();
         let session = Uuid::nil();
@@ -1233,6 +1954,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(refcount, 3);
+    }
+
+    #[test]
+    fn blob_lease_apis_are_idempotent_and_scoped_to_open_commands() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let first = begin_sample_command(&idx, session, 21);
+        let second = begin_sample_command(&idx, session, 22);
+        let blob = BlobHash::from_bytes([0x21; 32]);
+        let other = BlobHash::from_bytes([0x22; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(1, 0))
+            .unwrap();
+        idx.put_blob_record(other, 1, false, TimePoint::new(1, 0))
+            .unwrap();
+
+        assert!(
+            idx.create_blob_lease(blob, first, TimePoint::new(2, 0))
+                .unwrap()
+        );
+        assert!(
+            !idx.create_blob_lease(blob, first, TimePoint::new(3, 0))
+                .unwrap()
+        );
+        assert!(idx.has_blob_lease(blob, first).unwrap());
+        assert_eq!(idx.clear_blob_leases_for_command(first).unwrap(), 1);
+        assert!(!idx.has_blob_lease(blob, first).unwrap());
+
+        idx.create_blob_lease(blob, first, TimePoint::new(4, 0))
+            .unwrap();
+        idx.create_blob_lease(other, second, TimePoint::new(4, 0))
+            .unwrap();
+        assert_eq!(idx.clear_all_blob_leases().unwrap(), 2);
+        assert!(!idx.has_blob_lease(blob, first).unwrap());
+        assert!(!idx.has_blob_lease(other, second).unwrap());
+
+        let missing = BlobHash::from_bytes([0xFF; 32]);
+        assert!(matches!(
+            idx.create_blob_lease(missing, first, TimePoint::new(5, 0)),
+            Err(IndexError::MissingBlob(hash)) if hash == missing
+        ));
+        idx.finish_command(first, TimePoint::new(6, 0), 0).unwrap();
+        assert!(matches!(
+            idx.create_blob_lease(blob, first, TimePoint::new(7, 0)),
+            Err(IndexError::CommandNotOpen { .. })
+        ));
+    }
+
+    #[test]
+    fn event_consumes_only_its_commands_matching_blob_lease() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let first = begin_sample_command(&idx, session, 31);
+        let second = begin_sample_command(&idx, session, 32);
+        let blob = BlobHash::from_bytes([0x31; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(1, 0))
+            .unwrap();
+        idx.create_blob_lease(blob, first, TimePoint::new(2, 0))
+            .unwrap();
+        idx.create_blob_lease(blob, second, TimePoint::new(2, 0))
+            .unwrap();
+
+        idx.put_event(&preimage_event(first, blob, 3)).unwrap();
+
+        assert!(!idx.has_blob_lease(blob, first).unwrap());
+        assert!(idx.has_blob_lease(blob, second).unwrap());
+        let refcount: i64 = idx
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![blob.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1);
     }
 
     #[test]
@@ -1279,6 +2080,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rc, 50);
+    }
+
+    #[test]
+    fn put_event_rejects_missing_blob_and_rolls_back_insert() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 41);
+        let missing = BlobHash::from_bytes([0x41; 32]);
+
+        assert!(matches!(
+            idx.put_event(&preimage_event(command, missing, 1)),
+            Err(IndexError::MissingBlob(hash)) if hash == missing
+        ));
+        let events: i64 = idx
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    #[test]
+    fn put_event_batch_missing_blob_rolls_back_refcount_event_and_lease() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 42);
+        let present = BlobHash::from_bytes([0x42; 32]);
+        let missing = BlobHash::from_bytes([0x43; 32]);
+        idx.put_blob_record(present, 1, false, TimePoint::new(1, 0))
+            .unwrap();
+        idx.create_blob_lease(present, command, TimePoint::new(2, 0))
+            .unwrap();
+
+        let events = [
+            preimage_event(command, present, 3),
+            preimage_event(command, missing, 4),
+        ];
+        assert!(matches!(
+            idx.put_event_batch(&events),
+            Err(IndexError::MissingBlob(hash)) if hash == missing
+        ));
+
+        let conn = idx.conn.lock().unwrap();
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let refcount: i64 = conn
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![present.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blob_leases
+                 WHERE hash = ?1 AND session = ?2 AND seq = ?3",
+                params![
+                    present.as_bytes().as_slice(),
+                    command.session.as_bytes().as_slice(),
+                    command.seq as i64,
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0);
+        assert_eq!(refcount, 0);
+        assert_eq!(lease_count, 1);
     }
 
     #[test]
@@ -1424,6 +2298,168 @@ mod tests {
     }
 
     #[test]
+    fn drop_command_retains_only_inflight_container_batch_states() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::from_bytes([0x51; 16]);
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+
+        for (offset, state, finalized_at, protected) in [
+            (0_u8, "PREPARED", None, true),
+            (1, "CONFIRMED", None, true),
+            (2, "REFUSED", None, false),
+            (3, "FINALIZED", Some(100_i64), false),
+        ] {
+            let seq = offset as u64 + 1;
+            let command = CommandId { session, seq };
+            idx.put_command(&sample_command(session, seq)).unwrap();
+            idx.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO container_capture_batches
+                     (batch_id, session, seq, request_hash, event_count, state,
+                      finalized_unix_secs)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+                    params![
+                        [offset + 1; 16].as_slice(),
+                        session.as_bytes().as_slice(),
+                        seq as i64,
+                        [offset + 1; 32].as_slice(),
+                        state,
+                        finalized_at,
+                    ],
+                )
+                .unwrap();
+
+            let dropped = idx.drop_command(command).unwrap();
+            assert_eq!(dropped == 0, protected, "state={state}");
+            assert_eq!(
+                idx.command_by_id(command).is_some(),
+                protected,
+                "state={state} retention mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_command_missing_blob_rolls_back_prior_decrement_and_deletion() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 61);
+        let first = BlobHash::from_bytes([0x61; 32]);
+        let missing = BlobHash::from_bytes([0x62; 32]);
+        for hash in [first, missing] {
+            idx.put_blob_record(hash, 1, false, TimePoint::new(0, 0))
+                .unwrap();
+        }
+        idx.put_event(&preimage_event(command, first, 1)).unwrap();
+        idx.put_event(&preimage_event(command, missing, 2)).unwrap();
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM blobs WHERE hash = ?1",
+                params![missing.as_bytes().as_slice()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            idx.drop_command(command),
+            Err(IndexError::MissingBlob(hash)) if hash == missing
+        ));
+
+        let conn = idx.conn.lock().unwrap();
+        let first_refcount: i64 = conn
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![first.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session = ?1 AND seq = ?2",
+                params![session.as_bytes().as_slice(), command.seq as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let commands: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE session = ?1 AND seq = ?2",
+                params![session.as_bytes().as_slice(), command.seq as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_refcount, 1);
+        assert_eq!(events, 2);
+        assert_eq!(commands, 1);
+    }
+
+    #[test]
+    fn drop_command_rejects_exhausted_event_refcount() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 62);
+        let blob = BlobHash::from_bytes([0x63; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_event(&preimage_event(command, blob, 1)).unwrap();
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE blobs SET refcount = 0 WHERE hash = ?1",
+                params![blob.as_bytes().as_slice()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            idx.drop_command(command),
+            Err(IndexError::BlobRefcountInvariant { hash, .. }) if hash == blob
+        ));
+        assert_eq!(idx.events_for_command(command).len(), 1);
+        assert!(idx.command_by_id(command).is_some());
+    }
+
+    #[test]
+    fn drop_command_rejects_malformed_event_blob_hash() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 63);
+        let blob = BlobHash::from_bytes([0x64; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_event(&preimage_event(command, blob, 1)).unwrap();
+        idx.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE events SET blob_hash = ?1
+                 WHERE session = ?2 AND seq = ?3",
+                params![
+                    vec![0x64u8; 31],
+                    session.as_bytes().as_slice(),
+                    command.seq as i64
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            idx.drop_command(command),
+            Err(IndexError::MalformedBlobHash { actual_len: 31, .. })
+        ));
+        assert_eq!(idx.events_for_command(command).len(), 1);
+        assert!(idx.command_by_id(command).is_some());
+    }
+
+    #[test]
     fn unreferenced_blobs_lists_zero_refcount() {
         let (_dir, idx) = open_index();
         let referenced = BlobHash::from_bytes([0xA1; 32]);
@@ -1455,6 +2491,27 @@ mod tests {
         let unref = idx.unreferenced_blobs().unwrap();
         assert!(unref.contains(&orphan));
         assert!(!unref.contains(&referenced));
+    }
+
+    #[test]
+    fn zero_refcount_blob_with_lease_is_not_sweepable() {
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let command = begin_sample_command(&idx, session, 51);
+        let blob = BlobHash::from_bytes([0x51; 32]);
+        idx.put_blob_record(blob, 1, false, TimePoint::new(1, 0))
+            .unwrap();
+        idx.create_blob_lease(blob, command, TimePoint::new(2, 0))
+            .unwrap();
+
+        assert!(!idx.unreferenced_blobs().unwrap().contains(&blob));
+        assert!(!idx.drop_blob_record(blob).unwrap());
+
+        assert_eq!(idx.clear_blob_leases_for_command(command).unwrap(), 1);
+        assert!(idx.unreferenced_blobs().unwrap().contains(&blob));
+        assert!(idx.drop_blob_record(blob).unwrap());
     }
 
     #[test]
@@ -1501,5 +2558,37 @@ mod tests {
         idx.put_blob_record(blob, 999, false, TimePoint::new(0, 0))
             .unwrap();
         assert_eq!(idx.blob_size_hint(blob), Some(999));
+    }
+
+    #[test]
+    fn republishing_blob_refreshes_placeholder_metadata_without_losing_owners() {
+        let (_dir, idx) = open_index();
+        let blob = BlobHash::from_bytes([0x78; 32]);
+        idx.put_blob_record(blob, 0, false, TimePoint::new(7, 0))
+            .unwrap();
+        idx.conn()
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE blobs SET refcount = 3 WHERE hash = ?1",
+                params![blob.as_bytes().as_slice()],
+            )
+            .unwrap();
+
+        idx.put_blob_record(blob, 42, true, TimePoint::new(99, 0))
+            .unwrap();
+
+        let row: (i64, i64, i64, i64) = idx
+            .conn()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT size, compressed, refcount, created_logical
+                 FROM blobs WHERE hash = ?1",
+                params![blob.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (42, 1, 3, 7));
     }
 }

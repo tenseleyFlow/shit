@@ -15,8 +15,9 @@
 //! - **Covered** — shit undoes commands of this kind. Backed by a
 //!   green smoke in CI.
 //! - **Pending** — shit knows about commands of this kind but doesn't
-//!   yet have full coverage (partial implementation, missing tier).
-//!   Surfaces in `pending_classes` so users see what's in flight.
+//!   claim positive undo coverage yet. A representative smoke may pin
+//!   its fail-closed safety policy instead. Surfaces in
+//!   `pending_classes` so users see what's in flight.
 //! - **Refused** — enumerated in [`crate::refuse::CATALOG`]; shit
 //!   explicitly says it won't undo. Not in this catalog (it lives in
 //!   `refuse.rs`).
@@ -45,29 +46,9 @@ pub struct CoverageClass {
 /// Ordering: alphabetical-by-id so diffs are easy to eyeball.
 pub const COVERAGE_CATALOG: &[CoverageClass] = &[
     CoverageClass {
-        id: "container-compose",
-        representative_smoke: "docker-compose-down-undo-linux.sh",
-        since_sprint: "AR03.6",
-    },
-    CoverageClass {
-        id: "container-network",
-        representative_smoke: "docker-network-rm-undo-linux.sh",
-        since_sprint: "AR03.4",
-    },
-    CoverageClass {
-        id: "container-rm",
-        representative_smoke: "docker-rm-undo-linux.sh",
-        since_sprint: "AR03.1",
-    },
-    CoverageClass {
         id: "container-rmi",
         representative_smoke: "docker-rmi-undo-linux.sh",
         since_sprint: "AR03.2",
-    },
-    CoverageClass {
-        id: "container-volume",
-        representative_smoke: "docker-volume-rm-undo-linux.sh",
-        since_sprint: "AR03.3",
     },
     CoverageClass {
         id: "fs-content-restore",
@@ -156,14 +137,15 @@ pub const COVERAGE_CATALOG: &[CoverageClass] = &[
     },
 ];
 
-/// Classes we know about and partially support, but don't claim full
-/// coverage for. Users see these in `pending_classes` so the doctor
-/// surface admits "we're working on it" rather than implying
-/// either complete coverage or refusal.
+/// Classes we know about but don't claim positive undo coverage for.
+/// Users see these in `pending_classes` so the doctor surface admits
+/// "we're working on it" rather than implying either complete
+/// coverage or refusal.
 ///
-/// Definition of "pending": there is design work or partial
-/// implementation in the tree, but the representative smoke isn't
-/// stable green AND the class isn't in [`crate::refuse::CATALOG`].
+/// Definition of "pending": there is design work, partial
+/// implementation, or a stable fail-closed smoke in the tree, but no
+/// stable positive undo smoke, and the class isn't in
+/// [`crate::refuse::CATALOG`].
 pub const PENDING_CATALOG: &[CoverageClass] = &[
     CoverageClass {
         // BSD shim default-on at install — sprint AU07. Once landed,
@@ -171,6 +153,26 @@ pub const PENDING_CATALOG: &[CoverageClass] = &[
         id: "bsd-shim-default",
         representative_smoke: "(none — AU07 pending)",
         since_sprint: "AU07",
+    },
+    CoverageClass {
+        id: "container-compose",
+        representative_smoke: "docker-compose-down-undo-linux.sh",
+        since_sprint: "AR03.6",
+    },
+    CoverageClass {
+        id: "container-network",
+        representative_smoke: "docker-network-rm-undo-linux.sh",
+        since_sprint: "AR03.4",
+    },
+    CoverageClass {
+        id: "container-rm",
+        representative_smoke: "docker-rm-undo-linux.sh",
+        since_sprint: "AR03.1",
+    },
+    CoverageClass {
+        id: "container-volume",
+        representative_smoke: "docker-volume-rm-undo-linux.sh",
+        since_sprint: "AR03.3",
     },
     CoverageClass {
         // Linux capability preservation across cargo rebuilds — AU08
@@ -210,8 +212,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_ids_are_unique() {
+    fn pending_ids_are_unique_and_sorted() {
         let ids = pending_class_ids();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "PENDING_CATALOG must stay alphabetically sorted by id"
+        );
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "duplicate id in PENDING_CATALOG");
     }

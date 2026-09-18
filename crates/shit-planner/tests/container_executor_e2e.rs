@@ -78,6 +78,10 @@ case "$1 $2" in
     ;;
 esac
 case "$1" in
+  "tag")
+    printf '%s\n' "$*" > '{rec}/argv-tag'
+    exit 0
+    ;;
   "run")
     # docker run --rm -i -v X:/data busybox tar -C /data -xzf -
     cat > '{rec}/stdin-run'
@@ -121,6 +125,7 @@ exit 2
 struct PathInjectingRunner {
     path: String,
     blobs: Mutex<HashMap<BlobHash, Vec<u8>>>,
+    image_ids: Mutex<HashMap<String, String>>,
 }
 
 impl PathInjectingRunner {
@@ -128,6 +133,7 @@ impl PathInjectingRunner {
         Self {
             path: format!("{}:/usr/bin:/bin", path.display()),
             blobs: Mutex::new(HashMap::new()),
+            image_ids: Mutex::new(HashMap::new()),
         }
     }
     fn add_blob(&self, hash: BlobHash, bytes: Vec<u8>) {
@@ -145,6 +151,14 @@ impl ContainerRunner for PathInjectingRunner {
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
+            if argv.get(1).map(String::as_str) == Some("tag")
+                && let (Some(id), Some(image)) = (argv.get(2), argv.get(3))
+            {
+                self.image_ids
+                    .lock()
+                    .unwrap()
+                    .insert(image.clone(), id.clone());
+            }
             Ok(())
         } else {
             Err(format!("{cmd} exited {:?}", status.code()))
@@ -162,9 +176,15 @@ impl ContainerRunner for PathInjectingRunner {
             .spawn()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(stdin_bytes)
-                .map_err(|e| format!("write stdin: {e}"))?;
+            if let Err(error) = stdin.write_all(stdin_bytes) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("write stdin: {error}"));
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("spawned {cmd} without a writable stdin pipe"));
         }
         let status = child.wait().map_err(|e| format!("wait {cmd}: {e}"))?;
         if status.success() {
@@ -186,6 +206,10 @@ impl ContainerRunner for PathInjectingRunner {
             return Err(format!("{cmd} exited {:?}", out.status.code()));
         }
         Ok(out.stdout)
+    }
+
+    fn probe_image_id(&self, _runtime: &str, image: &str) -> Result<Option<String>, String> {
+        Ok(self.image_ids.lock().unwrap().get(image).cloned())
     }
 
     fn load_stash_tarball(&self, hash: &BlobHash) -> Option<Vec<u8>> {
@@ -223,6 +247,9 @@ fn rmi_reverse_runs_docker_load_with_captured_tarball() {
 
     let recorded = fs::read(record_dir.path().join("stdin-load")).expect("stub recorded stdin");
     assert_eq!(recorded, SAMPLE_TAR);
+    let tag = fs::read_to_string(record_dir.path().join("argv-tag"))
+        .expect("stub recorded explicit immutable-id retag");
+    assert_eq!(tag.trim(), "tag sha256:abc nginx:1.25");
 }
 
 #[test]

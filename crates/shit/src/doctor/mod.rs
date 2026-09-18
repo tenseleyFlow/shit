@@ -772,7 +772,7 @@ fn caveats_for(fs: &FsKind, picked: Option<&CowTier>) -> Vec<String> {
             out.push("XFS: reflink requires the volume to have been made with reflink=1; if FICLONE returns EOPNOTSUPP at runtime we fall through to copy_file_range".to_string());
         }
         (FsKind::Zfs, _) => {
-            out.push("ZFS: per-file zfs clone is not used in v1 (snapshot-granularity only); see snapper-style integration in a later sprint".to_string());
+            out.push("ZFS: the experimental clone engine is not wired into production capture; the active FreeBSD helper remains kqueue + bounded staging copy".to_string());
         }
         (FsKind::Overlayfs, _) => {
             out.push("overlayfs (likely a container): tier detection is best-effort; streaming fallback always works".to_string());

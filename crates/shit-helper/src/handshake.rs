@@ -13,97 +13,23 @@ use std::os::fd::RawFd;
 
 use crate::ipc::{Conn, ConnError};
 
-/// Per-platform capture-tier classifier reported in the handshake
-/// ack (DR-66). The string surfaces in `shit metrics` and the
-/// telemetry stream so operators can tell *which* tier is actually
-/// running — Linux can degrade from bpf-lsm → fanotify → inotify;
-/// FreeBSD's preload-shim is best-effort; the daemon needs to know.
-/// M03.x.POWER-USER.3 — classify the active capture tier AND return
-/// a structured reason when it degraded from the intended target.
-/// Used by [`perform_helper_side`] to populate the
-/// `HelperResponse::HandshakeAck::{kernel_tier, degraded_reason}`
-/// fields so the daemon's doctor surface can lead the user to a
-/// specific fix.
+/// Capture tier resolved by the caller after the real producer has started.
 ///
-/// The string in `.1` mirrors the helper's ES probe outcome enum
-/// (`NotEntitled`, `NotPrivileged`, etc.) with a brief remediation
-/// hint. `.1 = None` when either the tier is the intended one or
-/// the platform doesn't have a degraded ES path to explain.
-///
-/// Pre-M03.x.POWER-USER.3 this was a `kernel_tier_classifier() ->
-/// &'static str`; the new shape returns a tuple so the wire can
-/// carry both pieces in one pass over the probe (the ES probe is a
-/// few-µs syscall but still worth avoiding a duplicate).
-pub fn classify_kernel_tier() -> (&'static str, Option<String>) {
-    #[cfg(target_os = "linux")]
-    {
-        // DR-01..04 light up bpf-lsm; until then the helper falls
-        // back to fanotify-perm (DR-08). The string mirrors the
-        // expected production tier so the operator sees the right
-        // banner during Stage 1 even though the runtime is degraded.
-        ("fanotify", None)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // M03.1.I.6: runtime probe of EndpointSecurity. The probe
-        // creates + immediately drops a minimal ES client (a few µs)
-        // and returns Success when the binary is entitled + the
-        // env (SIP+AuthRoot+AMFI bypass in dev, signed binary in
-        // prod) accepts the entitlement. Anywhere else → still on
-        // FSEvents degraded tier. The producer (`capture::macos_es`)
-        // ALSO runs alongside FSEvents per Decision 3 of the
-        // M03.1.I design; this string just tells the daemon which
-        // tier is the source of truth for content-bearing events.
-        use crate::es::probe::{ProbeResult, probe_client_creation};
-        match probe_client_creation() {
-            ProbeResult::Success => ("endpoint-security", None),
-            r => {
-                let reason = describe_es_probe_failure(&r);
-                ("fsevents-degraded", Some(reason))
-            }
-        }
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        ("kqueue", None)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
-    {
-        ("unsupported", None)
-    }
+/// A probe or compile-time platform guess is not sufficient for the handshake:
+/// Linux may fall back from eBPF-LSM to fanotify, and macOS/BSD producer startup
+/// may fail after their prerequisites appeared usable.  Keeping this value as
+/// an explicit input makes `HandshakeAck` a statement about live runtime state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveCaptureTier {
+    pub kernel_tier: String,
+    pub degraded_reason: Option<String>,
 }
 
-/// macOS-only: map an ES probe failure to a human-readable
-/// remediation hint the daemon's doctor surface can show.
-#[cfg(target_os = "macos")]
-fn describe_es_probe_failure(r: &crate::es::probe::ProbeResult) -> String {
-    use crate::es::probe::ProbeResult;
-    match r {
-        ProbeResult::Success => unreachable!("caller handles SUCCESS path"),
-        ProbeResult::NotEntitled => {
-            "ES NotEntitled — helper binary lacks the ES entitlement, OR AMFI is \
-             rejecting the claim (run `shit setup-es-mode --check`)"
-                .into()
-        }
-        ProbeResult::NotPermitted => {
-            "ES NotPermitted — entitlement OK but Full Disk Access not granted \
-             (System Settings → Privacy & Security → Full Disk Access)"
-                .into()
-        }
-        ProbeResult::NotPrivileged => {
-            "ES NotPrivileged — helper not running as root (production runs via \
-             shitd with elevation; dev runs need sudo)"
-                .into()
-        }
-        ProbeResult::InvalidArgument => "ES InvalidArgument (probe bug)".into(),
-        ProbeResult::InternalError => "ES InternalError (host-side ES issue)".into(),
-        ProbeResult::TooManyClients => {
-            "ES TooManyClients — host is saturated with ES subscribers; close \
-             other ES clients (XDR/EDR agents) before retrying"
-                .into()
-        }
-        ProbeResult::UnknownResult(raw) => {
-            format!("ES UnknownResult({raw}) — kernel returned an unrecognized status")
+impl ActiveCaptureTier {
+    pub fn new(kernel_tier: impl Into<String>, degraded_reason: Option<String>) -> Self {
+        Self {
+            kernel_tier: kernel_tier.into(),
+            degraded_reason,
         }
     }
 }
@@ -125,25 +51,48 @@ pub enum HandshakeError {
 }
 
 /// Outcome of a successful handshake — the cap set both sides agreed to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HandshakeOutcome {
     pub daemon_pid: u32,
     pub daemon_uid: u32,
     pub granted: HelperCaps,
+    pub kernel_tier: String,
+    pub degraded_reason: Option<String>,
 }
 
-/// Drive the helper side of the handshake.
+/// Authenticated first half of the helper handshake.
 ///
-/// `expected_daemon_pid` / `expected_daemon_uid` come from the CLI args
-/// the daemon-spawned helper was given. `local_caps` is what we *can*
-/// offer (computed by the caller from platform + privilege). We grant
-/// the intersection of what the daemon asks for and what we can do.
-pub fn perform_helper_side(
+/// The fields are private so only this module can mint a value after checking
+/// both socket peer credentials and the daemon's `Handshake` payload. Runtime
+/// capture producers may start only after the caller holds this token.
+#[derive(Debug)]
+pub struct AuthenticatedHandshake {
+    daemon_pid: u32,
+    daemon_uid: u32,
+    capability_request: HelperCaps,
+}
+
+impl AuthenticatedHandshake {
+    pub fn daemon_pid(&self) -> u32 {
+        self.daemon_pid
+    }
+
+    pub fn daemon_uid(&self) -> u32 {
+        self.daemon_uid
+    }
+}
+
+/// Authenticate the socket peer and consume its handshake hello without
+/// sending an acknowledgment yet.
+///
+/// Splitting authentication from acknowledgment lets the caller start the
+/// real producer against an authenticated daemon, then truthfully report the
+/// producer and capabilities that reached their live boundary.
+pub fn authenticate_helper_side(
     conn: &Conn,
     expected_daemon_pid: u32,
     expected_daemon_uid: u32,
-    local_caps: HelperCaps,
-) -> Result<HandshakeOutcome, HandshakeError> {
+) -> Result<AuthenticatedHandshake, HandshakeError> {
     let (peer_pid, peer_uid) = peer_cred(conn.as_raw_fd())?;
     if peer_pid != expected_daemon_pid {
         return Err(HandshakeError::PidMismatch {
@@ -192,8 +141,22 @@ pub fn perform_helper_side(
         });
     }
 
-    let granted = capability_request.intersect(local_caps);
-    let (tier, degraded_reason) = classify_kernel_tier();
+    Ok(AuthenticatedHandshake {
+        daemon_pid,
+        daemon_uid,
+        capability_request,
+    })
+}
+
+/// Finish an authenticated handshake after capture startup has resolved.
+/// `local_caps` and `active_capture` must describe the same live producers.
+pub fn acknowledge_helper_side(
+    conn: &Conn,
+    authenticated: AuthenticatedHandshake,
+    local_caps: HelperCaps,
+    active_capture: ActiveCaptureTier,
+) -> Result<HandshakeOutcome, HandshakeError> {
+    let granted = authenticated.capability_request.intersect(local_caps);
     let self_verify = self_verify_report();
     let ack = HelperResponse::HandshakeAck {
         helper_pid: std::process::id(),
@@ -201,8 +164,8 @@ pub fn perform_helper_side(
         protocol_version: HELPER_PROTOCOL_VERSION,
         granted,
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
-        kernel_tier: tier.to_string(),
-        degraded_reason,
+        kernel_tier: active_capture.kernel_tier.clone(),
+        degraded_reason: active_capture.degraded_reason.clone(),
         self_verify,
     };
     // DR-64 fault-injection: crash mid-reply. The daemon must
@@ -214,9 +177,11 @@ pub fn perform_helper_side(
     shit_proto::fault_inject::maybe_inject("helper.handshake.after_ack_send");
 
     Ok(HandshakeOutcome {
-        daemon_pid,
-        daemon_uid,
+        daemon_pid: authenticated.daemon_pid,
+        daemon_uid: authenticated.daemon_uid,
         granted,
+        kernel_tier: active_capture.kernel_tier,
+        degraded_reason: active_capture.degraded_reason,
     })
 }
 
@@ -241,8 +206,8 @@ pub fn perform_daemon_side(
         protocol_version,
         granted,
         helper_version: _,
-        kernel_tier: _,
-        degraded_reason: _,
+        kernel_tier,
+        degraded_reason,
         self_verify: _,
     } = resp
     else {
@@ -258,6 +223,8 @@ pub fn perform_daemon_side(
         daemon_pid: helper_pid,
         daemon_uid: helper_uid,
         granted,
+        kernel_tier,
+        degraded_reason,
     })
 }
 
@@ -381,22 +348,57 @@ mod tests {
     use crate::ipc::socketpair;
     use std::thread;
 
+    fn active_tier(name: &str) -> ActiveCaptureTier {
+        ActiveCaptureTier::new(name, None)
+    }
+
+    fn complete_handshake(
+        conn: &Conn,
+        expected_pid: u32,
+        expected_uid: u32,
+        local_caps: HelperCaps,
+        tier: ActiveCaptureTier,
+    ) -> Result<HandshakeOutcome, HandshakeError> {
+        let authenticated = authenticate_helper_side(conn, expected_pid, expected_uid)?;
+        acknowledge_helper_side(conn, authenticated, local_caps, tier)
+    }
+
     #[test]
     fn handshake_round_trip_via_socketpair() {
         let (client, server) = socketpair().unwrap();
         let expected_pid = std::process::id();
         let expected_uid = current_uid();
 
-        let server_thread = thread::spawn(move || {
-            perform_helper_side(&server, expected_pid, expected_uid, HelperCaps::full())
+        let (authenticated_tx, authenticated_rx) = std::sync::mpsc::channel();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let server_thread = thread::spawn(move || -> Result<_, HandshakeError> {
+            let authenticated = authenticate_helper_side(&server, expected_pid, expected_uid)?;
+            authenticated_tx.send(()).unwrap();
+            ack_rx.recv().unwrap();
+            acknowledge_helper_side(
+                &server,
+                authenticated,
+                HelperCaps::full(),
+                active_tier("bpf-lsm"),
+            )
         });
 
-        let outcome_daemon = perform_daemon_side(&client, HelperCaps::full()).unwrap();
+        let daemon_thread = thread::spawn(move || perform_daemon_side(&client, HelperCaps::full()));
+        authenticated_rx.recv().unwrap();
+        assert!(
+            !daemon_thread.is_finished(),
+            "authentication must not send HandshakeAck before capture startup resolves"
+        );
+        ack_tx.send(()).unwrap();
+        let outcome_daemon = daemon_thread.join().unwrap().unwrap();
         let outcome_helper = server_thread.join().unwrap().unwrap();
         assert_eq!(outcome_helper.daemon_pid, expected_pid);
         assert_eq!(outcome_helper.daemon_uid, expected_uid);
         assert_eq!(outcome_helper.granted, HelperCaps::full());
         assert_eq!(outcome_daemon.granted, HelperCaps::full());
+        assert_eq!(outcome_helper.kernel_tier, "bpf-lsm");
+        assert_eq!(outcome_daemon.kernel_tier, "bpf-lsm");
+        assert_eq!(outcome_daemon.degraded_reason, None);
     }
 
     #[test]
@@ -411,19 +413,50 @@ mod tests {
         };
 
         let server_thread = thread::spawn(move || {
-            perform_helper_side(&server, expected_pid, expected_uid, helper_local)
+            complete_handshake(
+                &server,
+                expected_pid,
+                expected_uid,
+                helper_local,
+                active_tier("fanotify"),
+            )
         });
         let outcome = perform_daemon_side(&client, HelperCaps::full()).unwrap();
         let helper_outcome = server_thread.join().unwrap().unwrap();
         assert_eq!(outcome.granted, helper_local);
         assert_eq!(helper_outcome.granted, helper_local);
+        assert_eq!(outcome.kernel_tier, "fanotify");
     }
 
     #[test]
     fn handshake_refuses_wrong_pid() {
         let (_client, server) = socketpair().unwrap();
         let wrong_pid = std::process::id().wrapping_add(1);
-        let res = perform_helper_side(&server, wrong_pid, current_uid(), HelperCaps::full());
+        let res = authenticate_helper_side(&server, wrong_pid, current_uid());
         assert!(matches!(res, Err(HandshakeError::PidMismatch { .. })));
+    }
+
+    #[test]
+    fn handshake_ack_uses_resolved_tier_and_reason_exactly() {
+        let (client, server) = socketpair().unwrap();
+        let expected_pid = std::process::id();
+        let expected_uid = current_uid();
+        let reason = "EndpointSecurity producer startup failed: NotEntitled".to_string();
+        let expected_reason = reason.clone();
+
+        let server_thread = thread::spawn(move || {
+            complete_handshake(
+                &server,
+                expected_pid,
+                expected_uid,
+                HelperCaps::full(),
+                ActiveCaptureTier::new("fsevents-degraded", Some(reason)),
+            )
+        });
+        let outcome = perform_daemon_side(&client, HelperCaps::full()).unwrap();
+        server_thread.join().unwrap().unwrap();
+
+        assert_eq!(outcome.kernel_tier, "fsevents-degraded");
+        assert_eq!(outcome.degraded_reason, Some(expected_reason));
     }
 }

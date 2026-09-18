@@ -41,8 +41,9 @@ enum State {
     /// Helper hasn't signaled WatchTreeReady yet. The Vec is the list
     /// of oneshot senders we'll drain when readiness lands.
     Pending(Vec<oneshot::Sender<Result<(), String>>>),
-    /// Helper has signaled. Subsequent waiters complete immediately.
-    Ready,
+    /// Helper has signaled. `wait_observed` becomes sticky only after a
+    /// WaitWatchReady request itself reaches the ready result.
+    Ready { wait_observed: bool },
     /// Capture failed before readiness (or became known-incomplete later).
     /// Preserve the first reason so a stray/late Ready cannot erase it.
     Failed(String),
@@ -75,7 +76,12 @@ impl WatchReadyMap {
                 false
             }
             Some(State::Pending(senders)) => {
-                map.insert(cmd, State::Ready);
+                map.insert(
+                    cmd,
+                    State::Ready {
+                        wait_observed: false,
+                    },
+                );
                 for sender in senders {
                     // Receiver may have dropped (caller timed out). That's
                     // fine; ignore.
@@ -83,8 +89,17 @@ impl WatchReadyMap {
                 }
                 true
             }
-            Some(State::Ready) | None => {
-                map.insert(cmd, State::Ready);
+            Some(State::Ready { wait_observed }) => {
+                map.insert(cmd, State::Ready { wait_observed });
+                true
+            }
+            None => {
+                map.insert(
+                    cmd,
+                    State::Ready {
+                        wait_observed: false,
+                    },
+                );
                 true
             }
         }
@@ -106,7 +121,7 @@ impl WatchReadyMap {
                     let _ = sender.send(Err(reason.clone()));
                 }
             }
-            Some(State::Ready) | None => {
+            Some(State::Ready { .. }) | None => {
                 map.insert(cmd, State::Failed(reason));
             }
         }
@@ -120,7 +135,7 @@ impl WatchReadyMap {
         let (tx, rx) = oneshot::channel();
         let mut map = self.inner.lock().unwrap();
         match map.get_mut(&cmd) {
-            Some(State::Ready) => {
+            Some(State::Ready { .. }) => {
                 // Already ready; fire the receiver synchronously.
                 let _ = tx.send(Ok(()));
             }
@@ -135,6 +150,33 @@ impl WatchReadyMap {
             }
         }
         rx
+    }
+
+    /// Record that the daemon-side WaitWatchReady request reached a successful
+    /// ready result. Helper readiness alone is insufficient: without this
+    /// proof the shell may have begun executing before capture attached.
+    pub fn mark_wait_observed(&self, cmd: CommandId) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(&cmd) {
+            Some(State::Ready { wait_observed }) => {
+                *wait_observed = true;
+                true
+            }
+            Some(State::Pending(_) | State::Failed(_)) | None => false,
+        }
+    }
+
+    /// Whether a WaitWatchReady request reached `ready=true` for this exact
+    /// command. The bit remains sticky until command finalization forgets it.
+    pub fn wait_was_observed(&self, cmd: CommandId) -> bool {
+        self.inner.lock().unwrap().get(&cmd).is_some_and(|state| {
+            matches!(
+                state,
+                State::Ready {
+                    wait_observed: true
+                }
+            )
+        })
     }
 
     /// Drop the entry for a finished command. Called from the
@@ -175,14 +217,27 @@ mod tests {
             m2.mark_ready(cmd(1));
         });
         rx.await.unwrap().unwrap();
+        assert!(!map.wait_was_observed(cmd(1)));
+        assert!(map.mark_wait_observed(cmd(1)));
+        assert!(map.wait_was_observed(cmd(1)));
     }
 
     #[tokio::test]
     async fn ready_before_wait_completes_immediately() {
         let map = WatchReadyMap::new();
         map.mark_ready(cmd(2));
+        assert!(!map.wait_was_observed(cmd(2)));
         let rx = map.await_ready(cmd(2));
         rx.await.unwrap().unwrap();
+        assert!(map.mark_wait_observed(cmd(2)));
+        assert!(map.wait_was_observed(cmd(2)));
+    }
+
+    #[test]
+    fn helper_ready_without_wait_is_not_execution_proof() {
+        let map = WatchReadyMap::new();
+        assert!(map.mark_ready(cmd(20)));
+        assert!(!map.wait_was_observed(cmd(20)));
     }
 
     #[tokio::test]
@@ -212,10 +267,13 @@ mod tests {
         let rx = map.await_ready(cmd(5));
         map.mark_failed(cmd(5), "baseline incomplete");
         assert_eq!(rx.await.unwrap().unwrap_err(), "baseline incomplete");
+        assert!(!map.mark_wait_observed(cmd(5)));
+        assert!(!map.wait_was_observed(cmd(5)));
 
         assert!(!map.mark_ready(cmd(5)));
         let late = map.await_ready(cmd(5));
         assert_eq!(late.await.unwrap().unwrap_err(), "baseline incomplete");
+        assert!(!map.wait_was_observed(cmd(5)));
     }
 
     #[tokio::test]

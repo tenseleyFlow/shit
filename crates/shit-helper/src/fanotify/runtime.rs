@@ -3,9 +3,9 @@
 //! Runtime glue between the fanotify kernel-tier modules.
 //!
 //! S08 contract: the reader thread owns the read+write loop on the
-//! fanotify fd. For every permission event it returns `ALLOW`
-//! immediately — capture-vs-allow decisions land in S11 once the
-//! undo executor and daemon-side AuthDecision logic exist.
+//! fanotify fd. For every permission event it obtains the capture runtime's
+//! fail-closed verdict, writes that response, and closes the kernel-provided
+//! event descriptor.
 //!
 //! Architecture:
 //!
@@ -13,7 +13,7 @@
 //!   ┌─────────────────────────────┐
 //!   │ reader_thread (blocking)    │
 //!   │   poll → read → process →   │
-//!   │     ALLOW → writev          │
+//!   │     verdict → writev        │
 //!   └─────────────────────────────┘
 //!         shares Arc<FanotifyState>
 //!   ┌─────────────────────────────┐
@@ -26,6 +26,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -157,6 +158,34 @@ impl Clone for FanotifyState {
     }
 }
 
+/// Owns the per-event descriptors installed by a fanotify read. They must stay
+/// open through capture and the permission response, then be closed exactly
+/// once regardless of a later parse/write failure.
+#[derive(Default)]
+struct EventFdBatch {
+    fds: Vec<RawFd>,
+}
+
+impl EventFdBatch {
+    fn record(&mut self, fd: RawFd) {
+        if fd >= 0 {
+            self.fds.push(fd);
+        }
+    }
+}
+
+impl Drop for EventFdBatch {
+    fn drop(&mut self) {
+        for fd in self.fds.drain(..) {
+            // SAFETY: every nonnegative descriptor came from exactly one
+            // kernel fanotify event and ownership transfers to userspace when
+            // that event is read. close(2) errors need no retry: after EINTR,
+            // the descriptor's state is unspecified on Linux.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 fn process_readable_batch(state: &FanotifyState, buf: &mut [u8]) -> Result<(), LoopError> {
     let bytes = read_step(&state.fd, buf)?;
     if bytes.is_empty() {
@@ -166,17 +195,27 @@ fn process_readable_batch(state: &FanotifyState, buf: &mut [u8]) -> Result<(), L
     let events_seen = Arc::clone(&state.events_seen);
     let tree = Arc::clone(&state.tree);
     let runtime = state.capture_runtime.as_ref().map(Arc::clone);
-    let responses = process_batch(
+    let mut event_fds = EventFdBatch::default();
+    let outcome = process_batch(
         bytes,
         |ev| {
             // Keep the tree guard until the runtime callback completes. The
             // detach path takes the same tree->runtime order, preventing a
             // resolved event from crossing command-state teardown.
-            let mut tg = tree.lock().ok()?;
+            let mut tg = match tree.lock() {
+                Ok(tree) => tree,
+                Err(_) => {
+                    tracing::error!(
+                        pid = ev.pid,
+                        "fanotify process-tree lock poisoned; denying permission event"
+                    );
+                    return Some(Decision::Deny);
+                }
+            };
             let Some((session, command_seq)) = tg.is_tracked(ev.pid) else {
                 return Some(Decision::Allow);
             };
-            if let Some(rt) = runtime.as_ref() {
+            let decision = if let Some(rt) = runtime.as_ref() {
                 let kind = if (ev.mask & libc::FAN_OPEN_EXEC_PERM) != 0 {
                     FanotifyCaptureKind::OpenExec
                 } else {
@@ -192,18 +231,36 @@ fn process_readable_batch(state: &FanotifyState, buf: &mut [u8]) -> Result<(), L
                     kind,
                     _life: std::marker::PhantomData,
                 };
-                if let Ok(mut g) = rt.lock() {
-                    g.handle_event(&view);
+                match rt.lock() {
+                    Ok(mut capture) => capture.handle_event(&view),
+                    Err(_) => {
+                        tracing::error!(
+                            pid = ev.pid,
+                            "fanotify capture runtime lock poisoned; denying tracked mutation"
+                        );
+                        Decision::Deny
+                    }
                 }
-            }
+            } else {
+                tracing::error!(
+                    pid = ev.pid,
+                    "fanotify capture runtime unavailable; denying tracked mutation"
+                );
+                Decision::Deny
+            };
             drop(tg);
-            Some(Decision::Allow)
+            Some(decision)
         },
-        |_ev| {
+        |ev| {
             events_seen.fetch_add(1, Ordering::Relaxed);
+            event_fds.record(ev.fd);
         },
     )?;
-    write_responses(&state.fd, &responses)
+    write_responses(&state.fd, &outcome.responses)?;
+    if outcome.overflowed {
+        return Err(LoopError::QueueOverflow);
+    }
+    Ok(())
 }
 
 fn flush_fanotify_reader(
@@ -230,8 +287,8 @@ fn flush_fanotify_reader(
 }
 
 /// Reader thread entry point. Blocks on the fanotify fd via `poll(2)`,
-/// reads up to 64 KiB of events at a time, decides ALLOW for each,
-/// writes the response batch back atomically.
+/// reads up to 64 KiB of events at a time, obtains a verdict for each,
+/// and writes every response back before closing the event descriptors.
 ///
 /// Exits when `state.shutdown` is set, when a kernel queue overflow
 /// fires (session is degraded — daemon should re-init), or when a
@@ -311,6 +368,23 @@ pub fn reader_thread(state: FanotifyState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_fd_batch_closes_every_recorded_descriptor() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        {
+            let mut batch = EventFdBatch::default();
+            batch.record(pipe_fds[0]);
+            batch.record(-1);
+        }
+        assert_eq!(unsafe { libc::fcntl(pipe_fds[0], libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        unsafe { libc::close(pipe_fds[1]) };
+    }
 
     #[test]
     fn fanotify_state_clone_shares_inner_arcs() {

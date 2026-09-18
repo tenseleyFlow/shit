@@ -362,6 +362,14 @@ pub trait InverseOpExecutor {
     fn begin_plan_execution(&self, _dry_run: bool) {}
     fn finish_plan_execution(&self) {}
 
+    /// Validate immutable recovery material required by `op` without changing
+    /// live state. The orchestrator runs this for every selected operation
+    /// before it executes any operation in the plan, preventing a missing or
+    /// corrupt later blob from leaving earlier mutations partially applied.
+    fn preflight(&self, _op: &InverseOp) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Does this executor handle `op`?
     fn supports(&self, op: &InverseOp) -> bool;
 

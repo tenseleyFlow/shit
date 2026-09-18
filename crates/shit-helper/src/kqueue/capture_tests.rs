@@ -195,6 +195,19 @@ fn stream_copies_small_file_identically_to_read_pre_image() {
     .expect("stream copy");
 
     assert_eq!(total, payload.len() as u64);
+    assert_eq!(
+        std::fs::read_dir(staging_dir.path()).unwrap().count(),
+        0,
+        "staging pathname must be removed before the fd is returned"
+    );
+    let flags = unsafe { libc::fcntl(staging_fd.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
+    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+    assert_eq!(
+        unsafe { libc::lseek(staging_fd.as_raw_fd(), 0, libc::SEEK_CUR) },
+        0,
+        "returned staging descriptor must be rewound"
+    );
 
     // Hash matches a known-good blake3 of the same bytes.
     let expected = *blake3::hash(&payload).as_bytes();

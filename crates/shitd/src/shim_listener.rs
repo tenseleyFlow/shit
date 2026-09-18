@@ -16,12 +16,10 @@
 //!    small and large frames).
 //! 2. Resolve `pid → CommandId` via `ActiveCommands::resolve_by_descendant`.
 //!    If no active command owns the emitter, the event is orphan
-//!    and dropped silently (the shim still gets an Allow ack — we
-//!    never block a user command on an attribution miss).
-//! 3. Send a best-effort `Allow` ack once the notification is decoded and
-//!    attributed. A peer that times out/closes before reading it must not
-//!    discard the already-received capture.
-//! 4. Validate and classify:
+//!    and receives no success acknowledgement.
+//! 3. Register the fully decoded + attributed frame in the shared ingest
+//!    tracker before journal work begins.
+//! 4. Validate, classify, and durably journal evidence or CaptureRefused:
 //!    - `unlink`/`unlinkat`/`rmdir`/`remove` → `TreeOp::Unlink`
 //!    - `rename`/`renameat` → `TreeOp::Rename`  (arg is `from\tto`)
 //!    - `open`/`openat`/`truncate` with `pre_image=Some(_)` →
@@ -29,8 +27,9 @@
 //!      `TreeOp::Create` or an explicit capture refusal.
 //!    - `pwrite` / `ftruncate` / `mmap_shared_w` — logged but not
 //!      journaled (fd-based — needs fd→path resolution; deferred).
-//! 5. For content events: write blob bytes to the BlobStore, journal
-//!    `FilePreImage`. For TreeOp events: journal directly.
+//! 5. Only after durable evidence/refusal, or explicit routing to the ordered
+//!    kernel tier, send a best-effort `Allow` ack. An ack write failure never
+//!    discards evidence already received.
 //!
 //! The locked design decision is **fan-in** (single daemon-side socket,
 //! 100-conn pool) rather than fan-out per process.
@@ -46,9 +45,10 @@ use shit_proto::{
     ShimAck, ShimNotification, ShimPreImage, decode_shim_notification_frame_large, encode_frame,
 };
 use shit_store::{BlobStore, Index};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
@@ -63,9 +63,228 @@ use tracing::{debug, info, warn};
 /// rejected before allocation.
 const SHIM_BUF_MAX: usize = shit_proto::MAX_LARGE_FRAME_SIZE;
 
+/// Tracks shim frames after they have been fully decoded. PostExec snapshots a
+/// decode-ticket watermark and seals its command; finalization then waits for
+/// every older decoded-but-not-yet-attributed frame and every attributed frame
+/// for that command.
+///
+/// This intentionally does **not** cover connections still in the accept
+/// backlog, frames not yet fully decoded, frames that never reached the
+/// socket, or attribution that becomes impossible after the producer exits.
+/// Those require a listener barrier plus a sender-side durable marker.
+#[derive(Debug, Default)]
+pub(crate) struct ShimIngestTracker {
+    inner: Mutex<ShimIngestTrackerInner>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct ShimIngestTrackerInner {
+    next_ticket: u64,
+    decoded_unattributed: BTreeSet<u64>,
+    commands: BTreeMap<shit_planner::CommandId, ShimCommandIngestState>,
+}
+
+#[derive(Debug, Default)]
+struct ShimCommandIngestState {
+    in_flight: usize,
+    sealed: bool,
+    late_registration: bool,
+}
+
+pub(crate) struct DecodedShimGuard {
+    tracker: Arc<ShimIngestTracker>,
+    ticket: Option<u64>,
+}
+
+pub(crate) struct ShimIngestRegistration {
+    tracker: Arc<ShimIngestTracker>,
+    command: shit_planner::CommandId,
+    late: bool,
+}
+
+pub(crate) struct PendingShimDrain {
+    tracker: Arc<ShimIngestTracker>,
+    command: shit_planner::CommandId,
+    decode_watermark: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ShimDrainError {
+    #[error("shim notification registered after the PostExec seal")]
+    LateRegistration,
+    #[error(
+        "timed out with {in_flight} attributed shim notification(s) and {decoded_unattributed} decoded unattributed notification(s) pending"
+    )]
+    TimedOut {
+        in_flight: usize,
+        decoded_unattributed: usize,
+    },
+}
+
+impl ShimIngestTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a frame immediately after successful full-frame decode.
+    pub(crate) fn begin_decoded(self: &Arc<Self>) -> DecodedShimGuard {
+        let ticket = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.next_ticket = inner.next_ticket.saturating_add(1);
+            let ticket = inner.next_ticket;
+            inner.decoded_unattributed.insert(ticket);
+            ticket
+        };
+        self.changed.notify_waiters();
+        DecodedShimGuard {
+            tracker: Arc::clone(self),
+            ticket: Some(ticket),
+        }
+    }
+
+    /// Seal a command at the synchronous PostExec boundary. Tombstones remain
+    /// for the daemon lifetime so a later decoded frame cannot reopen it.
+    pub(crate) fn seal(self: &Arc<Self>, command: shit_planner::CommandId) -> PendingShimDrain {
+        let decode_watermark = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.commands.entry(command).or_default().sealed = true;
+            inner.next_ticket
+        };
+        self.changed.notify_waiters();
+        PendingShimDrain {
+            tracker: Arc::clone(self),
+            command,
+            decode_watermark,
+        }
+    }
+
+    #[cfg(test)]
+    fn state_for_test(&self, command: shit_planner::CommandId) -> (usize, bool, bool) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .commands
+            .get(&command)
+            .map(|state| (state.in_flight, state.sealed, state.late_registration))
+            .unwrap_or_default()
+    }
+}
+
+impl DecodedShimGuard {
+    /// Atomically move a decoded ticket into a command's in-flight count.
+    /// The returned guard spans all journal/refusal writes for the frame.
+    pub(crate) fn attribute(mut self, command: shit_planner::CommandId) -> ShimIngestRegistration {
+        let ticket = self.ticket.take().expect("decoded ticket consumed once");
+        let late = {
+            let mut inner = self
+                .tracker
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.decoded_unattributed.remove(&ticket);
+            let state = inner.commands.entry(command).or_default();
+            let late = state.sealed;
+            state.late_registration |= late;
+            state.in_flight = state.in_flight.saturating_add(1);
+            late
+        };
+        self.tracker.changed.notify_waiters();
+        ShimIngestRegistration {
+            tracker: Arc::clone(&self.tracker),
+            command,
+            late,
+        }
+    }
+}
+
+impl ShimIngestRegistration {
+    pub(crate) fn is_late(&self) -> bool {
+        self.late
+    }
+}
+
+impl Drop for DecodedShimGuard {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        self.tracker
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoded_unattributed
+            .remove(&ticket);
+        self.tracker.changed.notify_waiters();
+    }
+}
+
+impl Drop for ShimIngestRegistration {
+    fn drop(&mut self) {
+        let mut inner = self
+            .tracker
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = inner.commands.get_mut(&self.command) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        drop(inner);
+        self.tracker.changed.notify_waiters();
+    }
+}
+
+impl PendingShimDrain {
+    pub(crate) async fn wait(self, timeout: Duration) -> Result<(), ShimDrainError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Register the waiter before inspecting state so a transition
+            // between the inspection and await cannot be lost.
+            let changed = self.tracker.changed.notified();
+            let snapshot = {
+                let inner = self
+                    .tracker
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let command = inner.commands.get(&self.command);
+                let in_flight = command.map_or(0, |state| state.in_flight);
+                let late = command.is_some_and(|state| state.late_registration);
+                let decoded_unattributed = inner
+                    .decoded_unattributed
+                    .range(..=self.decode_watermark)
+                    .count();
+                (in_flight, decoded_unattributed, late)
+            };
+            if snapshot.0 == 0 && snapshot.1 == 0 {
+                return if snapshot.2 {
+                    Err(ShimDrainError::LateRegistration)
+                } else {
+                    Ok(())
+                };
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return Err(ShimDrainError::TimedOut {
+                    in_flight: snapshot.0,
+                    decoded_unattributed: snapshot.1,
+                });
+            }
+        }
+    }
+}
+
 /// Listen on the shim socket inside `$XDG_RUNTIME_DIR/shit/shim.sock`,
 /// serving each accepted connection on its own tokio task. Returns when
 /// `shutdown` fires.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     cfg: &ResolvedConfig,
     shutdown: Arc<Notify>,
@@ -73,6 +292,8 @@ pub async fn serve(
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
     live_baseline: Arc<LiveBaseline>,
+    ingest_tracker: Arc<ShimIngestTracker>,
+    finalization_blocks: Arc<crate::server::FinalizationBlocks>,
 ) -> anyhow::Result<()> {
     let sock_path = shim_socket_path(cfg);
     if let Some(parent) = sock_path.parent() {
@@ -96,8 +317,18 @@ pub async fn serve(
                     let blob_store = Arc::clone(&blob_store);
                     let active = Arc::clone(&active);
                     let live_baseline = Arc::clone(&live_baseline);
+                    let ingest_tracker = Arc::clone(&ingest_tracker);
+                    let finalization_blocks = Arc::clone(&finalization_blocks);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_one(stream, index, blob_store, active, live_baseline).await {
+                        if let Err(e) = handle_one(
+                            stream,
+                            index,
+                            blob_store,
+                            active,
+                            live_baseline,
+                            ingest_tracker,
+                            finalization_blocks,
+                        ).await {
                             debug!(err = %e, "shim client errored");
                         }
                     });
@@ -115,14 +346,16 @@ pub async fn serve(
     }
 }
 
-/// Per-connection handler. One notification → resolve/reserve order →
-/// ack → best-effort ingest → close.
+/// Per-connection handler. One notification → decode/register → resolve →
+/// durable ingest/refusal → ack → close.
 async fn handle_one(
     mut stream: UnixStream,
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
     live_baseline: Arc<LiveBaseline>,
+    ingest_tracker: Arc<ShimIngestTracker>,
+    finalization_blocks: Arc<crate::server::FinalizationBlocks>,
 ) -> anyhow::Result<()> {
     // W06.A.4.1: dynamic-allocation buffer. Read the 4-byte u32 BE
     // length prefix exactly, then allocate a buffer sized to the
@@ -196,6 +429,7 @@ async fn handle_one(
             return Ok(());
         }
     };
+    let decoded = ingest_tracker.begin_decoded();
     debug!(
         pid = note.pid,
         syscall = %note.syscall,
@@ -215,33 +449,69 @@ async fn handle_one(
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    let resolved = active.resolve_by_descendant(note.pid);
+    let Some(command) = active.resolve_by_descendant(note.pid) else {
+        // This decoded frame cannot be authoritatively attached. Withholding
+        // the success ack is intentional; PID attribution after producer exit
+        // remains outside the tracker guarantee until the wire carries a
+        // validated CommandId claim.
+        debug!(pid = note.pid, syscall = %note.syscall, "shim notify: no active command for pid; withholding ack");
+        return Ok(());
+    };
+    let registration = decoded.attribute(command);
 
-    // Reserve this notification's daemon logical timestamp before the ACK.
-    // Ingestion remains fail-open and happens after the ACK, but the event
-    // keeps the order in which this listener accepted it.
+    // Reserve this notification's daemon logical timestamp before ingestion.
     let ingest_ts = crate::server::next_ts();
 
-    // Ack — never block the user's command on journaling. The shim's
-    // read deadline is deliberately short, so a slow ancestry lookup can
-    // leave us writing after the shim has already timed out and closed its
-    // socket. ACK delivery is therefore best-effort: once a complete valid
-    // notification has been decoded and attributed, an EPIPE must not throw
-    // away its pre-image.
+    let disposition = if registration.is_late() {
+        durable_shim_refusal(
+            &index,
+            command,
+            ingest_ts,
+            PathBuf::from(&note.arg),
+            "shim notification registered after the command's PostExec seal".to_string(),
+        )
+    } else {
+        ingest_notification(
+            &note,
+            command,
+            ingest_ts,
+            &index,
+            &blob_store,
+            &live_baseline,
+        )
+    };
+
+    let disposition = match disposition {
+        Ok(disposition) => disposition,
+        Err(error) => {
+            // Keep the in-flight registration live until the close block is
+            // installed. Otherwise PostExec could drain between guard drop
+            // and this insertion and publish a partially captured command.
+            finalization_blocks.insert(
+                command,
+                format!("shim ingest had no durable evidence or refusal: {error}"),
+            );
+            warn!(%command, %error, pid = note.pid, syscall = %note.syscall, "blocking command close after non-durable shim ingest");
+            drop(registration);
+            return Ok(());
+        }
+    };
+
+    // A durable disposition now exists. The drain covers journal work and
+    // close-block installation, not peer ack I/O.
+    drop(registration);
+
+    // ACK is after the durable shim disposition, except for explicit
+    // kernel-tier delegation. Delegation is accepted/routed here and fenced
+    // by the helper's ordered PostExec barrier; withholding its ACK would add
+    // the shim's full 50 ms timeout to every in-watch create in bulk workloads.
+    // The sender may already have timed out and closed; EPIPE cannot undo
+    // evidence already stored or the routing decision already made.
     let ack = ShimAck::Allow;
     let frame = encode_frame(&ack)?;
     if let Err(e) = stream.write_all(&frame).await {
-        debug!(err = %e, pid = note.pid, syscall = %note.syscall, "shim ack write failed; ingesting notification anyway");
+        debug!(err = %e, pid = note.pid, syscall = %note.syscall, ?disposition, "shim ack write failed after durable ingest");
     }
-
-    ingest_notification(
-        &note,
-        resolved,
-        ingest_ts,
-        &index,
-        &blob_store,
-        &live_baseline,
-    );
     Ok(())
 }
 
@@ -418,26 +688,55 @@ fn unsafe_replay_path(note: &ShimNotification) -> Option<(PathBuf, String)> {
     }
 }
 
-/// Convert a shim notification into a `CaptureEvent` and journal it,
-/// if the emitter's pid resolves to an active command. Errors are
-/// logged but never propagated — the shim path is best-effort.
+/// Explicit outcome of processing one attributed shim notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShimIngestDisposition {
+    EvidenceDurable,
+    RefusalDurable,
+    ExistingEvidenceDurable,
+    /// This operation is intentionally owned by the ordered kernel capture
+    /// tier. PostExec's helper barrier remains the durability boundary.
+    DelegatedToKernelTier,
+}
+
+fn durable_shim_refusal(
+    index: &Index,
+    command: shit_planner::CommandId,
+    ts: shit_planner::time::TimePoint,
+    path: PathBuf,
+    detail: String,
+) -> Result<ShimIngestDisposition, String> {
+    journal_capture_refused(index, command, ts, path, detail)
+        .map(|()| ShimIngestDisposition::RefusalDurable)
+        .map_err(|error| error.to_string())
+}
+
+fn fallback_shim_refusal(
+    index: &Index,
+    command: shit_planner::CommandId,
+    ts: shit_planner::time::TimePoint,
+    path: PathBuf,
+    context: &str,
+    error: impl std::fmt::Display,
+) -> Result<ShimIngestDisposition, String> {
+    let detail = format!("{context}: {error}");
+    durable_shim_refusal(index, command, ts, path, detail.clone()).map_err(|refusal_error| {
+        format!("{detail}; fallback CaptureRefused was not durable: {refusal_error}")
+    })
+}
+
+/// Convert one authoritatively attributed shim notification into durable
+/// evidence, a durable command refusal, or an explicit ordered-tier
+/// delegation. No error is swallowed: an `Err` means neither the intended
+/// evidence nor its refusal fallback was durable, so command close must block.
 fn ingest_notification(
     note: &ShimNotification,
-    resolved: Option<shit_planner::events::CommandId>,
+    command: shit_planner::events::CommandId,
     ingest_ts: shit_planner::time::TimePoint,
     index: &Index,
     blob_store: &BlobStore,
     live_baseline: &LiveBaseline,
-) {
-    let Some(command) = resolved else {
-        // The shim is loaded into a process whose ancestor isn't a
-        // tracked shell. Likely a background daemon / system service
-        // that picked up LD_PRELOAD from a parent env, OR the pid
-        // resolution raced the process's lifetime.
-        debug!(pid = note.pid, syscall = %note.syscall, "shim notify: no active command for pid; dropping");
-        return;
-    };
-
+) -> Result<ShimIngestDisposition, String> {
     // AU10 — a structured resolution failure means the shim could not prove
     // a stable target identity. Journal one refusal and stop: the protocol's
     // contract is explicitly "refusal instead of an inverse op". Falling
@@ -473,23 +772,7 @@ fn ingest_notification(
         // (not a canonicalized form) because the failure mode IS
         // that canonicalize couldn't resolve it — surfacing the
         // raw input is the honest signal.
-        if let Err(e) = journal_capture_refused(index, command, ingest_ts, primary_path, detail) {
-            warn!(
-                err = %e,
-                pid = note.pid,
-                syscall = %note.syscall,
-                "shim notify: CaptureRefused journal failed"
-            );
-        } else {
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                session = %command.session,
-                seq = command.seq,
-                "shim notify: journaled CaptureRefused (AU10)"
-            );
-        }
-        return;
+        return durable_shim_refusal(index, command, ingest_ts, primary_path, detail);
     }
 
     // Defense in depth for older shims and malformed/corrupt frames. Every
@@ -497,21 +780,7 @@ fn ingest_notification(
     // when it reaches the daemon. Never reinterpret a captured path using the
     // daemon's cwd or the future undo caller's cwd.
     if let Some((path, detail)) = unsafe_replay_path(note) {
-        if let Err(e) = journal_capture_refused(index, command, ingest_ts, path, detail) {
-            warn!(
-                err = %e,
-                pid = note.pid,
-                syscall = %note.syscall,
-                "shim notify: unsafe-path CaptureRefused journal failed"
-            );
-        } else {
-            warn!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                "shim notify: refused unsafe replay path"
-            );
-        }
-        return;
+        return durable_shim_refusal(index, command, ingest_ts, path, detail);
     }
 
     // M07.B.5: metadata-mutation syscalls (chmod/chown/xattr and legacy
@@ -560,63 +829,45 @@ fn ingest_notification(
             } else {
                 shit_planner::FilePreImageSource::ShimMetadataPreMutation
             };
-            if let Err(e) =
-                ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts)
-            {
-                warn!(
-                    err = %e,
-                    pid = note.pid,
-                    syscall = %note.syscall,
-                    "shim notify: metadata pre-image ingest failed"
-                );
-                if let Err(journal_err) = journal_capture_refused(
+            return match ingest_pre_image_with_source(
+                command, pre, index, blob_store, source, ingest_ts,
+            ) {
+                Ok(()) => Ok(ShimIngestDisposition::EvidenceDurable),
+                Err(error) => fallback_shim_refusal(
                     index,
                     command,
                     ingest_ts,
                     PathBuf::from(&pre.path),
-                    format!("metadata pre-image ingest failed: {e}"),
-                ) {
-                    warn!(err = %journal_err, pid = note.pid, syscall = %note.syscall, "shim notify: metadata-ingest CaptureRefused journal failed");
-                }
-            } else {
-                debug!(
-                    pid = note.pid,
-                    syscall = %note.syscall,
-                    arg = %note.arg,
-                    "shim notify: metadata-mutation pre-image journaled (M07.B.5)"
-                );
-            }
+                    "metadata pre-image ingest failed",
+                    error,
+                ),
+            };
         } else {
-            if let Err(e) = journal_capture_refused(
+            return durable_shim_refusal(
                 index,
                 command,
                 ingest_ts,
                 PathBuf::from(&note.arg),
                 "successful metadata mutation carried no pre-image".to_string(),
-            ) {
-                warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: missing-metadata CaptureRefused journal failed");
-            }
+            );
         }
-        return;
     }
 
     // W06.A.4: content syscalls with attached pre-image take the
     // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
         if let Some(pre) = &note.pre_image {
-            if let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
-                warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
-                if let Err(journal_err) = journal_capture_refused(
+            return match ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
+                Ok(()) => Ok(ShimIngestDisposition::EvidenceDurable),
+                Err(error) => fallback_shim_refusal(
                     index,
                     command,
                     ingest_ts,
                     PathBuf::from(&pre.path),
-                    format!("content pre-image ingest failed: {e}"),
-                ) {
-                    warn!(err = %journal_err, pid = note.pid, syscall = %note.syscall, "shim notify: content-ingest CaptureRefused journal failed");
-                }
-            }
-            return;
+                    "content pre-image ingest failed",
+                    error,
+                ),
+            };
         }
         // AR05.1: no pre-image means the file didn't exist when the
         // shim looked. On in-watch paths the dir-diff Create event
@@ -642,7 +893,7 @@ fn ingest_notification(
                 arg = %note.arg,
                 "shim notify: path is in-watch; defer to kqueue dir-diff"
             );
-            return;
+            return Ok(ShimIngestDisposition::DelegatedToKernelTier);
         }
         // Inode sentinel (0,0) matches the Unlink path's convention
         // (line 347) — the executor's TreeOp::Create reverse is just
@@ -664,17 +915,17 @@ fn ingest_notification(
                 mode: 0o644,
             }),
         };
-        if let Err(e) = index.put_event(&event) {
-            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
-        } else {
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                arg = %note.arg,
-                "shim notify: journaled fresh-create as TreeOp::Create"
-            );
-        }
-        return;
+        return match index.put_event(&event) {
+            Ok(_) => Ok(ShimIngestDisposition::EvidenceDurable),
+            Err(error) => fallback_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "fresh-create journal failed",
+                error,
+            ),
+        };
     }
 
     // W06.A.4: a rename notification with an attached pre-image is
@@ -689,19 +940,16 @@ fn ingest_notification(
     // empty and the bytes stuck at the source tmpfile path.
     if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
+        && let Err(error) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
     {
-        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: rename pre-image ingest failed");
-        if let Err(journal_err) = journal_capture_refused(
+        return fallback_shim_refusal(
             index,
             command,
             ingest_ts,
             PathBuf::from(&pre.path),
-            format!("rename destination pre-image ingest failed: {e}"),
-        ) {
-            warn!(err = %journal_err, pid = note.pid, syscall = %note.syscall, "shim notify: rename-ingest CaptureRefused journal failed");
-        }
-        return;
+            "rename destination pre-image ingest failed",
+            error,
+        );
     }
     // DR-CR-54 — when the rename's source was a directory, the
     // shim captured per-file pre-images for every regular file in
@@ -737,7 +985,7 @@ fn ingest_notification(
             "shim notify: recursive rename pre-images ingested (DR-CR-54)"
         );
         if failed > 0 {
-            if let Err(e) = journal_capture_refused(
+            return durable_shim_refusal(
                 index,
                 command,
                 ingest_ts,
@@ -746,10 +994,7 @@ fn ingest_notification(
                     "{failed} of {} recursive rename pre-images failed to ingest",
                     note.extra_pre_images.len()
                 ),
-            ) {
-                warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: recursive-ingest CaptureRefused journal failed");
-            }
-            return;
+            );
         }
     }
     // Fall through to journal the TreeOp::Rename below.
@@ -765,19 +1010,16 @@ fn ingest_notification(
     if matches!(note.syscall.as_str(), "unlink" | "unlinkat" | "remove")
         && let Some(pre) = &note.pre_image
         && matches!(FileKind::from_mode(pre.mode), Some(FileKind::Regular))
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
+        && let Err(error) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
     {
-        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: unlink pre-image ingest failed");
-        if let Err(journal_err) = journal_capture_refused(
+        return fallback_shim_refusal(
             index,
             command,
             ingest_ts,
             PathBuf::from(&pre.path),
-            format!("unlink pre-image ingest failed: {e}"),
-        ) {
-            warn!(err = %journal_err, pid = note.pid, syscall = %note.syscall, "shim notify: unlink-ingest CaptureRefused journal failed");
-        }
-        return;
+            "unlink pre-image ingest failed",
+            error,
+        );
     }
     // Fall through to journal the TreeOp::Unlink below.
 
@@ -785,31 +1027,21 @@ fn ingest_notification(
         // Fd-based content syscalls (ftruncate, pwrite, mmap_shared_w)
         // have no path in the wire payload; they need fd→path resolution
         // which is FreeBSD-specific (procstat/kvm). Deferred.
-        if matches!(
+        let detail = if matches!(
             note.syscall.as_str(),
             "ftruncate" | "pwrite" | "mmap_shared_w"
         ) {
-            if let Err(e) = journal_capture_refused(
-                index,
-                command,
-                ingest_ts,
-                PathBuf::from(&note.arg),
-                format!(
-                    "successful fd-based {} mutation has no stable path or pre-image",
-                    note.syscall
-                ),
-            ) {
-                warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: fd-mutation CaptureRefused journal failed");
-            }
+            format!(
+                "successful fd-based {} mutation has no stable path or pre-image",
+                note.syscall
+            )
         } else {
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                arg = %note.arg,
-                "shim notify: syscall not classifiable"
-            );
-        }
-        return;
+            format!(
+                "successful shim syscall {} is not safely classifiable",
+                note.syscall
+            )
+        };
+        return durable_shim_refusal(index, command, ingest_ts, PathBuf::from(&note.arg), detail);
     };
 
     // M03.x.CREATE / M03.x.LINK: gate Create-style classifications
@@ -842,7 +1074,7 @@ fn ingest_notification(
             arg = %note.arg,
             "shim notify: Create path is in-watch; defer to kqueue dir-diff"
         );
-        return;
+        return Ok(ShimIngestDisposition::DelegatedToKernelTier);
     }
 
     if let CaptureEventKind::TreeOp(tree_op) = kind {
@@ -854,7 +1086,9 @@ fn ingest_notification(
             crate::helper_link::TreeSignalSource::Shim,
             false,
         ) {
-            Ok(crate::helper_link::TreeJournalOutcome::Journaled) => {}
+            Ok(crate::helper_link::TreeJournalOutcome::Journaled) => {
+                Ok(ShimIngestDisposition::EvidenceDurable)
+            }
             Ok(crate::helper_link::TreeJournalOutcome::Deduplicated) => {
                 debug!(
                     pid = note.pid,
@@ -863,12 +1097,16 @@ fn ingest_notification(
                     seq = command.seq,
                     "shim notify: equivalent helper TreeOp already journaled"
                 );
-                return;
+                Ok(ShimIngestDisposition::ExistingEvidenceDurable)
             }
-            Err(e) => {
-                warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
-                return;
-            }
+            Err(error) => fallback_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "shim TreeOp journal failed",
+                error,
+            ),
         }
     } else {
         let event = CaptureEvent {
@@ -878,18 +1116,18 @@ fn ingest_notification(
             partial: false,
             kind,
         };
-        if let Err(e) = index.put_event(&event) {
-            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
-            return;
+        match index.put_event(&event) {
+            Ok(_) => Ok(ShimIngestDisposition::EvidenceDurable),
+            Err(error) => fallback_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "shim event journal failed",
+                error,
+            ),
         }
     }
-    debug!(
-        pid = note.pid,
-        syscall = %note.syscall,
-        session = %command.session,
-        seq = command.seq,
-        "shim notify: journaled"
-    );
 }
 
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
@@ -923,7 +1161,11 @@ fn ingest_pre_image_with_source(
     source: shit_planner::FilePreImageSource,
     ts: shit_planner::time::TimePoint,
 ) -> anyhow::Result<()> {
-    let (blob_hash, stat) = blob_store
+    // Keep GC's exclusive sweep lock out across the complete publication
+    // sequence. Between blob creation and the event refcount trigger, the new
+    // object is intentionally still at zero references.
+    let publication = blob_store.shared_guard();
+    let (blob_hash, stat) = publication
         .put(&pre.bytes)
         .map_err(|e| anyhow::anyhow!("blob put: {e}"))?;
     index
@@ -968,6 +1210,7 @@ fn ingest_pre_image_with_source(
     index
         .put_event(&event)
         .map_err(|e| anyhow::anyhow!("put_event: {e}"))?;
+    drop(publication);
     Ok(())
 }
 
@@ -1451,6 +1694,84 @@ mod tests {
         }
     }
 
+    fn tracker_command(seq: u64) -> shit_planner::CommandId {
+        shit_planner::CommandId {
+            session: uuid::Uuid::nil(),
+            seq,
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_frame_blocks_drain_until_ingest_guard_drops() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(100);
+        let registration = tracker.begin_decoded().attribute(command);
+        assert!(!registration.is_late());
+        let pending = tracker.seal(command);
+        let waiter = tokio::spawn(async move { pending.wait(Duration::from_secs(1)).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        assert_eq!(tracker.state_for_test(command), (1, true, false));
+
+        drop(registration);
+        assert_eq!(waiter.await.unwrap(), Ok(()));
+        assert_eq!(tracker.state_for_test(command), (0, true, false));
+    }
+
+    #[tokio::test]
+    async fn decoded_before_seal_then_attributed_after_seal_is_late() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(101);
+        let decoded = tracker.begin_decoded();
+        let pending = tracker.seal(command);
+        let waiter = tokio::spawn(async move { pending.wait(Duration::from_secs(1)).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        let registration = decoded.attribute(command);
+        assert!(registration.is_late());
+        drop(registration);
+
+        assert_eq!(waiter.await.unwrap(), Err(ShimDrainError::LateRegistration));
+        assert_eq!(tracker.state_for_test(command), (0, true, true));
+    }
+
+    #[tokio::test]
+    async fn drain_times_out_while_attributed_ingest_is_in_flight() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(102);
+        let registration = tracker.begin_decoded().attribute(command);
+        let result = tracker.seal(command).wait(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            result,
+            Err(ShimDrainError::TimedOut {
+                in_flight: 1,
+                decoded_unattributed: 0,
+            })
+        );
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn sealed_tombstone_rejects_frames_after_an_initial_drain() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(103);
+        assert_eq!(
+            tracker.seal(command).wait(Duration::from_millis(20)).await,
+            Ok(())
+        );
+
+        let registration = tracker.begin_decoded().attribute(command);
+        assert!(registration.is_late());
+        drop(registration);
+        assert_eq!(
+            tracker.seal(command).wait(Duration::from_millis(20)).await,
+            Err(ShimDrainError::LateRegistration)
+        );
+    }
+
     #[test]
     fn mkdir_notifications_classify_as_directory_creates() {
         for syscall in ["mkdir", "mkdirat"] {
@@ -1638,12 +1959,13 @@ mod tests {
 
         ingest_notification(
             &note("open", "relative.txt"),
-            Some(command),
+            command,
             TimePoint::new(1, 1),
             &index,
             &blob_store,
             &live_baseline,
-        );
+        )
+        .unwrap();
 
         let events = index.events_for_command(command);
         assert_eq!(events.len(), 1);
@@ -1659,6 +1981,9 @@ mod tests {
     /// shim's eventual call shape.
     #[tokio::test]
     async fn one_shot_notify_round_trip() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("shim.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -1667,11 +1992,42 @@ mod tests {
         let blob_store = fresh_blob_store(tmp.path());
         let active = Arc::new(ActiveCommands::new());
         let live_baseline = Arc::new(LiveBaseline::new());
+        let pid = std::process::id();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::nil(),
+            seq: 1,
+        };
+        index
+            .put_session(command.session, "bash", pid, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("unlink /tmp/probe".into()),
+                cwd: tmp.path().to_path_buf(),
+                pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        assert!(active.insert(pid, command));
+        let handler_index = Arc::clone(&index);
         let _accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_one(stream, index, blob_store, active, live_baseline)
-                .await
-                .unwrap();
+            handle_one(
+                stream,
+                handler_index,
+                blob_store,
+                active,
+                live_baseline,
+                Arc::new(ShimIngestTracker::new()),
+                Arc::new(crate::server::FinalizationBlocks::default()),
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1682,7 +2038,7 @@ mod tests {
             let mut s = StdUnixStream::connect(&sock_path).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let note = ShimNotification {
-                pid: 4242,
+                pid,
                 syscall: "unlink".into(),
                 arg: "/tmp/probe".into(),
                 ts_unix_nanos: 0,
@@ -1700,6 +2056,102 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(client_result, ShimAck::Allow);
+        assert!(
+            index
+                .events_for_command(command)
+                .iter()
+                .any(|event| { matches!(event.kind, CaptureEventKind::CaptureRefused { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn non_durable_refusal_withholds_ack_and_blocks_finalization() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("shim.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let index = Arc::new(Index::open(tmp.path().join("idx.sqlite")).unwrap());
+        let blob_store = fresh_blob_store(tmp.path());
+        let active = Arc::new(ActiveCommands::new());
+        let pid = std::process::id();
+        let command = tracker_command(2);
+        index
+            .put_session(command.session, "bash", pid, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("unlink /tmp/probe".into()),
+                cwd: tmp.path().to_path_buf(),
+                pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_shim_refusal
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'CaptureRefused'
+                 BEGIN SELECT RAISE(FAIL, 'injected shim refusal failure'); END;",
+            )
+            .unwrap();
+        assert!(active.insert(pid, command));
+        let blocks = Arc::new(crate::server::FinalizationBlocks::default());
+        let handler_blocks = Arc::clone(&blocks);
+        let handler = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_one(
+                stream,
+                index,
+                blob_store,
+                active,
+                Arc::new(LiveBaseline::new()),
+                Arc::new(ShimIngestTracker::new()),
+                handler_blocks,
+            )
+            .await
+        });
+
+        let client_sock = sock.clone();
+        let bytes_read = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = StdUnixStream::connect(client_sock).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let frame = encode_shim_notification_frame(&ShimNotification {
+                pid,
+                syscall: "unlink".into(),
+                arg: "/tmp/probe".into(),
+                ts_unix_nanos: 0,
+                pre_image: None,
+                extra_pre_images: Vec::new(),
+                failure: None,
+            })
+            .unwrap();
+            stream.write_all(&frame).unwrap();
+            let mut ack = [0u8; 64];
+            stream.read(&mut ack).unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes_read, 0, "non-durable ingest must not receive Allow");
+        handler.await.unwrap().unwrap();
+        assert!(
+            blocks
+                .get(command)
+                .is_some_and(|detail| detail.contains("no durable evidence or refusal"))
+        );
     }
 
     /// A shim is allowed to stop waiting for the ACK after its short
@@ -1744,7 +2196,16 @@ mod tests {
         let handler_index = Arc::clone(&index);
         let handler = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_one(stream, handler_index, blob_store, active, live_baseline).await
+            handle_one(
+                stream,
+                handler_index,
+                blob_store,
+                active,
+                live_baseline,
+                Arc::new(ShimIngestTracker::new()),
+                Arc::new(crate::server::FinalizationBlocks::default()),
+            )
+            .await
         });
 
         let note = ShimNotification {
@@ -1958,12 +2419,13 @@ mod tests {
 
         ingest_notification(
             &note,
-            Some(command),
+            command,
             reserved_ts,
             &index,
             &blob_store,
             &LiveBaseline::new(),
-        );
+        )
+        .unwrap();
 
         let events = index.events_for_command(command);
         assert_eq!(events.len(), 1);
@@ -2032,12 +2494,13 @@ mod tests {
 
         ingest_notification(
             &note,
-            Some(command),
+            command,
             TimePoint::new(779, 44),
             &index,
             &blob_store,
             &LiveBaseline::new(),
-        );
+        )
+        .unwrap();
 
         let events = index.events_for_command(command);
         assert_eq!(events.len(), 1, "{events:#?}");

@@ -34,6 +34,8 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use shit_preload_shim::dispatch::SHIT_INSTALL_PREFIXES_ENV;
+use shit_preload_shim::install_config;
 use shit_preload_shim::runtime::{
     DYLD_INSERT_LIBRARIES_ENV, LD_PRELOAD_ENV, SHIT_DAEMON_SOCK_ENV, SHIT_PRELOAD_ACTIVE_ENV,
 };
@@ -68,6 +70,8 @@ pub fn run(args: InstallArgs) -> Result<()> {
     let lib_path = resolve_lib_path(args.lib.as_deref())
         .context("could not locate libshit_preload_shim.{so,dylib}; pass `--lib <path>` or install the daemon package")?;
     let sock_path = resolve_sock_path(args.sock.as_deref())?;
+    let install_prefixes = resolve_install_prefixes()?;
+    let install_prefixes_env = encode_install_prefixes(&install_prefixes)?;
 
     let preload_env = if cfg!(target_os = "macos") {
         DYLD_INSERT_LIBRARIES_ENV
@@ -81,6 +85,7 @@ pub fn run(args: InstallArgs) -> Result<()> {
         println!("  {preload_env} = {}", lib_path.display());
         println!("  {SHIT_PRELOAD_ACTIVE_ENV} = 1");
         println!("  {SHIT_DAEMON_SOCK_ENV} = {}", sock_path.display());
+        println!("  {SHIT_INSTALL_PREFIXES_ENV} = {install_prefixes_env}");
         return Ok(());
     }
 
@@ -90,6 +95,7 @@ pub fn run(args: InstallArgs) -> Result<()> {
     child.env(preload_env, &lib_path);
     child.env(SHIT_PRELOAD_ACTIVE_ENV, "1");
     child.env(SHIT_DAEMON_SOCK_ENV, &sock_path);
+    child.env(SHIT_INSTALL_PREFIXES_ENV, &install_prefixes_env);
 
     let status = child.status().with_context(|| format!("exec {cmd}"))?;
     if let Some(code) = status.code() {
@@ -98,6 +104,42 @@ pub fn run(args: InstallArgs) -> Result<()> {
     // Killed by signal — exit non-zero so the parent shell sees a
     // failure rather than silently succeeding.
     std::process::exit(128);
+}
+
+/// Resolve the configured install roots before loading the shim. The cdylib
+/// deliberately does not parse TOML or consult HOME on its syscall hot path;
+/// callers pass this stable, fully expanded set through the environment.
+pub(super) fn resolve_install_prefixes() -> Result<Vec<String>> {
+    let config_path = crate::config_home()?.join("shit/install-prefixes.toml");
+    let home = crate::home_dir()?;
+    resolve_install_prefixes_from(&config_path, &home)
+}
+
+fn resolve_install_prefixes_from(config_path: &Path, home: &Path) -> Result<Vec<String>> {
+    let config = install_config::load_file(config_path)
+        .with_context(|| format!("load install prefixes from {}", config_path.display()))?;
+    let prefixes = install_config::resolve_with_fs(&config, home)
+        .with_context(|| format!("resolve install prefixes from {}", config_path.display()))?;
+    prefixes
+        .into_iter()
+        .map(|prefix| {
+            let canonical = std::fs::canonicalize(&prefix)
+                .with_context(|| format!("canonicalize install prefix {prefix}"))?;
+            canonical.into_os_string().into_string().map_err(|_| {
+                anyhow::anyhow!("install prefix is not representable as UTF-8: {prefix}")
+            })
+        })
+        .collect()
+}
+
+/// Encode the prefix set in the shim's documented colon-separated wire form.
+/// Refuse an unrepresentable path rather than silently broadening or splitting
+/// the capture scope at the wrong boundary.
+pub(super) fn encode_install_prefixes(prefixes: &[String]) -> Result<String> {
+    if let Some(path) = prefixes.iter().find(|path| path.contains(':')) {
+        bail!("install prefix contains ':' and cannot be encoded safely: {path}");
+    }
+    Ok(prefixes.join(":"))
 }
 
 /// Find `libshit_preload_shim.{so,dylib}` in the documented search order.
@@ -200,5 +242,52 @@ mod tests {
         let p = PathBuf::from("/tmp/test-shit.sock");
         let got = resolve_sock_path(Some(&p)).unwrap();
         assert_eq!(got, p);
+    }
+
+    #[test]
+    fn install_prefix_env_is_colon_separated() {
+        let encoded = encode_install_prefixes(&[
+            "/usr/local".to_string(),
+            "/Users/u/Library/Python".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(encoded, "/usr/local:/Users/u/Library/Python");
+    }
+
+    #[test]
+    fn install_prefix_env_rejects_unrepresentable_colon() {
+        let err = encode_install_prefixes(&["/tmp/prefix:other".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("cannot be encoded safely"));
+    }
+
+    #[test]
+    fn configured_install_prefixes_are_canonicalized_before_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let real_prefix = temp.path().join("real-prefix");
+        let configured_prefix = temp.path().join("configured-prefix");
+        let config_path = temp.path().join("install-prefixes.toml");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&real_prefix).unwrap();
+        std::os::unix::fs::symlink(&real_prefix, &configured_prefix).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                "replace = true\n[[prefix]]\npath = {:?}\n",
+                configured_prefix.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let prefixes = resolve_install_prefixes_from(&config_path, &home).unwrap();
+        assert_eq!(
+            prefixes,
+            vec![
+                std::fs::canonicalize(&real_prefix)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
     }
 }

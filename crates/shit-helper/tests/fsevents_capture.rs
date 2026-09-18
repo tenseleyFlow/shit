@@ -181,12 +181,28 @@ fn fsevents_capture_create_and_unlink_through_helper() {
         panic!("no Unlink TreeMutation for {target:?} within 5s");
     }
 
-    // 7. UnwatchTree teardown (best-effort; the test passes either way).
+    // 7. UnwatchTree is an ordered close barrier. The helper must stop
+    //    attribution, drain the producer, send every preceding event/refusal,
+    //    and then acknowledge this exact command before it can be killed.
     let unwatch_req = HelperRequest::UnwatchTree {
         session,
         command_seq,
     };
-    let _ = send_frame_nonblocking(&conn_fd, &encode_frame(&unwatch_req).unwrap());
+    send_frame_nonblocking(&conn_fd, &encode_frame(&unwatch_req).unwrap())
+        .expect("send UnwatchTree");
+    let flushed = drain_until(&conn_fd, Duration::from_secs(5), |r| {
+        matches!(
+            r,
+            HelperResponse::UnwatchTreeFlushed {
+                session: s,
+                command_seq: cs,
+            } if *s == session && *cs == command_seq
+        )
+    });
+    if flushed.is_none() {
+        kill_and_dump_stderr(&mut child);
+        panic!("UnwatchTreeFlushed never arrived within 5s");
+    }
 
     let _ = child.kill();
     let _ = child.wait();

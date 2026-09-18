@@ -616,6 +616,7 @@ impl LsmEventSink for LinuxCaptureSink {
         let view = crate::capture::linux::LsmReleaseView {
             command: shit_planner::events::CommandId { session, seq },
             pid: process_pid,
+            ts_ns: ev.hdr.ts_ns,
             dev: ev.dev,
             inode: ev.inode,
             f_mode: ev.f_mode,
@@ -640,6 +641,7 @@ impl LsmEventSink for LinuxCaptureSink {
         let view = crate::capture::linux::LsmSetattrView {
             command: shit_planner::events::CommandId { session, seq },
             pid: process_pid,
+            ts_ns: ev.hdr.ts_ns,
             dev: ev.dev,
             inode: ev.inode,
             attr_valid: ev.attr_valid,
@@ -695,6 +697,7 @@ impl LsmEventSink for LinuxCaptureSink {
         let view = crate::capture::linux::LsmCreateView {
             command: shit_planner::events::CommandId { session, seq },
             pid: process_pid,
+            ts_ns: ev.hdr.ts_ns,
             parent_dev: ev.parent_dev,
             parent_inode: ev.parent_inode,
             mode: ev.mode,
@@ -719,6 +722,7 @@ impl LsmEventSink for LinuxCaptureSink {
         let view = crate::capture::linux::LsmOpenView {
             command: shit_planner::events::CommandId { session, seq },
             pid: process_pid,
+            ts_ns: ev.hdr.ts_ns,
             dev: ev.dev,
             inode: ev.inode,
             f_mode: ev.f_mode,

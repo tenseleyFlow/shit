@@ -49,6 +49,10 @@ pub const BUILTIN_PREFIXES: &[&str] = &[
     "~/.local/bin",
     "~/.local/lib",
     "~/.cargo/bin",
+    // `pip install --user` uses this base on macOS (with the Python
+    // major/minor and site-packages below it). It is harmless and optional on
+    // non-macOS hosts, where resolution drops it when it does not exist.
+    "~/Library/Python",
 ];
 
 /// Raw parsed `install-prefixes.toml`. Use [`load_str`] / [`load_file`]

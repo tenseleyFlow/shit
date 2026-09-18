@@ -29,11 +29,26 @@
 //!   Volume restoration (when `with_volumes` was true) routes through
 //!   the per-service Rm captures stashed alongside the compose down.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use super::container_lock::{
+    ContainerEngineLockGuard, CooperativeContainerLockState, NoopContainerEngineLockGuard,
+};
 use crate::executor::{ConflictPolicy, ExecutionOutcome, InverseOpExecutor};
+use crate::inode::BlobHash;
 use crate::inverse::{ContainerOp, InverseOp};
 
 /// Subprocess + stdin-piping abstraction. Tests inject a spy.
 pub trait ContainerRunner {
+    /// Hold the cooperative engine lock across a complete restore transaction.
+    /// Injected runners default to a no-op; production runners override this.
+    fn acquire_engine_lock(
+        &self,
+        _runtime: &str,
+    ) -> Result<Box<dyn ContainerEngineLockGuard + '_>, String> {
+        Ok(Box::new(NoopContainerEngineLockGuard))
+    }
     /// Run an argv (no stdin). Returns `Ok` on exit 0.
     fn run(&self, argv: &[String]) -> Result<(), String>;
     /// Run an argv with `stdin_bytes` piped to stdin. Used for
@@ -42,6 +57,16 @@ pub trait ContainerRunner {
     /// Capture stdout of a command (used for stash-existence check
     /// via `docker image inspect ...`).
     fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String>;
+    /// Prove whether an image reference is absent, or return its immutable
+    /// engine ID when present. Implementations must distinguish a real
+    /// not-found result from daemon/context/auth failures; treating every
+    /// non-zero `image inspect` as absence would let undo overwrite later
+    /// state while the engine is unhealthy.
+    fn probe_image_id(&self, runtime: &str, image: &str) -> Result<Option<String>, String> {
+        Err(format!(
+            "{runtime} image-state probe for `{image}` is not implemented by this runner"
+        ))
+    }
     /// Test-only: load tarball bytes for a stash blob hash. The
     /// production runner wraps the daemon-side container-stash store
     /// (C04.6). Returning `None` means the stash is missing.
@@ -52,14 +77,60 @@ pub trait ContainerRunner {
 /// `SHIT_DURING_UNDO=1` env-var prevents the container wrapper from
 /// re-capturing our own reverse invocation.
 #[derive(Debug, Default)]
-pub struct SystemContainerRunner;
+pub struct SystemContainerRunner {
+    engine_lock: CooperativeContainerLockState,
+}
+
+/// Build a production undo subprocess with the routing boundary made
+/// explicit. Docker's ambient context and endpoint environment must not be
+/// able to redirect a captured local/default-context inverse at apply time.
+///
+/// `lock_token` is the cooperative engine-lock capability. When present, an
+/// installed wrapper recognizes the exact token and enters reentrantly while
+/// the Rust executor continues to own the lock across the complete restore.
+pub fn configured_undo_command(runtime: &str, lock_token: Option<&str>) -> std::process::Command {
+    let mut command = std::process::Command::new(runtime);
+    command.env("SHIT_DURING_UNDO", "1");
+    if let Some(token) = lock_token {
+        command.env("SHIT_CONTAINER_LOCK_HELD", token);
+    } else {
+        command.env_remove("SHIT_CONTAINER_LOCK_HELD");
+    }
+    if runtime == "docker" {
+        for name in [
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_CONFIG",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        ] {
+            command.env_remove(name);
+        }
+        command.args(["--context", "default"]);
+    }
+    command
+}
 
 impl ContainerRunner for SystemContainerRunner {
+    fn acquire_engine_lock(
+        &self,
+        runtime: &str,
+    ) -> Result<Box<dyn ContainerEngineLockGuard + '_>, String> {
+        if runtime != "docker" {
+            return Err(format!(
+                "cooperative restore locking is not implemented for container runtime `{runtime}`"
+            ));
+        }
+        self.engine_lock
+            .acquire_docker()
+            .map(|guard| Box::new(guard) as Box<dyn ContainerEngineLockGuard + '_>)
+    }
+
     fn run(&self, argv: &[String]) -> Result<(), String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let status = std::process::Command::new(cmd)
+        let token = self.engine_lock.active_token()?;
+        let status = configured_undo_command(cmd, token.as_deref())
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
@@ -72,16 +143,26 @@ impl ContainerRunner for SystemContainerRunner {
     fn run_with_stdin(&self, argv: &[String], stdin_bytes: &[u8]) -> Result<(), String> {
         use std::io::Write;
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let mut child = std::process::Command::new(cmd)
+        let token = self.engine_lock.active_token()?;
+        let mut child = configured_undo_command(cmd, token.as_deref())
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(stdin_bytes)
-                .map_err(|e| format!("write stdin: {e}"))?;
+            if let Err(error) = stdin.write_all(stdin_bytes) {
+                // Dropping `Child` does not terminate or reap it. A restore
+                // process that closes stdin early must not survive an
+                // executor error and continue mutating container state in the
+                // background.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("write stdin to {cmd}: {error}"));
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("spawned {cmd} without a writable stdin pipe"));
         }
         let status = child.wait().map_err(|e| format!("wait {cmd}: {e}"))?;
         if status.success() {
@@ -93,15 +174,65 @@ impl ContainerRunner for SystemContainerRunner {
 
     fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let out = std::process::Command::new(cmd)
+        let token = self.engine_lock.active_token()?;
+        let out = configured_undo_command(cmd, token.as_deref())
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .output()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if !out.status.success() {
             return Err(format!("{cmd} exited {:?}", out.status.code()));
         }
         Ok(out.stdout)
+    }
+
+    fn probe_image_id(&self, runtime: &str, image: &str) -> Result<Option<String>, String> {
+        let token = self.engine_lock.active_token()?;
+        // Establish engine liveness first. This prevents a daemon outage from
+        // being mistaken for proof that a tag is absent.
+        let info = configured_undo_command(runtime, token.as_deref())
+            .arg("info")
+            .output()
+            .map_err(|error| format!("spawn {runtime} info: {error}"))?;
+        if !info.status.success() {
+            return Err(format!(
+                "{runtime} info exited {:?}: {}",
+                info.status.code(),
+                String::from_utf8_lossy(&info.stderr).trim()
+            ));
+        }
+
+        let inspect = configured_undo_command(runtime, token.as_deref())
+            .args(["image", "inspect", "--format", "{{.Id}}", image])
+            .output()
+            .map_err(|error| format!("spawn {runtime} image inspect: {error}"))?;
+        if inspect.status.success() {
+            let id = String::from_utf8(inspect.stdout).map_err(|error| {
+                format!("{runtime} image inspect returned non-UTF-8 ID: {error}")
+            })?;
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(format!(
+                    "{runtime} image inspect succeeded for `{image}` without an image ID"
+                ));
+            }
+            return Ok(Some(id.to_string()));
+        }
+
+        let stderr = String::from_utf8_lossy(&inspect.stderr);
+        let normalized = stderr.to_ascii_lowercase();
+        let proven_missing = normalized.contains("no such image")
+            || normalized.contains("image not known")
+            || normalized.contains("image not found")
+            || normalized.contains("does not exist");
+        if proven_missing {
+            Ok(None)
+        } else {
+            Err(format!(
+                "{runtime} image inspect `{image}` exited {:?}: {}",
+                inspect.status.code(),
+                stderr.trim()
+            ))
+        }
     }
 
     fn load_stash_tarball(&self, _hash: &crate::inode::BlobHash) -> Option<Vec<u8>> {
@@ -117,15 +248,139 @@ impl ContainerRunner for SystemContainerRunner {
 
 pub struct ContainerExecutor<R: ContainerRunner> {
     runner: R,
+    /// Tarballs pinned in memory for the duration of one plan. Preflight loads
+    /// every recovery-critical blob before the first mutation; execution must
+    /// use those bytes so concurrent GC cannot invalidate the checked plan.
+    preflighted_tarballs: Mutex<HashMap<BlobHash, Arc<[u8]>>>,
 }
 
 impl<R: ContainerRunner> ContainerExecutor<R> {
     pub fn new(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            preflighted_tarballs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn preflight_tarball(&self, hash: &BlobHash, missing_error: String) -> Result<(), String> {
+        {
+            let tarballs = self
+                .preflighted_tarballs
+                .lock()
+                .map_err(|_| "container preflight tarball cache lock poisoned".to_string())?;
+            if tarballs.contains_key(hash) {
+                return Ok(());
+            }
+        }
+
+        let bytes = self.runner.load_stash_tarball(hash).ok_or(missing_error)?;
+        self.preflighted_tarballs
+            .lock()
+            .map_err(|_| "container preflight tarball cache lock poisoned".to_string())?
+            .insert(*hash, Arc::from(bytes));
+        Ok(())
+    }
+
+    /// Prefer plan-pinned bytes, but preserve direct executor use by falling
+    /// back to the runner when no orchestrator preflight has populated the
+    /// cache.
+    fn preflighted_or_live_tarball(&self, hash: &BlobHash) -> Result<Option<Arc<[u8]>>, String> {
+        if let Some(bytes) = self
+            .preflighted_tarballs
+            .lock()
+            .map_err(|_| "container preflight tarball cache lock poisoned".to_string())?
+            .get(hash)
+            .cloned()
+        {
+            return Ok(Some(bytes));
+        }
+        Ok(self.runner.load_stash_tarball(hash).map(Arc::from))
     }
 }
 
 impl<R: ContainerRunner> InverseOpExecutor for ContainerExecutor<R> {
+    fn begin_plan_execution(&self, _dry_run: bool) {
+        if let Ok(mut tarballs) = self.preflighted_tarballs.lock() {
+            tarballs.clear();
+        }
+    }
+
+    fn finish_plan_execution(&self) {
+        if let Ok(mut tarballs) = self.preflighted_tarballs.lock() {
+            tarballs.clear();
+        }
+    }
+
+    fn preflight(&self, op: &InverseOp) -> Result<(), String> {
+        let InverseOp::ContainerRestore {
+            runtime,
+            op: container_op,
+            stash_tarball,
+            ..
+        } = op
+        else {
+            return Ok(());
+        };
+
+        match container_op {
+            ContainerOp::Rmi { image, .. } => {
+                let ContainerOp::Rmi { digest, .. } = container_op else {
+                    unreachable!()
+                };
+                let expected_id = digest.as_deref().ok_or_else(|| {
+                    format!(
+                        "{} rmi reverse: capture for `{image}` has no immutable image ID; refusing to load a tag-only archive",
+                        runtime.as_str()
+                    )
+                })?;
+                match self.runner.probe_image_id(runtime.as_str(), image)? {
+                    None => {}
+                    Some(current_id) if same_image_id(&current_id, expected_id) => {}
+                    Some(current_id) => {
+                        return Err(format!(
+                            "{} rmi reverse: image reference `{image}` now resolves to `{current_id}`, not captured `{expected_id}`; refusing to overwrite later state",
+                            runtime.as_str()
+                        ));
+                    }
+                }
+                let hash = stash_tarball.as_ref().ok_or_else(|| {
+                    format!(
+                        "{} rmi reverse: no stash tarball recorded for image `{image}` \
+                         (capture path missed `{} save`)",
+                        runtime.as_str(),
+                        runtime.as_str()
+                    )
+                })?;
+                self.preflight_tarball(
+                    hash,
+                    format!(
+                        "{} rmi reverse: stash tarball for `{image}` missing from store \
+                         (GC'd past retention or manually removed)",
+                        runtime.as_str()
+                    ),
+                )
+            }
+            ContainerOp::VolumeRm { name, .. } => {
+                let hash = stash_tarball.as_ref().ok_or_else(|| {
+                    format!(
+                        "{} volume rm reverse: no stash tarball recorded for volume \
+                         `{name}` (capture path missed the tar step)",
+                        runtime.as_str()
+                    )
+                })?;
+                self.preflight_tarball(
+                    hash,
+                    format!(
+                        "{} volume rm reverse: stash tarball for `{name}` missing from \
+                         store (GC'd past retention or manually removed)",
+                        runtime.as_str()
+                    ),
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn supports(&self, op: &InverseOp) -> bool {
         matches!(op, InverseOp::ContainerRestore { .. })
     }
@@ -259,24 +514,16 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
                 .unwrap_or_else(|| format!("shit-restored-{id}")),
         };
 
-        // When the container was running at capture, the user's
-        // rootfs may have diverged from the original image (in-place
-        // edits, written files, etc.). The capture path commits the
-        // running container to `shit-stash:<id>:<ts>` and ships that
-        // tag as `stash_image`. The synthesized `docker run` uses
-        // that image instead of the original `.Config.Image` so the
-        // restored container has the same in-place state.
-        //
-        // Guard: if `was_running` but no stash, refuse cleanly —
-        // running from `.Config.Image` would silently lose any
-        // rootfs writes the user accumulated.
-        if was_running && stash_image.is_none() {
+        // Running and stopped containers can both have writable-layer changes.
+        // The capture path therefore commits every removed container and ships
+        // that tag as `stash_image`. Falling back to `.Config.Image` would be
+        // silently lossy for either state.
+        if stash_image.is_none() {
             return ExecutionOutcome::Failed {
                 err: format!(
-                    "{bin} rm reverse: container `{restored_name}` was running at \
-                     capture but no stash image was recorded (capture path missed \
-                     `{bin} commit`). Restoring from the original image would lose \
-                     any rootfs writes."
+                    "{bin} rm reverse: container `{restored_name}` has no stash image \
+                     (capture path missed `{bin} commit`). Restoring from the original \
+                     image would lose writable-layer changes."
                 ),
             };
         }
@@ -324,7 +571,15 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
             };
         }
 
-        let argv = synthesize_container_run(bin, &restored_name, &obj, stash_image.as_deref());
+        let mut argv = synthesize_container_run(bin, &restored_name, &obj, stash_image.as_deref());
+        if !was_running {
+            // Preserve lifecycle state: `docker create` reconstructs a stopped
+            // container, while the normal `run -d` path recreates a running one.
+            argv[1] = "create".to_string();
+            if argv.get(2).map(String::as_str) == Some("-d") {
+                argv.remove(2);
+            }
+        }
 
         if dry_run {
             return ExecutionOutcome::WouldApply;
@@ -342,10 +597,65 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
         &self,
         bin: &str,
         image: &str,
-        _digest: Option<&str>,
+        digest: Option<&str>,
         stash_tarball: &Option<crate::inode::BlobHash>,
         dry_run: bool,
     ) -> ExecutionOutcome {
+        if bin != "docker" {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "{bin} rmi reverse: the lossless restore boundary supports only Docker's local `default` context"
+                ),
+            };
+        }
+        let Some(expected_id) = digest else {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "{bin} rmi reverse: capture for `{image}` has no immutable image ID; refusing to load a tag-only archive"
+                ),
+            };
+        };
+        // One guard spans the first conflict probe, archive load, conditional
+        // retag, and final postcondition. Per-subprocess wrapper locking would
+        // leave TOCTOU windows between those steps.
+        let _engine_lock = if dry_run {
+            None
+        } else {
+            match self.runner.acquire_engine_lock(bin) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    return ExecutionOutcome::Failed {
+                        err: format!("{bin} rmi reverse: could not acquire engine lock: {error}"),
+                    };
+                }
+            }
+        };
+        match self.runner.probe_image_id(bin, image) {
+            Ok(None) => {}
+            Ok(Some(current_id)) if same_image_id(&current_id, expected_id) => {
+                return ExecutionOutcome::Skipped {
+                    reason: format!(
+                        "{bin} rmi reverse: `{image}` already resolves to captured image `{expected_id}`"
+                    ),
+                };
+            }
+            Ok(Some(current_id)) => {
+                return ExecutionOutcome::Conflict {
+                    kind: crate::inverse::Conflict::Hard {
+                        detail: format!(
+                            "{bin} rmi reverse: `{image}` now resolves to `{current_id}`, not captured `{expected_id}`; loading the archive would overwrite later state"
+                        ),
+                    },
+                };
+            }
+            Err(error) => {
+                return ExecutionOutcome::Failed {
+                    err: format!(
+                        "{bin} rmi reverse: could not prove `{image}` is absent before load: {error}"
+                    ),
+                };
+            }
+        }
         let hash = match stash_tarball {
             Some(h) => h,
             None => {
@@ -357,9 +667,9 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
                 };
             }
         };
-        let tarball = match self.runner.load_stash_tarball(hash) {
-            Some(b) => b,
-            None => {
+        let tarball = match self.preflighted_or_live_tarball(hash) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
                 return ExecutionOutcome::Failed {
                     err: format!(
                         "{bin} rmi reverse: stash tarball for `{image}` missing from store \
@@ -367,15 +677,74 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
                     ),
                 };
             }
+            Err(err) => return ExecutionOutcome::Failed { err },
         };
         if dry_run {
             return ExecutionOutcome::WouldApply;
         }
         let argv = vec![bin.to_string(), "load".to_string()];
-        match self.runner.run_with_stdin(&argv, &tarball) {
-            Ok(()) => ExecutionOutcome::Applied,
-            Err(e) => ExecutionOutcome::Failed {
-                err: format!("{bin} load: {e}"),
+        if let Err(error) = self.runner.run_with_stdin(&argv, tarball.as_ref()) {
+            return ExecutionOutcome::Failed {
+                err: format!("{bin} load: {error}"),
+            };
+        }
+
+        // Archives are captured by immutable ID. They may therefore load
+        // without recreating the user's original tag, and an archive from a
+        // different engine may carry a normalized tag spelling. Re-probe
+        // after the potentially long load before creating the tag so a
+        // concurrent later-state change is never overwritten.
+        match self.runner.probe_image_id(bin, image) {
+            Ok(None) => {
+                let tag_argv = vec![
+                    bin.to_string(),
+                    "tag".to_string(),
+                    expected_id.to_string(),
+                    image.to_string(),
+                ];
+                if let Err(error) = self.runner.run(&tag_argv) {
+                    return ExecutionOutcome::Failed {
+                        err: format!(
+                            "{bin} rmi reverse loaded `{expected_id}` but could not restore tag `{image}`: {error}"
+                        ),
+                    };
+                }
+            }
+            Ok(Some(current_id)) if same_image_id(&current_id, expected_id) => {}
+            Ok(Some(current_id)) => {
+                return ExecutionOutcome::Conflict {
+                    kind: crate::inverse::Conflict::Hard {
+                        detail: format!(
+                            "{bin} rmi reverse loaded `{expected_id}`, but `{image}` concurrently appeared as `{current_id}`; refusing to retag later state"
+                        ),
+                    },
+                };
+            }
+            Err(error) => {
+                return ExecutionOutcome::Failed {
+                    err: format!(
+                        "{bin} rmi reverse loaded `{expected_id}` but could not re-check `{image}` before retagging: {error}"
+                    ),
+                };
+            }
+        }
+
+        match self.runner.probe_image_id(bin, image) {
+            Ok(Some(current_id)) if same_image_id(&current_id, expected_id) => {
+                ExecutionOutcome::Applied
+            }
+            Ok(Some(current_id)) => ExecutionOutcome::Failed {
+                err: format!(
+                    "{bin} rmi reverse postcondition failed: `{image}` resolves to `{current_id}`, not `{expected_id}`"
+                ),
+            },
+            Ok(None) => ExecutionOutcome::Failed {
+                err: format!(
+                    "{bin} rmi reverse postcondition failed: restored tag `{image}` is absent"
+                ),
+            },
+            Err(error) => ExecutionOutcome::Failed {
+                err: format!("{bin} rmi reverse could not verify restored tag `{image}`: {error}"),
             },
         }
     }
@@ -399,9 +768,9 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
                 };
             }
         };
-        let tarball = match self.runner.load_stash_tarball(hash) {
-            Some(b) => b,
-            None => {
+        let tarball = match self.preflighted_or_live_tarball(hash) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
                 return ExecutionOutcome::Failed {
                     err: format!(
                         "{bin} volume rm reverse: stash tarball for `{name}` missing from \
@@ -409,6 +778,7 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
                     ),
                 };
             }
+            Err(err) => return ExecutionOutcome::Failed { err },
         };
         if dry_run {
             return ExecutionOutcome::WouldApply;
@@ -442,7 +812,7 @@ impl<R: ContainerRunner> ContainerExecutor<R> {
             "-xzf".to_string(),
             "-".to_string(),
         ];
-        match self.runner.run_with_stdin(&extract_argv, &tarball) {
+        match self.runner.run_with_stdin(&extract_argv, tarball.as_ref()) {
             Ok(()) => ExecutionOutcome::Applied,
             Err(e) => ExecutionOutcome::Failed {
                 err: format!("{bin} volume extract: {e}"),
@@ -739,21 +1109,18 @@ pub fn synthesize_container_run(
         }
     }
 
-    // --entrypoint (string form; docker also accepts an array but
-    // the CLI flag takes a single string per docker convention).
-    // Captured Entrypoint is an array; we join with spaces. If the
-    // user's original entrypoint had spaces in a single arg this
-    // round-trips imperfectly — documented limitation.
-    if let Some(ep) = config.get("Entrypoint").and_then(|v| v.as_array())
-        && !ep.is_empty()
-    {
-        let parts: Vec<String> = ep
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        if !parts.is_empty() {
+    // Docker's CLI accepts one executable for `--entrypoint`; any remaining
+    // entrypoint elements must be placed after the image, ahead of Config.Cmd.
+    // Joining the captured array with spaces changes argv boundaries and can
+    // turn `["/bin/sh", "-c"]` into a lookup for a literal executable named
+    // `/bin/sh -c`.
+    let mut entrypoint_tail = Vec::new();
+    if let Some(ep) = config.get("Entrypoint").and_then(|v| v.as_array()) {
+        let mut parts = ep.iter().filter_map(|value| value.as_str());
+        if let Some(executable) = parts.next().filter(|value| !value.is_empty()) {
             argv.push("--entrypoint".to_string());
-            argv.push(parts.join(" "));
+            argv.push(executable.to_string());
+            entrypoint_tail.extend(parts.map(String::from));
         }
     }
 
@@ -773,6 +1140,11 @@ pub fn synthesize_container_run(
         })
         .unwrap_or_default();
     argv.push(image);
+
+    // With an explicit entrypoint override Docker treats positionals after
+    // the image as argv for that executable. Preserve the captured entrypoint
+    // tail before appending Config.Cmd.
+    argv.extend(entrypoint_tail);
 
     // Cmd — array of strings appended verbatim as positional args.
     if let Some(cmd) = config.get("Cmd").and_then(|v| v.as_array()) {
@@ -798,6 +1170,13 @@ fn looks_like_auto_hostname(hostname: &str, inspect: &serde_json::Value) -> bool
     hostname.len() == 12
         && id.starts_with(hostname)
         && hostname.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn same_image_id(actual: &str, expected: &str) -> bool {
+    fn normalized(value: &str) -> &str {
+        value.trim().strip_prefix("sha256:").unwrap_or(value.trim())
+    }
+    normalized(actual) == normalized(expected)
 }
 
 /// Pure: from a `docker network inspect`-style JSON object, synthesize
@@ -863,10 +1242,16 @@ pub fn synthesize_network_create(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{CommandId, CommandRecord};
+    use crate::executor::OutcomeKind;
     use crate::inode::BlobHash;
-    use crate::inverse::ContainerRuntime;
-    use std::cell::RefCell;
+    use crate::inverse::{ContainerRuntime, PlanNode, UndoPlan};
+    use crate::orchestrator::Orchestrator;
+    use crate::probe::mock::InMemoryProbe;
+    use crate::time::TimePoint;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     type CallRecord = (String, Vec<String>, Vec<u8>);
 
@@ -876,27 +1261,60 @@ mod tests {
         canned_inspect: RefCell<Vec<u8>>,
         inspect_should_fail: RefCell<bool>,
         run_should_fail: RefCell<bool>,
+        image_probe_error: RefCell<Option<String>>,
+        image_ids: RefCell<std::collections::HashMap<String, String>>,
         stash_blobs: RefCell<std::collections::HashMap<BlobHash, Vec<u8>>>,
+        require_lock: Cell<bool>,
+        lock_held: Cell<bool>,
+    }
+
+    struct SpyLockGuard<'a>(&'a Cell<bool>);
+
+    impl ContainerEngineLockGuard for SpyLockGuard<'_> {}
+
+    impl Drop for SpyLockGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
     }
 
     impl ContainerRunner for SpyRunner {
+        fn acquire_engine_lock(
+            &self,
+            runtime: &str,
+        ) -> Result<Box<dyn ContainerEngineLockGuard + '_>, String> {
+            assert_eq!(runtime, "docker");
+            assert!(!self.lock_held.replace(true), "test lock acquired twice");
+            Ok(Box::new(SpyLockGuard(&self.lock_held)))
+        }
+
         fn run(&self, argv: &[String]) -> Result<(), String> {
+            assert!(!self.require_lock.get() || self.lock_held.get());
             self.calls
                 .borrow_mut()
                 .push(("run".into(), argv.to_vec(), Vec::new()));
             if *self.run_should_fail.borrow() {
                 Err("simulated run failure".into())
             } else {
+                if argv.get(1).map(String::as_str) == Some("tag")
+                    && let (Some(id), Some(image)) = (argv.get(2), argv.get(3))
+                {
+                    self.image_ids
+                        .borrow_mut()
+                        .insert(image.clone(), id.clone());
+                }
                 Ok(())
             }
         }
         fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), String> {
+            assert!(!self.require_lock.get() || self.lock_held.get());
             self.calls
                 .borrow_mut()
                 .push(("run_stdin".into(), argv.to_vec(), stdin.to_vec()));
             Ok(())
         }
         fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
+            assert!(!self.require_lock.get() || self.lock_held.get());
             self.calls
                 .borrow_mut()
                 .push(("capture".into(), argv.to_vec(), Vec::new()));
@@ -906,12 +1324,155 @@ mod tests {
                 Ok(self.canned_inspect.borrow().clone())
             }
         }
+        fn probe_image_id(&self, runtime: &str, image: &str) -> Result<Option<String>, String> {
+            assert!(!self.require_lock.get() || self.lock_held.get());
+            self.calls.borrow_mut().push((
+                "probe_image".into(),
+                vec![runtime.into(), image.into()],
+                Vec::new(),
+            ));
+            if let Some(error) = self.image_probe_error.borrow().clone() {
+                return Err(error);
+            }
+            Ok(self.image_ids.borrow().get(image).cloned())
+        }
         fn load_stash_tarball(&self, hash: &BlobHash) -> Option<Vec<u8>> {
+            assert!(!self.require_lock.get() || self.lock_held.get());
             self.stash_blobs.borrow().get(hash).cloned()
         }
     }
 
+    #[derive(Default)]
+    struct SyncSpyRunner {
+        calls: Mutex<Vec<CallRecord>>,
+        stash_blobs: Mutex<HashMap<BlobHash, Vec<u8>>>,
+        image_ids: Mutex<HashMap<String, String>>,
+    }
+
+    impl ContainerRunner for SyncSpyRunner {
+        fn run(&self, argv: &[String]) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("run".into(), argv.to_vec(), Vec::new()));
+            if argv.get(1).map(String::as_str) == Some("tag")
+                && let (Some(id), Some(image)) = (argv.get(2), argv.get(3))
+            {
+                self.image_ids
+                    .lock()
+                    .unwrap()
+                    .insert(image.clone(), id.clone());
+            }
+            Ok(())
+        }
+
+        fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("run_stdin".into(), argv.to_vec(), stdin.to_vec()));
+            Ok(())
+        }
+
+        fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("capture".into(), argv.to_vec(), Vec::new()));
+            Ok(Vec::new())
+        }
+
+        fn probe_image_id(&self, runtime: &str, image: &str) -> Result<Option<String>, String> {
+            self.calls.lock().unwrap().push((
+                "probe_image".into(),
+                vec![runtime.into(), image.into()],
+                Vec::new(),
+            ));
+            Ok(self.image_ids.lock().unwrap().get(image).cloned())
+        }
+
+        fn load_stash_tarball(&self, hash: &BlobHash) -> Option<Vec<u8>> {
+            self.stash_blobs.lock().unwrap().get(hash).cloned()
+        }
+    }
+
+    fn plan_for(ops: Vec<InverseOp>) -> UndoPlan {
+        UndoPlan {
+            command: CommandRecord {
+                command: CommandId {
+                    session: Uuid::nil(),
+                    seq: 1,
+                },
+                cmd_string: Some("container test".into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: 1,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::min(),
+                ended_at: None,
+                exit_code: None,
+                event_ids: Vec::new(),
+            },
+            nodes: ops
+                .into_iter()
+                .enumerate()
+                .map(|(cohort, op)| PlanNode {
+                    op,
+                    cohort: cohort as u32,
+                    conflict: None,
+                })
+                .collect(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn mutating_network_rm_op() -> InverseOp {
+        InverseOp::ContainerRestore {
+            runtime: ContainerRuntime::Docker,
+            op: ContainerOp::NetworkRm {
+                name: "test-network".into(),
+            },
+            captured_config: b"{}".to_vec(),
+            stash_image: None,
+            stash_tarball: None,
+            requires_confirmation: false,
+        }
+    }
+
     // ----- Rmi -----
+
+    #[test]
+    fn production_docker_commands_pin_default_route_and_scrub_overrides() {
+        let command = configured_undo_command("docker", Some("docker-engine:42:nonce"));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["--context", "default"]);
+
+        let env: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(env.get("SHIT_DURING_UNDO"), Some(&Some("1".into())));
+        assert_eq!(
+            env.get("SHIT_CONTAINER_LOCK_HELD"),
+            Some(&Some("docker-engine:42:nonce".into()))
+        );
+        for name in [
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_CONFIG",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        ] {
+            assert_eq!(env.get(name), Some(&None), "{name} must be removed");
+        }
+    }
 
     fn rmi_op(stash: Option<BlobHash>) -> InverseOp {
         InverseOp::ContainerRestore {
@@ -939,10 +1500,43 @@ mod tests {
         let outcome = exe.execute(&rmi_op(Some(h)), false, ConflictPolicy::Abort);
         assert_eq!(outcome, ExecutionOutcome::Applied);
         let calls = exe.runner.calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "run_stdin");
-        assert_eq!(calls[0].1, vec!["docker".to_string(), "load".to_string()]);
-        assert_eq!(calls[0].2, b"<tarball bytes>");
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].0, "probe_image");
+        assert_eq!(calls[1].0, "run_stdin");
+        assert_eq!(calls[1].1, vec!["docker".to_string(), "load".to_string()]);
+        assert_eq!(calls[1].2, b"<tarball bytes>");
+        assert_eq!(calls[2].0, "probe_image");
+        assert_eq!(
+            calls[3].1,
+            vec![
+                "docker".to_string(),
+                "tag".to_string(),
+                "sha256:deadbeef".to_string(),
+                "nginx:1.25".to_string(),
+            ]
+        );
+        assert_eq!(calls[4].0, "probe_image");
+    }
+
+    #[test]
+    fn rmi_restore_holds_one_engine_lock_across_every_runtime_step() {
+        let runner = SpyRunner::default();
+        let hash = BlobHash::from_bytes([0x19; 32]);
+        runner
+            .stash_blobs
+            .borrow_mut()
+            .insert(hash, b"archive".to_vec());
+        runner.require_lock.set(true);
+        let executor = ContainerExecutor::new(runner);
+
+        assert_eq!(
+            executor.execute(&rmi_op(Some(hash)), false, ConflictPolicy::Abort),
+            ExecutionOutcome::Applied
+        );
+        assert!(
+            !executor.runner.lock_held.get(),
+            "engine lock must release after the final postcondition probe"
+        );
     }
 
     #[test]
@@ -971,6 +1565,90 @@ mod tests {
     }
 
     #[test]
+    fn rmi_refuses_to_overwrite_a_later_tag_target() {
+        let runner = SpyRunner::default();
+        let hash = BlobHash::from_bytes([0x41; 32]);
+        runner
+            .stash_blobs
+            .borrow_mut()
+            .insert(hash, b"archive".to_vec());
+        runner
+            .image_ids
+            .borrow_mut()
+            .insert("nginx:1.25".into(), "sha256:later".into());
+        let exe = ContainerExecutor::new(runner);
+
+        let outcome = exe.execute(&rmi_op(Some(hash)), false, ConflictPolicy::Force);
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Conflict {
+                kind: crate::inverse::Conflict::Hard { ref detail }
+            } if detail.contains("later state")
+        ));
+        assert!(
+            exe.runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.0 != "run_stdin")
+        );
+    }
+
+    #[test]
+    fn rmi_is_idempotent_when_tag_already_has_captured_id() {
+        let runner = SpyRunner::default();
+        let hash = BlobHash::from_bytes([0x42; 32]);
+        runner
+            .stash_blobs
+            .borrow_mut()
+            .insert(hash, b"archive".to_vec());
+        runner
+            .image_ids
+            .borrow_mut()
+            .insert("nginx:1.25".into(), "deadbeef".into());
+        let exe = ContainerExecutor::new(runner);
+
+        assert!(matches!(
+            exe.execute(&rmi_op(Some(hash)), false, ConflictPolicy::Abort),
+            ExecutionOutcome::Skipped { reason } if reason.contains("already resolves")
+        ));
+    }
+
+    #[test]
+    fn rmi_probe_failure_is_not_mistaken_for_absence() {
+        let runner = SpyRunner::default();
+        let hash = BlobHash::from_bytes([0x43; 32]);
+        runner
+            .stash_blobs
+            .borrow_mut()
+            .insert(hash, b"archive".to_vec());
+        *runner.image_probe_error.borrow_mut() = Some("daemon unavailable".into());
+        let exe = ContainerExecutor::new(runner);
+
+        assert!(matches!(
+            exe.execute(&rmi_op(Some(hash)), false, ConflictPolicy::Abort),
+            ExecutionOutcome::Failed { err } if err.contains("could not prove")
+        ));
+    }
+
+    #[test]
+    fn rmi_requires_an_immutable_captured_image_id() {
+        let mut op = rmi_op(Some(BlobHash::from_bytes([0x44; 32])));
+        if let InverseOp::ContainerRestore {
+            op: ContainerOp::Rmi { digest, .. },
+            ..
+        } = &mut op
+        {
+            *digest = None;
+        }
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        assert!(matches!(
+            exe.execute(&op, false, ConflictPolicy::Abort),
+            ExecutionOutcome::Failed { err } if err.contains("no immutable image ID")
+        ));
+    }
+
+    #[test]
     fn rmi_dry_run_loads_blob_but_does_not_exec() {
         let runner = SpyRunner::default();
         let h = BlobHash::from_bytes([9; 32]);
@@ -981,8 +1659,98 @@ mod tests {
         let exe = ContainerExecutor::new(runner);
         let outcome = exe.execute(&rmi_op(Some(h)), true, ConflictPolicy::Abort);
         assert_eq!(outcome, ExecutionOutcome::WouldApply);
-        // No run/run_stdin invocation in dry-run.
-        assert!(exe.runner.calls.borrow().is_empty());
+        // Dry-run still proves the target tag is absent, but does not mutate.
+        let calls = exe.runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "probe_image");
+    }
+
+    #[test]
+    fn rmi_preflight_pins_tarball_bytes_through_execution() {
+        let runner = SpyRunner::default();
+        let hash = BlobHash::from_bytes([0x31; 32]);
+        runner
+            .stash_blobs
+            .borrow_mut()
+            .insert(hash, b"pinned tarball".to_vec());
+        let exe = ContainerExecutor::new(runner);
+        let op = rmi_op(Some(hash));
+
+        exe.begin_plan_execution(false);
+        exe.preflight(&op).unwrap();
+        exe.runner.stash_blobs.borrow_mut().remove(&hash);
+        let outcome = exe.execute(&op, false, ConflictPolicy::Abort);
+        exe.finish_plan_execution();
+
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        let calls = exe.runner.calls.borrow();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[0].0, "probe_image");
+        assert_eq!(calls[1].0, "probe_image");
+        assert_eq!(calls[2].0, "run_stdin");
+        assert_eq!(calls[2].2, b"pinned tarball");
+        assert_eq!(calls[3].0, "probe_image");
+        assert_eq!(calls[4].0, "run");
+        assert_eq!(calls[5].0, "probe_image");
+    }
+
+    #[test]
+    fn rmi_preflight_requires_hash_and_present_bytes() {
+        let exe = ContainerExecutor::new(SpyRunner::default());
+        let no_hash = exe.preflight(&rmi_op(None)).unwrap_err();
+        assert!(no_hash.contains("no stash tarball"), "got: {no_hash}");
+
+        let missing = exe
+            .preflight(&rmi_op(Some(BlobHash::from_bytes([0x32; 32]))))
+            .unwrap_err();
+        assert!(missing.contains("missing from store"), "got: {missing}");
+    }
+
+    #[test]
+    fn missing_late_rmi_stash_prevents_earlier_serial_container_mutation() {
+        let exe = ContainerExecutor::new(SyncSpyRunner::default());
+        let probe = InMemoryProbe::new();
+        let plan = plan_for(vec![
+            mutating_network_rm_op(),
+            rmi_op(Some(BlobHash::from_bytes([0x33; 32]))),
+        ]);
+
+        let report = Orchestrator::new(&exe, &probe).run(&plan, false, ConflictPolicy::Force);
+
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::Skipped);
+        assert_eq!(report.records[1].outcome_kind, OutcomeKind::Failed);
+        assert!(
+            exe.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call.0 == "probe_image")
+        );
+    }
+
+    #[test]
+    fn missing_late_rmi_stash_prevents_earlier_parallel_container_mutation() {
+        let exe = ContainerExecutor::new(SyncSpyRunner::default());
+        let probe = InMemoryProbe::new();
+        let plan = plan_for(vec![
+            mutating_network_rm_op(),
+            rmi_op(Some(BlobHash::from_bytes([0x34; 32]))),
+        ]);
+
+        let report =
+            Orchestrator::new(&exe, &probe).run_parallel(&plan, false, ConflictPolicy::Skip, 2);
+
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::Skipped);
+        assert_eq!(report.records[1].outcome_kind, OutcomeKind::Failed);
+        assert!(
+            exe.runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call.0 == "probe_image")
+        );
     }
 
     // ----- VolumeRm -----
@@ -1045,6 +1813,33 @@ mod tests {
         let calls = exe.runner.calls.borrow();
         // Create argv must NOT contain --driver.
         assert!(!calls[0].1.iter().any(|s| s == "--driver"));
+    }
+
+    #[test]
+    fn volume_preflight_requires_and_pins_tarball_bytes() {
+        let runner = SpyRunner::default();
+        let hash = BlobHash::from_bytes([0x35; 32]);
+        runner
+            .stash_blobs
+            .borrow_mut()
+            .insert(hash, b"pinned volume tarball".to_vec());
+        let exe = ContainerExecutor::new(runner);
+        let op = volume_rm_op(Some(hash), None);
+
+        let no_hash = exe.preflight(&volume_rm_op(None, None)).unwrap_err();
+        assert!(no_hash.contains("no stash tarball"), "got: {no_hash}");
+
+        exe.begin_plan_execution(false);
+        exe.preflight(&op).unwrap();
+        exe.runner.stash_blobs.borrow_mut().remove(&hash);
+        let outcome = exe.execute(&op, false, ConflictPolicy::Abort);
+        exe.finish_plan_execution();
+
+        assert_eq!(outcome, ExecutionOutcome::Applied);
+        let calls = exe.runner.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, "run_stdin");
+        assert_eq!(calls[1].2, b"pinned volume tarball");
     }
 
     // ----- NetworkRm -----
@@ -1206,10 +2001,16 @@ mod tests {
     }
 
     #[test]
-    fn rm_stopped_runs_synthesized_argv_from_original_image() {
-        let exe = ContainerExecutor::new(SpyRunner::default());
+    fn rm_stopped_recreates_stopped_container_from_stash_image() {
+        let runner = SpyRunner::default();
+        *runner.canned_inspect.borrow_mut() = b"{\"Id\":\"...\"}".to_vec();
+        let exe = ContainerExecutor::new(runner);
         let outcome = exe.execute(
-            &rm_op_with_inspect(false, None, &minimal_inspect()),
+            &rm_op_with_inspect(
+                false,
+                Some("shit-stash:abc123:1700000000"),
+                &minimal_inspect(),
+            ),
             false,
             ConflictPolicy::Abort,
         );
@@ -1218,15 +2019,11 @@ mod tests {
             "got: {outcome:?}"
         );
         let calls = exe.runner.calls.borrow();
-        assert_eq!(
-            calls.len(),
-            1,
-            "no stash check needed for stopped container"
-        );
-        let run_argv = &calls[0].1;
-        // Image should be the ORIGINAL, not a stash.
-        assert!(run_argv.contains(&"nginx:alpine".into()));
-        assert!(!run_argv.iter().any(|a| a.starts_with("shit-stash")));
+        assert_eq!(calls.len(), 2);
+        let create_argv = &calls[1].1;
+        assert_eq!(create_argv[1], "create");
+        assert!(!create_argv.contains(&"-d".into()));
+        assert!(create_argv.contains(&"shit-stash:abc123:1700000000".into()));
     }
 
     #[test]
@@ -1244,18 +2041,22 @@ mod tests {
 
     #[test]
     fn rm_dry_run_returns_would_apply_without_executing() {
-        let exe = ContainerExecutor::new(SpyRunner::default());
+        let runner = SpyRunner::default();
+        *runner.canned_inspect.borrow_mut() = b"{\"Id\":\"...\"}".to_vec();
+        let exe = ContainerExecutor::new(runner);
         let outcome = exe.execute(
-            &rm_op_with_inspect(false, None, &minimal_inspect()),
+            &rm_op_with_inspect(false, Some("shit-stash:abc123"), &minimal_inspect()),
             true,
             ConflictPolicy::Abort,
         );
         assert!(matches!(outcome, ExecutionOutcome::WouldApply));
-        assert!(exe.runner.calls.borrow().is_empty());
+        let calls = exe.runner.calls.borrow();
+        assert_eq!(calls.len(), 1, "dry run may verify but must not mutate");
+        assert_eq!(calls[0].0, "capture");
     }
 
     #[test]
-    fn rm_missing_image_in_inspect_fails_cleanly() {
+    fn rm_stopped_without_recorded_stash_also_fails() {
         let exe = ContainerExecutor::new(SpyRunner::default());
         let inspect = br#"{
             "Id": "x",
@@ -1269,7 +2070,7 @@ mod tests {
             false,
             ConflictPolicy::Abort,
         ) {
-            ExecutionOutcome::Failed { err } => assert!(err.contains("no resolvable image")),
+            ExecutionOutcome::Failed { err } => assert!(err.contains("no stash image")),
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -1278,7 +2079,9 @@ mod tests {
     fn rm_inspect_array_form_is_unwrapped() {
         // `docker inspect <id>` returns a single-element JSON array;
         // executor must unwrap it.
-        let exe = ContainerExecutor::new(SpyRunner::default());
+        let runner = SpyRunner::default();
+        *runner.canned_inspect.borrow_mut() = b"{\"Id\":\"stash\"}".to_vec();
+        let exe = ContainerExecutor::new(runner);
         let inspect = br#"[{
             "Id": "abc",
             "Name": "/web",
@@ -1287,7 +2090,7 @@ mod tests {
             "Mounts": []
         }]"#;
         let outcome = exe.execute(
-            &rm_op_with_inspect(false, None, inspect),
+            &rm_op_with_inspect(false, Some("shit-stash:abc"), inspect),
             false,
             ConflictPolicy::Abort,
         );
@@ -1296,7 +2099,7 @@ mod tests {
             "got: {outcome:?}"
         );
         let calls = exe.runner.calls.borrow();
-        assert!(calls[0].1.contains(&"alpine:3.20".into()));
+        assert!(calls[1].1.contains(&"shit-stash:abc".into()));
     }
 
     // ----- synthesize_container_run unit tests -----
@@ -1572,12 +2375,14 @@ mod tests {
     }
 
     #[test]
-    fn synth_entrypoint_joined_with_spaces() {
+    fn synth_entrypoint_preserves_argv_boundaries() {
         let argv = syn(
-            r#"{"Config":{"Image":"x","Entrypoint":["/bin/sh","-c"]},"HostConfig":{}}"#,
+            r#"{"Config":{"Image":"x","Entrypoint":["/bin/sh","-c"],"Cmd":["echo hi"]},"HostConfig":{}}"#,
             None,
         );
-        assert!(argv.windows(2).any(|w| w == ["--entrypoint", "/bin/sh -c"]));
+        assert!(argv.windows(2).any(|w| w == ["--entrypoint", "/bin/sh"]));
+        let image = argv.iter().position(|value| value == "x").unwrap();
+        assert_eq!(&argv[image..], &["x", "-c", "echo hi"]);
     }
 
     // ----- ComposeDown -----
