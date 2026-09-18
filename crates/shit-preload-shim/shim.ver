@@ -7,7 +7,7 @@
  * `.gnu.version_d`. This script provides those definitions.
  *
  * Versions surveyed (FreeBSD 14.4 `objdump -T /lib/libc.so.7`):
- *   FBSD_1.0  — open, unlink, rename, truncate, ftruncate,
+ *   FBSD_1.0  — open, unlink, rmdir, remove, rename, truncate, ftruncate,
  *               pwrite, mmap, mkfifo, link, extattr_set_file,
  *               extattr_delete_file, chflags
  *   FBSD_1.1  — openat, unlinkat, renameat, mkfifoat, linkat

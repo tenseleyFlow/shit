@@ -3,9 +3,9 @@
 //! Runtime glue between the fanotify kernel-tier modules.
 //!
 //! S08 contract: the reader thread owns the read+write loop on the
-//! fanotify fd. For every permission event it returns `ALLOW`
-//! immediately — capture-vs-allow decisions land in S11 once the
-//! undo executor and daemon-side AuthDecision logic exist.
+//! fanotify fd. For every permission event it obtains the capture runtime's
+//! fail-closed verdict, writes that response, and closes the kernel-provided
+//! event descriptor.
 //!
 //! Architecture:
 //!
@@ -13,7 +13,7 @@
 //!   ┌─────────────────────────────┐
 //!   │ reader_thread (blocking)    │
 //!   │   poll → read → process →   │
-//!   │     ALLOW → writev          │
+//!   │     verdict → writev        │
 //!   └─────────────────────────────┘
 //!         shares Arc<FanotifyState>
 //!   ┌─────────────────────────────┐
@@ -26,10 +26,11 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use super::event_loop::{
     Decision, LoopError, READ_BUF_BYTES, process_batch, read_step, wait_readable, write_responses,
@@ -49,6 +50,10 @@ pub struct FanotifyState {
     pub fd: Arc<FanotifyFd>,
     pub tree: Arc<Mutex<TreeMap>>,
     pub shutdown: Arc<AtomicBool>,
+    /// True while the reader thread is expected to be servicing the
+    /// fanotify fd. Cleared on every normal/error exit so WatchTree cannot
+    /// claim readiness after the capture loop has died.
+    pub reader_alive: Arc<AtomicBool>,
     /// Telemetry counter. Bumped once per parsed event regardless of
     /// decision. Surfaced via `shit doctor` and the daemon stats path.
     pub events_seen: Arc<AtomicU64>,
@@ -66,18 +71,33 @@ pub struct FanotifyState {
     /// Without this map the helper would leak marks across commands
     /// (slowly accumulating fanotify watches over time).
     pub marked_paths: Arc<Mutex<HashMap<CommandId, PathBuf>>>,
+    barrier_tx: mpsc::Sender<FanotifyBarrierRequest>,
+    barrier_rx: Arc<Mutex<Option<mpsc::Receiver<FanotifyBarrierRequest>>>>,
+}
+
+struct FanotifyBarrierRequest {
+    deadline: Instant,
+    reply: mpsc::SyncSender<Result<(), String>>,
 }
 
 impl FanotifyState {
     pub fn new(fd: FanotifyFd) -> Self {
+        let (barrier_tx, barrier_rx) = mpsc::channel();
         Self {
             fd: Arc::new(fd),
             tree: Arc::new(Mutex::new(TreeMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            // The reader flips this only after its thread actually starts.
+            // An optimistic initial `true` could let WatchTree advertise
+            // readiness in the spawn/scheduling window (or after spawn
+            // failure) even though nobody is servicing the fanotify fd.
+            reader_alive: Arc::new(AtomicBool::new(false)),
             events_seen: Arc::new(AtomicU64::new(0)),
             overflows: Arc::new(AtomicU64::new(0)),
             capture_runtime: None,
             marked_paths: Arc::new(Mutex::new(HashMap::new())),
+            barrier_tx,
+            barrier_rx: Arc::new(Mutex::new(Some(barrier_rx))),
         }
     }
 
@@ -92,6 +112,33 @@ impl FanotifyState {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
+
+    /// Wait until the sole reader has processed everything preceding this
+    /// request and drained the fanotify fd to an observed-empty state.
+    pub fn flush_until(&self, deadline: Instant) -> Result<(), String> {
+        if !self.reader_alive.load(Ordering::Acquire) {
+            return Err("fanotify reader is not running".to_string());
+        }
+        if Instant::now() >= deadline {
+            return Err("fanotify reader flush timed out".to_string());
+        }
+        let (reply, receive) = mpsc::sync_channel(1);
+        self.barrier_tx
+            .send(FanotifyBarrierRequest { deadline, reply })
+            .map_err(|_| "fanotify reader control disconnected".to_string())?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("fanotify reader flush timed out".to_string());
+        }
+        receive
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => "fanotify reader flush timed out".to_string(),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "fanotify reader exited during flush".to_string()
+                }
+            })?
+    }
 }
 
 impl Clone for FanotifyState {
@@ -100,22 +147,175 @@ impl Clone for FanotifyState {
             fd: Arc::clone(&self.fd),
             tree: Arc::clone(&self.tree),
             shutdown: Arc::clone(&self.shutdown),
+            reader_alive: Arc::clone(&self.reader_alive),
             events_seen: Arc::clone(&self.events_seen),
             overflows: Arc::clone(&self.overflows),
             capture_runtime: self.capture_runtime.as_ref().map(Arc::clone),
             marked_paths: Arc::clone(&self.marked_paths),
+            barrier_tx: self.barrier_tx.clone(),
+            barrier_rx: Arc::clone(&self.barrier_rx),
+        }
+    }
+}
+
+/// Owns the per-event descriptors installed by a fanotify read. They must stay
+/// open through capture and the permission response, then be closed exactly
+/// once regardless of a later parse/write failure.
+#[derive(Default)]
+struct EventFdBatch {
+    fds: Vec<RawFd>,
+}
+
+impl EventFdBatch {
+    fn record(&mut self, fd: RawFd) {
+        if fd >= 0 {
+            self.fds.push(fd);
+        }
+    }
+}
+
+impl Drop for EventFdBatch {
+    fn drop(&mut self) {
+        for fd in self.fds.drain(..) {
+            // SAFETY: every nonnegative descriptor came from exactly one
+            // kernel fanotify event and ownership transfers to userspace when
+            // that event is read. close(2) errors need no retry: after EINTR,
+            // the descriptor's state is unspecified on Linux.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn process_readable_batch(state: &FanotifyState, buf: &mut [u8]) -> Result<(), LoopError> {
+    let bytes = read_step(&state.fd, buf)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let events_seen = Arc::clone(&state.events_seen);
+    let tree = Arc::clone(&state.tree);
+    let runtime = state.capture_runtime.as_ref().map(Arc::clone);
+    let mut event_fds = EventFdBatch::default();
+    let outcome = process_batch(
+        bytes,
+        |ev| {
+            // Keep the tree guard until the runtime callback completes. The
+            // detach path takes the same tree->runtime order, preventing a
+            // resolved event from crossing command-state teardown.
+            let mut tg = match tree.lock() {
+                Ok(tree) => tree,
+                Err(_) => {
+                    tracing::error!(
+                        pid = ev.pid,
+                        "fanotify process-tree lock poisoned; denying permission event"
+                    );
+                    return Some(Decision::Deny);
+                }
+            };
+            let Some((session, command_seq)) = tg.is_tracked(ev.pid) else {
+                return Some(Decision::Allow);
+            };
+            let decision = if let Some(rt) = runtime.as_ref() {
+                let kind = if (ev.mask & libc::FAN_OPEN_EXEC_PERM) != 0 {
+                    FanotifyCaptureKind::OpenExec
+                } else {
+                    FanotifyCaptureKind::OpenWrite
+                };
+                let view = FanotifyEventView {
+                    command: CommandId {
+                        session,
+                        seq: command_seq,
+                    },
+                    fd: ev.fd,
+                    pid: ev.pid,
+                    kind,
+                    _life: std::marker::PhantomData,
+                };
+                match rt.lock() {
+                    Ok(mut capture) => capture.handle_event(&view),
+                    Err(_) => {
+                        tracing::error!(
+                            pid = ev.pid,
+                            "fanotify capture runtime lock poisoned; denying tracked mutation"
+                        );
+                        Decision::Deny
+                    }
+                }
+            } else {
+                tracing::error!(
+                    pid = ev.pid,
+                    "fanotify capture runtime unavailable; denying tracked mutation"
+                );
+                Decision::Deny
+            };
+            drop(tg);
+            Some(decision)
+        },
+        |ev| {
+            events_seen.fetch_add(1, Ordering::Relaxed);
+            event_fds.record(ev.fd);
+        },
+    )?;
+    write_responses(&state.fd, &outcome.responses)?;
+    if outcome.overflowed {
+        return Err(LoopError::QueueOverflow);
+    }
+    Ok(())
+}
+
+fn flush_fanotify_reader(
+    state: &FanotifyState,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err("fanotify reader flush timed out while draining".to_string());
+        }
+        match wait_readable(&state.fd, Duration::ZERO) {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(error) => return Err(format!("fanotify flush poll failed: {error}")),
+        }
+        if let Err(error) = process_readable_batch(state, buf) {
+            if matches!(error, LoopError::QueueOverflow) {
+                state.overflows.fetch_add(1, Ordering::Release);
+            }
+            return Err(format!("fanotify flush drain failed: {error}"));
         }
     }
 }
 
 /// Reader thread entry point. Blocks on the fanotify fd via `poll(2)`,
-/// reads up to 64 KiB of events at a time, decides ALLOW for each,
-/// writes the response batch back atomically.
+/// reads up to 64 KiB of events at a time, obtains a verdict for each,
+/// and writes every response back before closing the event descriptors.
 ///
 /// Exits when `state.shutdown` is set, when a kernel queue overflow
 /// fires (session is degraded — daemon should re-init), or when a
 /// non-recoverable read/write error surfaces.
 pub fn reader_thread(state: FanotifyState) {
+    struct ReaderAliveGuard(Arc<AtomicBool>);
+    impl Drop for ReaderAliveGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    state.reader_alive.store(true, Ordering::Release);
+    let _alive_guard = ReaderAliveGuard(Arc::clone(&state.reader_alive));
+    let barrier_rx = match state.barrier_rx.lock() {
+        Ok(mut slot) => match slot.take() {
+            Some(receiver) => receiver,
+            None => {
+                tracing::error!("fanotify barrier receiver already owned; exiting reader");
+                return;
+            }
+        },
+        Err(_) => {
+            tracing::error!("fanotify barrier receiver lock poisoned; exiting reader");
+            return;
+        }
+    };
     tracing::info!("fanotify reader thread started");
     let mut buf = vec![0u8; READ_BUF_BYTES];
 
@@ -123,6 +323,11 @@ pub fn reader_thread(state: FanotifyState) {
         if state.shutdown.load(Ordering::Acquire) {
             tracing::info!("fanotify reader: shutdown requested");
             break;
+        }
+
+        while let Ok(request) = barrier_rx.try_recv() {
+            let result = flush_fanotify_reader(&state, &mut buf, request.deadline);
+            let _ = request.reply.send(result);
         }
 
         // 250ms poll timeout so we re-check the shutdown flag promptly.
@@ -135,72 +340,8 @@ pub fn reader_thread(state: FanotifyState) {
             }
         }
 
-        let bytes = match read_step(&state.fd, &mut buf) {
-            Ok([]) => continue,
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(err = %e, "fanotify read failed; exiting reader");
-                break;
-            }
-        };
-
-        let events_seen = Arc::clone(&state.events_seen);
-        let tree = Arc::clone(&state.tree);
-        let runtime = state.capture_runtime.as_ref().map(Arc::clone);
-        let result = process_batch(
-            bytes,
-            |ev| {
-                // L01: resolve the event's pid to a tracked CommandId
-                // via the TreeMap; if untracked, ALLOW without capture.
-                // If tracked AND we have a runtime wired, dispatch the
-                // event to it for pre-image capture, then ALLOW.
-                //
-                // The kernel holds the syscall behind FAN_ALLOW; staying
-                // under the CAPTURE_TO_ALLOW p99 budget (10ms) means the
-                // dedupe lookup + pre-image read + staging write +
-                // SCM_RIGHTS send all complete before we return here.
-                let mut tg = tree.lock().ok()?;
-                let resolved = tg.is_tracked(ev.pid);
-                drop(tg);
-                let Some((session, command_seq)) = resolved else {
-                    return Some(Decision::Allow);
-                };
-                if let Some(rt) = runtime.as_ref() {
-                    let kind = if (ev.mask & libc::FAN_OPEN_EXEC_PERM) != 0 {
-                        FanotifyCaptureKind::OpenExec
-                    } else {
-                        FanotifyCaptureKind::OpenWrite
-                    };
-                    let view = FanotifyEventView {
-                        command: CommandId {
-                            session,
-                            seq: command_seq,
-                        },
-                        fd: ev.fd,
-                        pid: ev.pid,
-                        kind,
-                        _life: std::marker::PhantomData,
-                    };
-                    if let Ok(mut g) = rt.lock() {
-                        g.handle_event(&view);
-                    }
-                }
-                Some(Decision::Allow)
-            },
-            |_ev| {
-                events_seen.fetch_add(1, Ordering::Relaxed);
-            },
-        );
-
-        match result {
-            Ok(responses) => {
-                if !responses.is_empty()
-                    && let Err(e) = write_responses(&state.fd, &responses)
-                {
-                    tracing::error!(err = %e, "fanotify write_responses failed");
-                    break;
-                }
-            }
+        match process_readable_batch(&state, &mut buf) {
+            Ok(()) => {}
             Err(LoopError::QueueOverflow) => {
                 state.overflows.fetch_add(1, Ordering::Release);
                 tracing::warn!(
@@ -229,6 +370,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_fd_batch_closes_every_recorded_descriptor() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        {
+            let mut batch = EventFdBatch::default();
+            batch.record(pipe_fds[0]);
+            batch.record(-1);
+        }
+        assert_eq!(unsafe { libc::fcntl(pipe_fds[0], libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        unsafe { libc::close(pipe_fds[1]) };
+    }
+
+    #[test]
     fn fanotify_state_clone_shares_inner_arcs() {
         // We need a fanotify fd to construct a real FanotifyState.
         // Skip if we can't init (no caps in the test runner).
@@ -243,6 +401,8 @@ mod tests {
         let s2 = s.clone();
         s.events_seen.fetch_add(7, Ordering::Relaxed);
         assert_eq!(s2.events_seen.load(Ordering::Relaxed), 7);
+        s.reader_alive.store(false, Ordering::Release);
+        assert!(!s2.reader_alive.load(Ordering::Acquire));
         s.shutdown();
         assert!(s2.shutdown.load(Ordering::Acquire));
     }

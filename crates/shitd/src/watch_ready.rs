@@ -26,6 +26,9 @@
 //!      happen in practice but cheap to support: `Pending` holds a
 //!      `Vec<Sender>`, all get drained on readiness.
 //!
+//! A durable capture refusal also marks the rendezvous failed. This wakes the
+//! shell-side wait immediately while preserving the fail-open shell contract;
+//! the refusal in the journal is what makes a later undo fail closed.
 //! Entries are removed by `UnwatchTree` to keep the map bounded.
 
 use shit_planner::events::CommandId;
@@ -37,9 +40,13 @@ use tokio::sync::oneshot;
 enum State {
     /// Helper hasn't signaled WatchTreeReady yet. The Vec is the list
     /// of oneshot senders we'll drain when readiness lands.
-    Pending(Vec<oneshot::Sender<()>>),
-    /// Helper has signaled. Subsequent waiters complete immediately.
-    Ready,
+    Pending(Vec<oneshot::Sender<Result<(), String>>>),
+    /// Helper has signaled. `wait_observed` becomes sticky only after a
+    /// WaitWatchReady request itself reaches the ready result.
+    Ready { wait_observed: bool },
+    /// Capture failed before readiness (or became known-incomplete later).
+    /// Preserve the first reason so a stray/late Ready cannot erase it.
+    Failed(String),
 }
 
 /// Per-CommandId readiness map. Cheap to clone (Arc).
@@ -56,30 +63,84 @@ impl WatchReadyMap {
 
     /// Helper signaled readiness. Drain any pending waiters and flip
     /// the entry to `Ready` so late waiters also complete fast.
-    pub fn mark_ready(&self, cmd: CommandId) {
+    /// Returns `true` when the command is ready, or `false` when a prior
+    /// failure was preserved instead.
+    pub fn mark_ready(&self, cmd: CommandId) -> bool {
         let mut map = self.inner.lock().unwrap();
-        let prev = map.insert(cmd, State::Ready);
-        if let Some(State::Pending(senders)) = prev {
-            for s in senders {
-                // Receiver may have dropped (caller timed out). That's
-                // fine; ignore.
-                let _ = s.send(());
+        match map.remove(&cmd) {
+            Some(State::Failed(reason)) => {
+                // A refusal is irreversible for this command. In particular,
+                // a helper must not be able to send Ready after an attach or
+                // baseline failure and turn incomplete evidence authoritative.
+                map.insert(cmd, State::Failed(reason));
+                false
+            }
+            Some(State::Pending(senders)) => {
+                map.insert(
+                    cmd,
+                    State::Ready {
+                        wait_observed: false,
+                    },
+                );
+                for sender in senders {
+                    // Receiver may have dropped (caller timed out). That's
+                    // fine; ignore.
+                    let _ = sender.send(Ok(()));
+                }
+                true
+            }
+            Some(State::Ready { wait_observed }) => {
+                map.insert(cmd, State::Ready { wait_observed });
+                true
+            }
+            None => {
+                map.insert(
+                    cmd,
+                    State::Ready {
+                        wait_observed: false,
+                    },
+                );
+                true
             }
         }
     }
 
-    /// Shell hook is asking to block until readiness. Returns a
-    /// receiver the caller should await. The receiver completes when
-    /// `mark_ready` fires for this CommandId, or yields Err(...) if
-    /// the entry is dropped before that (e.g. UnwatchTree races
-    /// WaitWatchReady -- caller treats this as not-ready).
-    pub fn await_ready(&self, cmd: CommandId) -> oneshot::Receiver<()> {
+    /// Mark capture setup/evidence incomplete and wake pending waiters with a
+    /// concrete reason. The first failure wins and cannot be overwritten by a
+    /// late readiness notification.
+    pub fn mark_failed(&self, cmd: CommandId, reason: impl Into<String>) {
+        let mut map = self.inner.lock().unwrap();
+        let reason = reason.into();
+        match map.remove(&cmd) {
+            Some(State::Failed(first_reason)) => {
+                map.insert(cmd, State::Failed(first_reason));
+            }
+            Some(State::Pending(senders)) => {
+                map.insert(cmd, State::Failed(reason.clone()));
+                for sender in senders {
+                    let _ = sender.send(Err(reason.clone()));
+                }
+            }
+            Some(State::Ready { .. }) | None => {
+                map.insert(cmd, State::Failed(reason));
+            }
+        }
+    }
+
+    /// Shell hook is asking to block until readiness. The receiver resolves to
+    /// `Ok(())` on readiness and `Err(reason)` on an explicit refusal. Dropping
+    /// the entry (for example, when teardown races a stale waiter) drops the
+    /// oneshot sender, which the caller also treats as not-ready.
+    pub fn await_ready(&self, cmd: CommandId) -> oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = oneshot::channel();
         let mut map = self.inner.lock().unwrap();
         match map.get_mut(&cmd) {
-            Some(State::Ready) => {
+            Some(State::Ready { .. }) => {
                 // Already ready; fire the receiver synchronously.
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
+            }
+            Some(State::Failed(reason)) => {
+                let _ = tx.send(Err(reason.clone()));
             }
             Some(State::Pending(senders)) => {
                 senders.push(tx);
@@ -89,6 +150,33 @@ impl WatchReadyMap {
             }
         }
         rx
+    }
+
+    /// Record that the daemon-side WaitWatchReady request reached a successful
+    /// ready result. Helper readiness alone is insufficient: without this
+    /// proof the shell may have begun executing before capture attached.
+    pub fn mark_wait_observed(&self, cmd: CommandId) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(&cmd) {
+            Some(State::Ready { wait_observed }) => {
+                *wait_observed = true;
+                true
+            }
+            Some(State::Pending(_) | State::Failed(_)) | None => false,
+        }
+    }
+
+    /// Whether a WaitWatchReady request reached `ready=true` for this exact
+    /// command. The bit remains sticky until command finalization forgets it.
+    pub fn wait_was_observed(&self, cmd: CommandId) -> bool {
+        self.inner.lock().unwrap().get(&cmd).is_some_and(|state| {
+            matches!(
+                state,
+                State::Ready {
+                    wait_observed: true
+                }
+            )
+        })
     }
 
     /// Drop the entry for a finished command. Called from the
@@ -125,16 +213,31 @@ mod tests {
         let map = Arc::new(WatchReadyMap::new());
         let rx = map.await_ready(cmd(1));
         let m2 = Arc::clone(&map);
-        tokio::spawn(async move { m2.mark_ready(cmd(1)) });
-        rx.await.unwrap();
+        tokio::spawn(async move {
+            m2.mark_ready(cmd(1));
+        });
+        rx.await.unwrap().unwrap();
+        assert!(!map.wait_was_observed(cmd(1)));
+        assert!(map.mark_wait_observed(cmd(1)));
+        assert!(map.wait_was_observed(cmd(1)));
     }
 
     #[tokio::test]
     async fn ready_before_wait_completes_immediately() {
         let map = WatchReadyMap::new();
         map.mark_ready(cmd(2));
+        assert!(!map.wait_was_observed(cmd(2)));
         let rx = map.await_ready(cmd(2));
-        rx.await.unwrap();
+        rx.await.unwrap().unwrap();
+        assert!(map.mark_wait_observed(cmd(2)));
+        assert!(map.wait_was_observed(cmd(2)));
+    }
+
+    #[test]
+    fn helper_ready_without_wait_is_not_execution_proof() {
+        let map = WatchReadyMap::new();
+        assert!(map.mark_ready(cmd(20)));
+        assert!(!map.wait_was_observed(cmd(20)));
     }
 
     #[tokio::test]
@@ -143,9 +246,11 @@ mod tests {
         let rx1 = map.await_ready(cmd(3));
         let rx2 = map.await_ready(cmd(3));
         let m2 = Arc::clone(&map);
-        tokio::spawn(async move { m2.mark_ready(cmd(3)) });
-        rx1.await.unwrap();
-        rx2.await.unwrap();
+        tokio::spawn(async move {
+            m2.mark_ready(cmd(3));
+        });
+        rx1.await.unwrap().unwrap();
+        rx2.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -154,5 +259,30 @@ mod tests {
         let rx = map.await_ready(cmd(4));
         map.forget(cmd(4));
         assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failure_wakes_waiters_and_is_sticky_against_late_ready() {
+        let map = WatchReadyMap::new();
+        let rx = map.await_ready(cmd(5));
+        map.mark_failed(cmd(5), "baseline incomplete");
+        assert_eq!(rx.await.unwrap().unwrap_err(), "baseline incomplete");
+        assert!(!map.mark_wait_observed(cmd(5)));
+        assert!(!map.wait_was_observed(cmd(5)));
+
+        assert!(!map.mark_ready(cmd(5)));
+        let late = map.await_ready(cmd(5));
+        assert_eq!(late.await.unwrap().unwrap_err(), "baseline incomplete");
+        assert!(!map.wait_was_observed(cmd(5)));
+    }
+
+    #[tokio::test]
+    async fn failure_before_wait_completes_immediately() {
+        let map = WatchReadyMap::new();
+        map.mark_failed(cmd(6), "attach failed");
+        assert_eq!(
+            map.await_ready(cmd(6)).await.unwrap().unwrap_err(),
+            "attach failed"
+        );
     }
 }

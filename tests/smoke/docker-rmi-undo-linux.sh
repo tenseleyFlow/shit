@@ -8,27 +8,28 @@
 # EXCLUDED_BY: 
 # EXCLUDED_REASON: 
 #
-# AR03.2 smoke — `docker rmi <image>; shit undo` restores the image.
+# AR03.2 smoke — `docker rmi --no-prune <image>; shit undo` restores
+# the image from one capture batch confirmed before runtime and durably
+# FINALIZED after the runtime reports its outcome.
 #
 # Exercises (DR-CR-26 inline-bytes path, AR03 PR-B):
 #   1. The docker-wrapper script (installed by `shit container-hooks
 #      install`) PATH-shadows the real docker.
-#   2. On `docker rmi alpine`, the wrapper invokes
-#      `shit-helper container-event docker pre` BEFORE exec'ing the
-#      real docker.
-#   3. The helper runs `docker save alpine` to capture the tarball
-#      bytes in-memory, computes blake3, and ships them inline in the
-#      ContainerEventReq to the daemon's ctl socket.
-#   4. The daemon writes the tarball to its BlobStore (content-
-#      verified — claimed hash must equal computed), registers a
-#      container_stashes row, and journals a CaptureEventKind::
-#      ContainerOp event attributed to the active command window.
-#   5. The real docker proceeds to remove the image.
-#   6. `shit undo` plans InverseOp::ContainerRestore { Rmi, image=alpine,
+#   2. On explicit `rmi --no-prune`, the wrapper independently validates the
+#      one-target policy, then asks `shit-helper container-prepare` to capture.
+#   3. The helper runs `docker save`, hashes the bounded tar stream,
+#      and ships one ContainerEventReq in an atomic batch.
+#   4. The daemon verifies the BlobStore + container_stashes ownership
+#      and journals one partial ContainerOp with an ordinal mapping.
+#   5. The daemon validates the evidence, atomically CONFIRMS the batch and
+#      ACKs authorization; only then does Docker remove the image.
+#   6. `container-finalize` records the runtime outcome and atomically moves
+#      the still-actionable batch to FINALIZED.
+#   7. `shit undo` plans InverseOp::ContainerRestore { Rmi, image=alpine,
 #      stash_tarball=<hash> }, MultiTierExecutor dispatches to
 #      ContainerExecutor::apply_rmi which loads the tarball back via
 #      `docker load`.
-#   7. Post-undo: `docker image inspect alpine` succeeds (image present).
+#   8. Post-undo: `docker image inspect alpine` succeeds (image present).
 #
 # Skips cleanly when docker isn't available or the user can't reach
 # the docker socket (CI sets things up; dev boxes vary).
@@ -110,17 +111,17 @@ smoke_log "PreExec seq=1 pid=${PID}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "$(pwd)" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "docker rmi ${TARGET_IMAGE} (via wrapper)"
+smoke_log "docker rmi --no-prune ${TARGET_IMAGE} (via wrapper)"
 # Wrapper + helper diagnostics: always dump wrapper stderr so we can see
 # whether the helper was invoked, whether it reached the daemon, and
 # whether `docker save` succeeded. Cheap insurance for a path with
 # subtle env-var dependencies.
 export SHIT_HOOK_DEBUG=1
-if ! SHIT_HELPER_LOG=debug docker rmi "${TARGET_IMAGE}" \
+if ! SHIT_HELPER_LOG=debug docker rmi --no-prune "${TARGET_IMAGE}" \
     >"${SHIT_SMOKE_TMP}/rmi.log" 2>&1; then
     smoke_log "rmi.log:"
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/rmi.log" >&2
-    smoke_fail "docker rmi ${TARGET_IMAGE} exited non-zero"
+    smoke_fail "docker rmi --no-prune ${TARGET_IMAGE} exited non-zero"
 fi
 smoke_log "rmi.log (informational; rmi succeeded):"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/rmi.log" >&2
@@ -136,6 +137,21 @@ smoke_log "PostExec seq=1"
 
 # Wait for the daemon to journal the ContainerOp event.
 smoke_wait_for_event "discriminant = 'ContainerOp'" 1 10
+
+# The positive Rmi contract is batch-atomic: exactly one FINALIZED batch,
+# exactly one ordinal mapping, and the mapped event must be non-partial.
+SESSION_HEX="${SESSION//-/}"
+batch_total="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batches WHERE session = X'${SESSION_HEX}' AND seq = 1;" 2>/dev/null || echo 0)"
+finalized_batches="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batches WHERE session = X'${SESSION_HEX}' AND seq = 1 AND state = 'FINALIZED';" 2>/dev/null || echo 0)"
+mapped_events="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batch_events m JOIN container_capture_batches b ON b.batch_id = m.batch_id WHERE b.session = X'${SESSION_HEX}' AND b.seq = 1 AND b.state = 'FINALIZED';" 2>/dev/null || echo 0)"
+non_partial_events="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batch_events m JOIN container_capture_batches b ON b.batch_id = m.batch_id JOIN events e ON e.id = m.event_id WHERE b.session = X'${SESSION_HEX}' AND b.seq = 1 AND b.state = 'FINALIZED' AND e.partial = 0;" 2>/dev/null || echo 0)"
+if [ "${batch_total:-0}" -ne 1 ] || [ "${finalized_batches:-0}" -ne 1 ]; then
+    smoke_fail "expected exactly one FINALIZED container batch; total=${batch_total:-0} finalized=${finalized_batches:-0}"
+fi
+if [ "${mapped_events:-0}" -ne 1 ] || [ "${non_partial_events:-0}" -ne 1 ]; then
+    smoke_fail "expected one mapped non-partial Rmi event; mapped=${mapped_events:-0} non_partial=${non_partial_events:-0}"
+fi
+smoke_log "container batch: 1 FINALIZED / 1 mapped non-partial event"
 
 # Confirm a container_stashes row landed for the tarball.
 stash_count="$(smoke_journal_query "SELECT COUNT(*) FROM container_stashes WHERE name = '${TARGET_IMAGE}';" 2>/dev/null || echo 0)"
@@ -169,6 +185,6 @@ smoke_log "session close"
 # Cleanup: leave the local docker state clean — remove the image so a
 # rerun starts from a clean baseline. (Use the wrapper's underlying
 # real docker via SHIT_DURING_UNDO to avoid re-triggering capture.)
-SHIT_DURING_UNDO=1 docker rmi "${TARGET_IMAGE}" >/dev/null 2>&1 || true
+SHIT_DURING_UNDO=1 docker rmi --no-prune "${TARGET_IMAGE}" >/dev/null 2>&1 || true
 
 smoke_log "PASS: docker-rmi-undo-linux (${TARGET_IMAGE} rmi'd → restored)"

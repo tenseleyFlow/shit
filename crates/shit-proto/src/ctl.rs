@@ -130,12 +130,11 @@ pub enum CtlRequest {
     /// emit `InverseOp::RestoreContent` (truncate verbs) or
     /// `InverseOp::FileExtend` (append verbs) on undo.
     ///
-    /// The daemon ACKs only after every target has been hashed +
-    /// stashed; the shell is expected to block until the ack so it
-    /// races the kernel tier rather than the actual `open`. Target
-    /// errors are returned per-target in `errors`, not surfaced as
-    /// a top-level `Error` — partial pre-stash (e.g., 3/4 targets
-    /// captured) is still useful and the shell should not abort.
+    /// The daemon ACKs only after every target has either been hashed +
+    /// stashed or its failure has produced a durable command-scoped
+    /// `CaptureRefused`. The shell blocks until that safe ack. A failure to
+    /// persist the refusal is a top-level `Error`, so the hook can withhold
+    /// normal command finalization without suppressing the user's command.
     PreStashRedirects {
         session: uuid::Uuid,
         command_seq: u64,
@@ -160,6 +159,33 @@ pub enum CtlRequest {
         #[serde(default)]
         events_limit: Option<usize>,
     },
+    /// Append-only wall-clock GC request. The legacy [`Self::Gc`] payload
+    /// used logical units in its age field; keeping a distinct variant avoids
+    /// silently reinterpreting requests from older clients.
+    GcWall(GcWallRequest),
+    /// Append-only lifecycle recovery request used when a shell companion
+    /// capture failed after `PreExec` opened the command window. The daemon
+    /// first persists a command-wide `CaptureRefused`, then routes `PostExec`
+    /// through the hook server and replies only after the row is finalized.
+    RefuseAndCloseCommand {
+        session: uuid::Uuid,
+        command_seq: u64,
+        exit_code: i32,
+        detail: String,
+        timeout_ms: u32,
+    },
+    /// Prepare one all-or-none batch of destructive container captures.
+    ///
+    /// The daemon validates every target, resolves all entries to the same
+    /// open command, and durably journals the whole vector as `partial=true`
+    /// before acknowledging. The runtime wrapper must not execute the
+    /// destructive command until it receives [`CtlResponse::ContainerBatchPrepared`].
+    ContainerBatchPrepare(ContainerBatchPrepareReq),
+    /// Finalize a previously prepared container batch after the runtime has
+    /// exited and every target has been probed. The daemon decides whether
+    /// the observations prove success; only then may it make the prepared
+    /// events non-partial.
+    ContainerBatchFinalize(ContainerBatchFinalizeReq),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,8 +256,18 @@ pub struct GcRequest {
     pub aggressive: bool,
     /// Override the configured size cap for just this run, in bytes.
     pub size_cap_bytes: Option<u64>,
-    /// Override the configured age cap for just this run, in logical units.
+    /// Legacy logical-time age override. New daemons reject `Some` explicitly;
+    /// the field remains in place to preserve the positional postcard shape.
     pub age_cap_logical: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcWallRequest {
+    pub dry_run: bool,
+    pub aggressive: bool,
+    pub size_cap_bytes: Option<u64>,
+    /// Override the configured age cap for just this run, in wall-clock seconds.
+    pub age_cap_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +283,23 @@ pub struct PinRequest {
 pub struct GcReport {
     pub dry_run: bool,
     pub aggressive_mode_used: bool,
+    pub commands_dropped: u64,
+    pub events_dropped: u64,
+    pub blobs_swept: u64,
+    pub bytes_reclaimed: u64,
+    pub paths_compacted: u64,
+    pub vacuumed: bool,
+    pub duration_ms: u64,
+}
+
+/// Reply to [`CtlRequest::GcWall`]. Kept distinct from legacy [`GcReport`] so
+/// the append-only request seam can expose clock quarantine without changing
+/// an existing positional postcard struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcWallReport {
+    pub dry_run: bool,
+    pub aggressive_mode_used: bool,
+    pub age_expiry_suppressed: bool,
     pub commands_dropped: u64,
     pub events_dropped: u64,
     pub blobs_swept: u64,
@@ -748,6 +801,51 @@ pub struct ContainerEventReq {
     pub uid: u32,
 }
 
+/// Atomic pre-execution publication for a destructive container invocation.
+///
+/// `batch_id` is generated once by the wrapper and retained across retries.
+/// `events` is ordered exactly like the destructive targets in the user's
+/// argv; that order becomes the durable target ordinal used at finalize time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerBatchPrepareReq {
+    pub batch_id: uuid::Uuid,
+    pub events: Vec<ContainerEventReq>,
+}
+
+/// Post-runtime evidence for one target in a prepared container batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerTargetObservationWire {
+    /// Zero-based position in [`ContainerBatchPrepareReq::events`].
+    pub ordinal: u32,
+    pub state: ContainerTargetStateWire,
+    /// Probe output or a bounded diagnostic. `None` for the ordinary,
+    /// unambiguous `Absent`/`Present` result.
+    pub detail: Option<String>,
+}
+
+/// Typed post-runtime state observed for one destructive target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContainerTargetStateWire {
+    /// The target no longer exists after the runtime returned.
+    Absent,
+    /// The target still exists after the runtime returned.
+    Present,
+    /// The target's state could not be established safely.
+    ProbeFailed,
+}
+
+/// Runtime result and target-by-target evidence for a prepared batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerBatchFinalizeReq {
+    pub batch_id: uuid::Uuid,
+    pub pid: u32,
+    pub uid: u32,
+    /// The real exit status returned by docker/podman, without wrapper
+    /// normalization.
+    pub exit_code: i32,
+    pub observations: Vec<ContainerTargetObservationWire>,
+}
+
 /// Container runtime (docker engine or podman). Mirrors
 /// [`shit_planner::inverse::ContainerRuntime`] on the wire side so the
 /// proto crate doesn't depend on the planner. `docker compose` and
@@ -907,9 +1005,8 @@ pub enum CtlResponse {
     },
     /// Reply to `PreStashRedirects` (AR06.5). See
     /// [`PreStashRedirectsResult`] for field semantics. The shell
-    /// hook ignores per-target errors in the common case and just
-    /// unblocks on ack — a missed pre-stash falls back to the
-    /// kernel tier rather than failing the user's command.
+    /// hook may unblock on per-target errors because each one is backed by a
+    /// durable command-wide refusal. A top-level error is not a safe ack.
     PreStashRedirectsAck(PreStashRedirectsResult),
     /// AU30 — reply to `CmdDetail`. Body carries the command
     /// metadata + every event (up to `events_limit`) + plan summary.
@@ -920,6 +1017,21 @@ pub enum CtlResponse {
     /// generic ctl-error path).
     CmdNotFound {
         id: String,
+    },
+    /// Append-only reply to [`CtlRequest::GcWall`].
+    GcWallReport(GcWallReport),
+    /// The refusal is durable and the command row is closed. Idempotent: an
+    /// already-closed command receives the same acknowledgement.
+    RefuseAndCloseAck,
+    /// The complete batch is durably CONFIRMED and the runtime may execute.
+    ContainerBatchPrepared {
+        batch_id: uuid::Uuid,
+    },
+    /// The complete batch has durably reached FINALIZED after runtime-outcome
+    /// evidence validation. Repeating the same well-formed finalize request is
+    /// idempotent and receives the same acknowledgement.
+    ContainerBatchFinalized {
+        batch_id: uuid::Uuid,
     },
 }
 
@@ -1000,8 +1112,8 @@ pub struct CmdDetailPlanSummary {
 pub struct PreStashRedirectsResult {
     /// Targets the daemon successfully hashed + journaled.
     pub stashed: u32,
-    /// Per-target failure messages. Append-class targets (deferred)
-    /// land here too; not surfaced to the user.
+    /// Per-target failure messages. Each entry in an ACK has already been
+    /// converted into a durable command-scoped refusal by the daemon.
     pub errors: Vec<PreStashRedirectError>,
 }
 

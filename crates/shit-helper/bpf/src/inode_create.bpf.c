@@ -44,6 +44,7 @@ int BPF_PROG(shit_inode_create,
     struct shit_create_event *e =
         bpf_ringbuf_reserve(&create_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return 0;
     }
 

@@ -133,6 +133,94 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         }
     }
 
+    /// Return the normal non-executing record for nodes excluded from plan
+    /// preflight. Path-filtered and explicit Refuse nodes remain visible even
+    /// when another node makes the whole actionable plan fail preflight.
+    fn inert_record(&self, op_index: usize, node: &PlanNode) -> Option<ExecutionRecord> {
+        let op = &node.op;
+        if self.filtered_out(op) {
+            return Some(ExecutionRecord {
+                op_index,
+                op: op.clone(),
+                tier: op.tier(),
+                outcome_kind: OutcomeKind::Skipped,
+                detail: Some(format!(
+                    "filtered out: {} not matched by --paths",
+                    op.primary_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<no-path>".into())
+                )),
+            });
+        }
+        if let InverseOp::Refuse {
+            class,
+            reason,
+            remediation,
+        } = op
+        {
+            let detail = match remediation {
+                Some(rem) => format!("refused ({class}): {reason}. Remediation: {rem}"),
+                None => format!("refused ({class}): {reason}"),
+            };
+            return Some(ExecutionRecord {
+                op_index,
+                op: op.clone(),
+                tier: op.tier(),
+                outcome_kind: OutcomeKind::Skipped,
+                detail: Some(detail),
+            });
+        }
+        None
+    }
+
+    /// Preflight every selected, actionable node before any mutation. When at
+    /// least one preflight fails, return a complete inert report: failing
+    /// nodes are Failed, other actionable nodes are Skipped, and filtered /
+    /// Refuse nodes retain their ordinary records.
+    fn preflight_failure_records(&self, plan: &UndoPlan) -> Option<Vec<ExecutionRecord>> {
+        let mut errors: Vec<Option<String>> = (0..plan.nodes.len()).map(|_| None).collect();
+        for (op_index, node) in plan.nodes.iter().enumerate() {
+            if self.inert_record(op_index, node).is_some() {
+                continue;
+            }
+            if let Err(err) = self.executor.preflight(&node.op) {
+                errors[op_index] = Some(err);
+            }
+        }
+        if errors.iter().all(Option::is_none) {
+            return None;
+        }
+
+        Some(
+            plan.nodes
+                .iter()
+                .enumerate()
+                .map(|(op_index, node)| {
+                    if let Some(record) = self.inert_record(op_index, node) {
+                        return record;
+                    }
+                    let (outcome_kind, detail) = match errors[op_index].as_deref() {
+                        Some(err) => (
+                            OutcomeKind::Failed,
+                            Some(format!("plan preflight failed: {err}")),
+                        ),
+                        None => (
+                            OutcomeKind::Skipped,
+                            Some("plan preflight failed; no operations were executed".to_string()),
+                        ),
+                    };
+                    ExecutionRecord {
+                        op_index,
+                        op: node.op.clone(),
+                        tier: node.op.tier(),
+                        outcome_kind,
+                        detail,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// Run the plan with cohort-level parallelism (DR-14 / S12.12).
     ///
     /// Within each `cohort` (as labeled on `PlanNode.cohort`) the
@@ -161,7 +249,18 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         E: Sync,
         P: Sync,
     {
+        self.executor.begin_plan_execution(dry_run);
         let plan_summary = PlanSummary::from_plan(plan);
+        if let Some(records) = self.preflight_failure_records(plan) {
+            let report = ExecutionReport {
+                plan_summary,
+                records,
+                dry_run,
+                policy,
+            };
+            self.executor.finish_plan_execution();
+            return report;
+        }
         let mut records: Vec<Option<ExecutionRecord>> = vec![None; plan.nodes.len()];
         let mut aborted = false;
 
@@ -237,12 +336,14 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             tracing::warn!("orchestrator (parallel): abort policy halted plan");
         }
 
-        ExecutionReport {
+        let report = ExecutionReport {
             plan_summary,
             records,
             dry_run,
             policy,
-        }
+        };
+        self.executor.finish_plan_execution();
+        report
     }
 
     /// Per-op evaluator extracted so it's shareable between the
@@ -261,42 +362,8 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         policy: ConflictPolicy,
     ) -> ExecutionRecord {
         let op = &node.op;
-        if self.filtered_out(op) {
-            return ExecutionRecord {
-                op_index,
-                op: op.clone(),
-                tier: op.tier(),
-                outcome_kind: OutcomeKind::Skipped,
-                detail: Some(format!(
-                    "filtered out: {} not matched by --paths",
-                    op.primary_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "<no-path>".into())
-                )),
-            };
-        }
-        // AR07.1: Refuse nodes are informational only. The orchestrator
-        // never dispatches them to an executor (no executor declares
-        // InverseTier::Refuse support). Surface as Skipped so the CLI
-        // reports them with the catalog reason + remediation rendered
-        // from the op itself.
-        if let InverseOp::Refuse {
-            class,
-            reason,
-            remediation,
-        } = op
-        {
-            let detail = match remediation {
-                Some(rem) => format!("refused ({class}): {reason}. Remediation: {rem}"),
-                None => format!("refused ({class}): {reason}"),
-            };
-            return ExecutionRecord {
-                op_index,
-                op: op.clone(),
-                tier: op.tier(),
-                outcome_kind: OutcomeKind::Skipped,
-                detail: Some(detail),
-            };
+        if let Some(record) = self.inert_record(op_index, node) {
+            return record;
         }
         // Honor the planner's plan-time conflict ONLY when it's a Hard
         // drift signal (post-content-hash mismatch). Missing/Soft/Phantom
@@ -317,6 +384,18 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             },
             (Some(c), ConflictPolicy::Abort) => ExecutionOutcome::Conflict { kind: c.clone() },
         };
+        // Descriptor-time checks are authoritative and can discover races or
+        // projected-pair state the generic probe cannot see. Preserve Skip's
+        // user-facing semantics for those executor-originated conflicts while
+        // never allowing Force to bypass the safety result.
+        let outcome = match (outcome, policy) {
+            (ExecutionOutcome::Conflict { kind }, ConflictPolicy::Skip) => {
+                ExecutionOutcome::Skipped {
+                    reason: format!("conflict: {kind:?}"),
+                }
+            }
+            (outcome, _) => outcome,
+        };
         let outcome_kind = OutcomeKind::from_outcome(&outcome);
         let detail = match &outcome {
             ExecutionOutcome::Skipped { reason } => Some(reason.clone()),
@@ -336,7 +415,18 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
     /// Walk the plan, applying each op. The returned report mirrors
     /// the plan's node order one-for-one.
     pub fn run(&self, plan: &UndoPlan, dry_run: bool, policy: ConflictPolicy) -> ExecutionReport {
+        self.executor.begin_plan_execution(dry_run);
         let plan_summary = PlanSummary::from_plan(plan);
+        if let Some(records) = self.preflight_failure_records(plan) {
+            let report = ExecutionReport {
+                plan_summary,
+                records,
+                dry_run,
+                policy,
+            };
+            self.executor.finish_plan_execution();
+            return report;
+        }
         let mut records: Vec<ExecutionRecord> = Vec::with_capacity(plan.nodes.len());
 
         for (op_index, node) in plan.nodes.iter().enumerate() {
@@ -364,12 +454,14 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             }
         }
 
-        ExecutionReport {
+        let report = ExecutionReport {
             plan_summary,
             records,
             dry_run,
             policy,
-        }
+        };
+        self.executor.finish_plan_execution();
+        report
     }
 
     /// Stage-1 precondition checker. Existence-based only.
@@ -395,9 +487,15 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             // signal — a true precondition violation, not a
             // recoverable gap).
             InverseOp::RestoreContent { .. } => None,
-            InverseOp::RestoreMetadata { path, .. }
-            | InverseOp::Unlink { path }
-            | InverseOp::FileExtend { path, .. } => {
+            // Descriptor-addressed operations validate existence, kind,
+            // identity, and size in FileExecutor. The executor also knows
+            // when a preceding RestoreContent projects/installs a fresh inode;
+            // probing here would report a false conflict in dry-run because
+            // the projected replacement intentionally does not exist yet.
+            InverseOp::RestoreMetadata { .. }
+            | InverseOp::RestoreFlags { .. }
+            | InverseOp::FileExtendGuarded { .. } => None,
+            InverseOp::Unlink { path } => {
                 if self.probe.exists(path) {
                     None
                 } else {
@@ -406,6 +504,10 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
                     })
                 }
             }
+            // Legacy append inverses carry no inode and always fail closed in
+            // FileExecutor. Do not mask that actionable compatibility error
+            // with an existence-only precondition result.
+            InverseOp::FileExtend { .. } => None,
             InverseOp::RecreatePath { path, kind, .. } => {
                 // G03 — a RecreatePath{Directory} that lands AFTER a
                 // child's RestoreContent has had to mkdir -p this path
@@ -495,7 +597,7 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
 mod tests {
     use super::*;
     use crate::events::{CommandId, CommandRecord};
-    use crate::executor::InMemoryBlobReader;
+    use crate::executor::{BlobReadError, BlobReader, InMemoryBlobReader};
     use crate::executors::FileExecutor;
     use crate::inode::{BlobHash, InodeRef};
     use crate::inverse::PlanNode;
@@ -503,8 +605,38 @@ mod tests {
     use crate::probe::ProbeStat;
     use crate::probe::mock::InMemoryProbe;
     use crate::time::TimePoint;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    /// Test reader that evicts a blob as soon as preflight reads it. A later
+    /// successful RestoreContent therefore proves execution used pinned bytes
+    /// instead of reopening the backing store.
+    #[derive(Default)]
+    struct EvictingBlobReader {
+        blobs: Mutex<BTreeMap<BlobHash, Vec<u8>>>,
+    }
+
+    impl EvictingBlobReader {
+        fn insert(&self, hash: BlobHash, bytes: Vec<u8>) {
+            self.blobs.lock().unwrap().insert(hash, bytes);
+        }
+
+        fn is_empty(&self) -> bool {
+            self.blobs.lock().unwrap().is_empty()
+        }
+    }
+
+    impl BlobReader for EvictingBlobReader {
+        fn read(&self, hash: &BlobHash) -> Result<Vec<u8>, BlobReadError> {
+            self.blobs
+                .lock()
+                .unwrap()
+                .remove(hash)
+                .ok_or_else(|| BlobReadError::NotFound(format!("{hash:?}")))
+        }
+    }
 
     fn empty_plan() -> UndoPlan {
         UndoPlan {
@@ -568,6 +700,216 @@ mod tests {
         let r = orc.run(&plan, false, ConflictPolicy::Abort);
         assert_eq!(r.records.len(), 1);
         assert_eq!(r.records[0].outcome_kind, OutcomeKind::ConflictMissing);
+    }
+
+    #[test]
+    fn restore_flags_refuses_replacement_inode_at_execute_time() {
+        use std::os::unix::fs::MetadataExt;
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("replaced-flags-target");
+        std::fs::write(&path, b"replacement").unwrap();
+        let live = std::fs::metadata(&path).unwrap();
+        let live_inode = InodeRef::new(live.dev(), live.ino());
+        let captured_inode = InodeRef::new(live.dev(), live.ino().wrapping_add(1));
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: live_inode,
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let orc = Orchestrator::new(&exec, &probe);
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreFlags {
+                inode: captured_inode,
+                path,
+                flags: 0,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        let report = orc.run(&plan, false, ConflictPolicy::Abort);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::ConflictPhantom);
+    }
+
+    #[test]
+    fn forced_dry_run_reports_guarded_file_extend_inode_conflict() {
+        use std::os::unix::fs::MetadataExt;
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("replaced-append-target");
+        std::fs::write(&path, b"replacement append bytes").unwrap();
+        let live = std::fs::metadata(&path).unwrap();
+        let live_inode = InodeRef::new(live.dev(), live.ino());
+        let captured_inode = InodeRef::new(live.dev(), live.ino().wrapping_add(1));
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: live_inode,
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let orc = Orchestrator::new(&exec, &probe);
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::FileExtendGuarded {
+                inode: captured_inode,
+                path,
+                truncate_to: 8,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+
+        let report = orc.run(&plan, true, ConflictPolicy::Force);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::ConflictPhantom);
+    }
+
+    #[test]
+    fn dry_run_projects_restore_content_for_paired_metadata() {
+        use crate::probe_live::LiveStateProbe;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("paired-dry-run");
+        std::fs::write(&path, b"post-command").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let live = std::fs::metadata(&path).unwrap();
+        let captured_inode = InodeRef::new(live.dev(), live.ino().wrapping_add(1));
+
+        let blob = BlobHash::from_bytes([0xa5; 32]);
+        let mut reader = InMemoryBlobReader::new();
+        reader.insert(blob, b"pre-command".to_vec());
+        let exec = FileExecutor::new(&reader);
+        let probe = LiveStateProbe::new();
+        let orc = Orchestrator::new(&exec, &probe);
+        let target_metadata = FileMetadata {
+            mode: 0o100600,
+            uid: live.uid(),
+            gid: live.gid(),
+            size: live.len(),
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            acl: None,
+            flags: 0,
+        };
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreContent {
+                inode: captured_inode,
+                path: path.clone(),
+                blob,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreMetadata {
+                inode: captured_inode,
+                path: path.clone(),
+                target: target_metadata.clone(),
+            },
+            cohort: 1,
+            conflict: None,
+        });
+
+        let report = orc.run(&plan, true, ConflictPolicy::Force);
+        assert_eq!(report.records.len(), 2);
+        assert!(
+            report
+                .records
+                .iter()
+                .all(|record| record.outcome_kind == OutcomeKind::WouldApply),
+            "{:#?}",
+            report.records
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"post-command");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+
+        // Projected provenance is plan-local. Reusing the executor for a
+        // metadata-only dry-run must validate the live replacement instead of
+        // inheriting the prior plan's projection.
+        let mut metadata_only = empty_plan();
+        metadata_only.nodes.push(PlanNode {
+            op: InverseOp::RestoreMetadata {
+                inode: captured_inode,
+                path,
+                target: target_metadata,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        let second = orc.run(&metadata_only, true, ConflictPolicy::Force);
+        assert_eq!(second.records[0].outcome_kind, OutcomeKind::ConflictPhantom);
+    }
+
+    #[test]
+    fn force_cannot_bypass_restore_metadata_runtime_inode_guard() {
+        use crate::probe_live::LiveStateProbe;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("metadata-target");
+        let displaced = tmpdir.path().join("metadata-target.old");
+        std::fs::write(&path, b"captured").unwrap();
+        let captured = std::fs::symlink_metadata(&path).unwrap();
+        let captured_inode = InodeRef::new(captured.dev(), captured.ino());
+        std::fs::rename(&path, displaced).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let probe = LiveStateProbe::new();
+        let orc = Orchestrator::new(&exec, &probe);
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreMetadata {
+                inode: captured_inode,
+                path: path.clone(),
+                target: FileMetadata {
+                    mode: 0o100600,
+                    uid: captured.uid(),
+                    gid: captured.gid(),
+                    size: captured.len(),
+                    mtime_unix_nanos: 0,
+                    xattrs: Default::default(),
+                    acl: None,
+                    flags: 0,
+                },
+            },
+            cohort: 0,
+            // This mirrors the planner's stale identity annotation. Force is
+            // allowed to bypass that annotation, but not the executor's live
+            // inode identity guard.
+            conflict: Some(Conflict::Phantom {
+                detail: "replacement detected while planning".into(),
+            }),
+        });
+
+        let report = orc.run(&plan, false, ConflictPolicy::Force);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::ConflictPhantom);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o640,
+            "Force must not chmod the replacement inode"
+        );
     }
 
     #[test]
@@ -733,6 +1075,259 @@ mod tests {
         // Inside was applied; outside still exists.
         assert!(!inside.exists());
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn serial_preflight_failure_prevents_earlier_mutation_even_with_force() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let earlier = tmpdir.path().join("earlier.txt");
+        let restore = tmpdir.path().join("restore.txt");
+        std::fs::write(&earlier, b"must survive").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let missing_blob = BlobHash::from_bytes([0x41; 32]);
+        let exec = FileExecutor::new(&reader);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            earlier.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let orc = Orchestrator::new(&exec, &probe);
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: earlier.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreContent {
+                inode: InodeRef::new(1, 2),
+                path: restore,
+                blob: missing_blob,
+            },
+            cohort: 1,
+            conflict: None,
+        });
+
+        let report = orc.run(&plan, false, ConflictPolicy::Force);
+
+        assert_eq!(report.records.len(), 2);
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::Skipped);
+        assert_eq!(report.records[1].outcome_kind, OutcomeKind::Failed);
+        assert!(
+            report.records[1]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("blob not found")
+        );
+        assert_eq!(std::fs::read(&earlier).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn parallel_preflight_failure_prevents_every_cohort_mutation() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let earlier = tmpdir.path().join("parallel-earlier.txt");
+        let restore = tmpdir.path().join("parallel-restore.txt");
+        std::fs::write(&earlier, b"must survive").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let missing_blob = BlobHash::from_bytes([0x42; 32]);
+        let exec = FileExecutor::new(&reader);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            earlier.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let orc = Orchestrator::new(&exec, &probe);
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: earlier.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreContent {
+                inode: InodeRef::new(1, 2),
+                path: restore,
+                blob: missing_blob,
+            },
+            cohort: 1,
+            conflict: None,
+        });
+
+        let report = orc.run_parallel(&plan, false, ConflictPolicy::Skip, 2);
+
+        assert_eq!(report.records.len(), 2);
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::Skipped);
+        assert_eq!(report.records[1].outcome_kind, OutcomeKind::Failed);
+        assert_eq!(std::fs::read(&earlier).unwrap(), b"must survive");
+    }
+
+    #[test]
+    fn serial_execution_uses_restore_bytes_pinned_before_reader_eviction() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let earlier = tmpdir.path().join("serial-remove.txt");
+        let restore = tmpdir.path().join("serial-restore.txt");
+        std::fs::write(&earlier, b"remove me").unwrap();
+
+        let blob = BlobHash::from_bytes([0x44; 32]);
+        let reader = EvictingBlobReader::default();
+        reader.insert(blob, b"serial pinned bytes".to_vec());
+        let exec = FileExecutor::new(&reader);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            earlier.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: earlier.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreContent {
+                inode: InodeRef::new(1, 2),
+                path: restore.clone(),
+                blob,
+            },
+            cohort: 1,
+            conflict: None,
+        });
+
+        let report = Orchestrator::new(&exec, &probe).run(&plan, false, ConflictPolicy::Abort);
+
+        assert!(reader.is_empty(), "preflight should evict the backing blob");
+        assert!(
+            report
+                .records
+                .iter()
+                .all(|record| record.outcome_kind == OutcomeKind::Applied),
+            "{:#?}",
+            report.records
+        );
+        assert!(!earlier.exists());
+        assert_eq!(std::fs::read(restore).unwrap(), b"serial pinned bytes");
+    }
+
+    #[test]
+    fn parallel_execution_uses_restore_bytes_pinned_before_reader_eviction() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let earlier = tmpdir.path().join("parallel-remove.txt");
+        let restore = tmpdir.path().join("parallel-restore.txt");
+        std::fs::write(&earlier, b"remove me").unwrap();
+
+        let blob = BlobHash::from_bytes([0x45; 32]);
+        let reader = EvictingBlobReader::default();
+        reader.insert(blob, b"parallel pinned bytes".to_vec());
+        let exec = FileExecutor::new(&reader);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            earlier.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: earlier.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreContent {
+                inode: InodeRef::new(1, 2),
+                path: restore.clone(),
+                blob,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+
+        let report =
+            Orchestrator::new(&exec, &probe).run_parallel(&plan, false, ConflictPolicy::Abort, 2);
+
+        assert!(reader.is_empty(), "preflight should evict the backing blob");
+        assert!(
+            report
+                .records
+                .iter()
+                .all(|record| record.outcome_kind == OutcomeKind::Applied),
+            "{:#?}",
+            report.records
+        );
+        assert!(!earlier.exists());
+        assert_eq!(std::fs::read(restore).unwrap(), b"parallel pinned bytes");
+    }
+
+    #[test]
+    fn path_filter_excludes_missing_blob_from_plan_preflight() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let selected = tmpdir.path().join("selected.txt");
+        let filtered = tmpdir.path().join("filtered.txt");
+        std::fs::write(&selected, b"remove me").unwrap();
+
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::new(&reader);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            selected.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: sample_meta(),
+            },
+            None,
+        );
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new(selected.to_str().unwrap()).unwrap());
+        let orc =
+            Orchestrator::new(&exec, &probe).with_paths_filter(Some(builder.build().unwrap()));
+        let mut plan = empty_plan();
+        plan.nodes.push(PlanNode {
+            op: InverseOp::Unlink {
+                path: selected.clone(),
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        plan.nodes.push(PlanNode {
+            op: InverseOp::RestoreContent {
+                inode: InodeRef::new(1, 2),
+                path: filtered,
+                blob: BlobHash::from_bytes([0x43; 32]),
+            },
+            cohort: 1,
+            conflict: None,
+        });
+
+        let report = orc.run(&plan, false, ConflictPolicy::Abort);
+
+        assert_eq!(report.records[0].outcome_kind, OutcomeKind::Applied);
+        assert_eq!(report.records[1].outcome_kind, OutcomeKind::Skipped);
+        assert!(!selected.exists());
     }
 
     #[test]

@@ -22,6 +22,15 @@ fn shit_bin() -> &'static str {
     env!("CARGO_BIN_EXE_shit")
 }
 
+fn shit_command() -> Command {
+    let mut command = Command::new(shit_bin());
+    command.env(
+        "XDG_CONFIG_HOME",
+        std::env::temp_dir().join(format!("shit-cli-tests-{}", std::process::id())),
+    );
+    command
+}
+
 /// Run shit with a ctl-sock arg pointing at a path that will never exist.
 /// Argument parsing must succeed; the daemon call must fail with the
 /// "daemon not running" message.
@@ -29,10 +38,7 @@ fn run_with_dead_ctl(args: &[&str]) -> std::process::Output {
     let dead = std::env::temp_dir().join("shit-undo-cli-test-no-such.sock");
     let mut all_args = args.to_vec();
     all_args.extend_from_slice(&["--ctl-sock", dead.to_str().unwrap()]);
-    Command::new(shit_bin())
-        .args(&all_args)
-        .output()
-        .expect("spawn shit")
+    shit_command().args(&all_args).output().expect("spawn shit")
 }
 
 fn assert_daemon_unavailable(out: &std::process::Output) {
@@ -52,7 +58,7 @@ fn bare_shit_runs_undo_with_defaults() {
     // explicitly at a dead socket so even a real running daemon on
     // the dev box doesn't flap this test.
     let dead = std::env::temp_dir().join("shit-undo-cli-test-no-such.sock");
-    let out = Command::new(shit_bin())
+    let out = shit_command()
         // Bare-shit doesn't accept --ctl-sock; emulate via env var
         // the daemon ctl-client respects. Skip via undo subcommand
         // instead since that's the equivalent shape.
@@ -77,7 +83,7 @@ fn shit_undo_accepts_steps_positional() {
 
 #[test]
 fn top_level_dry_run_is_rejected() {
-    let out = Command::new(shit_bin()).arg("--dry-run").output().unwrap();
+    let out = shit_command().arg("--dry-run").output().unwrap();
     assert!(!out.status.success(), "bare `shit --dry-run` must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -88,7 +94,7 @@ fn top_level_dry_run_is_rejected() {
 
 #[test]
 fn top_level_positional_is_rejected() {
-    let out = Command::new(shit_bin()).arg("3").output().unwrap();
+    let out = shit_command().arg("3").output().unwrap();
     assert!(
         !out.status.success(),
         "bare `shit 3` must fail (3 is not a subcommand)"
@@ -97,10 +103,7 @@ fn top_level_positional_is_rejected() {
 
 #[test]
 fn top_level_on_conflict_flag_is_rejected() {
-    let out = Command::new(shit_bin())
-        .arg("--on-conflict=skip")
-        .output()
-        .unwrap();
+    let out = shit_command().arg("--on-conflict=skip").output().unwrap();
     assert!(
         !out.status.success(),
         "bare `shit --on-conflict=skip` must fail"
@@ -109,7 +112,7 @@ fn top_level_on_conflict_flag_is_rejected() {
 
 #[test]
 fn force_requires_yes() {
-    let out = Command::new(shit_bin())
+    let out = shit_command()
         .args(["undo", "--on-conflict=force"])
         .output()
         .unwrap();

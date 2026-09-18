@@ -167,6 +167,12 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_fstat,
     libc::SYS_statx,      // glibc fs::metadata on modern kernels; pre-image read path
     libc::SYS_newfstatat, // glibc symlink_metadata (AT_SYMLINK_NOFOLLOW); L04 pre_open_tree
+    // Capture metadata reads user.* xattrs from the already-open source fd.
+    // Keep both descriptor-only calls together: flistxattr enumerates names,
+    // then fgetxattr reads each value. Omitting either makes production
+    // (kill-mode) seccomp terminate the helper during WatchTree baseline.
+    libc::SYS_flistxattr,
+    libc::SYS_fgetxattr,
     libc::SYS_openat,
     libc::SYS_getdents64, // glibc fs::read_dir; L04 pre_open_tree walks cwd
     libc::SYS_pread64,    // file read via dup'd fd in capture/linux::read_pre_image
@@ -282,6 +288,12 @@ mod tests {
         for s in ALLOWED_SYSCALLS.iter().chain(ALLOWED_SYSCALLS_ARCH.iter()) {
             assert!(seen.insert(*s), "duplicate syscall {s}");
         }
+    }
+
+    #[test]
+    fn descriptor_xattr_capture_syscalls_are_allowed() {
+        assert!(ALLOWED_SYSCALLS.contains(&libc::SYS_flistxattr));
+        assert!(ALLOWED_SYSCALLS.contains(&libc::SYS_fgetxattr));
     }
 
     /// Each mode parses from the env var as expected. The test mutates

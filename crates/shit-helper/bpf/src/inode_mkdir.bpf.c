@@ -17,7 +17,7 @@
  * tree. Always returns 0; never blocks; verifier-rejection on a
  * kernel diff would break every mkdir on the affected box.
  * Mitigations identical: CO-RE reads, straight-line code, ringbuf
- * full ↦ drop silently.
+ * full ↦ allow + increment the out-of-band loss counter.
  *
  * LSM hook signature (observed via vmlinux.h BTF on hasu 7.0.8):
  *   int inode_mkdir(struct inode *dir,
@@ -58,6 +58,7 @@ int BPF_PROG(shit_inode_mkdir,
     struct shit_mkdir_event *e =
         bpf_ringbuf_reserve(&mkdir_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return 0;
     }
 

@@ -207,10 +207,10 @@ pub enum InverseOp {
         statements: Vec<String>,
         rollback_hint: RollbackHint,
     },
-    /// C06: append-only file truncate-back. Append undo doesn't need
-    /// the full pre-content blob — just the pre-existing length.
-    /// `pre_size` was captured by the shell redirect pre-stash before
-    /// `>>` opened the file; reverse is `truncate(path, pre_size)`.
+    /// C06: legacy append-only file truncate-back. Kept in its original
+    /// position so persisted postcard plans remain decodable. New plans use
+    /// [`Self::FileExtendGuarded`], which also carries the captured inode and
+    /// refuses to truncate a replacement file.
     FileExtend { path: PathBuf, truncate_to: u64 },
     /// C06: shell-state diff between pre-exec and post-exec snapshots.
     /// Reverse is an informational snippet the user sources (or, with
@@ -263,6 +263,34 @@ pub enum InverseOp {
         class: String,
         reason: String,
         remediation: Option<String>,
+    },
+    /// B09 — restore only the BSD/macOS `st_flags` bitmap. This is
+    /// intentionally narrower than `RestoreMetadata`: a chflags-only
+    /// mutation must not issue unrelated chown/chmod/xattr operations.
+    /// Execution keeps the captured inode guard. If the same command
+    /// later unlinked the last name and undo recreated it with a fresh
+    /// inode, flags restoration refuses rather than risk changing an
+    /// unrelated replacement; execution-provenance tracking is needed
+    /// to safely cover that compound case.
+    ///
+    /// Keep new variants appended: postcard encodes enum discriminants
+    /// positionally and persisted plans may contain older values.
+    RestoreFlags {
+        inode: InodeRef,
+        path: PathBuf,
+        flags: u32,
+    },
+    /// Append-only truncate-back guarded by the file identity captured before
+    /// the command ran. The executor verifies `(dev, ino)` on the opened file
+    /// descriptor immediately before truncating; conflict policy, including
+    /// `Force`, cannot bypass that guard.
+    ///
+    /// Keep this variant at the end: postcard encodes enum discriminants
+    /// positionally and persisted plans contain every preceding variant.
+    FileExtendGuarded {
+        inode: InodeRef,
+        path: PathBuf,
+        truncate_to: u64,
     },
 }
 
@@ -536,10 +564,12 @@ impl InverseOp {
         match self {
             Self::RestoreContent { path, .. }
             | Self::RestoreMetadata { path, .. }
+            | Self::RestoreFlags { path, .. }
             | Self::Unlink { path, .. }
             | Self::RecreatePath { path, .. }
             | Self::CreateSymlink { path, .. }
-            | Self::FileExtend { path, .. } => Some(path),
+            | Self::FileExtend { path, .. }
+            | Self::FileExtendGuarded { path, .. } => Some(path),
             Self::CreateHardlink { target, .. } => Some(target),
             Self::Rename { to, .. } => Some(to),
             Self::SetEnv { .. }
@@ -563,9 +593,10 @@ impl InverseOp {
     /// Inode this op targets, if any. Used for conflict detection.
     pub fn primary_inode(&self) -> Option<InodeRef> {
         match self {
-            Self::RestoreContent { inode, .. } | Self::RestoreMetadata { inode, .. } => {
-                Some(*inode)
-            }
+            Self::RestoreContent { inode, .. }
+            | Self::RestoreMetadata { inode, .. }
+            | Self::RestoreFlags { inode, .. }
+            | Self::FileExtendGuarded { inode, .. } => Some(*inode),
             _ => None,
         }
     }
@@ -575,12 +606,14 @@ impl InverseOp {
         match self {
             Self::RestoreContent { .. }
             | Self::RestoreMetadata { .. }
+            | Self::RestoreFlags { .. }
             | Self::Unlink { .. }
             | Self::RecreatePath { .. }
             | Self::Rename { .. }
             | Self::CreateSymlink { .. }
             | Self::CreateHardlink { .. }
-            | Self::FileExtend { .. } => InverseTier::Files,
+            | Self::FileExtend { .. }
+            | Self::FileExtendGuarded { .. } => InverseTier::Files,
             Self::SetEnv { .. } | Self::UnsetEnv { .. } => InverseTier::Env,
             Self::PackageRollback { .. } => InverseTier::Packages,
             Self::NetworkRollback { .. } => InverseTier::Network,
@@ -656,8 +689,9 @@ impl Conflict {
 /// Non-conflict advisory messages attached to the plan as a whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanWarning {
-    /// One or more events in the input were marked partial — those events
-    /// were dropped from the plan; user sees a "partial undo" notice.
+    /// One or more events in the input were marked partial. `dropped` counts
+    /// the non-authoritative observations excluded when the planner replaces
+    /// the entire actionable plan with a command-wide refusal.
     PartialEvents { dropped: usize },
     /// The original command did not finish (no `PostExec`). The plan may be
     /// incomplete because we missed events after the daemon stopped watching.
@@ -779,6 +813,18 @@ mod tests {
             inode: dummy_inode(),
             path: PathBuf::from("/tmp/x"),
             target: dummy_meta(),
+        };
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    #[test]
+    fn restore_flags_postcard_roundtrip() {
+        let op = InverseOp::RestoreFlags {
+            inode: dummy_inode(),
+            path: PathBuf::from("/tmp/flags"),
+            flags: 0x8002,
         };
         let bytes = postcard::to_allocvec(&op).unwrap();
         let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
@@ -1000,14 +1046,34 @@ mod tests {
     }
 
     #[test]
-    fn file_extend_roundtrips_through_postcard() {
+    fn legacy_file_extend_postcard_fixture_stays_compatible() {
         let op = InverseOp::FileExtend {
+            path: PathBuf::from("/x"),
+            truncate_to: 7,
+        };
+        let bytes = postcard::to_allocvec(&op).unwrap();
+        // Variant index 19 followed by the postcard string and u64 encodings.
+        // Keeping this fixture stable protects plans persisted before the
+        // inode-guarded successor variant was introduced.
+        assert_eq!(bytes, [19, 2, b'/', b'x', 7]);
+        let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(op, back);
+    }
+
+    #[test]
+    fn guarded_file_extend_roundtrips_and_exposes_identity() {
+        let inode = dummy_inode();
+        let op = InverseOp::FileExtendGuarded {
+            inode,
             path: PathBuf::from("/tmp/x.log"),
             truncate_to: 1234,
         };
         let bytes = postcard::to_allocvec(&op).unwrap();
         let back: InverseOp = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(op, back);
+        assert_eq!(op.tier(), InverseTier::Files);
+        assert_eq!(op.primary_path(), Some(std::path::Path::new("/tmp/x.log")));
+        assert_eq!(op.primary_inode(), Some(inode));
     }
 
     fn sample_shell_state() -> InverseOp {

@@ -18,10 +18,9 @@ use crate::ShellKind;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Maximum helper frame size. Larger than the shell-hook frame
-/// (`MAX_FRAME_SIZE = 4 KiB`) because AuthEvent path_hints can be up to
-/// `PATH_MAX`. Helper messages travel over SEQPACKET; we still enforce
-/// a hard cap on the decode side to defeat resource exhaustion.
+/// Maximum helper frame size. Helper messages travel over SEQPACKET; we keep a
+/// surface-specific cap and enforce it on decode to defeat resource
+/// exhaustion. AuthEvent path hints can be up to `PATH_MAX`.
 pub const MAX_HELPER_FRAME_SIZE: usize = 8 * 1024;
 
 /// Hard cap for `path_hint` strings. Slightly below PATH_MAX so we can
@@ -35,7 +34,35 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// **Version 2 (S24.A):** added `HelperResponse::CapturedPreImage` for
 /// the kqueue post-hoc capture path; daemon learns to recvmsg with a
 /// cmsg buffer to extract the SCM_RIGHTS-attached staging fd.
-pub const HELPER_PROTOCOL_VERSION: u16 = 4;
+///
+/// **Version 3 (S29.1):** added `HelperResponse::TreeMutation` for
+/// mkdir/rmdir/rename/symlink/link observations.
+///
+/// **Version 4 (S29.3):** added `HelperResponse::CapturedMetadataChange`
+/// for chmod/chown/touch (`NOTE_ATTRIB`).
+///
+/// **Version 5:** added `partial` to `HelperResponse::TreeMutation` so
+/// post-hoc producers cannot be mistaken for authoritative undo evidence.
+///
+/// **Version 6:** split fd-less deletion evidence out of
+/// `CapturedPreImage` into `CapturedDeletionMarker`, and added
+/// `CaptureRefused`. A missing content fd can no longer make a failed
+/// regular-file capture look like an authoritative empty-file pre-image.
+///
+/// **Version 7:** added `TreeOpWire::SymlinkRemovedIdentified`.  The old
+/// target alone cannot correlate a rich symlink-removal observation with a
+/// generic `Unlink` from another capture tier; the replacement carries the
+/// removed symlink's `(dev, inode)` identity as well.
+///
+/// **Version 8:** added BSD `st_flags` and `command_seq` to baseline messages.
+/// Promotion must restore the complete pre-command metadata tuple rather than
+/// combining pre-command bytes with post-event flags, and daemon-side ingest
+/// failures must refuse the exact command before ordered readiness arrives.
+///
+/// **Version 9:** added `HelperResponse::UnwatchTreeFlushed`. The daemon does
+/// not finalize a command until every capture response ordered before its
+/// `UnwatchTree` request has been drained and ingested.
+pub const HELPER_PROTOCOL_VERSION: u16 = 9;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -345,8 +372,9 @@ pub enum HelperResponse {
         uid: u32,
         gid: u32,
         mtime_unix_nanos: i128,
-        /// User-namespace xattrs at capture time (W09.21). Empty when
-        /// the FS has none or the read failed.
+        /// User-namespace xattrs at capture time (W09.21). Empty means the
+        /// producer positively observed no restorable xattrs; a read failure
+        /// must produce `CaptureRefused`, never authoritative empty state.
         xattrs: std::collections::BTreeMap<String, Vec<u8>>,
         /// True when this capture was triggered by `NOTE_DELETE`. The
         /// daemon journals a paired `TreeOp::Unlink` so `shit undo`
@@ -363,6 +391,36 @@ pub enum HelperResponse {
         #[serde(default)]
         flags: u32,
     },
+    /// Typed metadata-only evidence for deletion of an entry whose contents do
+    /// not need a blob (currently directories and FIFOs). Consumers may still
+    /// refuse replay when their metadata model cannot reconstruct the entry
+    /// completely; the marker must not be silently reduced to mode-only undo.
+    ///
+    /// This is deliberately distinct from [`Self::CapturedPreImage`]. A
+    /// `CapturedPreImage` always carries an SCM_RIGHTS fd, including for an
+    /// actually empty regular file. Producers MUST use [`Self::CaptureRefused`]
+    /// when regular-file bytes were unreadable, over cap, or lost to a race.
+    CapturedDeletionMarker {
+        session: Uuid,
+        seq: u64,
+        dev: u64,
+        inode: u64,
+        /// Absolute UTF-8 path. An unrepresentable native path is a refusal,
+        /// never a path with U+FFFD replacement characters.
+        path: String,
+        metadata: FileMetadataWire,
+    },
+    /// The helper observed a mutation but could not collect trustworthy undo
+    /// evidence. The daemon journals this as `CaptureRefused`; it must never
+    /// synthesize a best-effort inverse from the remaining fields.
+    CaptureRefused {
+        session: Uuid,
+        seq: u64,
+        /// Best-effort display path only. `None` is used when a native POSIX
+        /// path cannot be represented on this UTF-8 wire.
+        path: Option<String>,
+        detail: String,
+    },
     /// W02.B.live-baseline — one regular file's content snapshot,
     /// captured at session-open by the helper-side baseline walker
     /// BEFORE any user command runs in this cwd.
@@ -377,11 +435,13 @@ pub enum HelperResponse {
     /// promotes the cached blob into a real `FilePreImage` event
     /// tied to that command's `CommandId`.
     ///
-    /// Not tied to a `seq` — baselines pre-date any command. The
-    /// `session` field is the session that triggered the walker;
-    /// the `cwd` field is the path the LiveBaseline cache keys on.
+    /// Baselines are captured during one command's WatchTree attach. Both
+    /// identity fields are carried so any daemon-side validation/ingest
+    /// failure can durably refuse that exact command before a later ordered
+    /// WatchTreeReady arrives.
     BaselineCaptured {
         session: Uuid,
+        command_seq: u64,
         /// Absolute cwd whose baseline this entry belongs to. Daemon
         /// uses this to find the LiveBaseline cache slot.
         cwd: String,
@@ -401,8 +461,14 @@ pub enum HelperResponse {
         uid: u32,
         gid: u32,
         mtime_unix_nanos: i128,
-        /// User-namespace xattrs at baseline time (W09.21). Empty when
-        /// the FS has none or the read failed.
+        /// BSD `st_flags` at baseline time. Zero on filesystems/platforms
+        /// without active flags.
+        flags: u32,
+        /// Reserved baseline xattr payload. BSD helpers send an empty map
+        /// because capability mode blocks `extattr_*_fd`; the daemon replaces
+        /// it with an identity-checked path snapshot before accepting the
+        /// baseline as authoritative. It must not interpret this map itself as
+        /// proof that the file has no attributes.
         xattrs: std::collections::BTreeMap<String, Vec<u8>>,
         /// Always `true` when this variant is sent — the staging fd
         /// is attached via SCM_RIGHTS. Mirrors `CapturedPreImage`'s
@@ -416,6 +482,7 @@ pub enum HelperResponse {
     /// the cache (if it existed at session-open).
     BaselineWalkComplete {
         session: Uuid,
+        command_seq: u64,
         cwd: String,
         /// Number of `BaselineCaptured` messages emitted during
         /// the walk. Daemon can sanity-check against its received
@@ -436,6 +503,10 @@ pub enum HelperResponse {
         seq: u64,
         op: TreeOpWire,
         ts_unix_nanos: u64,
+        /// Post-hoc/degraded producers (currently macOS FSEvents) cannot
+        /// guarantee a reversible pre-state. The daemon preserves this bit so
+        /// the planner reports the observation but never executes its inverse.
+        partial: bool,
     },
     /// S29.3 — metadata mutation observation (chmod/chown/touch).
     /// `before` is the snapshot captured at fd-registration time (or
@@ -489,6 +560,22 @@ pub enum HelperResponse {
     /// decides what to do.
     Error {
         message: String,
+    },
+    /// Ordered completion barrier for [`HelperRequest::UnwatchTree`].
+    ///
+    /// A helper may send this only after the platform producer has stopped
+    /// attributing new mutations to this command and every capture/refusal
+    /// response causally before the unwatch request has been sent on the same
+    /// connection. Because the daemon dispatches helper responses in wire
+    /// order, observing this marker proves that those earlier responses have
+    /// also been durably ingested before command finalization.
+    ///
+    /// If the helper cannot establish that guarantee it must withhold this
+    /// marker. The daemon's bounded wait then records `CaptureRefused`, so a
+    /// lost tail can never be presented as safely undoable.
+    UnwatchTreeFlushed {
+        session: Uuid,
+        command_seq: u64,
     },
 }
 
@@ -587,6 +674,20 @@ pub enum TreeOpWire {
         /// Path of the symlink that was removed.
         path: String,
     },
+    /// Version 7 identity-bearing replacement for `SymlinkRemoved`.
+    ///
+    /// This is a new appended variant rather than extra fields on the legacy
+    /// variant: postcard enum discriminants are append-compatible, while
+    /// adding struct-variant fields would change the existing wire shape.
+    SymlinkRemovedIdentified {
+        /// Stable identity of the symlink that was removed.
+        dev: u64,
+        inode: u64,
+        /// The OLD symlink's target (`readlink` value pre-replacement).
+        target: String,
+        /// Path of the symlink that was removed.
+        path: String,
+    },
 }
 
 /// Wire mirror of a subset of `shit_planner::FileMetadata`. xattrs and
@@ -670,6 +771,24 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
                 });
             }
         }
+        HelperResponse::CapturedDeletionMarker { path, .. } => {
+            if path.len() > HELPER_PATH_HINT_MAX {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: path.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::CaptureRefused { path, .. } => {
+            if let Some(p) = path
+                && p.len() > HELPER_PATH_HINT_MAX
+            {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
         HelperResponse::TreeMutation { op, .. } => {
             // Validate every path field in the op variant.
             let longest = match op {
@@ -677,7 +796,10 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
                 TreeOpWire::Rename { from, to, .. } => from.len().max(to.len()),
                 TreeOpWire::Link { target, .. } => target.len(),
                 TreeOpWire::Symlink { target, path }
-                | TreeOpWire::SymlinkRemoved { target, path } => target.len().max(path.len()),
+                | TreeOpWire::SymlinkRemoved { target, path }
+                | TreeOpWire::SymlinkRemovedIdentified { target, path, .. } => {
+                    target.len().max(path.len())
+                }
             };
             if longest > HELPER_PATH_HINT_MAX {
                 return Err(HelperProtoError::PathHintTooLong {
@@ -857,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_constant_is_four() {
+    fn protocol_version_constant_is_nine() {
         // Bumping this is intentional and should be paired with an
         // explicit migration plan; this test catches accidental bumps.
         //   Version 2 (S24.A) added `HelperResponse::CapturedPreImage`
@@ -866,7 +988,55 @@ mod tests {
         //     for mkdir/rmdir/rename/symlink/link observations.
         //   Version 4 (S29.3) added `HelperResponse::CapturedMetadataChange`
         //     for chmod/chown/touch (NOTE_ATTRIB).
-        assert_eq!(HELPER_PROTOCOL_VERSION, 4);
+        //   Version 5 added the `TreeMutation.partial` safety bit.
+        //   Version 6 split authoritative metadata-only deletion markers
+        //     from failed pre-image capture and added explicit refusals.
+        //   Version 7 added identity-bearing symlink-removal observations.
+        //   Version 8 added baseline-time BSD flags and command identity so
+        //     promotion never mixes state and ingest failures are attributable.
+        //   Version 9 added an ordered UnwatchTree completion marker so command
+        //     finalization cannot race the tail of capture delivery.
+        assert_eq!(HELPER_PROTOCOL_VERSION, 9);
+    }
+
+    #[test]
+    fn unwatch_tree_flushed_round_trip() {
+        let response = HelperResponse::UnwatchTreeFlushed {
+            session: Uuid::from_u128(0xF1_05),
+            command_seq: 42,
+        };
+        let encoded = encode_frame(&response).expect("encode completion marker");
+        let decoded: HelperResponse = decode_frame(&encoded).expect("decode completion marker");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn baseline_captured_round_trip_preserves_pre_command_metadata() {
+        let event = HelperResponse::BaselineCaptured {
+            session: Uuid::nil(),
+            command_seq: 19,
+            cwd: "/tmp/work".into(),
+            dev: 64,
+            inode: 1042,
+            path: "/tmp/work/file".into(),
+            blob_hash: [0xAB; 32],
+            stored_bytes: 17,
+            mode: 0o100640,
+            uid: 1001,
+            gid: 1002,
+            mtime_unix_nanos: 1_700_000_000_123_456_789,
+            flags: 0x0000_0002,
+            xattrs: {
+                let mut attrs = std::collections::BTreeMap::new();
+                attrs.insert("user.shit.test".into(), b"baseline".to_vec());
+                attrs
+            },
+            fd_sent_via_scm: true,
+        };
+
+        let encoded = encode_frame(&event).expect("encode baseline");
+        let decoded: HelperResponse = decode_frame(&encoded).expect("decode baseline");
+        assert_eq!(decoded, event);
     }
 
     #[test]
@@ -915,6 +1085,7 @@ mod tests {
                 mode: 0o40755,
             },
             ts_unix_nanos: 1_700_000_000_000_000_000,
+            partial: false,
         };
         let encoded = crate::frame::encode_frame(&ev).expect("encode");
         let decoded: HelperResponse = crate::frame::decode_frame(&encoded).expect("decode");
@@ -948,6 +1119,38 @@ mod tests {
         let bytes = encode_frame(&ev).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
         assert_eq!(ev, decoded);
+    }
+
+    #[test]
+    fn deletion_marker_and_capture_refusal_round_trip_distinctly() {
+        let marker = HelperResponse::CapturedDeletionMarker {
+            session: Uuid::nil(),
+            seq: 18,
+            dev: 64,
+            inode: 1000,
+            path: "/tmp/shit-vm-test/fifo".into(),
+            metadata: FileMetadataWire {
+                mode: 0o010600,
+                uid: 1001,
+                gid: 1001,
+                size: 0,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                xattrs: std::collections::BTreeMap::new(),
+                flags: 0,
+            },
+        };
+        let refused = HelperResponse::CaptureRefused {
+            session: Uuid::nil(),
+            seq: 18,
+            path: Some("/tmp/shit-vm-test/large-file".into()),
+            detail: "regular-file pre-image exceeded the capture cap".into(),
+        };
+
+        for event in [marker, refused] {
+            let bytes = encode_frame(&event).unwrap();
+            let decoded: HelperResponse = decode_frame(&bytes).unwrap();
+            assert_eq!(event, decoded);
+        }
     }
 
     #[test]

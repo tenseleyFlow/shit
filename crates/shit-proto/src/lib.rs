@@ -29,14 +29,16 @@ pub mod shim;
 
 pub use ctl::{
     BookmarkRequest, BookmarkSummary, CloudEventReq, CloudRuntimeWire, CloudVerbWire,
-    CmdDetailBody, CmdDetailEventWire, CmdDetailPlanSummary, ConflictPolicyWire, ContainerEventReq,
-    ContainerRuntimeWire, ContainerStashSummary, ContainerVerbWire, CtlRequest, CtlResponse,
-    DaemonStatus, DbConnInfo, DbEngineParseError, DbEngineWire, DbEventReq, DbTxStateWire,
-    GcReport, GcRequest, HelperLinkState, MetricsSnapshot, NetEventReq, NetToolParseError,
-    NetToolWire, PinRequest, PinSummary, PkgEventReq, PkgManagerParseError, PkgManagerWire,
-    PkgPhase, PreStashRedirectError, PreStashRedirectsResult, ProcEventReq, ProcSnapshot,
-    ProcToolParseError, ProcToolWire, RedirectOpWire, RedirectTargetWire, SvcEventReq,
-    SvcScopeWire, SvcToolParseError, SvcToolWire, UndoReportWire, UndoRequest,
+    CmdDetailBody, CmdDetailEventWire, CmdDetailPlanSummary, ConflictPolicyWire,
+    ContainerBatchFinalizeReq, ContainerBatchPrepareReq, ContainerEventReq, ContainerRuntimeWire,
+    ContainerStashSummary, ContainerTargetObservationWire, ContainerTargetStateWire,
+    ContainerVerbWire, CtlRequest, CtlResponse, DaemonStatus, DbConnInfo, DbEngineParseError,
+    DbEngineWire, DbEventReq, DbTxStateWire, GcReport, GcRequest, GcWallReport, GcWallRequest,
+    HelperLinkState, MetricsSnapshot, NetEventReq, NetToolParseError, NetToolWire, PinRequest,
+    PinSummary, PkgEventReq, PkgManagerParseError, PkgManagerWire, PkgPhase, PreStashRedirectError,
+    PreStashRedirectsResult, ProcEventReq, ProcSnapshot, ProcToolParseError, ProcToolWire,
+    RedirectOpWire, RedirectTargetWire, SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire,
+    UndoReportWire, UndoRequest,
 };
 pub use frame::{
     DecodeError, EncodeError, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE, WIRE_VERSION, decode_frame,
@@ -118,6 +120,8 @@ pub use helper::{
 };
 pub use shim::{
     SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage, XattrPreImage,
+    decode_shim_notification_frame, decode_shim_notification_frame_large,
+    encode_shim_notification_frame, encode_shim_notification_frame_large,
 };
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.

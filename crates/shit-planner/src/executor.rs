@@ -356,6 +356,20 @@ impl PrivilegedOpRouter for InMemoryPrivilegedOpRouter {
 /// **Sync, not async.** Stage 1 is sequential and FS-only; async lands
 /// once we add helper-IPC routing for privileged ops (DR-15).
 pub trait InverseOpExecutor {
+    /// Start/end hooks for executor state that must be scoped to one plan
+    /// (for example projected RestoreContent provenance during dry-run).
+    /// Stateless executors use these defaults.
+    fn begin_plan_execution(&self, _dry_run: bool) {}
+    fn finish_plan_execution(&self) {}
+
+    /// Validate immutable recovery material required by `op` without changing
+    /// live state. The orchestrator runs this for every selected operation
+    /// before it executes any operation in the plan, preventing a missing or
+    /// corrupt later blob from leaving earlier mutations partially applied.
+    fn preflight(&self, _op: &InverseOp) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Does this executor handle `op`?
     fn supports(&self, op: &InverseOp) -> bool;
 

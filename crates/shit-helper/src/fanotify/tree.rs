@@ -70,6 +70,16 @@ impl TreeMap {
         self.pid_cache.clear();
     }
 
+    /// Snapshot the command windows currently registered with the kernel
+    /// capture tier.  A BPF ring-buffer loss record has no pid/path payload,
+    /// so its exact owner cannot be recovered; callers must conservatively
+    /// taint every command in this set.
+    pub fn active_commands(&self) -> Vec<(Uuid, u64)> {
+        let mut commands = self.trees.keys().copied().collect::<Vec<_>>();
+        commands.sort_unstable();
+        commands
+    }
+
     /// Is `pid` a descendant of any currently tracked root? Result is
     /// cached. Tolerates ESRCH (process exited mid-lookup) by treating
     /// it as "not tracked."
@@ -215,6 +225,17 @@ mod tests {
         tm.unwatch(s, 1);
         assert!(!tm.trees.contains_key(&(s, 1)));
         assert!(tm.pid_cache.is_empty());
+    }
+
+    #[test]
+    fn active_commands_is_a_deterministic_snapshot() {
+        let mut tm = TreeMap::new();
+        let later = Uuid::from_u128(2);
+        let earlier = Uuid::from_u128(1);
+        tm.watch(later, 9, 9009);
+        tm.watch(earlier, 7, 7007);
+
+        assert_eq!(tm.active_commands(), vec![(earlier, 7), (later, 9)]);
     }
 
     #[test]

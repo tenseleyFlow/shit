@@ -56,6 +56,10 @@ pub enum DecodeError {
     Postcard(#[from] postcard::Error),
     #[error("frame too large: {0} bytes")]
     TooLarge(usize),
+    #[error("unsupported shim wire extension: {0}")]
+    UnsupportedShimExtension(u8),
+    #[error("invalid shim wire extension: {0}")]
+    InvalidShimExtension(&'static str),
 }
 
 /// Encode any postcard-serializable message into the on-wire framing:

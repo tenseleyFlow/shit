@@ -194,7 +194,7 @@ reboot
 ```
 
 ### What happens to `shit` after reversal?
-The helper still runs. Its ES probe will fail (no entitlement enforcement → no ES connection), and the daemon falls back to FSEvents-degraded mode — exactly the same as the default install. No on-disk state needs cleanup. The ad-hoc-signed helper just stops being able to claim ES.
+The helper still runs. Its ES probe will fail (no entitlement enforcement → no ES connection), and the daemon returns to the default FSEvents-degraded helper tier. FSEvents provides readiness and diagnostics only; supported filesystem undo continues through the DYLD interposer if `shit dyld-hooks install` is still active. No on-disk state needs cleanup. The ad-hoc-signed helper just stops being able to claim ES.
 
 To go further and uninstall `shit` entirely, follow the "Uninstalling" section in [`install-macos.md`](./install-macos.md).
 

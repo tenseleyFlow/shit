@@ -153,6 +153,7 @@ unsafe extern "C" {
     );
 
     fn FSEventStreamStart(stream_ref: FSEventStreamRef) -> bool;
+    fn FSEventStreamFlushSync(stream_ref: FSEventStreamRef);
     fn FSEventStreamStop(stream_ref: FSEventStreamRef);
     fn FSEventStreamInvalidate(stream_ref: FSEventStreamRef);
     fn FSEventStreamRelease(stream_ref: FSEventStreamRef);
@@ -408,6 +409,27 @@ impl FsEventsStream {
             },
             rx,
         ))
+    }
+
+    /// Force every event that occurred before this call through the native
+    /// callback before returning. The capture pump drains its Rust channel
+    /// immediately afterward to form a synchronous detach barrier.
+    pub fn flush_sync(&self) -> std::io::Result<()> {
+        let stream_ref = self
+            .stream_ref
+            .lock()
+            .map_err(|_| std::io::Error::other("FSEvents stream state lock is poisoned"))?;
+        let stream_ref = stream_ref.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "FSEvents stream is no longer active",
+            )
+        })?;
+        // SAFETY: `stream_ref` remains retained by `self`, the stream was
+        // started before construction returned, and the state mutex prevents
+        // a concurrent `stop` from taking/releasing it during this call.
+        unsafe { FSEventStreamFlushSync(stream_ref.0 as FSEventStreamRef) };
+        Ok(())
     }
 
     /// Stop the stream and join the worker. Safe to call once; further

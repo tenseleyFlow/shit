@@ -5,18 +5,21 @@
 -- `docker volume rm` volume tarballs, and (informational) the
 -- captured-rootfs `shit-stash:<id>:<ts>` image tags from the
 -- `docker rm -f` capture path. Container stashes are LARGE
--- (image tarballs run 100 MiB to several GiB) and short-lived; we
--- intentionally do NOT mix them into the long-retention blob store.
+-- (image tarballs run 100 MiB to several GiB), so eligible unbatched rows are
+-- short-lived; we intentionally do NOT mix them into the long-retention blob
+-- store. Rows later associated with an atomic container batch are protected
+-- while authorization/runtime is in flight, then receive a full retention
+-- window from durable runtime finalization (added by migration v6).
 --
--- Default retention: 1 day (configurable; see
+-- Default retention for eligible unbatched rows: 1 day (configurable; see
 -- `daemon::container_stash::CONTAINER_STASH_RETENTION_SECS`). The S13
 -- GC pass walks `container_stashes` independently from the file-tier
 -- refcount-driven reap.
 --
 -- Each row is content-addressed by blake3 of the tarball bytes. The
 -- bytes themselves live OUTSIDE this index: they're shipped through
--- the existing BlobStore (with their own short-retention policy
--- applied at the GC layer). The `blob_hash` column is the lookup key
+-- the existing BlobStore (with eligible-row retention applied at the GC
+-- layer). The `blob_hash` column is the lookup key
 -- back into BlobStore; the rest of this row is the metadata needed to
 -- enumerate, surface, and prune.
 

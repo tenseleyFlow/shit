@@ -2,8 +2,8 @@
 
 //! fanotify event loop. Single-threaded `epoll` on the fanotify fd:
 //! read up to 64 KiB of events at a time, parse, dispatch each to the
-//! handler closure, batch the resulting ALLOW/DENY responses, write
-//! them back with a single `writev`.
+//! handler closure, and write every resulting ALLOW/DENY response back
+//! in bounded `writev` batches.
 //!
 //! Architecture choice: `epoll` not `io_uring`. fanotify perm mode
 //! requires a synchronous read-write cycle; io_uring offers no benefit
@@ -52,6 +52,16 @@ pub enum Decision {
     Deny,
 }
 
+/// All permission responses parsed from one kernel read plus its loss signal.
+/// Overflow is data, rather than an early error, so responses that preceded an
+/// overflow marker are still returned to the kernel before the runtime marks
+/// capture degraded.
+#[derive(Debug)]
+pub struct BatchOutcome {
+    pub responses: Vec<libc::fanotify_response>,
+    pub overflowed: bool,
+}
+
 impl Decision {
     fn as_kernel_response(self) -> u32 {
         match self {
@@ -72,17 +82,19 @@ pub fn process_batch<F, G>(
     buf: &[u8],
     mut decide: F,
     mut observe: G,
-) -> Result<Vec<libc::fanotify_response>, LoopError>
+) -> Result<BatchOutcome, LoopError>
 where
     F: FnMut(&Event) -> Option<Decision>,
     G: FnMut(&Event),
 {
     let mut responses = Vec::with_capacity(RESPONSE_BATCH_MAX);
+    let mut overflowed = false;
     for ev_res in EventIter::new(buf) {
         let ev = ev_res?;
         observe(&ev);
         if ev.is_overflow() {
-            return Err(LoopError::QueueOverflow);
+            overflowed = true;
+            continue;
         }
         if !ev.needs_permission() {
             continue;
@@ -92,22 +104,19 @@ where
             fd: ev.fd,
             response: decision.as_kernel_response(),
         });
-        if responses.len() >= RESPONSE_BATCH_MAX {
-            // Flush early — caller writes this batch and calls back
-            // into process_batch for the rest of the buffer in a
-            // future read cycle. (Realistically the kernel won't
-            // hand us more than READ_BUF_BYTES / 24 ≈ 2700 events
-            // per read, so this triggers under perf storms.)
-            break;
-        }
     }
-    Ok(responses)
+    Ok(BatchOutcome {
+        responses,
+        overflowed,
+    })
 }
 
-/// Write a batch of responses back to the fanotify fd via a single
-/// `writev(2)`. The kernel expects each response struct as a separate
-/// frame; we use iovecs so we don't have to coalesce into a backing
-/// buffer.
+/// Write every response back to the fanotify fd in bounded `writev(2)`
+/// groups. Linux currently consumes one response per write syscall (bytes
+/// after the first struct are response-info payload), so a successful
+/// `writev` normally reports one complete struct even when more iovecs were
+/// supplied. Keep retrying from the first unconsumed response so no
+/// permission event is stranded.
 pub fn write_responses(
     fd: &FanotifyFd,
     responses: &[libc::fanotify_response],
@@ -115,29 +124,88 @@ pub fn write_responses(
     if responses.is_empty() {
         return Ok(());
     }
-    // SAFETY: each `fanotify_response` is POD; we cast its slice to
-    // bytes for IoSlice. Kernel reads `sizeof(struct fanotify_response)`
-    // per response.
-    let slices: Vec<IoSlice<'_>> = responses
-        .iter()
-        .map(|r| {
-            let p = (r as *const libc::fanotify_response).cast::<u8>();
-            let bytes =
-                unsafe { std::slice::from_raw_parts(p, size_of::<libc::fanotify_response>()) };
-            IoSlice::new(bytes)
-        })
-        .collect();
+    for batch in responses.chunks(RESPONSE_BATCH_MAX) {
+        write_response_batch_with(
+            batch,
+            |remaining| {
+                // SAFETY: each `fanotify_response` is POD and every iovec
+                // borrows one complete initialized response for the duration
+                // of writev.
+                let slices: Vec<IoSlice<'_>> = remaining
+                    .iter()
+                    .map(|response| {
+                        let ptr = (response as *const libc::fanotify_response).cast::<u8>();
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(ptr, size_of::<libc::fanotify_response>())
+                        };
+                        IoSlice::new(bytes)
+                    })
+                    .collect();
+                let rc = unsafe {
+                    libc::writev(
+                        fd.as_raw_fd(),
+                        slices.as_ptr().cast::<libc::iovec>(),
+                        slices.len() as libc::c_int,
+                    )
+                };
+                if rc < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(rc as usize)
+                }
+            },
+            // fanotify's poll implementation advertises readable events only,
+            // never POLLOUT. Waiting for writable after a hypothetical EAGAIN
+            // would therefore deadlock; yield and retry the unchanged slice.
+            std::thread::yield_now,
+        )?;
+    }
+    Ok(())
+}
 
-    // Single writev syscall — atomic from the kernel's POV.
-    let rc = unsafe {
-        libc::writev(
-            fd.as_raw_fd(),
-            slices.as_ptr() as *const libc::iovec,
-            slices.len() as libc::c_int,
-        )
-    };
-    if rc < 0 {
-        return Err(LoopError::Io(io::Error::last_os_error()));
+fn write_response_batch_with<W, B>(
+    batch: &[libc::fanotify_response],
+    mut write_once: W,
+    mut eagain_backoff: B,
+) -> Result<(), LoopError>
+where
+    W: FnMut(&[libc::fanotify_response]) -> io::Result<usize>,
+    B: FnMut(),
+{
+    let response_size = size_of::<libc::fanotify_response>();
+    let mut consumed = 0usize;
+    while consumed < batch.len() {
+        match write_once(&batch[consumed..]) {
+            Ok(0) => {
+                return Err(LoopError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "fanotify response write returned zero",
+                )));
+            }
+            Ok(written) => {
+                let remaining_bytes = (batch.len() - consumed) * response_size;
+                if written > remaining_bytes || written % response_size != 0 {
+                    return Err(LoopError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "fanotify response write returned {written} bytes for {remaining_bytes} bytes of complete responses"
+                        ),
+                    )));
+                }
+                // Advance only by complete response objects. In particular,
+                // never form a byte pointer into the middle of a struct after
+                // a short write.
+                consumed += written / response_size;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => {}
+            Err(error)
+                if error.raw_os_error() == Some(libc::EAGAIN)
+                    || error.raw_os_error() == Some(libc::EWOULDBLOCK) =>
+            {
+                eagain_backoff();
+            }
+            Err(error) => return Err(LoopError::Io(error)),
+        }
     }
     Ok(())
 }
@@ -206,7 +274,7 @@ mod tests {
         buf.extend(build_event(libc::FAN_OPEN_PERM, 7, 100));
         buf.extend(build_event(libc::FAN_ACCESS_PERM, 8, 101));
         let mut seen = 0;
-        let resps = process_batch(
+        let outcome = process_batch(
             &buf,
             |_| Some(Decision::Allow),
             |_| {
@@ -214,9 +282,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resps.len(), 2);
+        assert_eq!(outcome.responses.len(), 2);
         assert_eq!(seen, 2);
-        for r in resps {
+        for r in outcome.responses {
             assert_eq!(r.response, libc::FAN_ALLOW);
         }
     }
@@ -224,10 +292,10 @@ mod tests {
     #[test]
     fn process_batch_deny_path() {
         let buf = build_event(libc::FAN_OPEN_PERM, 9, 200);
-        let resps = process_batch(&buf, |_| Some(Decision::Deny), |_| {}).unwrap();
-        assert_eq!(resps.len(), 1);
-        assert_eq!(resps[0].response, libc::FAN_DENY);
-        assert_eq!(resps[0].fd, 9);
+        let outcome = process_batch(&buf, |_| Some(Decision::Deny), |_| {}).unwrap();
+        assert_eq!(outcome.responses.len(), 1);
+        assert_eq!(outcome.responses[0].response, libc::FAN_DENY);
+        assert_eq!(outcome.responses[0].fd, 9);
     }
 
     #[test]
@@ -235,7 +303,7 @@ mod tests {
         // FAN_OPEN is a notification class, not perm.
         let buf = build_event(libc::FAN_OPEN, 9, 200);
         let mut observed = 0;
-        let resps = process_batch(
+        let outcome = process_batch(
             &buf,
             |_| Some(Decision::Allow),
             |_| {
@@ -243,33 +311,126 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(resps.is_empty());
+        assert!(outcome.responses.is_empty());
         assert_eq!(observed, 1);
     }
 
     #[test]
     fn process_batch_surfaces_overflow() {
         let buf = build_event(libc::FAN_Q_OVERFLOW, -1, 0);
-        let err = process_batch(&buf, |_| Some(Decision::Allow), |_| {}).unwrap_err();
-        assert!(matches!(err, LoopError::QueueOverflow));
+        let outcome = process_batch(&buf, |_| Some(Decision::Allow), |_| {}).unwrap();
+        assert!(outcome.overflowed);
+        assert!(outcome.responses.is_empty());
     }
 
     #[test]
-    fn process_batch_caps_at_response_batch_max() {
+    fn process_batch_keeps_responses_on_queue_overflow() {
+        let mut buf = Vec::new();
+        buf.extend(build_event(libc::FAN_OPEN_PERM, 7, 100));
+        buf.extend(build_event(libc::FAN_Q_OVERFLOW, -1, 0));
+        buf.extend(build_event(libc::FAN_OPEN_PERM, 8, 101));
+        let outcome = process_batch(&buf, |_| Some(Decision::Deny), |_| {}).unwrap();
+        assert!(outcome.overflowed);
+        assert_eq!(
+            outcome
+                .responses
+                .iter()
+                .map(|response| response.fd)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+    }
+
+    #[test]
+    fn process_batch_retains_every_permission_event_beyond_write_batch_size() {
         let mut buf = Vec::new();
         for i in 0..(RESPONSE_BATCH_MAX * 2) as i32 {
             buf.extend(build_event(libc::FAN_OPEN_PERM, i, 100 + i));
         }
-        let resps = process_batch(&buf, |_| Some(Decision::Allow), |_| {}).unwrap();
-        assert_eq!(resps.len(), RESPONSE_BATCH_MAX);
+        let outcome = process_batch(&buf, |_| Some(Decision::Allow), |_| {}).unwrap();
+        assert_eq!(outcome.responses.len(), RESPONSE_BATCH_MAX * 2);
+        assert_eq!(
+            outcome.responses.last().unwrap().fd,
+            (RESPONSE_BATCH_MAX * 2 - 1) as i32
+        );
     }
 
     #[test]
     fn process_batch_handler_can_choose_implicit_allow() {
         // None from decide → defaults to Allow.
         let buf = build_event(libc::FAN_OPEN_PERM, 5, 555);
-        let resps = process_batch(&buf, |_| None, |_| {}).unwrap();
-        assert_eq!(resps.len(), 1);
-        assert_eq!(resps[0].response, libc::FAN_ALLOW);
+        let outcome = process_batch(&buf, |_| None, |_| {}).unwrap();
+        assert_eq!(outcome.responses.len(), 1);
+        assert_eq!(outcome.responses[0].response, libc::FAN_ALLOW);
+    }
+
+    #[test]
+    fn response_writer_retries_interrupt_would_block_and_complete_prefixes() {
+        let responses = [
+            libc::fanotify_response {
+                fd: 10,
+                response: libc::FAN_ALLOW,
+            },
+            libc::fanotify_response {
+                fd: 11,
+                response: libc::FAN_DENY,
+            },
+            libc::fanotify_response {
+                fd: 12,
+                response: libc::FAN_ALLOW,
+            },
+        ];
+        let mut attempts = Vec::new();
+        let mut step = 0usize;
+        let mut backoffs = 0usize;
+        write_response_batch_with(
+            &responses,
+            |remaining| {
+                attempts.push(
+                    remaining
+                        .iter()
+                        .map(|response| response.fd)
+                        .collect::<Vec<_>>(),
+                );
+                step += 1;
+                match step {
+                    1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    2 => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                    3 => Ok(2 * size_of::<libc::fanotify_response>()),
+                    4 => Ok(size_of::<libc::fanotify_response>()),
+                    _ => panic!("unexpected write attempt"),
+                }
+            },
+            || backoffs += 1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            attempts,
+            vec![
+                vec![10, 11, 12],
+                vec![10, 11, 12],
+                vec![10, 11, 12],
+                vec![12]
+            ]
+        );
+        assert_eq!(backoffs, 1);
+    }
+
+    #[test]
+    fn response_writer_rejects_partial_struct_without_advancing() {
+        let responses = [libc::fanotify_response {
+            fd: 10,
+            response: libc::FAN_ALLOW,
+        }];
+        let error = write_response_batch_with(
+            &responses,
+            |_| Ok(size_of::<libc::fanotify_response>() - 1),
+            || {},
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, LoopError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData)
+        );
     }
 }

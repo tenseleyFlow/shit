@@ -41,6 +41,20 @@ pub struct ShellStatePreStash {
     inner: Mutex<HashMap<CommandId, ShellStatePre>>,
 }
 
+/// Durable disposition of one post-command shell-state snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostOutcome {
+    /// No matching pre-command snapshot existed. A shell mutation may have
+    /// occurred, so the caller must fail the command closed.
+    Orphan,
+    /// Every captured dimension matched its pre-command value.
+    Unchanged,
+    /// A non-empty diff was durably journaled.
+    Changed,
+    /// A non-empty diff existed but the event write failed.
+    JournalFailed(String),
+}
+
 impl ShellStatePreStash {
     pub fn new() -> Self {
         Self {
@@ -71,6 +85,16 @@ impl ShellStatePreStash {
 
     pub fn take(&self, key: CommandId) -> Option<ShellStatePre> {
         self.inner.lock().ok()?.remove(&key)
+    }
+
+    /// Whether a command still needs its post-command shell-state snapshot.
+    /// PostExec checks this to fail closed for older hooks whose close message
+    /// could overtake PostExecShellState.
+    pub fn contains(&self, key: CommandId) -> bool {
+        self.inner
+            .lock()
+            .map(|stash| stash.contains_key(&key))
+            .unwrap_or(true)
     }
 
     /// Drop entries older than `PRE_STASH_TTL`. Called by the
@@ -123,14 +147,14 @@ pub fn handle_post(
     aliases_after_pairs: Vec<(String, String)>,
     index: &Index,
     ts: TimePoint,
-) {
+) -> PostOutcome {
     let Some(pre) = stash.take(command) else {
         tracing::debug!(
             session = %command.session,
             seq = command.seq,
             "post-exec-shell-state with no matching pre; dropping"
         );
-        return;
+        return PostOutcome::Orphan;
     };
     let opts_after = pairs_to_map(opts_after_pairs);
     let aliases_after = pairs_to_map(aliases_after_pairs);
@@ -141,7 +165,7 @@ pub fn handle_post(
 
     if !pwd_changed && opts_diff.is_empty() && aliases_diff.is_empty() {
         // Nothing to do.
-        return;
+        return PostOutcome::Unchanged;
     }
     let event = CaptureEvent {
         id: EventId(0),
@@ -156,8 +180,12 @@ pub fn handle_post(
             funcs: Vec::new(), // AR06.4 — follow-up
         },
     };
-    if let Err(e) = index.put_event(&event) {
-        tracing::warn!(err = %e, "shell-state-diff put_event failed");
+    match index.put_event(&event) {
+        Ok(_) => PostOutcome::Changed,
+        Err(e) => {
+            tracing::warn!(err = %e, "shell-state-diff put_event failed");
+            PostOutcome::JournalFailed(e.to_string())
+        }
     }
 }
 
@@ -197,4 +225,108 @@ fn diff_optional_map(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shit_planner::{CommandRecord, PlannerStore};
+    use uuid::Uuid;
+
+    fn command() -> CommandId {
+        CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, Index) {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("index.sqlite")).unwrap();
+        index
+            .put_session(Uuid::nil(), "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command: command(),
+                cmd_string: None,
+                cwd: PathBuf::from("/before"),
+                pid: 1,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: Vec::new(),
+            })
+            .unwrap();
+        (tmp, index)
+    }
+
+    #[test]
+    fn post_without_pre_is_explicit_orphan() {
+        let (_tmp, index) = fixture();
+        let outcome = handle_post(
+            &ShellStatePreStash::new(),
+            command(),
+            PathBuf::from("/after"),
+            Vec::new(),
+            Vec::new(),
+            &index,
+            TimePoint::new(1, 1),
+        );
+        assert_eq!(outcome, PostOutcome::Orphan);
+        assert!(index.events_for_command(command()).is_empty());
+    }
+
+    #[test]
+    fn contains_tracks_an_outstanding_post_snapshot() {
+        let stash = ShellStatePreStash::new();
+        handle_pre(
+            &stash,
+            command(),
+            PathBuf::from("/before"),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(stash.contains(command()));
+        assert!(stash.take(command()).is_some());
+        assert!(!stash.contains(command()));
+    }
+
+    #[test]
+    fn changed_post_reports_journal_failure() {
+        let (_tmp, index) = fixture();
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_shell_state_diff
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'ShellStateDiff'
+                 BEGIN SELECT RAISE(FAIL, 'injected shell-state failure'); END;",
+            )
+            .unwrap();
+        let stash = ShellStatePreStash::new();
+        handle_pre(
+            &stash,
+            command(),
+            PathBuf::from("/before"),
+            Vec::new(),
+            Vec::new(),
+        );
+        let outcome = handle_post(
+            &stash,
+            command(),
+            PathBuf::from("/after"),
+            Vec::new(),
+            Vec::new(),
+            &index,
+            TimePoint::new(1, 1),
+        );
+        assert!(
+            matches!(outcome, PostOutcome::JournalFailed(ref detail) if detail.contains("injected shell-state failure"))
+        );
+        assert!(index.events_for_command(command()).is_empty());
+    }
 }

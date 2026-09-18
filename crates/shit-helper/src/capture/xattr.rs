@@ -14,17 +14,26 @@
 //!   Restoring a file without its xattrs leaves it broken in
 //!   user-visible ways (signed binaries unsigned, quarantined
 //!   apps un-quarantined, etc.).
-//! - **Linux:** stubbed pending the L04 pre_open_tree integration —
-//!   adding flistxattr to that hot path crashed the runner; see
-//!   note below.
+//! - **Linux:** `flistxattr(2)` / `fgetxattr(2)`, limited to the
+//!   restorable `user.*` namespace.
 
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
 
-/// Best-effort xattr read off `fd`. Errors are swallowed: missing
-/// xattr support on the filesystem (UFS without UFS2, tmpfs without
-/// xattr enable) yields an empty map rather than a capture failure.
+/// Best-effort compatibility wrapper. Capture paths that treat the returned
+/// map as authoritative MUST use [`try_read_user_xattrs`] instead: an empty
+/// map after a read error would make undo delete attributes it never saw.
+#[allow(dead_code)] // FreeBSD's Capsicum capture still needs the non-authoritative fallback.
 pub fn read_user_xattrs(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
+    try_read_user_xattrs(fd).unwrap_or_default()
+}
+
+/// Strict xattr snapshot off an already-open descriptor.
+///
+/// `Ok(empty)` means the filesystem positively reported no restorable
+/// attributes. List/read/encoding/race/cap failures remain errors so the
+/// caller can emit `CaptureRefused` rather than authoritative empty state.
+pub fn try_read_user_xattrs(fd: RawFd) -> std::io::Result<BTreeMap<String, Vec<u8>>> {
     // NOTE (W09.21 / capsicum-default-on interaction): on FreeBSD with
     // cap_enter active (B05 default), `extattr_*_fd` returns no
     // attributes on tracked fds even when the file has them — capsicum
@@ -34,16 +43,6 @@ pub fn read_user_xattrs(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
     // fds before cap_enter with rights explicitly carried in. Until
     // then xattr capture is a no-op when capsicum is active; the
     // smoke validates the round-trip with SHIT_CAPSICUM=0.
-    //
-    // NOTE (W09.21 / Linux pre_open_tree interaction): on the L04
-    // tier, pre_open_tree opens every regular file under root_pid's
-    // cwd at PreExec and calls fstat_meta on each fd. Adding
-    // flistxattr to that hot path triggered a helper crash on the
-    // AR00 runner — reproducible "UnwatchTree dispatch failed: EPIPE"
-    // pattern that timed out wait-watch-ready and broke the
-    // edit/rm/chmod/mv-undo-linux smokes. Linux xattr capture
-    // doesn't have a validating smoke yet, and the platform target
-    // for W09.21 is FreeBSD; punt the Linux read to a follow-up.
     #[cfg(target_os = "freebsd")]
     {
         freebsd::read(fd)
@@ -52,10 +51,17 @@ pub fn read_user_xattrs(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
     {
         macos::read(fd)
     }
-    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::read(fd)
+    }
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos", target_os = "linux")))]
     {
         let _ = fd;
-        BTreeMap::new()
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor xattr capture is unsupported on this platform",
+        ))
     }
 }
 
@@ -69,52 +75,110 @@ mod freebsd {
     /// no terminator. Names are NOT null-terminated. Parsing requires
     /// reading the leading length byte and advancing exactly that
     /// many bytes.
-    pub fn read(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
+    pub fn read(fd: RawFd) -> std::io::Result<BTreeMap<String, Vec<u8>>> {
+        const XATTR_CAPTURE_CAP: usize = 8 * 1024 * 1024;
         let ns = libc::EXTATTR_NAMESPACE_USER;
         // First call with NULL/0 returns the size needed.
         let list_size = unsafe { libc::extattr_list_fd(fd, ns, std::ptr::null_mut(), 0) };
-        if list_size <= 0 {
-            return BTreeMap::new();
+        if list_size < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        let mut buf = vec![0u8; list_size as usize];
+        if list_size == 0 {
+            return Ok(BTreeMap::new());
+        }
+        let list_size = usize::try_from(list_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "xattr name-list length does not fit usize",
+            )
+        })?;
+        if list_size > XATTR_CAPTURE_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "xattr name list is {list_size} bytes, above the {XATTR_CAPTURE_CAP}-byte cap"
+                ),
+            ));
+        }
+        let mut buf = vec![0u8; list_size];
         let n = unsafe { libc::extattr_list_fd(fd, ns, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            return BTreeMap::new();
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n as usize != list_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("xattr name list changed during capture (expected {list_size}, read {n})"),
+            ));
         }
         let mut out = BTreeMap::new();
+        let mut total = list_size;
         let mut i = 0usize;
         let end = n as usize;
         while i < end {
             let len = buf[i] as usize;
             i += 1;
             if i + len > end {
-                break;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed FreeBSD xattr name list",
+                ));
             }
             let name_bytes = &buf[i..i + len];
             i += len;
-            let Ok(name) = std::str::from_utf8(name_bytes) else {
-                continue;
-            };
-            let cname = match CString::new(name) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            let name = std::str::from_utf8(name_bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xattr name is not valid UTF-8",
+                )
+            })?;
+            let cname = CString::new(name).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr name contains NUL: {e}"),
+                )
+            })?;
             let val_size =
                 unsafe { libc::extattr_get_fd(fd, ns, cname.as_ptr(), std::ptr::null_mut(), 0) };
             if val_size < 0 {
-                continue;
+                return Err(std::io::Error::last_os_error());
             }
-            let mut val = vec![0u8; val_size as usize];
+            let val_size = usize::try_from(val_size).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr {name:?} length does not fit usize"),
+                )
+            })?;
+            total = total.checked_add(val_size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xattr capture length overflow",
+                )
+            })?;
+            if total > XATTR_CAPTURE_CAP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr capture exceeds the {XATTR_CAPTURE_CAP}-byte aggregate cap"),
+                ));
+            }
+            let mut val = vec![0u8; val_size];
             let m = unsafe {
                 libc::extattr_get_fd(fd, ns, cname.as_ptr(), val.as_mut_ptr().cast(), val.len())
             };
             if m < 0 {
-                continue;
+                return Err(std::io::Error::last_os_error());
             }
-            val.truncate(m as usize);
+            if m as usize != val_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "xattr {name:?} changed during capture (expected {val_size}, read {m})"
+                    ),
+                ));
+            }
             out.insert(name.to_string(), val);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -150,50 +214,217 @@ mod macos {
     /// codesign signatures, Spotlight metadata, ACLs, FinderInfo —
     /// all need restoration during undo or the file ends up
     /// user-visibly broken (signed binaries unsigned, etc.).
-    pub fn read(fd: RawFd) -> BTreeMap<String, Vec<u8>> {
+    pub fn read(fd: RawFd) -> std::io::Result<BTreeMap<String, Vec<u8>>> {
+        const XATTR_CAPTURE_CAP: usize = 8 * 1024 * 1024;
         // First call with NULL/0 → returns the size needed.
         // SAFETY: passing 0/NULL is the documented size-query form;
         // fd is borrowed-valid for this call.
         let list_size = unsafe { flistxattr(fd, std::ptr::null_mut(), 0, 0) };
-        if list_size <= 0 {
-            return BTreeMap::new();
+        if list_size < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        let mut buf = vec![0u8; list_size as usize];
+        if list_size == 0 {
+            return Ok(BTreeMap::new());
+        }
+        let list_size = usize::try_from(list_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "xattr name-list length does not fit usize",
+            )
+        })?;
+        if list_size > XATTR_CAPTURE_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "xattr name list is {list_size} bytes, above the {XATTR_CAPTURE_CAP}-byte cap"
+                ),
+            ));
+        }
+        let mut buf = vec![0u8; list_size];
         // SAFETY: buf has list_size bytes; fd borrowed-valid.
         let n = unsafe { flistxattr(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if n <= 0 {
-            return BTreeMap::new();
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n as usize != list_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("xattr name list changed during capture (expected {list_size}, read {n})"),
+            ));
         }
         let mut out = BTreeMap::new();
+        let mut total = list_size;
         // Split on NUL; skip the trailing empty slice the split
         // produces when the buffer ends with a NUL.
         for name_bytes in buf[..n as usize]
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
         {
-            let Ok(name) = std::str::from_utf8(name_bytes) else {
-                continue;
-            };
-            let Ok(cname) = CString::new(name) else {
-                continue;
-            };
+            let name = std::str::from_utf8(name_bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xattr name is not valid UTF-8",
+                )
+            })?;
+            let cname = CString::new(name).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr name contains NUL: {e}"),
+                )
+            })?;
             // SAFETY: cname NUL-terminated; fd borrowed-valid;
             // value=NULL/size=0 is the size-query form.
             let val_size = unsafe { fgetxattr(fd, cname.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
             if val_size < 0 {
-                continue;
+                return Err(std::io::Error::last_os_error());
             }
-            let mut val = vec![0u8; val_size as usize];
+            let val_size = usize::try_from(val_size).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr {name:?} length does not fit usize"),
+                )
+            })?;
+            total = total.checked_add(val_size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xattr capture length overflow",
+                )
+            })?;
+            if total > XATTR_CAPTURE_CAP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr capture exceeds the {XATTR_CAPTURE_CAP}-byte aggregate cap"),
+                ));
+            }
+            let mut val = vec![0u8; val_size];
             // SAFETY: val has val_size bytes; fd + cname still valid.
             let m =
                 unsafe { fgetxattr(fd, cname.as_ptr(), val.as_mut_ptr().cast(), val.len(), 0, 0) };
             if m < 0 {
-                continue;
+                return Err(std::io::Error::last_os_error());
             }
-            val.truncate(m as usize);
+            if m as usize != val_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "xattr {name:?} changed during capture (expected {val_size}, read {m})"
+                    ),
+                ));
+            }
             out.insert(name.to_string(), val);
         }
-        out
+        Ok(out)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::os::fd::RawFd;
+
+    pub fn read(fd: RawFd) -> std::io::Result<BTreeMap<String, Vec<u8>>> {
+        const XATTR_CAPTURE_CAP: usize = 8 * 1024 * 1024;
+
+        let list_size = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+        if list_size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if list_size == 0 {
+            return Ok(BTreeMap::new());
+        }
+        let list_size = usize::try_from(list_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "xattr name-list length does not fit usize",
+            )
+        })?;
+        if list_size > XATTR_CAPTURE_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "xattr name list is {list_size} bytes, above the {XATTR_CAPTURE_CAP}-byte cap"
+                ),
+            ));
+        }
+        let mut names = vec![0 as libc::c_char; list_size];
+        let got = unsafe { libc::flistxattr(fd, names.as_mut_ptr(), names.len()) };
+        if got < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if got as usize != list_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "xattr name list changed during capture (expected {list_size}, read {got})"
+                ),
+            ));
+        }
+
+        let name_bytes =
+            unsafe { std::slice::from_raw_parts(names.as_ptr().cast::<u8>(), names.len()) };
+        let mut out = BTreeMap::new();
+        let mut total = list_size;
+        for raw in name_bytes
+            .split(|byte| *byte == 0)
+            .filter(|raw| !raw.is_empty())
+        {
+            let full = std::str::from_utf8(raw).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xattr name is not valid UTF-8",
+                )
+            })?;
+            let Some(name) = full.strip_prefix("user.") else {
+                continue;
+            };
+            let c_name = CString::new(full).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr name contains NUL: {e}"),
+                )
+            })?;
+            let value_size =
+                unsafe { libc::fgetxattr(fd, c_name.as_ptr(), std::ptr::null_mut(), 0) };
+            if value_size < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let value_size = usize::try_from(value_size).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr {full:?} length does not fit usize"),
+                )
+            })?;
+            total = total.checked_add(value_size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "xattr capture length overflow",
+                )
+            })?;
+            if total > XATTR_CAPTURE_CAP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("xattr capture exceeds the {XATTR_CAPTURE_CAP}-byte aggregate cap"),
+                ));
+            }
+            let mut value = vec![0u8; value_size];
+            let read = unsafe {
+                libc::fgetxattr(fd, c_name.as_ptr(), value.as_mut_ptr().cast(), value.len())
+            };
+            if read < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if read as usize != value_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "xattr {full:?} changed during capture (expected {value_size}, read {read})"
+                    ),
+                ));
+            }
+            out.insert(name.to_string(), value);
+        }
+        Ok(out)
     }
 }
 

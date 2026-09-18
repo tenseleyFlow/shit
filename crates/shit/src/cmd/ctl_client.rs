@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use shit_proto::{CtlRequest, CtlResponse, decode_frame, encode_frame};
+use shit_proto::{CtlRequest, CtlResponse, MAX_FRAME_SIZE, decode_frame, encode_frame};
 
 use crate::exitcode::{CliError, DAEMON_UNAVAILABLE, GENERIC_FAILURE};
 
@@ -35,11 +35,80 @@ pub fn call(path: &Path, req: &CtlRequest) -> Result<CtlResponse, CliError> {
     stream
         .write_all(&bytes)
         .map_err(|e| CliError::fail(GENERIC_FAILURE, format!("write: {e}")))?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = stream
-        .read(&mut buf)
-        .map_err(|e| CliError::fail(GENERIC_FAILURE, format!("read: {e}")))?;
-    let resp: CtlResponse = decode_frame(&buf[..n])
-        .map_err(|e| CliError::fail(GENERIC_FAILURE, format!("decode: {e}")))?;
-    Ok(resp)
+    read_response(&mut stream)
+}
+
+/// Read one length-prefixed ctl response from a stream.
+///
+/// A Unix stream read is allowed to return fewer bytes than requested even
+/// when the peer wrote the whole frame in one call. Reading into a fixed
+/// buffer once therefore truncated larger undo reports in practice. Read the
+/// four-byte prefix first, validate it before allocating, then read the exact
+/// body promised by that prefix.
+fn read_response(stream: &mut impl Read) -> Result<CtlResponse, CliError> {
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .map_err(|e| CliError::fail(GENERIC_FAILURE, format!("read response header: {e}")))?;
+
+    let body_len = u32::from_be_bytes(header) as usize;
+    let total_len = 4usize
+        .checked_add(body_len)
+        .ok_or_else(|| CliError::fail(GENERIC_FAILURE, "response frame length overflow"))?;
+    if total_len > MAX_FRAME_SIZE {
+        return Err(CliError::fail(
+            GENERIC_FAILURE,
+            format!("response frame too large: {total_len} bytes"),
+        ));
+    }
+
+    let mut frame = vec![0u8; total_len];
+    frame[..4].copy_from_slice(&header);
+    stream
+        .read_exact(&mut frame[4..])
+        .map_err(|e| CliError::fail(GENERIC_FAILURE, format!("read response body: {e}")))?;
+
+    decode_frame(&frame).map_err(|e| CliError::fail(GENERIC_FAILURE, format!("decode: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ChunkedReader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        max_chunk: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let limit = buf.len().min(self.max_chunk);
+            self.bytes.read(&mut buf[..limit])
+        }
+    }
+
+    #[test]
+    fn reads_response_body_across_partial_stream_reads() {
+        let message = "x".repeat(30_000);
+        let frame = encode_frame(&CtlResponse::Error(message.clone())).unwrap();
+        let mut stream = ChunkedReader {
+            bytes: std::io::Cursor::new(frame),
+            max_chunk: 8_188,
+        };
+
+        let response = read_response(&mut stream).unwrap();
+        match response {
+            CtlResponse::Error(actual) => assert_eq!(actual, message),
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_response_before_allocating_body() {
+        let oversized_body = u32::try_from(MAX_FRAME_SIZE).unwrap();
+        let mut stream = std::io::Cursor::new(oversized_body.to_be_bytes());
+
+        let err = read_response(&mut stream).unwrap_err();
+        assert!(err.to_string().contains("response frame too large"));
+    }
 }

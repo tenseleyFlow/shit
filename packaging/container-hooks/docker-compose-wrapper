@@ -5,40 +5,327 @@
 # docker-wrapper above; this script catches the v1 binary that's
 # still ubiquitous in CI images.
 #
-# Pre/post capture invocations of
-# `shit-helper container-event docker-compose ...` are gated on
-# DR-CR-21/26. Stage 1 just execs the real docker-compose with
-# SHIT_DURING_UNDO recursion guard.
+# The same two-phase preflight used by docker/podman is applied here. The
+# helper currently refuses destructive compose operations because no lossless
+# batch model exists for them; read-only compose commands return an empty token.
 
 set -e
-
-# Recursion guard: a docker-compose invocation issued FROM the
-# helper itself (during a shit undo) must NOT re-capture. The
-# executors set SHIT_DURING_UNDO=1.
-if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
-    real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker-compose 2>/dev/null || command -v -- docker-compose)
-    [ -n "$real" ] || { echo "shit: real docker-compose not found on PATH" >&2; exit 127; }
-    exec "$real" "$@"
-fi
 
 # Locate the real docker-compose (first non-wrapper entry on PATH).
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker-compose 2>/dev/null || command -v -- docker-compose)
 [ -n "$real" ] || { echo "shit: real docker-compose not found on PATH" >&2; exit 127; }
 
-# DR-CR-53 (AR03.6): pre-capture via `shit-helper container-event`.
-# Routes `docker-compose down` through prepare_compose_down which
-# packs project + compose_file into extras for the daemon-side
-# apply_compose_down to replay via `docker compose up -d`. The v2
-# plugin form (`docker compose down ...`) goes through the docker
-# wrapper, which falls through to classify_compose_argv. Hook-
-# friendly: failure logs and returns 0.
+# The standalone Compose client mutates the Docker engine, so it participates
+# in exactly the same cooperative lease as the docker wrapper.
+container_lock_engine=docker-engine
+container_lock_owned=0
+container_lock_reentrant=0
+container_lock_root=
+container_lock_dir=
+container_lock_token=
+container_lock_claim=
+container_lock_child_pid=
+container_lock_child_state=idle
+container_lock_pending_signal=
+container_lock_pending_signal_rc=
+container_lock_child_result=
+
+container_lock_read_path() {
+    container_lock_read_target=$1
+    container_lock_observed=
+    if [ -f "$container_lock_read_target" ] && [ ! -L "$container_lock_read_target" ]; then
+        container_lock_extra=
+        {
+            IFS= read -r container_lock_observed || container_lock_observed=
+            if IFS= read -r container_lock_extra; then
+                container_lock_observed=
+            fi
+        } <"$container_lock_read_target"
+    fi
+}
+
+container_lock_read_owner() {
+    container_lock_read_path "$container_lock_dir"
+}
+
+container_lock_owner_active() {
+    container_lock_candidate=$1
+    case "$container_lock_candidate" in
+        "$container_lock_engine":*) container_lock_pid=${container_lock_candidate#*:} ;;
+        *) return 1 ;;
+    esac
+    container_lock_pid=${container_lock_pid%%:*}
+    case "$container_lock_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$container_lock_pid" 2>/dev/null
+}
+
+container_lock_owner_well_formed() {
+    container_lock_candidate=$1
+    case "$container_lock_candidate" in
+        "$container_lock_engine":*) container_lock_pid=${container_lock_candidate#*:} ;;
+        *) return 1 ;;
+    esac
+    container_lock_tail=$container_lock_pid
+    container_lock_pid=${container_lock_pid%%:*}
+    case "$container_lock_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$container_lock_tail" in
+        "$container_lock_pid"|"$container_lock_pid":?*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+container_lock_private_root() {
+    [ -d "$container_lock_root" ] && [ ! -L "$container_lock_root" ] || return 1
+    container_lock_mode=$(LC_ALL=C ls -ldn "$container_lock_root" 2>/dev/null \
+        | LC_ALL=C awk 'NR == 1 { print $1 }')
+    container_lock_owner=$(LC_ALL=C ls -ldn "$container_lock_root" 2>/dev/null \
+        | LC_ALL=C awk 'NR == 1 { print $3 }')
+    case "$container_lock_mode" in
+        drwx------|drwx------@|drwx------.) ;;
+        *) return 1 ;;
+    esac
+    [ "$container_lock_owner" = "$container_lock_uid" ]
+}
+
+container_lock_init_root() {
+    container_lock_uid=$(id -u 2>/dev/null) || return 1
+    case "$container_lock_uid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    container_lock_root=/tmp/shit-container-hooks-$container_lock_uid
+    if (umask 077 && mkdir "$container_lock_root" 2>/dev/null); then
+        :
+    elif ! container_lock_private_root; then
+        return 1
+    fi
+    container_lock_private_root || return 1
+    container_lock_dir=$container_lock_root/$container_lock_engine.lock
+}
+
+container_lock_release() {
+    if [ "$container_lock_owned" -eq 1 ]; then
+        container_lock_read_owner
+        if [ "$container_lock_observed" = "$container_lock_token" ]; then
+            rm -f "$container_lock_dir" 2>/dev/null || :
+        fi
+    fi
+    container_lock_owned=0
+    if [ -n "$container_lock_claim" ]; then
+        rm -f "$container_lock_claim" 2>/dev/null || :
+        container_lock_claim=
+    fi
+    if [ "${SHIT_CONTAINER_LOCK_HELD:-}" = "$container_lock_token" ]; then
+        unset SHIT_CONTAINER_LOCK_HELD
+    fi
+    return 0
+}
+
+container_lock_signal() {
+    container_lock_signal_rc=$1
+    container_lock_signal_name=$2
+
+    # Do not release between spawning the runtime and registering `$!`.
+    # A signal in that window is consumed as soon as the pid is published.
+    if [ "$container_lock_child_state" = spawning ]; then
+        if [ -z "$container_lock_pending_signal" ]; then
+            container_lock_pending_signal=$container_lock_signal_name
+            container_lock_pending_signal_rc=$container_lock_signal_rc
+        fi
+        return 0
+    fi
+
+    # Preserve the first signal's status and make cleanup non-interruptible.
+    # A second catchable signal must not kill the wrapper while it is waiting
+    # for the runtime child, which could otherwise strand the engine lock.
+    trap '' HUP INT TERM
+    if [ "$container_lock_child_state" = running ] \
+        && [ -n "$container_lock_child_pid" ] \
+        && [ -z "$container_lock_child_result" ]; then
+        container_lock_signal_sent=0
+        if kill -s "$container_lock_signal_name" "$container_lock_child_pid" 2>/dev/null; then
+            container_lock_signal_sent=1
+        fi
+        # POSIX asynchronous commands may inherit SIGINT ignored. Forward the
+        # original INT, then TERM as a termination fallback; the wrapper still
+        # exits with the original signal status after reaping the runtime.
+        if [ "$container_lock_signal_name" = INT ]; then
+            kill -s TERM "$container_lock_child_pid" 2>/dev/null || :
+        fi
+        set +e
+        wait "$container_lock_child_pid"
+        container_lock_child_rc=$?
+        container_lock_child_state=reaped
+        container_lock_child_pid=
+    fi
+    container_lock_release
+    exit "$container_lock_signal_rc"
+}
+
+container_lock_test_barrier() {
+    container_lock_test_ready=$1
+    container_lock_test_release=$2
+    if [ "${SHIT_CONTAINER_TEST_HOOKS:-}" != 1 ] \
+        || [ -z "$container_lock_test_ready" ] \
+        || [ -z "$container_lock_test_release" ]; then
+        return 0
+    fi
+    : >"$container_lock_test_ready"
+    while [ ! -f "$container_lock_test_release" ]; do
+        sleep 1
+    done
+}
+
+container_lock_child_registered() {
+    container_lock_child_pid=$1
+    container_lock_child_state=running
+    if [ -n "$container_lock_pending_signal" ]; then
+        container_lock_deferred_name=$container_lock_pending_signal
+        container_lock_deferred_rc=$container_lock_pending_signal_rc
+        container_lock_pending_signal=
+        container_lock_pending_signal_rc=
+        container_lock_signal "$container_lock_deferred_rc" "$container_lock_deferred_name"
+    fi
+}
+
+container_lock_acquire() {
+    container_lock_init_root || return 1
+    if [ -n "${SHIT_CONTAINER_LOCK_HELD:-}" ]; then
+        container_lock_read_owner
+        if [ "$container_lock_observed" = "$SHIT_CONTAINER_LOCK_HELD" ] \
+            && container_lock_owner_active "$container_lock_observed"; then
+            container_lock_reentrant=1
+            return 0
+        fi
+    fi
+
+    container_lock_counter=0
+    while :; do
+        container_lock_nonce=sh.$$.${container_lock_counter}
+        container_lock_claim=$container_lock_root/.$container_lock_engine.claim.$container_lock_nonce
+        if [ ! -f "$container_lock_claim" ] && [ ! -d "$container_lock_claim" ] \
+            && [ ! -L "$container_lock_claim" ]; then
+            container_lock_token=$container_lock_engine:$$:$container_lock_nonce
+            container_lock_read_owner
+            if [ "$container_lock_observed" = "$container_lock_token" ]; then
+                container_lock_counter=$((container_lock_counter + 1))
+                continue
+            fi
+            if (umask 077 && printf '%s\n' "$container_lock_token" >"$container_lock_claim"); then
+                break
+            fi
+            return 1
+        fi
+        container_lock_counter=$((container_lock_counter + 1))
+    done
+
+    while :; do
+        if [ -d "$container_lock_dir" ] || [ -L "$container_lock_dir" ]; then
+            return 1
+        fi
+        if ln "$container_lock_claim" "$container_lock_dir" 2>/dev/null; then
+            container_lock_owned=1
+            SHIT_CONTAINER_LOCK_HELD=$container_lock_token
+            export SHIT_CONTAINER_LOCK_HELD
+            return 0
+        fi
+        [ -f "$container_lock_dir" ] && [ ! -L "$container_lock_dir" ] || return 1
+        container_lock_read_owner
+        container_lock_first=$container_lock_observed
+        container_lock_owner_well_formed "$container_lock_first" || return 1
+        if container_lock_owner_active "$container_lock_first"; then
+            sleep 1
+            continue
+        fi
+        echo "shit: stale container engine lock at $container_lock_dir; verify no container helper/runtime remains, then remove it manually" >&2
+        return 1
+    done
+}
+
+container_run_real() {
+    container_lock_child_result=
+    container_lock_child_state=spawning
+    (
+        trap - HUP INT TERM
+        exec "$real" "$@"
+    ) <&0 &
+    container_lock_spawned_pid=$!
+    container_lock_test_barrier \
+        "${SHIT_CONTAINER_TEST_SPAWN_READY:-}" \
+        "${SHIT_CONTAINER_TEST_SPAWN_RELEASE:-}"
+    container_lock_child_registered "$container_lock_spawned_pid"
+    wait "$container_lock_child_pid"
+    container_lock_child_result=$?
+    container_lock_test_barrier \
+        "${SHIT_CONTAINER_TEST_WAIT_READY:-}" \
+        "${SHIT_CONTAINER_TEST_WAIT_RELEASE:-}"
+    container_run_rc=$container_lock_child_result
+    container_lock_child_state=reaped
+    container_lock_child_pid=
+    container_lock_child_state=idle
+    return "$container_run_rc"
+}
+
+trap 'container_lock_release' 0
+trap 'container_lock_signal 129 HUP' HUP
+trap 'container_lock_signal 130 INT' INT
+trap 'container_lock_signal 143 TERM' TERM
+
+if ! container_lock_acquire; then
+    echo "shit: refusing docker-compose command: cannot acquire private container engine lock" >&2
+    exit 125
+fi
+
+if [ "$container_lock_reentrant" -eq 1 ]; then
+    exec "$real" "$@"
+fi
+if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
+    set +e
+    container_run_real "$@"
+    real_rc=$?
+    set -e
+    exit "$real_rc"
+fi
+
+compose_is_reviewed_read_only() {
+    case "${1:-}" in
+        config|events|images|logs|ls|ps|top|version) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! compose_is_reviewed_read_only "$@"; then
+    echo "shit: refusing Docker Compose command outside the reviewed read-only policy" >&2
+    exit 125
+fi
+
 helper=$(command -v shit-helper 2>/dev/null || true)
 if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
     echo "shit-hook: docker-compose-wrapper real=${real} helper=${helper:-<not-found>}" >&2
 fi
 if [ -n "$helper" ]; then
-    target_argv=$(printf '%s\n' "$@")
-    "$helper" container-event docker-compose pre "--target-argv=$target_argv" || true
+    set +e
+    batch_token=$(printf '%s\0' "$@" | "$helper" container-prepare docker-compose --target-argv-nul-stdin)
+    prepare_rc=$?
+    set -e
+    if [ "$prepare_rc" -ne 0 ]; then
+        echo "shit: refusing docker-compose command: container preflight failed" >&2
+        exit 125
+    fi
+    if [ -n "$batch_token" ]; then
+        echo "shit: refusing read-only Docker Compose command: helper returned unexpected authorization" >&2
+        exit 125
+    fi
 fi
 
-exec "$real" "$@"
+container_lock_release
+
+set +e
+container_run_real "$@"
+real_rc=$?
+set -e
+
+exit "$real_rc"

@@ -3,66 +3,630 @@
 # C04 container wrapper: docker. PATH-prepended under
 # $XDG_CONFIG_HOME/shit/bin/ when `shit container-hooks install` runs.
 #
-# Pre/post capture invocations of `shit-helper container-event docker ...`
-# are gated on DR-CR-21/26 (daemon-side container capture pipeline +
-# helper subcommand). Stage 1 just execs the real docker with
-# SHIT_DURING_UNDO recursion guard.
+# Destructive capture uses an atomic authorization batch: the helper durably
+# confirms every target before docker runs. The post-runtime finalize message
+# records exit status and observations but cannot revoke the usable inverse.
 
 set -e
-
-# Recursion guard: a docker invocation issued FROM the helper itself
-# (during a shit undo, or during a capture-time `docker run`/`docker
-# save` sidecar) must NOT re-capture. The executors and the helper's
-# capture path both set SHIT_DURING_UNDO=1. PATH-strip the wrapper's
-# directory and re-resolve so we find the real docker even when the
-# original `command -v` returns the wrapper itself.
-if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
-    real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker 2>/dev/null || command -v -- docker)
-    [ -n "$real" ] || { echo "shit: real docker not found on PATH" >&2; exit 127; }
-    exec "$real" "$@"
-fi
 
 # Locate the real docker (first non-wrapper entry on PATH).
 real=$(PATH="${PATH#*$(dirname "$0"):}" command -v docker 2>/dev/null || command -v -- docker)
 [ -n "$real" ] || { echo "shit: real docker not found on PATH" >&2; exit 127; }
 
-# DR-CR-26 (AR03 PR-B): pre-capture via `shit-helper container-event`.
-# The helper classifies the argv, runs `docker save` for destructive
-# image verbs (rmi), and ships the tarball bytes inline to the daemon.
-# Helper is hook-friendly: any failure logs and returns 0, so a torn
-# daemon cannot break `docker`. Best-effort by design.
+# Serialize the snapshot, mutation, and observation against other cooperative
+# docker/docker-compose callers. A fully written claim becomes canonical via
+# atomic hard-link creation; this needs only POSIX ln(1), unlike flock(1).
+# The mkdir-created root is private even when XDG_RUNTIME_DIR is unavailable.
+container_lock_engine=docker-engine
+container_lock_owned=0
+container_lock_reentrant=0
+container_lock_root=
+container_lock_dir=
+container_lock_token=
+container_lock_claim=
+container_lock_child_pid=
+container_lock_child_state=idle
+container_lock_pending_signal=
+container_lock_pending_signal_rc=
+container_lock_child_result=
+container_lock_exit_override=
+container_lock_finalize_required=0
+
+container_lock_read_path() {
+    container_lock_read_target=$1
+    container_lock_observed=
+    if [ -f "$container_lock_read_target" ] && [ ! -L "$container_lock_read_target" ]; then
+        container_lock_extra=
+        {
+            IFS= read -r container_lock_observed || container_lock_observed=
+            if IFS= read -r container_lock_extra; then
+                container_lock_observed=
+            fi
+        } <"$container_lock_read_target"
+    fi
+}
+
+container_lock_read_owner() {
+    container_lock_read_path "$container_lock_dir"
+}
+
+container_lock_owner_active() {
+    container_lock_candidate=$1
+    case "$container_lock_candidate" in
+        "$container_lock_engine":*)
+            container_lock_pid=${container_lock_candidate#*:}
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    container_lock_pid=${container_lock_pid%%:*}
+    case "$container_lock_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$container_lock_pid" 2>/dev/null
+}
+
+container_lock_owner_well_formed() {
+    container_lock_candidate=$1
+    case "$container_lock_candidate" in
+        "$container_lock_engine":*) container_lock_pid=${container_lock_candidate#*:} ;;
+        *) return 1 ;;
+    esac
+    container_lock_tail=$container_lock_pid
+    container_lock_pid=${container_lock_pid%%:*}
+    case "$container_lock_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$container_lock_tail" in
+        "$container_lock_pid"|"$container_lock_pid":?*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+container_lock_private_root() {
+    [ -d "$container_lock_root" ] && [ ! -L "$container_lock_root" ] || return 1
+    container_lock_mode=$(LC_ALL=C ls -ldn "$container_lock_root" 2>/dev/null \
+        | LC_ALL=C awk 'NR == 1 { print $1 }')
+    container_lock_owner=$(LC_ALL=C ls -ldn "$container_lock_root" 2>/dev/null \
+        | LC_ALL=C awk 'NR == 1 { print $3 }')
+    case "$container_lock_mode" in
+        drwx------|drwx------@|drwx------.) ;;
+        *) return 1 ;;
+    esac
+    [ "$container_lock_owner" = "$container_lock_uid" ]
+}
+
+container_lock_init_root() {
+    container_lock_uid=$(id -u 2>/dev/null) || return 1
+    case "$container_lock_uid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # This location is deliberately independent of caller-controlled
+    # XDG_RUNTIME_DIR/TMPDIR so wrappers and the long-lived daemon always name
+    # the same endpoint lock.
+    container_lock_root=/tmp/shit-container-hooks-$container_lock_uid
+    if (umask 077 && mkdir "$container_lock_root" 2>/dev/null); then
+        :
+    elif ! container_lock_private_root; then
+        return 1
+    fi
+    container_lock_private_root || return 1
+    container_lock_dir=$container_lock_root/$container_lock_engine.lock
+}
+
+container_lock_release() {
+    if [ "$container_lock_owned" -eq 1 ]; then
+        container_lock_read_owner
+        if [ "$container_lock_observed" = "$container_lock_token" ]; then
+            rm -f "$container_lock_dir" 2>/dev/null || :
+        fi
+    fi
+    container_lock_owned=0
+    if [ -n "$container_lock_claim" ]; then
+        rm -f "$container_lock_claim" 2>/dev/null || :
+        container_lock_claim=
+    fi
+    if [ "${SHIT_CONTAINER_LOCK_HELD:-}" = "$container_lock_token" ]; then
+        unset SHIT_CONTAINER_LOCK_HELD
+    fi
+    return 0
+}
+
+container_lock_signal() {
+    container_lock_signal_rc=$1
+    container_lock_signal_name=$2
+
+    # The child exists before POSIX exposes its pid through the following `$!`
+    # assignment. A trap in that tiny spawn window must not release the engine
+    # lock while the unregistered runtime keeps running. Defer the first signal;
+    # the launch path consumes it immediately after publishing the child pid.
+    if [ "$container_lock_child_state" = spawning ] \
+        || [ "$container_lock_child_state" = preparing ] \
+        || [ "$container_lock_child_state" = authorized ]; then
+        if [ -z "$container_lock_pending_signal" ]; then
+            container_lock_pending_signal=$container_lock_signal_name
+            container_lock_pending_signal_rc=$container_lock_signal_rc
+        fi
+        return 0
+    fi
+
+    # Once a signal has selected the wrapper's terminal status, ignore later
+    # catchable signals until the runtime is reaped and any durable finalize
+    # request has completed. SIGKILL still leaves the canonical lock behind.
+    trap '' HUP INT TERM
+    if [ "$container_lock_finalize_required" -eq 1 ] \
+        && [ -z "$container_lock_exit_override" ]; then
+        container_lock_exit_override=$container_lock_signal_rc
+    fi
+    if [ "$container_lock_child_state" = running ] \
+        && [ -n "$container_lock_child_pid" ] \
+        && [ -z "$container_lock_child_result" ]; then
+        container_lock_signal_sent=0
+        if kill -s "$container_lock_signal_name" "$container_lock_child_pid" 2>/dev/null; then
+            container_lock_signal_sent=1
+        fi
+        # POSIX shells start asynchronous commands with SIGINT ignored. The
+        # runtime is launched asynchronously so the wrapper can finalize it;
+        # forward INT first, then TERM as a termination fallback in case the
+        # executable inherited that ignored disposition. The wrapper still
+        # reports the original INT status, while finalize records what the
+        # runtime actually returned.
+        if [ "$container_lock_signal_name" = INT ]; then
+            kill -s TERM "$container_lock_child_pid" 2>/dev/null || :
+        fi
+        set +e
+        wait "$container_lock_child_pid"
+        container_lock_child_rc=$?
+        # `wait` returns 127 when the normal path reaped the child immediately
+        # before this trap ran. In that case preserve the result already saved
+        # by the normal path instead of manufacturing 127.
+        if [ "$container_lock_signal_sent" -eq 1 ] \
+            || [ "$container_lock_child_rc" -ne 127 ]; then
+            container_lock_child_result=$container_lock_child_rc
+        fi
+        container_lock_child_state=reaped
+        container_lock_child_pid=
+    fi
+
+    # An authorized batch must report a terminal runtime outcome before the
+    # wrapper releases serialization. Returning into the main path lets it send
+    # container-finalize with the runtime's result, then exit with the original
+    # signal status selected above.
+    if [ "$container_lock_finalize_required" -eq 1 ]; then
+        return 0
+    fi
+    container_lock_release
+    exit "$container_lock_signal_rc"
+}
+
+# Test-only scheduling barrier. It is inert unless the focused wrapper suite
+# explicitly enables it; production correctness does not depend on it.
+container_lock_test_barrier() {
+    container_lock_test_ready=$1
+    container_lock_test_release=$2
+    if [ "${SHIT_CONTAINER_TEST_HOOKS:-}" != 1 ] \
+        || [ -z "$container_lock_test_ready" ] \
+        || [ -z "$container_lock_test_release" ]; then
+        return 0
+    fi
+    : >"$container_lock_test_ready"
+    while [ ! -f "$container_lock_test_release" ]; do
+        sleep 1
+    done
+}
+
+container_lock_child_registered() {
+    container_lock_child_pid=$1
+    container_lock_child_state=running
+    if [ -n "$container_lock_pending_signal" ]; then
+        container_lock_deferred_name=$container_lock_pending_signal
+        container_lock_deferred_rc=$container_lock_pending_signal_rc
+        container_lock_pending_signal=
+        container_lock_pending_signal_rc=
+        container_lock_signal "$container_lock_deferred_rc" "$container_lock_deferred_name"
+    fi
+}
+
+container_lock_acquire() {
+    container_lock_init_root || return 1
+
+    # Capture-time helper children inherit this token. Matching it against the
+    # live owner makes nested `docker save`/`docker inspect` calls reentrant,
+    # while an independent `shit undo` (which has no token) still takes the
+    # engine lock before loading or tagging an image.
+    if [ -n "${SHIT_CONTAINER_LOCK_HELD:-}" ]; then
+        container_lock_read_owner
+        if [ "$container_lock_observed" = "$SHIT_CONTAINER_LOCK_HELD" ] \
+            && container_lock_owner_active "$container_lock_observed"; then
+            container_lock_reentrant=1
+            return 0
+        fi
+    fi
+
+    # Publish a complete, unique claim before it can become canonical. ln(1)
+    # is an atomic no-replace operation, so no waiter can observe a lock whose
+    # owner token has not yet been written.
+    container_lock_counter=0
+    while :; do
+        container_lock_nonce=sh.$$.${container_lock_counter}
+        container_lock_claim=$container_lock_root/.$container_lock_engine.claim.$container_lock_nonce
+        if [ ! -f "$container_lock_claim" ] && [ ! -d "$container_lock_claim" ] \
+            && [ ! -L "$container_lock_claim" ]; then
+            container_lock_token=$container_lock_engine:$$:$container_lock_nonce
+            container_lock_read_owner
+            if [ "$container_lock_observed" = "$container_lock_token" ]; then
+                container_lock_counter=$((container_lock_counter + 1))
+                continue
+            fi
+            if (umask 077 && printf '%s\n' "$container_lock_token" >"$container_lock_claim"); then
+                break
+            fi
+            return 1
+        fi
+        container_lock_counter=$((container_lock_counter + 1))
+    done
+
+    while :; do
+        # POSIX ln treats an existing directory as a destination directory;
+        # reject that shape before attempting the canonical no-replace link.
+        if [ -d "$container_lock_dir" ] || [ -L "$container_lock_dir" ]; then
+            return 1
+        fi
+        if ln "$container_lock_claim" "$container_lock_dir" 2>/dev/null; then
+            container_lock_owned=1
+            SHIT_CONTAINER_LOCK_HELD=$container_lock_token
+            export SHIT_CONTAINER_LOCK_HELD
+            return 0
+        fi
+
+        # The canonical lock is always a regular, non-symlink file. Any other
+        # object is corruption at a security boundary and fails closed.
+        [ -f "$container_lock_dir" ] && [ ! -L "$container_lock_dir" ] || return 1
+        container_lock_read_owner
+        container_lock_first=$container_lock_observed
+        container_lock_owner_well_formed "$container_lock_first" || return 1
+        if container_lock_owner_active "$container_lock_first"; then
+            sleep 1
+            continue
+        fi
+
+        # PID death does not prove quiescence: SIGKILL can leave a helper or
+        # real engine child running. Automatic stale removal could therefore
+        # admit an overlapping mutation. Fail closed until an operator verifies
+        # the engine is idle and removes this exact canonical file manually.
+        echo "shit: stale container engine lock at $container_lock_dir; verify no container helper/runtime remains, then remove it manually" >&2
+        return 1
+    done
+}
+
+container_run_real() {
+    container_lock_child_result=
+    container_lock_child_state=spawning
+    (
+        trap - HUP INT TERM
+        exec "$real" "$@"
+    ) <&0 &
+    container_lock_spawned_pid=$!
+    container_lock_test_barrier \
+        "${SHIT_CONTAINER_TEST_SPAWN_READY:-}" \
+        "${SHIT_CONTAINER_TEST_SPAWN_RELEASE:-}"
+    container_lock_child_registered "$container_lock_spawned_pid"
+    if [ "$container_lock_child_state" = running ] \
+        && [ -n "$container_lock_child_pid" ]; then
+        wait "$container_lock_child_pid"
+        container_run_wait_rc=$?
+        if [ -z "$container_lock_child_result" ]; then
+            container_lock_child_result=$container_run_wait_rc
+        fi
+    fi
+    container_lock_test_barrier \
+        "${SHIT_CONTAINER_TEST_WAIT_READY:-}" \
+        "${SHIT_CONTAINER_TEST_WAIT_RELEASE:-}"
+    container_run_rc=${container_lock_child_result:-125}
+    container_lock_child_state=reaped
+    container_lock_child_pid=
+    container_lock_child_state=idle
+    return "$container_run_rc"
+}
+
+container_run_default_docker() {
+    container_lock_child_result=
+    container_lock_child_state=spawning
+    (
+        trap - HUP INT TERM
+        # --context wins over currentContext; removing route-affecting env
+        # variables also prevents a caller's remote daemon selection from
+        # leaking into the one mutation admitted by the release boundary.
+        unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_CONFIG
+        exec "$real" --context default "$@"
+    ) <&0 &
+    container_lock_spawned_pid=$!
+    container_lock_test_barrier \
+        "${SHIT_CONTAINER_TEST_SPAWN_READY:-}" \
+        "${SHIT_CONTAINER_TEST_SPAWN_RELEASE:-}"
+    container_lock_child_registered "$container_lock_spawned_pid"
+    if [ "$container_lock_child_state" = running ] \
+        && [ -n "$container_lock_child_pid" ]; then
+        wait "$container_lock_child_pid"
+        container_run_wait_rc=$?
+        if [ -z "$container_lock_child_result" ]; then
+            container_lock_child_result=$container_run_wait_rc
+        fi
+    fi
+    container_lock_test_barrier \
+        "${SHIT_CONTAINER_TEST_WAIT_READY:-}" \
+        "${SHIT_CONTAINER_TEST_WAIT_RELEASE:-}"
+    container_run_rc=${container_lock_child_result:-125}
+    container_lock_child_state=reaped
+    container_lock_child_pid=
+    container_lock_child_state=runtime_done
+    return "$container_run_rc"
+}
+
+trap 'container_lock_release' 0
+trap 'container_lock_signal 129 HUP' HUP
+trap 'container_lock_signal 130 INT' INT
+trap 'container_lock_signal 143 TERM' TERM
+
+if ! container_lock_acquire; then
+    echo "shit: refusing docker command: cannot acquire private container engine lock" >&2
+    exit 125
+fi
+
+# A helper child already runs beneath the outer wrapper's lock and must not
+# recursively capture. An independent undo has no inherited token: it owns the
+# lock itself and waits for the real runtime so cleanup and exact status survive.
+if [ "$container_lock_reentrant" -eq 1 ]; then
+    exec "$real" "$@"
+fi
+if [ "${SHIT_DURING_UNDO:-}" = "1" ]; then
+    set +e
+    container_run_real "$@"
+    real_rc=$?
+    set -e
+    exit "$real_rc"
+fi
+
+# Independently enforce the release boundary before asking any helper version
+# for authorization. This keeps an older or mismatched helper from widening a
+# newly installed wrapper's policy. The function sets container_policy to
+# either `read` or the sole positive capability, `rmi1`.
+docker_named_reference() {
+    [ -n "$1" ] || return 1
+    case "$1" in
+        -*|*@*|sha256:*) return 1 ;;
+    esac
+    case "$1" in
+        *[!0123456789abcdefABCDEF]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+classify_container_policy() {
+    container_policy=
+    if [ "$#" -eq 0 ]; then
+        container_policy=read
+        return 0
+    fi
+    case "$1" in
+        --help|-h|--version|-v)
+            container_policy=read
+            return 0
+            ;;
+        -*) return 1 ;;
+    esac
+    top=$1
+    shift
+
+    if [ "$top" = rmi ]; then
+        policy_no_prune=0
+        policy_targets=0
+        policy_target=
+        policy_positional_only=0
+        while [ "$#" -gt 0 ]; do
+            policy_arg=$1
+            shift
+            if [ "$policy_positional_only" -eq 0 ]; then
+                case "$policy_arg" in
+                    --)
+                        policy_positional_only=1
+                        continue
+                        ;;
+                    --no-prune|--no-prune=true)
+                        policy_no_prune=$((policy_no_prune + 1))
+                        continue
+                        ;;
+                    -*) return 1 ;;
+                esac
+            fi
+            policy_targets=$((policy_targets + 1))
+            policy_target=$policy_arg
+        done
+        [ "$policy_no_prune" -eq 1 ] || return 1
+        [ "$policy_targets" -eq 1 ] || return 1
+        docker_named_reference "$policy_target" || return 1
+        container_policy=rmi1
+        return 0
+    fi
+
+    case "$top" in
+        diff|events|history|images|info|inspect|logs|port|ps|search|stats|top|version|wait)
+            container_policy=read
+            return 0
+            ;;
+        container|image|network|volume|context|system|manifest)
+            namespace=$top
+            case "$namespace:${1:-}" in
+                container:diff|container:inspect|container:list|container:logs|container:ls|container:port|container:stats|container:top|container:wait|\
+                image:history|image:inspect|image:list|image:ls|\
+                network:inspect|network:list|network:ls|volume:inspect|volume:list|volume:ls|\
+                context:inspect|context:list|context:ls|context:show|\
+                system:df|system:info|manifest:inspect)
+                    container_policy=read
+                    return 0
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        compose)
+            case "${1:-}" in
+                config|events|images|logs|ls|ps|top|version)
+                    container_policy=read
+                    return 0
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# The current helper emits a policy-specific capability. A generic v2 token
+# from an older, broader helper must never authorize this release boundary.
+valid_batch_token() {
+    case "$1" in
+        v3-rmi1:????????-????-????-????-????????????) ;;
+        *) return 1 ;;
+    esac
+    token_hex=$(printf '%s' "${1#v3-rmi1:}" | tr -d '-') || return 1
+    [ "${#token_hex}" -eq 32 ] || return 1
+    case "$token_hex" in
+        *[!0123456789abcdefABCDEF]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+if ! classify_container_policy "$@"; then
+    echo "shit: refusing Docker command outside the one-target rmi/read-only policy" >&2
+    exit 125
+fi
+if [ "$container_policy" = rmi1 ] \
+    && { [ "${DOCKER_HOST+x}" = x ] \
+        || [ "${DOCKER_CONTEXT+x}" = x ] \
+        || [ "${DOCKER_TLS_VERIFY+x}" = x ] \
+        || [ "${DOCKER_CERT_PATH+x}" = x ] \
+        || [ "${DOCKER_CONFIG+x}" = x ]; }; then
+    echo "shit: refusing Docker image removal while mutable Docker routing variables are set" >&2
+    exit 125
+fi
+
+# Prepare before invoking the runtime. Read-only argv require exact empty
+# stdout; the positive path requires the policy-specific v3-rmi1 capability.
 helper=$(command -v shit-helper 2>/dev/null || true)
 # Debug breadcrumb (gated on SHIT_HOOK_DEBUG=1) so smokes can see the
 # wrapper's path resolution without enabling shell -x.
 if [ "${SHIT_HOOK_DEBUG:-}" = "1" ]; then
     echo "shit-hook: docker-wrapper real=${real} helper=${helper:-<not-found>}" >&2
 fi
-if [ -n "$helper" ]; then
-    # Newline-separate the user's argv so the helper can split it
-    # cleanly (NUL is awkward to ship through a CLI string flag).
-    target_argv=$(printf '%s\n' "$@")
-    # `--target-argv=...` equals syntax so clap doesn't try to parse
-    # a leading `--flag` in the value as a new flag.
-    "$helper" container-event docker pre "--target-argv=$target_argv" || true
+if [ -z "$helper" ]; then
+    if [ "$container_policy" = rmi1 ]; then
+        echo "shit: refusing Docker image removal: shit-helper not found" >&2
+        exit 125
+    fi
+    batch_token=
+else
+    # NUL-delimited stdin preserves empty and newline-bearing argv exactly.
+    set +e
+    container_lock_child_state=preparing
+    batch_token=$(printf '%s\0' "$@" | "$helper" container-prepare docker --target-argv-nul-stdin)
+    prepare_rc=$?
+    set -e
+    if [ "$prepare_rc" -ne 0 ]; then
+        echo "shit: refusing docker command: container preflight failed" >&2
+        if [ -n "$container_lock_pending_signal_rc" ]; then
+            container_lock_release
+            exit "$container_lock_pending_signal_rc"
+        fi
+        exit 125
+    fi
+    case "$container_policy" in
+        read)
+            if [ -n "$batch_token" ]; then
+                echo "shit: refusing read-only Docker command: helper returned unexpected authorization" >&2
+                exit 125
+            fi
+            ;;
+        rmi1)
+            if [ -z "$batch_token" ] || ! valid_batch_token "$batch_token"; then
+                echo "shit: refusing Docker image removal: helper did not return a valid v3-rmi1 capability" >&2
+                exit 125
+            fi
+            # From this point the daemon may have durably authorized the batch.
+            # Every catchable exit path must reach container-finalize first.
+            container_lock_finalize_required=1
+            ;;
+        *)
+            echo "shit: refusing Docker command: internal wrapper policy error" >&2
+            exit 125
+            ;;
+    esac
+    if [ "$container_lock_finalize_required" -eq 1 ]; then
+        container_lock_child_state=authorized
+    else
+        container_lock_child_state=idle
+    fi
 fi
 
-# AU23 / DR-CR-51 — fire post-hook AFTER the real docker exits so
-# verbs whose state is only available post-exec (e.g. `docker pull`'s
-# resolved manifest digest, captured via `docker inspect`) get
-# journaled. We can't `exec` if we want to run code after; capture
-# the real docker's rc, fire post (best-effort), and exit with the
-# rc the user expected. Skip the post hook on non-zero exit — a
-# failed pull has no digest to capture, and other verbs route their
-# stash through the pre hook anyway.
-#
-# `set +e` around the real-docker invocation: `set -e` at the top
-# would trip the shell out before we capture the rc when docker
-# returns non-zero (the user's case for e.g. `docker rm nonexistent`).
+# Empty prepare output is possible only for the helper's reviewed read-only
+# allow-list (or the identical no-helper fallback). Do not let an unbounded
+# `events`/`logs -f`/`stats` reader monopolize mutation and undo serialization.
+if [ -z "$batch_token" ]; then
+    container_lock_release
+    if [ -n "$container_lock_pending_signal_rc" ]; then
+        exit "$container_lock_pending_signal_rc"
+    fi
+fi
+
+# We cannot exec because the post-runtime outcome should still be reported,
+# including when docker itself fails. Safety already rests on the confirmed
+# pre-authorization batch.
 set +e
-"$real" "$@"
-real_rc=$?
+if [ -n "$batch_token" ]; then
+    # The only admitted destructive batch is a local/default-context rmi.
+    # Pin the actual mutation as well as capture so a concurrent/currentContext
+    # change cannot redirect the operation after authorization.
+    if [ -n "$container_lock_pending_signal_rc" ]; then
+        # The prepare ACK may already have made the inverse actionable. Do not
+        # run the mutation after an interrupt, but close the lifecycle below.
+        real_rc=$container_lock_pending_signal_rc
+        container_lock_exit_override=$container_lock_pending_signal_rc
+        container_lock_pending_signal=
+        container_lock_pending_signal_rc=
+    else
+        container_run_default_docker "$@"
+        real_rc=$?
+    fi
+else
+    container_run_real "$@"
+    real_rc=$?
+fi
 set -e
-if [ "$real_rc" -eq 0 ] && [ -n "$helper" ]; then
-    "$helper" container-event docker post "--target-argv=$target_argv" || true
+
+if [ -n "$batch_token" ]; then
+    batch_id=${batch_token#v3-rmi1:}
+    set +e
+    container_lock_child_state=finalizing
+    printf '%s\0' "$@" | "$helper" container-finalize docker \
+        --batch-id "$batch_id" --exit-code "$real_rc" --target-argv-nul-stdin
+    finalize_rc=$?
+    container_lock_child_state=idle
+    set -e
+    if [ "$finalize_rc" -ne 0 ]; then
+        echo "shit: docker completed, but container batch finalization failed" >&2
+        # Authorization and the usable inverse were durable before docker
+        # started. Finalize is telemetry-only, so never falsify docker's
+        # actual result after the runtime has already executed.
+    fi
+    container_lock_finalize_required=0
+elif [ "$real_rc" -eq 0 ] && [ -n "$helper" ]; then
+    # AU23 / DR-CR-51: non-destructive pull journaling still uses the legacy
+    # post hook because there is intentionally no destructive batch token.
+    if ! printf '%s\0' "$@" | "$helper" container-event docker post --target-argv-nul-stdin; then
+        echo "shit: docker completed, but post-capture telemetry failed" >&2
+    fi
+fi
+if [ -n "$container_lock_exit_override" ]; then
+    exit "$container_lock_exit_override"
 fi
 exit "$real_rc"

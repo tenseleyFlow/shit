@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-use shit_store::{BlobStore, GcConfig, Index, run_pass};
+use shit_store::{BlobStore, GcConfig, Index, RetentionNow, run_pass};
 
 /// Sets up a fresh Index + BlobStore in a tempdir. Returns the
 /// tempdir so the caller can keep it alive.
@@ -32,8 +32,9 @@ fn populate(index: &Index, session: Uuid, count: u64) {
         conn.execute(
             "INSERT INTO commands
              (session, seq, cmd_string, cwd, pid, shell_kind,
-              started_logical, started_wall_nanos, importance)
-             VALUES (?1, ?2, 'echo', '/tmp', 1, 'bash', ?2, 0, 0)",
+              started_logical, started_wall_nanos,
+              ended_logical, ended_wall_nanos, exit_code, importance)
+             VALUES (?1, ?2, 'echo', '/tmp', 1, 'bash', ?2, 0, ?2 + 1, 1, 0, 0)",
             params![session.as_bytes().as_slice(), seq as i64],
         )
         .unwrap();
@@ -56,7 +57,7 @@ fn pinned_commands_survive_aggressive_pass() {
     populate(&idx, session, count);
 
     let config = GcConfig {
-        age_threshold_logical: 0,
+        age_threshold_secs: 0,
         size_cap_bytes: Some(1), // tiny cap → aggressive
         batch_size: 10,
         ..GcConfig::default()
@@ -66,7 +67,7 @@ fn pinned_commands_survive_aggressive_pass() {
         &blobs,
         &config,
         Arc::new(AtomicBool::new(false)),
-        u64::MAX / 2,
+        RetentionNow::trusted(u64::MAX / 2),
     )
     .unwrap();
 
@@ -108,11 +109,17 @@ fn cancellation_leaves_consistent_state() {
 
     let cancel = Arc::new(AtomicBool::new(true));
     let config = GcConfig {
-        age_threshold_logical: 0,
+        age_threshold_secs: 0,
         batch_size: 5,
         ..GcConfig::default()
     };
-    let _ = run_pass(&idx, &blobs, &config, cancel, u64::MAX / 2);
+    let _ = run_pass(
+        &idx,
+        &blobs,
+        &config,
+        cancel,
+        RetentionNow::trusted(u64::MAX / 2),
+    );
 
     // Even after cancellation, the schema invariants must hold:
     // every events row points at a commands row; pinned commands
@@ -141,7 +148,7 @@ fn idempotent_run_on_empty_store_is_noop() {
         &blobs,
         &GcConfig::default(),
         Arc::new(AtomicBool::new(false)),
-        1,
+        RetentionNow::trusted(1),
     )
     .unwrap();
     let r2 = run_pass(
@@ -149,7 +156,7 @@ fn idempotent_run_on_empty_store_is_noop() {
         &blobs,
         &GcConfig::default(),
         Arc::new(AtomicBool::new(false)),
-        1,
+        RetentionNow::trusted(1),
     )
     .unwrap();
     assert_eq!(r1.commands_dropped, 0);

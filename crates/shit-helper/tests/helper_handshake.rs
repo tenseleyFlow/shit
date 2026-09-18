@@ -117,26 +117,31 @@ fn spawn_helper_and_complete_handshake() {
             granted,
             helper_version,
             kernel_tier,
-            degraded_reason: _,
+            degraded_reason,
             self_verify: _,
         } => {
             assert_eq!(protocol_version, HELPER_PROTOCOL_VERSION);
             assert_eq!(helper_uid, daemon_uid);
-            // S06 helper advertises watch_tree only (no real ES/fanotify yet).
-            assert!(granted.watch_tree);
             assert!(!helper_version.is_empty());
-            // DR-66: per-OS classifier; non-empty + finite vocab.
-            assert!(matches!(
-                kernel_tier.as_str(),
-                "fanotify"
-                    | "bpf-lsm"
-                    | "endpoint-security"
-                    | "fsevents-degraded"
-                    | "kqueue"
-                    | "preload-shim"
-                    | "degraded"
-                    | "unsupported"
-            ));
+            // Tier and granted capture caps are one runtime-resolved claim.
+            match kernel_tier.as_str() {
+                "fanotify" | "bpf-lsm" | "endpoint-security" => {
+                    assert!(granted.watch_tree);
+                    assert!(granted.auth_subscribe);
+                }
+                "fsevents-degraded" | "kqueue" => {
+                    assert!(granted.watch_tree);
+                    assert!(!granted.auth_subscribe);
+                }
+                "degraded" => {
+                    assert!(!granted.watch_tree);
+                    assert!(!granted.auth_subscribe);
+                }
+                other => panic!("unexpected resolved capture tier {other:?}"),
+            }
+            if kernel_tier == "fsevents-degraded" {
+                assert!(degraded_reason.is_some());
+            }
         }
         other => panic!("expected HandshakeAck, got {other:?}"),
     }

@@ -34,6 +34,7 @@ serde_json = "1.0"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 blake3 = "1.5"
+sha2 = "0.10"
 zstd = "0.13"
 nix = { version = "0.29", features = ["fs", "process", "user", "signal", "socket", "uio"] }
 libc = "0.2"

@@ -8,10 +8,10 @@
 //! 1. **OS family** — FreeBSD (primary), NetBSD, OpenBSD, DragonFly
 //!    (best-effort). Identified at compile time via `cfg(target_os)`;
 //!    there is no runtime "which BSD am I?" probe needed.
-//! 2. **Storage substrate** — ZFS or UFS / FFS / etc. ZFS unlocks
-//!    snapshot-based coarse capture which is dramatically cheaper than
-//!    the kqueue + LD_PRELOAD path. Detected at runtime by shelling
-//!    out to `zfs(8)` because that's the boundary between OS and pool.
+//! 2. **Storage substrate** — ZFS or UFS / FFS / etc. ZFS is a candidate for
+//!    the isolated snapshot/clone engine, which is not yet connected to the
+//!    production kqueue + LD_PRELOAD path. It is detected at runtime by
+//!    shelling out to `zfs(8)` because that's the boundary between OS and pool.
 //!
 //! Strategy mirrors `linux_kernel.rs`: a struct describing what we
 //! found, plus `diagnose()` for `shit doctor` to render.

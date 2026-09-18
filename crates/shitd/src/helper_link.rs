@@ -14,8 +14,8 @@
 #![allow(dead_code)]
 
 use nix::sys::socket::{
-    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixAddr, bind,
-    cmsg_space, listen, recvmsg, socket,
+    AddressFamily, Backlog, ControlMessageOwned, MsgFlags, Shutdown, SockFlag, SockType, UnixAddr,
+    bind, cmsg_space, listen, recvmsg, shutdown, socket,
 };
 use shit_planner::events::{CaptureEvent, CaptureEventKind, CommandId, EventId, TreeOp};
 use shit_planner::inode::{BlobHash, InodeRef};
@@ -24,11 +24,14 @@ use shit_proto::{
     HELPER_PROTOCOL_VERSION, HelperCaps, HelperRequest, HelperResponse, decode_frame, encode_frame,
 };
 use shit_store::{BlobStore, Index};
+#[cfg(test)]
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 // W01.B.fix-framing: SEQPACKET on every platform that supports
 // AF_UNIX+SOCK_SEQPACKET (Linux + all BSDs). macOS XNU is the only
@@ -46,6 +49,37 @@ use std::sync::Arc;
 const HELPER_SOCK_TYPE: SockType = SockType::SeqPacket;
 #[cfg(target_os = "macos")]
 const HELPER_SOCK_TYPE: SockType = SockType::Stream;
+
+/// Keep synchronous hook-path writes bounded. Any timeout poisons the link
+/// below because macOS's STREAM transport may already contain a frame prefix.
+const SEND_TIMEOUT_SECS: libc::time_t = 1;
+
+fn set_send_timeout(fd: RawFd) -> std::io::Result<()> {
+    let timeout = libc::timeval {
+        tv_sec: SEND_TIMEOUT_SECS,
+        tv_usec: 0,
+    };
+    // SAFETY: `timeout` is live for the call and `fd` remains owned by the
+    // caller. The level/name pair requires exactly a `timeval` value.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            std::ptr::from_ref(&timeout).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn poison_after_send_failure(fd: RawFd) {
+    let _ = shutdown(fd, Shutdown::Both);
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum HelperLinkError {
@@ -89,11 +123,146 @@ pub type PrivOpWaiters = std::sync::Arc<
     >,
 >;
 
+/// Ordered `UnwatchTree` completion waiters shared by the hook server and the
+/// helper-response dispatcher. The waiter is installed before the request is
+/// written, so even a very fast helper cannot race its completion marker.
+pub type UnwatchWaiters = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (uuid::Uuid, u64),
+            tokio::sync::oneshot::Sender<Result<(), String>>,
+        >,
+    >,
+>;
+
+/// Capture responses are consumed before the helper's ordered unwatch
+/// completion marker, but a response is not durable merely because it was
+/// received.  This map remembers the rare case where both the primary
+/// evidence write and the command-scoped `CaptureRefused` fallback failed.
+/// The failure is sticky until the exact command's unwatch waiter consumes it.
+#[derive(Debug, Default)]
+pub(crate) struct IngestFailures {
+    /// `None` means the command is initialized and has no known durability
+    /// failure; `Some(detail)` is sticky until completion consumes the entry.
+    inner: Mutex<HashMap<CommandId, Option<String>>>,
+}
+
+impl IngestFailures {
+    fn begin_command(&self, command: CommandId) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(command)
+            .or_insert(None);
+    }
+
+    fn mark(&self, command: CommandId, detail: String) {
+        let mut failures = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = failures.entry(command).or_insert(None);
+        if state.is_none() {
+            *state = Some(detail);
+        }
+    }
+
+    fn take(&self, command: CommandId) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&command)
+            .flatten()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, command: CommandId) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&command)
+            .is_some_and(Option::is_some)
+    }
+
+    #[cfg(test)]
+    fn is_initialized(&self, command: CommandId) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&command)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnwatchTreeError {
+    #[error("unwatch request failed: {0}")]
+    Send(#[from] HelperLinkError),
+    #[error("an unwatch request is already pending for {session}/{command_seq}")]
+    AlreadyPending {
+        session: uuid::Uuid,
+        command_seq: u64,
+    },
+    #[error("helper stopped before the unwatch barrier completed: {0}")]
+    HelperStopped(String),
+    #[error("unwatch completion channel closed")]
+    CompletionChannelClosed,
+    #[error("unwatch completion timed out after {0:?}")]
+    Timeout(Duration),
+}
+
+/// Registered end-of-command barrier. Creation synchronously installs the
+/// waiter and writes `UnwatchTree`; awaiting is deliberately separate so the
+/// hook datagram loop can preserve wire order without stalling later PreExec
+/// intake while the platform producer drains.
+pub struct PendingUnwatch {
+    key: (uuid::Uuid, u64),
+    receiver: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    waiters: UnwatchWaiters,
+    ingest_failures: Arc<IngestFailures>,
+}
+
+impl PendingUnwatch {
+    pub async fn wait(mut self, timeout: Duration) -> Result<(), UnwatchTreeError> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("PendingUnwatch receiver is consumed exactly once");
+        let result = match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(detail))) => Err(UnwatchTreeError::HelperStopped(detail)),
+            Ok(Err(_)) => Err(UnwatchTreeError::CompletionChannelClosed),
+            Err(_) => Err(UnwatchTreeError::Timeout(timeout)),
+        };
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+        result
+    }
+}
+
+impl Drop for PendingUnwatch {
+    fn drop(&mut self) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+        self.ingest_failures.take(CommandId {
+            session: self.key.0,
+            seq: self.key.1,
+        });
+    }
+}
+
 /// Outcome of a successful helper link.
 #[derive(Debug)]
 pub struct HelperLink {
     /// Connected SEQPACKET/STREAM fd to the running helper.
     pub conn_fd: OwnedFd,
+    /// Serialize complete request frames. The server and privileged-op router
+    /// can write through the same link concurrently, and macOS uses a byte
+    /// stream where partial sends from two writers would otherwise interleave.
+    send_lock: std::sync::Mutex<()>,
     /// Helper process handle. Wrapped in `Mutex<Option<Child>>` so
     /// `kill_helper(&self)` (called via `&Arc<HelperLink>`) can take +
     /// kill + reap without `&mut self`. `Drop` is a no-op when
@@ -127,26 +296,66 @@ pub struct HelperLink {
     /// key; the key is monotonic per router instance so collisions
     /// don't happen in practice).
     pub priv_op_waiters: PrivOpWaiters,
+    /// Awaiters for the ordered end-of-command capture barrier. Kept separate
+    /// from privileged-op replies because command ids are the real wire keys
+    /// here and more than one command can be closing concurrently.
+    unwatch_waiters: UnwatchWaiters,
+    /// Sticky failures proving that a helper response could not be made
+    /// durable, including failure of the refusal fallback itself.
+    ingest_failures: Arc<IngestFailures>,
+}
+
+/// Reap a helper if handshake setup exits early through any `?` path. On a
+/// successful handshake ownership is explicitly transferred into HelperLink.
+struct SpawnedHelperGuard {
+    child: Option<Child>,
+}
+
+impl SpawnedHelperGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn into_child(mut self) -> Child {
+        self.child
+            .take()
+            .expect("spawned helper guard is consumed exactly once")
+    }
+}
+
+impl Drop for SpawnedHelperGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl HelperLink {
     /// Send a request to the helper. STREAM-safe (relies on the
     /// length-prefix framing in `shit_proto::frame`).
     pub fn send_request(&self, msg: &HelperRequest) -> Result<(), HelperLinkError> {
-        let frame = encode_frame(msg)?;
-        let mut sent = 0;
-        while sent < frame.len() {
-            let n = nix::sys::socket::send(
-                self.conn_fd.as_raw_fd(),
-                &frame[sent..],
-                nix::sys::socket::MsgFlags::empty(),
-            )?;
-            if n == 0 {
-                return Err(HelperLinkError::HelperExited);
-            }
-            sent += n;
+        let _send_guard = self
+            .send_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let HelperRequest::WatchTree {
+            session,
+            command_seq,
+            ..
+        } = msg
+        {
+            // Initialize before the first request byte is visible to the
+            // helper, so a fast response cannot race command initialization.
+            // Duplicate WatchTree requests never clear a sticky failure.
+            self.ingest_failures.begin_command(CommandId {
+                session: *session,
+                seq: *command_seq,
+            });
         }
-        Ok(())
+        let frame = encode_frame(msg)?;
+        send_frame_blocking(&self.conn_fd, &frame)
     }
 
     /// Receive one response frame from the helper.
@@ -157,17 +366,75 @@ impl HelperLink {
 
     /// Receive one response frame plus an optional fd attached via
     /// `SCM_RIGHTS` (S24.A). Mirrors `Conn::recv_response_with_fd` on
-    /// the helper side. The cmsg always rides with the first chunk on
-    /// STREAM transports; we issue one `recvmsg(2)` with a
-    /// MAX_HELPER_FRAME_SIZE buffer and a cmsg space sized for one
-    /// `RawFd`. On STREAM, if the kernel delivered fewer bytes than
-    /// the frame's length-prefix demands, we complete the read via
-    /// plain `recv(2)` (no cmsg expected for the tail).
+    /// the helper side. On macOS STREAM sockets the cmsg rides with the
+    /// first bytes, so we receive exactly the four-byte frame header with
+    /// `recvmsg(2)` and then read the declared body. Limiting that first iov
+    /// prevents it from consuming bytes belonging to a coalesced next frame.
     pub fn recv_response_with_fd(
         &self,
     ) -> Result<(HelperResponse, Option<OwnedFd>), HelperLinkError> {
         let (buf, fd) = recv_frame_with_fd_blocking(self.conn_fd.as_raw_fd())?;
         Ok((decode_frame(&buf)?, fd))
+    }
+
+    /// Register the completion waiter before synchronously writing
+    /// `UnwatchTree`. Callers should do this in hook-arrival order, then await
+    /// the returned barrier from a separate task.
+    pub fn begin_unwatch_tree(
+        &self,
+        command: CommandId,
+    ) -> Result<PendingUnwatch, UnwatchTreeError> {
+        use std::collections::hash_map::Entry;
+
+        let key = (command.session, command.seq);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut waiters = self
+                .unwatch_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match waiters.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(tx);
+                }
+                Entry::Occupied(_) => {
+                    return Err(UnwatchTreeError::AlreadyPending {
+                        session: command.session,
+                        command_seq: command.seq,
+                    });
+                }
+            }
+        }
+
+        let request = HelperRequest::UnwatchTree {
+            session: command.session,
+            command_seq: command.seq,
+        };
+        if let Err(error) = self.send_request(&request) {
+            self.unwatch_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            self.ingest_failures.take(command);
+            return Err(UnwatchTreeError::Send(error));
+        }
+
+        Ok(PendingUnwatch {
+            key,
+            receiver: Some(rx),
+            waiters: Arc::clone(&self.unwatch_waiters),
+            ingest_failures: Arc::clone(&self.ingest_failures),
+        })
+    }
+
+    /// Convenience wrapper for callers that do not need to separate ordered
+    /// request emission from the asynchronous wait.
+    pub async fn unwatch_tree_and_wait(
+        &self,
+        command: CommandId,
+        timeout: Duration,
+    ) -> Result<(), UnwatchTreeError> {
+        self.begin_unwatch_tree(command)?.wait(timeout).await
     }
 }
 
@@ -417,12 +684,18 @@ pub fn spawn_and_handshake(
         .env_remove("DYLD_INSERT_LIBRARIES");
 
     let child = cmd.spawn().map_err(HelperLinkError::Io)?;
+    let child = SpawnedHelperGuard::new(child);
 
     // Accept blocks until the helper connects. Tests timeout via
     // their own deadlines.
     let conn_raw = nix::sys::socket::accept(listener.as_raw_fd())?;
     // SAFETY: accept returned a fresh fd we own.
-    let conn_fd = unsafe { std::os::fd::FromRawFd::from_raw_fd(conn_raw) };
+    let conn_fd: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(conn_raw) };
+    if let Err(error) = set_send_timeout(conn_fd.as_raw_fd()) {
+        drop(listener);
+        let _ = std::fs::remove_file(sock_path);
+        return Err(HelperLinkError::Io(error));
+    }
     drop(listener);
     let _ = std::fs::remove_file(sock_path);
 
@@ -487,7 +760,8 @@ pub fn spawn_and_handshake(
 
     Ok(HelperLink {
         conn_fd,
-        child: std::sync::Mutex::new(Some(child)),
+        send_lock: std::sync::Mutex::new(()),
+        child: std::sync::Mutex::new(Some(child.into_child())),
         helper_pid,
         helper_uid,
         granted,
@@ -496,6 +770,10 @@ pub fn spawn_and_handshake(
         priv_op_waiters: PrivOpWaiters::new(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ),
+        unwatch_waiters: UnwatchWaiters::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        ingest_failures: Arc::new(IngestFailures::default()),
     })
 }
 
@@ -532,12 +810,19 @@ pub fn discover_helper_bin() -> Option<PathBuf> {
 fn send_frame_blocking(fd: &OwnedFd, frame: &[u8]) -> Result<(), HelperLinkError> {
     let mut sent = 0;
     while sent < frame.len() {
-        let n = nix::sys::socket::send(
+        let n = match nix::sys::socket::send(
             fd.as_raw_fd(),
             &frame[sent..],
             nix::sys::socket::MsgFlags::empty(),
-        )?;
+        ) {
+            Ok(n) => n,
+            Err(error) => {
+                poison_after_send_failure(fd.as_raw_fd());
+                return Err(error.into());
+            }
+        };
         if n == 0 {
+            poison_after_send_failure(fd.as_raw_fd());
             return Err(HelperLinkError::HelperExited);
         }
         sent += n;
@@ -624,6 +909,7 @@ pub async fn dispatch_loop(
     shutdown: Arc<tokio::sync::Notify>,
     watch_ready: Arc<crate::watch_ready::WatchReadyMap>,
     stats: Arc<crate::stats::Stats>,
+    active: Arc<crate::active_commands::ActiveCommands>,
 ) -> Result<(), HelperLinkError> {
     tracing::info!("helper dispatch loop started");
     loop {
@@ -644,6 +930,8 @@ pub async fn dispatch_loop(
                             &live_baseline,
                             &link.kernel_tier,
                             &link.priv_op_waiters,
+                            &link.unwatch_waiters,
+                            &link.ingest_failures,
                         );
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
@@ -653,25 +941,101 @@ pub async fn dispatch_loop(
                         // surface the degraded state instead
                         // of trusting the sticky `kernel_tier`.
                         stats.note_helper_disconnected();
+                        refuse_active_commands_after_helper_loss(
+                            &active,
+                            &index,
+                            &watch_ready,
+                            &link.ingest_failures,
+                            "privileged capture helper exited while the command was running",
+                        );
+                        fail_pending_unwatch(
+                            &link.unwatch_waiters,
+                            "privileged capture helper exited during command close",
+                        );
                         return Ok(());
                     }
                     Ok(Err(e)) => {
                         tracing::error!(error = %e, "dispatch recv failed; loop terminating");
                         stats.note_helper_disconnected();
+                        refuse_active_commands_after_helper_loss(
+                            &active,
+                            &index,
+                            &watch_ready,
+                            &link.ingest_failures,
+                            &format!("privileged capture helper receive failed: {e}"),
+                        );
+                        fail_pending_unwatch(
+                            &link.unwatch_waiters,
+                            &format!("privileged capture helper receive failed: {e}"),
+                        );
                         return Err(e);
                     }
                     Err(join_err) => {
                         tracing::error!(?join_err, "dispatch recv task panicked");
                         stats.note_helper_disconnected();
+                        refuse_active_commands_after_helper_loss(
+                            &active,
+                            &index,
+                            &watch_ready,
+                            &link.ingest_failures,
+                            &format!("privileged capture helper receive task failed: {join_err}"),
+                        );
+                        fail_pending_unwatch(
+                            &link.unwatch_waiters,
+                            &format!(
+                                "privileged capture helper receive task failed: {join_err}"
+                            ),
+                        );
                         return Err(HelperLinkError::HelperExited);
                     }
                 }
             }
             _ = shutdown.notified() => {
                 tracing::info!("helper dispatch loop received shutdown signal");
+                fail_pending_unwatch(
+                    &link.unwatch_waiters,
+                    "daemon shutdown interrupted the capture completion barrier",
+                );
                 return Ok(());
             }
         }
+    }
+}
+
+fn fail_pending_unwatch(waiters: &UnwatchWaiters, detail: &str) {
+    let pending = {
+        let mut waiters = waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waiters
+            .drain()
+            .map(|(_, sender)| sender)
+            .collect::<Vec<_>>()
+    };
+    for sender in pending {
+        let _ = sender.send(Err(detail.to_string()));
+    }
+}
+
+fn refuse_active_commands_after_helper_loss(
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+    watch_ready: &crate::watch_ready::WatchReadyMap,
+    ingest_failures: &IngestFailures,
+    detail: &str,
+) {
+    for command in active.snapshot() {
+        watch_ready.mark_failed(command, detail.to_string());
+        let path = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+            .map(|record| record.cwd);
+        let _ = persist_refusal_or_mark_ingest_failure(
+            index,
+            ingest_failures,
+            command,
+            path,
+            detail.to_string(),
+            "helper-loss CaptureRefused",
+        );
     }
 }
 
@@ -685,6 +1049,8 @@ fn dispatch_response(
     live_baseline: &crate::baseline::LiveBaseline,
     kernel_tier: &str,
     priv_op_waiters: &PrivOpWaiters,
+    unwatch_waiters: &UnwatchWaiters,
+    ingest_failures: &IngestFailures,
 ) {
     match resp {
         HelperResponse::CapturedPreImage {
@@ -702,49 +1068,63 @@ fn dispatch_response(
             mtime_unix_nanos,
             xattrs,
             is_delete,
-            fd_sent_via_scm: _,
+            fd_sent_via_scm,
             flags,
         } => {
             let Some(staging) = fd else {
-                // AR01.1.fix-marker-only — when the helper lost the
-                // race to read pre-image bytes (typical for atomic
-                // unlinks like .git/index.lock), it emits a marker
-                // CapturedPreImage with stored_bytes=0, is_delete=true,
-                // and no SCM_RIGHTS fd. The intended semantics (per
-                // capture/linux.rs::handle_lsm_unlink doc): journal the
-                // TreeOp::Unlink only -- the planner falls back to any
-                // prior FilePreImage for the same (dev, inode), and if
-                // none exists treats the shape as a transient lock-file
-                // (W01.B classifier).
-                if stored_bytes == 0 && is_delete {
-                    let command = CommandId { session, seq };
-                    let inode_ref = InodeRef::new(dev, inode);
-                    let path_buf: PathBuf = path.unwrap_or_default().into();
-                    let ts = crate::server::next_ts();
-                    // G02: derive kind from mode bits (S_IFMT). The
-                    // marker-only path is the canonical route for
-                    // dir-removal via LSM's inode_unlink because the
-                    // helper's fstat returns FileType::Directory and
-                    // the pre-image-bytes capture is skipped (dirs
-                    // have no content). With kind+mode plumbed here,
-                    // the planner emits RecreatePath{Directory} so
-                    // `git clean -fd` undo restores the dir as a
-                    // dir, not a regular file.
-                    if let Err(e) = journal_unlink_idempotent(
-                        index,
-                        command,
-                        ts,
-                        inode_ref,
-                        path_buf,
-                        kind_from_mode_bits(mode),
-                        mode,
-                    ) {
-                        tracing::error!(error = %e, %session, seq, "marker-only Unlink journal failed");
+                let detail = format!(
+                    "CapturedPreImage for ({dev}, {inode}) declared {stored_bytes} bytes but carried no SCM_RIGHTS fd"
+                );
+                let _ = persist_refusal_or_mark_ingest_failure(
+                    index,
+                    ingest_failures,
+                    CommandId { session, seq },
+                    path.map(PathBuf::from),
+                    detail,
+                    "missing-fd CapturedPreImage refusal",
+                );
+                return;
+            };
+            if !fd_sent_via_scm {
+                let _ = persist_refusal_or_mark_ingest_failure(
+                    index,
+                    ingest_failures,
+                    CommandId { session, seq },
+                    path.map(PathBuf::from),
+                    "CapturedPreImage carried an fd but declared fd_sent_via_scm=false".into(),
+                    "invalid fd declaration refusal",
+                );
+                drop(staging);
+                return;
+            }
+            let replay_path = match path.as_deref() {
+                Some(raw) => match strict_absolute_replay_path(raw, "CapturedPreImage path") {
+                    Ok(path) => path,
+                    Err(detail) => {
+                        let _ = persist_refusal_or_mark_ingest_failure(
+                            index,
+                            ingest_failures,
+                            CommandId { session, seq },
+                            Some(PathBuf::from(raw)),
+                            detail,
+                            "unsafe CapturedPreImage path refusal",
+                        );
+                        drop(staging);
+                        return;
                     }
+                },
+                None => {
+                    let _ = persist_refusal_or_mark_ingest_failure(
+                        index,
+                        ingest_failures,
+                        CommandId { session, seq },
+                        None,
+                        "CapturedPreImage did not carry a replay path".into(),
+                        "missing CapturedPreImage path refusal",
+                    );
+                    drop(staging);
                     return;
                 }
-                tracing::error!(%session, seq, dev, inode, "CapturedPreImage missing SCM_RIGHTS fd");
-                return;
             };
             // W02.B.live-baseline — if the LiveBaseline cache has a
             // clean (un-promoted) entry for this (dev, inode), the
@@ -763,44 +1143,80 @@ fn dispatch_response(
             // couldn't capture at all.
             let inode_ref = shit_planner::InodeRef::new(dev, inode);
             let cmd = shit_planner::events::CommandId { session, seq };
-            let baseline_promote = live_baseline
-                .get_cwd_for_inode(dev, inode)
-                .and_then(|cache| cache.promote(inode_ref, cmd));
-            if let Some((blob, baseline_xattrs)) = baseline_promote {
-                tracing::info!(
-                    %session, seq, dev, inode,
-                    xattr_count = baseline_xattrs.len(),
-                    "promoted live-baseline blob into FilePreImage (pre-write content captured at session-open)"
-                );
-                if let Err(e) = handle_baseline_promoted_pre_image(
-                    session,
-                    seq,
-                    dev,
-                    inode,
-                    path,
-                    blob,
-                    stored_bytes,
-                    mode,
-                    uid,
-                    gid,
-                    mtime_unix_nanos,
-                    baseline_xattrs,
-                    flags,
-                    is_delete,
-                    // AU11 — the helper's `post_content_hash` (which
-                    // on BSD post-hoc kqueue is the held-fd's
-                    // CURRENT content hash) is genuinely post-state.
-                    // Carry it through so the planner's drift
-                    // detection still fires for baseline-promoted
-                    // captures (previously the W02.B path discarded
-                    // it as a v1 tradeoff).
-                    post_content_hash,
-                    index,
-                ) {
-                    tracing::error!(error = %e, %session, seq, "baseline-promoted FilePreImage journal failed");
+            if kernel_tier == "kqueue" {
+                let baseline_cache = live_baseline
+                    .get_cwd_for_inode(dev, inode)
+                    .filter(|cache| cache.state() == crate::baseline::WalkState::Ready)
+                    .or_else(|| live_baseline.get_cwd_for_path(&replay_path));
+
+                if let Some(cache) = baseline_cache {
+                    match cache.promote(inode_ref, cmd) {
+                        Some(crate::baseline::BaselinePromotion::Promoted(pre_image)) => {
+                            tracing::info!(
+                                %session, seq, dev, inode,
+                                xattr_count = pre_image.xattrs.len(),
+                                "promoted complete pre-command baseline into FilePreImage"
+                            );
+                            if let Err(e) = handle_baseline_promoted_pre_image(
+                                session,
+                                seq,
+                                dev,
+                                inode,
+                                path,
+                                pre_image,
+                                is_delete,
+                                // The held fd is post-state for BSD
+                                // Write/Extend, so only its hash is useful.
+                                post_content_hash,
+                                index,
+                            ) {
+                                tracing::error!(error = %e, %session, seq, "baseline-promoted FilePreImage journal failed");
+                                let _ = persist_refusal_or_mark_ingest_failure(
+                                    index,
+                                    ingest_failures,
+                                    CommandId { session, seq },
+                                    Some(replay_path.clone()),
+                                    format!("failed to ingest baseline-promoted pre-image: {e}"),
+                                    "baseline-promoted pre-image ingest refusal",
+                                );
+                            }
+                            drop(staging);
+                            return;
+                        }
+                        Some(crate::baseline::BaselinePromotion::AlreadyPromoted) => {
+                            // A repeated NOTE_WRITE for the same inode and
+                            // command needs no second journal event.
+                            drop(staging);
+                            return;
+                        }
+                        None if !is_delete => {
+                            // The cache is Ready, so an absent inode did not
+                            // exist at command start. Its undo evidence is the
+                            // directory Create observation, not post-write
+                            // bytes mislabeled as a pre-image.
+                            tracing::debug!(%session, seq, dev, inode, "discarding post-write bytes for inode absent from ready baseline");
+                            drop(staging);
+                            return;
+                        }
+                        None => {
+                            // A held fd after unlink still contains genuine
+                            // pre-delete bytes, so deletion may safely use the
+                            // ordinary ingestion path below.
+                        }
+                    }
+                } else if !is_delete {
+                    let detail = "BSD kqueue write has no authoritative pre-command baseline; refusing post-write bytes as a pre-image";
+                    refuse_baseline_command(
+                        index,
+                        watch_ready,
+                        ingest_failures,
+                        CommandId { session, seq },
+                        Some(replay_path),
+                        detail.into(),
+                    );
+                    drop(staging);
+                    return;
                 }
-                drop(staging); // close helper's post-write fd; we don't need it
-                return;
             }
             if let Err(e) = handle_captured_pre_image(
                 CapturedPreImageArgs {
@@ -826,50 +1242,257 @@ fn dispatch_response(
                 kernel_tier,
             ) {
                 tracing::error!(error = %e, %session, seq, "failed to journal CapturedPreImage");
+                let _ = persist_refusal_or_mark_ingest_failure(
+                    index,
+                    ingest_failures,
+                    CommandId { session, seq },
+                    Some(replay_path),
+                    format!("failed to ingest captured pre-image: {e}"),
+                    "captured pre-image ingest refusal",
+                );
             }
+        }
+        HelperResponse::CapturedDeletionMarker {
+            session,
+            seq,
+            dev,
+            inode,
+            path,
+            metadata,
+        } => {
+            let command = CommandId { session, seq };
+            let kind = kind_from_mode_bits(metadata.mode);
+            let marker_path = PathBuf::from(&path);
+            let detail = if fd.is_some() {
+                "CapturedDeletionMarker unexpectedly carried an SCM_RIGHTS fd".to_string()
+            } else if let Err(reason) = strict_absolute_replay_path(&path, "deletion marker path") {
+                reason
+            } else if kernel_tier == "bpf-lsm"
+                && shit_planner::PlannerStore::events_for_command(index, command)
+                    .iter()
+                    .any(|event| {
+                        matches!(
+                            &event.kind,
+                            CaptureEventKind::TreeOp(TreeOp::Create {
+                                inode: created_inode,
+                                path: created_path,
+                                ..
+                            }) if *created_inode == InodeRef::new(dev, inode)
+                                && created_path == &marker_path
+                        )
+                    })
+            {
+                // The authoritative LSM create and this deletion marker name
+                // the exact same inode at the exact same path.  The entry was
+                // born and removed inside this command, so no pre-command
+                // metadata exists to reconstruct.  Keep the Create event; the
+                // planner's "created path is now gone" classifier makes it a
+                // transient no-op.  Turning this marker into CaptureRefused
+                // would make harmless pip-style scratch directories block the
+                // command atomically.
+                drop(fd);
+                tracing::debug!(%session, seq, dev, inode, %path, "ignoring exact create-then-delete metadata marker");
+                return;
+            } else {
+                format!(
+                    "metadata-only deletion marker for {kind:?} cannot reconstruct complete metadata safely"
+                )
+            };
+            drop(fd);
+            let _ = persist_refusal_or_mark_ingest_failure(
+                index,
+                ingest_failures,
+                command,
+                Some(marker_path),
+                detail,
+                "deletion-marker refusal",
+            );
+        }
+        HelperResponse::CaptureRefused {
+            session,
+            seq,
+            path,
+            detail,
+        } => {
+            drop(fd);
+            let command = CommandId { session, seq };
+            watch_ready.mark_failed(command, detail.clone());
+            let _ = persist_refusal_or_mark_ingest_failure(
+                index,
+                ingest_failures,
+                command,
+                path.map(PathBuf::from),
+                detail,
+                "helper CaptureRefused",
+            );
         }
         HelperResponse::BaselineCaptured {
             session,
+            command_seq,
             cwd,
             dev,
             inode,
             path,
             blob_hash,
             stored_bytes,
-            mode: _,
-            uid: _,
-            gid: _,
-            mtime_unix_nanos: _,
+            mode,
+            uid,
+            gid,
+            mtime_unix_nanos,
+            flags,
             xattrs: _,
-            fd_sent_via_scm: _,
+            fd_sent_via_scm,
         } => {
+            let command = CommandId {
+                session,
+                seq: command_seq,
+            };
+            let cwd_path = match strict_absolute_replay_path(&cwd, "BaselineCaptured cwd") {
+                Ok(path) => path,
+                Err(reason) => {
+                    tracing::error!(%session, dev, inode, %reason, "rejecting unsafe BaselineCaptured cwd");
+                    refuse_baseline_command(
+                        index,
+                        watch_ready,
+                        ingest_failures,
+                        command,
+                        None,
+                        format!("invalid baseline cwd: {reason}"),
+                    );
+                    drop(fd);
+                    return;
+                }
+            };
+            let cache = live_baseline.entry_for_cwd(&cwd_path);
+            if let Err(other) = cache.begin_walk(command) {
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(cwd_path),
+                    format!(
+                        "baseline frames overlapped an active walk for command {}:{}",
+                        other.session, other.seq
+                    ),
+                );
+                drop(fd);
+                return;
+            }
             let Some(staging) = fd else {
                 tracing::error!(%session, dev, inode, "BaselineCaptured missing SCM_RIGHTS fd");
+                cache.mark_failed();
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(PathBuf::from(&path)),
+                    "baseline content arrived without its staging fd".into(),
+                );
                 return;
             };
+            if !fd_sent_via_scm {
+                tracing::error!(%session, dev, inode, "BaselineCaptured carried fd with false fd_sent_via_scm");
+                cache.mark_failed();
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(PathBuf::from(&path)),
+                    "baseline staging-fd declaration was inconsistent".into(),
+                );
+                drop(staging);
+                return;
+            }
+            let baseline_path = match strict_absolute_replay_path(&path, "BaselineCaptured path") {
+                Ok(path) if path.starts_with(&cwd_path) => path,
+                Ok(_) => {
+                    tracing::error!(%session, dev, inode, %path, %cwd, "rejecting BaselineCaptured path outside its cwd");
+                    cache.mark_failed();
+                    refuse_baseline_command(
+                        index,
+                        watch_ready,
+                        ingest_failures,
+                        command,
+                        Some(PathBuf::from(&path)),
+                        "baseline path was outside its watched cwd".into(),
+                    );
+                    drop(staging);
+                    return;
+                }
+                Err(reason) => {
+                    tracing::error!(%session, dev, inode, %reason, "rejecting unsafe BaselineCaptured path");
+                    cache.mark_failed();
+                    refuse_baseline_command(
+                        index,
+                        watch_ready,
+                        ingest_failures,
+                        command,
+                        Some(PathBuf::from(&path)),
+                        format!("invalid baseline path: {reason}"),
+                    );
+                    drop(staging);
+                    return;
+                }
+            };
             if let Err(e) = handle_baseline_captured(
-                session,
-                std::path::PathBuf::from(&cwd),
+                command,
+                cwd_path,
                 dev,
                 inode,
-                std::path::PathBuf::from(&path),
+                baseline_path,
                 blob_hash,
                 stored_bytes,
+                mode,
+                uid,
+                gid,
+                mtime_unix_nanos,
+                flags,
                 staging,
                 blob_store,
                 index,
                 live_baseline,
             ) {
                 tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
+                cache.mark_failed();
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(PathBuf::from(path)),
+                    format!("failed to ingest authoritative baseline: {e}"),
+                );
             }
         }
         HelperResponse::BaselineWalkComplete {
             session,
+            command_seq,
             cwd,
             file_count,
             partial,
         } => {
-            let cwd_path = std::path::PathBuf::from(&cwd);
+            let command = CommandId {
+                session,
+                seq: command_seq,
+            };
+            let cwd_path = match strict_absolute_replay_path(&cwd, "BaselineWalkComplete cwd") {
+                Ok(path) => path,
+                Err(reason) => {
+                    tracing::error!(%session, %reason, "rejecting unsafe BaselineWalkComplete cwd");
+                    refuse_baseline_command(
+                        index,
+                        watch_ready,
+                        ingest_failures,
+                        command,
+                        None,
+                        format!("invalid completed-baseline cwd: {reason}"),
+                    );
+                    return;
+                }
+            };
             // W09.12: empty-cwd case — the walk completed but no
             // entries arrived (cwd is empty pre-exec). Without an
             // entry in the LiveBaseline by-cwd map, the
@@ -880,20 +1503,73 @@ fn dispatch_response(
             // Force-create the entry here so the cwd is registered
             // as watched even with zero baseline files.
             let cache = live_baseline.entry_for_cwd(&cwd_path);
-            cache.mark_ready();
-            tracing::info!(
-                %session, cwd, file_count, partial, cached = cache.entry_count(),
-                "live-baseline walk complete; cache ready"
-            );
+            if let Err(other) = cache.begin_walk(command) {
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(cwd_path),
+                    format!(
+                        "baseline completion overlapped an active walk for command {}:{}",
+                        other.session, other.seq
+                    ),
+                );
+                return;
+            }
+            if partial {
+                cache.mark_failed();
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(cwd_path),
+                    "helper reported a partial pre-command baseline".into(),
+                );
+                tracing::warn!(
+                    %session, cwd, file_count,
+                    "partial live-baseline walk rejected; cache failed"
+                );
+            } else if cache.state() == crate::baseline::WalkState::Failed {
+                refuse_baseline_command(
+                    index,
+                    watch_ready,
+                    ingest_failures,
+                    command,
+                    Some(cwd_path),
+                    "one or more authoritative baseline entries failed validation or ingest".into(),
+                );
+                tracing::warn!(
+                    %session, cwd, file_count,
+                    "live-baseline ingest failed before walk completion; cache remains failed"
+                );
+            } else {
+                cache.mark_ready();
+                tracing::info!(
+                    %session, cwd, file_count, cached = cache.entry_count(),
+                    "complete live-baseline walk accepted; cache ready"
+                );
+            }
         }
         HelperResponse::TreeMutation {
             session,
             seq,
             op,
             ts_unix_nanos,
+            partial,
         } => {
-            if let Err(e) = handle_tree_mutation(session, seq, op, ts_unix_nanos, index) {
+            let fallback_path = Some(tree_mutation_path_hint(&op));
+            if let Err(e) = handle_tree_mutation(session, seq, op, ts_unix_nanos, partial, index) {
                 tracing::error!(error = %e, %session, seq, "failed to journal TreeMutation");
+                let _ = persist_refusal_or_mark_ingest_failure(
+                    index,
+                    ingest_failures,
+                    CommandId { session, seq },
+                    fallback_path,
+                    format!("failed to ingest TreeMutation: {e}"),
+                    "TreeMutation ingest refusal",
+                );
             }
         }
         HelperResponse::CapturedMetadataChange {
@@ -906,6 +1582,7 @@ fn dispatch_response(
             after,
             ts_unix_nanos,
         } => {
+            let fallback_path = path.as_ref().map(PathBuf::from);
             if let Err(e) = handle_metadata_change(
                 session,
                 seq,
@@ -923,6 +1600,14 @@ fn dispatch_response(
                     seq,
                     "failed to journal CapturedMetadataChange"
                 );
+                let _ = persist_refusal_or_mark_ingest_failure(
+                    index,
+                    ingest_failures,
+                    CommandId { session, seq },
+                    fallback_path,
+                    format!("failed to ingest CapturedMetadataChange: {e}"),
+                    "CapturedMetadataChange ingest refusal",
+                );
             }
         }
         HelperResponse::WatchTreeReady {
@@ -937,8 +1622,48 @@ fn dispatch_response(
                 session,
                 seq: command_seq,
             };
-            watch_ready.mark_ready(cmd);
-            tracing::debug!(%session, command_seq, "WatchTreeReady routed");
+            if watch_ready.mark_ready(cmd) {
+                tracing::debug!(%session, command_seq, "WatchTreeReady routed");
+            } else {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    "ignoring WatchTreeReady after capture was already refused"
+                );
+            }
+        }
+        HelperResponse::UnwatchTreeFlushed {
+            session,
+            command_seq,
+        } => {
+            let command = CommandId {
+                session,
+                seq: command_seq,
+            };
+            let mut waiters = unwatch_waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(sender) = waiters.remove(&(session, command_seq)) {
+                let completion = ingest_failures.take(command).map_or(Ok(()), |detail| {
+                    Err(format!(
+                        "helper flush completed, but daemon capture ingest was not durable: {detail}"
+                    ))
+                });
+                if sender.send(completion).is_err() {
+                    tracing::warn!(
+                        %session,
+                        command_seq,
+                        "unwatch waiter dropped before completion arrived"
+                    );
+                }
+            } else {
+                ingest_failures.take(command);
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    "UnwatchTreeFlushed arrived without a pending waiter"
+                );
+            }
         }
         HelperResponse::PrivilegedOpResult {
             session,
@@ -978,6 +1703,123 @@ fn dispatch_response(
     }
 }
 
+/// Persist a command-atomic refusal whenever a capture tier cannot prove that
+/// its evidence is complete.  This is shared by the helper response path and
+/// the daemon's watch-readiness/dispatch failure paths: the shell hooks are
+/// intentionally fail-open, so the journal entry (rather than withholding a
+/// readiness notification) is the safety boundary for a later undo.
+pub(crate) fn journal_helper_capture_refused(
+    index: &Index,
+    command: CommandId,
+    path: Option<PathBuf>,
+    detail: String,
+) -> Result<(), shit_store::IndexError> {
+    index
+        .put_event(&CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: crate::server::next_ts(),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-incomplete".to_string(),
+                path: path.unwrap_or_else(|| PathBuf::from("<unrepresentable-helper-path>")),
+                detail,
+            },
+        })
+        .map(|_| ())
+}
+
+/// Persist the command-atomic fallback for an ingest or validation failure.
+/// If the journal is unavailable even for the fallback, remember that fact in
+/// memory so an ordered helper flush cannot be mistaken for durable ingest.
+fn persist_refusal_or_mark_ingest_failure(
+    index: &Index,
+    ingest_failures: &IngestFailures,
+    command: CommandId,
+    path: Option<PathBuf>,
+    detail: String,
+    context: &str,
+) -> Result<(), shit_store::IndexError> {
+    match journal_helper_capture_refused(index, command, path, detail.clone()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let sticky =
+                format!("{context} was not durable: {error}; intended command refusal: {detail}");
+            ingest_failures.mark(command, sticky);
+            tracing::error!(%error, %command, %context, "CaptureRefused journal failed; command close will be rejected");
+            Err(error)
+        }
+    }
+}
+
+/// Make a baseline failure sticky for readiness and durable for undo. Baseline
+/// frames are ordered before WatchTreeReady on the helper connection; the
+/// readiness map preserves this failure if that later frame still arrives.
+fn refuse_baseline_command(
+    index: &Index,
+    watch_ready: &crate::watch_ready::WatchReadyMap,
+    ingest_failures: &IngestFailures,
+    command: CommandId,
+    path: Option<PathBuf>,
+    detail: String,
+) {
+    watch_ready.mark_failed(command, detail.clone());
+    let _ = persist_refusal_or_mark_ingest_failure(
+        index,
+        ingest_failures,
+        command,
+        path,
+        detail,
+        "baseline CaptureRefused",
+    );
+}
+
+/// Validate a path before it is allowed to become replay authority.
+///
+/// Helper messages are trusted for attribution, not for lexical path safety.
+/// Requiring the exact normalized absolute spelling prevents a future undo
+/// from reinterpreting `.`/`..`, repeated separators, trailing separators, or
+/// an embedded NUL in a different process context.
+fn strict_absolute_replay_path(raw: &str, field: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if raw.as_bytes().contains(&0) {
+        return Err(format!("{field} contains an embedded NUL byte"));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(format!("{field} is not absolute"));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
+            Component::CurDir => return Err(format!("{field} contains `.`")),
+            Component::ParentDir => return Err(format!("{field} contains `..`")),
+            Component::Prefix(_) => return Err(format!("{field} contains a platform prefix")),
+        }
+    }
+    if normalized.to_str() != Some(raw) {
+        return Err(format!("{field} is not in normalized absolute form"));
+    }
+    Ok(normalized)
+}
+
+fn tree_mutation_path_hint(op: &shit_proto::TreeOpWire) -> PathBuf {
+    use shit_proto::TreeOpWire;
+
+    PathBuf::from(match op {
+        TreeOpWire::Create { path, .. }
+        | TreeOpWire::Unlink { path, .. }
+        | TreeOpWire::Symlink { path, .. }
+        | TreeOpWire::SymlinkRemoved { path, .. }
+        | TreeOpWire::SymlinkRemovedIdentified { path, .. } => path,
+        TreeOpWire::Rename { to, .. } => to,
+        TreeOpWire::Link { target, .. } => target,
+    })
+}
+
 /// S29.1 — convert a wire `TreeMutation` into a planner `CaptureEvent`
 /// and journal it. Cheap; no blob round-trip needed.
 fn handle_tree_mutation(
@@ -985,6 +1827,7 @@ fn handle_tree_mutation(
     seq: u64,
     op: shit_proto::TreeOpWire,
     _ts_unix_nanos: u64,
+    partial: bool,
     index: &Index,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::TreeOp;
@@ -1003,27 +1846,44 @@ fn handle_tree_mutation(
         }
     }
 
-    // Unlink is dedupe-sensitive: the dir-diff and the per-file Delete
-    // both surface Unlink for the same removal. Route through
-    // `journal_unlink_idempotent` and return early.
-    if let TreeOpWire::Unlink {
-        dev,
-        inode,
-        path,
-        kind,
-        mode,
-    } = &op
-    {
-        let ts = crate::server::next_ts();
-        return journal_unlink_idempotent(
-            index,
-            CommandId { session, seq },
-            ts,
-            InodeRef::new(*dev, *inode),
-            std::path::PathBuf::from(path),
-            convert_kind(*kind),
-            *mode,
-        );
+    let path_issue = match &op {
+        TreeOpWire::Create { path, .. } => {
+            strict_absolute_replay_path(path, "TreeMutation create path").err()
+        }
+        TreeOpWire::Unlink { path, .. } => {
+            strict_absolute_replay_path(path, "TreeMutation unlink path").err()
+        }
+        TreeOpWire::Rename { from, to, .. } => {
+            strict_absolute_replay_path(from, "TreeMutation rename source")
+                .and_then(|_| strict_absolute_replay_path(to, "TreeMutation rename destination"))
+                .err()
+        }
+        TreeOpWire::Link { target, .. } => {
+            strict_absolute_replay_path(target, "TreeMutation link target").err()
+        }
+        TreeOpWire::Symlink { path, .. }
+        | TreeOpWire::SymlinkRemoved { path, .. }
+        | TreeOpWire::SymlinkRemovedIdentified { path, .. } => {
+            strict_absolute_replay_path(path, "TreeMutation symlink path").err()
+        }
+    };
+    if let Some(detail) = path_issue {
+        let path = match &op {
+            TreeOpWire::Create { path, .. }
+            | TreeOpWire::Unlink { path, .. }
+            | TreeOpWire::Symlink { path, .. }
+            | TreeOpWire::SymlinkRemoved { path, .. }
+            | TreeOpWire::SymlinkRemovedIdentified { path, .. } => PathBuf::from(path),
+            TreeOpWire::Rename { to, .. } => PathBuf::from(to),
+            TreeOpWire::Link { target, .. } => PathBuf::from(target),
+        };
+        journal_helper_capture_refused(index, CommandId { session, seq }, Some(path), detail)
+            .map_err(|e| {
+                HelperLinkError::Io(std::io::Error::other(format!(
+                    "put_event (unsafe tree path refusal): {e}"
+                )))
+            })?;
+        return Ok(());
     }
 
     let tree_op = match op {
@@ -1039,7 +1899,18 @@ fn handle_tree_mutation(
             kind: convert_kind(kind),
             mode,
         },
-        TreeOpWire::Unlink { .. } => unreachable!("handled above"),
+        TreeOpWire::Unlink {
+            dev,
+            inode,
+            path,
+            kind,
+            mode,
+        } => TreeOp::Unlink {
+            inode: InodeRef::new(dev, inode),
+            path: std::path::PathBuf::from(path),
+            kind: convert_kind(kind),
+            mode,
+        },
         TreeOpWire::Rename {
             from,
             to,
@@ -1066,19 +1937,28 @@ fn handle_tree_mutation(
             target,
             path: std::path::PathBuf::from(path),
         },
+        TreeOpWire::SymlinkRemovedIdentified {
+            dev,
+            inode,
+            target,
+            path,
+        } => TreeOp::SymlinkRemovedIdentified {
+            inode: InodeRef::new(dev, inode),
+            target,
+            path: std::path::PathBuf::from(path),
+        },
     };
 
     let ts = crate::server::next_ts();
-    let event = CaptureEvent {
-        id: EventId(0),
-        command: CommandId { session, seq },
+    journal_tree_op(
+        index,
+        CommandId { session, seq },
         ts,
-        partial: false,
-        kind: CaptureEventKind::TreeOp(tree_op),
-    };
-    index.put_event(&event).map_err(|e| {
-        HelperLinkError::Io(std::io::Error::other(format!("put_event (tree): {e}")))
-    })?;
+        tree_op,
+        TreeSignalSource::HelperMutation,
+        partial,
+    )
+    .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event (tree): {e}"))))?;
     Ok(())
 }
 
@@ -1132,12 +2012,40 @@ fn handle_metadata_change(
             flags: m.flags,
         }
     }
+    let command = CommandId { session, seq };
+    let path_buf = match path.as_deref() {
+        Some(raw) => match strict_absolute_replay_path(raw, "CapturedMetadataChange path") {
+            Ok(path) => path,
+            Err(detail) => {
+                journal_helper_capture_refused(index, command, Some(PathBuf::from(raw)), detail)
+                    .map_err(|e| {
+                        HelperLinkError::Io(std::io::Error::other(format!(
+                            "put_event (unsafe metadata path refusal): {e}"
+                        )))
+                    })?;
+                return Ok(());
+            }
+        },
+        None => {
+            journal_helper_capture_refused(
+                index,
+                command,
+                None,
+                "CapturedMetadataChange did not carry a replay path".to_string(),
+            )
+            .map_err(|e| {
+                HelperLinkError::Io(std::io::Error::other(format!(
+                    "put_event (missing metadata path refusal): {e}"
+                )))
+            })?;
+            return Ok(());
+        }
+    };
     let inode_ref = InodeRef::new(dev, inode);
-    let path_buf: std::path::PathBuf = path.unwrap_or_default().into();
     let ts = crate::server::next_ts();
     let event = CaptureEvent {
         id: EventId(0),
-        command: CommandId { session, seq },
+        command,
         ts,
         partial: false,
         kind: CaptureEventKind::MetadataChange {
@@ -1159,16 +2067,30 @@ fn handle_captured_pre_image(
     blob_store: &BlobStore,
     kernel_tier: &str,
 ) -> Result<(), HelperLinkError> {
-    let bytes = read_all_from_fd(&args.staging, args.stored_bytes as usize)?;
-    let (canonical_hash, stat) = blob_store
-        .put(&bytes)
-        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("blob put: {e}"))))?;
+    let raw_path = args.path.as_deref().ok_or_else(|| {
+        HelperLinkError::Io(std::io::Error::other(
+            "CapturedPreImage did not carry a replay path",
+        ))
+    })?;
+    let path_buf = strict_absolute_replay_path(raw_path, "CapturedPreImage path")
+        .map_err(|detail| HelperLinkError::Io(std::io::Error::other(detail)))?;
     let claimed = BlobHash(args.blob_hash);
-    if canonical_hash != claimed {
-        return Err(HelperLinkError::Io(std::io::Error::other(format!(
-            "captured pre-image hash mismatch: helper claimed {claimed}, daemon computed {canonical_hash}"
-        ))));
-    }
+    let mut staging_reader =
+        PositionedStableFdReader::new(&args.staging, args.stored_bytes, MAX_CAPTURE_FD_BYTES)?;
+    let publication = blob_store.shared_guard();
+    let (canonical_hash, stat) = publication
+        .put_verified_exact(
+            &mut staging_reader,
+            claimed,
+            args.stored_bytes,
+            MAX_CAPTURE_FD_BYTES,
+        )
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "captured pre-image blob ingest: {e}"
+            )))
+        })?;
+    staging_reader.finish()?;
     let ts = crate::server::next_ts();
     index
         .put_blob_record(canonical_hash, stat.stored_bytes, stat.compressed, ts)
@@ -1189,8 +2111,6 @@ fn handle_captured_pre_image(
         acl: None,
         flags: args.flags,
     };
-    let path_buf: PathBuf = args.path.clone().unwrap_or_default().into();
-
     // M03.x.OPEN-UNDO follow-up — tag the FilePreImage's source so
     // the planner can tell pre-mutation captures (macOS ES) from
     // post-mutation captures (BSD kqueue post-hoc, Linux LSM, shim).
@@ -1220,32 +2140,32 @@ fn handle_captured_pre_image(
     index
         .put_event(&pre_image)
         .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
+    drop(publication);
 
     if args.is_delete {
         // G02: inherit kind+mode from the captured pre-image's
         // metadata. The mode bits carry the original perms; kind
         // is derived from S_IFMT.
-        journal_unlink_idempotent(
+        journal_tree_op(
             index,
             command,
             ts,
-            inode_ref,
-            path_buf,
-            kind_from_mode_bits(args.mode),
-            args.mode,
-        )?;
+            TreeOp::Unlink {
+                inode: inode_ref,
+                path: path_buf,
+                kind: kind_from_mode_bits(args.mode),
+                mode: args.mode,
+            },
+            TreeSignalSource::HelperPreImage,
+            false,
+        )
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
+        })?;
     }
     Ok(())
 }
 
-/// Journal a `TreeOp::Unlink` exactly once per `(command, inode, path)`.
-/// Both the CapturedPreImage(is_delete=true) handler AND the dir-diff
-/// path on the helper side can produce an Unlink for the same target;
-/// kqueue's per-event delivery order isn't deterministic enough to
-/// dedupe on the helper. Dedupe here so the planner sees one Unlink
-/// per logical mutation — otherwise plan() emits two RecreatePath
-/// nodes and the second hits ConflictPhantom at undo time (the smoke
-/// regression surfaced this).
 /// G02 — derive `FileKind` from raw POSIX mode bits. The helper's
 /// fstat-on-held-fd before unlink captures the full mode including
 /// S_IFMT type bits; the planner needs a typed `FileKind` to emit
@@ -1276,43 +2196,646 @@ fn kind_from_mode_bits(mode: u32) -> shit_planner::metadata::FileKind {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn journal_unlink_idempotent(
+/// Independent capture channels which can report the same namespace change.
+///
+/// `HelperPreImage` is deliberately distinct from `HelperMutation`: BSD can
+/// surface one unlink through both its held-fd delete path and its directory
+/// diff. Counting each channel separately lets us collapse those duplicates
+/// without collapsing two real, identical operations observed twice by one
+/// channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeSignalSource {
+    HelperMutation,
+    HelperPreImage,
+    Shim,
+}
+
+impl TreeSignalSource {
+    const fn slot(self) -> usize {
+        match self {
+            Self::HelperMutation => 0,
+            Self::HelperPreImage => 1,
+            Self::Shim => 2,
+        }
+    }
+}
+
+/// The exact semantic identity used to pair reports from independent tiers.
+/// Metadata is part of an unlink's identity: if two tiers disagree about the
+/// entry kind or mode, retaining both is safer than discarding the richer
+/// reconstruction evidence. Target-less `Unlink(kind=Symlink)` likewise does
+/// not match `SymlinkRemoved`, whose lexical target is load-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TreeMutationIdentity {
+    Unlink {
+        inode: InodeRef,
+        path: PathBuf,
+        kind: u8,
+        mode: u32,
+    },
+    Rename {
+        inode: InodeRef,
+        from: PathBuf,
+        to: PathBuf,
+    },
+    SymlinkRemoved {
+        inode: InodeRef,
+        target: String,
+        path: PathBuf,
+    },
+}
+
+impl TreeMutationIdentity {
+    fn from_op(op: &TreeOp) -> Option<Self> {
+        match op {
+            TreeOp::Unlink {
+                inode,
+                path,
+                kind,
+                mode,
+            } => Some(Self::Unlink {
+                inode: *inode,
+                path: path.clone(),
+                kind: file_kind_tag(*kind),
+                mode: *mode,
+            }),
+            TreeOp::Rename { from, to, inode } => Some(Self::Rename {
+                inode: *inode,
+                from: from.clone(),
+                to: to.clone(),
+            }),
+            TreeOp::SymlinkRemovedIdentified {
+                inode,
+                target,
+                path,
+            } => Some(Self::SymlinkRemoved {
+                inode: *inode,
+                target: target.clone(),
+                path: path.clone(),
+            }),
+            // The legacy target-bearing shape has no inode identity.  Never
+            // infer that two path/target observations are the same removal.
+            TreeOp::SymlinkRemoved { .. }
+            | TreeOp::Create { .. }
+            | TreeOp::Link { .. }
+            | TreeOp::Symlink { .. } => None,
+        }
+    }
+
+    /// Whether `op` proves that this exact namespace mutation can happen
+    /// again.  Two identical unlinks/renames are physically impossible
+    /// without an intervening transition that puts the same inode back at
+    /// the source path.  That transition starts a new dedup generation.
+    fn is_rearmed_by(&self, op: &TreeOp) -> bool {
+        let inode_at = |candidate: InodeRef, candidate_path: &PathBuf| match op {
+            TreeOp::Create { inode, path, .. } => inode == &candidate && path == candidate_path,
+            TreeOp::Link { source, target } => source == &candidate && target == candidate_path,
+            TreeOp::Rename { inode, to, .. } => inode == &candidate && to == candidate_path,
+            TreeOp::Unlink { .. }
+            | TreeOp::Symlink { .. }
+            | TreeOp::SymlinkRemoved { .. }
+            | TreeOp::SymlinkRemovedIdentified { .. } => false,
+        };
+
+        match self {
+            Self::Unlink { inode, path, .. } | Self::SymlinkRemoved { inode, path, .. } => {
+                inode_at(*inode, path)
+            }
+            Self::Rename { inode, from, .. } => inode_at(*inode, from),
+        }
+    }
+}
+
+const fn file_kind_tag(kind: shit_planner::metadata::FileKind) -> u8 {
+    use shit_planner::metadata::FileKind;
+    match kind {
+        FileKind::Regular => 0,
+        FileKind::Directory => 1,
+        FileKind::Symlink => 2,
+        FileKind::Fifo => 3,
+        FileKind::Socket => 4,
+        FileKind::BlockDevice => 5,
+        FileKind::CharDevice => 6,
+    }
+}
+
+#[derive(Debug)]
+struct TreeObservationState {
+    authoritative_sources: u8,
+    partial_sources: u8,
+    last_seen: Instant,
+}
+
+impl TreeObservationState {
+    fn new(now: Instant) -> Self {
+        Self {
+            authoritative_sources: 0,
+            partial_sources: 0,
+            last_seen: now,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TreeDedupLedger {
+    entries: HashMap<(CommandId, TreeMutationIdentity), TreeObservationState>,
+    last_prune: Instant,
+}
+
+impl TreeDedupLedger {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_prune: Instant::now(),
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        const ENTRY_TTL: Duration = Duration::from_secs(10);
+        const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+        const MAX_ENTRIES: usize = 8_192;
+
+        if now.duration_since(self.last_prune) >= PRUNE_INTERVAL
+            || self.entries.len() >= MAX_ENTRIES
+        {
+            self.entries
+                .retain(|_, counts| now.duration_since(counts.last_seen) <= ENTRY_TTL);
+            self.last_prune = now;
+        }
+        if self.entries.len() >= MAX_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, counts)| counts.last_seen)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn rearm(&mut self, command: CommandId, op: &TreeOp) {
+        self.entries.retain(|(entry_command, identity), _| {
+            *entry_command != command || !identity.is_rearmed_by(op)
+        });
+    }
+}
+
+static TREE_DEDUP_LEDGER: OnceLock<Mutex<TreeDedupLedger>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeJournalOutcome {
+    Journaled,
+    Deduplicated,
+}
+
+/// Journal a namespace mutation while pairing equivalent observations from
+/// independent capture channels.
+///
+/// For each exact `(command, operation identity, generation)`, at most one
+/// authoritative event is journaled.  An exact unlink or rename cannot occur
+/// twice until another namespace transition puts the same inode back at its
+/// source path; observing that transition rearms the identity and begins a new
+/// generation.  This avoids the unsafe old "maximum per-source count" rule,
+/// which could pair two disjoint occurrences when different channels missed
+/// opposite operations.  A partial event never establishes authoritative
+/// coverage: if it arrives first it is retained as diagnostics and a later
+/// authoritative event is also journaled; if an authoritative event already
+/// exists for the generation, a partial duplicate is suppressed.
+///
+/// This ledger is intentionally bounded and process-local. Reports separated
+/// by a daemon restart, by more than ten seconds, or by capacity eviction may
+/// both be retained. That failure mode is a visible duplicate rather than the
+/// unsafe alternative of suppressing a real mutation without provenance. The
+/// current wires still carry no shared per-syscall operation id.  If a capture
+/// tier loses the intervening same-inode rearm event, it has lost a
+/// load-bearing namespace mutation and must report that loss separately; this
+/// ledger never manufactures a cross-source ordinal match.
+pub(crate) fn journal_tree_op(
     index: &Index,
     command: CommandId,
     ts: shit_planner::TimePoint,
-    inode_ref: InodeRef,
-    path: std::path::PathBuf,
-    kind: shit_planner::metadata::FileKind,
-    mode: u32,
-) -> Result<(), HelperLinkError> {
-    use shit_planner::PlannerStore;
-    let already = index.events_for_command(command).into_iter().any(|e| {
-        matches!(
-            &e.kind,
-            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path, .. })
-                if *inode == inode_ref && existing_path == &path
-        )
-    });
-    if already {
-        return Ok(());
-    }
-    let unlink_ev = CaptureEvent {
+    tree_op: TreeOp,
+    source: TreeSignalSource,
+    partial: bool,
+) -> Result<TreeJournalOutcome, shit_store::IndexError> {
+    let event = CaptureEvent {
         id: EventId(0),
         command,
         ts,
-        partial: false,
-        kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
-            inode: inode_ref,
-            path,
-            kind,
-            mode,
-        }),
+        partial,
+        kind: CaptureEventKind::TreeOp(tree_op.clone()),
     };
-    index.put_event(&unlink_ev).map_err(|e| {
-        HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
-    })?;
-    Ok(())
+
+    let identity = TreeMutationIdentity::from_op(&tree_op);
+
+    let now = Instant::now();
+    let mut ledger = TREE_DEDUP_LEDGER
+        .get_or_init(|| Mutex::new(TreeDedupLedger::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger.prune(now);
+
+    // Rearm older identities before handling the current event.  An exact
+    // duplicate cannot rearm itself: for Rename(A -> B), `to` differs from
+    // the recorded source A; unlink/removal variants never enter this branch.
+    ledger.rearm(command, &tree_op);
+
+    let Some(identity) = identity else {
+        drop(ledger);
+        index.put_event(&event)?;
+        return Ok(TreeJournalOutcome::Journaled);
+    };
+
+    let counts = ledger
+        .entries
+        .entry((command, identity))
+        .or_insert_with(|| TreeObservationState::new(now));
+    counts.last_seen = now;
+
+    let source_bit = 1u8 << source.slot();
+    let should_journal = if partial {
+        if counts.authoritative_sources != 0 || counts.partial_sources != 0 {
+            counts.partial_sources |= source_bit;
+            false
+        } else {
+            index.put_event(&event)?;
+            counts.partial_sources |= source_bit;
+            true
+        }
+    } else {
+        if counts.authoritative_sources != 0 {
+            counts.authoritative_sources |= source_bit;
+            false
+        } else {
+            index.put_event(&event)?;
+            counts.authoritative_sources |= source_bit;
+            true
+        }
+    };
+
+    Ok(if should_journal {
+        TreeJournalOutcome::Journaled
+    } else {
+        TreeJournalOutcome::Deduplicated
+    })
+}
+
+#[cfg(test)]
+mod tree_dedup_tests {
+    use super::*;
+    use shit_planner::events::CommandRecord;
+    use shit_planner::metadata::FileKind;
+    use shit_planner::{PlannerStore, TimePoint};
+    use shit_proto::ShellKind;
+
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    fn fixture(seq: u64) -> (tempfile::TempDir, Index, CommandId) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path().join("index.sqlite")).unwrap();
+        let discriminator = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
+        let session =
+            uuid::Uuid::from_u128(0xded0_0000_0000_4000_8000_0000_0000_0000 | discriminator);
+        let command = CommandId { session, seq };
+        index
+            .put_session(session, "bash", 101, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("tree mutation".into()),
+                cwd: "/tmp".into(),
+                pid: 101,
+                shell_kind: ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: Vec::new(),
+            })
+            .unwrap();
+        (dir, index, command)
+    }
+
+    fn unlink() -> TreeOp {
+        TreeOp::Unlink {
+            inode: InodeRef::new(7, 11),
+            path: "/tmp/removed".into(),
+            kind: FileKind::Regular,
+            mode: 0o100640,
+        }
+    }
+
+    fn rename() -> TreeOp {
+        TreeOp::Rename {
+            inode: InodeRef::new(7, 12),
+            from: "/tmp/from".into(),
+            to: "/tmp/to".into(),
+        }
+    }
+
+    fn symlink_removed() -> TreeOp {
+        TreeOp::SymlinkRemovedIdentified {
+            inode: InodeRef::new(7, 13),
+            target: "../target".into(),
+            path: "/tmp/link".into(),
+        }
+    }
+
+    fn fsevents_placeholder_unlink() -> TreeOp {
+        TreeOp::Unlink {
+            inode: InodeRef::new(0, 0),
+            path: "/tmp/link".into(),
+            kind: FileKind::Regular,
+            mode: 0o644,
+        }
+    }
+
+    fn relink_removed_inode() -> TreeOp {
+        TreeOp::Link {
+            source: InodeRef::new(7, 11),
+            target: "/tmp/removed".into(),
+        }
+    }
+
+    fn assert_order(first: TreeSignalSource, second: TreeSignalSource) {
+        let (_dir, index, command) = fixture(1);
+        for (ordinal, op) in [unlink(), rename(), symlink_removed()]
+            .into_iter()
+            .enumerate()
+        {
+            let first_outcome = journal_tree_op(
+                &index,
+                command,
+                TimePoint::new((ordinal * 2 + 1) as u64, 0),
+                op.clone(),
+                first,
+                false,
+            )
+            .unwrap();
+            let second_outcome = journal_tree_op(
+                &index,
+                command,
+                TimePoint::new((ordinal * 2 + 2) as u64, 0),
+                op,
+                second,
+                false,
+            )
+            .unwrap();
+            assert_eq!(first_outcome, TreeJournalOutcome::Journaled);
+            assert_eq!(second_outcome, TreeJournalOutcome::Deduplicated);
+        }
+        let events = index.events_for_command(command);
+        assert_eq!(
+            events.len(),
+            3,
+            "one event per semantic operation: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn helper_then_shim_deduplicates_unlink_rename_and_symlink_removal() {
+        assert_order(TreeSignalSource::HelperMutation, TreeSignalSource::Shim);
+    }
+
+    #[test]
+    fn shim_then_helper_deduplicates_unlink_rename_and_symlink_removal() {
+        assert_order(TreeSignalSource::Shim, TreeSignalSource::HelperMutation);
+    }
+
+    #[test]
+    fn repeated_identical_operations_preserve_multiplicity() {
+        let (_dir, index, command) = fixture(2);
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(1, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(2, 0),
+                relink_removed_inode(),
+                TreeSignalSource::HelperMutation,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(3, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+
+        let events = index.events_for_command(command);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(&event.kind, CaptureEventKind::TreeOp(TreeOp::Unlink { .. }))
+                })
+                .count(),
+            2,
+            "same identity was rearmed between real occurrences: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn disjoint_cross_source_observations_do_not_collapse_across_rearm() {
+        let (_dir, index, command) = fixture(5);
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(1, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+        journal_tree_op(
+            &index,
+            command,
+            TimePoint::new(2, 0),
+            relink_removed_inode(),
+            TreeSignalSource::HelperMutation,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(3, 0),
+                unlink(),
+                TreeSignalSource::Shim,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+    }
+
+    #[test]
+    fn duplicate_from_same_source_without_rearm_is_suppressed() {
+        let (_dir, index, command) = fixture(6);
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(1, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(2, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Deduplicated
+        );
+    }
+
+    #[test]
+    fn partial_first_does_not_suppress_authoritative_shim() {
+        let (_dir, index, command) = fixture(3);
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(1, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                true,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(2, 0),
+                unlink(),
+                TreeSignalSource::Shim,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 2, "{events:#?}");
+        assert_eq!(events.iter().filter(|event| !event.partial).count(), 1);
+    }
+
+    #[test]
+    fn authoritative_shim_suppresses_later_partial_duplicate() {
+        let (_dir, index, command) = fixture(4);
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(1, 0),
+                unlink(),
+                TreeSignalSource::Shim,
+                false,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Journaled
+        );
+        assert_eq!(
+            journal_tree_op(
+                &index,
+                command,
+                TimePoint::new(2, 0),
+                unlink(),
+                TreeSignalSource::HelperMutation,
+                true,
+            )
+            .unwrap(),
+            TreeJournalOutcome::Deduplicated
+        );
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(!events[0].partial);
+    }
+
+    #[test]
+    fn fsevents_placeholder_unlink_does_not_coalesce_with_rich_shim_symlink_removal() {
+        for (seq, partial_first) in [(7, true), (8, false)] {
+            let (_dir, index, command) = fixture(seq);
+            let observations = if partial_first {
+                [
+                    (
+                        fsevents_placeholder_unlink(),
+                        TreeSignalSource::HelperMutation,
+                        true,
+                    ),
+                    (symlink_removed(), TreeSignalSource::Shim, false),
+                ]
+            } else {
+                [
+                    (symlink_removed(), TreeSignalSource::Shim, false),
+                    (
+                        fsevents_placeholder_unlink(),
+                        TreeSignalSource::HelperMutation,
+                        true,
+                    ),
+                ]
+            };
+
+            for (ordinal, (op, source, partial)) in observations.into_iter().enumerate() {
+                assert_eq!(
+                    journal_tree_op(
+                        &index,
+                        command,
+                        TimePoint::new(ordinal as u64 + 1, 0),
+                        op,
+                        source,
+                        partial,
+                    )
+                    .unwrap(),
+                    TreeJournalOutcome::Journaled
+                );
+            }
+
+            let events = index.events_for_command(command);
+            assert_eq!(events.len(), 2, "{events:#?}");
+            assert_eq!(events.iter().filter(|event| event.partial).count(), 1);
+            assert!(events.iter().any(|event| matches!(
+                event.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified { .. })
+            )));
+        }
+    }
 }
 
 /// W02.B.live-baseline step 3 — ingest one BaselineCaptured message.
@@ -1324,28 +2847,38 @@ fn journal_unlink_idempotent(
 /// `CapturedPreImage`'s baseline-swap path.
 #[allow(clippy::too_many_arguments)]
 fn handle_baseline_captured(
-    session: uuid::Uuid,
+    command: CommandId,
     cwd: std::path::PathBuf,
     dev: u64,
     inode: u64,
     path: std::path::PathBuf,
     blob_hash_claimed: [u8; 32],
     stored_bytes: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime_unix_nanos: i128,
+    flags: u32,
     staging: OwnedFd,
     blob_store: &BlobStore,
     index: &Index,
     live_baseline: &crate::baseline::LiveBaseline,
 ) -> Result<(), HelperLinkError> {
-    let bytes = read_all_from_fd(&staging, stored_bytes as usize)?;
-    let (canonical_hash, stat) = blob_store
-        .put(&bytes)
-        .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("blob put: {e}"))))?;
     let claimed = BlobHash(blob_hash_claimed);
-    if canonical_hash != claimed {
-        return Err(HelperLinkError::Io(std::io::Error::other(format!(
-            "baseline blob hash mismatch: helper claimed {claimed}, daemon computed {canonical_hash}"
-        ))));
-    }
+    let mut staging_reader =
+        PositionedStableFdReader::new(&staging, stored_bytes, MAX_CAPTURE_FD_BYTES)?;
+    let publication = blob_store.shared_guard();
+    let (canonical_hash, stat) = publication
+        .put_verified_exact(
+            &mut staging_reader,
+            claimed,
+            stored_bytes,
+            MAX_CAPTURE_FD_BYTES,
+        )
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!("baseline blob ingest: {e}")))
+        })?;
+    staging_reader.finish()?;
     // Register the blob in the index now, at capture time. When the
     // baseline cache later promotes this blob into a FilePreImage
     // event (via `handle_baseline_promoted_pre_image`), the planner's
@@ -1355,8 +2888,10 @@ fn handle_baseline_captured(
     // check (AU11 drift detection regression observed pre-fix).
     //
     // Idempotent via ON CONFLICT DO NOTHING; refcount stays 0 until a
-    // FilePreImage event references it, at which point put_event bumps
-    // it. Unpromoted baseline blobs end up refcount=0 and get GC'd.
+    // FilePreImage event references it. A command-scoped lease protects that
+    // zero-refcount interval. Promotion atomically bumps the refcount and
+    // consumes this exact lease; successful command finish clears any
+    // baseline leases that were never promoted.
     let ts = crate::server::next_ts();
     index
         .put_blob_record(canonical_hash, stat.stored_bytes, stat.compressed, ts)
@@ -1365,6 +2900,14 @@ fn handle_baseline_captured(
                 "baseline put_blob_record: {e}"
             )))
         })?;
+    index
+        .create_blob_lease(canonical_hash, command, ts)
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "baseline create_blob_lease: {e}"
+            )))
+        })?;
+    drop(publication);
     let inode_ref = InodeRef::new(dev, inode);
     // W09.21 — read user-namespace xattrs here in the daemon (not
     // the helper) because the helper runs under cap_enter(2) where
@@ -1372,13 +2915,29 @@ fn handle_baseline_captured(
     // The daemon's read happens BEFORE the user's command runs (the
     // WatchTreeReady ack to PreExec waits for all BaselineCaptured to
     // flush), so we see the genuine pre-command state.
-    let xattrs = crate::xattr::read_user_xattrs_at_path(&path);
-    let entry =
-        crate::baseline::BaselineEntry::new(inode_ref, canonical_hash, stored_bytes, xattrs);
+    let xattrs =
+        crate::xattr::try_read_user_xattrs_at_path_for_inode(&path, dev, inode).map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "authoritative baseline xattr capture for {} failed: {e}",
+                path.display()
+            )))
+        })?;
+    let entry = crate::baseline::BaselineEntry::new(
+        inode_ref,
+        canonical_hash,
+        stored_bytes,
+        mode,
+        uid,
+        gid,
+        mtime_unix_nanos,
+        xattrs,
+        flags,
+    );
     let cache = live_baseline.entry_for_cwd(&cwd);
     cache.insert(path.clone(), entry);
     tracing::debug!(
-        %session,
+        session = %command.session,
+        seq = command.seq,
         dev,
         inode,
         path = %path.display(),
@@ -1401,14 +2960,7 @@ fn handle_baseline_promoted_pre_image(
     dev: u64,
     inode: u64,
     path: Option<String>,
-    blob: BlobHash,
-    stored_bytes: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    mtime_unix_nanos: i128,
-    xattrs: BTreeMap<String, Vec<u8>>,
-    flags: u32,
+    baseline: crate::baseline::BaselinePreImage,
     is_delete: bool,
     post_content_hash: Option<[u8; 32]>,
     index: &Index,
@@ -1416,19 +2968,25 @@ fn handle_baseline_promoted_pre_image(
     let command = CommandId { session, seq };
     let inode_ref = InodeRef::new(dev, inode);
     let meta = FileMetadata {
-        mode,
-        uid,
-        gid,
-        size: stored_bytes,
-        mtime_unix_nanos,
+        mode: baseline.mode,
+        uid: baseline.uid,
+        gid: baseline.gid,
+        size: baseline.size,
+        mtime_unix_nanos: baseline.mtime_unix_nanos,
         // W09.21 — xattrs captured daemon-side at session-open (helper
         // can't because of cap_enter). Restore via planner's
         // restore_metadata_inner → restore_user_xattrs.
-        xattrs,
+        xattrs: baseline.xattrs,
         acl: None,
-        flags,
+        flags: baseline.flags,
     };
-    let path_buf: PathBuf = path.clone().unwrap_or_default().into();
+    let raw_path = path.as_deref().ok_or_else(|| {
+        HelperLinkError::Io(std::io::Error::other(
+            "baseline-promoted pre-image did not carry a replay path",
+        ))
+    })?;
+    let path_buf = strict_absolute_replay_path(raw_path, "baseline-promoted pre-image path")
+        .map_err(|detail| HelperLinkError::Io(std::io::Error::other(detail)))?;
     let ts = crate::server::next_ts();
 
     let pre_image = CaptureEvent {
@@ -1439,7 +2997,7 @@ fn handle_baseline_promoted_pre_image(
         kind: CaptureEventKind::FilePreImage {
             inode: inode_ref,
             path: path_buf.clone(),
-            blob,
+            blob: baseline.blob,
             meta,
             // AU11 — the helper attached the held fd's
             // post-mutation content hash on BSD kqueue (post-hoc;
@@ -1466,47 +3024,172 @@ fn handle_baseline_promoted_pre_image(
         .map_err(|e| HelperLinkError::Io(std::io::Error::other(format!("put_event: {e}"))))?;
 
     if is_delete {
-        journal_unlink_idempotent(
+        journal_tree_op(
             index,
             command,
             ts,
-            inode_ref,
-            path_buf,
-            kind_from_mode_bits(mode),
-            mode,
-        )?;
+            TreeOp::Unlink {
+                inode: inode_ref,
+                path: path_buf,
+                kind: kind_from_mode_bits(baseline.mode),
+                mode: baseline.mode,
+            },
+            TreeSignalSource::HelperPreImage,
+            false,
+        )
+        .map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
+        })?;
     }
     Ok(())
 }
 
-fn read_all_from_fd(fd: &OwnedFd, expected_size: usize) -> Result<Vec<u8>, HelperLinkError> {
-    let mut buf = vec![0u8; expected_size];
-    let mut offset: usize = 0;
-    while offset < expected_size {
-        // SAFETY: buf is a valid writable slice; fd is owned for the
-        // call duration.
-        let n = unsafe {
-            libc::pread(
-                fd.as_raw_fd(),
-                buf[offset..].as_mut_ptr().cast(),
-                expected_size - offset,
-                offset as i64,
-            )
-        };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(HelperLinkError::Io(err));
-        }
-        if n == 0 {
-            buf.truncate(offset);
-            return Ok(buf);
-        }
-        offset += n as usize;
+const MAX_CAPTURE_FD_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StagingFdIdentity {
+    dev: u64,
+    inode: u64,
+    size: u64,
+    file_type: libc::mode_t,
+}
+
+fn staging_fd_identity(fd: RawFd) -> std::io::Result<StagingFdIdentity> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is borrowed by the caller for this operation and `stat`
+    // points at writable storage of the exact type required by fstat(2).
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    Ok(buf)
+    let size = u64::try_from(stat.st_size).map_err(|_| {
+        std::io::Error::other(format!(
+            "captured SCM_RIGHTS fd reports a negative length ({})",
+            stat.st_size
+        ))
+    })?;
+    Ok(StagingFdIdentity {
+        dev: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        size,
+        file_type: stat.st_mode & libc::S_IFMT,
+    })
+}
+
+/// Positioned, identity-checked view of an SCM_RIGHTS staging file.
+///
+/// `pread(2)` avoids trusting or mutating the sender's open-file-description
+/// offset. Reaching EOF performs the post-read fstat before EOF is reported to
+/// the blob store, so the store cannot publish bytes from an fd whose identity
+/// or length changed during ingest.
+struct PositionedStableFdReader<'a> {
+    fd: &'a OwnedFd,
+    before: StagingFdIdentity,
+    expected_size: u64,
+    offset: u64,
+    post_read_verified: bool,
+}
+
+impl<'a> PositionedStableFdReader<'a> {
+    fn new(fd: &'a OwnedFd, expected_size: u64, max_size: u64) -> std::io::Result<Self> {
+        if expected_size > max_size {
+            return Err(std::io::Error::other(format!(
+                "captured fd declared {expected_size} bytes, above the {max_size}-byte ingest cap"
+            )));
+        }
+        let before = staging_fd_identity(fd.as_raw_fd())?;
+        if before.file_type != libc::S_IFREG {
+            return Err(std::io::Error::other(
+                "captured SCM_RIGHTS fd is not a regular staging file",
+            ));
+        }
+        if before.size != expected_size {
+            return Err(std::io::Error::other(format!(
+                "captured fd length mismatch: wire declared {expected_size}, fd reports {}",
+                before.size
+            )));
+        }
+        Ok(Self {
+            fd,
+            before,
+            expected_size,
+            offset: 0,
+            post_read_verified: false,
+        })
+    }
+
+    fn verify_post_read_identity(&mut self) -> std::io::Result<()> {
+        let after = staging_fd_identity(self.fd.as_raw_fd())?;
+        if after.file_type != libc::S_IFREG || after != self.before {
+            return Err(std::io::Error::other(
+                "captured fd identity or length changed during ingest",
+            ));
+        }
+        self.post_read_verified = true;
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        if !self.post_read_verified {
+            let mut probe = [0_u8; 1];
+            if std::io::Read::read(&mut self, &mut probe)? != 0 {
+                return Err(std::io::Error::other(format!(
+                    "captured fd exceeded its declared {}-byte length",
+                    self.expected_size
+                )));
+            }
+        }
+        if self.offset != self.expected_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "captured fd ended after {} bytes; wire declared {}",
+                    self.offset, self.expected_size
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Read for PositionedStableFdReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.post_read_verified {
+            return Ok(0);
+        }
+        let offset: libc::off_t = self.offset.try_into().map_err(|_| {
+            std::io::Error::other("captured fd offset does not fit the platform's off_t")
+        })?;
+        loop {
+            // SAFETY: `buffer` is valid writable memory for `buffer.len()`
+            // bytes, `fd` remains owned for this call, and `offset` was
+            // checked to fit off_t.
+            let read = unsafe {
+                libc::pread(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    offset,
+                )
+            };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if read == 0 {
+                self.verify_post_read_identity()?;
+                return Ok(0);
+            }
+            let read = read as usize;
+            self.offset = self
+                .offset
+                .checked_add(read as u64)
+                .ok_or_else(|| std::io::Error::other("captured fd offset overflow"))?;
+            return Ok(read);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1556,6 +3239,32 @@ mod tests_dispatch {
     use shit_planner::PlannerStore;
     use uuid::Uuid;
 
+    fn test_helper_link() -> (Arc<HelperLink>, OwnedFd) {
+        let (daemon, helper) = nix::sys::socket::socketpair(
+            AddressFamily::Unix,
+            HELPER_SOCK_TYPE,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+        (
+            Arc::new(HelperLink {
+                conn_fd: daemon,
+                send_lock: std::sync::Mutex::new(()),
+                child: std::sync::Mutex::new(None),
+                helper_pid: 0,
+                helper_uid: 0,
+                granted: HelperCaps::degraded(),
+                kernel_tier: "test".into(),
+                degraded_reason: None,
+                priv_op_waiters: Default::default(),
+                unwatch_waiters: Default::default(),
+                ingest_failures: Arc::new(IngestFailures::default()),
+            }),
+            helper,
+        )
+    }
+
     fn tmp_staging_fd(content: &[u8]) -> OwnedFd {
         // Open a tempfile, write content, return the owned fd. The
         // file unlinks at tempdir drop — but the fd keeps it reachable.
@@ -1567,6 +3276,789 @@ mod tests_dispatch {
         // lifetime. Test-only; OS reclaims on process exit.
         std::mem::forget(dir);
         f.into()
+    }
+
+    fn tmp_staging_rw_fd(content: &[u8]) -> OwnedFd {
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, content).unwrap();
+        file.sync_all().unwrap();
+        file.into()
+    }
+
+    fn register_test_command(index: &Index, session: Uuid, seq: u64, cwd: &str) -> CommandId {
+        use shit_planner::{CommandRecord, TimePoint};
+
+        index
+            .put_session(
+                session,
+                "bash",
+                1234,
+                Some("/dev/null"),
+                TimePoint::new(0, 0),
+            )
+            .unwrap();
+        let command = CommandId { session, seq };
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("test mutation".into()),
+                cwd: cwd.into(),
+                pid: 5678,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(1, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        command
+    }
+
+    #[tokio::test]
+    async fn helper_loss_refuses_every_active_command_and_wakes_waiters() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0x1055);
+        let first = register_test_command(&index, session, 1, "/tmp/first");
+        let second = register_test_command(&index, session, 2, "/tmp/second");
+        let inactive = register_test_command(&index, session, 3, "/tmp/inactive");
+        let active = crate::active_commands::ActiveCommands::new();
+        active.insert(1001, first);
+        active.insert(1002, second);
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let first_wait = watch_ready.await_ready(first);
+        let second_wait = watch_ready.await_ready(second);
+
+        refuse_active_commands_after_helper_loss(
+            &active,
+            &index,
+            &watch_ready,
+            &IngestFailures::default(),
+            "test helper disconnect",
+        );
+
+        assert_eq!(
+            first_wait.await.unwrap().unwrap_err(),
+            "test helper disconnect"
+        );
+        assert_eq!(
+            second_wait.await.unwrap().unwrap_err(),
+            "test helper disconnect"
+        );
+        for command in [first, second] {
+            let events = index.events_for_command(command);
+            assert!(matches!(
+                &events[..],
+                [CaptureEvent {
+                    kind: CaptureEventKind::CaptureRefused { detail, .. },
+                    ..
+                }] if detail == "test helper disconnect"
+            ));
+        }
+        assert!(index.events_for_command(inactive).is_empty());
+    }
+
+    #[tokio::test]
+    async fn helper_loss_refusal_failure_is_sticky_for_the_command() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let command = CommandId {
+            session: Uuid::from_u128(0x1056),
+            seq: 1,
+        };
+        let active = crate::active_commands::ActiveCommands::new();
+        active.insert(1001, command);
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let ready = watch_ready.await_ready(command);
+        let ingest_failures = IngestFailures::default();
+
+        // No command row: the helper-loss CaptureRefused cannot satisfy the
+        // events foreign key and must poison later completion.
+        refuse_active_commands_after_helper_loss(
+            &active,
+            &index,
+            &watch_ready,
+            &ingest_failures,
+            "test helper disconnect",
+        );
+
+        assert_eq!(ready.await.unwrap().unwrap_err(), "test helper disconnect");
+        assert!(ingest_failures.contains(command));
+    }
+
+    #[tokio::test]
+    async fn unwatch_completion_routes_only_after_dispatch() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let unwatch_waiters: UnwatchWaiters = Default::default();
+        let session = Uuid::from_u128(0xF105);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        unwatch_waiters
+            .lock()
+            .unwrap()
+            .insert((session, 77), sender);
+
+        dispatch_response(
+            HelperResponse::UnwatchTreeFlushed {
+                session,
+                command_seq: 77,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &Default::default(),
+        );
+
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert!(unwatch_waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tree_ingest_and_refusal_failure_poison_exact_unwatch_completion() {
+        use shit_proto::{FileKindWire, TreeOpWire};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let unwatch_waiters: UnwatchWaiters = Default::default();
+        let ingest_failures = IngestFailures::default();
+        let command = CommandId {
+            session: Uuid::from_u128(0xF108),
+            seq: 91,
+        };
+
+        // Intentionally do not register the command. Both the primary tree
+        // event and its CaptureRefused fallback fail the events FK.
+        dispatch_response(
+            HelperResponse::TreeMutation {
+                session: command.session,
+                seq: command.seq,
+                op: TreeOpWire::Create {
+                    dev: 1,
+                    inode: 2,
+                    path: "/tmp/not-durable".into(),
+                    kind: FileKindWire::Regular,
+                    mode: 0o100644,
+                },
+                ts_unix_nanos: 1,
+                partial: false,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &ingest_failures,
+        );
+        assert!(ingest_failures.contains(command));
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        unwatch_waiters
+            .lock()
+            .unwrap()
+            .insert((command.session, command.seq), sender);
+        dispatch_response(
+            HelperResponse::UnwatchTreeFlushed {
+                session: command.session,
+                command_seq: command.seq,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &ingest_failures,
+        );
+
+        let detail = receiver.await.unwrap().unwrap_err();
+        assert!(detail.contains("TreeMutation"), "{detail}");
+        assert!(!ingest_failures.contains(command));
+    }
+
+    #[tokio::test]
+    async fn metadata_journal_failure_uses_durable_refusal_without_poisoning_flush() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xF109);
+        let command = register_test_command(&index, session, 92, "/tmp");
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_metadata_ingest
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'MetadataChange'
+                 BEGIN SELECT RAISE(FAIL, 'injected metadata journal failure'); END;",
+            )
+            .unwrap();
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let unwatch_waiters: UnwatchWaiters = Default::default();
+        let ingest_failures = IngestFailures::default();
+        let metadata = shit_proto::FileMetadataWire {
+            mode: 0o100644,
+            uid: 1,
+            gid: 2,
+            size: 3,
+            mtime_unix_nanos: 4,
+            xattrs: BTreeMap::new(),
+            flags: 0,
+        };
+
+        dispatch_response(
+            HelperResponse::CapturedMetadataChange {
+                session,
+                seq: command.seq,
+                dev: 1,
+                inode: 2,
+                path: Some("/tmp/file".into()),
+                before: metadata.clone(),
+                after: metadata,
+                ts_unix_nanos: 1,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &ingest_failures,
+        );
+
+        assert!(!ingest_failures.contains(command));
+        assert!(matches!(
+            &index.events_for_command(command)[..],
+            [CaptureEvent {
+                kind: CaptureEventKind::CaptureRefused { detail, .. },
+                ..
+            }] if detail.contains("CapturedMetadataChange")
+        ));
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        unwatch_waiters
+            .lock()
+            .unwrap()
+            .insert((session, command.seq), sender);
+        dispatch_response(
+            HelperResponse::UnwatchTreeFlushed {
+                session,
+                command_seq: command.seq,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &ingest_failures,
+        );
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn undurable_helper_refusal_poison_exact_unwatch_completion() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let unwatch_waiters: UnwatchWaiters = Default::default();
+        let ingest_failures = IngestFailures::default();
+        let command = CommandId {
+            session: Uuid::from_u128(0xF10A),
+            seq: 93,
+        };
+
+        dispatch_response(
+            HelperResponse::CaptureRefused {
+                session: command.session,
+                seq: command.seq,
+                path: Some("/tmp/file".into()),
+                detail: "helper detected loss".into(),
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &ingest_failures,
+        );
+        assert!(ingest_failures.contains(command));
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        unwatch_waiters
+            .lock()
+            .unwrap()
+            .insert((command.session, command.seq), sender);
+        dispatch_response(
+            HelperResponse::UnwatchTreeFlushed {
+                session: command.session,
+                command_seq: command.seq,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "test",
+            &Default::default(),
+            &unwatch_waiters,
+            &ingest_failures,
+        );
+        let detail = receiver.await.unwrap().unwrap_err();
+        assert!(detail.contains("helper CaptureRefused"), "{detail}");
+    }
+
+    #[test]
+    fn validation_refusal_failures_for_preimage_deletion_and_baseline_are_sticky() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let session = Uuid::from_u128(0xF10C);
+        let metadata = shit_proto::FileMetadataWire {
+            mode: 0o040700,
+            uid: 1,
+            gid: 2,
+            size: 0,
+            mtime_unix_nanos: 3,
+            xattrs: BTreeMap::new(),
+            flags: 0,
+        };
+        let responses = [
+            HelperResponse::CapturedPreImage {
+                session,
+                seq: 1,
+                dev: 1,
+                inode: 2,
+                path: Some("/tmp/preimage".into()),
+                blob_hash: [0; 32],
+                stored_bytes: 1,
+                post_content_hash: None,
+                mode: 0o100600,
+                uid: 1,
+                gid: 2,
+                mtime_unix_nanos: 3,
+                xattrs: BTreeMap::new(),
+                is_delete: false,
+                fd_sent_via_scm: false,
+                flags: 0,
+            },
+            HelperResponse::CapturedDeletionMarker {
+                session,
+                seq: 2,
+                dev: 1,
+                inode: 3,
+                path: "/tmp/deleted".into(),
+                metadata,
+            },
+            HelperResponse::BaselineWalkComplete {
+                session,
+                command_seq: 3,
+                cwd: "/tmp/baseline".into(),
+                file_count: 1,
+                partial: true,
+            },
+        ];
+
+        for (offset, response) in responses.into_iter().enumerate() {
+            let command = CommandId {
+                session,
+                seq: offset as u64 + 1,
+            };
+            let ingest_failures = IngestFailures::default();
+            dispatch_response(
+                response,
+                None,
+                &index,
+                &blob_store,
+                &watch_ready,
+                &live_baseline,
+                "test",
+                &Default::default(),
+                &Default::default(),
+                &ingest_failures,
+            );
+            assert!(
+                ingest_failures.contains(command),
+                "validation failure for {command} was not sticky"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn helper_loss_wakes_every_unwatch_waiter() {
+        let waiters: UnwatchWaiters = Default::default();
+        let session = Uuid::from_u128(0xF106);
+        let mut receivers = Vec::new();
+        for seq in [1, 2] {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            waiters.lock().unwrap().insert((session, seq), sender);
+            receivers.push(receiver);
+        }
+
+        fail_pending_unwatch(&waiters, "test helper loss");
+
+        for receiver in receivers {
+            assert_eq!(receiver.await.unwrap(), Err("test helper loss".into()));
+        }
+        assert!(waiters.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unwatch_timeout_removes_waiter_and_preserves_exact_request_identity() {
+        let (link, helper_fd) = test_helper_link();
+        let command = CommandId {
+            session: Uuid::from_u128(0xF107),
+            seq: 88,
+        };
+
+        let error = link
+            .unwatch_tree_and_wait(command, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UnwatchTreeError::Timeout(_)));
+        assert!(link.unwatch_waiters.lock().unwrap().is_empty());
+
+        let frame = recv_frame_blocking_owned(&helper_fd).unwrap();
+        let request: HelperRequest = decode_frame(&frame).unwrap();
+        assert_eq!(
+            request,
+            HelperRequest::UnwatchTree {
+                session: command.session,
+                command_seq: command.seq,
+            }
+        );
+    }
+
+    #[test]
+    fn watch_tree_initializes_ingest_state_without_clearing_duplicate_failure() {
+        let (link, helper_fd) = test_helper_link();
+        let command = CommandId {
+            session: Uuid::from_u128(0xF10B),
+            seq: 94,
+        };
+        let request = HelperRequest::WatchTree {
+            root_pid: 123,
+            descendants_too: true,
+            session: command.session,
+            command_seq: command.seq,
+            shell_kind: shit_proto::ShellKind::Bash,
+            cwd_path: "/tmp".into(),
+        };
+        link.send_request(&request).unwrap();
+        assert!(link.ingest_failures.is_initialized(command));
+        assert!(!link.ingest_failures.contains(command));
+
+        link.ingest_failures
+            .mark(command, "sticky ingest failure".into());
+        link.send_request(&request).unwrap();
+
+        assert!(link.ingest_failures.contains(command));
+        for _ in 0..2 {
+            let frame = recv_frame_blocking_owned(&helper_fd).unwrap();
+            let decoded: HelperRequest = decode_frame(&frame).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_baseline_is_failed_refused_and_cannot_become_ready() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xB501);
+        let command = register_test_command(&index, session, 41, "/tmp/work");
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+
+        dispatch_response(
+            HelperResponse::BaselineWalkComplete {
+                session,
+                command_seq: command.seq,
+                cwd: "/tmp/work".into(),
+                file_count: 2,
+                partial: true,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "kqueue",
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        dispatch_response(
+            HelperResponse::WatchTreeReady {
+                session,
+                command_seq: command.seq,
+            },
+            None,
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "kqueue",
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        assert_eq!(
+            live_baseline
+                .get_cwd(Path::new("/tmp/work"))
+                .unwrap()
+                .state(),
+            crate::baseline::WalkState::Failed
+        );
+        assert!(watch_ready.await_ready(command).await.unwrap().is_err());
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(matches!(
+            events[0].kind,
+            CaptureEventKind::CaptureRefused { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn kqueue_baseline_miss_refuses_post_write_fd_instead_of_journaling_it() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xB502);
+        let command = register_test_command(&index, session, 42, "/tmp/work");
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let post_bytes = b"already modified";
+        let (post_hash, _) = blob_store.put(post_bytes).unwrap();
+        let claimed = *post_hash.as_bytes();
+
+        dispatch_response(
+            HelperResponse::CapturedPreImage {
+                session,
+                seq: command.seq,
+                dev: 5,
+                inode: 9,
+                path: Some("/tmp/work/file".into()),
+                blob_hash: claimed,
+                stored_bytes: post_bytes.len() as u64,
+                post_content_hash: Some(claimed),
+                mode: 0o100600,
+                uid: 9001,
+                gid: 9002,
+                mtime_unix_nanos: 99,
+                xattrs: BTreeMap::new(),
+                flags: 0,
+                is_delete: false,
+                fd_sent_via_scm: true,
+            },
+            Some(tmp_staging_fd(post_bytes)),
+            &index,
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "kqueue",
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        assert!(watch_ready.await_ready(command).await.unwrap().is_err());
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(matches!(
+            events[0].kind,
+            CaptureEventKind::CaptureRefused { .. }
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, CaptureEventKind::FilePreImage { .. }))
+        );
+    }
+
+    #[test]
+    fn baseline_capture_lease_is_consumed_by_promotion_event() {
+        use std::os::unix::fs::MetadataExt;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let cwd = store_dir.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let path = cwd.join("file");
+        let bytes = b"authoritative pre-command bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xB504);
+        let command = register_test_command(&index, session, 44, cwd.to_str().unwrap());
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let cache = live_baseline.entry_for_cwd(&cwd);
+        cache.begin_walk(command).unwrap();
+        let blob = shit_planner::hash_file(&path).unwrap();
+
+        handle_baseline_captured(
+            command,
+            cwd,
+            metadata.dev(),
+            metadata.ino(),
+            path.clone(),
+            *blob.as_bytes(),
+            bytes.len() as u64,
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            (metadata.mtime() as i128) * 1_000_000_000 + metadata.mtime_nsec() as i128,
+            0,
+            tmp_staging_fd(bytes),
+            &blob_store,
+            &index,
+            &live_baseline,
+        )
+        .unwrap();
+
+        assert!(index.has_blob_lease(blob, command).unwrap());
+        let refcount_before: i64 = index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                [blob.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount_before, 0);
+
+        cache.mark_ready();
+        let Some(crate::baseline::BaselinePromotion::Promoted(pre_image)) =
+            cache.promote(InodeRef::new(metadata.dev(), metadata.ino()), command)
+        else {
+            panic!("ready baseline did not promote");
+        };
+        handle_baseline_promoted_pre_image(
+            command.session,
+            command.seq,
+            metadata.dev(),
+            metadata.ino(),
+            Some(path.to_string_lossy().into_owned()),
+            pre_image,
+            false,
+            None,
+            &index,
+        )
+        .unwrap();
+
+        assert!(!index.has_blob_lease(blob, command).unwrap());
+        let refcount_after: i64 = index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                [blob.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount_after, 1);
+        assert!(matches!(
+            &index.events_for_command(command)[..],
+            [CaptureEvent {
+                kind: CaptureEventKind::FilePreImage { blob: event_blob, .. },
+                ..
+            }] if *event_blob == blob
+        ));
+    }
+
+    #[test]
+    fn baseline_promotion_uses_only_pre_command_metadata() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xB503);
+        let command = register_test_command(&index, session, 43, "/tmp/work");
+        let (blob, stat) = blob_store.put(b"pre-command bytes").unwrap();
+        index
+            .put_blob_record(
+                blob,
+                stat.stored_bytes,
+                stat.compressed,
+                crate::server::next_ts(),
+            )
+            .unwrap();
+        let mut xattrs = BTreeMap::new();
+        xattrs.insert("user.test".into(), b"before".to_vec());
+        let baseline = crate::baseline::BaselinePreImage {
+            blob,
+            size: 17,
+            mode: 0o100640,
+            uid: 1001,
+            gid: 1002,
+            mtime_unix_nanos: 1_700_000_000_123_456_789,
+            xattrs: xattrs.clone(),
+            flags: 0x2,
+        };
+
+        handle_baseline_promoted_pre_image(
+            session,
+            command.seq,
+            5,
+            9,
+            Some("/tmp/work/file".into()),
+            baseline,
+            false,
+            Some([0xCC; 32]),
+            &index,
+        )
+        .unwrap();
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        let CaptureEventKind::FilePreImage {
+            blob: actual_blob,
+            meta,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("expected baseline-promoted preimage: {events:#?}");
+        };
+        assert_eq!(*actual_blob, blob);
+        assert_eq!(meta.mode, 0o100640);
+        assert_eq!(meta.uid, 1001);
+        assert_eq!(meta.gid, 1002);
+        assert_eq!(meta.size, 17);
+        assert_eq!(meta.mtime_unix_nanos, 1_700_000_000_123_456_789);
+        assert_eq!(meta.xattrs, xattrs);
+        assert_eq!(meta.flags, 0x2);
     }
 
     #[test]
@@ -1650,16 +4142,11 @@ mod tests_dispatch {
         assert!(has_unlink, "missing paired Unlink event: {events:#?}");
     }
 
-    /// AR01.1.fix-marker-only — when the helper sends `CapturedPreImage`
-    /// with `stored_bytes=0`, `is_delete=true`, and no SCM_RIGHTS fd
-    /// (the unlink-race-lost path used for atomic lock files like
-    /// `.git/index.lock`), the daemon must journal a `TreeOp::Unlink`
-    /// only -- NO `FilePreImage`. Pre-AR01.1 the daemon rejected these
-    /// outright with `CapturedPreImage missing SCM_RIGHTS fd` and the
-    /// unlink never reached the journal, leaving the planner blind to
-    /// the delete.
+    /// A metadata-only directory marker cannot prove the complete state needed
+    /// to reconstruct the entry, so it must journal a refusal rather than a
+    /// lossy typed Unlink.
     #[test]
-    fn marker_only_unlink_journals_just_treeop() {
+    fn marker_only_unlink_journals_refusal() {
         use shit_planner::{CommandRecord, TimePoint};
         let store_dir = tempfile::tempdir().unwrap();
         let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
@@ -1677,7 +4164,7 @@ mod tests_dispatch {
         index
             .put_command(&CommandRecord {
                 command: CommandId { session, seq: 1 },
-                cmd_string: Some("git commit".into()),
+                cmd_string: Some("rmdir cache".into()),
                 cwd: "/tmp".into(),
                 pid: 5678,
                 shell_kind: shit_proto::ShellKind::Bash,
@@ -1688,29 +4175,44 @@ mod tests_dispatch {
             })
             .unwrap();
 
-        let command = CommandId { session, seq: 1 };
-        let inode_ref = InodeRef::new(64, 999);
-        let path_buf: PathBuf = "/tmp/.git/index.lock".into();
-        let ts = crate::server::next_ts();
-        journal_unlink_idempotent(
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let watch_ready = crate::watch_ready::WatchReadyMap::new();
+        let live_baseline = crate::baseline::LiveBaseline::new();
+        let waiters: PrivOpWaiters = Default::default();
+        dispatch_response(
+            HelperResponse::CapturedDeletionMarker {
+                session,
+                seq: 1,
+                dev: 64,
+                inode: 999,
+                path: "/tmp/cache".into(),
+                metadata: shit_proto::FileMetadataWire {
+                    mode: 0o040700,
+                    uid: 1000,
+                    gid: 1000,
+                    size: 0,
+                    mtime_unix_nanos: 0,
+                    xattrs: BTreeMap::new(),
+                    flags: 0,
+                },
+            },
+            None,
             &index,
-            command,
-            ts,
-            inode_ref,
-            path_buf,
-            shit_planner::metadata::FileKind::Regular,
-            0o100644,
-        )
-        .expect("marker-only journal");
+            &blob_store,
+            &watch_ready,
+            &live_baseline,
+            "bpf-lsm",
+            &waiters,
+            &Default::default(),
+            &Default::default(),
+        );
 
+        let command = CommandId { session, seq: 1 };
         let events = index.events_for_command(command);
-        assert_eq!(events.len(), 1, "expected 1 Unlink, got {events:#?}");
+        assert_eq!(events.len(), 1, "expected 1 refusal, got {events:#?}");
         assert!(
-            matches!(
-                events[0].kind,
-                CaptureEventKind::TreeOp(TreeOp::Unlink { .. })
-            ),
-            "expected TreeOp::Unlink, got {:#?}",
+            matches!(events[0].kind, CaptureEventKind::CaptureRefused { .. }),
+            "expected CaptureRefused, got {:#?}",
             events[0].kind
         );
         assert!(
@@ -1719,6 +4221,225 @@ mod tests_dispatch {
                 .any(|e| matches!(e.kind, CaptureEventKind::FilePreImage { .. })),
             "marker-only path must not journal FilePreImage: {events:#?}"
         );
+        assert!(matches!(
+            &events[0].kind,
+            CaptureEventKind::CaptureRefused { path, detail, .. }
+                if path == Path::new("/tmp/cache")
+                    && detail.contains("cannot reconstruct complete metadata")
+        ));
+    }
+
+    #[test]
+    fn exact_lsm_create_then_deletion_marker_is_transient_not_refused() {
+        use shit_planner::{CommandRecord, TimePoint};
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::from_u128(0xc0de);
+        let command = CommandId { session, seq: 1 };
+        index
+            .put_session(
+                session,
+                "bash",
+                1234,
+                Some("/dev/null"),
+                TimePoint::new(0, 0),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("mkdir cache && rmdir cache".into()),
+                cwd: "/tmp".into(),
+                pid: 5678,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(1, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        let inode = InodeRef::new(64, 999);
+        let path = PathBuf::from("/tmp/cache");
+        index
+            .put_event(&CaptureEvent {
+                id: EventId(0),
+                command,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode,
+                    path: path.clone(),
+                    kind: shit_planner::metadata::FileKind::Directory,
+                    mode: 0o040700,
+                }),
+            })
+            .unwrap();
+
+        dispatch_response(
+            HelperResponse::CapturedDeletionMarker {
+                session,
+                seq: command.seq,
+                dev: inode.dev,
+                inode: inode.inode,
+                path: path.to_string_lossy().into_owned(),
+                metadata: shit_proto::FileMetadataWire {
+                    mode: 0o040700,
+                    uid: 1000,
+                    gid: 1000,
+                    size: 0,
+                    mtime_unix_nanos: 0,
+                    xattrs: BTreeMap::new(),
+                    flags: 0,
+                },
+            },
+            None,
+            &index,
+            &blob_store,
+            &crate::watch_ready::WatchReadyMap::new(),
+            &crate::baseline::LiveBaseline::new(),
+            "bpf-lsm",
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "marker should add no event: {events:#?}");
+        assert!(matches!(
+            events[0].kind,
+            CaptureEventKind::TreeOp(TreeOp::Create { inode: actual, .. }) if actual == inode
+        ));
+    }
+
+    #[test]
+    fn missing_regular_preimage_fd_journals_refusal_not_empty_recreate() {
+        use shit_planner::{CommandRecord, TimePoint};
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::nil();
+        let command = CommandId { session, seq: 9 };
+        index
+            .put_session(
+                session,
+                "bash",
+                1234,
+                Some("/dev/null"),
+                TimePoint::new(0, 0),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("rm large.bin".into()),
+                cwd: "/tmp".into(),
+                pid: 5678,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(1, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+
+        dispatch_response(
+            HelperResponse::CapturedPreImage {
+                session,
+                seq: command.seq,
+                dev: 64,
+                inode: 999,
+                path: Some("/tmp/large.bin".into()),
+                blob_hash: [0; 32],
+                stored_bytes: 0,
+                post_content_hash: None,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                mtime_unix_nanos: 0,
+                xattrs: BTreeMap::new(),
+                is_delete: true,
+                fd_sent_via_scm: false,
+                flags: 0,
+            },
+            None,
+            &index,
+            &blob_store,
+            &crate::watch_ready::WatchReadyMap::new(),
+            &crate::baseline::LiveBaseline::new(),
+            "bpf-lsm",
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(matches!(
+            events[0].kind,
+            CaptureEventKind::CaptureRefused { .. }
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event.kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) | CaptureEventKind::FilePreImage { .. }
+        )));
+    }
+
+    #[test]
+    fn degraded_tree_mutation_stays_partial_in_the_journal() {
+        use shit_planner::{CommandRecord, TimePoint};
+        use shit_proto::{FileKindWire, TreeOpWire};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let index = Index::open(store_dir.path().join("db.sqlite")).unwrap();
+        let session = Uuid::nil();
+        let command = CommandId { session, seq: 7 };
+        index
+            .put_session(
+                session,
+                "zsh",
+                1234,
+                Some("/dev/null"),
+                TimePoint::new(0, 0),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("touch guessed-by-fsevents".into()),
+                cwd: "/tmp".into(),
+                pid: 5678,
+                shell_kind: shit_proto::ShellKind::Zsh,
+                started_at: TimePoint::new(1, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+
+        handle_tree_mutation(
+            session,
+            command.seq,
+            TreeOpWire::Create {
+                dev: 1,
+                inode: 2,
+                path: "/tmp/guessed-by-fsevents".into(),
+                kind: FileKindWire::Regular,
+                mode: 0o100644,
+            },
+            0,
+            true,
+            &index,
+        )
+        .unwrap();
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(events[0].partial, "degraded event became actionable");
+        assert!(matches!(
+            events[0].kind,
+            CaptureEventKind::TreeOp(TreeOp::Create { .. })
+        ));
     }
 
     #[test]
@@ -1737,7 +4458,7 @@ mod tests_dispatch {
             seq: 2,
             dev: 0,
             inode: 0,
-            path: None,
+            path: Some("/tmp/hash-mismatch".into()),
             blob_hash: bogus_claim,
             stored_bytes: bytes.len() as u64,
             post_content_hash: None,
@@ -1752,5 +4473,140 @@ mod tests_dispatch {
         };
         let err = handle_captured_pre_image(args, &index, &blob_store, "kqueue");
         assert!(err.is_err(), "expected hash-mismatch refusal");
+        let actual = BlobHash(*blake3::hash(bytes).as_bytes());
+        assert!(!blob_store.contains(&actual));
+        assert!(!blob_store.contains(&BlobHash(bogus_claim)));
+        assert_eq!(
+            std::fs::read_dir(blob_store.root().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn positioned_staging_reader_preserves_sender_offset() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let payload = vec![b'P'; 3 * 64 * 1024 + 29];
+        let hash = BlobHash(*blake3::hash(&payload).as_bytes());
+        let fd = tmp_staging_rw_fd(&payload);
+        // SAFETY: fd is live and 7 is within this regular staging file.
+        assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 7, libc::SEEK_SET) }, 7);
+
+        let mut reader =
+            PositionedStableFdReader::new(&fd, payload.len() as u64, MAX_CAPTURE_FD_BYTES).unwrap();
+        let publication = blob_store.shared_guard();
+        publication
+            .put_verified_exact(
+                &mut reader,
+                hash,
+                payload.len() as u64,
+                MAX_CAPTURE_FD_BYTES,
+            )
+            .unwrap();
+        reader.finish().unwrap();
+        // SAFETY: querying a live fd's current offset has no side effects.
+        assert_eq!(unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_CUR) }, 7);
+        assert_eq!(publication.get(hash).unwrap(), payload);
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_initial_size_mismatch() {
+        let payload = b"wire-size-mismatch";
+        let fd = tmp_staging_rw_fd(payload);
+        let error = match PositionedStableFdReader::new(
+            &fd,
+            payload.len() as u64 + 1,
+            MAX_CAPTURE_FD_BYTES,
+        ) {
+            Ok(_) => panic!("mismatched staging length was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("length mismatch"), "{error}");
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_non_regular_fd() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let error = match PositionedStableFdReader::new(&fd, 0, MAX_CAPTURE_FD_BYTES) {
+            Ok(_) => panic!("socket staging fd was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not a regular"), "{error}");
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_size_mutation_without_residue() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let payload = vec![b'M'; 128 * 1024 + 11];
+        let hash = BlobHash(*blake3::hash(&payload).as_bytes());
+        let fd = tmp_staging_rw_fd(&payload);
+        let mut reader =
+            PositionedStableFdReader::new(&fd, payload.len() as u64, MAX_CAPTURE_FD_BYTES).unwrap();
+        // SAFETY: fd is a live writable regular tempfile.
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 64 * 1024) }, 0);
+
+        let publication = blob_store.shared_guard();
+        assert!(
+            publication
+                .put_verified_exact(
+                    &mut reader,
+                    hash,
+                    payload.len() as u64,
+                    MAX_CAPTURE_FD_BYTES,
+                )
+                .is_err()
+        );
+        assert!(!publication.contains(&hash));
+        assert_eq!(
+            std::fs::read_dir(blob_store.root().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn positioned_staging_reader_rejects_identity_swap_without_residue() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(store_dir.path().join("blobs")).unwrap();
+        let original_bytes = vec![b'A'; 96 * 1024 + 7];
+        let replacement_bytes = vec![b'B'; original_bytes.len()];
+        let original_hash = BlobHash(*blake3::hash(&original_bytes).as_bytes());
+        let replacement_hash = BlobHash(*blake3::hash(&replacement_bytes).as_bytes());
+        let fd = tmp_staging_rw_fd(&original_bytes);
+        let replacement = tmp_staging_rw_fd(&replacement_bytes);
+        let mut reader =
+            PositionedStableFdReader::new(&fd, original_bytes.len() as u64, MAX_CAPTURE_FD_BYTES)
+                .unwrap();
+        // SAFETY: both descriptors are live. dup2 atomically replaces the
+        // descriptor owned by `fd`; that OwnedFd remains its sole owner.
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), fd.as_raw_fd()) },
+            fd.as_raw_fd()
+        );
+
+        let publication = blob_store.shared_guard();
+        assert!(
+            publication
+                .put_verified_exact(
+                    &mut reader,
+                    original_hash,
+                    original_bytes.len() as u64,
+                    MAX_CAPTURE_FD_BYTES,
+                )
+                .is_err()
+        );
+        assert!(!publication.contains(&original_hash));
+        assert!(!publication.contains(&replacement_hash));
+        assert_eq!(
+            std::fs::read_dir(blob_store.root().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

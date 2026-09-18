@@ -11,9 +11,9 @@ use crate::proc_track::ProcPreStash;
 use crate::stats::Stats;
 use crate::svc_track::SvcPreStash;
 use shit_proto::{
-    ConflictPolicyWire, CtlRequest, CtlResponse, DaemonStatus, GcRequest, MAX_LARGE_FRAME_SIZE,
-    NetEventReq, PkgEventReq, ProcEventReq, SvcEventReq, UndoReportWire, UndoRequest,
-    decode_frame_large, encode_frame,
+    ConflictPolicyWire, CtlRequest, CtlResponse, DaemonStatus, GcRequest, GcWallRequest,
+    HookMessage, MAX_LARGE_FRAME_SIZE, NetEventReq, PkgEventReq, ProcEventReq, SvcEventReq,
+    UndoReportWire, UndoRequest, decode_frame_large, encode_frame,
 };
 use shit_store::{BlobStore, Index};
 
@@ -38,6 +38,10 @@ pub struct CtlState {
     /// immediately so the shell hook doesn't block on a non-existent
     /// signal.
     pub watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
+    /// Close gate shared with the hook server. A readiness timeout is only a
+    /// safe fail-open boundary when its `CaptureRefused` fallback is durable;
+    /// otherwise PostExec must leave the command open and retry the refusal.
+    pub finalization_blocks: Arc<crate::server::FinalizationBlocks>,
     /// AU28 / DR-15 stage-1 — helper link for privileged-op routing.
     /// When `Some`, `handle_undo` wraps it in a
     /// `HelperLinkPrivilegedOpRouter` and threads it into the
@@ -110,6 +114,7 @@ async fn handle_client(
         db_stash,
         active,
         watch_ready,
+        finalization_blocks,
         helper_link,
     } = state;
     // Length-prefix-first read so we can grow the buffer up to
@@ -156,7 +161,7 @@ async fn handle_client(
             shutdown.notify_one();
             CtlResponse::ShutdownAcked
         }
-        CtlRequest::Gc(req) => handle_gc(req, index, blob_store).await,
+        CtlRequest::Gc(req) => handle_legacy_gc(req, index, blob_store).await,
         CtlRequest::Pin(req) => handle_pin(req, index),
         CtlRequest::Forget { id, yes: _ } => handle_forget(id, index),
         CtlRequest::PinList => handle_pin_list(index),
@@ -173,8 +178,12 @@ async fn handle_client(
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
         CtlRequest::ContainerEvent(req) => {
-            handle_container_event(req, &active, &index, &blob_store)
+            handle_container_event(req, &active, &index, &blob_store, &finalization_blocks)
         }
+        CtlRequest::ContainerBatchPrepare(req) => {
+            handle_container_batch_prepare(req, &active, &index, &blob_store, &finalization_blocks)
+        }
+        CtlRequest::ContainerBatchFinalize(req) => handle_container_batch_finalize(req, &index),
         CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => {
@@ -207,7 +216,15 @@ async fn handle_client(
             command_seq,
             timeout_ms,
         } => {
-            handle_wait_watch_ready(session, command_seq, timeout_ms, watch_ready.as_deref()).await
+            handle_wait_watch_ready(
+                session,
+                command_seq,
+                timeout_ms,
+                watch_ready.as_deref(),
+                &index,
+                &finalization_blocks,
+            )
+            .await
         }
         CtlRequest::PreStashRedirects {
             session,
@@ -220,6 +237,7 @@ async fn handle_client(
             &active,
             &index,
             &blob_store,
+            &finalization_blocks,
         ),
         CtlRequest::CmdDetail { id, events_limit } => {
             // AU30 — same tokio lesson as the AU22 fix above:
@@ -238,67 +256,299 @@ async fn handle_client(
                 Err(e) => CtlResponse::Error(format!("cmd-detail spawn_blocking panic: {e}")),
             }
         }
+        CtlRequest::GcWall(req) => handle_wall_gc(req, index, blob_store).await,
+        CtlRequest::RefuseAndCloseCommand {
+            session,
+            command_seq,
+            exit_code,
+            detail,
+            timeout_ms,
+        } => {
+            handle_refuse_and_close_command(
+                cfg,
+                session,
+                command_seq,
+                exit_code,
+                detail,
+                timeout_ms,
+                &index,
+                &finalization_blocks,
+            )
+            .await
+        }
     };
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
     Ok(())
 }
 
+const MAX_LIFECYCLE_REFUSAL_DETAIL_BYTES: usize = 2048;
+const MAX_LIFECYCLE_CLOSE_TIMEOUT_MS: u32 = 30_000;
+
+/// Recover a command whose shell-side companion capture failed. The ctl
+/// request is synchronous so the shell can retry before opening its next
+/// sequence. Actual close work remains owned by `server`: we enqueue the
+/// ordinary `PostExec` datagram, then wait for its durable close boundary.
+#[allow(clippy::too_many_arguments)]
+async fn handle_refuse_and_close_command(
+    cfg: &ResolvedConfig,
+    session: uuid::Uuid,
+    command_seq: u64,
+    exit_code: i32,
+    detail: String,
+    timeout_ms: u32,
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
+) -> CtlResponse {
+    if detail.is_empty() || detail.len() > MAX_LIFECYCLE_REFUSAL_DETAIL_BYTES {
+        return CtlResponse::Error(format!(
+            "refuse-and-close detail must contain 1..={MAX_LIFECYCLE_REFUSAL_DETAIL_BYTES} bytes"
+        ));
+    }
+    if timeout_ms == 0 || timeout_ms > MAX_LIFECYCLE_CLOSE_TIMEOUT_MS {
+        return CtlResponse::Error(format!(
+            "refuse-and-close timeout must be 1..={MAX_LIFECYCLE_CLOSE_TIMEOUT_MS} ms"
+        ));
+    }
+
+    let command = shit_planner::CommandId {
+        session,
+        seq: command_seq,
+    };
+    let Some(record) = <Index as shit_planner::PlannerStore>::command_by_id(index, command) else {
+        return CtlResponse::Error(format!(
+            "refuse-and-close found no command row for {command}"
+        ));
+    };
+    if record.ended_at.is_some() {
+        return CtlResponse::RefuseAndCloseAck;
+    }
+
+    let refusal_detail = format!("shell hook capture failed; command-wide undo refused: {detail}");
+    let refusal_already_durable =
+        <Index as shit_planner::PlannerStore>::events_for_command(index, command)
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    shit_planner::CaptureEventKind::CaptureRefused { class, detail, .. }
+                        if class == "capture-incomplete" && detail == &refusal_detail
+                )
+            });
+    if !refusal_already_durable
+        && let Err(error) = crate::helper_link::journal_helper_capture_refused(
+            index,
+            command,
+            Some(record.cwd.clone()),
+            refusal_detail.clone(),
+        )
+    {
+        finalization_blocks.insert(
+            command,
+            format!("refuse-and-close could not persist `{refusal_detail}`: {error}"),
+        );
+        return CtlResponse::Error(format!(
+            "refuse-and-close could not persist CaptureRefused: {error}"
+        ));
+    }
+    // One durable command-wide refusal makes every incomplete producer safe;
+    // release any older provisional close gates before asking the lifecycle
+    // owner to finalize.
+    finalization_blocks.clear(command);
+
+    let post_exec = HookMessage::PostExec {
+        session,
+        seq: command_seq,
+        exit_code,
+        ts_unix_nanos: crate::clock::now().unix_nanos,
+    };
+    let frame = match encode_frame(&post_exec) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return CtlResponse::Error(format!("encode recovery PostExec: {error}"));
+        }
+    };
+    let socket = match tokio::net::UnixDatagram::unbound() {
+        Ok(socket) => socket,
+        Err(error) => {
+            return CtlResponse::Error(format!("open recovery PostExec socket: {error}"));
+        }
+    };
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
+    match tokio::time::timeout_at(deadline, socket.send_to(&frame, &cfg.hook_socket_path)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return CtlResponse::Error(format!("enqueue recovery PostExec: {error}"));
+        }
+        Err(_) => {
+            return CtlResponse::Error(format!(
+                "timed out enqueueing recovery PostExec for {command}; retry is safe"
+            ));
+        }
+    }
+
+    loop {
+        match <Index as shit_planner::PlannerStore>::command_by_id(index, command) {
+            Some(record) if record.ended_at.is_some() => {
+                return CtlResponse::RefuseAndCloseAck;
+            }
+            Some(_) => {}
+            None => {
+                return CtlResponse::Error(format!(
+                    "command row {command} disappeared while waiting for close"
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return CtlResponse::Error(format!(
+                "timed out waiting for lifecycle owner to close {command}; retry is safe"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Trigger a one-shot GC pass. Runs in `spawn_blocking` because
 /// `shit_store::gc::run_pass` does sync sqlite work that can hold a
 /// connection across the entire pass.
-async fn handle_gc(req: GcRequest, index: Arc<Index>, blob_store: Arc<BlobStore>) -> CtlResponse {
+#[derive(Clone, Copy)]
+enum GcReplyKind {
+    Legacy,
+    Wall,
+}
+
+struct GcRunRequest {
+    dry_run: bool,
+    aggressive: bool,
+    size_cap_bytes: Option<u64>,
+    age_cap_secs: Option<u64>,
+}
+
+async fn handle_legacy_gc(
+    req: GcRequest,
+    index: Arc<Index>,
+    blob_store: Arc<BlobStore>,
+) -> CtlResponse {
+    if req.age_cap_logical.is_some() {
+        return CtlResponse::Error(
+            "gc: --age-cap-logical is no longer supported; upgrade the client and use --age-cap-secs"
+                .to_string(),
+        );
+    }
+    handle_gc(
+        GcRunRequest {
+            dry_run: req.dry_run,
+            aggressive: req.aggressive,
+            size_cap_bytes: req.size_cap_bytes,
+            age_cap_secs: None,
+        },
+        GcReplyKind::Legacy,
+        index,
+        blob_store,
+    )
+    .await
+}
+
+async fn handle_wall_gc(
+    req: GcWallRequest,
+    index: Arc<Index>,
+    blob_store: Arc<BlobStore>,
+) -> CtlResponse {
+    handle_gc(
+        GcRunRequest {
+            dry_run: req.dry_run,
+            aggressive: req.aggressive,
+            size_cap_bytes: req.size_cap_bytes,
+            age_cap_secs: req.age_cap_secs,
+        },
+        GcReplyKind::Wall,
+        index,
+        blob_store,
+    )
+    .await
+}
+
+async fn handle_gc(
+    req: GcRunRequest,
+    reply_kind: GcReplyKind,
+    index: Arc<Index>,
+    blob_store: Arc<BlobStore>,
+) -> CtlResponse {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut config = shit_store::GcConfig::default();
     if let Some(s) = req.size_cap_bytes {
         config.size_cap_bytes = Some(s);
     }
-    if let Some(a) = req.age_cap_logical {
-        config.age_threshold_logical = a;
+    if let Some(a) = req.age_cap_secs {
+        config.age_threshold_secs = a;
     }
-    // Aggressive mode is induced by passing an effectively-infinite
-    // age threshold, since the algorithm already enters aggressive on
-    // size-cap breach. Forcing the cutoff is the cleanest way to
-    // route `--aggressive`.
-    if req.aggressive {
-        config.age_threshold_logical = 0;
-    }
+    // Explicit aggressive collection is independent of wall-clock trust.
+    // A quarantined clock suppresses only normal age-based expiry.
+    config.force_aggressive = req.aggressive;
+    let retention_now = crate::clock::now().retention_now();
     if req.dry_run {
         // Dry-run: enumerate candidates without mutating. We don't
         // have a "dry-run mode" inside run_pass yet (it'd be a
         // helpful S13 follow-up). For stage 1, dry-run returns a
         // zeros report — accurate-enough for users wanting "did GC
         // run?" status.
-        return CtlResponse::GcReport(shit_proto::GcReport {
-            dry_run: true,
-            aggressive_mode_used: false,
-            commands_dropped: 0,
-            events_dropped: 0,
-            blobs_swept: 0,
-            bytes_reclaimed: 0,
-            paths_compacted: 0,
-            vacuumed: false,
-            duration_ms: 0,
-        });
+        return gc_report_response(
+            reply_kind,
+            true,
+            req.aggressive,
+            !retention_now.age_expiry_safe,
+            &shit_store::GcReport::default(),
+        );
     }
     let join = tokio::task::spawn_blocking(move || {
-        shit_store::run_pass(&index, &blob_store, &config, cancel, 1)
+        shit_store::run_pass(&index, &blob_store, &config, cancel, retention_now)
     })
     .await;
     match join {
-        Ok(Ok(r)) => CtlResponse::GcReport(shit_proto::GcReport {
-            dry_run: false,
-            aggressive_mode_used: r.aggressive_mode_used,
-            commands_dropped: r.commands_dropped as u64,
-            events_dropped: r.events_dropped as u64,
-            blobs_swept: r.blobs_swept as u64,
-            bytes_reclaimed: r.bytes_reclaimed,
-            paths_compacted: r.paths_compacted as u64,
-            vacuumed: r.vacuumed,
-            duration_ms: r.duration.as_millis() as u64,
-        }),
+        Ok(Ok(r)) => gc_report_response(
+            reply_kind,
+            false,
+            r.aggressive_mode_used,
+            r.age_expiry_suppressed,
+            &r,
+        ),
         Ok(Err(e)) => CtlResponse::Error(format!("gc: {e}")),
         Err(e) => CtlResponse::Error(format!("gc spawn_blocking panic: {e}")),
+    }
+}
+
+fn gc_report_response(
+    kind: GcReplyKind,
+    dry_run: bool,
+    aggressive_mode_used: bool,
+    age_expiry_suppressed: bool,
+    report: &shit_store::GcReport,
+) -> CtlResponse {
+    match kind {
+        GcReplyKind::Legacy => CtlResponse::GcReport(shit_proto::GcReport {
+            dry_run,
+            aggressive_mode_used,
+            commands_dropped: report.commands_dropped as u64,
+            events_dropped: report.events_dropped as u64,
+            blobs_swept: report.blobs_swept as u64,
+            bytes_reclaimed: report.bytes_reclaimed,
+            paths_compacted: report.paths_compacted as u64,
+            vacuumed: report.vacuumed,
+            duration_ms: report.duration.as_millis() as u64,
+        }),
+        GcReplyKind::Wall => CtlResponse::GcWallReport(shit_proto::GcWallReport {
+            dry_run,
+            aggressive_mode_used,
+            age_expiry_suppressed,
+            commands_dropped: report.commands_dropped as u64,
+            events_dropped: report.events_dropped as u64,
+            blobs_swept: report.blobs_swept as u64,
+            bytes_reclaimed: report.bytes_reclaimed,
+            paths_compacted: report.paths_compacted as u64,
+            vacuumed: report.vacuumed,
+            duration_ms: report.duration.as_millis() as u64,
+        }),
     }
 }
 
@@ -438,6 +688,13 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
 
 /// C04.7: prune container stashes older than `older_than_secs`.
 fn handle_container_stashes_prune(older_than_secs: u64, index: Arc<Index>) -> CtlResponse {
+    let now = crate::clock::now();
+    if !now.age_expiry_safe {
+        return CtlResponse::Error(
+            "container-stashes prune: wall-clock sanity is quarantined; age-based deletion is disabled for this daemon lifetime"
+                .to_string(),
+        );
+    }
     // Fetch sizes BEFORE the prune so we can report bytes freed.
     let by_hash: std::collections::HashMap<[u8; 32], u64> =
         match shit_store::container_stash::list_all(&index) {
@@ -449,7 +706,7 @@ fn handle_container_stashes_prune(older_than_secs: u64, index: Arc<Index>) -> Ct
                 return CtlResponse::Error(format!("container-stashes prune (pre-scan): {e}"));
             }
         };
-    match shit_store::container_stash::prune_older_than(&index, older_than_secs) {
+    match shit_store::container_stash::prune_older_than(&index, older_than_secs, now.unix_secs()) {
         Ok(pruned) => {
             let bytes_freed: u64 = pruned.iter().filter_map(|h| by_hash.get(h)).sum();
             CtlResponse::ContainerStashPruneReport {
@@ -574,22 +831,197 @@ fn handle_db_event(
     CtlResponse::DbEventAck
 }
 
-/// Handle one container-event request (DR-CR-26). PR-B extension:
-/// the request may carry tarball bytes inline (small-image fast
-/// path); the handler writes them to the blob store + registers a
-/// container_stash row BEFORE journaling the ContainerOp event.
-/// Always acks regardless of journaling outcome (the warn-log from
-/// container_track::handle is the operator's failure signal); the
-/// shell-issued container command shouldn't be punished for shit's
-/// downstream issues.
+/// Handle the legacy read-only container-event path (DR-CR-26). Pull
+/// observations remain informational; destructive verbs must use the atomic
+/// batch protocol. Any invalid legacy request becomes a durable command-scoped
+/// refusal, or blocks finalization when even that refusal cannot be persisted.
 fn handle_container_event(
     req: shit_proto::ContainerEventReq,
     active: &crate::active_commands::ActiveCommands,
     index: &Index,
     blob_store: &BlobStore,
+    finalization_blocks: &crate::server::FinalizationBlocks,
 ) -> CtlResponse {
-    let _ = crate::container_track::handle(req, active, index, blob_store);
-    CtlResponse::ContainerEventAck
+    let command = active.resolve_by_descendant(req.pid);
+    match crate::container_track::handle(req, active, index, blob_store) {
+        Ok(_) => CtlResponse::ContainerEventAck,
+        Err(error) => container_capture_error(
+            command,
+            format!("container capture failed before journaling: {error}"),
+            index,
+            finalization_blocks,
+        ),
+    }
+}
+
+fn handle_container_batch_prepare(
+    req: shit_proto::ContainerBatchPrepareReq,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+    blob_store: &BlobStore,
+    finalization_blocks: &crate::server::FinalizationBlocks,
+) -> CtlResponse {
+    let batch_id = req.batch_id;
+    let command = container_prepare_error_owner(&req, active, index);
+    match crate::container_track::prepare_batch(req, active, index, blob_store) {
+        Ok(shit_store::ContainerBatchState::Confirmed) => {
+            CtlResponse::ContainerBatchPrepared { batch_id }
+        }
+        Ok(state) => container_batch_prepare_error(
+            batch_id,
+            command,
+            format!("container batch {batch_id} was not confirmed before authorization: {state:?}"),
+            index,
+            finalization_blocks,
+        ),
+        Err(error) => container_batch_prepare_error(
+            batch_id,
+            command,
+            format!("container batch {batch_id} prepare failed: {error}"),
+            index,
+            finalization_blocks,
+        ),
+    }
+}
+
+fn container_prepare_error_owner(
+    req: &shit_proto::ContainerBatchPrepareReq,
+    active: &crate::active_commands::ActiveCommands,
+    index: &Index,
+) -> Option<shit_planner::CommandId> {
+    // A same-id retry is a bearer-capability operation and may arrive after
+    // the original command left ActiveCommands. Prefer its durable owner so a
+    // retry failure can never be attributed to a newer foreground command.
+    let existing = index.container_batch_info(req.batch_id).ok().flatten();
+    existing.as_ref().map(|info| info.command).or_else(|| {
+        req.events.first().and_then(|event| {
+            crate::container_track::command_identity(event)
+                .ok()
+                .and_then(|claimed| active.resolve_exact_by_descendant(event.pid, claimed))
+        })
+    })
+}
+
+/// Fail a prepare request without poisoning an authorization that was already
+/// confirmed by an earlier identical request. A newly-created/crash-left
+/// PREPARED batch never produced an ACK, so make its refusal terminal before
+/// recording the command-wide capture failure.
+fn container_batch_prepare_error(
+    batch_id: uuid::Uuid,
+    fallback_command: Option<shit_planner::CommandId>,
+    mut detail: String,
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
+) -> CtlResponse {
+    let info = match index.container_batch_info(batch_id) {
+        Ok(info) => info,
+        Err(error) => {
+            detail.push_str(&format!("; durable batch lookup also failed: {error}"));
+            return container_capture_error(fallback_command, detail, index, finalization_blocks);
+        }
+    };
+    let Some(info) = info else {
+        return container_capture_error(fallback_command, detail, index, finalization_blocks);
+    };
+    match info.state {
+        shit_store::ContainerBatchState::Confirmed | shit_store::ContainerBatchState::Finalized => {
+            // The UUID is already bound to an actionable request. A malformed
+            // or corrupt retry is rejected, but cannot rewrite its history or
+            // re-authorize a consumed FINALIZED batch.
+            CtlResponse::Error(detail)
+        }
+        shit_store::ContainerBatchState::Refused => CtlResponse::Error(detail),
+        shit_store::ContainerBatchState::Prepared => {
+            match index.finalize_container_batch(batch_id, false) {
+                Ok(shit_store::ContainerBatchState::Refused) => {}
+                Ok(shit_store::ContainerBatchState::Confirmed) => {
+                    return CtlResponse::Error(detail);
+                }
+                Ok(shit_store::ContainerBatchState::Finalized) => {
+                    return CtlResponse::Error(detail);
+                }
+                Ok(shit_store::ContainerBatchState::Prepared) => {
+                    detail.push_str("; batch refusal unexpectedly left the batch prepared");
+                }
+                Err(error) => {
+                    // A concurrent identical prepare can confirm after our
+                    // lookup but before this refusal. Preserve that terminal
+                    // authorization rather than poisoning its command.
+                    if index
+                        .container_batch_info(batch_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|latest| {
+                            matches!(
+                                latest.state,
+                                shit_store::ContainerBatchState::Confirmed
+                                    | shit_store::ContainerBatchState::Finalized
+                            )
+                        })
+                    {
+                        return CtlResponse::Error(detail);
+                    }
+                    detail.push_str(&format!("; durable batch refusal also failed: {error}"));
+                }
+            }
+            container_capture_error(Some(info.command), detail, index, finalization_blocks)
+        }
+    }
+}
+
+fn handle_container_batch_finalize(
+    req: shit_proto::ContainerBatchFinalizeReq,
+    index: &Index,
+) -> CtlResponse {
+    let batch_id = req.batch_id;
+    match crate::container_track::finalize_batch(&req, index) {
+        Ok(shit_store::ContainerBatchState::Finalized) => {
+            CtlResponse::ContainerBatchFinalized { batch_id }
+        }
+        Ok(state) => CtlResponse::Error(format!(
+            "container batch {batch_id} did not reach durable runtime finalization: {state:?}"
+        )),
+        Err(error) => CtlResponse::Error(format!(
+            "container batch {batch_id} finalize failed: {error}"
+        )),
+    }
+}
+
+/// Persist a command-wide refusal for any container authorization failure.
+/// The wrapper always receives an Error and therefore never treats the
+/// refusal itself as permission to run a destructive command.
+fn container_capture_error(
+    command: Option<shit_planner::CommandId>,
+    detail: String,
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
+) -> CtlResponse {
+    let Some(command) = command else {
+        return CtlResponse::Error(detail);
+    };
+    let refusal = shit_planner::CaptureEvent {
+        id: shit_planner::EventId(0),
+        command,
+        ts: crate::server::next_ts(),
+        partial: false,
+        kind: shit_planner::CaptureEventKind::CaptureRefused {
+            class: "container-capture-failed".into(),
+            path: std::path::PathBuf::from("/.shit-container-capture"),
+            detail: detail.clone(),
+        },
+    };
+    match index.put_event(&refusal) {
+        Ok(_) => {
+            tracing::error!(%command, error = %detail, "container capture refused durably");
+            CtlResponse::Error(detail)
+        }
+        Err(refusal_error) => {
+            let block = format!("{detail}; durable refusal also failed: {refusal_error}");
+            finalization_blocks.insert(command, block.clone());
+            tracing::error!(%command, error = %block, "container capture cannot finalize");
+            CtlResponse::Error(block)
+        }
+    }
 }
 
 fn handle_cloud_event(
@@ -655,9 +1087,8 @@ struct DaemonGhRunner;
 impl shit_planner::executors::gh::GhRunner for DaemonGhRunner {
     fn run(&self, argv: &[String]) -> Result<(), String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let status = std::process::Command::new(cmd)
+        let status = shit_planner::executors::container::configured_undo_command(cmd, None)
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
@@ -670,16 +1101,21 @@ impl shit_planner::executors::gh::GhRunner for DaemonGhRunner {
     fn run_with_stdin(&self, argv: &[String], stdin_bytes: &[u8]) -> Result<(), String> {
         use std::io::Write;
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let mut child = std::process::Command::new(cmd)
+        let mut child = shit_planner::executors::container::configured_undo_command(cmd, None)
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(stdin_bytes)
-                .map_err(|e| format!("write stdin to {cmd}: {e}"))?;
+            if let Err(error) = stdin.write_all(stdin_bytes) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("write stdin to {cmd}: {error}"));
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("spawned {cmd} without a writable stdin pipe"));
         }
         let status = child.wait().map_err(|e| format!("wait {cmd}: {e}"))?;
         if status.success() {
@@ -699,9 +1135,8 @@ struct DaemonKubectlRunner;
 impl shit_planner::executors::kubectl::KubectlRunner for DaemonKubectlRunner {
     fn run(&self, argv: &[String]) -> Result<(), String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let status = std::process::Command::new(cmd)
+        let status = shit_planner::executors::container::configured_undo_command(cmd, None)
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
@@ -714,9 +1149,8 @@ impl shit_planner::executors::kubectl::KubectlRunner for DaemonKubectlRunner {
     fn run_with_stdin(&self, argv: &[String], stdin_bytes: &[u8]) -> Result<(), String> {
         use std::io::Write;
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let mut child = std::process::Command::new(cmd)
+        let mut child = shit_planner::executors::container::configured_undo_command(cmd, None)
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
@@ -735,9 +1169,8 @@ impl shit_planner::executors::kubectl::KubectlRunner for DaemonKubectlRunner {
 
     fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let out = std::process::Command::new(cmd)
+        let out = shit_planner::executors::container::configured_undo_command(cmd, None)
             .args(args)
-            .env("SHIT_DURING_UNDO", "1")
             .output()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if !out.status.success() {
@@ -813,16 +1246,32 @@ impl shit_planner::executors::terraform::TerraformRunner for DaemonTerraformRunn
 /// captures a borrow of the blob store.
 struct DaemonContainerRunner<'a> {
     blob_store: &'a BlobStore,
+    engine_lock: shit_planner::executors::CooperativeContainerLockState,
 }
 
 impl shit_planner::executors::ContainerRunner for DaemonContainerRunner<'_> {
+    fn acquire_engine_lock(
+        &self,
+        runtime: &str,
+    ) -> Result<Box<dyn shit_planner::executors::ContainerEngineLockGuard + '_>, String> {
+        if runtime != "docker" {
+            return Err(format!(
+                "cooperative restore locking is not implemented for container runtime `{runtime}`"
+            ));
+        }
+        self.engine_lock.acquire_docker().map(|guard| {
+            Box::new(guard) as Box<dyn shit_planner::executors::ContainerEngineLockGuard + '_>
+        })
+    }
+
     fn run(&self, argv: &[String]) -> Result<(), String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let status = std::process::Command::new(cmd)
-            .args(args)
-            .env("SHIT_DURING_UNDO", "1")
-            .status()
-            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        let token = self.engine_lock.active_token()?;
+        let status =
+            shit_planner::executors::container::configured_undo_command(cmd, token.as_deref())
+                .args(args)
+                .status()
+                .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
             Ok(())
         } else {
@@ -832,16 +1281,23 @@ impl shit_planner::executors::ContainerRunner for DaemonContainerRunner<'_> {
     fn run_with_stdin(&self, argv: &[String], stdin_bytes: &[u8]) -> Result<(), String> {
         use std::io::Write;
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let mut child = std::process::Command::new(cmd)
-            .args(args)
-            .env("SHIT_DURING_UNDO", "1")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        let token = self.engine_lock.active_token()?;
+        let mut child =
+            shit_planner::executors::container::configured_undo_command(cmd, token.as_deref())
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(stdin_bytes)
-                .map_err(|e| format!("write stdin to {cmd}: {e}"))?;
+            if let Err(error) = stdin.write_all(stdin_bytes) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("write stdin to {cmd}: {error}"));
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("spawned {cmd} without a writable stdin pipe"));
         }
         let status = child.wait().map_err(|e| format!("wait {cmd}: {e}"))?;
         if status.success() {
@@ -852,15 +1308,63 @@ impl shit_planner::executors::ContainerRunner for DaemonContainerRunner<'_> {
     }
     fn capture(&self, argv: &[String]) -> Result<Vec<u8>, String> {
         let (cmd, args) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
-        let out = std::process::Command::new(cmd)
-            .args(args)
-            .env("SHIT_DURING_UNDO", "1")
-            .output()
-            .map_err(|e| format!("spawn {cmd}: {e}"))?;
+        let token = self.engine_lock.active_token()?;
+        let out =
+            shit_planner::executors::container::configured_undo_command(cmd, token.as_deref())
+                .args(args)
+                .output()
+                .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if !out.status.success() {
             return Err(format!("{cmd} exited {:?}", out.status.code()));
         }
         Ok(out.stdout)
+    }
+    fn probe_image_id(&self, runtime: &str, image: &str) -> Result<Option<String>, String> {
+        let token = self.engine_lock.active_token()?;
+        let info =
+            shit_planner::executors::container::configured_undo_command(runtime, token.as_deref())
+                .arg("info")
+                .output()
+                .map_err(|error| format!("spawn {runtime} info: {error}"))?;
+        if !info.status.success() {
+            return Err(format!(
+                "{runtime} info exited {:?}: {}",
+                info.status.code(),
+                String::from_utf8_lossy(&info.stderr).trim()
+            ));
+        }
+        let inspect =
+            shit_planner::executors::container::configured_undo_command(runtime, token.as_deref())
+                .args(["image", "inspect", "--format", "{{.Id}}", image])
+                .output()
+                .map_err(|error| format!("spawn {runtime} image inspect: {error}"))?;
+        if inspect.status.success() {
+            let id = String::from_utf8(inspect.stdout).map_err(|error| {
+                format!("{runtime} image inspect returned non-UTF-8 ID: {error}")
+            })?;
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(format!(
+                    "{runtime} image inspect succeeded for `{image}` without an image ID"
+                ));
+            }
+            return Ok(Some(id.to_string()));
+        }
+        let stderr = String::from_utf8_lossy(&inspect.stderr);
+        let normalized = stderr.to_ascii_lowercase();
+        if normalized.contains("no such image")
+            || normalized.contains("image not known")
+            || normalized.contains("image not found")
+            || normalized.contains("does not exist")
+        {
+            Ok(None)
+        } else {
+            Err(format!(
+                "{runtime} image inspect `{image}` exited {:?}: {}",
+                inspect.status.code(),
+                stderr.trim()
+            ))
+        }
     }
     fn load_stash_tarball(&self, hash: &shit_planner::BlobHash) -> Option<Vec<u8>> {
         // AR03 PR-B (DR-CR-26): resolve the stash through the
@@ -1065,6 +1569,54 @@ impl shit_planner::executors::NetRunner for PrivilegedNetRunner {
 }
 
 impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
+    fn begin_plan_execution(&self, dry_run: bool) {
+        self.file_executor.begin_plan_execution(dry_run);
+        self.package_executor.begin_plan_execution(dry_run);
+        self.service_executor.begin_plan_execution(dry_run);
+        self.network_executor.begin_plan_execution(dry_run);
+        self.container_executor.begin_plan_execution(dry_run);
+        self.terraform_executor.begin_plan_execution(dry_run);
+        self.kubectl_executor.begin_plan_execution(dry_run);
+        self.gh_executor.begin_plan_execution(dry_run);
+        self.shell_state_executor.begin_plan_execution(dry_run);
+    }
+
+    fn finish_plan_execution(&self) {
+        self.file_executor.finish_plan_execution();
+        self.package_executor.finish_plan_execution();
+        self.service_executor.finish_plan_execution();
+        self.network_executor.finish_plan_execution();
+        self.container_executor.finish_plan_execution();
+        self.terraform_executor.finish_plan_execution();
+        self.kubectl_executor.finish_plan_execution();
+        self.gh_executor.finish_plan_execution();
+        self.shell_state_executor.finish_plan_execution();
+    }
+
+    fn preflight(&self, op: &shit_planner::InverseOp) -> Result<(), String> {
+        if self.file_executor.supports(op) {
+            self.file_executor.preflight(op)
+        } else if self.package_executor.supports(op) {
+            self.package_executor.preflight(op)
+        } else if self.service_executor.supports(op) {
+            self.service_executor.preflight(op)
+        } else if self.network_executor.supports(op) {
+            self.network_executor.preflight(op)
+        } else if self.container_executor.supports(op) {
+            self.container_executor.preflight(op)
+        } else if self.terraform_executor.supports(op) {
+            self.terraform_executor.preflight(op)
+        } else if self.kubectl_executor.supports(op) {
+            self.kubectl_executor.preflight(op)
+        } else if self.gh_executor.supports(op) {
+            self.gh_executor.preflight(op)
+        } else if self.shell_state_executor.supports(op) {
+            self.shell_state_executor.preflight(op)
+        } else {
+            Err(format!("no executor wired for tier {:?}", op.tier()))
+        }
+    }
+
     fn supports(&self, op: &shit_planner::InverseOp) -> bool {
         self.file_executor.supports(op)
             || self.package_executor.supports(op)
@@ -1114,9 +1666,10 @@ impl shit_planner::executor::InverseOpExecutor for MultiTierExecutor<'_> {
 /// Blocks the calling ctl client (typically `shit hook-send pre-exec`
 /// from a shell PreExec hook) until the helper has signaled
 /// `HelperResponse::WatchTreeReady` for the specified (session,
-/// command_seq) -- which means kernel-tier capture is genuinely set
-/// up and the user's command can safely run without racing the
-/// helper's watch_tree handling.
+/// command_seq), or until capture is known to have failed. The shell hooks are
+/// fail-open, so a false response does not prevent the user's command from
+/// running; every false path must first persist a `CaptureRefused` event so a
+/// later undo cannot treat incomplete evidence as authoritative.
 ///
 /// Returns:
 /// - `WatchReady { ready: true, reason: None }` on success.
@@ -1130,32 +1683,93 @@ async fn handle_wait_watch_ready(
     command_seq: u64,
     timeout_ms: u32,
     watch_ready: Option<&crate::watch_ready::WatchReadyMap>,
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
 ) -> CtlResponse {
+    let cmd = shit_planner::events::CommandId {
+        session,
+        seq: command_seq,
+    };
     let Some(map) = watch_ready else {
+        journal_watch_readiness_refusal(index, finalization_blocks, cmd, "no helper");
         return CtlResponse::WatchReady {
             ready: false,
             reason: Some("no helper".to_string()),
         };
     };
-    let cmd = shit_planner::events::CommandId {
-        session,
-        seq: command_seq,
-    };
     let rx = map.await_ready(cmd);
     let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(())) => CtlResponse::WatchReady {
+        Ok(Ok(Ok(()))) if map.mark_wait_observed(cmd) => CtlResponse::WatchReady {
             ready: true,
             reason: None,
         },
-        Ok(Err(_canceled)) => CtlResponse::WatchReady {
+        Ok(Ok(Ok(()))) => {
+            // A concurrent failure/teardown replaced the Ready state before
+            // the successful wait could become sticky. Do not tell the shell
+            // it had a proven capture boundary.
+            journal_watch_readiness_refusal(
+                index,
+                finalization_blocks,
+                cmd,
+                "ready state disappeared before acknowledgement",
+            );
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some("ready state disappeared before acknowledgement".to_string()),
+            }
+        }
+        Ok(Ok(Err(reason))) => CtlResponse::WatchReady {
             ready: false,
-            reason: Some("canceled".to_string()),
+            reason: Some(reason),
         },
-        Err(_) => CtlResponse::WatchReady {
-            ready: false,
-            reason: Some("timeout".to_string()),
-        },
+        Ok(Err(_canceled)) => {
+            journal_watch_readiness_refusal(index, finalization_blocks, cmd, "canceled");
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some("canceled".to_string()),
+            }
+        }
+        Err(_) => {
+            map.mark_failed(cmd, "timeout");
+            journal_watch_readiness_refusal(index, finalization_blocks, cmd, "timeout");
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some("timeout".to_string()),
+            }
+        }
+    }
+}
+
+fn journal_watch_readiness_refusal(
+    index: &Index,
+    finalization_blocks: &crate::server::FinalizationBlocks,
+    command: shit_planner::events::CommandId,
+    reason: &str,
+) {
+    let path = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+        .map(|record| record.cwd);
+    let detail = format!("capture watch was not ready before command execution: {reason}");
+    // Install the close gate before touching SQLite so PostExec cannot race a
+    // failed refusal write and expose this command as complete.
+    let block_token = finalization_blocks.insert(
+        command,
+        format!("watch-readiness refusal was not yet durable: {detail}"),
+    );
+    if let Err(e) = crate::helper_link::journal_helper_capture_refused(index, command, path, detail)
+    {
+        warn!(
+            err = %e,
+            session = %command.session,
+            command_seq = command.seq,
+            reason,
+            "watch-readiness CaptureRefused journal failed"
+        );
+    } else {
+        // Clear only the provisional readiness block. Another producer may
+        // have installed an independent close gate for this command while the
+        // SQLite write was in flight.
+        finalization_blocks.clear_token(command, block_token);
     }
 }
 
@@ -1480,7 +2094,10 @@ fn handle_undo(
             service_executor: shit_planner::executors::ServiceExecutor::new(PrivilegedSvcRunner),
             network_executor: shit_planner::executors::NetworkExecutor::new(PrivilegedNetRunner),
             container_executor: shit_planner::executors::ContainerExecutor::new(
-                DaemonContainerRunner { blob_store },
+                DaemonContainerRunner {
+                    blob_store,
+                    engine_lock: Default::default(),
+                },
             ),
             terraform_executor: shit_planner::executors::terraform::TerraformExecutor::new(
                 DaemonTerraformRunner,
@@ -1579,7 +2196,773 @@ fn handle_undo(
 #[cfg(test)]
 mod cmd_detail_helpers_tests {
     use super::*;
-    use shit_planner::events::CaptureEventKind;
+    use shit_planner::events::{CaptureEventKind, CommandId, CommandRecord};
+    use shit_planner::{PlannerStore, TimePoint};
+
+    fn readiness_fixture(seq: u64) -> (tempfile::TempDir, Index, CommandId) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path().join("db.sqlite")).unwrap();
+        let command = CommandId {
+            session: uuid::Uuid::from_u128(0x51_17),
+            seq,
+        };
+        index
+            .put_session(
+                command.session,
+                "bash",
+                1000,
+                Some("/dev/null"),
+                TimePoint::new(1, 1),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("touch evidence".into()),
+                cwd: "/tmp/readiness-cwd".into(),
+                pid: 1001,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(2, 2),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        (dir, index, command)
+    }
+
+    #[tokio::test]
+    async fn refuse_and_close_acks_only_after_refusal_and_durable_close() {
+        #[cfg(target_os = "macos")]
+        let socket_root = std::path::Path::new("/private/tmp").to_path_buf();
+        #[cfg(not(target_os = "macos"))]
+        let socket_root = std::env::temp_dir();
+        let dir = tempfile::Builder::new()
+            .prefix("shit-refuse-close-")
+            .tempdir_in(socket_root)
+            .unwrap();
+        let hook_path = dir.path().join("hook.sock");
+        let cfg = crate::config::Config {
+            hook_socket_path: Some(hook_path.clone()),
+            state_dir: Some(dir.path().join("state")),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let index = Arc::new(Index::open(dir.path().join("db.sqlite")).unwrap());
+        let command = CommandId {
+            session: uuid::Uuid::from_u128(0xc105e),
+            seq: 9,
+        };
+        index
+            .put_session(
+                command.session,
+                "bash",
+                500,
+                Some("/dev/null"),
+                TimePoint::new(1, 1),
+            )
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("printf x > important".into()),
+                cwd: "/tmp/refuse-close-cwd".into(),
+                pid: 500,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(2, 2),
+                ended_at: None,
+                exit_code: None,
+                event_ids: Vec::new(),
+            })
+            .unwrap();
+
+        let hook = tokio::net::UnixDatagram::bind(&hook_path).unwrap();
+        let receiver_index = Arc::clone(&index);
+        let receiver = tokio::spawn(async move {
+            let mut buf = vec![0_u8; shit_proto::MAX_FRAME_SIZE];
+            let len = hook.recv(&mut buf).await.unwrap();
+            let message: HookMessage = shit_proto::decode_frame(&buf[..len]).unwrap();
+            match message {
+                HookMessage::PostExec {
+                    session,
+                    seq,
+                    exit_code,
+                    ..
+                } => {
+                    assert_eq!(session, command.session);
+                    assert_eq!(seq, command.seq);
+                    assert_eq!(exit_code, 23);
+                    assert!(
+                        receiver_index
+                            .finish_command(command, TimePoint::new(3, 3), exit_code)
+                            .unwrap()
+                    );
+                }
+                other => panic!("expected recovery PostExec, got {other:?}"),
+            }
+        });
+
+        let blocks = crate::server::FinalizationBlocks::default();
+        blocks.insert(command, "older provisional capture failure".into());
+        let response = handle_refuse_and_close_command(
+            &cfg,
+            command.session,
+            command.seq,
+            23,
+            "post-command shell-state capture was not delivered".into(),
+            2_000,
+            index.as_ref(),
+            &blocks,
+        )
+        .await;
+        assert!(matches!(response, CtlResponse::RefuseAndCloseAck));
+        receiver.await.unwrap();
+        assert!(blocks.get(command).is_none());
+
+        let record = index.command_by_id(command).unwrap();
+        assert!(record.ended_at.is_some());
+        assert_eq!(record.exit_code, Some(23));
+        let events = index.events_for_command(command);
+        assert!(matches!(
+            events.as_slice(),
+            [shit_planner::CaptureEvent {
+                kind: CaptureEventKind::CaptureRefused { class, path, detail },
+                ..
+            }] if class == "capture-incomplete"
+                && path == &std::path::PathBuf::from("/tmp/refuse-close-cwd")
+                && detail.contains("post-command shell-state")
+        ));
+
+        // Once ended, retry is idempotent and does not append another refusal
+        // or require the hook receiver to still exist.
+        assert!(matches!(
+            handle_refuse_and_close_command(
+                &cfg,
+                command.session,
+                command.seq,
+                99,
+                "safe retry".into(),
+                2_000,
+                index.as_ref(),
+                &blocks,
+            )
+            .await,
+            CtlResponse::RefuseAndCloseAck
+        ));
+        assert_eq!(index.events_for_command(command).len(), 1);
+        assert_eq!(index.command_by_id(command).unwrap().exit_code, Some(23));
+    }
+
+    #[tokio::test]
+    async fn refuse_and_close_keeps_row_open_when_refusal_is_not_durable() {
+        let (dir, index, command) = readiness_fixture(10);
+        let cfg = crate::config::Config {
+            hook_socket_path: Some(dir.path().join("unused-hook.sock")),
+            state_dir: Some(dir.path().join("state")),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_lifecycle_refusal
+                 BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'injected refusal failure'); END;",
+            )
+            .unwrap();
+        let blocks = crate::server::FinalizationBlocks::default();
+
+        let response = handle_refuse_and_close_command(
+            &cfg,
+            command.session,
+            command.seq,
+            5,
+            "post-command capture failed".into(),
+            2_000,
+            &index,
+            &blocks,
+        )
+        .await;
+        assert!(matches!(response, CtlResponse::Error(_)));
+        assert!(blocks.get(command).is_some());
+        assert!(index.command_by_id(command).unwrap().ended_at.is_none());
+        assert!(index.events_for_command(command).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuse_and_close_retry_does_not_duplicate_a_durable_refusal() {
+        let (dir, index, command) = readiness_fixture(11);
+        let cfg = crate::config::Config {
+            hook_socket_path: Some(dir.path().join("missing-hook.sock")),
+            state_dir: Some(dir.path().join("state")),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        let blocks = crate::server::FinalizationBlocks::default();
+
+        for _ in 0..2 {
+            let response = handle_refuse_and_close_command(
+                &cfg,
+                command.session,
+                command.seq,
+                5,
+                "post-command capture failed".into(),
+                100,
+                &index,
+                &blocks,
+            )
+            .await;
+            assert!(matches!(response, CtlResponse::Error(_)));
+            assert!(index.command_by_id(command).unwrap().ended_at.is_none());
+        }
+        assert_eq!(index.events_for_command(command).len(), 1);
+    }
+
+    #[test]
+    fn failed_container_publication_is_replaced_by_durable_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path().join("db.sqlite")).unwrap();
+        let blobs = BlobStore::open(dir.path().join("blob-store")).unwrap();
+        let command = CommandId {
+            session: uuid::Uuid::now_v7(),
+            seq: 1,
+        };
+        let pid = 4242;
+        index
+            .put_session(command.session, "bash", pid, None, TimePoint::new(1, 1))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("docker rmi image".into()),
+                cwd: "/tmp".into(),
+                pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(2, 2),
+                ended_at: None,
+                exit_code: None,
+                event_ids: Vec::new(),
+            })
+            .unwrap();
+        let active = crate::active_commands::ActiveCommands::new();
+        assert!(active.insert(pid, command));
+        let finalization_blocks = crate::server::FinalizationBlocks::default();
+        let request = shit_proto::ContainerEventReq {
+            runtime: shit_proto::ContainerRuntimeWire::Docker,
+            verb: shit_proto::ContainerVerbWire::Rmi,
+            captured_config: Vec::new(),
+            stash_image: None,
+            stash_tarball: Some([0xAA; 32]),
+            stash_tarball_bytes: Some(b"bytes whose hash is not aa".to_vec()),
+            extras: std::collections::BTreeMap::from([("image".into(), "image".into())]),
+            pid,
+            uid: 0,
+        };
+
+        assert!(matches!(
+            handle_container_event(request, &active, &index, &blobs, &finalization_blocks,),
+            CtlResponse::Error(detail) if detail.contains("container capture failed")
+        ));
+        assert!(finalization_blocks.get(command).is_none());
+        assert!(matches!(
+            index.events_for_command(command).as_slice(),
+            [shit_planner::CaptureEvent {
+                kind: CaptureEventKind::CaptureRefused { class, .. },
+                ..
+            }] if class == "container-capture-failed"
+        ));
+
+        let blocked = CommandId {
+            session: command.session,
+            seq: 2,
+        };
+        index
+            .put_command(&CommandRecord {
+                command: blocked,
+                cmd_string: Some("docker rmi other".into()),
+                cwd: "/tmp".into(),
+                pid: pid + 1,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(3, 3),
+                ended_at: None,
+                exit_code: None,
+                event_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(active.insert(pid + 1, blocked));
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_container_refusal
+                 BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'injected event failure'); END;",
+            )
+            .unwrap();
+        let blocked_request = shit_proto::ContainerEventReq {
+            runtime: shit_proto::ContainerRuntimeWire::Docker,
+            verb: shit_proto::ContainerVerbWire::Rmi,
+            captured_config: Vec::new(),
+            stash_image: None,
+            stash_tarball: Some([0xBB; 32]),
+            stash_tarball_bytes: Some(b"another mismatched payload".to_vec()),
+            extras: std::collections::BTreeMap::from([("image".into(), "other".into())]),
+            pid: pid + 1,
+            uid: 0,
+        };
+        assert!(matches!(
+            handle_container_event(
+                blocked_request,
+                &active,
+                &index,
+                &blobs,
+                &finalization_blocks,
+            ),
+            CtlResponse::Error(_)
+        ));
+        assert!(finalization_blocks.get(blocked).is_some());
+        assert!(index.events_for_command(blocked).is_empty());
+    }
+
+    #[test]
+    fn container_prepare_error_owner_uses_exported_background_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path().join("db.sqlite")).unwrap();
+        let session = uuid::Uuid::now_v7();
+        let background = CommandId { session, seq: 1 };
+        let foreground = CommandId { session, seq: 2 };
+        let pid = std::process::id();
+        let active = crate::active_commands::ActiveCommands::new();
+        assert!(active.insert(pid, background));
+        assert!(active.insert(pid, foreground));
+
+        let request = shit_proto::ContainerBatchPrepareReq {
+            batch_id: uuid::Uuid::now_v7(),
+            events: vec![shit_proto::ContainerEventReq {
+                runtime: shit_proto::ContainerRuntimeWire::Docker,
+                verb: shit_proto::ContainerVerbWire::Rmi,
+                captured_config: Vec::new(),
+                stash_image: None,
+                stash_tarball: None,
+                stash_tarball_bytes: None,
+                extras: std::collections::BTreeMap::from([
+                    ("_shit_session".into(), background.session.to_string()),
+                    ("_shit_seq".into(), background.seq.to_string()),
+                ]),
+                pid,
+                // SAFETY: getuid has no failure mode on supported POSIX targets.
+                uid: unsafe { libc::getuid() },
+            }],
+        };
+
+        assert_eq!(
+            container_prepare_error_owner(&request, &active, &index),
+            Some(background),
+            "a background failure must not poison the newer stack-top command"
+        );
+
+        let mut malformed = request;
+        malformed.events[0]
+            .extras
+            .insert("_shit_seq".into(), "01".into());
+        assert_eq!(
+            container_prepare_error_owner(&malformed, &active, &index),
+            None,
+            "an unbound identity must not be guessed from the active stack"
+        );
+    }
+
+    #[test]
+    fn container_batch_ctl_prepare_confirms_and_finalize_acks_all_runtime_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path().join("db.sqlite")).unwrap();
+        let blobs = BlobStore::open(dir.path().join("blob-store")).unwrap();
+        let command = CommandId {
+            session: uuid::Uuid::now_v7(),
+            seq: 1,
+        };
+        let pid = std::process::id();
+        // SAFETY: getuid has no failure mode on supported POSIX targets.
+        let uid = unsafe { libc::getuid() };
+        index
+            .put_session(command.session, "bash", pid, None, TimePoint::new(1, 1))
+            .unwrap();
+        assert!(
+            index
+                .begin_command(&CommandRecord {
+                    command,
+                    cmd_string: Some("docker rmi --no-prune image".into()),
+                    cwd: dir.path().to_path_buf(),
+                    pid,
+                    shell_kind: shit_proto::ShellKind::Bash,
+                    started_at: TimePoint::new(2, 2),
+                    ended_at: None,
+                    exit_code: None,
+                    event_ids: Vec::new(),
+                })
+                .unwrap()
+        );
+        let active = crate::active_commands::ActiveCommands::new();
+        assert!(active.insert(pid, command));
+        let blocks = crate::server::FinalizationBlocks::default();
+        let event = |image: &str, bytes: &[u8]| shit_proto::ContainerEventReq {
+            runtime: shit_proto::ContainerRuntimeWire::Docker,
+            verb: shit_proto::ContainerVerbWire::Rmi,
+            captured_config: Vec::new(),
+            stash_image: None,
+            stash_tarball: Some(*blake3::hash(bytes).as_bytes()),
+            stash_tarball_bytes: Some(bytes.to_vec()),
+            extras: std::collections::BTreeMap::from([
+                ("image".into(), image.into()),
+                ("digest".into(), format!("sha256:{}", "b".repeat(64))),
+                ("no_prune".into(), "true".into()),
+                ("_shit_session".into(), command.session.to_string()),
+                ("_shit_seq".into(), command.seq.to_string()),
+                ("_shit_docker_context".into(), "default".into()),
+            ]),
+            pid,
+            uid,
+        };
+
+        let exit_zero_batch = uuid::Uuid::now_v7();
+        assert!(matches!(
+            handle_container_batch_prepare(
+                shit_proto::ContainerBatchPrepareReq {
+                    batch_id: exit_zero_batch,
+                    events: vec![event("uncertain:latest", b"uncertain image tar")],
+                },
+                &active,
+                &index,
+                &blobs,
+                &blocks,
+            ),
+            CtlResponse::ContainerBatchPrepared { batch_id }
+                if batch_id == exit_zero_batch
+        ));
+        assert_eq!(
+            index.container_batch_state(exit_zero_batch).unwrap(),
+            Some(shit_store::ContainerBatchState::Confirmed)
+        );
+        assert!(
+            index
+                .events_for_command(command)
+                .iter()
+                .all(|event| !event.partial),
+            "prepare ACK must not expose a partial member"
+        );
+        assert!(matches!(
+            handle_container_batch_prepare(
+                shit_proto::ContainerBatchPrepareReq {
+                    batch_id: exit_zero_batch,
+                    events: vec![event("different:latest", b"different request bytes")],
+                },
+                &active,
+                &index,
+                &blobs,
+                &blocks,
+            ),
+            CtlResponse::Error(_)
+        ));
+        assert_eq!(
+            index.container_batch_state(exit_zero_batch).unwrap(),
+            Some(shit_store::ContainerBatchState::Confirmed)
+        );
+        assert_eq!(
+            index.events_for_command(command).len(),
+            1,
+            "a bad retry cannot append a command-wide refusal to confirmed history"
+        );
+        assert!(matches!(
+            handle_container_batch_finalize(
+                shit_proto::ContainerBatchFinalizeReq {
+                    batch_id: exit_zero_batch,
+                    pid,
+                    uid,
+                    exit_code: 0,
+                    observations: vec![shit_proto::ContainerTargetObservationWire {
+                        ordinal: 0,
+                        state: shit_proto::ContainerTargetStateWire::Present,
+                        detail: None,
+                    }],
+                },
+                &index,
+            ),
+            CtlResponse::ContainerBatchFinalized { batch_id }
+                if batch_id == exit_zero_batch
+        ));
+        assert_eq!(
+            index.container_batch_state(exit_zero_batch).unwrap(),
+            Some(shit_store::ContainerBatchState::Finalized)
+        );
+        let finalized_at = index
+            .container_batch_info(exit_zero_batch)
+            .unwrap()
+            .unwrap()
+            .finalized_unix_secs;
+        assert!(finalized_at.is_some());
+        assert!(matches!(
+            handle_container_batch_finalize(
+                shit_proto::ContainerBatchFinalizeReq {
+                    batch_id: exit_zero_batch,
+                    pid,
+                    uid,
+                    exit_code: 0,
+                    observations: vec![shit_proto::ContainerTargetObservationWire {
+                        ordinal: 0,
+                        state: shit_proto::ContainerTargetStateWire::Present,
+                        detail: None,
+                    }],
+                },
+                &index,
+            ),
+            CtlResponse::ContainerBatchFinalized { batch_id }
+                if batch_id == exit_zero_batch
+        ));
+        assert_eq!(
+            index
+                .container_batch_info(exit_zero_batch)
+                .unwrap()
+                .unwrap()
+                .finalized_unix_secs,
+            finalized_at
+        );
+        assert!(matches!(
+            handle_container_batch_prepare(
+                shit_proto::ContainerBatchPrepareReq {
+                    batch_id: exit_zero_batch,
+                    events: vec![event("uncertain:latest", b"uncertain image tar")],
+                },
+                &active,
+                &index,
+                &blobs,
+                &blocks,
+            ),
+            CtlResponse::Error(detail) if detail.contains("consumed")
+        ));
+
+        let runtime_failure_batch = uuid::Uuid::now_v7();
+        assert!(matches!(
+            handle_container_batch_prepare(
+                shit_proto::ContainerBatchPrepareReq {
+                    batch_id: runtime_failure_batch,
+                    events: vec![event("failed:latest", b"failed image tar")],
+                },
+                &active,
+                &index,
+                &blobs,
+                &blocks,
+            ),
+            CtlResponse::ContainerBatchPrepared { batch_id }
+                if batch_id == runtime_failure_batch
+        ));
+        assert!(matches!(
+            handle_container_batch_finalize(
+                shit_proto::ContainerBatchFinalizeReq {
+                    batch_id: runtime_failure_batch,
+                    pid,
+                    uid,
+                    exit_code: 42,
+                    observations: vec![shit_proto::ContainerTargetObservationWire {
+                        ordinal: 0,
+                        state: shit_proto::ContainerTargetStateWire::ProbeFailed,
+                        detail: Some("runtime exited before a trustworthy probe".into()),
+                    }],
+                },
+                &index,
+            ),
+            CtlResponse::ContainerBatchFinalized { batch_id }
+                if batch_id == runtime_failure_batch
+        ));
+        assert_eq!(
+            index.container_batch_state(runtime_failure_batch).unwrap(),
+            Some(shit_store::ContainerBatchState::Finalized)
+        );
+        assert!(
+            index
+                .events_for_command(command)
+                .iter()
+                .all(|event| !event.partial)
+        );
+        assert!(blocks.get(command).is_none());
+    }
+
+    #[test]
+    fn prepared_authorization_failure_is_terminally_refused_before_error() {
+        let (_dir, index, command) = readiness_fixture(77);
+        let batch_id = uuid::Uuid::now_v7();
+        let event = shit_planner::CaptureEvent {
+            id: shit_planner::EventId(0),
+            command,
+            ts: TimePoint::new(3, 3),
+            partial: true,
+            kind: CaptureEventKind::ContainerOp {
+                runtime: shit_planner::ContainerRuntime::Docker,
+                op: shit_planner::ContainerOp::Rmi {
+                    image: "prepared:latest".into(),
+                    digest: Some(format!("sha256:{}", "c".repeat(64))),
+                },
+                captured_config: Vec::new(),
+                stash_image: None,
+                stash_tarball: None,
+            },
+        };
+        assert_eq!(
+            index
+                .prepare_container_batch(batch_id, [0x44; 32], &[event])
+                .unwrap()
+                .state,
+            shit_store::ContainerBatchState::Prepared
+        );
+        let blocks = crate::server::FinalizationBlocks::default();
+
+        assert!(matches!(
+            container_batch_prepare_error(
+                batch_id,
+                Some(command),
+                "injected pre-authorization failure".into(),
+                &index,
+                &blocks,
+            ),
+            CtlResponse::Error(_)
+        ));
+        assert_eq!(
+            index.container_batch_state(batch_id).unwrap(),
+            Some(shit_store::ContainerBatchState::Refused)
+        );
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events
+                .iter()
+                .find(|event| event.partial)
+                .map(|event| &event.kind),
+            Some(CaptureEventKind::ContainerOp { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, CaptureEventKind::CaptureRefused { .. }))
+        );
+        assert!(blocks.get(command).is_none());
+    }
+
+    #[tokio::test]
+    async fn no_helper_readiness_is_a_durable_command_refusal() {
+        let (_dir, index, command) = readiness_fixture(41);
+        let blocks = crate::server::FinalizationBlocks::default();
+        let response =
+            handle_wait_watch_ready(command.session, command.seq, 10, None, &index, &blocks).await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some(reason),
+            } if reason == "no helper"
+        ));
+        let events = index.events_for_command(command);
+        assert!(matches!(
+            &events[..],
+            [shit_planner::CaptureEvent {
+                kind: CaptureEventKind::CaptureRefused { path, detail, .. },
+                ..
+            }] if path == Path::new("/tmp/readiness-cwd")
+                && detail.contains("no helper")
+        ));
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_is_a_durable_command_refusal() {
+        let (_dir, index, command) = readiness_fixture(42);
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let blocks = crate::server::FinalizationBlocks::default();
+        let response =
+            handle_wait_watch_ready(command.session, command.seq, 0, Some(&map), &index, &blocks)
+                .await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some(reason),
+            } if reason == "timeout"
+        ));
+        assert!(index.events_for_command(command).iter().any(|event| {
+            matches!(
+                &event.kind,
+                CaptureEventKind::CaptureRefused { detail, .. }
+                    if detail.contains("timeout")
+            )
+        }));
+        assert!(!map.wait_was_observed(command));
+        assert!(!map.mark_ready(command));
+        assert!(!map.wait_was_observed(command));
+    }
+
+    #[tokio::test]
+    async fn ready_watch_does_not_add_a_refusal() {
+        let (_dir, index, command) = readiness_fixture(43);
+        let map = crate::watch_ready::WatchReadyMap::new();
+        map.mark_ready(command);
+        let blocks = crate::server::FinalizationBlocks::default();
+        let response = handle_wait_watch_ready(
+            command.session,
+            command.seq,
+            10,
+            Some(&map),
+            &index,
+            &blocks,
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: true,
+                reason: None,
+            }
+        ));
+        assert!(map.wait_was_observed(command));
+        assert!(index.events_for_command(command).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_readiness_refusal_blocks_command_finalization() {
+        let (_dir, index, command) = readiness_fixture(44);
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_readiness_refusal
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'CaptureRefused'
+                 BEGIN SELECT RAISE(FAIL, 'injected readiness refusal failure'); END;",
+            )
+            .unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let blocks = crate::server::FinalizationBlocks::default();
+
+        let response =
+            handle_wait_watch_ready(command.session, command.seq, 0, Some(&map), &index, &blocks)
+                .await;
+
+        assert!(matches!(
+            response,
+            CtlResponse::WatchReady {
+                ready: false,
+                reason: Some(reason),
+            } if reason == "timeout"
+        ));
+        assert!(blocks.get(command).is_some());
+        assert!(index.events_for_command(command).is_empty());
+    }
 
     #[test]
     fn time_point_round_trips_under_i64_max() {

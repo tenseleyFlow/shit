@@ -317,6 +317,169 @@ fn metrics_request_postcard_roundtrip() {
 }
 
 #[test]
+fn wall_gc_request_and_report_roundtrip_without_changing_legacy_shapes() {
+    use shit_proto::{CtlRequest, CtlResponse, GcWallReport, GcWallRequest};
+
+    let request = CtlRequest::GcWall(GcWallRequest {
+        dry_run: false,
+        aggressive: true,
+        size_cap_bytes: Some(1024),
+        age_cap_secs: Some(3600),
+    });
+    let request_frame = encode_frame(&request).unwrap();
+    assert!(matches!(
+        decode_frame(&request_frame).unwrap(),
+        CtlRequest::GcWall(GcWallRequest {
+            age_cap_secs: Some(3600),
+            ..
+        })
+    ));
+
+    let response = CtlResponse::GcWallReport(GcWallReport {
+        dry_run: false,
+        aggressive_mode_used: true,
+        age_expiry_suppressed: true,
+        commands_dropped: 2,
+        events_dropped: 3,
+        blobs_swept: 4,
+        bytes_reclaimed: 5,
+        paths_compacted: 6,
+        vacuumed: false,
+        duration_ms: 7,
+    });
+    let response_frame = encode_frame(&response).unwrap();
+    assert!(matches!(
+        decode_frame(&response_frame).unwrap(),
+        CtlResponse::GcWallReport(GcWallReport {
+            age_expiry_suppressed: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn refuse_and_close_request_and_ack_roundtrip() {
+    use shit_proto::{CtlRequest, CtlResponse};
+
+    let session = Uuid::from_u128(0xfeed_face_dead_beef_0123_4567_89ab_cdef);
+    let request = CtlRequest::RefuseAndCloseCommand {
+        session,
+        command_seq: 44,
+        exit_code: 7,
+        detail: "post-command shell-state capture was not delivered".into(),
+        timeout_ms: 7_500,
+    };
+    let frame = encode_frame(&request).unwrap();
+    match decode_frame(&frame).unwrap() {
+        CtlRequest::RefuseAndCloseCommand {
+            session: decoded_session,
+            command_seq,
+            exit_code,
+            detail,
+            timeout_ms,
+        } => {
+            assert_eq!(decoded_session, session);
+            assert_eq!(command_seq, 44);
+            assert_eq!(exit_code, 7);
+            assert_eq!(detail, "post-command shell-state capture was not delivered");
+            assert_eq!(timeout_ms, 7_500);
+        }
+        other => panic!("expected RefuseAndCloseCommand, got {other:?}"),
+    }
+
+    let ack_frame = encode_frame(&CtlResponse::RefuseAndCloseAck).unwrap();
+    assert!(matches!(
+        decode_frame(&ack_frame).unwrap(),
+        CtlResponse::RefuseAndCloseAck
+    ));
+}
+
+#[test]
+fn container_batch_prepare_and_finalize_roundtrip() {
+    use shit_proto::{
+        ContainerBatchFinalizeReq, ContainerBatchPrepareReq, ContainerEventReq,
+        ContainerRuntimeWire, ContainerTargetObservationWire, ContainerTargetStateWire,
+        ContainerVerbWire, CtlRequest, CtlResponse,
+    };
+    use std::collections::BTreeMap;
+
+    let batch_id = Uuid::from_u128(0xa11c_e001_dead_beef_0123_4567_89ab_cdef);
+    let prepare = CtlRequest::ContainerBatchPrepare(ContainerBatchPrepareReq {
+        batch_id,
+        events: vec![ContainerEventReq {
+            runtime: ContainerRuntimeWire::Docker,
+            verb: ContainerVerbWire::Rmi,
+            captured_config: br#"{"Id":"sha256:abc"}"#.to_vec(),
+            stash_image: None,
+            stash_tarball: Some([0xAB; 32]),
+            stash_tarball_bytes: None,
+            extras: BTreeMap::from([("image".into(), "example:latest".into())]),
+            pid: 4242,
+            uid: 1000,
+        }],
+    });
+    let frame = encode_frame(&prepare).unwrap();
+    match decode_frame(&frame).unwrap() {
+        CtlRequest::ContainerBatchPrepare(req) => {
+            assert_eq!(req.batch_id, batch_id);
+            assert_eq!(req.events.len(), 1);
+            assert!(matches!(req.events[0].verb, ContainerVerbWire::Rmi));
+        }
+        other => panic!("expected ContainerBatchPrepare, got {other:?}"),
+    }
+
+    let finalize = CtlRequest::ContainerBatchFinalize(ContainerBatchFinalizeReq {
+        batch_id,
+        pid: 4242,
+        uid: 1000,
+        exit_code: 0,
+        observations: vec![
+            ContainerTargetObservationWire {
+                ordinal: 0,
+                state: ContainerTargetStateWire::Absent,
+                detail: None,
+            },
+            ContainerTargetObservationWire {
+                ordinal: 1,
+                state: ContainerTargetStateWire::ProbeFailed,
+                detail: Some("runtime socket disappeared".into()),
+            },
+        ],
+    });
+    let frame = encode_frame(&finalize).unwrap();
+    match decode_frame(&frame).unwrap() {
+        CtlRequest::ContainerBatchFinalize(req) => {
+            assert_eq!(req.batch_id, batch_id);
+            assert_eq!(req.exit_code, 0);
+            assert_eq!(req.observations.len(), 2);
+            assert_eq!(
+                req.observations[1].state,
+                ContainerTargetStateWire::ProbeFailed
+            );
+            assert_eq!(
+                req.observations[1].detail.as_deref(),
+                Some("runtime socket disappeared")
+            );
+        }
+        other => panic!("expected ContainerBatchFinalize, got {other:?}"),
+    }
+
+    for response in [
+        CtlResponse::ContainerBatchPrepared { batch_id },
+        CtlResponse::ContainerBatchFinalized { batch_id },
+    ] {
+        let frame = encode_frame(&response).unwrap();
+        match decode_frame(&frame).unwrap() {
+            CtlResponse::ContainerBatchPrepared { batch_id: decoded }
+            | CtlResponse::ContainerBatchFinalized { batch_id: decoded } => {
+                assert_eq!(decoded, batch_id);
+            }
+            other => panic!("expected container batch ack, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn db_event_req_postcard_roundtrip() {
     use shit_proto::{CtlRequest, DbConnInfo, DbEngineWire, DbEventReq, DbTxStateWire, PkgPhase};
     use std::collections::BTreeMap;

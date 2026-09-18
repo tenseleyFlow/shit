@@ -22,7 +22,7 @@
 #   (/opt/homebrew/bin/python3 on arm64, /usr/local/bin on x86).
 #
 # Per-run isolation: unique package name + $HOME pointed at the
-# smoke tmpdir so ~/.local is per-run.
+# smoke tmpdir so the macOS Python user base is per-run.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -142,6 +142,10 @@ INSTALLED_MOD="${PY_USER_SITE}/${MOD_NAME}.py"
 [ -f "${INSTALLED_MOD}" ] || smoke_fail "module file not found at ${INSTALLED_MOD}"
 V1_SHA="$(sha256_of "${INSTALLED_MOD}")"
 smoke_log "pre-state: v1 module at ${INSTALLED_MOD}, sha=${V1_SHA:0:16}..."
+# The shim compares canonical mutation paths. Darwin presents TMPDIR as
+# /var/folders while canonicalization resolves it through /private/var/folders,
+# so pass the canonical user base just like `shit install`/auto-inject do.
+PY_USER_BASE_REAL="$(cd "${PY_USER_BASE}" && pwd -P)"
 
 # v2 source + version bump.
 cat > "${PKG_DIR}/${MOD_NAME}.py" <<'EOF'
@@ -171,8 +175,12 @@ sleep 0.7
 # THE workload. DYLD_INSERT the shim. pip's wheel installer does
 # the same rename-into-place pattern as on Linux; same shim
 # interposers fire.
-smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} pip install ${PIP_FLAGS} --force-reinstall --no-cache-dir (v2)"
-( cd "${PKG_DIR}" && DYLD_INSERT_LIBRARIES="${SHIM_LIB}" ${PIP_BIN} install ${PIP_FLAGS} --force-reinstall --no-cache-dir . ) \
+smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} SHIT_INSTALL_PREFIXES=${PY_USER_BASE_REAL} pip install ${PIP_FLAGS} --force-reinstall --no-cache-dir (v2)"
+( cd "${PKG_DIR}" && \
+    DYLD_INSERT_LIBRARIES="${SHIM_LIB}" \
+    SHIT_PRELOAD_ACTIVE=1 \
+    SHIT_INSTALL_PREFIXES="${PY_USER_BASE_REAL}" \
+    ${PIP_BIN} install ${PIP_FLAGS} --force-reinstall --no-cache-dir . ) \
     >"${SHIT_SMOKE_TMP}/pip-v2.log" 2>&1
 PIP_RC=$?
 if [ "${PIP_RC}" -ne 0 ]; then
@@ -212,13 +220,25 @@ smoke_log "shim notifications observed by daemon: ${SHIM_HITS}"
 N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 smoke_log "journal events: ${N_EVENTS}"
 
-smoke_log "running: shit undo --yes"
+# Invoke undo from a fresh directory unrelated to the captured command. Shim
+# paths must already be absolute; a relative journal entry would otherwise be
+# replayed here and could create/unlink an unrelated cwd entry.
+UNDO_CWD="${SHIT_SMOKE_TMP}/undo-cwd"
+mkdir -p "${UNDO_CWD}"
+smoke_log "running from empty sentinel cwd ${UNDO_CWD}: shit undo --yes"
 set +e
-"${SHIT_BIN}" undo --yes > "${SHIT_SMOKE_TMP}/undo.log" 2>&1
+( cd "${UNDO_CWD}" && "${SHIT_BIN}" undo --yes ) > "${SHIT_SMOKE_TMP}/undo.log" 2>&1
 UNDO_RC=$?
 set -e
 smoke_log "shit undo --yes exit=${UNDO_RC}"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+
+if find "${UNDO_CWD}" ! -path "${UNDO_CWD}" -print -quit | grep -q .; then
+    smoke_log "unsafe cwd artifacts created by undo:"
+    find "${UNDO_CWD}" ! -path "${UNDO_CWD}" -print | sed 's/^/    /' >&2
+    smoke_fail "undo replayed a captured relative path in its caller cwd"
+fi
+smoke_log "undo caller cwd remained empty ✓"
 
 if [ ! -x "${INSTALLED_BIN}" ]; then
     smoke_log "undo log:"
@@ -236,24 +256,23 @@ POST_SHA="$(sha256_of "${INSTALLED_MOD}")"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-# Outcome A — full undo (v1 module restored byte-identical)
+# Outcome A — the user-visible install target was restored byte-identical.
+# Pip may already have removed its own ephemeral build/cache paths before undo;
+# conflicts or explicit capture refusals for those paths are acceptable, but an
+# otherwise unexplained non-zero executor exit is not.
 if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; then
-    smoke_log "OUTCOME A — full undo (module restored to v1 byte-identical, output='${POST_OUTPUT}', shim hits=${SHIM_HITS})"
+    if [ "${UNDO_RC}" -ne 0 ] \
+        && ! grep -qE "out-of-scope|outside|refus|conflict" "${SHIT_SMOKE_TMP}/undo.log"; then
+        smoke_fail "target restored, but undo failed without a documented conflict/refusal"
+    fi
+    smoke_log "OUTCOME A — target restored to v1 byte-identical (undo exit=${UNDO_RC}, output='${POST_OUTPUT}', shim hits=${SHIM_HITS})"
     smoke_log "PASS: pip-install-user-undo-macos (Outcome A)"
     exit 0
 fi
 
-# Outcome B — loud refusal acceptable (see Linux smoke's rationale
-# about pip's transactional rename hitting conflict reports).
-if [ "${UNDO_RC}" -ne 0 ] \
-    && grep -qE "out-of-scope|outside|refus|conflict|${PKG_NAME}" "${SHIT_SMOKE_TMP}/undo.log"; then
-    smoke_log "OUTCOME B — loud refusal (undo non-zero, log named conflict/out-of-scope)"
-    smoke_log "PASS: pip-install-user-undo-macos (Outcome B)"
-    exit 0
-fi
-
-# Outcome C — partial / wrong restore
-smoke_log "OUTCOME C — partial / wrong restore"
+# The strict lane never treats a generic refusal/conflict as success when the
+# requested v1 install state was not actually restored.
+smoke_log "FAILURE — target was not restored"
 smoke_log "  undo exit:    ${UNDO_RC}"
 smoke_log "  output now:   '${POST_OUTPUT}' (expected 'hello pip v1')"
 smoke_log "  sha now:      ${POST_SHA:0:16}..."
@@ -261,4 +280,4 @@ smoke_log "  sha v1:       ${V1_SHA:0:16}..."
 smoke_log "  sha v2:       ${V2_SHA:0:16}..."
 smoke_log "  shim hits:    ${SHIM_HITS}"
 smoke_log "  journal evts: ${N_EVENTS}"
-smoke_fail "pip install --user overwrite undo didn't restore v1 (outcome C)"
+smoke_fail "pip install --user overwrite undo didn't restore v1"

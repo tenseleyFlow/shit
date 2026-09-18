@@ -12,6 +12,7 @@
 
 pub mod aws;
 pub mod container;
+pub mod container_lock;
 pub mod db;
 pub mod descriptor;
 pub mod env;
@@ -28,6 +29,9 @@ pub mod xattr;
 
 pub use aws::{AwsExecutor, AwsRunner, SystemAwsRunner};
 pub use container::{ContainerExecutor, ContainerRunner, SystemContainerRunner};
+pub use container_lock::{
+    ContainerEngineLockGuard, CooperativeContainerLockState, NoopContainerEngineLockGuard,
+};
 pub use db::{
     DbExecOutcome, DbExecutor, DbSuggestion, DbSuggestionSink, VecDbSuggestionSink,
     decide as db_decide,

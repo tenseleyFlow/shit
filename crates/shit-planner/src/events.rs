@@ -50,9 +50,9 @@ pub struct CaptureEvent {
     pub command: CommandId,
     pub ts: TimePoint,
     /// `true` when the capture was incomplete (e.g., source mutated mid-copy,
-    /// or we got a post-hoc event without a pre-image). The planner treats
-    /// partial events as informational and refuses to emit content-restore
-    /// inverses for them.
+    /// or we got a post-hoc event without a pre-image). Both undo and forward
+    /// planners treat one partial event as command-wide incomplete capture and
+    /// emit only a refusal; they never combine partial and actionable ops.
     pub partial: bool,
     pub kind: CaptureEventKind,
 }
@@ -118,6 +118,20 @@ pub enum FilePreImageSource {
     /// capture alone.
     #[default]
     Other,
+    /// The captured metadata came from a `chflags` / `fchflags`
+    /// interposer before the syscall ran. The inline bytes are an
+    /// implementation detail of the shim wire; the planner must emit
+    /// only a flags restore for this source, not content or broad
+    /// metadata restores.
+    ///
+    /// Keep new variants appended: postcard encodes enum discriminants
+    /// positionally and persisted journals may contain older values.
+    ShimFlagsPreMutation,
+    /// A path-based metadata/xattr interposer captured the pre-mutation stat
+    /// and xattr target. Inline bytes are only a wire/storage implementation
+    /// detail; planning must restore metadata without replacing file content
+    /// or breaking hardlinks.
+    ShimMetadataPreMutation,
 }
 
 impl FilePreImageSource {
@@ -466,6 +480,18 @@ pub enum TreeOp {
     SymlinkRemoved {
         target: String, // the OLD symlink's target
         path: PathBuf,  // path of the symlink that was replaced
+    },
+    /// Identity-bearing replacement for `SymlinkRemoved`.
+    ///
+    /// Kept as an appended variant so existing postcard journals retain
+    /// their enum discriminants.  New capture paths must use this shape: the
+    /// `(dev, inode)` pair is what lets the planner prove that a generic
+    /// symlink `Unlink` and a target-bearing observation describe the same
+    /// removed directory entry rather than two removals at the same path.
+    SymlinkRemovedIdentified {
+        inode: InodeRef,
+        target: String,
+        path: PathBuf,
     },
 }
 

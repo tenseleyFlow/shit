@@ -97,6 +97,32 @@ struct shit_event_hdr {
  * extra byte so a NUL-terminated basename always fits. */
 #define SHIT_NAME_MAX 255
 
+/* Every BPF object that includes this header gets a private, one-element
+ * loss counter.  The LSM programs deliberately allow the syscall when their
+ * ring buffer is full, but a failed reserve must not be invisible: userspace
+ * polls this map and marks every command active at the time of observation as
+ * non-undoable.
+ *
+ * This is an ARRAY rather than a ring-buffer "loss event" because a full
+ * ringbuf could not carry that event either.  Atomic add is required because
+ * the same hook can run concurrently on several CPUs.  Unsigned wrap is part
+ * of the ABI; userspace computes deltas with wrapping subtraction. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} ringbuf_loss_count SEC(".maps");
+
+static __always_inline void shit_note_ringbuf_loss(void)
+{
+    __u32 key = 0;
+    __u64 *count = bpf_map_lookup_elem(&ringbuf_loss_count, &key);
+    if (count) {
+        __sync_fetch_and_add(count, 1);
+    }
+}
+
 /* lsm/inode_unlink — `rm`-style deletes. dev/inode identify the
  * about-to-be-unlinked file; (parent_inode, name) are captured so
  * userspace can race-to-open `/proc/<pid>/cwd/<name>` (or any other

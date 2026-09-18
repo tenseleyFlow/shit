@@ -13,6 +13,11 @@ fn shitd_bin() -> &'static str {
 #[test]
 fn idle_timeout_causes_exit() {
     let tmp = tempfile::tempdir().unwrap();
+    let config_home = tmp.path().join("config");
+    let wrapper_bin = config_home.join("shit/bin");
+    std::fs::create_dir_all(&wrapper_bin).unwrap();
+    let stale_wrapper = wrapper_bin.join("docker");
+    std::fs::write(&stale_wrapper, "#!/bin/sh\n# old fail-open wrapper\n").unwrap();
     let cfg = tmp.path().join("config.toml");
     let sock = tmp.path().join("test.sock");
     let ctl = tmp.path().join("test-ctl.sock");
@@ -41,6 +46,7 @@ log_level = "warn"
     let status = Command::new(shitd_bin())
         .args(["--config"])
         .arg(&cfg)
+        .env("XDG_CONFIG_HOME", &config_home)
         // S24.A: idle-exit test doesn't need the helper tier.
         .env("SHIT_HELPER_DISABLED", "1")
         .status()
@@ -48,6 +54,11 @@ log_level = "warn"
     let elapsed = start.elapsed();
 
     assert!(status.success(), "shitd exit status: {status:?}");
+    assert_eq!(
+        std::fs::read(&stale_wrapper).unwrap(),
+        shit_shell::container_wrappers::DOCKER_WRAPPER.as_bytes(),
+        "daemon startup must refresh an opted-in stale wrapper"
+    );
     assert!(
         elapsed >= Duration::from_secs(1),
         "exited too fast: {elapsed:?}"

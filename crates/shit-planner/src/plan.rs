@@ -18,18 +18,101 @@
 //!   tier recorded `post_content_hash` and the current file content differs,
 //!   we emit `Conflict::Hard` rather than silently overwrite the user's
 //!   later edits.
-//! - Partial events are dropped with a warning; the rest of the plan still
-//!   produces actionable output.
+//! - A partial event or structured `CaptureRefused` event short-circuits the
+//!   whole command to refusal-only output. A knowingly incomplete capture
+//!   must never produce a partial undo.
 
-use crate::events::{CaptureEvent, CaptureEventKind, CommandRecord, PackageManager, TreeOp};
+use crate::events::{
+    CaptureEvent, CaptureEventKind, CommandRecord, FilePreImageSource, PackageManager, TreeOp,
+};
 use crate::inode::InodeRef;
 use crate::inverse::{
     Conflict, ContainerOp, InverseOp, NativeDelegation, PlanNode, PlanWarning, UndoPlan,
 };
 use crate::probe::StateProbe;
 use crate::store::PlannerStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Build the command-atomic refusal used by both undo and forward planning
+/// when at least one persisted event is marked partial.
+///
+/// A single synthetic node keeps output deterministic regardless of event
+/// arrival order. `PartialEvents::dropped` is retained for wire compatibility
+/// and records how many non-authoritative observations were excluded.
+pub(crate) fn partial_capture_refusal_plan(
+    command: CommandRecord,
+    events: &[CaptureEvent],
+) -> UndoPlan {
+    let partial_count = events.iter().filter(|event| event.partial).count();
+    debug_assert!(partial_count > 0);
+
+    let mut warnings = vec![PlanWarning::PartialEvents {
+        dropped: partial_count,
+    }];
+    if command.ended_at.is_none() {
+        warnings.push(PlanWarning::UnclosedCommand);
+    }
+
+    UndoPlan {
+        command,
+        nodes: vec![PlanNode {
+            op: InverseOp::Refuse {
+                class: "capture-incomplete".to_string(),
+                reason: format!(
+                    "capture incomplete: {partial_count} event(s) were marked partial; \
+                     refusing command-wide planning"
+                ),
+                remediation: None,
+            },
+            cohort: 0,
+            conflict: None,
+        }],
+        warnings,
+    }
+}
+
+/// Return a command-atomic refusal plan for persisted capture failures.
+/// Refusal events are already durable proof that at least one mutation could
+/// not be represented safely, so neither undo nor redo may execute the other
+/// half of the command beside them.
+pub(crate) fn capture_refusal_plan(
+    command: CommandRecord,
+    events: &[CaptureEvent],
+) -> Option<UndoPlan> {
+    let nodes: Vec<PlanNode> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            CaptureEventKind::CaptureRefused {
+                class,
+                path,
+                detail,
+            } => Some(PlanNode {
+                op: InverseOp::Refuse {
+                    class: class.clone(),
+                    reason: format!("capture incomplete for {}: {}", path.display(), detail),
+                    remediation: capture_refusal_remediation(detail),
+                },
+                cohort: 0,
+                conflict: None,
+            }),
+            _ => None,
+        })
+        .collect();
+    if nodes.is_empty() {
+        return None;
+    }
+
+    let mut warnings = Vec::new();
+    if command.ended_at.is_none() {
+        warnings.push(PlanWarning::UnclosedCommand);
+    }
+    Some(UndoPlan {
+        command,
+        nodes,
+        warnings,
+    })
+}
 
 pub fn plan(
     command: CommandRecord,
@@ -64,21 +147,31 @@ pub fn plan(
         };
     }
 
+    // A partial row is durable evidence that capture could not establish a
+    // complete pre-command state. Never combine inverses from authoritative
+    // rows with that incomplete observation: doing so would report success
+    // after synthesizing only part of the command's pre-state.
+    if events.iter().any(|event| event.partial) {
+        return partial_capture_refusal_plan(command, events);
+    }
+
+    // A refusal is evidence that at least one successful mutation in this
+    // command could not be captured safely. Applying the inverses for its
+    // other events would leave the user in a synthesized half-state, so make
+    // the refusal command-atomic just like the static refuse catalog above.
+    // Retain every refusal for diagnostics, but emit no actionable nodes.
+    if let Some(refusal) = capture_refusal_plan(command.clone(), events) {
+        return refusal;
+    }
+
     let mut nodes = Vec::new();
     let mut warnings = Vec::new();
-
-    let partial_count = events.iter().filter(|e| e.partial).count();
-    if partial_count > 0 {
-        warnings.push(PlanWarning::PartialEvents {
-            dropped: partial_count,
-        });
-    }
 
     if command.ended_at.is_none() {
         warnings.push(PlanWarning::UnclosedCommand);
     }
 
-    let mut live: Vec<&CaptureEvent> = events.iter().filter(|e| !e.partial).collect();
+    let mut live: Vec<&CaptureEvent> = events.iter().collect();
     // Reverse-chronological: latest events first.
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.id)));
 
@@ -101,7 +194,66 @@ pub fn plan(
     //      Skip all three inverses entirely.
     let class = classify_replace_paths(&live, probe);
 
+    // A target-less symlink Unlink is not executable.  If it could not be
+    // paired by inode identity and namespace generation with a richer
+    // target-bearing observation, fail the whole command closed.  Returning
+    // only refusals is essential: mixing a guessed partial undo with the
+    // refusal would still synthesize a half-state when applied.
+    if !class.unmatched_symlink_unlinks.is_empty() {
+        let nodes = class
+            .unmatched_symlink_unlinks
+            .iter()
+            .filter_map(|event_id| {
+                live.iter().find_map(|event| {
+                    if &event.id != event_id {
+                        return None;
+                    }
+                    let CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }) = &event.kind else {
+                        return None;
+                    };
+                    Some(PlanNode {
+                        op: InverseOp::Refuse {
+                            class: "capture-incomplete".to_string(),
+                            reason: format!(
+                                "capture incomplete for {}: removed symlink target could not be correlated by inode identity",
+                                path.display()
+                            ),
+                            remediation: None,
+                        },
+                        cohort: 0,
+                        conflict: None,
+                    })
+                })
+            })
+            .collect();
+        return UndoPlan {
+            command,
+            nodes,
+            warnings,
+        };
+    }
+
     for ev in &live {
+        // Linux uses independent ring readers for mkdir and rmdir, so
+        // daemon arrival order is not syscall order. Exact identity pairs
+        // are transient regardless of arrival order; only the paired event
+        // IDs are skipped so repeated unmatched operations remain visible.
+        if class.exact_transient_events.contains(&ev.id) {
+            continue;
+        }
+        // Multiple producers may report the same pre-image. Keep exactly
+        // one canonical event, preferring a release-time observation with a
+        // post hash even if an open-time event arrived later.
+        if class.superseded_file_preimages.contains(&ev.id) {
+            continue;
+        }
+        // A target-bearing SymlinkRemoved is strictly richer than the
+        // helper's generic Unlink(kind=Symlink) for the same removal. The
+        // classifier pairs them by multiplicity and marks only the redundant
+        // generic event, so arrival order cannot select the lossy inverse.
+        if class.superseded_symlink_unlinks.contains(&ev.id) {
+            continue;
+        }
         // W01.B.fix-rename-coalescing: skip the entire event if the
         // path is transient (Create+PreImage+Unlink AND gone at undo).
         if let Some(p) = event_path(ev)
@@ -119,6 +271,7 @@ pub fn plan(
         // to bar.
         if let Some(p) = event_path(ev)
             && class.hardlink_live_paths.contains(p)
+            && !is_shim_inode_metadata_event(ev)
         {
             continue;
         }
@@ -135,6 +288,21 @@ pub fn plan(
         command,
         nodes,
         warnings,
+    }
+}
+
+/// Metadata mutations apply to an inode, not one directory entry. A kqueue
+/// unlink can mark a surviving hardlink alias as noise, but an explicit shim
+/// snapshot on that alias remains a real mutation and must survive the
+/// hardlink-live event filter.
+fn is_shim_inode_metadata_event(ev: &CaptureEvent) -> bool {
+    match &ev.kind {
+        CaptureEventKind::FilePreImage { source, .. } => matches!(
+            source,
+            FilePreImageSource::ShimFlagsPreMutation | FilePreImageSource::ShimMetadataPreMutation
+        ),
+        CaptureEventKind::MetadataChange { before, after, .. } => before.only_flags_changed(after),
+        _ => false,
     }
 }
 
@@ -172,11 +340,203 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Generic symlink-unlink events paired with richer `SymlinkRemoved`
+    /// events for the same `(inode, path, namespace generation)`.
+    superseded_symlink_unlinks: HashSet<crate::events::EventId>,
+    /// Target-less symlink unlinks for which no identity-bearing rich event
+    /// exists in the same namespace generation.  These make the command
+    /// refusal-only; path/count pairing is deliberately forbidden.
+    unmatched_symlink_unlinks: HashSet<crate::events::EventId>,
+    /// Exact `(dev,inode,path)` directory Create/Unlink pairs. This is
+    /// event-ID based (not path based) so independent Linux ring-reader
+    /// arrival order cannot change the result or consume an unrelated
+    /// repeated operation at the same pathname.
+    exact_transient_events: HashSet<crate::events::EventId>,
+    /// Duplicate FilePreImage observations superseded by a canonical event.
+    /// Canonical selection always prefers an event carrying a post hash.
+    superseded_file_preimages: HashSet<crate::events::EventId>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
+    // Resolve the lossy-vs-rich symlink deletion pair before feeding events
+    // into any other shape classifier. Otherwise a superseded generic Unlink
+    // could make Create+SymlinkRemoved look like a transient scratch path and
+    // suppress the target-bearing restore along with the duplicate.
+    type SymlinkIdentity = (InodeRef, PathBuf);
+    type SymlinkGeneration = (InodeRef, PathBuf, u64);
+
+    let mut generic_symlink_unlinks: HashMap<SymlinkGeneration, Vec<crate::events::EventId>> =
+        HashMap::new();
+    let mut rich_symlink_removals: HashMap<SymlinkGeneration, usize> = HashMap::new();
+    let mut generations: HashMap<SymlinkIdentity, u64> = HashMap::new();
+    let mut chronological = events.to_vec();
+    chronological.sort_by_key(|event| (event.ts, event.id));
+    for ev in chronological {
+        match &ev.kind {
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path,
+                kind: crate::metadata::FileKind::Symlink,
+                ..
+            }) => {
+                let generation = generations
+                    .get(&(*inode, path.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                generic_symlink_unlinks
+                    .entry((*inode, path.clone(), generation))
+                    .or_default()
+                    .push(ev.id);
+            }
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified { inode, path, .. }) => {
+                let generation = generations
+                    .get(&(*inode, path.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                *rich_symlink_removals
+                    .entry((*inode, path.clone(), generation))
+                    .or_default() += 1;
+            }
+            CaptureEventKind::TreeOp(TreeOp::Create { inode, path, .. }) => {
+                *generations.entry((*inode, path.clone())).or_default() += 1;
+            }
+            CaptureEventKind::TreeOp(TreeOp::Link { source, target }) => {
+                *generations.entry((*source, target.clone())).or_default() += 1;
+            }
+            CaptureEventKind::TreeOp(TreeOp::Rename { inode, to, .. }) => {
+                *generations.entry((*inode, to.clone())).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut superseded_symlink_unlinks = HashSet::new();
+    let mut unmatched_symlink_unlinks = HashSet::new();
+    for (identity, generic_ids) in generic_symlink_unlinks {
+        let rich_count = rich_symlink_removals.get(&identity).copied().unwrap_or(0);
+        let matched = generic_ids.len().min(rich_count);
+        superseded_symlink_unlinks.extend(generic_ids.iter().copied().take(matched));
+        unmatched_symlink_unlinks.extend(generic_ids.into_iter().skip(matched));
+    }
+
+    // Pair transient directory lifecycles by kernel identity, never by path
+    // alone. Each side is sorted only to make multiplicity selection stable;
+    // the pairing itself is deliberately independent of producer arrival.
+    type DirectoryIdentity = (InodeRef, PathBuf);
+    let mut directory_creates: HashMap<DirectoryIdentity, Vec<&CaptureEvent>> = HashMap::new();
+    let mut directory_unlinks: HashMap<DirectoryIdentity, Vec<&CaptureEvent>> = HashMap::new();
+    for event in events {
+        match &event.kind {
+            CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: crate::metadata::FileKind::Directory,
+                ..
+            }) if inode.dev != 0 || inode.inode != 0 => {
+                directory_creates
+                    .entry((*inode, path.clone()))
+                    .or_default()
+                    .push(event);
+            }
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path,
+                kind: crate::metadata::FileKind::Directory,
+                ..
+            }) if inode.dev != 0 || inode.inode != 0 => {
+                directory_unlinks
+                    .entry((*inode, path.clone()))
+                    .or_default()
+                    .push(event);
+            }
+            _ => {}
+        }
+    }
+    let mut exact_transient_events = HashSet::new();
+    for (identity, mut creates) in directory_creates {
+        let Some(unlinks) = directory_unlinks.get_mut(&identity) else {
+            continue;
+        };
+        creates.sort_by_key(|event| (event.ts, event.id));
+        unlinks.sort_by_key(|event| (event.ts, event.id));
+        let matched = creates.len().min(unlinks.len());
+        exact_transient_events.extend(creates.into_iter().take(matched).map(|event| event.id));
+        exact_transient_events.extend(unlinks.iter().take(matched).map(|event| event.id));
+    }
+
+    // Coalesce identical pre-images without losing release-time conflict
+    // evidence. A later-arriving open event has `post_content_hash=None` and
+    // must never supersede an earlier release event with `Some(hash)`.
+    type PreImageIdentity = (InodeRef, PathBuf, crate::inode::BlobHash);
+    let mut pre_image_groups: Vec<(
+        PreImageIdentity,
+        crate::metadata::FileMetadata,
+        Vec<&CaptureEvent>,
+    )> = Vec::new();
+    for event in events {
+        if let CaptureEventKind::FilePreImage {
+            inode,
+            path,
+            blob,
+            meta,
+            source,
+            ..
+        } = &event.kind
+        {
+            // This enrichment pair is emitted by the generic helper path.
+            // Never coalesce shim field-specific snapshots or trusted
+            // baseline/ES observations; those may represent distinct
+            // mutations even when their content blob is unchanged.
+            if *source != FilePreImageSource::Other {
+                continue;
+            }
+            let identity = (*inode, path.clone(), *blob);
+            if let Some((_, _, group)) = pre_image_groups
+                .iter_mut()
+                .find(|(key, captured_meta, _)| key == &identity && captured_meta == meta)
+            {
+                group.push(event);
+            } else {
+                pre_image_groups.push((identity, meta.clone(), vec![event]));
+            }
+        }
+    }
+    let mut superseded_file_preimages = HashSet::new();
+    for (_, _, group) in &pre_image_groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let canonical = group
+            .iter()
+            .copied()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    CaptureEventKind::FilePreImage {
+                        post_content_hash: Some(_),
+                        ..
+                    }
+                )
+            })
+            .max_by_key(|event| (event.ts, event.id))
+            .unwrap_or_else(|| {
+                group
+                    .iter()
+                    .copied()
+                    .min_by_key(|event| (event.ts, event.id))
+                    .expect("non-empty pre-image group")
+            });
+        superseded_file_preimages.extend(
+            group
+                .iter()
+                .filter(|event| event.id != canonical.id)
+                .map(|event| event.id),
+        );
+    }
+
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
+    let mut directory_creates: HashSet<PathBuf> = HashSet::new();
+    let mut directory_unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
     let mut rename_destinations: HashSet<PathBuf> = HashSet::new();
     // G01.B.3 — paths whose FilePreImage carries a strong "pre-command
@@ -205,18 +565,48 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut unlinks_with_inode: std::collections::HashMap<PathBuf, crate::inode::InodeRef> =
         std::collections::HashMap::new();
     for ev in events {
+        if superseded_symlink_unlinks.contains(&ev.id)
+            || exact_transient_events.contains(&ev.id)
+            || superseded_file_preimages.contains(&ev.id)
+        {
+            continue;
+        }
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, source, .. } => {
-                pre_images.insert(path.clone());
-                if source.is_trusted_pre_mutation() {
-                    pre_command_pre_images.insert(path.clone());
+                if !matches!(
+                    source,
+                    FilePreImageSource::ShimFlagsPreMutation
+                        | FilePreImageSource::ShimMetadataPreMutation
+                ) {
+                    // Metadata-only shim events reuse the FilePreImage wire.
+                    // Treating their inline bytes as content preimages would
+                    // suppress real Create/Rename inverses in mixed commands.
+                    pre_images.insert(path.clone());
+                    if source.is_trusted_pre_mutation() {
+                        pre_command_pre_images.insert(path.clone());
+                    }
                 }
             }
-            CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
+            CaptureEventKind::TreeOp(TreeOp::Create { path, kind, .. }) => {
                 creates.insert(path.clone());
+                if *kind == crate::metadata::FileKind::Directory {
+                    directory_creates.insert(path.clone());
+                }
             }
-            CaptureEventKind::TreeOp(TreeOp::Unlink { path, inode, .. }) => {
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                path, inode, kind, ..
+            }) => {
+                // A target-less symlink deletion is refusal-only. It must not
+                // participate in Create+Unlink transient/replace shapes,
+                // which could suppress both the refusal and any richer
+                // SymlinkRemoved event for another occurrence at this path.
+                if *kind == crate::metadata::FileKind::Symlink {
+                    continue;
+                }
                 unlinks.insert(path.clone());
+                if *kind == crate::metadata::FileKind::Directory {
+                    directory_unlinks.insert(path.clone());
+                }
                 // W09.20 — only index real inodes. The shim's
                 // Unlink path uses (0, 0) as a sentinel (it doesn't
                 // know the inode of the path it intercepted), and
@@ -255,6 +645,13 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut transient = HashSet::new();
     for p in creates.iter().chain(rename_destinations.iter()) {
         if !unlinks.contains(p) {
+            continue;
+        }
+        // Remaining directory events were not paired by exact identity
+        // above. Never collapse them merely because their paths match:
+        // they may be a real remove/recreate lifecycle with different
+        // inodes, and both inverses are required.
+        if directory_creates.contains(p) || directory_unlinks.contains(p) {
             continue;
         }
         // Three shapes (two transient, one atomic) for paths with BOTH
@@ -329,6 +726,9 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     // expectation is the lock path stays gone — same as transient.
     for p in &creates {
         if unlinks.contains(p) {
+            continue;
+        }
+        if directory_creates.contains(p) {
             continue;
         }
         if probe.stat(p).is_none() {
@@ -557,6 +957,10 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
+        superseded_symlink_unlinks,
+        unmatched_symlink_unlinks,
+        exact_transient_events,
+        superseded_file_preimages,
     }
 }
 
@@ -584,7 +988,8 @@ fn event_path(ev: &CaptureEvent) -> Option<&PathBuf> {
         CaptureEventKind::TreeOp(TreeOp::Create { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. })
         | CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. })
-        | CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => Some(path),
+        | CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. })
+        | CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified { path, .. }) => Some(path),
         _ => None,
     }
 }
@@ -605,8 +1010,42 @@ fn emit_for_event(
             blob,
             meta,
             post_content_hash,
-            source: _,
+            source,
         } => {
+            // B09 — the chflags shim reuses its inline FilePreImage
+            // payload to carry the pre-syscall stat fields, but bytes and
+            // unrelated metadata are not part of this mutation. Emit the
+            // field-specific inverse before any blob checks: the blob is
+            // intentionally irrelevant to flags restoration.
+            if matches!(source, FilePreImageSource::ShimFlagsPreMutation) {
+                // chflags mutates the inode. If this pathname was later
+                // unlinked but another hardlink survives, restore through
+                // that live alias rather than conflict on the dead name.
+                let restore_path = class.hardlink_dead_to_source.get(path).unwrap_or(path);
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreFlags {
+                        inode: *inode,
+                        path: restore_path.clone(),
+                        flags: meta.flags,
+                    },
+                    cohort: 0,
+                    conflict: file_path_conflict(restore_path, *inode, probe),
+                });
+                return;
+            }
+            if matches!(source, FilePreImageSource::ShimMetadataPreMutation) {
+                let restore_path = class.hardlink_dead_to_source.get(path).unwrap_or(path);
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreMetadata {
+                        inode: *inode,
+                        path: restore_path.clone(),
+                        target: meta.clone(),
+                    },
+                    cohort: 0,
+                    conflict: file_path_conflict(restore_path, *inode, probe),
+                });
+                return;
+            }
             // W09.20 — for the dead side of a hardlink pair, the
             // surviving alias has the right content already; the
             // CreateHardlink emitted from the Unlink branch will
@@ -690,9 +1129,27 @@ fn emit_for_event(
             inode,
             path,
             before,
-            ..
+            after,
         } => {
             let conflict = file_path_conflict(path, *inode, probe);
+            if before.only_flags_changed(after) {
+                // FreeBSD may also have a synchronous shim snapshot for
+                // this mutation. Keep both field-specific inverses. Exact
+                // duplicates are idempotent, while global inode/value
+                // deduplication is unsafe for repeated or cyclic chflags
+                // mutations in one command.
+                let restore_path = class.hardlink_dead_to_source.get(path).unwrap_or(path);
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreFlags {
+                        inode: *inode,
+                        path: restore_path.clone(),
+                        flags: before.flags,
+                    },
+                    cohort: 0,
+                    conflict: file_path_conflict(restore_path, *inode, probe),
+                });
+                return;
+            }
             nodes.push(PlanNode {
                 op: InverseOp::RestoreMetadata {
                     inode: *inode,
@@ -714,13 +1171,16 @@ fn emit_for_event(
             // conflict check guards against rotation between
             // capture and undo (logrotate moving the file out of
             // the way mid-session would otherwise have us truncate
-            // the WRONG file). `apply_file_extend` includes a
+            // the WRONG file). `FileExtendGuarded` repeats that identity
+            // check on the opened file descriptor at execution time, so
+            // `--force` cannot bypass it. The executor also includes a
             // defensive grow-refusal guard, so a malformed
             // pre_size > current_size errors at execute time
             // rather than silently growing.
             let conflict = file_path_conflict(path, *inode, probe);
             nodes.push(PlanNode {
-                op: InverseOp::FileExtend {
+                op: InverseOp::FileExtendGuarded {
+                    inode: *inode,
                     path: path.clone(),
                     truncate_to: *pre_size,
                 },
@@ -1149,18 +1609,27 @@ fn emit_for_event(
                 op: InverseOp::Refuse {
                     class: class.clone(),
                     reason: format!("capture incomplete for {}: {}", path.display(), detail),
-                    remediation: Some(
-                        "Re-run the command from a directory whose parent path exists; \
-                         shit cannot reverse this path because the shim could not resolve \
-                         an absolute path to attribute the captured pre-image to."
-                            .to_string(),
-                    ),
+                    remediation: capture_refusal_remediation(detail),
                 },
                 cohort: 0,
                 conflict: None,
             });
         }
     }
+}
+
+fn capture_refusal_remediation(detail: &str) -> Option<String> {
+    // Only path-resolution failures are plausibly fixed by changing how the
+    // command addresses its target. Unsupported syscalls, oversized
+    // pre-images, and read/permission failures need different remedies; a
+    // generic "re-run from an existing parent" hint is misleading for them.
+    (detail.contains("canonicalize tripped")
+        || (detail.contains("relative") && detail.contains("unsafe undo target")))
+    .then(|| {
+        "Re-run the command with an absolute target whose parent path already exists; \
+         shit cannot safely attribute a relative or unresolved capture path."
+            .to_string()
+    })
 }
 
 fn engine_label(e: crate::events::DbEngine) -> &'static str {
@@ -1299,6 +1768,27 @@ fn emit_for_tree_op(
             if atomic_replace_paths.contains(path) {
                 return;
             }
+            // Recreating a symlink requires its lexical target. A generic
+            // helper Unlink can identify the removed entry as a symlink but
+            // carries no target; `RecreatePath(Symlink)` is therefore not an
+            // executable inverse. A paired target-bearing SymlinkRemoved was
+            // already preferred by the event-level coalescer above. Any
+            // unmatched generic observation must fail closed explicitly.
+            if *kind == crate::metadata::FileKind::Symlink {
+                nodes.push(PlanNode {
+                    op: InverseOp::Refuse {
+                        class: "capture-incomplete".to_string(),
+                        reason: format!(
+                            "capture incomplete for {}: removed symlink target was not captured",
+                            path.display()
+                        ),
+                        remediation: None,
+                    },
+                    cohort: 0,
+                    conflict: None,
+                });
+                return;
+            }
             // W09.20 — hardlink-aware restoration. If this unlinked
             // path is part of a hardlink group whose other alias is
             // alive on disk at undo time, emit a single
@@ -1398,6 +1888,16 @@ fn emit_for_tree_op(
             // same path produced an Unlink inverse that runs
             // BEFORE this one (reverse-event-order), so the
             // path is free by the time we get here.
+            nodes.push(PlanNode {
+                op: InverseOp::CreateSymlink {
+                    target: target.clone(),
+                    path: path.clone(),
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
+        TreeOp::SymlinkRemovedIdentified { target, path, .. } => {
             nodes.push(PlanNode {
                 op: InverseOp::CreateSymlink {
                     target: target.clone(),
@@ -1544,6 +2044,86 @@ mod tests {
     }
 
     #[test]
+    fn capture_refusal_remediation_is_specific_to_path_resolution() {
+        let probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let make_event = |detail: &str| CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-incomplete".into(),
+                path: PathBuf::from("/tmp/target"),
+                detail: detail.into(),
+            },
+        };
+
+        let unsupported = make_event(
+            "shim cannot model this operation safely (utimes changes atime, which was not captured)",
+        );
+        let unsupported_plan = plan(dummy_command(), &[unsupported], &probe, &store);
+        assert!(matches!(
+            &unsupported_plan.nodes[0].op,
+            InverseOp::Refuse {
+                remediation: None,
+                ..
+            }
+        ));
+
+        let unresolved =
+            make_event("shim canonicalize tripped on path argument (parent does not exist)");
+        let unresolved_plan = plan(dummy_command(), &[unresolved], &probe, &store);
+        assert!(matches!(
+            &unresolved_plan.nodes[0].op,
+            InverseOp::Refuse {
+                remediation: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn capture_refusal_short_circuits_actionable_events_for_the_command() {
+        let command = dummy_command();
+        let command_id = command.command;
+        let events = vec![
+            CaptureEvent {
+                id: EventId(1),
+                command: command_id,
+                ts: TimePoint::new(1, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode: InodeRef::new(1, 2),
+                    path: PathBuf::from("/tmp/created"),
+                    kind: crate::metadata::FileKind::Regular,
+                    mode: 0o100644,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(2),
+                command: command_id,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::CaptureRefused {
+                    class: "capture-incomplete".into(),
+                    path: PathBuf::from("/tmp/uncaptured"),
+                    detail: "pre-image unavailable".into(),
+                },
+            },
+        ];
+
+        let planned = plan(
+            command,
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(planned.nodes.len(), 1, "{:#?}", planned.nodes);
+        assert!(matches!(planned.nodes[0].op, InverseOp::Refuse { .. }));
+    }
+
+    #[test]
     fn unclosed_command_warns() {
         let mut cmd = dummy_command();
         cmd.ended_at = None;
@@ -1558,7 +2138,106 @@ mod tests {
     }
 
     #[test]
-    fn partial_events_are_dropped_with_warning() {
+    fn partial_only_create_refuses_the_whole_command() {
+        let command = dummy_command();
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: command.command,
+            ts: TimePoint::new(1, 0),
+            partial: true,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/tmp/created"),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+
+        let planned = plan(command, &[ev], &InMemoryProbe::new(), &InMemoryStore::new());
+        assert_eq!(planned.nodes.len(), 1, "{:#?}", planned.nodes);
+        assert!(matches!(
+            &planned.nodes[0].op,
+            InverseOp::Refuse { class, .. } if class == "capture-incomplete"
+        ));
+        assert!(
+            planned
+                .nodes
+                .iter()
+                .all(|node| matches!(node.op, InverseOp::Refuse { .. }))
+        );
+        assert!(
+            planned
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, PlanWarning::PartialEvents { dropped: 1 }))
+        );
+    }
+
+    #[test]
+    fn mixed_partial_and_authoritative_preimage_is_refusal_only() {
+        let command = dummy_command();
+        let command_id = command.command;
+        let authoritative_path = PathBuf::from("/tmp/authoritative");
+        let authoritative_inode = InodeRef::new(1, 2);
+        let authoritative_blob = BlobHash::from_bytes([2; 32]);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            authoritative_path.clone(),
+            ProbeStat {
+                inode: authoritative_inode,
+                meta: meta(8),
+            },
+            None,
+        );
+        let mut store = InMemoryStore::new();
+        store.put_blob(authoritative_blob, 8);
+        let events = vec![
+            CaptureEvent {
+                id: EventId(1),
+                command: command_id,
+                ts: TimePoint::new(1, 0),
+                partial: true,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode: InodeRef::new(1, 1),
+                    path: PathBuf::from("/tmp/partial"),
+                    kind: crate::metadata::FileKind::Regular,
+                    mode: 0o100644,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(2),
+                command: command_id,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::FilePreImage {
+                    inode: authoritative_inode,
+                    path: authoritative_path,
+                    blob: authoritative_blob,
+                    meta: meta(8),
+                    post_content_hash: None,
+                    source: crate::FilePreImageSource::Other,
+                },
+            },
+        ];
+
+        let planned = plan(command, &events, &probe, &store);
+        assert_eq!(planned.nodes.len(), 1, "{:#?}", planned.nodes);
+        assert!(
+            planned
+                .nodes
+                .iter()
+                .all(|node| matches!(node.op, InverseOp::Refuse { .. }))
+        );
+        assert!(
+            !planned
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, InverseOp::RestoreContent { .. }))
+        );
+    }
+
+    #[test]
+    fn legacy_partial_file_preimage_row_refuses_instead_of_being_dropped() {
         let probe = InMemoryProbe::new();
         let store = InMemoryStore::new();
         let ev = CaptureEvent {
@@ -1579,7 +2258,8 @@ mod tests {
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
-        assert!(p.is_empty());
+        assert_eq!(p.nodes.len(), 1, "{:#?}", p.nodes);
+        assert!(matches!(p.nodes[0].op, InverseOp::Refuse { .. }));
         assert!(
             p.warnings
                 .iter()
@@ -1627,6 +2307,464 @@ mod tests {
         assert!(p.nodes[0].conflict.is_none(), "{:?}", p.nodes[0].conflict);
         assert!(!p.has_blocking_conflicts());
         assert_eq!(p.content_restore_count(), 1);
+    }
+
+    fn flags_pre_image(inode: InodeRef, path: &str, flags: u32, logical: u64) -> CaptureEvent {
+        let mut captured = meta(0);
+        captured.flags = flags;
+        CaptureEvent {
+            id: EventId(logical),
+            command: dummy_command().command,
+            ts: TimePoint::new(logical, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: PathBuf::from(path),
+                blob: BlobHash::from_bytes([logical as u8; 32]),
+                meta: captured,
+                post_content_hash: None,
+                source: crate::FilePreImageSource::ShimFlagsPreMutation,
+            },
+        }
+    }
+
+    #[test]
+    fn shim_flags_preimage_emits_only_restore_flags() {
+        let inode = InodeRef::new(1, 5);
+        let path = PathBuf::from("/tmp/flags-only");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let p = plan(
+            dummy_command(),
+            &[flags_pre_image(inode, path.to_str().unwrap(), 0, 1)],
+            &probe,
+            &InMemoryStore::new(),
+        );
+        assert_eq!(p.nodes.len(), 1, "{:#?}", p.nodes);
+        assert!(matches!(
+            p.nodes[0].op,
+            InverseOp::RestoreFlags { flags: 0, .. }
+        ));
+        assert_eq!(p.content_restore_count(), 0);
+    }
+
+    #[test]
+    fn shim_metadata_preimage_emits_only_restore_metadata() {
+        let inode = InodeRef::new(1, 8);
+        let path = PathBuf::from("/tmp/metadata-only");
+        let mut captured = meta(73);
+        captured.mode = 0o100600;
+        captured.uid = 123;
+        captured.gid = 456;
+        captured
+            .xattrs
+            .insert("user.magic".to_string(), b"before".to_vec());
+
+        let mut current = meta(73);
+        current.mode = 0o100644;
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: current,
+            },
+            None,
+        );
+        let event = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: path.clone(),
+                // Metadata-only captures deliberately do not require this
+                // blob to exist. A planner lookup here would regress into
+                // content restoration/truncation for chmod/xattr events.
+                blob: BlobHash::from_bytes([0xEE; 32]),
+                meta: captured.clone(),
+                post_content_hash: None,
+                source: crate::FilePreImageSource::ShimMetadataPreMutation,
+            },
+        };
+
+        let p = plan(dummy_command(), &[event], &probe, &InMemoryStore::new());
+        assert_eq!(p.nodes.len(), 1, "{:#?}", p.nodes);
+        assert!(matches!(
+            &p.nodes[0].op,
+            InverseOp::RestoreMetadata {
+                inode: emitted_inode,
+                path: emitted_path,
+                target,
+            } if *emitted_inode == inode && emitted_path == &path && target == &captured
+        ));
+        assert_eq!(p.content_restore_count(), 0);
+    }
+
+    #[test]
+    fn shim_flags_preimage_does_not_suppress_created_path_unlink() {
+        let inode = InodeRef::new(1, 6);
+        let path = PathBuf::from("/tmp/created-then-flagged");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let create = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let flags = flags_pre_image(inode, path.to_str().unwrap(), 0, 2);
+        let p = plan(
+            dummy_command(),
+            &[create, flags],
+            &probe,
+            &InMemoryStore::new(),
+        );
+        assert_eq!(p.nodes.len(), 2, "{:#?}", p.nodes);
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreFlags { .. }))
+        );
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::Unlink { .. }))
+        );
+        assert!(!p.nodes.iter().any(|n| matches!(
+            n.op,
+            InverseOp::RestoreContent { .. } | InverseOp::RestoreMetadata { .. }
+        )));
+    }
+
+    #[test]
+    fn shim_flags_preimage_does_not_suppress_reverse_rename() {
+        let inode = InodeRef::new(1, 7);
+        let from = PathBuf::from("/tmp/flags-before-rename");
+        let to = PathBuf::from("/tmp/flags-after-rename");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            to.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let rename = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: from.clone(),
+                to: to.clone(),
+                inode,
+            }),
+        };
+        let flags = flags_pre_image(inode, to.to_str().unwrap(), 0, 2);
+        let p = plan(
+            dummy_command(),
+            &[rename, flags],
+            &probe,
+            &InMemoryStore::new(),
+        );
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreFlags { .. }))
+        );
+        assert!(p.nodes.iter().any(|n| matches!(
+            &n.op,
+            InverseOp::Rename { from: f, to: t } if f == &to && t == &from
+        )));
+    }
+
+    #[test]
+    fn shim_and_kqueue_flags_events_emit_idempotent_field_specific_inverses() {
+        let inode = InodeRef::new(1, 8);
+        let path = PathBuf::from("/tmp/flags-dedupe");
+        let mut probe = InMemoryProbe::new();
+        let mut current = meta(0);
+        current.flags = 2;
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: current,
+            },
+            None,
+        );
+        let before = meta(0);
+        let mut after = before.clone();
+        after.flags = 2;
+        let helper = CaptureEvent {
+            id: EventId(2),
+            command: dummy_command().command,
+            ts: TimePoint::new(2, 0),
+            partial: false,
+            kind: CaptureEventKind::MetadataChange {
+                inode,
+                path: path.clone(),
+                before,
+                after,
+            },
+        };
+        let p = plan(
+            dummy_command(),
+            &[flags_pre_image(inode, path.to_str().unwrap(), 0, 1), helper],
+            &probe,
+            &InMemoryStore::new(),
+        );
+        assert_eq!(
+            p.nodes
+                .iter()
+                .filter(|n| matches!(n.op, InverseOp::RestoreFlags { .. }))
+                .count(),
+            2,
+            "{:#?}",
+            p.nodes
+        );
+        assert!(
+            !p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. }))
+        );
+    }
+
+    #[test]
+    fn repeated_cyclic_flags_changes_preserve_reverse_order() {
+        let inode = InodeRef::new(1, 82);
+        let path = PathBuf::from("/tmp/flags-cycle");
+        let mut probe = InMemoryProbe::new();
+        let mut current = meta(0);
+        current.flags = 2;
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: current,
+            },
+            None,
+        );
+        let metadata_event = |id: u64, before_flags: u32, after_flags: u32| {
+            let mut before = meta(0);
+            before.flags = before_flags;
+            let mut after = before.clone();
+            after.flags = after_flags;
+            CaptureEvent {
+                id: EventId(id),
+                command: dummy_command().command,
+                ts: TimePoint::new(id, 0),
+                partial: false,
+                kind: CaptureEventKind::MetadataChange {
+                    inode,
+                    path: path.clone(),
+                    before,
+                    after,
+                },
+            }
+        };
+
+        // Two helper-only mutations cycle 0 -> 1 -> 0, followed by a
+        // shimmed 0 -> 2 mutation that kqueue also observes. A global
+        // `(inode, pre_flags)` dedupe would incorrectly suppress both
+        // helper events whose pre-value is 0 and leave undo at 1.
+        let events = vec![
+            metadata_event(1, 0, 1),
+            metadata_event(2, 1, 0),
+            flags_pre_image(inode, path.to_str().unwrap(), 0, 3),
+            metadata_event(4, 0, 2),
+        ];
+        let p = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        let targets: Vec<u32> = p
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                InverseOp::RestoreFlags { flags, .. } => Some(*flags),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, vec![0, 0, 1, 0], "{:#?}", p.nodes);
+    }
+
+    #[test]
+    fn pure_flags_metadata_change_uses_field_specific_inverse() {
+        let inode = InodeRef::new(1, 80);
+        let path = PathBuf::from("/tmp/flags-helper-only");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let mut before = meta(0);
+        before.flags = 1;
+        let mut after = before.clone();
+        after.flags = 2;
+        let event = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::MetadataChange {
+                inode,
+                path,
+                before,
+                after,
+            },
+        };
+        let p = plan(dummy_command(), &[event], &probe, &InMemoryStore::new());
+        assert!(matches!(
+            p.nodes.as_slice(),
+            [PlanNode {
+                op: InverseOp::RestoreFlags { flags: 1, .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn flags_then_unlink_keeps_captured_inode_guard() {
+        let inode = InodeRef::new(1, 81);
+        let path = PathBuf::from("/tmp/flags-then-unlink");
+        let unlink = CaptureEvent {
+            id: EventId(2),
+            command: dummy_command().command,
+            ts: TimePoint::new(2, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let events = vec![flags_pre_image(inode, path.to_str().unwrap(), 0, 1), unlink];
+        let p = plan(
+            dummy_command(),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert!(matches!(
+            p.nodes.first().map(|n| &n.op),
+            Some(InverseOp::RecreatePath { path: p, .. }) if p == &path
+        ));
+        assert!(p.nodes.iter().any(|n| matches!(
+            &n.op,
+            InverseOp::RestoreFlags {
+                inode: captured,
+                path: p,
+                ..
+            } if p == &path && captured == &inode
+        )));
+    }
+
+    #[test]
+    fn flags_restore_survives_hardlink_live_alias_filter() {
+        let inode = InodeRef::new(1, 9);
+        let dead = PathBuf::from("/tmp/flags-hardlink-dead");
+        let live = PathBuf::from("/tmp/flags-hardlink-live");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            live.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let unlink = |id: u64, path: PathBuf| CaptureEvent {
+            id: EventId(id),
+            command: dummy_command().command,
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path,
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let events = vec![
+            flags_pre_image(inode, live.to_str().unwrap(), 0, 1),
+            unlink(2, dead.clone()),
+            unlink(3, live.clone()),
+        ];
+        let p = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreFlags { .. }))
+        );
+        assert!(p.nodes.iter().any(|n| matches!(
+            &n.op,
+            InverseOp::CreateHardlink { source, target }
+                if source == &live && target == &dead
+        )));
+    }
+
+    #[test]
+    fn flags_restore_on_unlinked_alias_routes_through_survivor() {
+        let inode = InodeRef::new(1, 10);
+        let dead = PathBuf::from("/tmp/flags-hardlink-dead-source");
+        let live = PathBuf::from("/tmp/flags-hardlink-survivor");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            live.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let unlink = |id: u64, path: PathBuf| CaptureEvent {
+            id: EventId(id),
+            command: dummy_command().command,
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path,
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let events = vec![
+            flags_pre_image(inode, dead.to_str().unwrap(), 0, 1),
+            unlink(2, dead.clone()),
+            unlink(3, live.clone()),
+        ];
+        let p = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        assert!(p.nodes.iter().any(|n| matches!(
+            &n.op,
+            InverseOp::RestoreFlags { path, .. } if path == &live
+        )));
     }
 
     #[test]
@@ -3130,11 +4268,11 @@ mod tests {
     }
 
     /// AU27 — FileAppendPreStash event with `pre_size = 100`
-    /// emits exactly one `InverseOp::FileExtend { truncate_to:
-    /// 100 }` plan node, with no Conflict when the inode at
+    /// emits exactly one `InverseOp::FileExtendGuarded { truncate_to:
+    /// 100, .. }` plan node, with no Conflict when the inode at
     /// undo time matches the captured one.
     #[test]
-    fn file_append_pre_stash_emits_file_extend() {
+    fn file_append_pre_stash_emits_guarded_file_extend() {
         let mut probe = InMemoryProbe::new();
         let store = InMemoryStore::new();
         let inode = InodeRef::new(1, 42);
@@ -3165,14 +4303,16 @@ mod tests {
         let p = plan(dummy_command(), &[ev], &probe, &store);
         assert_eq!(p.nodes.len(), 1, "expected exactly one plan node");
         match &p.nodes[0].op {
-            InverseOp::FileExtend {
+            InverseOp::FileExtendGuarded {
+                inode: emitted_inode,
                 path: p,
                 truncate_to,
             } => {
+                assert_eq!(*emitted_inode, inode);
                 assert_eq!(*p, path);
                 assert_eq!(*truncate_to, 100);
             }
-            other => panic!("expected FileExtend, got {other:?}"),
+            other => panic!("expected FileExtendGuarded, got {other:?}"),
         }
         assert!(
             p.nodes[0].conflict.is_none(),
@@ -3219,6 +4359,450 @@ mod tests {
         assert!(
             p.nodes[0].conflict.is_some(),
             "expected conflict when inode differs"
+        );
+    }
+
+    fn assert_rich_symlink_removal_wins(helper_first: bool) {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/removed-link");
+        let (helper_ts, shim_ts) = if helper_first {
+            (TimePoint::new(1, 0), TimePoint::new(2, 0))
+        } else {
+            (TimePoint::new(2, 0), TimePoint::new(1, 0))
+        };
+        let helper = CaptureEvent {
+            id: EventId(901),
+            command,
+            ts: helper_ts,
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: InodeRef::new(7, 41),
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Symlink,
+                mode: 0o120777,
+            }),
+        };
+        let shim = CaptureEvent {
+            id: EventId(902),
+            command,
+            ts: shim_ts,
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                inode: InodeRef::new(7, 41),
+                target: "../old-target".into(),
+                path: path.clone(),
+            }),
+        };
+
+        let result = plan(
+            dummy_command(),
+            &[helper, shim],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(result.nodes.len(), 1, "{:#?}", result.nodes);
+        assert!(matches!(
+            &result.nodes[0].op,
+            InverseOp::CreateSymlink { target, path: actual }
+                if target == "../old-target" && actual == &path
+        ));
+    }
+
+    #[test]
+    fn helper_symlink_unlink_then_shim_target_coalesces_to_rich_inverse() {
+        assert_rich_symlink_removal_wins(true);
+    }
+
+    #[test]
+    fn shim_target_then_helper_symlink_unlink_coalesces_to_rich_inverse() {
+        assert_rich_symlink_removal_wins(false);
+    }
+
+    #[test]
+    fn symlink_variant_coalescing_refuses_unmatched_repeated_operation() {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/repeated-link");
+        let generic = |id, logical| CaptureEvent {
+            id: EventId(id),
+            command,
+            ts: TimePoint::new(logical, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: InodeRef::new(7, 42),
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Symlink,
+                mode: 0o120777,
+            }),
+        };
+        let rich = CaptureEvent {
+            id: EventId(905),
+            command,
+            ts: TimePoint::new(3, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                inode: InodeRef::new(7, 42),
+                target: "../old-target".into(),
+                path: path.clone(),
+            }),
+        };
+
+        let result = plan(
+            dummy_command(),
+            &[generic(903, 1), generic(904, 2), rich],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "an unmatched removal makes the command refusal-only: {:#?}",
+            result.nodes
+        );
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.op, InverseOp::CreateSymlink { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.op, InverseOp::Refuse { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !result
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, InverseOp::RecreatePath { .. }))
+        );
+    }
+
+    #[test]
+    fn superseded_generic_symlink_unlink_does_not_make_replacement_transient() {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/replaced-link");
+        let events = vec![
+            CaptureEvent {
+                id: EventId(906),
+                command,
+                ts: TimePoint::new(1, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    inode: InodeRef::new(7, 43),
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Symlink,
+                    mode: 0o120777,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(907),
+                command,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                    inode: InodeRef::new(7, 43),
+                    target: "../old-target".into(),
+                    path: path.clone(),
+                }),
+            },
+            CaptureEvent {
+                id: EventId(908),
+                command,
+                ts: TimePoint::new(3, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode: InodeRef::new(7, 44),
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Symlink,
+                    mode: 0o120777,
+                }),
+            },
+        ];
+
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: InodeRef::new(7, 44),
+                meta: meta(0),
+            },
+            None,
+        );
+        let result = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        assert_eq!(result.nodes.len(), 2, "{:#?}", result.nodes);
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, InverseOp::CreateSymlink { .. }))
+        );
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, InverseOp::Unlink { .. }))
+        );
+        assert!(!result.nodes.iter().any(|node| matches!(
+            node.op,
+            InverseOp::Refuse { .. } | InverseOp::RecreatePath { .. }
+        )));
+    }
+
+    #[test]
+    fn symlink_variants_at_same_path_with_different_inodes_do_not_coalesce() {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/reused-link-name");
+        let events = vec![
+            CaptureEvent {
+                id: EventId(909),
+                command,
+                ts: TimePoint::new(1, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    inode: InodeRef::new(7, 50),
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Symlink,
+                    mode: 0o120777,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(910),
+                command,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                    inode: InodeRef::new(7, 51),
+                    target: "../other-target".into(),
+                    path,
+                }),
+            },
+        ];
+
+        let result = plan(
+            dummy_command(),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(result.nodes.len(), 1, "{:#?}", result.nodes);
+        assert!(matches!(result.nodes[0].op, InverseOp::Refuse { .. }));
+    }
+
+    #[test]
+    fn symlink_variants_across_same_inode_rearm_do_not_coalesce() {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/rearmed-link");
+        let inode = InodeRef::new(7, 52);
+        let events = vec![
+            CaptureEvent {
+                id: EventId(911),
+                command,
+                ts: TimePoint::new(1, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    inode,
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Symlink,
+                    mode: 0o120777,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(912),
+                command,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode,
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Symlink,
+                    mode: 0o120777,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(913),
+                command,
+                ts: TimePoint::new(3, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                    inode,
+                    target: "../second-target".into(),
+                    path,
+                }),
+            },
+        ];
+
+        let result = plan(
+            dummy_command(),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(result.nodes.len(), 1, "{:#?}", result.nodes);
+        assert!(matches!(result.nodes[0].op, InverseOp::Refuse { .. }));
+    }
+
+    fn directory_create_unlink_events(create_ts: u64, unlink_ts: u64) -> Vec<CaptureEvent> {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/exact-transient-dir");
+        let inode = InodeRef::new(8, 700);
+        vec![
+            CaptureEvent {
+                id: EventId(920),
+                command,
+                ts: TimePoint::new(create_ts, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode,
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Directory,
+                    mode: 0o040755,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(921),
+                command,
+                ts: TimePoint::new(unlink_ts, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    inode,
+                    path,
+                    kind: crate::metadata::FileKind::Directory,
+                    mode: 0o040755,
+                }),
+            },
+        ]
+    }
+
+    #[test]
+    fn exact_directory_transient_create_arrives_first() {
+        let result = plan(
+            dummy_command(),
+            &directory_create_unlink_events(1, 2),
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert!(result.nodes.is_empty(), "{:#?}", result.nodes);
+    }
+
+    #[test]
+    fn exact_directory_transient_unlink_arrives_first() {
+        // Daemon timestamps reflect independent-reader arrival here, not
+        // kernel syscall order. Identity pairing must give the same result.
+        let result = plan(
+            dummy_command(),
+            &directory_create_unlink_events(2, 1),
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert!(result.nodes.is_empty(), "{:#?}", result.nodes);
+    }
+
+    #[test]
+    fn same_path_different_directory_identity_is_not_transient() {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/replaced-dir");
+        let events = vec![
+            CaptureEvent {
+                id: EventId(922),
+                command,
+                ts: TimePoint::new(2, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode: InodeRef::new(8, 702),
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Directory,
+                    mode: 0o040755,
+                }),
+            },
+            CaptureEvent {
+                id: EventId(923),
+                command,
+                ts: TimePoint::new(1, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    inode: InodeRef::new(8, 701),
+                    path: path.clone(),
+                    kind: crate::metadata::FileKind::Directory,
+                    mode: 0o040700,
+                }),
+            },
+        ];
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path,
+            ProbeStat {
+                inode: InodeRef::new(8, 702),
+                meta: meta(0),
+            },
+            None,
+        );
+        let result = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        assert_eq!(result.nodes.len(), 2, "{:#?}", result.nodes);
+        assert!(
+            result
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, InverseOp::Unlink { .. }))
+        );
+        assert!(result.nodes.iter().any(|node| matches!(
+            &node.op,
+            InverseOp::RecreatePath {
+                kind: crate::metadata::FileKind::Directory,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn post_hash_preimage_supersedes_later_open_without_post_hash() {
+        let command = dummy_command().command;
+        let path = PathBuf::from("/tmp/post-hash-wins");
+        let inode = InodeRef::new(8, 800);
+        let blob = BlobHash::from_bytes([0x41; 32]);
+        let expected_post = BlobHash::from_bytes([0x42; 32]);
+        let current = BlobHash::from_bytes([0x43; 32]);
+        let make_event = |id, ts, post_content_hash| CaptureEvent {
+            id: EventId(id),
+            command,
+            ts: TimePoint::new(ts, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: path.clone(),
+                blob,
+                meta: meta(6),
+                post_content_hash,
+                source: FilePreImageSource::Other,
+            },
+        };
+        let events = vec![
+            make_event(924, 1, Some(expected_post)),
+            // Simulate the independent open reader arriving after release.
+            make_event(925, 2, None),
+        ];
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path,
+            ProbeStat {
+                inode,
+                meta: meta(6),
+            },
+            Some(current),
+        );
+        let mut store = InMemoryStore::new();
+        store.put_blob(blob, 6);
+        let result = plan(dummy_command(), &events, &probe, &store);
+        assert_eq!(result.nodes.len(), 2, "{:#?}", result.nodes);
+        assert!(
+            result
+                .nodes
+                .iter()
+                .all(|node| matches!(&node.conflict, Some(Conflict::Hard { .. })))
         );
     }
 }

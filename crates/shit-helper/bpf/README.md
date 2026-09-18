@@ -4,8 +4,8 @@ This directory contains the eBPF programs that ship with `shit-helper`.
 
 ## Layout
 
-- `src/*.bpf.c` — source. Written in C with **no header dependencies**
-  so the build is portable across kernel versions and distros.
+- `src/*.bpf.c` — source. LSM programs use the checked-in
+  `include/vmlinux.h` plus libbpf's helper headers for CO-RE reads.
 - `build/*.bpf.o` — compiled output, **committed to the repo**. The
   consuming Rust code embeds these via `include_bytes!`.
 - `Makefile` — builds the .o files. Run on a Linux box with `clang`
@@ -41,10 +41,18 @@ After regenerating, commit both the `.bpf.c` source and the
 | File | Section | Type | Returns | Risk |
 |------|---------|------|---------|------|
 | `noop_tracepoint.bpf.c` | `tracepoint/sched/sched_process_exec` | TRACEPOINT | always 0 | observation only — **cannot deny syscalls** |
+| `inode_*.bpf.c`, `file_*.bpf.c` | `lsm/*` | BPF LSM | always 0 | system-wide observation; verifier and load behavior require HP-18 review |
 
-LSM hooks are deliberately not yet present; per the standing rule in
-`.docs/audits/helper-protocol.md` (HP-18), any hook that *can* return
-non-zero requires explicit isolation review before introduction.
+Each LSM object owns a private `ringbuf_loss_count` one-element BPF array.
+If `bpf_ringbuf_reserve` fails, the hook still returns 0 but atomically
+increments that counter. The userspace reader polls it independently of the
+full ring buffer and emits `CaptureRefused` for every command active when a
+delta is observed. Because the lost record contains the only exact pid/path
+identity, narrower attribution is not truthful.
+
+The `file_open` and `file_release` hooks emit only writable regular-file
+events. Writable pipes, sockets, devices, and anonymous inodes cannot carry a
+replayable filesystem pre-image and are filtered before ring-buffer reserve.
 
 ## License
 

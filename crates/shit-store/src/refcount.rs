@@ -18,9 +18,9 @@
 //! the commit fails, no refcounts change. Inter-batch the GC pass is
 //! resumable — the next pass picks up whatever wasn't dropped.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
-use crate::index::{Index, IndexError};
+use crate::index::{Index, IndexError, decrement_event_blob_ref};
 use shit_planner::CommandId;
 
 /// Summary of a batch reap.
@@ -30,8 +30,8 @@ pub struct ReapBatch {
     pub commands_dropped: usize,
     /// Number of events removed from `events`.
     pub events_dropped: usize,
-    /// Number of distinct blob hashes whose refcount was decremented.
-    /// (NOT necessarily the number that hit zero — call
+    /// Number of event-owned blob references decremented. Repeated hashes
+    /// count once per owning event. (NOT necessarily the number that hit zero — call
     /// [`Index::unreferenced_blobs`] for that.)
     pub refs_decremented: usize,
 }
@@ -50,6 +50,9 @@ impl ReapBatch {
 /// have filtered them out via the GC's mark-expired phase. Defense
 /// in depth: this helper also checks the `pins` table inside the
 /// transaction so a TOCTOU race can't drop a pin that landed mid-pass.
+/// Commands associated with PREPARED or CONFIRMED container batches are also
+/// retained because authorization may still be pending or the runtime may
+/// still be running. REFUSED and FINALIZED batches return to normal retention.
 pub fn reap_commands(index: &Index, ids: &[CommandId]) -> Result<ReapBatch, IndexError> {
     if ids.is_empty() {
         return Ok(ReapBatch::default());
@@ -60,49 +63,82 @@ pub fn reap_commands(index: &Index, ids: &[CommandId]) -> Result<ReapBatch, Inde
     let mut summary = ReapBatch::default();
 
     for id in ids {
+        // A command can be marked for GC and then race a delayed PostExec (or
+        // be supplied directly by another caller). Recheck completion inside
+        // this transaction before touching its events/refcounts. Open commands
+        // are capture state, not reclaimable history.
+        let completed: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM commands
+                 WHERE session = ?1 AND seq = ?2
+                   AND ended_logical IS NOT NULL
+                   AND ended_wall_nanos IS NOT NULL",
+                params![id.session.as_bytes().as_slice(), id.seq as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if completed.is_none() {
+            continue;
+        }
+
         // TOCTOU guard: if this command became pinned (via `pins`, the
         // user-facing savepoint table) or held (via `holds`, the C01
         // programmatic per-pid pin) since the mark-expired pass enumerated
         // it, skip.
-        let pinned: bool = tx
+        let pinned = tx
             .query_row(
                 "SELECT 1 FROM pins WHERE session = ?1 AND seq = ?2",
                 params![id.session.as_bytes().as_slice(), id.seq as i64],
-                |_| Ok(true),
+                |_| Ok(()),
             )
-            .unwrap_or(false);
+            .optional()?
+            .is_some();
         if pinned {
             continue;
         }
-        let held: bool = tx
+        let held = tx
             .query_row(
                 "SELECT 1 FROM holds WHERE session = ?1 AND seq = ?2 LIMIT 1",
                 params![id.session.as_bytes().as_slice(), id.seq as i64],
-                |_| Ok(true),
+                |_| Ok(()),
             )
-            .unwrap_or(false);
+            .optional()?
+            .is_some();
         if held {
             continue;
         }
+        let has_container_batch: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM container_capture_batches
+                 WHERE session = ?1 AND seq = ?2
+                   AND state IN ('PREPARED', 'CONFIRMED')
+             )",
+            params![id.session.as_bytes().as_slice(), id.seq as i64],
+            |row| row.get(0),
+        )?;
+        if has_container_batch {
+            continue;
+        }
 
-        // Decrement refcounts for every blob this command referenced.
+        // Decrement refcounts for every blob this command owned. ContainerOp
+        // tarballs are owned by their stash rows; confirmed in-flight batches
+        // remain protected until durable runtime finalization.
         let hashes: Vec<Vec<u8>> = {
             let mut stmt = tx.prepare(
                 "SELECT blob_hash FROM events
-                 WHERE session = ?1 AND seq = ?2 AND blob_hash IS NOT NULL",
+                 WHERE session = ?1 AND seq = ?2
+                   AND discriminant = 'FilePreImage'
+                   AND blob_hash IS NOT NULL
+                 ORDER BY id",
             )?;
             stmt.query_map(
                 params![id.session.as_bytes().as_slice(), id.seq as i64],
                 |row| row.get::<_, Vec<u8>>(0),
             )?
-            .filter_map(Result::ok)
-            .collect()
+            .collect::<Result<_, _>>()?
         };
         for h in &hashes {
-            tx.execute(
-                "UPDATE blobs SET refcount = MAX(refcount - 1, 0) WHERE hash = ?1",
-                params![h.as_slice()],
-            )?;
+            decrement_event_blob_ref(&tx, h, "reaping command batch")?;
         }
         summary.refs_decremented += hashes.len();
 
@@ -126,6 +162,7 @@ pub fn reap_commands(index: &Index, ids: &[CommandId]) -> Result<ReapBatch, Inde
 mod tests {
     use super::*;
     use rusqlite::params;
+    use shit_planner::BlobHash;
     use uuid::Uuid;
 
     fn make_index() -> Index {
@@ -140,8 +177,9 @@ mod tests {
         let conn = index.conn().lock().unwrap();
         conn.execute(
             "INSERT INTO commands
-             (session, seq, cmd_string, cwd, pid, shell_kind, started_logical, started_wall_nanos)
-             VALUES (?1, ?2, ?3, '/tmp', 1, 'bash', ?2, 0)",
+             (session, seq, cmd_string, cwd, pid, shell_kind, started_logical,
+              started_wall_nanos, ended_logical, ended_wall_nanos, exit_code)
+             VALUES (?1, ?2, ?3, '/tmp', 1, 'bash', ?2, 0, ?2 + 1, 1, 0)",
             params![session.as_bytes().as_slice(), seq as i64, "test"],
         )
         .unwrap();
@@ -152,6 +190,37 @@ mod tests {
         let idx = make_index();
         let s = reap_commands(&idx, &[]).unwrap();
         assert_eq!(s, ReapBatch::default());
+    }
+
+    #[test]
+    fn reap_skips_open_command_even_when_requested_directly() {
+        let idx = make_index();
+        let session = Uuid::now_v7();
+        let id = CommandId { session, seq: 7 };
+        {
+            let conn = idx.conn().lock().unwrap();
+            conn.execute(
+                "INSERT INTO commands
+                 (session, seq, cmd_string, cwd, pid, shell_kind,
+                  started_logical, started_wall_nanos)
+                 VALUES (?1, ?2, 'open', '/tmp', 1, 'bash', 1, 0)",
+                params![session.as_bytes().as_slice(), id.seq as i64],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(reap_commands(&idx, &[id]).unwrap(), ReapBatch::default());
+        let remains: i64 = idx
+            .conn()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE session = ?1 AND seq = ?2",
+                params![session.as_bytes().as_slice(), id.seq as i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remains, 1);
     }
 
     #[test]
@@ -174,6 +243,123 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn reap_retains_only_inflight_container_batch_states() {
+        let idx = make_index();
+        let session = Uuid::from_bytes([0x52; 16]);
+        let mut ids = Vec::new();
+        for (offset, state, finalized_at) in [
+            (0_u8, "PREPARED", None),
+            (1, "CONFIRMED", None),
+            (2, "REFUSED", None),
+            (3, "FINALIZED", Some(100_i64)),
+        ] {
+            let id = CommandId {
+                session,
+                seq: offset as u64 + 1,
+            };
+            insert_command(&idx, session, id.seq);
+            idx.conn()
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO container_capture_batches
+                     (batch_id, session, seq, request_hash, event_count, state,
+                      finalized_unix_secs)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+                    params![
+                        [offset + 11; 16].as_slice(),
+                        session.as_bytes().as_slice(),
+                        id.seq as i64,
+                        [offset + 11; 32].as_slice(),
+                        state,
+                        finalized_at,
+                    ],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        let summary = reap_commands(&idx, &ids).unwrap();
+        assert_eq!(summary.commands_dropped, 2);
+        let conn = idx.conn().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT seq FROM commands WHERE session = ?1 ORDER BY seq")
+            .unwrap();
+        let remaining = stmt
+            .query_map(params![session.as_bytes().as_slice()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<i64>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![1, 2]);
+    }
+
+    #[test]
+    fn reap_batch_missing_blob_rolls_back_prior_command() {
+        let idx = make_index();
+        let session = Uuid::now_v7();
+        let first = CommandId { session, seq: 1 };
+        let corrupt = CommandId { session, seq: 2 };
+        insert_command(&idx, session, first.seq);
+        insert_command(&idx, session, corrupt.seq);
+        let present = BlobHash::from_bytes([0x71; 32]);
+        let missing = BlobHash::from_bytes([0x72; 32]);
+        {
+            let conn = idx.conn().lock().unwrap();
+            conn.execute(
+                "INSERT INTO blobs (hash, size, compressed, refcount, created_logical)
+                 VALUES (?1, 1, 0, 1, 0)",
+                params![present.as_bytes().as_slice()],
+            )
+            .unwrap();
+            for (id, hash) in [(first, present), (corrupt, missing)] {
+                conn.execute(
+                    "INSERT INTO events
+                     (session, seq, ts_logical, ts_wall_nanos, partial,
+                      discriminant, blob_hash, payload)
+                     VALUES (?1, ?2, 1, 0, 0, 'FilePreImage', ?3, X'')",
+                    params![
+                        id.session.as_bytes().as_slice(),
+                        id.seq as i64,
+                        hash.as_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        assert!(matches!(
+            reap_commands(&idx, &[first, corrupt]),
+            Err(IndexError::MissingBlob(hash)) if hash == missing
+        ));
+
+        let conn = idx.conn().lock().unwrap();
+        let refcount: i64 = conn
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![present.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let commands: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE session = ?1",
+                params![session.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE session = ?1",
+                params![session.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1);
+        assert_eq!(commands, 2);
+        assert_eq!(events, 2);
     }
 
     #[test]

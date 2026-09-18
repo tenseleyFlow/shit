@@ -27,11 +27,16 @@
 //! - **ProcessOp**: undo can't resurrect a killed process and redo
 //!   can't re-kill one — `shit redo` just renders the original
 //!   `ProcessNote` as informational.
+//! - **Partial capture**: one partial event refuses the entire forward plan;
+//!   authoritative events are never replayed beside an incomplete capture.
 
-use crate::events::{CaptureEvent, CaptureEventKind, CommandRecord, TreeOp};
+use crate::events::{
+    CaptureEvent, CaptureEventKind, CommandRecord, EventId, FilePreImageSource, TreeOp,
+};
 use crate::inverse::{Conflict, InverseOp, InverseTier, PlanNode, PlanWarning, UndoPlan};
 use crate::probe::StateProbe;
 use crate::store::PlannerStore;
+use std::collections::{HashMap, HashSet};
 
 pub fn plan_forward(
     command: CommandRecord,
@@ -39,15 +44,16 @@ pub fn plan_forward(
     probe: &dyn StateProbe,
     _store: &dyn PlannerStore,
 ) -> UndoPlan {
+    if events.iter().any(|event| event.partial) {
+        return crate::plan::partial_capture_refusal_plan(command, events);
+    }
+    if let Some(refusal) = crate::plan::capture_refusal_plan(command.clone(), events) {
+        return refusal;
+    }
+
     let mut nodes: Vec<PlanNode> = Vec::new();
     let mut warnings: Vec<PlanWarning> = Vec::new();
 
-    let partial_count = events.iter().filter(|e| e.partial).count();
-    if partial_count > 0 {
-        warnings.push(PlanWarning::PartialEvents {
-            dropped: partial_count,
-        });
-    }
     if command.ended_at.is_none() {
         warnings.push(PlanWarning::UnclosedCommand);
     }
@@ -56,11 +62,18 @@ pub fn plan_forward(
     // (latest last) — mirror of `plan()`'s reverse-chronological
     // walk. This lets tree-creates land before content writes when
     // a redo touches the same path twice.
-    let mut live: Vec<&CaptureEvent> = events.iter().filter(|e| !e.partial).collect();
+    let mut live: Vec<&CaptureEvent> = events.iter().collect();
     live.sort_by_key(|e| (e.ts, e.id));
 
+    // FreeBSD observes chflags twice: synchronously through the shim
+    // (pre-state only) and post-hoc through kqueue (before + after).
+    // Pair each helper event with at most one earlier shim event. A global
+    // inode/value set is insufficient: repeated or cyclic mutations may
+    // legitimately reuse the same pre-value within one command.
+    let paired_flags_shims = paired_flags_shim_events(&live);
+
     for ev in live {
-        emit_forward_for_event(ev, probe, &mut nodes, &mut warnings);
+        emit_forward_for_event(ev, probe, &paired_flags_shims, &mut nodes, &mut warnings);
     }
 
     crate::cohort::assign_cohorts(&mut nodes);
@@ -72,13 +85,72 @@ pub fn plan_forward(
     }
 }
 
+fn paired_flags_shim_events(events: &[&CaptureEvent]) -> HashSet<EventId> {
+    let mut pending: HashMap<(crate::inode::InodeRef, u32), Vec<EventId>> = HashMap::new();
+    let mut paired = HashSet::new();
+
+    for ev in events {
+        match &ev.kind {
+            CaptureEventKind::FilePreImage {
+                inode,
+                meta,
+                source: FilePreImageSource::ShimFlagsPreMutation,
+                ..
+            } => pending.entry((*inode, meta.flags)).or_default().push(ev.id),
+            CaptureEventKind::MetadataChange {
+                inode,
+                before,
+                after,
+                ..
+            } if before.only_flags_changed(after) => {
+                if let Some(ids) = pending.get_mut(&(*inode, before.flags))
+                    && let Some(id) = ids.pop()
+                {
+                    paired.insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    paired
+}
+
 fn emit_forward_for_event(
     ev: &CaptureEvent,
     probe: &dyn StateProbe,
+    paired_flags_shims: &HashSet<EventId>,
     nodes: &mut Vec<PlanNode>,
     warnings: &mut Vec<PlanWarning>,
 ) {
     match &ev.kind {
+        CaptureEventKind::FilePreImage {
+            path,
+            source: FilePreImageSource::ShimFlagsPreMutation,
+            ..
+        } => {
+            if !paired_flags_shims.contains(&ev.id) {
+                warnings.push(PlanWarning::Informational {
+                    tier: InverseTier::Files,
+                    message: format!(
+                        "cannot redo chflags on {} — shim capture records pre-flags only",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        CaptureEventKind::FilePreImage {
+            path,
+            source: FilePreImageSource::ShimMetadataPreMutation,
+            ..
+        } => {
+            warnings.push(PlanWarning::Informational {
+                tier: InverseTier::Files,
+                message: format!(
+                    "cannot redo metadata change on {} — shim capture records pre-metadata only",
+                    path.display()
+                ),
+            });
+        }
         CaptureEventKind::FilePreImage { path, .. } => {
             // No captured post-bytes → can't redo content. Emit an
             // informational warning and skip. The metadata half
@@ -95,10 +167,23 @@ fn emit_forward_for_event(
         CaptureEventKind::MetadataChange {
             inode,
             path,
-            before: _,
+            before,
             after,
         } => {
             // Forward: apply the post metadata.
+            if before.only_flags_changed(after) {
+                let expected_inode = probe.stat(path).map(|s| s.inode).unwrap_or(*inode);
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreFlags {
+                        inode: expected_inode,
+                        path: path.clone(),
+                        flags: after.flags,
+                    },
+                    cohort: 0,
+                    conflict: file_conflict(path, probe),
+                });
+                return;
+            }
             nodes.push(PlanNode {
                 op: InverseOp::RestoreMetadata {
                     inode: *inode,
@@ -490,7 +575,7 @@ fn emit_forward_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec
                 conflict: phantom_if_exists(path, probe),
             });
         }
-        TreeOp::SymlinkRemoved { path, .. } => {
+        TreeOp::SymlinkRemoved { path, .. } | TreeOp::SymlinkRemovedIdentified { path, .. } => {
             // W09.16.1 — forward of "symlink at `path` was removed"
             // is to remove it. The paired Create event (for the new
             // symlink that took its place) re-creates the replacement
@@ -620,6 +705,110 @@ mod tests {
     }
 
     #[test]
+    fn forward_partial_only_create_is_refusal_only() {
+        let mut partial = ev(
+            CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/partial"),
+                kind: FileKind::Regular,
+                mode: 0o100644,
+            }),
+            1,
+        );
+        partial.partial = true;
+
+        let planned = plan_forward(
+            command(1),
+            &[partial],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(planned.nodes.len(), 1, "{:#?}", planned.nodes);
+        assert!(matches!(
+            &planned.nodes[0].op,
+            InverseOp::Refuse { class, .. } if class == "capture-incomplete"
+        ));
+        assert!(
+            planned
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, PlanWarning::PartialEvents { dropped: 1 }))
+        );
+    }
+
+    #[test]
+    fn forward_mixed_partial_and_authoritative_events_is_refusal_only() {
+        let mut partial = ev(
+            CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/partial"),
+                kind: FileKind::Regular,
+                mode: 0o100644,
+            }),
+            1,
+        );
+        partial.partial = true;
+        let authoritative = ev(
+            CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(1, 2),
+                path: PathBuf::from("/authoritative"),
+                kind: FileKind::Regular,
+                mode: 0o100644,
+            }),
+            2,
+        );
+
+        let planned = plan_forward(
+            command(1),
+            &[authoritative, partial],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(planned.nodes.len(), 1, "{:#?}", planned.nodes);
+        assert!(
+            planned
+                .nodes
+                .iter()
+                .all(|node| matches!(node.op, InverseOp::Refuse { .. }))
+        );
+    }
+
+    #[test]
+    fn forward_capture_refusal_suppresses_authoritative_actions() {
+        let authoritative = ev(
+            CaptureEventKind::TreeOp(TreeOp::Create {
+                inode: InodeRef::new(1, 2),
+                path: PathBuf::from("/authoritative"),
+                kind: FileKind::Regular,
+                mode: 0o100644,
+            }),
+            1,
+        );
+        let refusal = ev(
+            CaptureEventKind::CaptureRefused {
+                class: "capture-incomplete".into(),
+                path: PathBuf::from("/missed"),
+                detail: "injected missing evidence".into(),
+            },
+            2,
+        );
+
+        let planned = plan_forward(
+            command(1),
+            &[authoritative, refusal],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+
+        assert_eq!(planned.nodes.len(), 1, "{:#?}", planned.nodes);
+        assert!(matches!(
+            &planned.nodes[0].op,
+            InverseOp::Refuse { class, reason, .. }
+                if class == "capture-incomplete" && reason.contains("injected missing evidence")
+        ));
+    }
+
+    #[test]
     fn forward_env_diff_re_adds_added_re_removes_removed() {
         let mut added = BTreeMap::new();
         added.insert("FOO".to_string(), "bar".to_string());
@@ -711,6 +900,34 @@ mod tests {
     }
 
     #[test]
+    fn forward_shim_metadata_preimage_is_not_reported_as_content() {
+        let events = vec![ev(
+            CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/tmp/metadata-only"),
+                blob: crate::inode::BlobHash::from_bytes([0; 32]),
+                meta: meta(),
+                post_content_hash: None,
+                source: crate::FilePreImageSource::ShimMetadataPreMutation,
+            },
+            1,
+        )];
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert!(plan.nodes.is_empty());
+        assert!(plan.warnings.iter().any(|warning| matches!(
+            warning,
+            PlanWarning::Informational { message, .. }
+                if message.contains("cannot redo metadata change")
+                    && !message.contains("file write")
+        )));
+    }
+
+    #[test]
     fn forward_metadata_change_targets_after_state() {
         let before = FileMetadata {
             mode: 0o644,
@@ -746,6 +963,118 @@ mod tests {
             }
             other => panic!("expected RestoreMetadata, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn forward_pure_flags_change_targets_after_flags_only() {
+        let before = meta();
+        let mut after = before.clone();
+        after.flags = 2;
+        let events = vec![ev(
+            CaptureEventKind::MetadataChange {
+                inode: InodeRef::new(1, 1),
+                path: PathBuf::from("/tmp/flags-forward"),
+                before,
+                after,
+            },
+            1,
+        )];
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&["/tmp/flags-forward"]),
+            &InMemoryStore::new(),
+        );
+        assert!(matches!(
+            plan.nodes.as_slice(),
+            [PlanNode {
+                op: InverseOp::RestoreFlags { flags: 2, .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn forward_paired_flags_capture_has_no_content_warning() {
+        let inode = InodeRef::new(1, 1);
+        let path = PathBuf::from("/tmp/flags-forward-paired");
+        let before = meta();
+        let mut after = before.clone();
+        after.flags = 1;
+        let events = vec![
+            ev(
+                CaptureEventKind::FilePreImage {
+                    inode,
+                    path: path.clone(),
+                    blob: crate::inode::BlobHash::from_bytes([1; 32]),
+                    meta: before.clone(),
+                    post_content_hash: None,
+                    source: crate::FilePreImageSource::ShimFlagsPreMutation,
+                },
+                1,
+            ),
+            ev(
+                CaptureEventKind::MetadataChange {
+                    inode,
+                    path: path.clone(),
+                    before,
+                    after,
+                },
+                2,
+            ),
+        ];
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&[path.to_str().unwrap()]),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(plan.nodes.len(), 1, "{:#?}", plan.nodes);
+        assert!(matches!(plan.nodes[0].op, InverseOp::RestoreFlags { .. }));
+        assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
+    }
+
+    #[test]
+    fn forward_pairs_each_flags_helper_event_with_only_one_shim_event() {
+        let inode = InodeRef::new(1, 1);
+        let path = PathBuf::from("/tmp/flags-forward-repeated");
+        let before = meta();
+        let mut after = before.clone();
+        after.flags = 1;
+        let shim = |id, marker| {
+            ev(
+                CaptureEventKind::FilePreImage {
+                    inode,
+                    path: path.clone(),
+                    blob: crate::inode::BlobHash::from_bytes([marker; 32]),
+                    meta: before.clone(),
+                    post_content_hash: None,
+                    source: crate::FilePreImageSource::ShimFlagsPreMutation,
+                },
+                id,
+            )
+        };
+        let events = vec![
+            shim(1, 1),
+            shim(2, 2),
+            ev(
+                CaptureEventKind::MetadataChange {
+                    inode,
+                    path: path.clone(),
+                    before,
+                    after,
+                },
+                3,
+            ),
+        ];
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&[path.to_str().unwrap()]),
+            &InMemoryStore::new(),
+        );
+        assert_eq!(plan.nodes.len(), 1, "{:#?}", plan.nodes);
+        assert_eq!(plan.warnings.len(), 1, "{:#?}", plan.warnings);
     }
 
     #[test]

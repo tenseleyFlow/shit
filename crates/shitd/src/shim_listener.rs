@@ -16,18 +16,20 @@
 //!    small and large frames).
 //! 2. Resolve `pid → CommandId` via `ActiveCommands::resolve_by_descendant`.
 //!    If no active command owns the emitter, the event is orphan
-//!    and dropped silently (the shim still gets an Allow ack — we
-//!    never block a user command on an attribution miss).
-//! 3. Classify:
-//!    - `unlink`/`unlinkat` → `TreeOp::Unlink`
+//!    and receives no success acknowledgement.
+//! 3. Register the fully decoded + attributed frame in the shared ingest
+//!    tracker before journal work begins.
+//! 4. Validate, classify, and durably journal evidence or CaptureRefused:
+//!    - `unlink`/`unlinkat`/`rmdir`/`remove` → `TreeOp::Unlink`
 //!    - `rename`/`renameat` → `TreeOp::Rename`  (arg is `from\tto`)
 //!    - `open`/`openat`/`truncate` with `pre_image=Some(_)` →
-//!      `FilePreImage` (W06.A.4); without it, log + drop.
+//!      `FilePreImage` (W06.A.4); without it, either a proven fresh
+//!      `TreeOp::Create` or an explicit capture refusal.
 //!    - `pwrite` / `ftruncate` / `mmap_shared_w` — logged but not
 //!      journaled (fd-based — needs fd→path resolution; deferred).
-//! 4. For content events: write blob bytes to the BlobStore, journal
-//!    `FilePreImage`. For TreeOp events: journal directly.
-//! 5. Ack `Allow`.
+//! 5. Only after durable evidence/refusal, or explicit routing to the ordered
+//!    kernel tier, send a best-effort `Allow` ack. An ack write failure never
+//!    discards evidence already received.
 //!
 //! The locked design decision is **fan-in** (single daemon-side socket,
 //! 100-conn pool) rather than fan-out per process.
@@ -39,11 +41,14 @@ use shit_planner::TreeOp;
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::inode::InodeRef;
 use shit_planner::metadata::{FileKind, FileMetadata};
-use shit_proto::{ShimAck, ShimNotification, ShimPreImage, decode_frame_large, encode_frame};
+use shit_proto::{
+    ShimAck, ShimNotification, ShimPreImage, decode_shim_notification_frame_large, encode_frame,
+};
 use shit_store::{BlobStore, Index};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
@@ -58,9 +63,228 @@ use tracing::{debug, info, warn};
 /// rejected before allocation.
 const SHIM_BUF_MAX: usize = shit_proto::MAX_LARGE_FRAME_SIZE;
 
+/// Tracks shim frames after they have been fully decoded. PostExec snapshots a
+/// decode-ticket watermark and seals its command; finalization then waits for
+/// every older decoded-but-not-yet-attributed frame and every attributed frame
+/// for that command.
+///
+/// This intentionally does **not** cover connections still in the accept
+/// backlog, frames not yet fully decoded, frames that never reached the
+/// socket, or attribution that becomes impossible after the producer exits.
+/// Those require a listener barrier plus a sender-side durable marker.
+#[derive(Debug, Default)]
+pub(crate) struct ShimIngestTracker {
+    inner: Mutex<ShimIngestTrackerInner>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct ShimIngestTrackerInner {
+    next_ticket: u64,
+    decoded_unattributed: BTreeSet<u64>,
+    commands: BTreeMap<shit_planner::CommandId, ShimCommandIngestState>,
+}
+
+#[derive(Debug, Default)]
+struct ShimCommandIngestState {
+    in_flight: usize,
+    sealed: bool,
+    late_registration: bool,
+}
+
+pub(crate) struct DecodedShimGuard {
+    tracker: Arc<ShimIngestTracker>,
+    ticket: Option<u64>,
+}
+
+pub(crate) struct ShimIngestRegistration {
+    tracker: Arc<ShimIngestTracker>,
+    command: shit_planner::CommandId,
+    late: bool,
+}
+
+pub(crate) struct PendingShimDrain {
+    tracker: Arc<ShimIngestTracker>,
+    command: shit_planner::CommandId,
+    decode_watermark: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ShimDrainError {
+    #[error("shim notification registered after the PostExec seal")]
+    LateRegistration,
+    #[error(
+        "timed out with {in_flight} attributed shim notification(s) and {decoded_unattributed} decoded unattributed notification(s) pending"
+    )]
+    TimedOut {
+        in_flight: usize,
+        decoded_unattributed: usize,
+    },
+}
+
+impl ShimIngestTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a frame immediately after successful full-frame decode.
+    pub(crate) fn begin_decoded(self: &Arc<Self>) -> DecodedShimGuard {
+        let ticket = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.next_ticket = inner.next_ticket.saturating_add(1);
+            let ticket = inner.next_ticket;
+            inner.decoded_unattributed.insert(ticket);
+            ticket
+        };
+        self.changed.notify_waiters();
+        DecodedShimGuard {
+            tracker: Arc::clone(self),
+            ticket: Some(ticket),
+        }
+    }
+
+    /// Seal a command at the synchronous PostExec boundary. Tombstones remain
+    /// for the daemon lifetime so a later decoded frame cannot reopen it.
+    pub(crate) fn seal(self: &Arc<Self>, command: shit_planner::CommandId) -> PendingShimDrain {
+        let decode_watermark = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.commands.entry(command).or_default().sealed = true;
+            inner.next_ticket
+        };
+        self.changed.notify_waiters();
+        PendingShimDrain {
+            tracker: Arc::clone(self),
+            command,
+            decode_watermark,
+        }
+    }
+
+    #[cfg(test)]
+    fn state_for_test(&self, command: shit_planner::CommandId) -> (usize, bool, bool) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .commands
+            .get(&command)
+            .map(|state| (state.in_flight, state.sealed, state.late_registration))
+            .unwrap_or_default()
+    }
+}
+
+impl DecodedShimGuard {
+    /// Atomically move a decoded ticket into a command's in-flight count.
+    /// The returned guard spans all journal/refusal writes for the frame.
+    pub(crate) fn attribute(mut self, command: shit_planner::CommandId) -> ShimIngestRegistration {
+        let ticket = self.ticket.take().expect("decoded ticket consumed once");
+        let late = {
+            let mut inner = self
+                .tracker
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.decoded_unattributed.remove(&ticket);
+            let state = inner.commands.entry(command).or_default();
+            let late = state.sealed;
+            state.late_registration |= late;
+            state.in_flight = state.in_flight.saturating_add(1);
+            late
+        };
+        self.tracker.changed.notify_waiters();
+        ShimIngestRegistration {
+            tracker: Arc::clone(&self.tracker),
+            command,
+            late,
+        }
+    }
+}
+
+impl ShimIngestRegistration {
+    pub(crate) fn is_late(&self) -> bool {
+        self.late
+    }
+}
+
+impl Drop for DecodedShimGuard {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        self.tracker
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decoded_unattributed
+            .remove(&ticket);
+        self.tracker.changed.notify_waiters();
+    }
+}
+
+impl Drop for ShimIngestRegistration {
+    fn drop(&mut self) {
+        let mut inner = self
+            .tracker
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = inner.commands.get_mut(&self.command) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        drop(inner);
+        self.tracker.changed.notify_waiters();
+    }
+}
+
+impl PendingShimDrain {
+    pub(crate) async fn wait(self, timeout: Duration) -> Result<(), ShimDrainError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Register the waiter before inspecting state so a transition
+            // between the inspection and await cannot be lost.
+            let changed = self.tracker.changed.notified();
+            let snapshot = {
+                let inner = self
+                    .tracker
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let command = inner.commands.get(&self.command);
+                let in_flight = command.map_or(0, |state| state.in_flight);
+                let late = command.is_some_and(|state| state.late_registration);
+                let decoded_unattributed = inner
+                    .decoded_unattributed
+                    .range(..=self.decode_watermark)
+                    .count();
+                (in_flight, decoded_unattributed, late)
+            };
+            if snapshot.0 == 0 && snapshot.1 == 0 {
+                return if snapshot.2 {
+                    Err(ShimDrainError::LateRegistration)
+                } else {
+                    Ok(())
+                };
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return Err(ShimDrainError::TimedOut {
+                    in_flight: snapshot.0,
+                    decoded_unattributed: snapshot.1,
+                });
+            }
+        }
+    }
+}
+
 /// Listen on the shim socket inside `$XDG_RUNTIME_DIR/shit/shim.sock`,
 /// serving each accepted connection on its own tokio task. Returns when
 /// `shutdown` fires.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     cfg: &ResolvedConfig,
     shutdown: Arc<Notify>,
@@ -68,6 +292,8 @@ pub async fn serve(
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
     live_baseline: Arc<LiveBaseline>,
+    ingest_tracker: Arc<ShimIngestTracker>,
+    finalization_blocks: Arc<crate::server::FinalizationBlocks>,
 ) -> anyhow::Result<()> {
     let sock_path = shim_socket_path(cfg);
     if let Some(parent) = sock_path.parent() {
@@ -91,8 +317,18 @@ pub async fn serve(
                     let blob_store = Arc::clone(&blob_store);
                     let active = Arc::clone(&active);
                     let live_baseline = Arc::clone(&live_baseline);
+                    let ingest_tracker = Arc::clone(&ingest_tracker);
+                    let finalization_blocks = Arc::clone(&finalization_blocks);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_one(stream, index, blob_store, active, live_baseline).await {
+                        if let Err(e) = handle_one(
+                            stream,
+                            index,
+                            blob_store,
+                            active,
+                            live_baseline,
+                            ingest_tracker,
+                            finalization_blocks,
+                        ).await {
                             debug!(err = %e, "shim client errored");
                         }
                     });
@@ -110,13 +346,16 @@ pub async fn serve(
     }
 }
 
-/// Per-connection handler. One notification → ingest → ack → close.
+/// Per-connection handler. One notification → decode/register → resolve →
+/// durable ingest/refusal → ack → close.
 async fn handle_one(
     mut stream: UnixStream,
     index: Arc<Index>,
     blob_store: Arc<BlobStore>,
     active: Arc<ActiveCommands>,
     live_baseline: Arc<LiveBaseline>,
+    ingest_tracker: Arc<ShimIngestTracker>,
+    finalization_blocks: Arc<crate::server::FinalizationBlocks>,
 ) -> anyhow::Result<()> {
     // W06.A.4.1: dynamic-allocation buffer. Read the 4-byte u32 BE
     // length prefix exactly, then allocate a buffer sized to the
@@ -183,13 +422,14 @@ async fn handle_one(
     if total == 0 {
         return Ok(());
     }
-    let note: ShimNotification = match decode_frame_large(&buf[..total]) {
+    let note: ShimNotification = match decode_shim_notification_frame_large(&buf[..total]) {
         Ok(n) => n,
         Err(e) => {
             warn!(err = %e, "shim notification decode failed");
             return Ok(());
         }
     };
+    let decoded = ingest_tracker.begin_decoded();
     debug!(
         pid = note.pid,
         syscall = %note.syscall,
@@ -198,66 +438,333 @@ async fn handle_one(
         "shim pre-mutation"
     );
 
-    // Resolve `pid → CommandId` BEFORE acking. The shim returns to
-    // the calling process immediately after we ack, the real
-    // syscall fires, and the process (e.g. `install` invoked by
-    // `make`) often terminates within milliseconds. If we resolve
-    // after acking, `ancestor_chain` shells out to `ps -p <pid>`
+    // Resolve `pid → CommandId` BEFORE acking. The shim has already called
+    // libc successfully, but it does not return to the mutating process until
+    // notification delivery completes (or its read deadline expires). The
+    // process (e.g. `install` invoked by `make`) can terminate within
+    // milliseconds after that return. If we resolve after acking,
+    // `ancestor_chain` can shell out to `ps -p <pid>`
     // for an already-dead pid and returns None — the notification
     // is then orphaned. Doing the resolution synchronously here
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    let resolved = active.resolve_by_descendant(note.pid);
+    let Some(command) = active.resolve_by_descendant(note.pid) else {
+        // This decoded frame cannot be authoritatively attached. Withholding
+        // the success ack is intentional; PID attribution after producer exit
+        // remains outside the tracker guarantee until the wire carries a
+        // validated CommandId claim.
+        debug!(pid = note.pid, syscall = %note.syscall, "shim notify: no active command for pid; withholding ack");
+        return Ok(());
+    };
+    let registration = decoded.attribute(command);
 
-    // Ack — never block the user's command on journaling. We're
-    // fail-open by design: even if the journal write below errors,
-    // the syscall proceeds.
+    // Reserve this notification's daemon logical timestamp before ingestion.
+    let ingest_ts = crate::server::next_ts();
+
+    let disposition = if registration.is_late() {
+        durable_shim_refusal(
+            &index,
+            command,
+            ingest_ts,
+            PathBuf::from(&note.arg),
+            "shim notification registered after the command's PostExec seal".to_string(),
+        )
+    } else {
+        ingest_notification(
+            &note,
+            command,
+            ingest_ts,
+            &index,
+            &blob_store,
+            &live_baseline,
+        )
+    };
+
+    let disposition = match disposition {
+        Ok(disposition) => disposition,
+        Err(error) => {
+            // Keep the in-flight registration live until the close block is
+            // installed. Otherwise PostExec could drain between guard drop
+            // and this insertion and publish a partially captured command.
+            finalization_blocks.insert(
+                command,
+                format!("shim ingest had no durable evidence or refusal: {error}"),
+            );
+            warn!(%command, %error, pid = note.pid, syscall = %note.syscall, "blocking command close after non-durable shim ingest");
+            drop(registration);
+            return Ok(());
+        }
+    };
+
+    // A durable disposition now exists. The drain covers journal work and
+    // close-block installation, not peer ack I/O.
+    drop(registration);
+
+    // ACK is after the durable shim disposition, except for explicit
+    // kernel-tier delegation. Delegation is accepted/routed here and fenced
+    // by the helper's ordered PostExec barrier; withholding its ACK would add
+    // the shim's full 50 ms timeout to every in-watch create in bulk workloads.
+    // The sender may already have timed out and closed; EPIPE cannot undo
+    // evidence already stored or the routing decision already made.
     let ack = ShimAck::Allow;
     let frame = encode_frame(&ack)?;
-    stream.write_all(&frame).await?;
-
-    ingest_notification(&note, resolved, &index, &blob_store, &live_baseline);
+    if let Err(e) = stream.write_all(&frame).await {
+        debug!(err = %e, pid = note.pid, syscall = %note.syscall, ?disposition, "shim ack write failed after durable ingest");
+    }
     Ok(())
 }
 
-/// Convert a shim notification into a `CaptureEvent` and journal it,
-/// if the emitter's pid resolves to an active command. Errors are
-/// logged but never propagated — the shim path is best-effort.
+fn journal_capture_refused(
+    index: &Index,
+    command: shit_planner::events::CommandId,
+    ts: shit_planner::time::TimePoint,
+    path: PathBuf,
+    detail: String,
+) -> Result<(), shit_store::IndexError> {
+    index
+        .put_event(&CaptureEvent {
+            id: EventId(0),
+            command,
+            ts,
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-incomplete".to_string(),
+                path,
+                detail,
+            },
+        })
+        .map(|_| ())
+}
+
+/// Return the first path that is unsafe to turn into an inverse.
+///
+/// The shim protocol intentionally carries absolute replay identities. A
+/// relative value cannot be repaired daemon-side because the emitter may have
+/// changed cwd (or used a real `*at` dirfd) and the command record's cwd is not
+/// authoritative for descendants.
+fn unsafe_replay_path(note: &ShimNotification) -> Option<(PathBuf, String)> {
+    use std::path::Component;
+
+    let validate = |raw: &str, field: &str| -> Result<PathBuf, String> {
+        if raw.as_bytes().contains(&0) {
+            return Err(format!("shim supplied {field} with an embedded NUL byte"));
+        }
+        let path = Path::new(raw);
+        if !path.is_absolute() {
+            return Err(format!(
+                "shim supplied relative {field}; refusing unsafe undo target"
+            ));
+        }
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::Normal(_) => {
+                    normalized.push(component.as_os_str());
+                }
+                Component::CurDir => return Err(format!("shim supplied {field} containing `.`")),
+                Component::ParentDir => {
+                    return Err(format!("shim supplied {field} containing `..`"));
+                }
+                Component::Prefix(_) => {
+                    return Err(format!("shim supplied {field} with a platform prefix"));
+                }
+            }
+        }
+        if normalized.to_str() != Some(raw) {
+            return Err(format!(
+                "shim supplied non-normalized {field}; refusing unsafe undo target"
+            ));
+        }
+        Ok(normalized)
+    };
+
+    if let Some(pre) = &note.pre_image
+        && let Err(detail) = validate(&pre.path, "pre-image path")
+    {
+        return Some((PathBuf::from(&pre.path), detail));
+    }
+    for pre in &note.extra_pre_images {
+        if let Err(detail) = validate(&pre.path, "recursive pre-image path") {
+            return Some((PathBuf::from(&pre.path), detail));
+        }
+    }
+
+    let is_rename = matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2");
+    if !is_rename && !note.extra_pre_images.is_empty() {
+        return Some((
+            PathBuf::from(&note.extra_pre_images[0].path),
+            "shim supplied recursive pre-images for a non-rename operation".to_string(),
+        ));
+    }
+
+    if matches!(
+        note.syscall.as_str(),
+        "unlink" | "unlinkat" | "rmdir" | "remove"
+    ) {
+        let Some(pre) = &note.pre_image else {
+            return Some((
+                PathBuf::from(&note.arg),
+                "successful destructive notification carried no deletion pre-image or metadata marker"
+                    .to_string(),
+            ));
+        };
+        if pre.path != note.arg {
+            return Some((
+                PathBuf::from(&note.arg),
+                format!(
+                    "destructive notification path disagreed with its pre-image path {:?}",
+                    pre.path
+                ),
+            ));
+        }
+    }
+
+    match note.syscall.as_str() {
+        "rename" | "renameat" | "renameat2" => {
+            let Some((from, to)) = note.arg.split_once('\t') else {
+                return Some((
+                    PathBuf::from(&note.arg),
+                    "shim supplied malformed rename operands; refusing unsafe undo target"
+                        .to_string(),
+                ));
+            };
+            if to.contains('\t') {
+                return Some((
+                    PathBuf::from(&note.arg),
+                    "shim supplied ambiguous rename operands; refusing unsafe undo target"
+                        .to_string(),
+                ));
+            }
+            let from_path = match validate(from, "rename source") {
+                Ok(path) => path,
+                Err(detail) => return Some((PathBuf::from(from), detail)),
+            };
+            let to_path = match validate(to, "rename destination") {
+                Ok(path) => path,
+                Err(detail) => return Some((PathBuf::from(to), detail)),
+            };
+            if let Some(pre) = &note.pre_image
+                && Path::new(&pre.path) != to_path
+            {
+                return Some((
+                    PathBuf::from(&pre.path),
+                    "rename destination pre-image is not bound to the rename destination"
+                        .to_string(),
+                ));
+            }
+            if let Some(pre) = note
+                .extra_pre_images
+                .iter()
+                .find(|pre| !Path::new(&pre.path).starts_with(&from_path))
+            {
+                return Some((
+                    PathBuf::from(&pre.path),
+                    "recursive rename pre-image is outside the rename source subtree".to_string(),
+                ));
+            }
+            None
+        }
+        "open" | "openat" | "truncate" | "unlink" | "unlinkat" | "rmdir" | "remove" | "mkfifo"
+        | "mkfifoat" | "link" | "linkat" | "mkdir" | "mkdirat" | "chmod" | "fchmod"
+        | "fchmodat" | "chown" | "fchown" | "lchown" | "fchownat" | "utimes" | "futimes"
+        | "futimens" | "utimensat" | "setxattr" | "fsetxattr" | "removexattr" | "fremovexattr"
+        | "chflags" | "fchflags" => {
+            let arg_path = match validate(&note.arg, "path") {
+                Ok(path) => path,
+                Err(detail) => return Some((PathBuf::from(&note.arg), detail)),
+            };
+            if let Some(pre) = &note.pre_image
+                && Path::new(&pre.path) != arg_path
+            {
+                return Some((
+                    PathBuf::from(&pre.path),
+                    "shim pre-image path is not bound to the syscall path".to_string(),
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Explicit outcome of processing one attributed shim notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShimIngestDisposition {
+    EvidenceDurable,
+    RefusalDurable,
+    ExistingEvidenceDurable,
+    /// This operation is intentionally owned by the ordered kernel capture
+    /// tier. PostExec's helper barrier remains the durability boundary.
+    DelegatedToKernelTier,
+}
+
+fn durable_shim_refusal(
+    index: &Index,
+    command: shit_planner::CommandId,
+    ts: shit_planner::time::TimePoint,
+    path: PathBuf,
+    detail: String,
+) -> Result<ShimIngestDisposition, String> {
+    journal_capture_refused(index, command, ts, path, detail)
+        .map(|()| ShimIngestDisposition::RefusalDurable)
+        .map_err(|error| error.to_string())
+}
+
+fn fallback_shim_refusal(
+    index: &Index,
+    command: shit_planner::CommandId,
+    ts: shit_planner::time::TimePoint,
+    path: PathBuf,
+    context: &str,
+    error: impl std::fmt::Display,
+) -> Result<ShimIngestDisposition, String> {
+    let detail = format!("{context}: {error}");
+    durable_shim_refusal(index, command, ts, path, detail.clone()).map_err(|refusal_error| {
+        format!("{detail}; fallback CaptureRefused was not durable: {refusal_error}")
+    })
+}
+
+/// Convert one authoritatively attributed shim notification into durable
+/// evidence, a durable command refusal, or an explicit ordered-tier
+/// delegation. No error is swallowed: an `Err` means neither the intended
+/// evidence nor its refusal fallback was durable, so command close must block.
 fn ingest_notification(
     note: &ShimNotification,
-    resolved: Option<shit_planner::events::CommandId>,
+    command: shit_planner::events::CommandId,
+    ingest_ts: shit_planner::time::TimePoint,
     index: &Index,
     blob_store: &BlobStore,
     live_baseline: &LiveBaseline,
-) {
-    let Some(command) = resolved else {
-        // The shim is loaded into a process whose ancestor isn't a
-        // tracked shell. Likely a background daemon / system service
-        // that picked up LD_PRELOAD from a parent env, OR the pid
-        // resolution raced the process's lifetime.
-        debug!(pid = note.pid, syscall = %note.syscall, "shim notify: no active command for pid; dropping");
-        return;
-    };
-
-    // AU10 — when the shim reported a structured capture failure
-    // (canonicalize_path tripping its load-bearing fallback is the
-    // canonical example), journal a CaptureRefused event BEFORE the
-    // rest of the syscall-specific handling. The downstream
-    // pre-image/TreeOp ingest may still fire (we don't want to lose
-    // the partial capture); the journaled refusal ensures the
-    // planner surfaces the gap as an InverseOp::Refuse node at undo
-    // time instead of silently mis-attributing.
+) -> Result<ShimIngestDisposition, String> {
+    // AU10 — a structured resolution failure means the shim could not prove
+    // a stable target identity. Journal one refusal and stop: the protocol's
+    // contract is explicitly "refusal instead of an inverse op". Falling
+    // through here used to pair the refusal with a best-effort relative
+    // TreeOp, which could later be replayed from `shit undo`'s cwd.
     if let Some(failure) = &note.failure {
-        let (class, primary_path, detail) = match failure {
+        let (primary_path, detail) = match failure {
             shit_proto::ShimFailure::CanonicalizeFailed {
                 which_arg,
                 attempted_path,
                 error_chain,
             } => (
-                "capture-incomplete".to_string(),
                 PathBuf::from(attempted_path),
                 format!("shim canonicalize tripped on {which_arg} argument ({error_chain})"),
+            ),
+            shit_proto::ShimFailure::PreImageUnavailable {
+                attempted_path,
+                reason,
+            } => (
+                PathBuf::from(attempted_path),
+                format!("shim could not capture the pre-image ({reason})"),
+            ),
+            shit_proto::ShimFailure::UnsupportedOperation {
+                attempted_path,
+                reason,
+            } => (
+                PathBuf::from(attempted_path),
+                format!("shim cannot model this operation safely ({reason})"),
             ),
         };
         // The primary path matters for the user-visible refusal
@@ -265,62 +772,34 @@ fn ingest_notification(
         // (not a canonicalized form) because the failure mode IS
         // that canonicalize couldn't resolve it — surfacing the
         // raw input is the honest signal.
-        let event = CaptureEvent {
-            id: EventId(0),
-            command,
-            ts: crate::server::next_ts(),
-            partial: false,
-            kind: CaptureEventKind::CaptureRefused {
-                class,
-                path: primary_path,
-                detail,
-            },
-        };
-        if let Err(e) = index.put_event(&event) {
-            warn!(
-                err = %e,
-                pid = note.pid,
-                syscall = %note.syscall,
-                "shim notify: CaptureRefused journal failed"
-            );
-        } else {
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                session = %command.session,
-                seq = command.seq,
-                "shim notify: journaled CaptureRefused (AU10)"
-            );
-        }
-        // Fall through — the syscall may have attached a partial
-        // pre_image too (e.g., `from` canonicalized but `to`
-        // didn't). Ingest what we can; the Refuse marker is
-        // additive.
+        return durable_shim_refusal(index, command, ingest_ts, primary_path, detail);
     }
 
-    // M07.B.5: metadata-mutation syscalls (chmod / chown / utimes /
-    // xattr families). The shim's pre-image carries the OLD
+    // Defense in depth for older shims and malformed/corrupt frames. Every
+    // filesystem operand that can become an inverse must already be absolute
+    // when it reaches the daemon. Never reinterpret a captured path using the
+    // daemon's cwd or the future undo caller's cwd.
+    if let Some((path, detail)) = unsafe_replay_path(note) {
+        return durable_shim_refusal(index, command, ingest_ts, path, detail);
+    }
+
+    // M07.B.5: metadata-mutation syscalls (chmod/chown/xattr and legacy
+    // timestamp notifications). The shim's pre-image carries the OLD
     // mode/uid/gid/mtime; ingest as a FilePreImage event so the
     // event lands in the journal with the BEFORE metadata fields
-    // populated. Without this branch, fchmodat / fchownat /
-    // utimensat etc. fall through to classify_tree_op (which
-    // returns None for them) and the daemon drops the event —
-    // undo has nothing to invert.
+    // populated. Current timestamp interposers send a structured refusal
+    // instead because FileMetadata does not yet carry atime; keeping their
+    // names here makes older compatible notifications explicit rather than
+    // falling through and disappearing.
     //
-    // Planner-side: synthesizing a metadata-restore inverse from
-    // a FilePreImage that has no companion TreeOp is the M07.B.6
-    // follow-up. This slice ships the journal correctness fix; the
-    // planner gap is surfaced explicitly so undo reports "captured
-    // but not yet restorable" rather than silently failing.
+    // Planner-side, the source discriminator below emits metadata-only
+    // restoration: inline bytes are never treated as file content.
     //
-    // Why not use the richer `MetadataChange { before, after }`
-    // event the ES producer emits? Because the shim notifies
-    // BEFORE the libc passthrough returns — a daemon-side stat to
-    // capture `after` sees the unchanged BEFORE state (the chmod
-    // hasn't fired yet on the file). Capturing `after` properly
-    // would require either (a) shim sending a post-syscall
-    // follow-up notification, or (b) the planner inferring after-
-    // state from the syscall arg shape. Both are M07.B.6 scope.
+    // Why not use the richer `MetadataChange { before, after }` event the ES
+    // producer emits? The shim captures the pre-state before libc and sends it
+    // only after libc succeeds; it intentionally carries no authoritative
+    // post-state. Undo needs only the captured before-state, while redo reports
+    // this limitation explicitly.
     if matches!(
         note.syscall.as_str(),
         "chmod"
@@ -338,53 +817,57 @@ fn ingest_notification(
             | "fsetxattr"
             | "removexattr"
             | "fremovexattr"
-            // M03.x.SETATTR — chflags family. Pre-image carries the
-            // OLD st_flags via FileMetadataWire.flags; ingest_pre_image
-            // routes through the same FilePreImage path as the chmod
-            // family. Planner-side, the inverse is RestoreMetadata
-            // (the executor's restore_flags_only call wraps chflags).
+            // B09 — chflags family. Pre-image carries the OLD st_flags;
+            // the source discriminator makes the planner emit only a
+            // RestoreFlags inverse rather than content + broad metadata.
             | "chflags"
             | "fchflags"
     ) {
         if let Some(pre) = &note.pre_image {
-            if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
-                warn!(
-                    err = %e,
-                    pid = note.pid,
-                    syscall = %note.syscall,
-                    "shim notify: metadata pre-image ingest failed"
-                );
+            let source = if matches!(note.syscall.as_str(), "chflags" | "fchflags") {
+                shit_planner::FilePreImageSource::ShimFlagsPreMutation
             } else {
-                debug!(
-                    pid = note.pid,
-                    syscall = %note.syscall,
-                    arg = %note.arg,
-                    "shim notify: metadata-mutation pre-image journaled (M07.B.5)"
-                );
-            }
+                shit_planner::FilePreImageSource::ShimMetadataPreMutation
+            };
+            return match ingest_pre_image_with_source(
+                command, pre, index, blob_store, source, ingest_ts,
+            ) {
+                Ok(()) => Ok(ShimIngestDisposition::EvidenceDurable),
+                Err(error) => fallback_shim_refusal(
+                    index,
+                    command,
+                    ingest_ts,
+                    PathBuf::from(&pre.path),
+                    "metadata pre-image ingest failed",
+                    error,
+                ),
+            };
         } else {
-            // No pre-image — typical for xattr family (path-only
-            // notify today) or fd-based variants where F_GETPATH
-            // failed. Drop with a debug log; the lack of journal
-            // entry surfaces at undo as a coverage gap.
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                arg = %note.arg,
-                "shim notify: metadata-mutation without pre-image; dropping"
+            return durable_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "successful metadata mutation carried no pre-image".to_string(),
             );
         }
-        return;
     }
 
     // W06.A.4: content syscalls with attached pre-image take the
     // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
         if let Some(pre) = &note.pre_image {
-            if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
-                warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
-            }
-            return;
+            return match ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
+                Ok(()) => Ok(ShimIngestDisposition::EvidenceDurable),
+                Err(error) => fallback_shim_refusal(
+                    index,
+                    command,
+                    ingest_ts,
+                    PathBuf::from(&pre.path),
+                    "content pre-image ingest failed",
+                    error,
+                ),
+            };
         }
         // AR05.1: no pre-image means the file didn't exist when the
         // shim looked. On in-watch paths the dir-diff Create event
@@ -410,7 +893,7 @@ fn ingest_notification(
                 arg = %note.arg,
                 "shim notify: path is in-watch; defer to kqueue dir-diff"
             );
-            return;
+            return Ok(ShimIngestDisposition::DelegatedToKernelTier);
         }
         // Inode sentinel (0,0) matches the Unlink path's convention
         // (line 347) — the executor's TreeOp::Create reverse is just
@@ -423,7 +906,7 @@ fn ingest_notification(
         let event = CaptureEvent {
             id: EventId(0),
             command,
-            ts: crate::server::next_ts(),
+            ts: ingest_ts,
             partial: false,
             kind: CaptureEventKind::TreeOp(TreeOp::Create {
                 inode: InodeRef::new(0, 0),
@@ -432,17 +915,17 @@ fn ingest_notification(
                 mode: 0o644,
             }),
         };
-        if let Err(e) = index.put_event(&event) {
-            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
-        } else {
-            debug!(
-                pid = note.pid,
-                syscall = %note.syscall,
-                arg = %note.arg,
-                "shim notify: journaled fresh-create as TreeOp::Create"
-            );
-        }
-        return;
+        return match index.put_event(&event) {
+            Ok(_) => Ok(ShimIngestDisposition::EvidenceDurable),
+            Err(error) => fallback_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "fresh-create journal failed",
+                error,
+            ),
+        };
     }
 
     // W06.A.4: a rename notification with an attached pre-image is
@@ -457,9 +940,16 @@ fn ingest_notification(
     // empty and the bytes stuck at the source tmpfile path.
     if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store)
+        && let Err(error) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
     {
-        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: rename pre-image ingest failed");
+        return fallback_shim_refusal(
+            index,
+            command,
+            ingest_ts,
+            PathBuf::from(&pre.path),
+            "rename destination pre-image ingest failed",
+            error,
+        );
     }
     // DR-CR-54 — when the rename's source was a directory, the
     // shim captured per-file pre-images for every regular file in
@@ -477,7 +967,7 @@ fn ingest_notification(
         let mut journaled = 0u64;
         let mut failed = 0u64;
         for pre in &note.extra_pre_images {
-            match ingest_pre_image(command, pre, index, blob_store) {
+            match ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
                 Ok(()) => journaled += 1,
                 Err(e) => {
                     failed += 1;
@@ -494,6 +984,18 @@ fn ingest_notification(
             failed,
             "shim notify: recursive rename pre-images ingested (DR-CR-54)"
         );
+        if failed > 0 {
+            return durable_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                format!(
+                    "{failed} of {} recursive rename pre-images failed to ingest",
+                    note.extra_pre_images.len()
+                ),
+            );
+        }
     }
     // Fall through to journal the TreeOp::Rename below.
 
@@ -505,25 +1007,41 @@ fn ingest_notification(
     // and uses the FilePreImage's RestoreContent inverse instead
     // of the Unlink's RecreatePath. Journal both events; the
     // planner picks the right shape.
-    if matches!(note.syscall.as_str(), "unlink" | "unlinkat")
+    if matches!(note.syscall.as_str(), "unlink" | "unlinkat" | "remove")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store)
+        && matches!(FileKind::from_mode(pre.mode), Some(FileKind::Regular))
+        && let Err(error) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
     {
-        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: unlink pre-image ingest failed");
+        return fallback_shim_refusal(
+            index,
+            command,
+            ingest_ts,
+            PathBuf::from(&pre.path),
+            "unlink pre-image ingest failed",
+            error,
+        );
     }
     // Fall through to journal the TreeOp::Unlink below.
 
-    let Some(kind) = classify_tree_op(&note.syscall, &note.arg) else {
+    let Some(kind) = classify_tree_op(&note.syscall, &note.arg, note.pre_image.as_ref()) else {
         // Fd-based content syscalls (ftruncate, pwrite, mmap_shared_w)
         // have no path in the wire payload; they need fd→path resolution
         // which is FreeBSD-specific (procstat/kvm). Deferred.
-        debug!(
-            pid = note.pid,
-            syscall = %note.syscall,
-            arg = %note.arg,
-            "shim notify: syscall not classifiable (fd-based content needs fd→path resolution)"
-        );
-        return;
+        let detail = if matches!(
+            note.syscall.as_str(),
+            "ftruncate" | "pwrite" | "mmap_shared_w"
+        ) {
+            format!(
+                "successful fd-based {} mutation has no stable path or pre-image",
+                note.syscall
+            )
+        } else {
+            format!(
+                "successful shim syscall {} is not safely classifiable",
+                note.syscall
+            )
+        };
+        return durable_shim_refusal(index, command, ingest_ts, PathBuf::from(&note.arg), detail);
     };
 
     // M03.x.CREATE / M03.x.LINK: gate Create-style classifications
@@ -538,15 +1056,17 @@ fn ingest_notification(
     // channel for mkfifo even in-watch. Gating it here would cause
     // the existing mkfifo-undo-fbsd smoke to lose its only signal.
     //
-    // link/linkat ARE gated — kqueue NOTE_WRITE on the dst's parent
-    // fires for hardlink creation (it appears as a fresh dirent),
-    // so in-watch link gets dir-diff coverage; the shim's notify
-    // would duplicate.
+    // link/linkat + mkdir/mkdirat ARE gated — kqueue NOTE_WRITE on
+    // the destination's parent fires when either creates a fresh
+    // dirent, so in-watch mutations get dir-diff coverage and the
+    // shim's notification would duplicate it.
     //
     // Unlink/Rename pass through (they describe in-place mutations,
     // not creates) — only the Create variants gate.
-    if matches!(note.syscall.as_str(), "link" | "linkat")
-        && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    if matches!(
+        note.syscall.as_str(),
+        "link" | "linkat" | "mkdir" | "mkdirat"
+    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
     {
         debug!(
             pid = note.pid,
@@ -554,28 +1074,60 @@ fn ingest_notification(
             arg = %note.arg,
             "shim notify: Create path is in-watch; defer to kqueue dir-diff"
         );
-        return;
+        return Ok(ShimIngestDisposition::DelegatedToKernelTier);
     }
 
-    let ts = crate::server::next_ts();
-    let event = CaptureEvent {
-        id: EventId(0),
-        command,
-        ts,
-        partial: false,
-        kind,
-    };
-    if let Err(e) = index.put_event(&event) {
-        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
-        return;
+    if let CaptureEventKind::TreeOp(tree_op) = kind {
+        match crate::helper_link::journal_tree_op(
+            index,
+            command,
+            ingest_ts,
+            tree_op,
+            crate::helper_link::TreeSignalSource::Shim,
+            false,
+        ) {
+            Ok(crate::helper_link::TreeJournalOutcome::Journaled) => {
+                Ok(ShimIngestDisposition::EvidenceDurable)
+            }
+            Ok(crate::helper_link::TreeJournalOutcome::Deduplicated) => {
+                debug!(
+                    pid = note.pid,
+                    syscall = %note.syscall,
+                    session = %command.session,
+                    seq = command.seq,
+                    "shim notify: equivalent helper TreeOp already journaled"
+                );
+                Ok(ShimIngestDisposition::ExistingEvidenceDurable)
+            }
+            Err(error) => fallback_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "shim TreeOp journal failed",
+                error,
+            ),
+        }
+    } else {
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: ingest_ts,
+            partial: false,
+            kind,
+        };
+        match index.put_event(&event) {
+            Ok(_) => Ok(ShimIngestDisposition::EvidenceDurable),
+            Err(error) => fallback_shim_refusal(
+                index,
+                command,
+                ingest_ts,
+                PathBuf::from(&note.arg),
+                "shim event journal failed",
+                error,
+            ),
+        }
     }
-    debug!(
-        pid = note.pid,
-        syscall = %note.syscall,
-        session = %command.session,
-        seq = command.seq,
-        "shim notify: journaled"
-    );
 }
 
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
@@ -586,30 +1138,46 @@ fn ingest_pre_image(
     pre: &ShimPreImage,
     index: &Index,
     blob_store: &BlobStore,
+    ts: shit_planner::time::TimePoint,
 ) -> anyhow::Result<()> {
-    let (blob_hash, stat) = blob_store
+    ingest_pre_image_with_source(
+        command,
+        pre,
+        index,
+        blob_store,
+        shit_planner::FilePreImageSource::Other,
+        ts,
+    )
+}
+
+/// Variant of [`ingest_pre_image`] that preserves why the shim captured
+/// the snapshot. Metadata/chflags shims use this so the planner treats inline
+/// bytes as a wire detail and never rewrites content for a metadata-only op.
+fn ingest_pre_image_with_source(
+    command: shit_planner::events::CommandId,
+    pre: &ShimPreImage,
+    index: &Index,
+    blob_store: &BlobStore,
+    source: shit_planner::FilePreImageSource,
+    ts: shit_planner::time::TimePoint,
+) -> anyhow::Result<()> {
+    // Keep GC's exclusive sweep lock out across the complete publication
+    // sequence. Between blob creation and the event refcount trigger, the new
+    // object is intentionally still at zero references.
+    let publication = blob_store.shared_guard();
+    let (blob_hash, stat) = publication
         .put(&pre.bytes)
         .map_err(|e| anyhow::anyhow!("blob put: {e}"))?;
-    let ts = crate::server::next_ts();
     index
         .put_blob_record(blob_hash, stat.stored_bytes, stat.compressed, ts)
         .map_err(|e| anyhow::anyhow!("put_blob_record: {e}"))?;
     let inode = InodeRef::new(pre.dev, pre.inode);
-    // M03.x.XATTR-MUTATE — build the FULL captured xattrs target.
-    // The shim only captures the ONE xattr being mutated (via
-    // `pre.xattr`) — the file's other xattrs (com.apple.provenance,
-    // user.*, etc.) aren't shipped on the wire. If we left them out
-    // of target.xattrs, the planner's RestoreMetadata "delete
-    // orphans" loop would remove every xattr not in target on undo.
-    //
-    // Strategy: read the file's CURRENT xattrs daemon-side, then
-    // overlay the shim's pre-value for the specific xattr the
-    // syscall is mutating. There's a small race (microseconds
-    // between shim-notify and this read); workloads that mutate
-    // multiple xattrs concurrently might lose attribution for
-    // ones not the syscall's primary target. Acceptable for v1;
-    // a future hardening could have the shim capture all xattrs.
-    let xattrs = build_xattrs_target(&pre.path, pre.xattr.as_ref());
+    // Current shims capture the complete pre-mutation xattr set from the same
+    // descriptor as content/metadata. A legacy payload has `xattrs=None`; it
+    // may use the old strict pathname fallback only while that pathname still
+    // exists. In particular, unlink ingestion never needs (or attempts) a
+    // post-syscall lookup when the authoritative wire snapshot is present.
+    let xattrs = resolve_xattrs_target(pre)?;
     let meta = FileMetadata {
         mode: pre.mode,
         uid: pre.uid,
@@ -636,12 +1204,13 @@ fn ingest_pre_image(
             // time. The planner's post-mutation conflict detection
             // is best-effort for shim-captured events.
             post_content_hash: None,
-            source: shit_planner::FilePreImageSource::Other,
+            source,
         },
     };
     index
         .put_event(&event)
         .map_err(|e| anyhow::anyhow!("put_event: {e}"))?;
+    drop(publication);
     Ok(())
 }
 
@@ -651,25 +1220,65 @@ fn ingest_pre_image(
 ///
 /// Inodes are best-effort: for `Rename` we stat the destination
 /// (which is the inode-preserved post-state, so stat-after-syscall
-/// works). For `Unlink` the path is gone by ingest time so we use
-/// `InodeRef::new(0, 0)` as a sentinel — the planner doesn't
-/// require a valid inode for the Unlink-inverse-is-RecreatePath
-/// path.
-fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
+/// works). For `Unlink`, a shim pre-image or metadata marker must supply the
+/// original inode/kind/mode. Missing or malformed deletion evidence is a
+/// refusal; it must never be guessed as an empty regular file.
+fn classify_tree_op(
+    syscall: &str,
+    arg: &str,
+    pre_image: Option<&ShimPreImage>,
+) -> Option<CaptureEventKind> {
     match syscall {
-        "unlink" | "unlinkat" => {
+        "unlink" | "unlinkat" | "rmdir" | "remove" => {
             let path = PathBuf::from(arg);
-            // G02: shim doesn't carry kind/mode in its notification
-            // wire (the shim's notify happens pre-syscall and
-            // doesn't fstat). Default to Regular/0o100644, matching
-            // pre-G02 hard-coded behavior. The kernel-tier LSM
-            // path (helper) DOES carry kind+mode and overrides this
-            // when both tiers see the same unlink.
+            let Some(pre) = pre_image else {
+                return Some(CaptureEventKind::CaptureRefused {
+                    class: "capture-incomplete".to_string(),
+                    path,
+                    detail: "shim supplied a destructive notification without deletion evidence"
+                        .to_string(),
+                });
+            };
+            let Some(kind) = FileKind::from_mode(pre.mode) else {
+                return Some(CaptureEventKind::CaptureRefused {
+                    class: "capture-incomplete".to_string(),
+                    path,
+                    detail: format!(
+                        "shim supplied deletion evidence with unknown file mode {:#o}",
+                        pre.mode
+                    ),
+                });
+            };
+            let inode = InodeRef::new(pre.dev, pre.inode);
+            let mode = pre.mode;
+            if kind == FileKind::Symlink {
+                let Some(target) = String::from_utf8(pre.bytes.clone()).ok() else {
+                    return Some(CaptureEventKind::CaptureRefused {
+                        class: "capture-incomplete".to_string(),
+                        path,
+                        detail: "shim supplied a symlink marker without a UTF-8 target".to_string(),
+                    });
+                };
+                return Some(CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                    inode,
+                    target,
+                    path,
+                }));
+            }
+            if kind != FileKind::Regular {
+                return Some(CaptureEventKind::CaptureRefused {
+                    class: "capture-incomplete".to_string(),
+                    path,
+                    detail: format!(
+                        "metadata-only deletion evidence cannot safely reconstruct {kind:?}"
+                    ),
+                });
+            }
             Some(CaptureEventKind::TreeOp(TreeOp::Unlink {
-                inode: InodeRef::new(0, 0),
+                inode,
                 path,
-                kind: shit_planner::metadata::FileKind::Regular,
-                mode: 0o100644,
+                kind,
+                mode,
             }))
         }
         "rename" | "renameat" | "renameat2" => {
@@ -721,22 +1330,21 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
-        // M03.x.CREATE mkdir: routed in CI but rolled back here —
-        // emitting TreeOp::Create{Directory} for out-of-watch mkdirs
-        // unconditionally caused cargo-install-force-undo to fail
-        // (applied=42, conflicts=6). Cargo's incidental parent dirs
-        // (e.g. `cargo-root/bin`) ended up rmdir-recursive'd by the
-        // executor's unlink_inner ENOTEMPTY fallback, racing the
-        // RestoreContent inverse for files INSIDE that dir.
-        //
-        // Closing this properly needs planner-side coordination:
-        // when a Create's path is a Directory AND any other inverse
-        // in the plan targets a path UNDER that directory, the
-        // rmdir should attempt empty-only (no recursive fallback)
-        // so the dir survives if it's still hosting restored
-        // content. Tracked as a follow-up; smoke
-        // `mkdir-out-of-watch-undo-macos.sh` is EXCLUDED_BY pending
-        // that work.
+        "mkdir" | "mkdirat" => {
+            // M03.x.CREATE — create notifications are emitted only
+            // after mkdir succeeds. In particular, mkdir -p calls
+            // that return EEXIST no longer fabricate Create events
+            // for pre-existing parent directories. In-watch creates
+            // are gated above; this classifies the out-of-watch path.
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Directory,
+                mode: 0o755,
+            }))
+        }
         _ => None,
     }
 }
@@ -750,11 +1358,10 @@ fn inode_of(path: &str) -> Option<InodeRef> {
     Some(InodeRef::new(meta.dev(), meta.ino()))
 }
 
-/// M03.x.XATTR-MUTATE — build the target xattr map for a captured
-/// shim pre-image. Reads the file's CURRENT xattrs daemon-side as
-/// the baseline, then overlays the shim's captured pre-value for
-/// the specific xattr being mutated (or removes it from the target
-/// if `value: None` — i.e. xattr didn't exist pre-syscall).
+/// Resolve a pre-image's complete xattr target. New payloads carry the
+/// authoritative map directly. Legacy payloads use a strict pathname read and
+/// overlay the one old-style xattr pre-value; a missing/deleted path therefore
+/// becomes an ingest error and a command-atomic CaptureRefused event.
 ///
 /// This is what the planner's `restore_user_xattrs` converges to:
 ///   - target has key+value → setxattr to restore the value
@@ -764,29 +1371,50 @@ fn inode_of(path: &str) -> Option<InodeRef> {
 /// microseconds. Workloads that mutate xattrs concurrently from
 /// multiple processes might lose attribution for non-primary
 /// xattrs. Acceptable for v1.
-fn build_xattrs_target(
-    path: &str,
-    xattr_pre: Option<&shit_proto::XattrPreImage>,
-) -> BTreeMap<String, Vec<u8>> {
-    let mut target = read_all_user_xattrs(path);
-    if let Some(xpre) = xattr_pre {
+fn resolve_xattrs_target(pre: &ShimPreImage) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    if let Some(target) = &pre.xattrs {
+        if let Some(xpre) = &pre.xattr {
+            let key = snapshot_xattr_name(&xpre.name);
+            if target.get(key) != xpre.value.as_ref() {
+                return Err(anyhow::anyhow!(
+                    "wire xattr snapshot disagrees with legacy pre-value for {:?}",
+                    xpre.name
+                ));
+            }
+        }
+        return Ok(target.clone());
+    }
+
+    let mut target = read_all_user_xattrs(&pre.path)?;
+    if let Some(xpre) = &pre.xattr {
+        let key = snapshot_xattr_name(&xpre.name);
         match &xpre.value {
             Some(v) => {
                 // Pre-syscall the xattr existed with this value.
                 // Overlay so target reflects pre-state, not the
                 // (possibly post-mutation) value from the daemon's
                 // own read.
-                target.insert(xpre.name.clone(), v.clone());
+                target.insert(key.to_string(), v.clone());
             }
             None => {
                 // Pre-syscall the xattr did NOT exist. Drop it
                 // from target so the restore loop's delete-orphans
                 // path removes it.
-                target.remove(&xpre.name);
+                target.remove(key);
             }
         }
     }
-    target
+    Ok(target)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_xattr_name(name: &str) -> &str {
+    name.strip_prefix("user.").unwrap_or(name)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn snapshot_xattr_name(name: &str) -> &str {
+    name
 }
 
 /// Read all user-namespace xattrs at `path`. macOS uses
@@ -795,11 +1423,11 @@ fn build_xattrs_target(
 /// platforms return empty (the M07 shim is macOS-only and the
 /// kqueue capture tier on FreeBSD doesn't go through this path).
 #[cfg(target_os = "macos")]
-fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
+fn read_all_user_xattrs(path: &str) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     use std::ffi::CString;
-    let Ok(c_path) = CString::new(path) else {
-        return BTreeMap::new();
-    };
+    const XATTR_CAPTURE_CAP: usize = 8 * 1024 * 1024;
+
+    let c_path = CString::new(path).map_err(|e| anyhow::anyhow!("xattr path contains NUL: {e}"))?;
     // First call sizes the buffer. XATTR_NOFOLLOW so we operate on
     // the symlink itself if `path` is one (matches the shim's
     // capture site which uses symlink_metadata).
@@ -811,10 +1439,23 @@ fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
             libc::XATTR_NOFOLLOW,
         )
     };
-    if list_size <= 0 {
-        return BTreeMap::new();
+    if list_size < 0 {
+        return Err(anyhow::anyhow!(
+            "listxattr size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
-    let mut name_buf = vec![0u8; list_size as usize];
+    if list_size == 0 {
+        return Ok(BTreeMap::new());
+    }
+    let list_size = usize::try_from(list_size)
+        .map_err(|_| anyhow::anyhow!("xattr name-list length does not fit usize"))?;
+    if list_size > XATTR_CAPTURE_CAP {
+        return Err(anyhow::anyhow!(
+            "xattr name list is {list_size} bytes, above the {XATTR_CAPTURE_CAP}-byte cap"
+        ));
+    }
+    let mut name_buf = vec![0u8; list_size];
     let n = unsafe {
         libc::listxattr(
             c_path.as_ptr(),
@@ -823,27 +1464,34 @@ fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
             libc::XATTR_NOFOLLOW,
         )
     };
-    if n <= 0 {
-        return BTreeMap::new();
+    if n < 0 {
+        return Err(anyhow::anyhow!(
+            "listxattr read failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if n as usize != list_size {
+        return Err(anyhow::anyhow!(
+            "xattr name list changed during capture (expected {list_size}, read {n})"
+        ));
     }
     let mut out = BTreeMap::new();
+    let mut total = list_size;
     // listxattr returns NUL-separated name list.
     for raw in name_buf[..n as usize].split(|&b| b == 0) {
         if raw.is_empty() {
             continue;
         }
-        let Ok(name) = std::str::from_utf8(raw) else {
-            continue;
-        };
-        // Skip system xattrs the planner shouldn't try to restore.
-        // com.apple.* are kernel/Finder-managed; the user didn't
-        // set them with `xattr -w`.
-        if name.starts_with("com.apple.") {
+        let name = std::str::from_utf8(raw)
+            .map_err(|_| anyhow::anyhow!("xattr name is not valid UTF-8"))?;
+        // Keep capture filtering identical to the executor's centralized
+        // denylist. Dropping every com.apple.* key here would make metadata
+        // restore delete unrelated quarantine/FinderInfo attributes.
+        if name == "com.apple.provenance" {
             continue;
         }
-        let Ok(c_name) = CString::new(name) else {
-            continue;
-        };
+        let c_name =
+            CString::new(name).map_err(|e| anyhow::anyhow!("xattr name contains NUL: {e}"))?;
         let val_size = unsafe {
             libc::getxattr(
                 c_path.as_ptr(),
@@ -855,9 +1503,27 @@ fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
             )
         };
         if val_size < 0 {
-            continue;
+            return Err(anyhow::anyhow!(
+                "getxattr size query for {name:?} failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        let mut val = vec![0u8; val_size as usize];
+        let val_size = usize::try_from(val_size)
+            .map_err(|_| anyhow::anyhow!("xattr {name:?} length does not fit usize"))?;
+        if val_size > XATTR_CAPTURE_CAP {
+            return Err(anyhow::anyhow!(
+                "xattr {name:?} is {val_size} bytes, above the {XATTR_CAPTURE_CAP}-byte cap"
+            ));
+        }
+        total = total
+            .checked_add(val_size)
+            .ok_or_else(|| anyhow::anyhow!("xattr capture length overflow"))?;
+        if total > XATTR_CAPTURE_CAP {
+            return Err(anyhow::anyhow!(
+                "xattr capture exceeds the {XATTR_CAPTURE_CAP}-byte aggregate cap"
+            ));
+        }
+        let mut val = vec![0u8; val_size];
         let got = unsafe {
             libc::getxattr(
                 c_path.as_ptr(),
@@ -869,22 +1535,124 @@ fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
             )
         };
         if got < 0 {
-            continue;
+            return Err(anyhow::anyhow!(
+                "getxattr read for {name:?} failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        val.truncate(got as usize);
+        if got as usize != val_size {
+            return Err(anyhow::anyhow!(
+                "xattr {name:?} changed during capture (expected {val_size}, read {got})"
+            ));
+        }
         out.insert(name.to_string(), val);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(target_os = "freebsd")]
-fn read_all_user_xattrs(path: &str) -> BTreeMap<String, Vec<u8>> {
-    crate::xattr::read_user_xattrs_at_path(std::path::Path::new(path))
+fn read_all_user_xattrs(path: &str) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    crate::xattr::try_read_user_xattrs_at_path(std::path::Path::new(path))
+        .map_err(|e| anyhow::anyhow!("strict FreeBSD xattr capture failed: {e}"))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-fn read_all_user_xattrs(_path: &str) -> BTreeMap<String, Vec<u8>> {
-    BTreeMap::new()
+#[cfg(target_os = "linux")]
+fn read_all_user_xattrs(path: &str) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    use std::ffi::CString;
+    const XATTR_CAPTURE_CAP: usize = 8 * 1024 * 1024;
+
+    let c_path = CString::new(path).map_err(|e| anyhow::anyhow!("xattr path contains NUL: {e}"))?;
+    let list_size = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+    if list_size < 0 {
+        return Err(anyhow::anyhow!(
+            "listxattr size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if list_size == 0 {
+        return Ok(BTreeMap::new());
+    }
+    let list_size = usize::try_from(list_size)
+        .map_err(|_| anyhow::anyhow!("xattr name-list length does not fit usize"))?;
+    if list_size > XATTR_CAPTURE_CAP {
+        return Err(anyhow::anyhow!(
+            "xattr name list is {list_size} bytes, above the {XATTR_CAPTURE_CAP}-byte cap"
+        ));
+    }
+    let mut names = vec![0 as libc::c_char; list_size];
+    let got = unsafe { libc::listxattr(c_path.as_ptr(), names.as_mut_ptr(), names.len()) };
+    if got < 0 || got as usize != list_size {
+        return Err(anyhow::anyhow!(
+            "xattr name list changed or failed during capture: {}",
+            if got < 0 {
+                std::io::Error::last_os_error().to_string()
+            } else {
+                format!("expected {list_size}, read {got}")
+            }
+        ));
+    }
+    let name_bytes =
+        unsafe { std::slice::from_raw_parts(names.as_ptr().cast::<u8>(), names.len()) };
+    let mut out = BTreeMap::new();
+    let mut total = list_size;
+    for raw in name_bytes
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let full = std::str::from_utf8(raw)
+            .map_err(|_| anyhow::anyhow!("xattr name is not valid UTF-8"))?;
+        let Some(name) = full.strip_prefix("user.") else {
+            continue;
+        };
+        let c_name =
+            CString::new(full).map_err(|e| anyhow::anyhow!("xattr name contains NUL: {e}"))?;
+        let value_size =
+            unsafe { libc::getxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+        if value_size < 0 {
+            return Err(anyhow::anyhow!(
+                "getxattr size query for {full:?} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let value_size = usize::try_from(value_size)
+            .map_err(|_| anyhow::anyhow!("xattr {full:?} length does not fit usize"))?;
+        total = total
+            .checked_add(value_size)
+            .ok_or_else(|| anyhow::anyhow!("xattr capture length overflow"))?;
+        if total > XATTR_CAPTURE_CAP {
+            return Err(anyhow::anyhow!(
+                "xattr capture exceeds the {XATTR_CAPTURE_CAP}-byte aggregate cap"
+            ));
+        }
+        let mut value = vec![0u8; value_size];
+        let read = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if read < 0 || read as usize != value_size {
+            return Err(anyhow::anyhow!(
+                "xattr {full:?} changed or failed during capture: {}",
+                if read < 0 {
+                    std::io::Error::last_os_error().to_string()
+                } else {
+                    format!("expected {value_size}, read {read}")
+                }
+            ));
+        }
+        out.insert(name.to_string(), value);
+    }
+    Ok(out)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "linux")))]
+fn read_all_user_xattrs(_path: &str) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    Err(anyhow::anyhow!(
+        "complete xattr capture is unsupported on this platform"
+    ))
 }
 
 /// Resolve the shim socket path. Default is sibling to the hook socket
@@ -905,12 +1673,306 @@ pub fn shim_socket_path(cfg: &ResolvedConfig) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shit_proto::{decode_frame, encode_frame};
+    use shit_planner::store::PlannerStore;
+    use shit_proto::{decode_frame, encode_shim_notification_frame};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
 
     fn fresh_blob_store(tmp: &std::path::Path) -> Arc<BlobStore> {
         Arc::new(BlobStore::open(tmp.join("blobs")).unwrap())
+    }
+
+    fn note(syscall: &str, arg: &str) -> ShimNotification {
+        ShimNotification {
+            pid: 4242,
+            syscall: syscall.to_string(),
+            arg: arg.to_string(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+        }
+    }
+
+    fn tracker_command(seq: u64) -> shit_planner::CommandId {
+        shit_planner::CommandId {
+            session: uuid::Uuid::nil(),
+            seq,
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_frame_blocks_drain_until_ingest_guard_drops() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(100);
+        let registration = tracker.begin_decoded().attribute(command);
+        assert!(!registration.is_late());
+        let pending = tracker.seal(command);
+        let waiter = tokio::spawn(async move { pending.wait(Duration::from_secs(1)).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        assert_eq!(tracker.state_for_test(command), (1, true, false));
+
+        drop(registration);
+        assert_eq!(waiter.await.unwrap(), Ok(()));
+        assert_eq!(tracker.state_for_test(command), (0, true, false));
+    }
+
+    #[tokio::test]
+    async fn decoded_before_seal_then_attributed_after_seal_is_late() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(101);
+        let decoded = tracker.begin_decoded();
+        let pending = tracker.seal(command);
+        let waiter = tokio::spawn(async move { pending.wait(Duration::from_secs(1)).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        let registration = decoded.attribute(command);
+        assert!(registration.is_late());
+        drop(registration);
+
+        assert_eq!(waiter.await.unwrap(), Err(ShimDrainError::LateRegistration));
+        assert_eq!(tracker.state_for_test(command), (0, true, true));
+    }
+
+    #[tokio::test]
+    async fn drain_times_out_while_attributed_ingest_is_in_flight() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(102);
+        let registration = tracker.begin_decoded().attribute(command);
+        let result = tracker.seal(command).wait(Duration::from_millis(20)).await;
+
+        assert_eq!(
+            result,
+            Err(ShimDrainError::TimedOut {
+                in_flight: 1,
+                decoded_unattributed: 0,
+            })
+        );
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn sealed_tombstone_rejects_frames_after_an_initial_drain() {
+        let tracker = Arc::new(ShimIngestTracker::new());
+        let command = tracker_command(103);
+        assert_eq!(
+            tracker.seal(command).wait(Duration::from_millis(20)).await,
+            Ok(())
+        );
+
+        let registration = tracker.begin_decoded().attribute(command);
+        assert!(registration.is_late());
+        drop(registration);
+        assert_eq!(
+            tracker.seal(command).wait(Duration::from_millis(20)).await,
+            Err(ShimDrainError::LateRegistration)
+        );
+    }
+
+    #[test]
+    fn mkdir_notifications_classify_as_directory_creates() {
+        for syscall in ["mkdir", "mkdirat"] {
+            let path = format!("/tmp/shit-{syscall}-does-not-exist");
+            let event = classify_tree_op(syscall, &path, None).expect("mkdir must be classifiable");
+
+            match event {
+                CaptureEventKind::TreeOp(TreeOp::Create {
+                    path: event_path,
+                    kind,
+                    mode,
+                    ..
+                }) => {
+                    assert_eq!(event_path, PathBuf::from(&path));
+                    assert_eq!(kind, FileKind::Directory);
+                    assert_eq!(mode, 0o755);
+                }
+                other => panic!("unexpected mkdir classification: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unlink_directory_marker_is_refused_as_lossy() {
+        let pre = ShimPreImage {
+            path: "/tmp/removed-dir".into(),
+            dev: 7,
+            inode: 9,
+            mode: 0o040750,
+            uid: 1000,
+            gid: 1000,
+            size: 64,
+            mtime_unix_nanos: 0,
+            bytes: Vec::new(),
+            xattr: None,
+            flags: 0,
+            xattrs: Some(BTreeMap::new()),
+        };
+        for syscall in ["unlinkat", "rmdir", "remove"] {
+            let event = classify_tree_op(syscall, &pre.path, Some(&pre)).unwrap();
+            assert!(matches!(
+                event,
+                CaptureEventKind::CaptureRefused { ref path, ref detail, .. }
+                    if path == Path::new("/tmp/removed-dir")
+                        && detail.contains("cannot safely reconstruct Directory")
+            ));
+        }
+    }
+
+    #[test]
+    fn unlink_symlink_marker_preserves_lexical_target() {
+        let pre = ShimPreImage {
+            path: "/tmp/removed-link".into(),
+            dev: 7,
+            inode: 10,
+            mode: 0o120777,
+            uid: 1000,
+            gid: 1000,
+            size: 9,
+            mtime_unix_nanos: 0,
+            bytes: b"../target".to_vec(),
+            xattr: None,
+            flags: 0,
+            xattrs: Some(BTreeMap::new()),
+        };
+        let event = classify_tree_op("unlink", &pre.path, Some(&pre)).unwrap();
+        assert!(matches!(
+            event,
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemovedIdentified {
+                inode,
+                target,
+                path,
+            }) if inode == InodeRef::new(7, 10)
+                && target == "../target"
+                && path == Path::new("/tmp/removed-link")
+        ));
+    }
+
+    #[test]
+    fn destructive_notification_without_preimage_is_refused() {
+        for syscall in ["unlink", "unlinkat", "rmdir", "remove"] {
+            let event = classify_tree_op(syscall, "/tmp/missing-evidence", None).unwrap();
+            assert!(matches!(event, CaptureEventKind::CaptureRefused { .. }));
+
+            let note = note(syscall, "/tmp/missing-evidence");
+            assert!(unsafe_replay_path(&note).is_some());
+        }
+    }
+
+    #[test]
+    fn destructive_notification_rejects_disagreeing_preimage_path() {
+        let mut note = note("unlink", "/tmp/claimed-target");
+        note.pre_image = Some(ShimPreImage {
+            path: "/tmp/different-target".into(),
+            dev: 1,
+            inode: 2,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            mtime_unix_nanos: 0,
+            bytes: Vec::new(),
+            xattr: None,
+            flags: 0,
+            xattrs: Some(BTreeMap::new()),
+        });
+        assert!(unsafe_replay_path(&note).is_some());
+    }
+
+    #[test]
+    fn replay_path_validation_checks_all_mutable_operands() {
+        assert!(unsafe_replay_path(&note("open", "relative.txt")).is_some());
+        assert!(unsafe_replay_path(&note("rename", "/absolute/from\trelative-to")).is_some());
+        assert!(unsafe_replay_path(&note("rename", "/missing-delimiter")).is_some());
+        assert!(unsafe_replay_path(&note("rename", "/from\t/to")).is_none());
+        assert!(unsafe_replay_path(&note("open", "/tmp/../unsafe")).is_some());
+        assert!(unsafe_replay_path(&note("open", "/tmp//unsafe")).is_some());
+
+        let mut primary = note("open", "/absolute/arg");
+        primary.pre_image = Some(ShimPreImage {
+            path: "relative-pre-image".into(),
+            dev: 1,
+            inode: 2,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            mtime_unix_nanos: 0,
+            bytes: Vec::new(),
+            xattr: None,
+            flags: 0,
+            xattrs: Some(BTreeMap::new()),
+        });
+        assert!(unsafe_replay_path(&primary).is_some());
+
+        let mut recursive = note("rename", "/absolute/from\t/absolute/to");
+        recursive.extra_pre_images = primary.pre_image.into_iter().collect();
+        assert!(unsafe_replay_path(&recursive).is_some());
+
+        let mut wrong_destination = note("rename", "/absolute/from\t/absolute/to");
+        wrong_destination.pre_image = Some(ShimPreImage {
+            path: "/absolute/not-to".into(),
+            dev: 1,
+            inode: 2,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            mtime_unix_nanos: 0,
+            bytes: Vec::new(),
+            xattr: None,
+            flags: 0,
+            xattrs: Some(BTreeMap::new()),
+        });
+        assert!(unsafe_replay_path(&wrong_destination).is_some());
+    }
+
+    #[test]
+    fn relative_create_journals_only_capture_refused() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let blob_store = BlobStore::open(tmp.path().join("blobs")).unwrap();
+        let live_baseline = LiveBaseline::new();
+        let session = uuid::Uuid::nil();
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        index
+            .put_session(session, "bash", 4242, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("create relative.txt".into()),
+                cwd: tmp.path().to_path_buf(),
+                pid: 4242,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+
+        ingest_notification(
+            &note("open", "relative.txt"),
+            command,
+            TimePoint::new(1, 1),
+            &index,
+            &blob_store,
+            &live_baseline,
+        )
+        .unwrap();
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            CaptureEventKind::CaptureRefused { .. }
+        ));
     }
 
     /// Spawn a one-shot listener, connect a sync client, send a
@@ -919,6 +1981,9 @@ mod tests {
     /// shim's eventual call shape.
     #[tokio::test]
     async fn one_shot_notify_round_trip() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("shim.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -927,11 +1992,42 @@ mod tests {
         let blob_store = fresh_blob_store(tmp.path());
         let active = Arc::new(ActiveCommands::new());
         let live_baseline = Arc::new(LiveBaseline::new());
+        let pid = std::process::id();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::nil(),
+            seq: 1,
+        };
+        index
+            .put_session(command.session, "bash", pid, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("unlink /tmp/probe".into()),
+                cwd: tmp.path().to_path_buf(),
+                pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        assert!(active.insert(pid, command));
+        let handler_index = Arc::clone(&index);
         let _accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_one(stream, index, blob_store, active, live_baseline)
-                .await
-                .unwrap();
+            handle_one(
+                stream,
+                handler_index,
+                blob_store,
+                active,
+                live_baseline,
+                Arc::new(ShimIngestTracker::new()),
+                Arc::new(crate::server::FinalizationBlocks::default()),
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -942,7 +2038,7 @@ mod tests {
             let mut s = StdUnixStream::connect(&sock_path).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let note = ShimNotification {
-                pid: 4242,
+                pid,
                 syscall: "unlink".into(),
                 arg: "/tmp/probe".into(),
                 ts_unix_nanos: 0,
@@ -950,7 +2046,7 @@ mod tests {
                 extra_pre_images: Vec::new(),
                 failure: None,
             };
-            let frame = encode_frame(&note).unwrap();
+            let frame = encode_shim_notification_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
             let mut buf = vec![0u8; 64];
             let n = s.read(&mut buf).unwrap();
@@ -960,6 +2056,203 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(client_result, ShimAck::Allow);
+        assert!(
+            index
+                .events_for_command(command)
+                .iter()
+                .any(|event| { matches!(event.kind, CaptureEventKind::CaptureRefused { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn non_durable_refusal_withholds_ack_and_blocks_finalization() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("shim.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let index = Arc::new(Index::open(tmp.path().join("idx.sqlite")).unwrap());
+        let blob_store = fresh_blob_store(tmp.path());
+        let active = Arc::new(ActiveCommands::new());
+        let pid = std::process::id();
+        let command = tracker_command(2);
+        index
+            .put_session(command.session, "bash", pid, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("unlink /tmp/probe".into()),
+                cwd: tmp.path().to_path_buf(),
+                pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_shim_refusal
+                 BEFORE INSERT ON events
+                 WHEN NEW.discriminant = 'CaptureRefused'
+                 BEGIN SELECT RAISE(FAIL, 'injected shim refusal failure'); END;",
+            )
+            .unwrap();
+        assert!(active.insert(pid, command));
+        let blocks = Arc::new(crate::server::FinalizationBlocks::default());
+        let handler_blocks = Arc::clone(&blocks);
+        let handler = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_one(
+                stream,
+                index,
+                blob_store,
+                active,
+                Arc::new(LiveBaseline::new()),
+                Arc::new(ShimIngestTracker::new()),
+                handler_blocks,
+            )
+            .await
+        });
+
+        let client_sock = sock.clone();
+        let bytes_read = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream = StdUnixStream::connect(client_sock).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let frame = encode_shim_notification_frame(&ShimNotification {
+                pid,
+                syscall: "unlink".into(),
+                arg: "/tmp/probe".into(),
+                ts_unix_nanos: 0,
+                pre_image: None,
+                extra_pre_images: Vec::new(),
+                failure: None,
+            })
+            .unwrap();
+            stream.write_all(&frame).unwrap();
+            let mut ack = [0u8; 64];
+            stream.read(&mut ack).unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes_read, 0, "non-durable ingest must not receive Allow");
+        handler.await.unwrap().unwrap();
+        assert!(
+            blocks
+                .get(command)
+                .is_some_and(|detail| detail.contains("no durable evidence or refusal"))
+        );
+    }
+
+    /// A shim is allowed to stop waiting for the ACK after its short
+    /// deadline. The daemon has already decoded and attributed the capture at
+    /// that point, so a closed peer must not suppress journal ingestion.
+    #[tokio::test]
+    async fn closed_ack_peer_still_journals_pre_image() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        use std::io::Write as _;
+        use std::net::Shutdown;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("shim.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let index = Arc::new(Index::open(tmp.path().join("idx.sqlite")).unwrap());
+        let blob_store = fresh_blob_store(tmp.path());
+        let active = Arc::new(ActiveCommands::new());
+        let live_baseline = Arc::new(LiveBaseline::new());
+
+        let session = uuid::Uuid::nil();
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        let pid = std::process::id();
+        index
+            .put_session(session, "bash", pid, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("unlink then clonefile".into()),
+                cwd: tmp.path().to_path_buf(),
+                pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        active.insert(pid, command);
+
+        let handler_index = Arc::clone(&index);
+        let handler = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_one(
+                stream,
+                handler_index,
+                blob_store,
+                active,
+                live_baseline,
+                Arc::new(ShimIngestTracker::new()),
+                Arc::new(crate::server::FinalizationBlocks::default()),
+            )
+            .await
+        });
+
+        let note = ShimNotification {
+            pid,
+            syscall: "unlink".into(),
+            arg: "/tmp/clone-destination".into(),
+            ts_unix_nanos: 0,
+            pre_image: Some(ShimPreImage {
+                path: "/tmp/clone-destination".into(),
+                dev: 64,
+                inode: 7777,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 3,
+                mtime_unix_nanos: 0,
+                bytes: b"old".to_vec(),
+                xattr: None,
+                flags: 0,
+                xattrs: Some(BTreeMap::new()),
+            }),
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let frame = shit_proto::encode_shim_notification_frame_large(&note).unwrap();
+        let client_sock = sock.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut stream = StdUnixStream::connect(client_sock).unwrap();
+            stream.write_all(&frame).unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
+        })
+        .await
+        .unwrap();
+
+        handler.await.unwrap().unwrap();
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 2, "unlink capture needs pre-image + tree op");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, CaptureEventKind::FilePreImage { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, CaptureEventKind::TreeOp(TreeOp::Unlink { .. })))
+        );
     }
 
     /// W06.A.4 — a content notification with an inline pre-image gets
@@ -996,8 +2289,11 @@ mod tests {
             })
             .expect("put_command");
 
+        let deleted_path = tmp.path().join("deleted-before-ingest.txt");
+        std::fs::write(&deleted_path, b"hello").unwrap();
+        std::fs::remove_file(&deleted_path).unwrap();
         let pre = ShimPreImage {
-            path: "/tmp/foo.txt".into(),
+            path: deleted_path.to_string_lossy().into_owned(),
             dev: 64,
             inode: 7777,
             mode: 0o100644,
@@ -1008,8 +2304,26 @@ mod tests {
             bytes: b"hello".to_vec(),
             xattr: None,
             flags: 0,
+            xattrs: Some(BTreeMap::from([(
+                "user.shit.snapshot".to_string(),
+                b"preserved".to_vec(),
+            )])),
         };
-        ingest_pre_image(command, &pre, &index, &blob_store).expect("ingest");
+        let reserved_ts = TimePoint::new(777, 42);
+        ingest_pre_image(command, &pre, &index, &blob_store, reserved_ts).expect("ingest");
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ts, reserved_ts);
+        assert!(matches!(
+            &events[0].kind,
+            CaptureEventKind::FilePreImage {
+                source: shit_planner::FilePreImageSource::Other,
+                meta,
+                ..
+            } if meta.xattrs.get("user.shit.snapshot").map(Vec::as_slice)
+                == Some(b"preserved".as_slice())
+        ));
 
         // Blob present at canonical hash. put() is content-addressed
         // and idempotent, so re-calling on the same bytes returns
@@ -1021,5 +2335,181 @@ mod tests {
             .expect("blob present");
         let round_trip = blob_store.get(blob_hash).expect("get");
         assert_eq!(round_trip, b"hello");
+    }
+
+    #[test]
+    fn legacy_pre_image_with_deleted_path_cannot_fabricate_empty_xattrs() {
+        let missing = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("already-deleted")
+            .to_string_lossy()
+            .into_owned();
+        let pre = ShimPreImage {
+            path: missing,
+            dev: 64,
+            inode: 7777,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: 0,
+            mtime_unix_nanos: 0,
+            bytes: Vec::new(),
+            xattr: None,
+            flags: 0,
+            // This is how the dedicated decoder marks a legacy payload.
+            xattrs: None,
+        };
+        assert!(
+            resolve_xattrs_target(&pre).is_err(),
+            "a missing legacy path must refuse instead of becoming authoritative empty"
+        );
+    }
+
+    #[test]
+    fn chflags_notification_uses_flags_source_and_reserved_timestamp() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let blob_store = BlobStore::open(tmp.path().join("blobs")).unwrap();
+        let session = uuid::Uuid::nil();
+        index
+            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .expect("put_session");
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("chflags hidden target".into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: 4242,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .expect("put_command");
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "chflags".into(),
+            arg: "/tmp/flags-target".into(),
+            ts_unix_nanos: 0,
+            pre_image: Some(ShimPreImage {
+                path: "/tmp/flags-target".into(),
+                dev: 64,
+                inode: 8888,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 0,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                bytes: Vec::new(),
+                xattr: None,
+                flags: 7,
+                xattrs: Some(BTreeMap::new()),
+            }),
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let reserved_ts = TimePoint::new(778, 43);
+
+        ingest_notification(
+            &note,
+            command,
+            reserved_ts,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        )
+        .unwrap();
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ts, reserved_ts);
+        assert!(matches!(
+            &events[0].kind,
+            CaptureEventKind::FilePreImage {
+                source: shit_planner::FilePreImageSource::ShimFlagsPreMutation,
+                meta,
+                ..
+            } if meta.flags == 7
+        ));
+    }
+
+    #[test]
+    fn chmod_notification_is_marked_metadata_only() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let blob_store = BlobStore::open(tmp.path().join("blobs")).unwrap();
+        let session = uuid::Uuid::nil();
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        index
+            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("chmod 600 target".into()),
+                cwd: "/tmp".into(),
+                pid: 4242,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "chmod".into(),
+            arg: "/tmp/metadata-target".into(),
+            ts_unix_nanos: 0,
+            pre_image: Some(ShimPreImage {
+                path: "/tmp/metadata-target".into(),
+                dev: 64,
+                inode: 9999,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 12,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                // Metadata notifications may carry bytes because they reuse
+                // ShimPreImage. Their source discriminator must keep those
+                // bytes out of RestoreContent planning.
+                bytes: b"must-not-restore-as-content".to_vec(),
+                xattr: None,
+                flags: 0,
+                xattrs: Some(BTreeMap::new()),
+            }),
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+
+        ingest_notification(
+            &note,
+            command,
+            TimePoint::new(779, 44),
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        )
+        .unwrap();
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(matches!(
+            &events[0].kind,
+            CaptureEventKind::FilePreImage {
+                source: shit_planner::FilePreImageSource::ShimMetadataPreMutation,
+                ..
+            }
+        ));
     }
 }

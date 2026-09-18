@@ -29,16 +29,16 @@ make ci     # everything CI runs
 
 - **`shit`** — the CLI: `shit undo`, `shit redo`, `shit list`, `shit show`, `shit pin`, `shit doctor`, …
 - **`shitd`** — a per-user daemon that owns the snapshot store, the sqlite index, the IPC sockets, and the undo planner.
-- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + LD_PRELOAD shim on FreeBSD (the shim is the supported default; running without it is reported by `shit doctor` as the degraded `kqueue-only` tier). Falls back to FSEvents-degraded on un-entitled macOS installs.
+- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + LD_PRELOAD shim on FreeBSD (the shim is the supported default; running without it is reported by `shit doctor` as the degraded `kqueue-only` tier). On un-entitled macOS installs, FSEvents supplies watch readiness and post-hoc diagnostics; actionable default-mode capture comes from the DYLD interposer.
 - **shell hooks** (bash, zsh, fish) that bracket each command with metadata events sent over a per-user Unix-domain-socket.
 
-When a command writes, renames, unlinks, or otherwise mutates a file inside a tracked process subtree, the helper captures the pre-image *before* the kernel allows the syscall to complete — using `clonefile` (APFS), `reflink` (btrfs/XFS), `zfs clone` (ZFS), hardlink, or streaming copy, picking the cheapest tier the underlying filesystem supports. Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`. When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
+For supported mutations, the capture tier records the pre-image before the mutation: kernel authorization tiers do so before allowing the syscall, while LD_PRELOAD/DYLD interposers capture before calling libc and publish the event only if the call succeeds. Depending on the active tier and filesystem, production capture uses `clonefile` (APFS), `reflink` (btrfs/XFS), hardlink, or bounded streaming copy. Degraded observers such as macOS FSEvents emit partial events for readiness and diagnostics; if one of those observations remains in a command's journal, the planner refuses the whole command and emits no executable inverses. Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`. When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
 
 Honesty principle: any command class we cannot mechanically reverse goes in the [refuse-list catalog](#refuse-list-what-we-explicitly-wont-undo) — `shit undo` exits non-zero with a one-line reason rather than silently producing a partial undo.
 
 ## Coverage today
 
-Each entry below has a green CI smoke. The capture mechanism column is named at the kernel surface that fires, not the user-facing tool. "LSM" means the helper's eBPF program is attached to the named hook (`bpf_lsm_<hook>`); "shim" means the LD_PRELOAD shim in `crates/shit-preload-shim/`; "wrapper" means a packaging wrapper script in `packaging/` that brackets the real binary with `shit-helper <tool>-event`.
+Each entry below has a green CI smoke. Where the safe behavior is an explicit refusal rather than an undo, the row says so. The capture mechanism column is named at the kernel surface that fires, not the user-facing tool. "LSM" means the helper's eBPF program is attached to the named hook (`bpf_lsm_<hook>`); "shim" means the LD_PRELOAD shim in `crates/shit-preload-shim/`; "wrapper" means a packaging wrapper script in `packaging/` that brackets the real binary with `shit-helper <tool>-event`.
 
 A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tier-agnostic** — they branch on the runtime platform inside the script and run unchanged on Linux, FreeBSD, and macOS. The smoke-driver auto-buckets them into every available CI runner.
 
@@ -49,8 +49,10 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 | Class | LSM hook | Smoke |
 |---|---|---|
 | `rm` / `unlink` / `unlinkat` | `inode_unlink` | `rm-undo-linux.sh` |
-| `rmdir` / `unlinkat(AT_REMOVEDIR)` (carries dir mode for accurate restore) | `inode_rmdir` (G03) | `git-clean-fd-undo-linux.sh` |
-| `chmod`, `chown`, `chgrp`, `utimes`, `truncate` | `inode_setattr` (v1/v2 BTF-dispatch for kernel ≥7.0 `mnt_idmap` drift) | `chmod-undo-linux.sh`, `chown-undo-linux.sh` |
+| `rmdir` / `unlinkat(AT_REMOVEDIR)` | `inode_rmdir`; captures a typed metadata-only marker, then refuses because complete directory metadata cannot yet be replayed | `rmdir-undo-lsm-tier-linux.sh` |
+| create a FIFO with `mkfifo` | `inode_create`; inverse removes the newly created path | `mkfifo-undo-linux.sh` |
+| delete a pre-existing FIFO | `inode_unlink`; captures a typed metadata-only marker, then refuses because complete FIFO metadata cannot yet be replayed | `mkfifo-restore-undo-linux.sh` |
+| `chmod`, `chown`, `chgrp`, `truncate` | `inode_setattr` (v1/v2 BTF-dispatch for kernel ≥7.0 `mnt_idmap` drift) | `chmod-undo-linux.sh`, `chown-undo-linux.sh` |
 | `mkdir` / `mkdirat` | `inode_mkdir` | `mkdir-undo-linux.sh` |
 | `open(O_CREAT)` / `creat` | `inode_create` | covered via `edit-undo-linux.sh`, `touch-edit-undo-linux.sh` |
 | `rename` / `renameat2` (atomic-replace, vim/git/sed dance, dir-rename recursive pre-image) | `inode_rename` (DR-CR-54 recursive subtree capture) | `mv-undo-linux.sh`, `vim-edit-undo-linux.sh`, `sed-i-undo-linux.sh`, `git-commit-undo-linux.sh`, `dir-rename-undo-linux.sh` |
@@ -71,7 +73,7 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 | `git stash drop` — `.git/refs/stash` rewrite | `git-stash-drop-undo-linux.sh` |
 | `git branch -D` (loose ref) | `git-branch-D-undo-linux.sh` |
 | `git branch -D` (packed-refs path — `git pack-refs --all` collapsed shape) | `git-branch-D-packed-undo-linux.sh` |
-| `git clean -fd` (files + directories at captured mode) | `git-clean-fd-undo-linux.sh` |
+| `git clean -fd` — command-atomic refusal when directory deletion is present; captured file inverses are not partially applied | `git-clean-fd-undo-linux.sh` |
 
 **Shell-state mutations** (DEBUG-trap snapshot via `crates/shit-shell/src/state.rs` → `PreExecShellState` IPC → `ShellStateRestore` inverse, applied via the per-session precmd-queue mechanism — DR-CR-50):
 
@@ -98,16 +100,18 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 | `dnf install / remove` | delegates to `dnf history undo <id>` | `dnf-history-undo-linux.sh` |
 | `apt`-tier capture wire (DR-19) | `pkg-event` IPC + journal | `apt-pkg.sh` |
 
-**Container / orchestration** (helper-side `container-event` wrapper captures `docker inspect` JSON pre-mutation; planner walks the JSON to reconstruct a `docker run` argv with ~15 flags):
+**Container / orchestration** uses an atomic prepare/runtime/finalize protocol. Positive undo coverage currently admits only one explicit, non-pruning image-tag removal against Docker's local `default` context. Route overrides, multiple targets, Podman, and other destructive verbs fail closed before the real runtime executes (exit 125). Installed wrappers enforce the same policy independently with a policy-specific `v3-rmi1` capability, and CLI/daemon startup atomically refreshes stale installed copies after an upgrade.
 
-| Workload | Smoke |
-|---|---|
-| `docker rm` (full container restore from `docker save` + inspect-JSON argv synthesis) | `docker-rm-undo-linux.sh` |
-| `docker rmi` (image tag restore via `docker load`) | `docker-rmi-undo-linux.sh` |
-| `docker volume rm` (volume tar stash + restore) | `docker-volume-rm-undo-linux.sh` |
-| `docker network rm` (network spec replay) | `docker-network-rm-undo-linux.sh` |
-| `docker compose down` (compose project snapshot + `up -d` replay) | `docker-compose-down-undo-linux.sh` |
-| `podman rm` (cross-runtime delegation through the same path) | `podman-rm-undo-linux.sh` |
+`PREPARED` and `CONFIRMED` batches protect their archive stashes regardless of age because capture may still be authorizing or the runtime may still be executing. A successful wrapper report advances the batch to durable `FINALIZED`: its inverse stays actionable, while the normal 24-hour stash window starts from the persisted runtime-completion time. `REFUSED` and `FINALIZED` batches return to ordinary command/GC retention, shared archive hashes use the latest referencing finalization time, and new retained container evidence is refused before publication above a 5 GiB hard ceiling.
+
+| Workload | Current policy | Smoke |
+|---|---|---|
+| `docker rmi --no-prune <tag>` (one tag, local `default` context) | supported: pre-runtime `CONFIRMED` binds a tag-free archive to the immutable image ID; wrapper completion records `FINALIZED`; undo loads and conditionally restores that tag | `docker-rmi-undo-linux.sh` |
+| `docker rmi --no-prune <tag> <tag> ...`, route overrides, or Podman `rmi` | refused before runtime; every image remains intact | `docker-rmi-multi-target-undo-linux.sh` |
+| `docker rm`, `podman rm` | refused before runtime; the container remains intact | `docker-rm-undo-linux.sh`, `podman-rm-undo-linux.sh` |
+| `docker volume rm` | refused before runtime; the volume and its contents remain intact | `docker-volume-rm-undo-linux.sh` |
+| `docker network rm` | refused before runtime; the network remains intact | `docker-network-rm-undo-linux.sh` |
+| `docker compose down` | refused before runtime; the project remains running | `docker-compose-down-undo-linux.sh` |
 
 **Cloud / IaC** (helper-side `cloud-event` wrapper captures tool state pre-mutation):
 
@@ -132,7 +136,7 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 
 Capture tier: kqueue (`EVFILT_VNODE` NOTE_WRITE/RENAME/DELETE/ATTRIB) + LD_PRELOAD shim for the cross-watch / install-overwrite race. The shim is the supported default; `shit doctor` reports the `kqueue-only` tier when the shim is missing and surfaces a multi-line WARN block telling you which classes of pre-image you lose. Capsicum sandbox is default-on (B05); set `SHIT_CAPSICUM=0` to opt out.
 
-Pre-image CoW tier on ZFS-backed paths: per-event `zfs clone`. The COW engine snapshots the source dataset, clones the snapshot to a hidden mountpoint (`/tmp/.shit-clones/<id>`), reads the pre-image bytes from the clone, then destroys the clone + snapshot — all per captured event. Falls through to hardlink + streaming copy when `/sbin/zfs` is missing, the path isn't on ZFS, or the dataset is `mountpoint=none|legacy`. Coverage validated by `zfs-clone-primitives-fbsd.sh` (primitives) and `zfs-clone-engine-fbsd.sh` (engine wire).
+An experimental per-event ZFS clone engine exists and is validated in isolation by `zfs-clone-primitives-fbsd.sh` and `zfs-clone-engine-fbsd.sh`, but it is not yet called by the production helper or daemon. Current BSD capture uses kqueue plus the preload shim and bounded staging/streaming; the ZFS smokes are engine tests, not a production-tier support claim.
 
 | Class | Smoke |
 |---|---|
@@ -147,7 +151,7 @@ Pre-image CoW tier on ZFS-backed paths: per-event `zfs clone`. The COW engine sn
 
 ### macOS
 
-Capture tier: EndpointSecurity (M03 — entitled installs) with FSEvents-degraded fallback (M01 — un-entitled, no Apple Developer ID required). The helper auto-selects at boot: ES when the entitlement is granted, FSEvents otherwise. `shit doctor` reports the active tier.
+Capture tier: EndpointSecurity (M03 — entitled installs) or the DYLD interposer for eligible dynamically linked processes (un-entitled default installs). The helper also starts FSEvents in the default tier, but those post-hoc events are marked partial: they establish watch readiness and provide diagnostics, not pre-images. A persisted partial observation makes the command refusal-only; it is never silently dropped while other inverses run. Reconciliation is not yet persistent and order-independent, so this can conservatively refuse a command even when DYLD or ES also supplied authoritative evidence. The DYLD path does not cover SIP/platform or hardened-runtime binaries, statically linked programs, or direct syscalls. `shit doctor` reports the active helper tier.
 
 | Class | Capture | Smoke |
 |---|---|---|
@@ -155,11 +159,14 @@ Capture tier: EndpointSecurity (M03 — entitled installs) with FSEvents-degrade
 | `mv` / `rename` | ES `AUTH_RENAME` | `es-rename-undo-macos.sh` |
 | `truncate` / `ftruncate` | ES `AUTH_TRUNCATE` | `es-truncate-undo-macos.sh` |
 | content overwrites via `open(O_WRONLY)` | ES `AUTH_OPEN` + clonefile pre-image | `es-open-write-undo-macos.sh` |
-| `chmod` / `chown` / `utimes` (metadata) | ES `AUTH_SETATTRLIST` | `es-chmod-metadata-macos.sh` |
+| `chmod` / `chown` (metadata) | ES `AUTH_SETMODE` / `AUTH_SETOWNER` observation; explicit refusal until mode/ACL side effects have a lossless inverse | `es-chmod-metadata-macos.sh` |
 | xattr round-trip | ES + xattr capture (M03.x.XATTR) | `es-xattr-roundtrip-macos.sh` |
-| FSEvents fallback (un-entitled) | post-hoc kqueue-style notifications, no pre-image | `fsevents-fallback-macos.sh` |
+| supported mutations from eligible non-platform processes | DYLD interposer pre-image, journaled only after syscall success | `chmod-undo-dyld-shim-macos.sh`, `make-install-undo-macos.sh`, `xattr-mutate-undo-macos.sh` |
+| FSEvents fallback (un-entitled) | partial post-hoc notifications; readiness/diagnostics only, with command-atomic refusal if a partial row remains | `fsevents-fallback-macos.sh` |
 | `brew install / uninstall` | brew JSON snapshot wrapper | `brew-pkg.sh` |
 | `sqlite3 file.db "<sql>"` | shim pre-image | `sqlite3-db.sh` |
+
+Timestamp setters are an explicit refusal on macOS today. The DYLD `utimes` / `futimes` / `futimens` / `utimensat` interposers and ES `AUTH_UTIMES` refuse rather than offer a lossy inverse because `FileMetadata` does not yet preserve atime. ES `AUTH_SETMODE` and `AUTH_SETOWNER` likewise refuse until ACL and ownership-induced mode changes can be modeled losslessly; eligible DYLD-interposed `chmod`/`chown` calls retain their narrower pre/post capture path.
 
 M03.x follow-ups (`mkfifo`/`mknod` via AUTH_CREATE, `chflags`/extended-ACL via AUTH_SETFLAGS+AUTH_SETACL, hardlink via AUTH_LINK, MAP_SHARED mmap via AUTH_MMAP, AUTH_CLONE/AUTH_COPYFILE for `cp -c`) are tracked in `.docs/sprints/macos/M03.x-followup-roadmap.md` — promote to landed when a real-workload smoke surfaces the gap.
 
@@ -183,21 +190,25 @@ These are gaps where coverage is plausible but not yet shipped. Each item is tra
 
 ### Linux
 
-- **`>>` append / `tee -a` Linux smoke** — the FileExtend wire + planner + executor all shipped in C06 (`InverseOp::FileExtend { truncate_to: pre_size }`, `FileExecutor::apply_file_extend`); pipeline integration tests in `shit-shell::c06_pipeline` are green. The remaining gap is a pinned Linux smoke — FreeBSD has `shell-append-undo-fbsd.sh` covering the round-trip; Linux needs the equivalent (proposed campaign: `AR-append-smoke-linux`).
+- **`>>` append / `tee -a` Linux smoke** — the append wire + planner + executor are present, and new plans use the inode-bound `InverseOp::FileExtendGuarded { inode, path, truncate_to: pre_size }`; the legacy `FileExtend` variant remains only for persisted-plan compatibility. Pipeline integration tests in `shit-shell::c06_pipeline` are green. The remaining gap is a pinned Linux smoke — FreeBSD has `shell-append-undo-fbsd.sh` covering the round-trip; Linux needs the equivalent (proposed campaign: `AR-append-smoke-linux`).
+- **Timestamp updates that change atime** — an LSM event carrying `ATTR_ATIME` is explicitly refused while `FileMetadata` lacks atime; restoring only mtime would be lossy. No broader timestamp-syscall coverage is claimed when that signal is absent.
+- **Directory and pre-existing FIFO deletion replay** — the LSM hooks capture authoritative typed metadata-only deletion markers, but the metadata model still omits fields needed for exact reconstruction (including atime and ACL state). The daemon therefore journals `CaptureRefused`, and the planner withholds every other inverse from the same command. The helper-side `mknod` route exists but is deliberately not invoked from incomplete evidence. This does not affect undoing FIFO *creation*: `mkfifo-undo-linux.sh` covers removing a FIFO created by the command.
 - **`docker pull <floating-tag>` digest journaling** — DR-CR-51. Post-phase reconciliation reserved but not implemented.
-- **multi-target `docker rmi a b c` batching** — DR-CR-52. Today only the first positional is journaled.
+- **Additional destructive container families** — `docker rm`, `podman rm`, `docker volume rm`, `docker network rm`, and `docker compose down` are not admitted by the atomic capture policy yet. Their wrappers deliberately exit 125 before runtime execution; fail-closed smokes verify the resources remain intact and no batch is confirmed.
 - **Packaging install hooks** — `apt install shit` → `doctor`-green is the AR09 sprint goal. Today the daemon must be built + setcap'd manually.
-- **mknod / mkfifo via privileged helper** — `RecreatePath` for fifo/socket/block/char kinds returns `Failed { err: "needs helper-IPC privileged-op routing (DR-15.1)" }`. The chown path is wired; mknod via helper is the remainder.
+- **Socket/block/character-device reconstruction policy** — pathname sockets cannot be recreated with their peer/bind state, while block/character devices need explicit device-number and privilege policy. These deletion shapes refuse rather than guessing; FIFO replay is additionally blocked on the complete-metadata gap above.
 
 ### FreeBSD
 
 - **NetBSD / OpenBSD / DragonFly** — explicitly post-v1 stretch (B06). Today the helper compiles only on FreeBSD; the other BSDs have an untested kqueue port.
+- **Interposition bypasses** — statically linked or setuid programs and code that issues direct syscalls bypass LD_PRELOAD. Kqueue can still promote a held-fd/baseline pre-image for an already watched target, but it cannot manufacture one for an unbaselined or cross-watch mutation; those bypass cases are not generally claimed as undoable.
 - **Perf budgets** — B07 wires a benchmark harness with regression gates. The Linux side is in place; BSD budgets land alongside the perf-bsd-14 CI gate.
 
 ### macOS
 
-- **Notarized helper distribution** — M04 sprint. Today the entitled-ES path requires a self-built helper with a developer-signed entitlement. Codesign self-verify infrastructure shipped in M07.C (the daemon refuses helpers whose code signature doesn't validate); the remaining M04 work is the signed-distribution + notarize CI pipeline so a `brew install shit` ships a ready-to-run binary. Un-entitled installs already get FSEvents-degraded capture out of the box.
-- **DYLD interposer auto-install** — DR-CR-34. The interposer itself shipped via M07.A (`shit dyld-hooks install` writes the shim to `/usr/local/lib/libshit_preload_shim.dylib` and the M07.B.5 smoke validates end-to-end against brew's `gchmod`, a non-SIP binary). The remaining work is package-manager auto-install (so `brew install shit` configures DYLD on first run), and the auth-event coverage for the long tail of dyld-strippable syscalls. SIP-protected system binaries are intentionally out of scope — Apple strips `DYLD_INSERT_LIBRARIES` on those by design.
+- **Notarized helper distribution** — M04 sprint. Today the entitled-ES path requires a self-built helper with a developer-signed entitlement. Codesign self-verify infrastructure shipped in M07.C (the daemon refuses helpers whose code signature doesn't validate); the remaining M04 work is the signed-distribution + notarize CI pipeline so a `brew install shit` ships a ready-to-run binary. Un-entitled installs get FSEvents readiness/diagnostics out of the box, but actionable filesystem undo requires the DYLD interposer.
+- **DYLD interposer auto-install** — DR-CR-34. The interposer itself shipped via M07.A: the archive/package places `libshit_preload_shim.dylib` in the library directory, while `shit dyld-hooks install` writes shell-rc snippets that point to it. The M07.B.5 smoke validates that path end-to-end against brew's `gchmod`, a non-SIP binary. The remaining work is package-manager auto-install (so `brew install shit` configures DYLD on first run), and coverage for the long tail of interposable libc calls. SIP/platform and hardened-runtime binaries, static binaries, and direct syscalls remain outside this path.
+- **Timestamp setters** — `utimes`, `futimes`, `futimens`, `utimensat`, and ES `AUTH_UTIMES` explicitly refuse until the captured metadata model includes atime.
 - **M03.x follow-ups** — see `.docs/sprints/macos/M03.x-followup-roadmap.md` for the precise list (AUTH_LINK / AUTH_MMAP / AUTH_SETFLAGS / AUTH_CLONE handlers); each gates on a real-workload smoke surfacing the gap.
 
 ## Compatibility expectations
@@ -211,13 +222,13 @@ These should work in practice once the underlying mechanism is wired (no archite
 
 ## OS support matrix
 
-| Capability | Linux (lsm=bpf) | Linux (no LSM) | FreeBSD | macOS (entitled ES) | macOS (FSEvents) |
+| Capability | Linux (lsm=bpf) | Linux (no LSM) | FreeBSD | macOS (entitled ES) | macOS (default: DYLD + FSEvents) |
 |---|---|---|---|---|---|
-| filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release†) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | ✅ EndpointSecurity AUTH events | ⚠️ post-hoc only, no pre-image |
-| pre-image via CoW | ✅ reflink/btrfs/XFS/zfs | ✅ same | ✅ zfs clone / hardlink | ✅ APFS clonefile | ✅ APFS clonefile |
-| LD_PRELOAD shim | ✅ install-pattern auto-inject | ✅ same | ✅ | ✅ DYLD interposer (M07.A install + M07.B.5 chmod smoke); SIP binaries excluded by Apple | ✅ same |
+| filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release†; unsafe deletion shapes refuse) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | ✅ EndpointSecurity AUTH events for supported families | ✅ DYLD for supported eligible libc calls; FSEvents is diagnostics-only |
+| pre-image capture | ✅ regular-file bytes via reflink/btrfs/XFS; directory/FIFO deletion is metadata-only and refused | ✅ same for supported fanotify events | ✅ bounded staged copy from tracked descriptors; experimental ZFS clone engine is not production-wired | ✅ APFS clonefile | ✅ DYLD byte pre-images for supported calls; none from FSEvents |
+| userspace interposer | ✅ LD_PRELOAD install-pattern auto-inject | ✅ same | ✅ LD_PRELOAD | ✅ DYLD interposer; platform/static/direct-syscall paths excluded | ✅ same |
 | package undo | ✅ apt, dnf | ✅ same | ✅ pkg | ✅ brew | ✅ brew |
-| container undo | ✅ docker, podman, compose | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
+| container undo | ✅ Docker `rmi --no-prune` only; other destructive verbs exit 125 | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
 | cloud undo | ✅ terraform, kubectl, gh | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
 | services | ✅ systemctl | ✅ same | ✅ service | ⚠️ launchctl untested | ⚠️ launchctl untested |
 | firewall | ✅ nft, iptables | ✅ same | ✅ pfctl | ❌ | ❌ |
@@ -225,22 +236,29 @@ These should work in practice once the underlying mechanism is wired (no archite
 
 ✅ has a green CI smoke today; ⚠️ structurally plausible but unpinned; ❌ not yet built.
 
+Windows is not a supported target. A native Windows port is currently a bounded feasibility experiment; WSL follows the Linux lane rather than constituting a separate native backend.
+
 † `file_release` is the in-place-write capture hook; on Linux ≥ 7.0 the LSM chain entry takes an extra `mnt_idmap` arg and the helper picks the right v1/v2 entry-point at load time via a BTF probe. Older kernels (< 7.0) use the legacy single-arg signature. A verifier-rejected attach on either fork degrades the helper to the fanotify-perm fallback rather than crashing.
 
 ## Coverage matrix in JSON
 
-`shit doctor --json` emits `arbitrary_undo_coverage` with two stable fields you can pin a CI gate to:
+`shit doctor --json` emits `arbitrary_undo_coverage` with three stable class lists, counts, and validation metadata you can pin a CI gate to:
 
 ```json
 "arbitrary_undo_coverage": {
-  "covered_classes": ["container-rm", "container-rmi", "fs-content-restore", "fs-metadata", "fs-rename", "fs-tree", "kubectl-delete", "package-apt", "package-dnf", "package-brew", "preload-install", "process-note", "redirect-truncate", "service-systemctl", "tool-gh", "tool-network", "tool-terraform", "..."],
+  "covered_classes": ["container-rmi", "fs-content-restore", "fs-metadata", "fs-post-hash-drift-detection", "fs-rename", "fs-tree", "kubectl-delete", "package-apt", "package-brew", "package-dnf", "preload-install", "process-note", "redirect-truncate", "service-systemctl", "shell-state", "tool-gh", "tool-network", "tool-terraform"],
   "refused_classes": ["remote-push", "history-rewrite", "identity-generation", "power-state", "sandbox-escape", "opaque-shell-mutation", "system-identity"],
-  "coverage_pct": 74,
-  "last_validated_at": ""
+  "pending_classes": ["bsd-shim-default", "container-compose", "container-network", "container-rm", "container-volume", "linux-cap-install-verify"],
+  "covered_count": 18,
+  "refused_count": 7,
+  "pending_count": 6,
+  "last_validated_at": "",
+  "snapshot_workflow_run_url": "",
+  "binary_built_at": "..."
 }
 ```
 
-The `covered_classes` list is hand-curated against the AR08.1 audit; the `refused_classes` list is enumerated from `shit-planner::refuse::CATALOG` at runtime so the two cannot drift.
+The covered and pending lists come from `shit-planner::coverage_catalog`; the refused list comes from `shit-planner::refuse::CATALOG`. The doctor assembles all three from those code catalogs at runtime so its claims cannot drift from the planner's policy.
 
 ## License
 

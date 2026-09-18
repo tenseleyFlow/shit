@@ -15,9 +15,10 @@
 //!    without `LC_LOAD_DYLINKER`. The kernel never invokes a dynamic
 //!    linker on these, so the shim has no entry point.
 //!
-//! In both cases the mutations are post-hoc-only via the kernel tier
-//! (LSM on Linux, ZFS-clone on FreeBSD where set up; nothing on macOS
-//! without an EndpointSecurity entitlement).
+//! In both cases the mutations are visible only through the active kernel
+//! observer (LSM on Linux, kqueue on FreeBSD; nothing on macOS without an
+//! EndpointSecurity entitlement). FreeBSD's isolated ZFS-clone engine is not
+//! yet connected to the production helper.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

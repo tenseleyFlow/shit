@@ -30,6 +30,38 @@ use std::path::{Path, PathBuf};
 use super::error::KqueueError;
 use super::init::KqueueFd;
 
+/// Every vnode discovery open is non-blocking. `O_RDONLY` on a FIFO waits for
+/// a writer otherwise, which can wedge WatchTree before readiness is decided.
+const WATCH_OPEN_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+
+#[cfg(target_os = "freebsd")]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns this thread's errno slot.
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns this thread's errno slot.
+    unsafe { libc::__errno() }
+}
+
+#[cfg(target_os = "dragonfly")]
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns this thread's errno slot.
+    unsafe { libc::__errno_location() }
+}
+
+fn clear_errno() {
+    // SAFETY: `errno_location` returns a valid thread-local c_int pointer.
+    unsafe { *errno_location() = 0 };
+}
+
+fn current_errno() -> libc::c_int {
+    // SAFETY: `errno_location` returns a valid thread-local c_int pointer.
+    unsafe { *errno_location() }
+}
+
 /// Decoded fflags from a kevent delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VnodeEventKind {
@@ -145,9 +177,9 @@ impl TrackedSubtree {
 /// file `O_RDONLY|O_CLOEXEC`, and register each fd with
 /// `EVFILT_VNODE` on `kq` for [`VNODE_FFLAGS`].
 ///
-/// Symlinks are not followed — we track real inodes only. Permission-
-/// denied entries are silently skipped so a partial tree still
-/// produces a usable subtree.
+/// Symlinks are not followed — we track real inodes only. Permission,
+/// race, and depth failures reject the registration: a partial descriptor
+/// set cannot support an authoritative pre-command baseline.
 ///
 /// B05 Phase A: descendants open via `openat(parent_fd, name, ...)`.
 /// B05 Phase B: root opens via [`register_subtree_at`] when a
@@ -195,18 +227,23 @@ fn register_subtree_with_root_fd(
     // fstat the root to learn if it's a directory. fstat works under
     // cap_enter (operation on an fd we own); avoids a second absolute
     // open via symlink_metadata.
-    let is_dir = unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        libc::fstat(root_fd.as_raw_fd(), &mut st) == 0
-            && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
-    };
+    let mut root_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(root_fd.as_raw_fd(), &mut root_stat) } != 0 {
+        return Err(KqueueError::Stat {
+            path: root.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let is_dir = (root_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
     let root_raw = root_fd.as_raw_fd();
     let mut entries = vec![TrackedEntry {
         fd: root_fd,
         path: root.to_path_buf(),
     }];
-    if is_dir {
-        walk_descendants(root_raw, root, depth_limit, &mut entries);
+    if is_dir && !walk_descendants(root_raw, root, depth_limit, &mut entries) {
+        return Err(KqueueError::IncompleteSubtree {
+            root_path: root.to_path_buf(),
+        });
     }
     register_entries(kq, &entries)?;
     Ok(TrackedSubtree { entries })
@@ -241,7 +278,7 @@ fn openat_root(root_dirfd: RawFd, abs_root: &Path) -> Result<OwnedFd, KqueueErro
     // No O_NOFOLLOW on the root open — historically the root open is
     // willing to traverse symlinks (the daemon may hand us a path
     // that's itself a symlink target). Descendants use O_NOFOLLOW.
-    let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    let flags = WATCH_OPEN_FLAGS;
     // SAFETY: root_dirfd alive per caller contract; cpath is a valid
     // NUL-terminated C string; openat returns -1/errno on failure.
     let raw = unsafe { libc::openat(root_dirfd, cpath.as_ptr(), flags, 0) };
@@ -263,18 +300,18 @@ fn openat_root(root_dirfd: RawFd, abs_root: &Path) -> Result<OwnedFd, KqueueErro
 /// `openat(parent_fd, name, ...)` so this walk works post-cap_enter
 /// once the root bootstrap lands.
 ///
-/// Errors during the walk are best-effort: a single permission-
-/// denied or race-deleted descendant skips that entry but doesn't
-/// abort sibling registration. Matches the original walker's
-/// permissive contract.
+/// Errors are accumulated while siblings are inspected, then make the whole
+/// registration fail closed rather than silently producing a partial watch.
 fn walk_descendants(
     parent_fd: RawFd,
     parent_path: &Path,
     depth_remaining: usize,
     out: &mut Vec<TrackedEntry>,
-) {
+) -> bool {
     if depth_remaining == 0 {
-        return;
+        // An empty directory exactly at the limit is complete. Any child (or
+        // inability to prove emptiness) means descendants were omitted.
+        return matches!(directory_has_children(parent_fd), Some(false));
     }
     // dup parent_fd so we can give a copy to fdopendir without losing
     // the caller's reference. closedir releases the dup; the original
@@ -286,7 +323,7 @@ fn walk_descendants(
             err = ?std::io::Error::last_os_error(),
             "walk_descendants: dup failed",
         );
-        return;
+        return false;
     }
     // SAFETY: dup_fd is a fresh open fd we own; fdopendir takes it
     // under its control. We never close dup_fd directly — closedir
@@ -302,15 +339,20 @@ fn walk_descendants(
             err = ?err,
             "walk_descendants: fdopendir failed",
         );
-        return;
+        return false;
     }
 
+    let mut complete = true;
+
     loop {
-        // SAFETY: dir is a valid DIR*; readdir returns NULL at EOF or
-        // on error (which we can't distinguish without errno reset
-        // dance; treat NULL as terminator).
+        // SAFETY: dir is a valid DIR*. Clearing errno lets us distinguish a
+        // complete EOF from a partial walk caused by a readdir failure.
+        clear_errno();
         let entry_ptr = unsafe { libc::readdir(dir) };
         if entry_ptr.is_null() {
+            if current_errno() != 0 {
+                complete = false;
+            }
             break;
         }
         let entry = unsafe { &*entry_ptr };
@@ -326,15 +368,17 @@ fn walk_descendants(
         if entry.d_type == libc::DT_LNK {
             continue;
         }
-        let is_child_dir = entry.d_type == libc::DT_DIR;
         let name_c = match CString::new(name_bytes) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         // openat with O_NOFOLLOW defends against a DT_REG ↦ symlink
         // race (entry was a file at readdir time, becomes a symlink
         // before our openat).
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let flags = WATCH_OPEN_FLAGS | libc::O_NOFOLLOW;
         // SAFETY: parent_fd is a valid dir fd; name_c is a valid C
         // string for the call; openat returns -1/errno on failure.
         let child_raw = unsafe { libc::openat(parent_fd, name_c.as_ptr(), flags, 0) };
@@ -342,24 +386,86 @@ fn walk_descendants(
             // Skip this descendant; siblings continue. This matches
             // the original walker's best-effort behavior on permission-
             // denied / race-deleted / ELOOP.
+            complete = false;
             continue;
         }
         // SAFETY: child_raw is a fresh kernel-allocated fd we now own.
         let child_fd = unsafe { OwnedFd::from_raw_fd(child_raw) };
         let child_raw_for_recurse = child_fd.as_raw_fd();
         let child_path = parent_path.join(std::ffi::OsStr::from_bytes(name_bytes));
+        // d_type may be DT_UNKNOWN and can race with replacement. Classify
+        // from the opened fd so only actual directories are recursed into and
+        // FIFOs/sockets remain non-blocking leaf watches.
+        let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(child_raw_for_recurse, &mut child_stat) } != 0 {
+            complete = false;
+            continue;
+        }
+        let is_child_dir = (child_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR;
         out.push(TrackedEntry {
             fd: child_fd,
             path: child_path.clone(),
         });
         if is_child_dir {
-            walk_descendants(child_raw_for_recurse, &child_path, depth_remaining - 1, out);
+            complete &=
+                walk_descendants(child_raw_for_recurse, &child_path, depth_remaining - 1, out);
         }
     }
 
-    // closedir closes the dup'd fd and frees the DIR*.
+    // dup shares the open file description and its directory offset. Restore
+    // it before closedir closes the duplicate so later baseline scans start at
+    // the beginning even if they forget to rewind defensively.
     // SAFETY: dir is a valid DIR* we got from fdopendir; not closed yet.
-    unsafe { libc::closedir(dir) };
+    unsafe {
+        libc::rewinddir(dir);
+        libc::closedir(dir);
+    }
+    complete
+}
+
+/// Probe whether a directory has any non-dot children without leaving the
+/// tracked fd's shared directory offset at EOF. `None` means the probe failed.
+fn directory_has_children(dir_fd: RawFd) -> Option<bool> {
+    let dup_fd = unsafe { libc::dup(dir_fd) };
+    if dup_fd < 0 {
+        return None;
+    }
+    let dir = unsafe { libc::fdopendir(dup_fd) };
+    if dir.is_null() {
+        unsafe { libc::close(dup_fd) };
+        return None;
+    }
+    unsafe { libc::rewinddir(dir) };
+    let mut found = false;
+    loop {
+        clear_errno();
+        let entry_ptr = unsafe { libc::readdir(dir) };
+        if entry_ptr.is_null() {
+            if current_errno() != 0 {
+                unsafe {
+                    libc::rewinddir(dir);
+                    libc::closedir(dir);
+                }
+                return None;
+            }
+            break;
+        }
+        let entry = unsafe { &*entry_ptr };
+        let name_len = unsafe { libc::strlen(entry.d_name.as_ptr()) };
+        let name =
+            unsafe { std::slice::from_raw_parts(entry.d_name.as_ptr().cast::<u8>(), name_len) };
+        if name != b"." && name != b".." {
+            found = true;
+            break;
+        }
+    }
+    // dup shares the open file description and its offset. Restore it before
+    // closedir consumes the duplicate.
+    unsafe {
+        libc::rewinddir(dir);
+        libc::closedir(dir);
+    }
+    Some(found)
 }
 
 fn open_for_watch(path: &Path) -> Result<OwnedFd, KqueueError> {
@@ -367,7 +473,7 @@ fn open_for_watch(path: &Path) -> Result<OwnedFd, KqueueError> {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte"),
     })?;
-    let flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    let flags = WATCH_OPEN_FLAGS;
     // SAFETY: cpath is a valid NUL-terminated C string for the call
     // duration; open returns -1 with errno on failure.
     let raw = unsafe { libc::open(cpath.as_ptr(), flags, 0) };
@@ -444,7 +550,7 @@ impl TrackedSubtree {
             .find(|e| e.path == parent_path)
             .map(|e| e.fd.as_raw_fd())?;
         let name_c = CString::new(basename.as_bytes()).ok()?;
-        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let flags = WATCH_OPEN_FLAGS | libc::O_NOFOLLOW;
         // SAFETY: parent_fd is alive in self.entries; name_c is a
         // valid NUL-terminated C string for the call.
         let raw = unsafe { libc::openat(parent_fd, name_c.as_ptr(), flags, 0) };
@@ -557,19 +663,40 @@ mod tests {
     }
 
     #[test]
-    fn register_subtree_respects_depth_limit() {
+    fn register_subtree_rejects_a_depth_truncated_watch() {
         let kq = init().expect("kqueue");
         let dir = tempfile::tempdir().expect("tempdir");
         // dir/a/b/c.txt
         let deep = dir.path().join("a").join("b");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("c.txt"), b"x").unwrap();
-        // depth_limit=1 should register: root + root/a (depth 1
-        // remaining at root means we recurse one level into a, but
-        // don't recurse into b's contents).
-        let tree = register_subtree(&kq, dir.path(), 1).expect("register");
-        // Expect: root, a → 2 entries.
-        assert_eq!(tree.len(), 2);
+        let error = register_subtree(&kq, dir.path(), 1).expect_err("partial watch must fail");
+        assert!(matches!(error, KqueueError::IncompleteSubtree { .. }));
+    }
+
+    #[test]
+    fn discovery_flags_are_nonblocking_and_fifo_is_a_leaf() {
+        assert_ne!(WATCH_OPEN_FLAGS & libc::O_NONBLOCK, 0);
+
+        let kq = init().expect("kqueue");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        // O_RDONLY without O_NONBLOCK would wedge here waiting for a writer.
+        let tree = register_subtree(&kq, dir.path(), 4).expect("fifo subtree registration");
+        let fifo_entry = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path == fifo)
+            .expect("fifo tracked as a non-directory leaf");
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstat(fifo_entry.fd.as_raw_fd(), &mut stat) },
+            0
+        );
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
     }
 
     #[test]

@@ -308,6 +308,10 @@ fn main() -> std::process::ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
+    if let Err(error) = refresh_installed_container_wrappers() {
+        eprintln!("shit: cannot safely refresh installed container wrappers: {error}");
+        return exitcode::exit(exitcode::GENERIC_FAILURE);
+    }
     let cli = Cli::parse();
     // S21.2 — root span carrying schema-required fields. The CLI is
     // one-shot per invocation, so this span lives for the duration of
@@ -337,6 +341,23 @@ fn main() -> std::process::ExitCode {
             exitcode::exit(exitcode::GENERIC_FAILURE)
         }
     }
+}
+
+/// Wrapper content is part of the container authorization protocol. Refresh
+/// opted-in copies before parsing or dispatching so a shell pre-exec call into
+/// this binary atomically replaces an older fail-open script before the shell
+/// starts the requested container command.
+fn refresh_installed_container_wrappers() -> anyhow::Result<()> {
+    let Ok(config_home) = config_home() else {
+        // With neither XDG_CONFIG_HOME nor HOME there is no default wrapper
+        // installation path to repair. Preserve commands such as --version in
+        // deliberately empty service environments.
+        return Ok(());
+    };
+    for path in shit_shell::container_wrappers::refresh_existing(&config_home)? {
+        tracing::warn!(path = %path.display(), "refreshed stale container wrapper");
+    }
+    Ok(())
 }
 
 /// Marshals the two possible error types subcommands return into

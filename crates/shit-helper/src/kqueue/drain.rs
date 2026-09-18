@@ -25,7 +25,9 @@
 
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{
+    Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel,
+};
 use std::thread::JoinHandle;
 
 use super::error::KqueueError;
@@ -43,6 +45,9 @@ pub const DEFAULT_CAPACITY: usize = 4096;
 /// to be a value the kernel won't already assign to any other
 /// EVFILT_USER subscription (we don't register any others).
 const SHUTDOWN_IDENT: libc::uintptr_t = 0xD15E_A5E5;
+/// EVFILT_USER wakeup used to place an ordered flush marker after all vnode
+/// events already readable from the kqueue.
+const FLUSH_IDENT: libc::uintptr_t = 0xD15E_F105;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DrainError {
@@ -54,6 +59,8 @@ pub enum DrainError {
     ThreadPanicked,
     #[error("kqueue registration: {0}")]
     Register(#[from] KqueueError),
+    #[error("drain flush control channel is closed")]
+    FlushControlClosed,
 }
 
 /// One decoded event surfaced to the consumer.
@@ -74,6 +81,9 @@ pub enum DrainEvent {
         kind: ProcEventKind,
         fflags: u32,
     },
+    /// Internal ordering barrier. Every decoded event drained before this
+    /// marker was queued ahead of it on the same bounded channel.
+    FlushComplete { token: u64 },
 }
 
 /// Handle held by the orchestrator side. Carries enough state to
@@ -85,38 +95,44 @@ pub struct DrainHandle {
     /// can be moved into the drain thread without losing our ability
     /// to issue an EV_DELETE / NOTE_TRIGGER from the outside.
     shutdown_fd: std::os::fd::OwnedFd,
+    flush_tx: Sender<u64>,
 }
 
 impl DrainHandle {
     /// Trigger the shutdown EVFILT_USER event so the drain thread's
     /// next `kevent(2)` returns with our marker and the loop exits.
     pub fn signal_shutdown(&self) -> Result<(), KqueueError> {
-        let ev = libc::kevent {
-            ident: SHUTDOWN_IDENT,
-            filter: libc::EVFILT_USER,
-            flags: 0,
-            fflags: libc::NOTE_TRIGGER,
-            data: 0,
-            udata: std::ptr::null_mut(),
-            ext: [0; 4],
-        };
-        // SAFETY: shutdown_fd is owned for the call; changelist is a
-        // single const kevent; no eventlist.
-        let rc = unsafe {
-            libc::kevent(
-                self.shutdown_fd.as_raw_fd(),
-                &ev,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if rc < 0 {
-            return Err(KqueueError::Kevent(std::io::Error::last_os_error()));
-        }
+        trigger_user_event(self.shutdown_fd.as_raw_fd(), SHUTDOWN_IDENT)
+    }
+
+    /// Ask the drain thread to empty all currently-readable kernel events and
+    /// then enqueue `FlushComplete(token)` after them.
+    pub fn signal_flush(&self, token: u64) -> Result<(), DrainError> {
+        self.flush_tx
+            .send(token)
+            .map_err(|_| DrainError::FlushControlClosed)?;
+        trigger_user_event(self.shutdown_fd.as_raw_fd(), FLUSH_IDENT)?;
         Ok(())
     }
+}
+
+fn trigger_user_event(fd: RawFd, ident: libc::uintptr_t) -> Result<(), KqueueError> {
+    let ev = libc::kevent {
+        ident,
+        filter: libc::EVFILT_USER,
+        flags: 0,
+        fflags: libc::NOTE_TRIGGER,
+        data: 0,
+        udata: std::ptr::null_mut(),
+        ext: [0; 4],
+    };
+    // SAFETY: shutdown_fd is owned for the call; changelist is a
+    // single const kevent; no eventlist.
+    let rc = unsafe { libc::kevent(fd, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    if rc < 0 {
+        return Err(KqueueError::Kevent(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Bundle returned by [`spawn`]: the receiver to drain events from,
@@ -138,6 +154,10 @@ impl DrainSession {
     /// exits, which closes the channel).
     pub fn recv(&self) -> Result<DrainEvent, std::sync::mpsc::RecvError> {
         self.events.recv()
+    }
+
+    pub fn request_flush(&self, token: u64) -> Result<(), DrainError> {
+        self.handle.signal_flush(token)
     }
 
     /// Signal shutdown and wait for the drain thread to exit. Returns
@@ -171,14 +191,19 @@ impl Drop for DrainSession {
 pub fn spawn(kq: Arc<KqueueFd>, capacity: usize) -> Result<DrainSession, DrainError> {
     let shutdown_fd = dup_for_shutdown(&kq)?;
     register_shutdown_user_event(&kq)?;
+    register_flush_user_event(&kq)?;
     let (tx, rx) = sync_channel(capacity);
+    let (flush_tx, flush_rx) = channel();
     let thread = std::thread::Builder::new()
         .name("shit-kqueue-drain".to_string())
-        .spawn(move || run(kq, tx, capacity))
+        .spawn(move || run(kq, tx, capacity, flush_rx))
         .map_err(DrainError::Kevent)?;
     Ok(DrainSession {
         events: rx,
-        handle: DrainHandle { shutdown_fd },
+        handle: DrainHandle {
+            shutdown_fd,
+            flush_tx,
+        },
         thread: Some(thread),
     })
 }
@@ -200,8 +225,16 @@ fn dup_for_shutdown(kq: &Arc<KqueueFd>) -> Result<std::os::fd::OwnedFd, DrainErr
 }
 
 fn register_shutdown_user_event(kq: &Arc<KqueueFd>) -> Result<(), DrainError> {
+    register_user_event(kq, SHUTDOWN_IDENT)
+}
+
+fn register_flush_user_event(kq: &Arc<KqueueFd>) -> Result<(), DrainError> {
+    register_user_event(kq, FLUSH_IDENT)
+}
+
+fn register_user_event(kq: &Arc<KqueueFd>, ident: libc::uintptr_t) -> Result<(), DrainError> {
     let ev = libc::kevent {
-        ident: SHUTDOWN_IDENT,
+        ident,
         filter: libc::EVFILT_USER,
         flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
         fflags: 0,
@@ -226,7 +259,12 @@ fn register_shutdown_user_event(kq: &Arc<KqueueFd>) -> Result<(), DrainError> {
     Ok(())
 }
 
-fn run(kq: Arc<KqueueFd>, tx: SyncSender<DrainEvent>, capacity: usize) -> Result<(), DrainError> {
+fn run(
+    kq: Arc<KqueueFd>,
+    tx: SyncSender<DrainEvent>,
+    capacity: usize,
+    flush_rx: Receiver<u64>,
+) -> Result<(), DrainError> {
     let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
     loop {
         // Blocking wait — timeout=NULL.
@@ -250,24 +288,93 @@ fn run(kq: Arc<KqueueFd>, tx: SyncSender<DrainEvent>, capacity: usize) -> Result
             }
             return Err(DrainError::Kevent(err));
         }
+        let mut shutdown = false;
+        let mut flush = false;
         for ev in events.iter().take(n as usize) {
-            // Shutdown marker — exit cleanly.
-            if ev.filter == libc::EVFILT_USER && ev.ident == SHUTDOWN_IDENT {
+            if ev.filter == libc::EVFILT_USER {
+                shutdown |= ev.ident == SHUTDOWN_IDENT;
+                flush |= ev.ident == FLUSH_IDENT;
+                continue;
+            }
+            if !forward_event(&tx, ev, capacity)? {
                 return Ok(());
             }
-            let Some(decoded) = decode(ev) else {
-                continue;
-            };
-            match tx.try_send(decoded) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    return Err(DrainError::QueueOverflow { capacity });
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    // Consumer dropped the receiver; treat as a
-                    // graceful exit signal.
+        }
+        if flush {
+            if !drain_readable(&kq, &tx, capacity, &mut shutdown)? {
+                return Ok(());
+            }
+            for token in flush_rx.try_iter() {
+                // Blocking here is deliberate: the pump is consuming this
+                // same channel while waiting for the marker, so the marker
+                // cannot be lost to bounded-channel overflow.
+                if tx.send(DrainEvent::FlushComplete { token }).is_err() {
                     return Ok(());
                 }
+            }
+        }
+        if shutdown {
+            return Ok(());
+        }
+    }
+}
+
+fn forward_event(
+    tx: &SyncSender<DrainEvent>,
+    event: &libc::kevent,
+    capacity: usize,
+) -> Result<bool, DrainError> {
+    let Some(decoded) = decode(event) else {
+        return Ok(true);
+    };
+    match tx.try_send(decoded) {
+        Ok(()) => Ok(true),
+        Err(TrySendError::Full(_)) => Err(DrainError::QueueOverflow { capacity }),
+        Err(TrySendError::Disconnected(_)) => Ok(false),
+    }
+}
+
+/// Drain every event currently readable without blocking. Normal events are
+/// forwarded before the caller enqueues its FlushComplete marker.
+fn drain_readable(
+    kq: &Arc<KqueueFd>,
+    tx: &SyncSender<DrainEvent>,
+    capacity: usize,
+    shutdown: &mut bool,
+) -> Result<bool, DrainError> {
+    let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    loop {
+        let n = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as libc::c_int,
+                &timeout,
+            )
+        };
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(DrainError::Kevent(error));
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+        for event in events.iter().take(n as usize) {
+            if event.filter == libc::EVFILT_USER {
+                *shutdown |= event.ident == SHUTDOWN_IDENT;
+                continue;
+            }
+            if !forward_event(tx, event, capacity)? {
+                return Ok(false);
             }
         }
     }
@@ -354,6 +461,36 @@ mod tests {
             "shutdown should be near-instant; took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn flush_marker_follows_already_readable_vnode_events_without_sleep() {
+        let kq = Arc::new(init().expect("kqueue"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"before").unwrap();
+        let tree = register_subtree(&kq, dir.path(), 4).expect("register");
+        let session = spawn(Arc::clone(&kq), 64).expect("spawn drain");
+
+        std::fs::write(&file, b"after-longer").unwrap();
+        session.request_flush(0xA11CE).expect("request flush");
+
+        let mut saw_vnode = false;
+        loop {
+            match session
+                .events
+                .recv_timeout(Duration::from_secs(1))
+                .expect("event or flush marker")
+            {
+                DrainEvent::Vnode { .. } => saw_vnode = true,
+                DrainEvent::FlushComplete { token: 0xA11CE } => break,
+                DrainEvent::FlushComplete { token } => panic!("unexpected flush token {token}"),
+                DrainEvent::Proc { .. } => {}
+            }
+        }
+        assert!(saw_vnode, "flush marker overtook the pending vnode event");
+        session.shutdown().expect("clean shutdown");
+        drop(tree);
     }
 
     #[test]

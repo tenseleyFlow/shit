@@ -6,18 +6,16 @@
 # SMOKE_RUNNER_HINT: self-hosted-lsm
 # SMOKE_TIMEOUT_SEC: 300
 #
-# AU20.2 — LSM-tier-explicit rmdir-undo smoke.
+# Linux LSM directory-deletion honesty gate.
 #
-# No standalone rmdir-undo smoke exists; git-clean-fd-undo-linux.sh
-# touches rmdir transitively. AU20 adds a dedicated one that:
-# - creates an empty dir BEFORE pre-exec,
-# - rmdirs it inside the watched session,
-# - asserts shit undo restores the dir,
-# - asserts the LSM inode_rmdir handler fired (routed through
-#   handle_lsm_unlink with is_directory=true per G03).
-#
-# Grep target: tracing::info!("lsm-unlink CapturedPreImage sent")
-# with structured field is_directory=true on the same line.
+# The inode_rmdir hook can hold the deleted directory inode and capture the
+# metadata currently represented by FileMetadataWire. That model is not yet
+# complete enough to replay a directory exactly (notably atime/ACL state), so
+# the daemon must convert the typed metadata-only deletion marker into
+# CaptureRefused. This smoke proves all three load-bearing properties:
+# - the LSM inode_rmdir path really emitted deletion evidence;
+# - the journal and CLI surface an explicit, command-atomic refusal; and
+# - undo does not synthesize a lossy replacement directory.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -65,7 +63,6 @@ mkdir -p "${SCRATCH}"
 TARGET="${SCRATCH}/lsm_rmdir_victim"
 mkdir "${TARGET}"
 chmod 0755 "${TARGET}"
-PRE_MODE="$(python3 -c "import os; print(oct(os.stat('${TARGET}').st_mode & 0o777))")"
 
 SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 PID="$$"
@@ -90,46 +87,56 @@ sleep 0.5
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
 
-# G03 rmdir route: helper emits CapturedPreImage{stored_bytes=0,
-# is_delete=true} marker for dirs (no bytes to send). Daemon
-# converts via journal_unlink_idempotent → TreeOpUnlink discriminant
-# (NOT FilePreImage — FilePreImage is the discriminant for events
-# that carry a content blob; the marker-only dir path bypasses that).
-smoke_wait_for_event "discriminant = 'TreeOpUnlink'" 1 10
+# The helper emits CapturedDeletionMarker for metadata-only evidence. The
+# daemon deliberately converts that to CaptureRefused instead of the old,
+# lossy TreeOpUnlink action.
+smoke_wait_for_event \
+    "discriminant = 'CaptureRefused' AND path LIKE '%/lsm_rmdir_victim'" 1 10
+
+N_ACTIONABLE="$(smoke_journal_count "discriminant = 'TreeOpUnlink' AND path LIKE '%/lsm_rmdir_victim'")"
+if [ "${N_ACTIONABLE}" -ne 0 ]; then
+    smoke_fail "directory deletion also journaled ${N_ACTIONABLE} actionable TreeOpUnlink event(s)"
+fi
 
 # AU20 load-bearing assertion: the LSM inode_rmdir handler MUST
 # have logged its emit line. The handler's success info line is
-# `lsm-unlink CapturedPreImage sent` (G03 routes rmdir through
-# handle_lsm_unlink). We can't match on structured fields
+# `lsm-unlink deletion evidence sent`. We can't match on structured fields
 # (basename, path) because tracing's pretty-formatter interleaves
 # ANSI escape codes between the field name and value when stderr
 # is a tty-like sink. The smoke's workload contains exactly one
-# rmdir and no file unlinks of our own, so any 'lsm-unlink
-# CapturedPreImage sent' line in shitd.log is necessarily ours;
-# the TreeOpUnlink journal entry (verified above) carries the
-# path, closing the identification loop.
-if ! grep -F "lsm-unlink CapturedPreImage sent" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
+# rmdir and no file unlinks of our own, so the deletion-evidence line in
+# shitd.log is necessarily ours; the path-specific CaptureRefused journal
+# entry above closes the identification loop.
+if ! grep -F "lsm-unlink deletion evidence sent" "${SHIT_SMOKE_TMP}/shitd.log" > /dev/null; then
     smoke_log "shitd.log tail:"
     tail -100 "${SHIT_SMOKE_TMP}/shitd.log" | sed 's/^/    /' >&2
-    smoke_fail "LSM inode_rmdir handler did not emit; 'lsm-unlink CapturedPreImage sent' missing from shitd.log"
+    smoke_fail "LSM inode_rmdir handler did not emit deletion evidence"
 fi
 smoke_log "LSM inode_rmdir handler confirmed fired"
 
-"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
+UNDO_RC=0
+"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || UNDO_RC=$?
+if [ "${UNDO_RC}" -eq 0 ]; then
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_fail "shit undo --yes exited non-zero"
-}
-
-if [ ! -d "${TARGET}" ]; then
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_fail "dir not restored by shit undo: ${TARGET}"
+    smoke_fail "directory deletion CaptureRefused unexpectedly exited 0"
 fi
-RESTORED_MODE="$(python3 -c "import os; print(oct(os.stat('${TARGET}').st_mode & 0o777))")"
-if [ "${RESTORED_MODE}" != "${PRE_MODE}" ]; then
-    smoke_fail "restored dir mode wrong: pre=${PRE_MODE} restored=${RESTORED_MODE}"
+
+if ! grep -qiE "Refused|capture-incomplete|metadata-only deletion marker" "${SHIT_SMOKE_TMP}/undo.log"; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "undo failed without surfacing the directory capture refusal"
+fi
+if ! grep -q "applied=0" "${SHIT_SMOKE_TMP}/undo.log"; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
+    smoke_fail "refused directory undo reported an applied inverse"
+fi
+
+# Fail closed means leaving the successful rmdir in place. Recreating even an
+# empty directory here would be a lossy synthetic inverse.
+if [ -e "${TARGET}" ]; then
+    smoke_fail "refused undo synthesized a replacement at ${TARGET}"
 fi
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: rmdir-undo-lsm-tier-linux (LSM inode_rmdir handler fired + dir restored to mode ${RESTORED_MODE})"
+smoke_log "PASS: rmdir-undo-lsm-tier-linux (LSM evidence captured; undo refused atomically; no directory synthesized)"

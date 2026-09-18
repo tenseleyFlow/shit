@@ -13,7 +13,7 @@
 //! statically.
 //!
 //! The test is FreeBSD-only (the `.symver` block is cfg-gated to
-//! BSD and Linux doesn't need versioned exports), and runs at
+//! FreeBSD and Linux/other BSDs don't use these version names), and runs at
 //! `cargo test --release -p shit-preload-shim --test symver`.
 
 #![cfg(target_os = "freebsd")]
@@ -28,6 +28,8 @@ use std::process::Command;
 const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
     ("open", "FBSD_1.0"),
     ("unlink", "FBSD_1.0"),
+    ("rmdir", "FBSD_1.0"),
+    ("remove", "FBSD_1.0"),
     ("rename", "FBSD_1.0"),
     ("truncate", "FBSD_1.0"),
     ("ftruncate", "FBSD_1.0"),
@@ -45,8 +47,8 @@ const EXPECTED_VERSIONED_EXPORTS: &[(&str, &str)] = &[
     // B09 — chflags shim parity (mirrors macOS PR #171). Path-based
     // only on FreeBSD; no portable fd→path means no fchflags shim.
     ("chflags", "FBSD_1.0"),
-    // chflagsat is the load-bearing one — /bin/chflags(8) calls
-    // it directly, bypassing the libc chflags wrapper.
+    // chflagsat callers bypass the libc chflags wrapper. The
+    // interposer captures only replayable path/atflag shapes.
     ("chflagsat", "FBSD_1.3"),
     // *at variants are at FBSD_1.1 in libc. openat also exists
     // at FBSD_1.2 but lld won't let us tag the same source

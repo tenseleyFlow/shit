@@ -8,22 +8,17 @@
 # EXCLUDED_BY:
 # EXCLUDED_REASON:
 #
-# M03.x.CREATE (mkfifo portion) gap-validation smoke.
+# M03.x.CREATE (mkfifo portion) regression smoke.
 #
 # Workload: a tiny C binary that calls `mkfifo(path, 0o644)` to
-# create a FIFO special file. macOS shim has NO `mkfifo` interposer
-# (the existing shim covers open/unlink/rename/mkdir/chmod family
-# but mkfifo/mknod was deferred per the M03.x.CREATE roadmap row).
-#
-# Hypothesis: real gap. Daemon's `classify_tree_op` already has a
-# "mkfifo"/"mkfifoat" arm (W09.10.1 added it for the kqueue
-# fall-through case on FreeBSD), so adding a shim interposer is
-# all that's needed for end-to-end coverage.
+# create a FIFO special file. The macOS shim's `mkfifo`/`mkfifoat`
+# interposers report the successful create and the daemon's existing
+# classifier journals a Create inverse.
 #
 # Outcomes:
 #   A. Full undo: FIFO removed; no leftover events
 #   B. Loud refusal
-#   C. Silent stomp (EXPECTED pre-fix) — FIFO survives undo
+#   C. Silent stomp (regression) — FIFO survives undo
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

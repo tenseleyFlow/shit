@@ -358,6 +358,60 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  fsevents-fallback-macos:
+    # The unentitled hosted runner is the intended environment: this
+    # proves the truthful FSEvents-degraded fallback when EndpointSecurity
+    # cannot initialize.
+    name: FSEvents degraded fallback smoke (M01/M02 macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: verify runtime prerequisites
+        run: |
+          test -x /usr/bin/python3
+          command -v sqlite3
+          command -v jq
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/fsevents-fallback-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsevents-fallback-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+            /tmp/shit-smoke.*/doctor.json
+
+  mkdir-out-of-watch-undo-macos:
+    # M03.x.CREATE regression guard. The target is deliberately outside
+    # the watched cwd, so only the successful post-syscall DYLD shim
+    # notification can produce the directory's Unlink inverse.
+    name: mkdir-out-of-watch undo smoke (M03.x.CREATE macOS)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/mkdir-out-of-watch-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkdir-out-of-watch-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   cp-clone-overwrite-undo-macos:
     # M03.x.CLONE-COPYFILE regression guard — replicates `cp -c <src>
     # <dst>` when dst exists: stat + unlink(dst) + clonefile(src, dst).
@@ -1071,12 +1125,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-rmi-undo:
-    # AR03.2 -- validates the container-runtime capture pipeline
-    # (DR-CR-26, AR03 PR-B). `docker rmi <image>` ships the tarball
-    # inline via the docker-wrapper hook → shit-helper container-event
-    # → shitd ctl → BlobStore + container_stashes; `shit undo` restores
-    # via `docker load`. Inline-bytes fast path is sized for alpine
-    # (~5 MB); large-image shipping is AR10.8.
+    # AR03.2 -- validates the atomic Rmi capture pipeline.
+    # `docker rmi --no-prune <image>` is CONFIRMED before Docker runs;
+    # post-runtime finalization records a durable FINALIZED state while
+    # preserving the inverse for `shit undo` to restore via `docker load`.
     #
     # ubuntu-24.04 hosted runners ship docker preinstalled; no extra
     # setup beyond sqlite + python3.
@@ -1107,13 +1159,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-pull-digest-journaling:
-    # AU23 / DR-CR-51 — `docker pull <image>` journals the resolved
-    # manifest digest via the wrapper's POST-phase hook so
-    # `shit show` displays both the floating tag the user typed
-    # AND the sha256 their bytes actually are. End-to-end exercise
-    # of: wrapper post → helper inspect → daemon ContainerOp::Pull
-    # → AU30 cmd-detail wire → render::cmd_detail Pull arm.
-    name: docker-pull-digest-journaling smoke (AU23)
+    # The initial release boundary is default-deny for engine mutations.
+    # Pull can retarget a mutable name and has no lossless inverse yet, so the
+    # wrapper must refuse it before helper/runtime execution.
+    name: docker-pull fail-closed smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1140,12 +1189,9 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-rmi-multi-target-undo:
-    # AU24 / DR-CR-52 — `docker rmi <a> <b> <c>` produces N events
-    # under the same command window; `shit undo` restores all N.
-    # Pre-AU24 prepare_rmi took only the first positional and silently
-    # dropped the rest. Validate-the-gap counterpart to the single-image
-    # docker-rmi-undo smoke; pins the post-AU24 batch contract.
-    name: docker-rmi-multi-target-undo smoke (AU24)
+    # Initial safe boundary: multiple rmi targets are refused before Docker
+    # executes, both images remain, and no batch becomes actionable.
+    name: docker-rmi-multi-target fail-closed smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1172,14 +1218,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-volume-rm-undo:
-    # AR03.3 -- validates the container-runtime VolumeRm capture +
-    # restore path. `docker volume rm <vol>` ships a gzipped tarball
-    # of the volume's contents (`docker run --rm -v vol:/src:ro
-    # busybox tar -czf -`) inline via the AR03.2 large-frame plumbing;
-    # `shit undo` recreates the volume and pipes the tarball back via
-    # `docker run --rm -i ... tar -xzf -`. Asserts byte-identity of a
-    # probe file pre- and post-undo.
-    name: docker-volume-rm-undo smoke (AR03.3)
+    # AR03.3 -- pins the current fail-closed policy: volume rm exits
+    # 125 before runtime execution, leaves probe bytes intact, and
+    # creates no actionable batch.
+    name: docker-volume-rm fail-closed smoke (AR03.3)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1206,14 +1248,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-network-rm-undo:
-    # AR03.4 -- validates the NetworkRm capture + restore path.
-    # `docker network rm <net>` ships the `docker network inspect`
-    # JSON as captured_config (small, no tarball, no inline-bytes
-    # path); `shit undo` parses the JSON via synthesize_network_create
-    # and runs `docker network create --driver <D> --subnet <S> <name>`
-    # to recreate with the captured IPAM. Asserts the restored
-    # network has the same subnet.
-    name: docker-network-rm-undo smoke (AR03.4)
+    # AR03.4 -- pins the current fail-closed policy: network rm exits
+    # 125 before runtime execution, leaves the subnet intact, and
+    # creates no actionable batch.
+    name: docker-network-rm fail-closed smoke (AR03.4)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1240,15 +1278,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-rm-undo:
-    # AR10.9 / AR03.1 -- the marquee test for full Rm reverse
-    # synthesis (DR-CR-22). `docker rm -f <container>` ships the
-    # `docker inspect` JSON + a `shit-stash-*` commit for the
-    # running rootfs; `shit undo` parses the inspect and runs
-    # `docker run -d` with the synthesized argv. Asserts the
-    # restored container has the same image-source (stash),
-    # env vars, port bindings, volume mounts, restart policy, AND
-    # any in-place rootfs writes the user made before the rm.
-    name: docker-rm-undo smoke (AR10.9 / AR03.1)
+    # AR10.9 / AR03.1 -- pins the current fail-closed policy: rm exits
+    # 125 before runtime execution, leaves the container/rootfs intact,
+    # and creates no actionable batch.
+    name: docker-rm fail-closed smoke (AR10.9 / AR03.1)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1275,15 +1308,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   podman-rm-undo:
-    # AR03.5 -- cross-runtime delegation proof. Mirrors AR10.9's
-    # docker-rm-undo smoke but uses rootless podman. The helper's
-    # PodmanVerb classifier delegates to DockerVerb's enum shape via
-    # From<DockerVerb>; this smoke proves the same prepare_rm +
-    # synthesize_container_run + apply_rm machinery round-trips
-    # cleanly when the runtime tool name is "podman" instead of
-    # "docker". ubuntu-24.04 hosted runners don't ship podman by
-    # default; we install it from apt.
-    name: podman-rm-undo smoke (AR03.5)
+    # AR03.5 -- rootless Podman fail-closed proof: rm exits 125 before
+    # runtime execution, leaves the container/rootfs intact, and
+    # creates no actionable batch. The runner installs podman from apt.
+    name: podman-rm fail-closed smoke (AR03.5)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -1310,12 +1338,10 @@ jobs:
             /tmp/shit-smoke.*/state/shit/log/
 
   docker-compose-down-undo:
-    # AR03.6 / DR-CR-53 -- validates the compose-down capture +
-    # restore path. `docker compose down` ships project +
-    # compose_file path in extras; `shit undo` runs `docker compose
-    # up -d` to bring the project back. Uses the v2 plugin form via
-    # the docker-wrapper's classify_compose_argv fall-through.
-    name: docker-compose-down-undo smoke (AR03.6)
+    # AR03.6 / DR-CR-53 -- pins the current fail-closed policy:
+    # compose down exits 125 before runtime execution, leaves both
+    # services running, and creates no actionable batch.
+    name: docker-compose-down fail-closed smoke (AR03.6)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -2168,11 +2194,12 @@ jobs:
 
       - name: setcap helper
         run: |
-          # AU22 adds cap_mknod to the capset so mkfifo-restore-undo-linux
-          # (and any future Fifo/Socket restore path) can dispatch
-          # libc::mknod via helper-IPC. cap_mknod is the standard
-          # POSIX-capability gate for mknod(2) with FIFO/SOCK kinds;
-          # block/char devices still need CAP_SYS_ADMIN (DR-15.2).
+          # Keep cap_mknod on the helper so the privileged mknod IPC route
+          # remains available for future exact FIFO replay. The current
+          # mkfifo-restore-undo-linux smoke intentionally gates
+          # CaptureRefused: metadata-only deletion evidence is not complete
+          # enough to invoke this route safely. FIFO creation undo only
+          # unlinks the newly-created path and remains supported.
           sudo setcap cap_mknod,cap_sys_admin,cap_bpf,cap_perfmon+ep \
             target/release/shit-helper
           getcap target/release/shit-helper
@@ -2271,17 +2298,9 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
-  # B04+B05 — FreeBSD smoke regression net. Runs all 10 BSD smokes
-  # inside a FreeBSD-14 VM. Single VM, many smokes (job-per-smoke
-  # would cost ~10 minutes per smoke in VM boot alone). One unit
-  # covers:
-  #   - file tier: rm-undo / mkdir-undo / chmod-undo / touch-edit-undo
-  #   - package tier: pkg-install-undo (via doas)
-  #   - service tier: service-restart-undo (cron via doas)
-  #   - network tier: pfctl-add-undo / pfctl-flush-undo (pf via doas)
-  #   - process tier: kill-proc-undo (pkill -f resolved by sysctl(KERN_PROC_*))
-  #   - sandbox: capsicum-default-on (B05: helper enters cap_enter, full
-  #     rm-undo pipeline works inside the capability sandbox)
+  # B04+B05 — FreeBSD smoke regression net. Runs every runnable
+  # freebsd-vm smoke discovered by smoke-driver inside one FreeBSD-14
+  # VM; job-per-smoke would pay the VM boot cost for every script.
   #
   # Doctor JSON pre-flight gates the smoke run — if the CI image's
   # FreeBSD lacks a working kqueue we skip cleanly and fail the job
@@ -2291,7 +2310,7 @@ jobs:
   freebsd-smoke:
     name: freebsd-smoke (B04)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: BSD smoke matrix inside FreeBSD 14

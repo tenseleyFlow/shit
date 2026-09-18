@@ -8,28 +8,10 @@
 # EXCLUDED_BY: 
 # EXCLUDED_REASON: 
 #
-# AR03.4 smoke — `docker network rm <net>; shit undo` restores the
-# network with its driver + subnet preserved.
-#
-# Exercises (DR-CR-26 network-rm path):
-#   1. Create a docker network with a non-default subnet (so the
-#      restore must honor the captured IPAM config, not just recreate
-#      a vanilla bridge).
-#   2. Through the shit-installed docker-wrapper, `docker network rm
-#      shit-test-net` invokes `shit-helper container-event docker
-#      pre` before exec'ing the real docker.
-#   3. The helper classifies as NetworkRm, runs `docker network
-#      inspect shit-test-net`, ships the JSON bytes as
-#      captured_config (small payload — no tarball, no inline-bytes
-#      path).
-#   4. Daemon journals the ContainerOp event with captured_config.
-#      No container_stashes row for NetworkRm (config-only verb).
-#   5. The real docker proceeds to remove the network.
-#   6. `shit undo --yes` plans InverseOp::ContainerRestore { NetworkRm,
-#      name=shit-test-net }, which parses the captured JSON via
-#      synthesize_network_create and runs `docker network create
-#      --driver bridge --subnet <captured> shit-test-net`.
-#   7. Post-undo: the network exists with the same driver + subnet.
+# AR03.4 fail-closed smoke. Network removal is outside the current
+# atomic capture policy, so the wrapper must exit 125 before invoking
+# the real runtime. The network/subnet must remain intact, and the
+# command must not own a CONFIRMED container capture batch.
 #
 # Skips cleanly when docker isn't available. ubuntu-24.04 hosted
 # runners have docker.
@@ -70,6 +52,14 @@ smoke_log "chose subnet=${SUBNET} for ${NET_NAME}"
 cleanup_net() {
     SHIT_DURING_UNDO=1 docker network rm "${NET_NAME}" >/dev/null 2>&1 || true
 }
+
+cleanup_on_exit() {
+    local rc=$?
+    trap - EXIT
+    cleanup_net
+    smoke_cleanup "${rc}"
+}
+trap cleanup_on_exit EXIT
 
 # Pre-state: create network with non-default driver + subnet.
 smoke_log "creating network ${NET_NAME} subnet=${SUBNET}"
@@ -116,65 +106,44 @@ smoke_log "PreExec seq=1 pid=${PID}"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "$(pwd)" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "docker network rm ${NET_NAME} (via wrapper)"
+smoke_log "docker network rm ${NET_NAME} (expected fail-closed refusal)"
 export SHIT_HOOK_DEBUG=1
-if ! docker network rm "${NET_NAME}" >"${SHIT_SMOKE_TMP}/netrm.log" 2>&1; then
-    smoke_log "netrm.log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/netrm.log" >&2
-    cleanup_net
-    smoke_fail "docker network rm ${NET_NAME} exited non-zero"
-fi
-smoke_log "netrm.log (informational; rm succeeded):"
+set +e
+docker network rm "${NET_NAME}" >"${SHIT_SMOKE_TMP}/netrm.log" 2>&1
+network_rm_rc=$?
+set -e
+smoke_log "netrm.log (expected refusal):"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/netrm.log" >&2
-
-# Confirm gone.
-if docker network inspect "${NET_NAME}" >/dev/null 2>&1; then
-    cleanup_net
-    smoke_fail "${NET_NAME} still present after rm (wrapper or docker bug)"
+if [ "${network_rm_rc}" -ne 125 ]; then
+    smoke_fail "expected docker network rm wrapper to exit 125, got ${network_rm_rc}"
 fi
 
-smoke_log "PostExec seq=1"
-"${SHIT_BIN}" hook-send post-exec \
-    --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
-
-smoke_wait_for_event "discriminant = 'ContainerOp'" 1 10
-# NetworkRm doesn't stash a tarball (no container_stashes row to
-# probe like AR03.2/AR03.3). The ContainerOp journal entry is the
-# only persisted artifact pre-undo; the daemon log shows verb=NetworkRm
-# in tracing. The real assertion is the post-undo subnet check below
-# — if the daemon journaled the wrong verb shape, undo wouldn't
-# recreate the network at all.
-
-smoke_log "running: shit undo --yes"
-"${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    cleanup_net
-    smoke_fail "shit undo --yes exited non-zero"
-}
-
-# Post-undo: network must exist + subnet must match.
+# The real runtime must never have removed or recreated the network.
 if ! docker network inspect "${NET_NAME}" >/dev/null 2>&1; then
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    cleanup_net
-    smoke_fail "${NET_NAME} still missing after undo — ContainerRestore (NetworkRm) didn't recreate"
+    smoke_fail "${NET_NAME} was removed despite fail-closed policy"
 fi
 
-post_subnet="$(SHIT_DURING_UNDO=1 docker network inspect "${NET_NAME}" --format '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)"
-if [ "${post_subnet}" != "${SUBNET}" ]; then
-    smoke_log "undo log:"
-    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
-    smoke_log "subnet mismatch: pre=${SUBNET} post=${post_subnet}"
-    cleanup_net
-    smoke_fail "network restored but subnet not preserved"
+intact_subnet="$(SHIT_DURING_UNDO=1 docker network inspect "${NET_NAME}" --format '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null)"
+if [ "${intact_subnet}" != "${SUBNET}" ]; then
+    smoke_fail "network subnet changed despite refusal: pre=${SUBNET} post=${intact_subnet}"
 fi
-smoke_log "${NET_NAME} restored with subnet=${post_subnet} (matches pre-state)"
+smoke_log "${NET_NAME} remained intact with subnet=${intact_subnet}"
+
+smoke_log "PostExec seq=1 exit=${network_rm_rc}"
+"${SHIT_BIN}" hook-send post-exec \
+    --session "${SESSION}" --seq 1 --exit-code "${network_rm_rc}" --sock "${SHIT_HOOK_SOCK}"
+
+SESSION_HEX="${SESSION//-/}"
+if ! actionable_batches="$(smoke_journal_query "SELECT COUNT(*) FROM container_capture_batches WHERE session = X'${SESSION_HEX}' AND seq = 1 AND state IN ('CONFIRMED', 'FINALIZED');" 2>/dev/null)"; then
+    smoke_fail "could not query container_capture_batches"
+fi
+if [ "${actionable_batches:-0}" -ne 0 ]; then
+    smoke_fail "unsupported docker network rm produced ${actionable_batches} actionable batch(es)"
+fi
+smoke_log "actionable container batches: 0"
 
 smoke_log "session close"
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-cleanup_net
-
-smoke_log "PASS: docker-network-rm-undo-linux (${NET_NAME} rm'd → restored with subnet)"
+smoke_log "PASS: docker-network-rm-undo-linux (exit 125; ${NET_NAME} intact; no actionable batch)"

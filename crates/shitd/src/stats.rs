@@ -21,7 +21,7 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use hdrhistogram::Histogram;
 use shit_proto::{HelperLinkState, MetricsSnapshot};
@@ -48,6 +48,10 @@ pub struct Stats {
     pub hook_latency_us: Mutex<Histogram<u64>>,
     /// Last completed GC pass summary. Zero if no pass has run.
     pub last_gc: Mutex<LastGc>,
+    /// Number of passes that retained age-expired data because the trusted
+    /// wall clock was quarantined. Internal until a versioned metrics seam is
+    /// added; structured GC logs expose each occurrence to operators.
+    pub gc_age_expiry_suppressed_total: AtomicU64,
     /// Kernel-tier classifier set once at startup.
     pub kernel_tier: Mutex<String>,
     /// B03.A — helper link liveness. Stored as `AtomicU8` so the
@@ -75,6 +79,7 @@ impl Stats {
             hook_decode_errors: AtomicU64::new(0),
             hook_latency_us: Mutex::new(new_latency_histogram()),
             last_gc: Mutex::new(LastGc::default()),
+            gc_age_expiry_suppressed_total: AtomicU64::new(0),
             kernel_tier: Mutex::new(String::new()),
             helper_link_state: AtomicU8::new(0),
         })
@@ -103,15 +108,22 @@ impl Stats {
         }
     }
 
-    pub fn note_gc(&self, duration_ms: u64, bytes_reclaimed: u64) {
+    pub fn note_gc(
+        &self,
+        duration_ms: u64,
+        bytes_reclaimed: u64,
+        at_unix_secs: u64,
+        age_expiry_suppressed: bool,
+    ) {
+        if age_expiry_suppressed {
+            self.gc_age_expiry_suppressed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(mut g) = self.last_gc.lock() {
             *g = LastGc {
                 duration_ms,
                 bytes_reclaimed,
-                at_unix_secs: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                at_unix_secs,
             };
         }
     }
@@ -236,12 +248,12 @@ mod tests {
     #[test]
     fn note_gc_populates_last_gc_fields() {
         let s = Stats::new();
-        s.note_gc(42, 1024 * 1024);
+        s.note_gc(42, 1024 * 1024, 1_700_000_000, true);
         let snap = s.snapshot(1, 0, 0, 0);
         assert_eq!(snap.last_gc_duration_ms, 42);
         assert_eq!(snap.last_gc_bytes_reclaimed, 1024 * 1024);
-        // at_unix_secs is now-ish; just check non-zero.
-        assert!(snap.last_gc_at_unix_secs > 0);
+        assert_eq!(snap.last_gc_at_unix_secs, 1_700_000_000);
+        assert_eq!(s.gc_age_expiry_suppressed_total.load(Ordering::Relaxed), 1);
     }
 
     #[test]

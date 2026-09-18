@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use anyhow::Context;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use tokio::sync::Notify;
 mod active_commands;
 mod ancestry;
 mod baseline;
+mod clock;
 mod cloud_track;
 mod config;
 mod container_track;
@@ -67,10 +69,108 @@ struct Cli {
     sock: Option<PathBuf>,
 }
 
-/// DR-66: per-OS classifier the daemon uses to prime
-/// `Stats::kernel_tier` at startup. Mirrors
-/// `shit_helper::handshake::classify_kernel_tier`; once the helper
-/// links up it overwrites this with its own runtime probe result.
+#[derive(Debug)]
+struct StartupDurabilityReport {
+    command_recovery: shit_store::StartupRecoveryReport,
+    remaining_blob_leases_cleared: usize,
+    blob_reconciliation: shit_store::StartupReconcileReport,
+}
+
+/// Repair durable state left by an earlier daemon lifetime.
+///
+/// This must run after opening the Index and BlobStore but before constructing
+/// or spawning any capture producer, listener, or GC task. Process-lifetime
+/// leases cannot survive a restart: interrupted commands consume theirs as
+/// part of atomic refusal/close recovery, then any remaining stale leases are
+/// cleared before the lease-free reconciliation pass.
+fn recover_startup_state(
+    index: &shit_store::Index,
+    blob_store: &shit_store::BlobStore,
+    wallclock_unix_nanos: u64,
+) -> anyhow::Result<StartupDurabilityReport> {
+    let command_recovery = shit_store::recover_interrupted_commands(index, wallclock_unix_nanos)
+        .context("recover interrupted commands from previous daemon lifetime")?;
+    let remaining_blob_leases_cleared = index
+        .clear_all_blob_leases()
+        .context("clear stale process-lifetime blob leases")?;
+    let blob_reconciliation = shit_store::reconcile_startup(index, blob_store)
+        .context("reconcile blob index and filesystem at startup")?;
+    Ok(StartupDurabilityReport {
+        command_recovery,
+        remaining_blob_leases_cleared,
+        blob_reconciliation,
+    })
+}
+
+fn log_startup_durability(report: &StartupDurabilityReport) {
+    let recovery = &report.command_recovery;
+    let reconcile = &report.blob_reconciliation;
+    tracing::info!(
+        commands_recovered = recovery.recovered_commands.len(),
+        confirmed_container_commands_preserved =
+            recovery.preserved_confirmed_container_commands.len(),
+        prepared_container_batches_refused = recovery.prepared_batches_refused,
+        recovery_blob_leases_cleared = recovery.blob_leases_cleared,
+        remaining_blob_leases_cleared = report.remaining_blob_leases_cleared,
+        tmp_files_removed = reconcile.tmp_files_removed,
+        refcount_rows_recomputed = reconcile.refcount_rows_recomputed,
+        refcounts_corrected = reconcile.refcount_corrected_hashes.len(),
+        metadata_corrected = reconcile.metadata_corrected_hashes.len(),
+        blob_rows_repaired = reconcile.repaired_blob_rows.len(),
+        blob_rows_removed = reconcile.removed_blob_rows.len(),
+        canonical_files_removed = reconcile.removed_canonical_files.len(),
+        ignored_paths = reconcile.ignored_paths.len(),
+        missing_referenced_blobs = reconcile.missing_referenced_hashes.len(),
+        corrupt_referenced_blobs = reconcile.corrupt_referenced_hashes.len(),
+        "startup durability recovery complete"
+    );
+    let refused_commands: Vec<_> = recovery
+        .recovered_commands
+        .iter()
+        .filter(|command| {
+            !recovery
+                .preserved_confirmed_container_commands
+                .contains(command)
+        })
+        .copied()
+        .collect();
+    if !refused_commands.is_empty() {
+        tracing::warn!(
+            commands = ?refused_commands,
+            synthetic_exit_code = shit_store::STARTUP_RECOVERY_EXIT_CODE,
+            "interrupted commands from a previous daemon lifetime were made non-undoable"
+        );
+    }
+    if !recovery.preserved_confirmed_container_commands.is_empty() {
+        tracing::info!(
+            commands = ?recovery.preserved_confirmed_container_commands,
+            synthetic_exit_code = shit_store::STARTUP_RECOVERY_EXIT_CODE,
+            "interrupted commands retained pre-authorized container inverses"
+        );
+    }
+    if !reconcile.ignored_paths.is_empty() {
+        tracing::warn!(
+            paths = ?reconcile.ignored_paths,
+            "startup reconciliation retained unrecognized blob-store paths"
+        );
+    }
+    if !reconcile.missing_referenced_hashes.is_empty()
+        || !reconcile.corrupt_referenced_hashes.is_empty()
+    {
+        tracing::error!(
+            missing_count = reconcile.missing_referenced_hashes.len(),
+            corrupt_count = reconcile.corrupt_referenced_hashes.len(),
+            missing_hashes = ?reconcile.missing_referenced_hashes,
+            corrupt_hashes = ?reconcile.corrupt_referenced_hashes,
+            "REFERENCED BLOB EVIDENCE IS MISSING OR CORRUPT; affected undo plans will refuse"
+        );
+    }
+}
+
+/// DR-66: display-only per-OS default used before a helper has connected.
+/// A successful helper handshake overwrites it with the producer tier that
+/// actually reached its live startup boundary; doctor also checks helper-link
+/// state and must not treat this disconnected default as runtime evidence.
 const fn daemon_kernel_tier_default() -> &'static str {
     #[cfg(target_os = "linux")]
     {
@@ -114,6 +214,17 @@ fn main() -> anyhow::Result<()> {
     // DR-68: pass the crash ring so each event also lands in the
     // panic-hook tail buffer.
     let _log_guard = log_setup::init(&resolved.state_dir, &resolved.log_level, crash::ring());
+
+    // Installed wrapper content is part of the container authorization
+    // protocol. A daemon restart after a package upgrade must atomically
+    // replace opted-in stale copies before it begins serving capture requests.
+    if let Ok(config_home) = config::config_home() {
+        for path in shit_shell::container_wrappers::refresh_existing(&config_home)
+            .context("refresh installed container wrappers")?
+        {
+            tracing::warn!(path = %path.display(), "refreshed stale container wrapper");
+        }
+    }
 
     // S21.6 — surface OTLP feature/config drift loudly. If the
     // operator set `[telemetry] otlp_endpoint` but the daemon wasn't
@@ -177,15 +288,45 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let index = Arc::new(shit_store::Index::open(&index_path)?);
     tracing::info!(path = %index_path.display(), "index opened");
 
+    // Establish the one daemon-lifetime wall clock before recovery writes any
+    // terminal timestamps. Durable history is a read-only startup anchor: a
+    // suspicious RTC jump quarantines age expiry and cannot poison the next
+    // daemon lifetime by stamping recovered rows in the suspect epoch.
+    let latest_durable_wall = index
+        .latest_wallclock_unix_nanos()
+        .context("read latest durable wall timestamp")?;
+    let startup_time = clock::init(latest_durable_wall).sample();
+    if !startup_time.age_expiry_safe {
+        tracing::warn!(
+            anchored_unix_nanos = startup_time.unix_nanos,
+            latest_durable_unix_nanos = latest_durable_wall,
+            "wall-clock sanity check failed; age-based retention is disabled for this daemon lifetime"
+        );
+    }
+
     let blobs_path = cfg.state_dir.join("blobs");
     let blob_store = Arc::new(shit_store::BlobStore::open(&blobs_path)?);
     tracing::info!(path = %blobs_path.display(), "blob store opened");
+
+    // No producer may exist before this boundary. Recovery closes every
+    // command whose prior capture proof died with the old process, expires
+    // process-lifetime leases, and reconciles physical/index blob ownership.
+    // Any failure aborts startup instead of serving from ambiguous state.
+    let startup_report =
+        recover_startup_state(index.as_ref(), blob_store.as_ref(), startup_time.unix_nanos)?;
+    let startup_next_logical = startup_report.command_recovery.next_logical;
+    server::seed_logical_clock(startup_next_logical);
+    log_startup_durability(&startup_report);
 
     // W02.B.live-baseline — per-cwd content snapshot held in memory.
     // Populated by the helper's BaselineCaptured stream at session
     // open; consulted by the CapturedPreImage ingest path to swap
     // post-write content for the genuine pre-content captured here.
     let live_baseline = Arc::new(baseline::LiveBaseline::new());
+    // DR-25 prereq: the in-memory active-command map. Construct it before the
+    // helper dispatch loop so an unexpected helper disconnect can durably
+    // refuse every command that was in flight at the time of the loss.
+    let active = Arc::new(active_commands::ActiveCommands::new());
 
     // S24.A — spawn shit-helper and start its dispatch loop. Best-
     // effort: if the helper binary isn't discoverable or the
@@ -200,6 +341,8 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // handler returns ready=false / "no helper" early without
     // touching the map in that case.
     let watch_ready = Arc::new(watch_ready::WatchReadyMap::new());
+    let finalization_blocks = Arc::new(server::FinalizationBlocks::default());
+    let shim_ingest = Arc::new(shim_listener::ShimIngestTracker::new());
 
     let (helper_link_arc, helper_dispatch_handle): (
         Option<Arc<helper_link::HelperLink>>,
@@ -236,6 +379,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let dispatch_shutdown = Arc::clone(&shutdown);
                         let dispatch_watch_ready = Arc::clone(&watch_ready);
                         let dispatch_stats = Arc::clone(&stats);
+                        let dispatch_active = Arc::clone(&active);
                         let handle = tokio::spawn(async move {
                             if let Err(e) = helper_link::dispatch_loop(
                                 dispatch_link,
@@ -245,6 +389,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                                 dispatch_shutdown,
                                 dispatch_watch_ready,
                                 dispatch_stats,
+                                dispatch_active,
                             )
                             .await
                             {
@@ -274,22 +419,15 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         let shutdown = Arc::clone(&shutdown);
         let stats = Arc::clone(&stats);
         tokio::spawn(async move {
-            // Stage-1 logical clock: a monotonic counter incrementing
-            // once per pass. Replaced by the daemon's real logical
-            // clock once the capture-runtime pipeline lights up.
-            let counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
-            let now_logical_fn = {
-                let counter = Arc::clone(&counter);
-                Arc::new(move || counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                    as Arc<dyn Fn() -> u64 + Send + Sync>
-            };
+            let retention_now_fn = Arc::new(|| clock::now().retention_now())
+                as Arc<dyn Fn() -> shit_store::RetentionNow + Send + Sync>;
             gc::run_loop(
                 index,
                 blob_store,
                 gc::GcTaskConfig::default(),
                 signal,
                 shutdown,
-                now_logical_fn,
+                retention_now_fn,
                 stats,
             )
             .await;
@@ -303,10 +441,6 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let net_stash = Arc::new(net_track::NetPreStash::new());
     let proc_stash = Arc::new(proc_track::ProcPreStash::new());
     let db_stash = Arc::new(db_track::DbPreStash::new());
-    // DR-25 prereq: the in-memory active-command map. Owns the
-    // shell_pid → (session, seq) lookup tier-event handlers use to
-    // attribute pkg/env/svc/net/proc/db events to a live command.
-    let active = Arc::new(active_commands::ActiveCommands::new());
     let pkg_janitor = {
         let pkg_stash = Arc::clone(&pkg_stash);
         let env_stash = Arc::clone(&env_stash);
@@ -383,6 +517,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             // handler can short-circuit to "no helper" when we're
             // in degraded mode.
             watch_ready: helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready)),
+            finalization_blocks: Arc::clone(&finalization_blocks),
             // AU28 — handle_undo wraps this in a
             // HelperLinkPrivilegedOpRouter when Some; in degraded
             // mode (None) the FileExecutor uses NoOpPrivilegedOpRouter
@@ -407,9 +542,20 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         let blob_store = Arc::clone(&blob_store);
         let active = Arc::clone(&active);
         let live_baseline = Arc::clone(&live_baseline);
+        let shim_ingest = Arc::clone(&shim_ingest);
+        let finalization_blocks = Arc::clone(&finalization_blocks);
         tokio::spawn(async move {
-            if let Err(e) =
-                shim_listener::serve(&cfg, shutdown, index, blob_store, active, live_baseline).await
+            if let Err(e) = shim_listener::serve(
+                &cfg,
+                shutdown,
+                index,
+                blob_store,
+                active,
+                live_baseline,
+                shim_ingest,
+                finalization_blocks,
+            )
+            .await
             {
                 tracing::error!(err = %e, "shim listener exited");
             }
@@ -427,6 +573,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     // is a no-op in degraded mode.
     let watch_ready_for_server = helper_link_arc.as_ref().map(|_| Arc::clone(&watch_ready));
     let live_baseline_for_server = Arc::clone(&live_baseline);
+    let shim_ingest_for_server = Arc::clone(&shim_ingest);
     // AU09 — capture socket paths before `cfg` moves into server::serve
     // so we can unlink them on the shutdown path below.
     let ctl_sock_path = cfg.ctl_socket_path.clone();
@@ -443,6 +590,8 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             helper_link_for_server,
             watch_ready_for_server,
             live_baseline_for_server,
+            shim_ingest_for_server,
+            finalization_blocks,
         ) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
@@ -512,5 +661,161 @@ async fn wait_for_term_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod startup_recovery_tests {
+    use super::*;
+    use shit_planner::{
+        CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, FileMetadata,
+        FilePreImageSource, InodeRef, PlannerStore, TimePoint,
+    };
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+
+    fn begin(index: &shit_store::Index, session: Uuid, seq: u64, logical: u64) -> CommandId {
+        let command = CommandId { session, seq };
+        assert!(
+            index
+                .begin_command(&CommandRecord {
+                    command,
+                    cmd_string: Some(format!("command-{seq}")),
+                    cwd: PathBuf::from("/tmp"),
+                    pid: 123,
+                    shell_kind: shit_proto::ShellKind::Bash,
+                    started_at: TimePoint::new(logical, logical * 10),
+                    ended_at: None,
+                    exit_code: None,
+                    event_ids: Vec::new(),
+                })
+                .unwrap()
+        );
+        command
+    }
+
+    #[test]
+    fn startup_orders_recovery_lease_expiry_reconcile_and_new_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = shit_store::Index::open(dir.path().join("index.sqlite")).unwrap();
+        let blobs = shit_store::BlobStore::open(dir.path().join("blob-store")).unwrap();
+        let session = Uuid::from_bytes([0x73; 16]);
+        index
+            .put_session(session, "bash", 1, None, TimePoint::new(1, 1))
+            .unwrap();
+
+        let interrupted = begin(&index, session, 1, 10);
+        let (leased, leased_stat) = blobs.put(b"leased only by old daemon").unwrap();
+        index
+            .put_blob_record(
+                leased,
+                leased_stat.stored_bytes,
+                leased_stat.compressed,
+                TimePoint::new(11, 11),
+            )
+            .unwrap();
+        index
+            .create_blob_lease(leased, interrupted, TimePoint::new(12, 12))
+            .unwrap();
+
+        // A completed command owns a blob whose physical evidence is missing.
+        // Reconciliation must report it loudly (the caller logs at error) and
+        // preserve a conservative database row rather than deleting evidence.
+        let completed = begin(&index, session, 2, 20);
+        let (missing, missing_stat) = blobs.put(b"referenced then lost").unwrap();
+        index
+            .put_blob_record(
+                missing,
+                missing_stat.stored_bytes,
+                missing_stat.compressed,
+                TimePoint::new(21, 21),
+            )
+            .unwrap();
+        index
+            .put_event(&CaptureEvent {
+                id: EventId(0),
+                command: completed,
+                ts: TimePoint::new(200, 2_000),
+                partial: false,
+                kind: CaptureEventKind::FilePreImage {
+                    inode: InodeRef::new(1, 2),
+                    path: PathBuf::from("/tmp/missing-evidence"),
+                    blob: missing,
+                    meta: FileMetadata {
+                        mode: 0o100644,
+                        uid: 1,
+                        gid: 1,
+                        size: 20,
+                        mtime_unix_nanos: 0,
+                        xattrs: BTreeMap::new(),
+                        acl: None,
+                        flags: 0,
+                    },
+                    post_content_hash: None,
+                    source: FilePreImageSource::Other,
+                },
+            })
+            .unwrap();
+        assert!(
+            index
+                .finish_command(completed, TimePoint::new(201, 2_010), 0)
+                .unwrap()
+        );
+        blobs.delete(&missing).unwrap();
+
+        // Simulate a stale process-lifetime lease attached to an already
+        // completed command. Command recovery will not own it; the explicit
+        // clear-all phase before reconciliation must remove it.
+        index
+            .conn_for_test()
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO blob_leases (hash, session, seq, created_logical)
+                 VALUES (?1, ?2, ?3, 202)",
+                (
+                    missing.as_bytes().as_slice(),
+                    completed.session.as_bytes().as_slice(),
+                    completed.seq as i64,
+                ),
+            )
+            .unwrap();
+
+        let report = recover_startup_state(&index, &blobs, 9_000).unwrap();
+        assert_eq!(
+            report.command_recovery.recovered_commands,
+            vec![interrupted]
+        );
+        assert_eq!(report.command_recovery.blob_leases_cleared, 1);
+        assert_eq!(report.remaining_blob_leases_cleared, 1);
+        assert_eq!(report.command_recovery.next_logical, 205);
+        assert_eq!(
+            report.blob_reconciliation.missing_referenced_hashes,
+            vec![missing]
+        );
+        assert_eq!(index.clear_all_blob_leases().unwrap(), 0);
+
+        let recovered = index.command_by_id(interrupted).unwrap();
+        assert_eq!(recovered.ended_at, Some(TimePoint::new(204, 9_000)));
+        assert_eq!(
+            recovered.exit_code,
+            Some(shit_store::STARTUP_RECOVERY_EXIT_CODE)
+        );
+        assert!(matches!(
+            index.events_for_command(interrupted).as_slice(),
+            [CaptureEvent {
+                ts: TimePoint { logical: 203, .. },
+                kind: CaptureEventKind::CaptureRefused { detail, .. },
+                ..
+            }] if detail == shit_store::STARTUP_RECOVERY_DETAIL
+        ));
+
+        // The first event produced after restart cannot move behind recovered
+        // or pre-crash journal history.
+        server::seed_logical_clock(report.command_recovery.next_logical);
+        let first_new_timestamp = server::next_ts();
+        assert!(first_new_timestamp.logical >= report.command_recovery.next_logical);
+        assert!(first_new_timestamp.logical > recovered.ended_at.unwrap().logical);
+        assert!(first_new_timestamp.logical > 201);
     }
 }

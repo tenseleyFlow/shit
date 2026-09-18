@@ -8,9 +8,18 @@ fn shit_bin() -> &'static str {
     env!("CARGO_BIN_EXE_shit")
 }
 
+fn shit_command() -> Command {
+    let mut command = Command::new(shit_bin());
+    command.env(
+        "XDG_CONFIG_HOME",
+        std::env::temp_dir().join(format!("shit-cli-tests-{}", std::process::id())),
+    );
+    command
+}
+
 #[test]
 fn completions_bash_renders() {
-    let out = Command::new(shit_bin())
+    let out = shit_command()
         .args(["completions", "bash"])
         .output()
         .unwrap();
@@ -28,7 +37,7 @@ fn completions_bash_renders() {
 
 #[test]
 fn completions_zsh_renders() {
-    let out = Command::new(shit_bin())
+    let out = shit_command()
         .args(["completions", "zsh"])
         .output()
         .unwrap();
@@ -39,7 +48,7 @@ fn completions_zsh_renders() {
 
 #[test]
 fn completions_fish_renders() {
-    let out = Command::new(shit_bin())
+    let out = shit_command()
         .args(["completions", "fish"])
         .output()
         .unwrap();
@@ -51,7 +60,7 @@ fn completions_fish_renders() {
 #[test]
 fn manpages_writes_files_for_each_subcommand() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(shit_bin())
+    let out = shit_command()
         .args(["manpages", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -88,7 +97,7 @@ fn manpages_does_not_emit_help_entry() {
     // The clap-generated `help` subcommand shouldn't get its own man
     // page — it'd shadow `man help` on the system.
     let dir = tempfile::tempdir().unwrap();
-    let _ = Command::new(shit_bin())
+    let _ = shit_command()
         .args(["manpages", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
