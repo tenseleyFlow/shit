@@ -46,12 +46,12 @@ In default mode, `shit` runs as an unprivileged user-level daemon (`shitd`) plus
 1. **FSEvents** — observes file mutations across watched roots. Its events carry post-mutation paths but no pre-image content, so they are marked partial and force a command-atomic refusal if they remain in the journal. They still provide watch readiness and useful diagnostics. Current reconciliation is conservative and can refuse a command when a partial observation arrived before equivalent DYLD/ES evidence.
 2. **DYLD shim** — when you install `shit` and run `shit dyld-hooks install`, snippets in `~/.zshrc` and `~/.bashrc` export `DYLD_INSERT_LIBRARIES=…/libshit_preload_shim.dylib`. New shells inherit this; eligible dynamically linked child processes load our shim. (Fish command bracketing is supported, but the installer does not currently edit fish configuration.) The shim interposes supported file-mutating libc calls such as `unlink`, `rename`, `open`, `chmod`, `chown`, and `xattr` (including supported `*at` variants), captures pre-mutation state, and journals it only after the real call succeeds.
 
-The DYLD shim is the actionable capture path in default mode; FSEvents does not fill a missing pre-image. These tested shapes use the shim:
+The DYLD shim is the actionable capture path in default mode; FSEvents does not fill a missing pre-image. These shapes have pinned workload smokes through the shim:
 - `make install` invoked from your shell → catches via shim (assuming `gmake` or any non-SIP make)
 - `cargo install --force` → catches via shim
 - `pip install --force-reinstall` → catches via shim (assuming brew Python)
-- `vim :wq` → catches via shim (vim is non-SIP)
-- `git commit` → catches via shim (Homebrew git is non-SIP)
+
+Homebrew `vim :wq` and `git commit` are plausible non-SIP workloads, but their dedicated M08 smokes have not landed yet and are not support evidence.
 
 What's NOT covered in default mode:
 - Anything you invoke via `/bin/sh -c '...'` that does mutations directly in `sh`. (`sh` is SIP-stripped.) Note: `sh -c 'gchmod ...'` IS covered — the SIP-strip only applies to `sh` itself, not its non-SIP children.
@@ -77,7 +77,7 @@ In power-user mode, `shit` additionally subscribes to **EndpointSecurity** kerne
 
 With those three flips, AMFI accepts the ES entitlement claim from any signed binary, including our `shit setup-es-mode --apply`-output ad-hoc signature.
 
-EndpointSecurity broadens capture; it does not make every filesystem mutation reversible. Only implemented event families are actionable, and `AUTH_UTIMES` explicitly refuses while captured metadata lacks atime.
+EndpointSecurity broadens capture; it does not make every filesystem mutation reversible. Only implemented event families are actionable. `AUTH_UTIMES` explicitly refuses while captured metadata lacks atime, and `AUTH_SETMODE` / `AUTH_SETOWNER` refuse until the inverse can preserve ACL and ownership-induced mode side effects losslessly.
 
 That's the work; here's what each step actually weakens.
 
