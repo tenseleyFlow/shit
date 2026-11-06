@@ -51,6 +51,13 @@ pub struct CtlState {
     /// (every privileged op returns PermissionDenied; user sees the
     /// original EPERM).
     pub helper_link: Option<Arc<crate::helper_link::HelperLink>>,
+    /// R3 close barrier. Undo and show wait for commands whose
+    /// PostExec arrived but whose helper flush has not, so a command
+    /// that just ended is visible to them.
+    pub closing: Arc<crate::server::ClosingCommands>,
+    /// Planner options from config (`[capture] strict`). Not read by
+    /// the planner until the R3 planner slice lands.
+    pub plan_options: shit_planner::PlanOptions,
 }
 use std::path::Path;
 use std::sync::Arc;
@@ -116,6 +123,8 @@ async fn handle_client(
         active,
         watch_ready,
         helper_link,
+        closing,
+        plan_options,
     } = state;
     // Length-prefix-first read so we can grow the buffer up to
     // MAX_LARGE_FRAME_SIZE only when a large payload (ContainerEvent
@@ -202,6 +211,8 @@ async fn handle_client(
             // Move handle_undo to spawn_blocking so the runtime worker
             // stays free to poll dispatch_loop, which routes the
             // response back to the router's waiter inside the timeout.
+            wait_for_closing_commands(&closing, "undo").await;
+            debug!(strict_capture = plan_options.strict_capture, "undo");
             let index = Arc::clone(&index);
             let blob_store = Arc::clone(&blob_store);
             let helper_link = helper_link.as_ref().map(Arc::clone);
@@ -239,6 +250,7 @@ async fn handle_client(
             // load events, build UndoPlan) which would block the
             // current-thread runtime worker. Move to spawn_blocking
             // so dispatch_loop + other tasks stay live.
+            wait_for_closing_commands(&closing, "show").await;
             let index = Arc::clone(&index);
             let blob_store = Arc::clone(&blob_store);
             match tokio::task::spawn_blocking(move || {
@@ -254,6 +266,21 @@ async fn handle_client(
     let frame = encode_frame(&resp)?;
     stream.write_all(&frame).await?;
     Ok(())
+}
+
+/// Wait (bounded) for commands that are still closing, so a command whose
+/// PostExec already arrived is listed with its end time and its full
+/// capture tail. On timeout the caller proceeds with what is journaled.
+async fn wait_for_closing_commands(closing: &crate::server::ClosingCommands, what: &str) {
+    let remaining = closing
+        .wait_for_drain(crate::server::UNWATCH_FLUSH_TIMEOUT)
+        .await;
+    if remaining > 0 {
+        warn!(
+            remaining,
+            what, "commands still closing after the flush timeout; proceeding"
+        );
+    }
 }
 
 /// Trigger a one-shot GC pass. Runs in `spawn_blocking` because
