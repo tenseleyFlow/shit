@@ -439,6 +439,13 @@ fn ingest_notification(
             );
             return;
         }
+        // A relative path would be resolved against the daemon's cwd at
+        // undo time; the shim's CaptureRefused marker (if any) is the only
+        // record we keep for it.
+        if !Path::new(&note.arg).is_absolute() {
+            debug!(pid = note.pid, arg = %note.arg, "shim notify: relative Create path; dropping");
+            return;
+        }
         // Inode sentinel (0,0) matches the Unlink path's convention
         // (line 347) — the executor's TreeOp::Create reverse is just
         // `unlink <path>` which doesn't need accurate (dev,inode).
@@ -553,6 +560,20 @@ fn ingest_notification(
         return;
     };
 
+    // Never journal a Create for a relative path: the undo executor would
+    // resolve it against the daemon's cwd and remove the wrong entry. The
+    // shim attaches a CaptureRefused marker when it could not make the
+    // path absolute (already journaled above).
+    if is_relative_create(&kind) {
+        debug!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            "shim notify: relative Create path; dropping"
+        );
+        return;
+    }
+
     // M03.x.CREATE / M03.x.LINK: gate Create-style classifications
     // on out-of-watch, mirroring the speculative-Create gating above
     // for open/openat (W09.12). In-watch creates that ALSO fire on
@@ -604,6 +625,14 @@ fn ingest_notification(
         seq = command.seq,
         "shim notify: journaled"
     );
+}
+
+/// True when `kind` is a TreeOp::Create whose path is not absolute.
+fn is_relative_create(kind: &CaptureEventKind) -> bool {
+    matches!(
+        kind,
+        CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) if !path.is_absolute()
+    )
 }
 
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
@@ -960,6 +989,19 @@ mod tests {
 
     fn fresh_blob_store(tmp: &std::path::Path) -> Arc<BlobStore> {
         Arc::new(BlobStore::open(tmp.join("blobs")).unwrap())
+    }
+
+    #[test]
+    fn relative_create_paths_are_rejected() {
+        for syscall in ["mkdir", "mkfifo", "link"] {
+            let rel = classify_tree_op(syscall, "relative/child").expect("classifiable");
+            assert!(
+                is_relative_create(&rel),
+                "{syscall} relative must be dropped"
+            );
+            let abs = classify_tree_op(syscall, "/tmp/shit-abs-child").expect("classifiable");
+            assert!(!is_relative_create(&abs), "{syscall} absolute must pass");
+        }
     }
 
     #[test]
