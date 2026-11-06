@@ -6,8 +6,10 @@
 #   packaging/release-tarball.sh <version> <target> <out-dir>
 #
 # The archive has a single top-level directory shit-<version>-<target>/.
-# PREFIX is the install prefix baked into the service files; it defaults
-# per OS (/usr on Linux, /usr/local on FreeBSD, /opt/homebrew on macOS).
+# PREFIX is the install prefix baked into the service files. Tarballs default
+# to /usr/local (where users copy them); the deb, rpm and AUR packages stage
+# with PREFIX=/usr, and brew renders its own service. `shit service install`
+# re-renders the unit from the embedded template with the real binary path.
 
 set -eu
 
@@ -16,12 +18,7 @@ TARGET="${2:?missing target}"
 OUT="${3:?missing out-dir}"
 NAME="shit-$VERSION-$TARGET"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-case "$(uname -s)" in
-    FreeBSD) DEFAULT_PREFIX=/usr/local ;;
-    Darwin) DEFAULT_PREFIX=/opt/homebrew ;;
-    *) DEFAULT_PREFIX=/usr ;;
-esac
-PREFIX="${PREFIX:-$DEFAULT_PREFIX}"
+PREFIX="${PREFIX:-/usr/local}"
 export PREFIX
 
 mkdir -p "$OUT"

@@ -34,4 +34,13 @@ If `shit doctor` reports a missing capability, run `sudo setcap cap_bpf,cap_perf
 
 ## From the release tarball
 
-`shit-<version>-x86_64-unknown-linux-gnu.tar.zst` (and `aarch64`) holds the same tree under `bin/`, `lib/` and `share/shit/`. Extract it, copy `bin/*` to `/usr/local/bin`, and run `setcap` on the helper yourself.
+`shit-<version>-x86_64-unknown-linux-gnu.tar.zst` (and `aarch64`) holds the same tree under `bin/`, `lib/` and `share/shit/`. Extract it, copy the files into `/usr/local`, give the helper its capabilities, and let `shit service install` write the systemd user unit with the real binary path:
+
+```sh
+tar --zstd -xf shit-0.1.0-x86_64-unknown-linux-gnu.tar.zst
+cd shit-0.1.0-x86_64-unknown-linux-gnu
+sudo cp bin/* /usr/local/bin/
+sudo install -d /usr/local/lib/shit && sudo cp lib/* /usr/local/lib/shit/
+sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/local/bin/shit-helper
+shit service install
+```

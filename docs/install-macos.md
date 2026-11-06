@@ -15,11 +15,13 @@
 # Homebrew (recommended)
 brew install tenseleyflow/tap/shit
 
-# or: direct download (Apple silicon)
+# or: direct download (Apple silicon; tar needs zstd)
+brew install zstd
 V=0.1.0
 curl -fsSL https://github.com/tenseleyFlow/shit/releases/download/v$V/shit-$V-aarch64-apple-darwin-unentitled.tar.zst | tar --zstd -x
 sudo cp shit-$V-*/bin/* /usr/local/bin/
 sudo mkdir -p /usr/local/lib && sudo cp shit-$V-*/lib/libshit_preload_shim.dylib /usr/local/lib/
+shit service install   # writes the launchd plist with the real binary path
 ```
 
 Then start the daemon and source the shell hook:
