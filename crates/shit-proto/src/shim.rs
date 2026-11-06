@@ -122,6 +122,11 @@ pub struct ShimNotification {
     /// daemon uses this to attribute the event to an active command
     /// via the same shell-pid lookup tier-event handlers use.
     pub pid: u32,
+    /// Wall-clock nanos of this process's first notification. With `pid`
+    /// it identifies one process across pid reuse, so the daemon can
+    /// keep attributing an emitter that has since exited (#202). A fork
+    /// child gets its own value. 0 means no identity.
+    pub pid_epoch_nanos: u64,
     /// libc symbol name that was interposed (e.g. "unlink", "truncate",
     /// "open", "pwrite", "mmap_shared_w"). Static-string in the shim;
     /// arrives as an owned String here so the serializer doesn't need
@@ -224,6 +229,7 @@ mod tests {
     fn shim_notification_round_trips() {
         let n = ShimNotification {
             pid: 12345,
+            pid_epoch_nanos: 0,
             syscall: "unlink".into(),
             arg: "/tmp/probe".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
@@ -240,6 +246,7 @@ mod tests {
     fn shim_notification_with_pre_image_round_trips() {
         let n = ShimNotification {
             pid: 4242,
+            pid_epoch_nanos: 0,
             syscall: "open".into(),
             arg: "/tmp/file.txt".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
@@ -272,6 +279,7 @@ mod tests {
     fn shim_notification_with_failure_round_trips() {
         let n = ShimNotification {
             pid: 9000,
+            pid_epoch_nanos: 0,
             syscall: "rename".into(),
             arg: "foo/bar/baz\tfoo/bar/qux".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
@@ -302,6 +310,7 @@ mod tests {
     fn shim_notification_with_xattr_pre_image_round_trips() {
         let n = ShimNotification {
             pid: 7777,
+            pid_epoch_nanos: 0,
             syscall: "setxattr".into(),
             arg: "/private/tmp/file.txt".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
@@ -336,6 +345,7 @@ mod tests {
     fn shim_notification_xattr_absent_pre_image_round_trips() {
         let n = ShimNotification {
             pid: 7777,
+            pid_epoch_nanos: 0,
             syscall: "setxattr".into(),
             arg: "/private/tmp/fresh.txt".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,
@@ -394,6 +404,7 @@ mod tests {
         }
         let n = ShimNotification {
             pid: 5555,
+            pid_epoch_nanos: 0,
             syscall: "rename".into(),
             arg: "/abs/site-packages\t/abs/.shit-stage".into(),
             ts_unix_nanos: 1_700_000_000_000_000_000,

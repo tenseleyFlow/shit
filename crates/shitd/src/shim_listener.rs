@@ -209,7 +209,7 @@ async fn handle_one(
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    let resolved = active.resolve_by_descendant(note.pid);
+    let resolved = active.resolve_shim_emitter(note.pid, note.pid_epoch_nanos);
 
     // Reserve journal order before allowing the intercepted syscall to
     // run. Ingestion itself remains fail-open and happens after the ACK,
@@ -1056,6 +1056,7 @@ mod tests {
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let note = ShimNotification {
                 pid: 4242,
+                pid_epoch_nanos: 0,
                 syscall: "unlink".into(),
                 arg: "/tmp/probe".into(),
                 ts_unix_nanos: 0,
@@ -1177,6 +1178,7 @@ mod tests {
             .expect("put_command");
         let note = ShimNotification {
             pid: 4242,
+            pid_epoch_nanos: 0,
             syscall: "chflags".into(),
             arg: "/tmp/flags-target".into(),
             ts_unix_nanos: 0,

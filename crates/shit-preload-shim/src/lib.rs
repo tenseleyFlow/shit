@@ -1260,6 +1260,30 @@ mod policy {
         None
     }
 
+    static EPOCH_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static EPOCH_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// This process's epoch for [`shit_proto::ShimNotification`]: `now`
+    /// at its first notification, kept until the pid changes. Atomics
+    /// rather than a lock because a fork child inherits lock state. Two
+    /// threads racing the first call can hand out different values; a
+    /// loser's binding simply never matches, which costs the exit
+    /// fallback and cannot misattribute.
+    pub fn process_epoch(
+        pid: u32,
+        now: u64,
+        epoch_pid: &std::sync::atomic::AtomicU32,
+        epoch_nanos: &std::sync::atomic::AtomicU64,
+    ) -> u64 {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if epoch_pid.load(Acquire) == pid {
+            return epoch_nanos.load(Acquire);
+        }
+        epoch_nanos.store(now, Release);
+        epoch_pid.store(pid, Release);
+        now
+    }
+
     fn try_notify(
         syscall: &'static str,
         arg: &str,
@@ -1313,6 +1337,7 @@ mod policy {
         let has_extras = !extra_pre_images.is_empty();
         let note = ShimNotification {
             pid,
+            pid_epoch_nanos: process_epoch(pid, now, &EPOCH_PID, &EPOCH_NANOS),
             syscall: syscall.to_string(),
             arg: arg.to_string(),
             ts_unix_nanos: now,
@@ -2044,6 +2069,17 @@ mod interposers {
 ))]
 mod tests {
     use std::ffi::CString;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+
+    #[test]
+    fn process_epoch_is_stable_per_pid_and_changes_with_it() {
+        let (pid, nanos) = (AtomicU32::new(0), AtomicU64::new(0));
+        assert_eq!(super::policy::process_epoch(10, 111, &pid, &nanos), 111);
+        assert_eq!(super::policy::process_epoch(10, 222, &pid, &nanos), 111);
+        // A fork child inherits the statics and has a new pid.
+        assert_eq!(super::policy::process_epoch(11, 333, &pid, &nanos), 333);
+        assert_eq!(super::policy::process_epoch(11, 444, &pid, &nanos), 333);
+    }
 
     /// `unlink` (the real interposed symbol) on a nonexistent path
     /// returns -1 with errno = ENOENT. This proves both that the

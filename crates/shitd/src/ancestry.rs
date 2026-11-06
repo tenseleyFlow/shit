@@ -63,27 +63,9 @@ pub const MAX_WALK_DEPTH: usize = 256;
 /// shell pid?"; returning an empty vec would force an extra branch
 /// at every callsite for the same outcome.
 pub fn ancestor_chain(start_pid: u32) -> Vec<u32> {
-    ancestor_walk(start_pid).chain
-}
-
-/// Result of [`ancestor_walk`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AncestorWalk {
-    /// Same contents as [`ancestor_chain`].
-    pub chain: Vec<u32>,
-    /// The start pid itself could not be resolved, so `chain` is just
-    /// `[start_pid]`. This is the "emitter exited before we looked"
-    /// race, as opposed to a walk that reached init without passing a
-    /// tracked shell.
-    pub start_gone: bool,
-}
-
-/// [`ancestor_chain`] plus whether the start pid had already exited.
-pub fn ancestor_walk(start_pid: u32) -> AncestorWalk {
     let mut chain = Vec::with_capacity(8);
     let mut seen: HashSet<u32> = HashSet::with_capacity(8);
     let mut cur = start_pid;
-    let mut start_gone = false;
     for _ in 0..MAX_WALK_DEPTH {
         if !seen.insert(cur) {
             // Loop — pid recycling race. Stop here.
@@ -91,16 +73,12 @@ pub fn ancestor_walk(start_pid: u32) -> AncestorWalk {
         }
         chain.push(cur);
         match parent_pid(cur) {
-            None => {
-                start_gone = cur == start_pid;
-                break;
-            }
-            Some(0) | Some(1) => break,
+            Some(0) | Some(1) | None => break,
             Some(p) if p == cur => break, // defensive: pid==ppid would also loop
             Some(p) => cur = p,
         }
     }
-    AncestorWalk { chain, start_gone }
+    chain
 }
 
 /// Look up the parent pid of `pid`. Returns `None` if the pid no
@@ -242,23 +220,27 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
-    fn walk_reports_live_start_and_parent() {
-        let w = ancestor_walk(std::process::id());
-        assert!(!w.start_gone);
-        assert_eq!(w.chain.get(1).copied(), parent_pid(std::process::id()));
+    fn parent_pid_matches_getppid() {
+        // SAFETY: getppid has no preconditions.
+        let ppid = unsafe { libc::getppid() } as u32;
+        let me = std::process::id();
+        assert_eq!(parent_pid(me), Some(ppid));
+        // A test runner directly under init has no second chain entry.
+        if ppid > 1 {
+            assert_eq!(ancestor_chain(me).get(1).copied(), Some(ppid));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
-    fn walk_reports_exited_start() {
+    fn exited_pid_has_no_parent() {
         let mut child = std::process::Command::new("true")
             .spawn()
             .expect("spawn true");
         let pid = child.id();
         child.wait().expect("reap true");
-        let w = ancestor_walk(pid);
-        assert!(w.start_gone, "reaped pid {pid} still resolved: {w:?}");
-        assert_eq!(w.chain, vec![pid]);
+        assert_eq!(parent_pid(pid), None);
+        assert_eq!(ancestor_chain(pid), vec![pid]);
     }
 
     #[test]
