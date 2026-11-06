@@ -35,7 +35,12 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// **Version 2 (S24.A):** added `HelperResponse::CapturedPreImage` for
 /// the kqueue post-hoc capture path; daemon learns to recvmsg with a
 /// cmsg buffer to extract the SCM_RIGHTS-attached staging fd.
-pub const HELPER_PROTOCOL_VERSION: u16 = 4;
+///
+/// **Version 5 (R3 slice A):** added `HelperResponse::CaptureRefused`
+/// (an observation that capture for a command is incomplete) and
+/// `HelperResponse::UnwatchTreeFlushed` (the close barrier for
+/// `UnwatchTree`).
+pub const HELPER_PROTOCOL_VERSION: u16 = 5;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -500,6 +505,28 @@ pub enum HelperResponse {
         command_seq: u64,
         reason: String,
     },
+    /// The helper observed that capture for this command is incomplete
+    /// (no kernel tier, a reader flush that timed out, and so on). This
+    /// is an observation, not a verdict: the daemon journals it as a
+    /// `CaptureRefused` event only in strict capture mode and logs it
+    /// otherwise. It never changes the command's readiness state.
+    CaptureRefused {
+        session: Uuid,
+        seq: u64,
+        /// Display path. `None` for command-scoped observations; the
+        /// daemon then uses the command's cwd.
+        path: Option<String>,
+        detail: String,
+    },
+    /// Ordered completion marker for `HelperRequest::UnwatchTree`. The
+    /// helper sends it on every `UnwatchTree`, degraded tiers included,
+    /// after every capture response for the command that it will ever
+    /// send. Responses are dispatched in wire order, so once the daemon
+    /// sees this marker the command's capture events are journaled.
+    UnwatchTreeFlushed {
+        session: Uuid,
+        command_seq: u64,
+    },
 }
 
 /// DR-15 helper-applied result for a privileged-op request.
@@ -671,6 +698,16 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
             }
         }
         HelperResponse::CapturedPreImage { path, .. } => {
+            if let Some(p) = path
+                && p.len() > HELPER_PATH_HINT_MAX
+            {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::CaptureRefused { path, .. } => {
             if let Some(p) = path
                 && p.len() > HELPER_PATH_HINT_MAX
             {
@@ -867,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_constant_is_four() {
+    fn protocol_version_constant_is_five() {
         // Bumping this is intentional and should be paired with an
         // explicit migration plan; this test catches accidental bumps.
         //   Version 2 (S24.A) added `HelperResponse::CapturedPreImage`
@@ -876,7 +913,47 @@ mod tests {
         //     for mkdir/rmdir/rename/symlink/link observations.
         //   Version 4 (S29.3) added `HelperResponse::CapturedMetadataChange`
         //     for chmod/chown/touch (NOTE_ATTRIB).
-        assert_eq!(HELPER_PROTOCOL_VERSION, 4);
+        //   Version 5 (R3 slice A) added `CaptureRefused` and
+        //     `UnwatchTreeFlushed`.
+        assert_eq!(HELPER_PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
+    fn capture_refused_and_unwatch_flushed_round_trip() {
+        let msgs = [
+            HelperResponse::CaptureRefused {
+                session: Uuid::from_u128(7),
+                seq: 3,
+                path: Some("/tmp/w".into()),
+                detail: "no Linux capture tier is active".into(),
+            },
+            HelperResponse::CaptureRefused {
+                session: Uuid::nil(),
+                seq: 4,
+                path: None,
+                detail: "flush timed out".into(),
+            },
+            HelperResponse::UnwatchTreeFlushed {
+                session: Uuid::from_u128(7),
+                command_seq: 3,
+            },
+        ];
+        for m in msgs {
+            let bytes = encode_frame(&m).unwrap();
+            let decoded: HelperResponse = decode_frame(&bytes).unwrap();
+            assert_eq!(m, decoded);
+        }
+    }
+
+    #[test]
+    fn validate_outgoing_rejects_over_long_capture_refused_path() {
+        let resp = HelperResponse::CaptureRefused {
+            session: Uuid::nil(),
+            seq: 1,
+            path: Some("/".repeat(HELPER_PATH_HINT_MAX + 1)),
+            detail: String::new(),
+        };
+        assert!(validate_outgoing(&resp).is_err());
     }
 
     #[test]
