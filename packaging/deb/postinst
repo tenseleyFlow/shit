@@ -4,13 +4,17 @@
 # Debian/Ubuntu postinst — DR-65.
 #
 # Writes the helper's self-verify baseline so the first runtime
-# check returns Match instead of BaselineMissing. The baseline lives
-# under /var/lib/shit/, the helper's release-build state-dir.
+# check returns Match instead of BaselineMissing (the baseline lives
+# under /var/lib/shit/, the helper's release-build state-dir), then
+# applies the helper's file capabilities. The baseline goes first: in a
+# container whose bounding set lacks the caps, exec of the capped helper
+# fails with EPERM.
 
 set -eu
 
 STATE_DIR=/var/lib/shit
-HELPER=/usr/libexec/shit/shit-helper
+HELPER=/usr/bin/shit-helper
+CAPS=cap_bpf,cap_perfmon,cap_sys_admin+ep
 
 case "$1" in
     configure)
@@ -26,6 +30,10 @@ case "$1" in
         if ! "$HELPER" self-baseline-write --state-dir "$STATE_DIR"; then
             echo "shit: self-verify baseline write failed (non-fatal)" >&2
         fi
+        if ! setcap "$CAPS" "$HELPER"; then
+            echo "shit: setcap failed; run: sudo setcap $CAPS $HELPER" >&2
+        fi
+        echo "shit: start the daemon with: systemctl --user enable --now shit"
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)
         ;;

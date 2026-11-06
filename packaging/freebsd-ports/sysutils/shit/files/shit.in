@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# PROVIDE: shit
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add these lines to /etc/rc.conf to run the shit daemon at boot:
+#
+#   shit_enable="YES"
+#   shit_user="alice"     # the account whose commands shit protects
+#
+# shitd is a per-user daemon (state under the user's XDG directories), so
+# shit_user is required and must be the login account, not root.
+
+. /etc/rc.subr
+
+name="shit"
+rcvar="shit_enable"
+desc="shit daemon: magic undo for the command line"
+
+load_rc_config $name
+
+: ${shit_enable:="NO"}
+: ${shit_user:=""}
+
+pidfile="/var/run/shitd.pid"
+logfile="/var/log/shitd.log"
+command="/usr/sbin/daemon"
+procname="%%PREFIX%%/bin/shitd"
+command_args="-f -o ${logfile} -p ${pidfile} -u ${shit_user} -- %%PREFIX%%/bin/shitd --foreground"
+
+start_precmd="shit_prestart"
+
+shit_prestart()
+{
+	# daemon(8) -u does not set HOME; shitd derives its state and
+	# socket paths from it, so export the user's home here.
+	local home
+	case "${shit_user}" in
+	""|root)
+		err 1 "set shit_user in /etc/rc.conf to the login account (shitd is per-user; root is not allowed)"
+		;;
+	esac
+	home=$(getent passwd "${shit_user}" | cut -d: -f6)
+	[ -n "${home}" ] || err 1 "no home directory for ${shit_user}"
+	export HOME="${home}"
+}
+
+run_rc_command "$1"

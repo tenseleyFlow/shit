@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Maintainer: mfwolffe <mfwolffe@outlook.com>
+pkgname=shit-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Magic undo for the command line (prebuilt binaries)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/tenseleyFlow/shit'
+license=('AGPL-3.0-or-later')
+depends=('glibc' 'gcc-libs' 'libcap')
+provides=("shit=${pkgver}")
+conflicts=('shit')
+install=shit.install
+options=('!strip' '!debug')
+_base="${url}/releases/download/v${pkgver}/shit-${pkgver}"
+source_x86_64=("${_base}-x86_64-unknown-linux-gnu.tar.zst")
+source_aarch64=("${_base}-aarch64-unknown-linux-gnu.tar.zst")
+# Fill with `updpkgsums` once the v${pkgver} release is published.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    cd "${srcdir}/shit-${pkgver}-${CARCH}-unknown-linux-gnu"
+
+    install -Dm755 -t "${pkgdir}/usr/bin" bin/shit bin/shitd bin/shit-helper
+    install -Dm644 -t "${pkgdir}/usr/lib/shit" lib/libshit_preload_shim.so
+
+    # The systemd user unit goes where `systemctl --user` looks for it. The
+    # tarball's unit points at /usr/local/bin; retarget it to /usr/bin.
+    install -d "${pkgdir}/usr/lib/systemd/user"
+    sed 's|/usr/local/bin/shitd|/usr/bin/shitd|' share/shit/systemd/shit.service \
+        > "${pkgdir}/usr/lib/systemd/user/shit.service"
+    chmod 644 "${pkgdir}/usr/lib/systemd/user/shit.service"
+    install -Dm644 share/shit/LICENSE \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # Shell hooks, command wrappers, descriptors.
+    install -d "${pkgdir}/usr/share/shit"
+    cp -a share/shit/shell share/shit/descriptors share/shit/*-hooks \
+        "${pkgdir}/usr/share/shit/"
+}

@@ -23,7 +23,7 @@
 //!
 //! 1. `--lib <path>` argument (explicit override),
 //! 2. `$XDG_DATA_HOME/shit/lib/libshit_preload_shim.{so,dylib}` (user-scope),
-//! 3. `/usr/local/lib/shit/libshit_preload_shim.{so,dylib}` (system-scope),
+//! 3. `/usr/local/lib/shit/` then `/usr/lib/shit/` (system-scope),
 //! 4. `$CARGO_TARGET_DIR/<profile>/libshit_preload_shim.{so,dylib}` (dev,
 //!    detected via `OUT_DIR` of the current build),
 //! 5. The compile-time `CARGO_MANIFEST_DIR`-relative `target/debug/`
@@ -126,9 +126,7 @@ fn resolve_lib_path(override_path: Option<&Path>) -> Result<PathBuf> {
         p.push(format!("libshit_preload_shim.{ext}"));
         candidates.push(p);
     }
-    candidates.push(PathBuf::from(format!(
-        "/usr/local/lib/shit/libshit_preload_shim.{ext}"
-    )));
+    candidates.extend(crate::paths::system_shim_candidates());
     // Dev-mode fallbacks under the workspace target dir. The cdylib
     // crate-type emits `libshit_preload_shim.{so,dylib}` (underscored) so
     // we check both forms.

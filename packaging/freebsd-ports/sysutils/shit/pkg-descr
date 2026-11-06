@@ -1,0 +1,7 @@
+shit reverses the on-disk effects of the last shell command: a botched mv,
+an rm, an in-place edit, a package install. Shell hooks bracket each command,
+and a privileged helper captures pre-mutation state (kqueue plus an
+LD_PRELOAD shim on FreeBSD). `shit undo` restores it.
+
+The port installs the CLI (shit), the per-user daemon (shitd), the helper
+(shit-helper), the preload shim, the shell hooks and an rc.d script.

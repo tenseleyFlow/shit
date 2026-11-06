@@ -1,0 +1,22 @@
+pkgbase = shit-bin
+	pkgdesc = Magic undo for the command line (prebuilt binaries)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/tenseleyFlow/shit
+	install = shit.install
+	arch = x86_64
+	arch = aarch64
+	license = AGPL-3.0-or-later
+	depends = glibc
+	depends = gcc-libs
+	depends = libcap
+	provides = shit=0.1.0
+	conflicts = shit
+	options = !strip
+	options = !debug
+	source_x86_64 = https://github.com/tenseleyFlow/shit/releases/download/v0.1.0/shit-0.1.0-x86_64-unknown-linux-gnu.tar.zst
+	sha256sums_x86_64 = SKIP
+	source_aarch64 = https://github.com/tenseleyFlow/shit/releases/download/v0.1.0/shit-0.1.0-aarch64-unknown-linux-gnu.tar.zst
+	sha256sums_aarch64 = SKIP
+
+pkgname = shit-bin

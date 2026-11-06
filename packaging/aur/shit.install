@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# pacman .install hooks. A PKGBUILD cannot run setcap (makepkg runs as a
+# normal user and fakeroot drops file capabilities), so the helper's
+# capabilities are applied here, as root, after the files land. pacman
+# replaces the binary on upgrade, which clears the capabilities, so
+# post_upgrade repeats the work.
+
+post_install() {
+    # Self-verify baseline for the helper (see packaging/deb/postinst). Written
+    # before setcap: in a container whose bounding set lacks the caps, exec of
+    # the capped binary fails with EPERM.
+    install -d -m 0755 /var/lib/shit
+    /usr/bin/shit-helper self-baseline-write --state-dir /var/lib/shit || \
+        echo "shit: self-verify baseline write failed (non-fatal)" >&2
+
+    setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/bin/shit-helper || \
+        echo "shit: setcap failed; run: sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/bin/shit-helper" >&2
+
+    cat <<'MSG'
+shit: start the per-user daemon with
+
+    systemctl --user enable --now shit
+
+then add the shell hook to your rc file:
+
+    shit hooks install
+
+Check the install with: shit doctor
+MSG
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    rm -rf /var/lib/shit
+}

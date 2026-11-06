@@ -52,3 +52,80 @@ filetime = "0.2"
 # HD-01 — integration test iterates CaptureEventKindDiscriminants to
 # enforce renderer coverage. Test-only dep; no shipped binary cost.
 strum = { workspace = true }
+
+# Linux packages. Build order (see tests/smoke/pkg-install-doctor-linux.sh):
+#   cargo build --release --workspace
+#   packaging/stage.sh target/stage     # renders the systemd user unit
+#   cargo deb -p shit --no-build        # target/debian/shit_<ver>_<arch>.deb
+#   cargo generate-rpm -p crates/shit   # target/generate-rpm/shit-<ver>.<arch>.rpm
+# Only the rendered systemd unit comes from target/stage; everything else is
+# read straight from the repo. cargo-generate-rpm resolves an asset `source`
+# against the current directory first, then the package directory, so the
+# `../../` paths resolve from crates/shit even though the command runs at the
+# workspace root. cargo-deb resolves them against the package directory.
+# The maintainer script applies the helper capabilities; both packages
+# install the same layout as the release tarball under /usr.
+[package.metadata.deb]
+name = "shit"
+maintainer = "mfwolffe <mfwolffe@outlook.com>"
+copyright = "mfwolffe"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = "$auto, libcap2-bin"
+extended-description = "shit reverses the on-disk effects of the last shell command. The package installs the CLI, the per-user daemon, the privileged capture helper (file capabilities applied by postinst) and a systemd user unit."
+maintainer-scripts = "../../packaging/deb"
+assets = [
+    ["../../target/release/shit", "usr/bin/shit", "755"],
+    ["../../target/release/shitd", "usr/bin/shitd", "755"],
+    ["../../target/release/shit-helper", "usr/bin/shit-helper", "755"],
+    ["../../target/release/libshit_preload_shim.so", "usr/lib/shit/libshit_preload_shim.so", "644"],
+    ["../../target/stage/share/shit/systemd/shit.service", "usr/lib/systemd/user/shit.service", "644"],
+    ["../../shell/*", "usr/share/shit/shell/", "644"],
+    ["../../packaging/descriptors/builtin/*", "usr/share/shit/descriptors/builtin/", "644"],
+    ["../../packaging/descriptors/cloud/*", "usr/share/shit/descriptors/cloud/", "644"],
+    ["../../packaging/net-hooks/*", "usr/share/shit/net-hooks/", "755"],
+    ["../../packaging/proc-hooks/*", "usr/share/shit/proc-hooks/", "755"],
+    ["../../packaging/svc-hooks/*", "usr/share/shit/svc-hooks/", "755"],
+    ["../../packaging/db-hooks/*", "usr/share/shit/db-hooks/", "755"],
+    ["../../packaging/cloud-hooks/*", "usr/share/shit/cloud-hooks/", "755"],
+    ["../../packaging/container-hooks/*", "usr/share/shit/container-hooks/", "755"],
+    ["../../packaging/pkg-hooks/*-wrapper", "usr/share/shit/pkg-hooks/", "755"],
+    ["../../packaging/pkg-hooks/*.sh", "usr/share/shit/pkg-hooks/", "755"],
+    ["../../packaging/pkg-hooks/apt-99shit", "usr/share/shit/pkg-hooks/", "644"],
+    ["../../packaging/pkg-hooks/pacman-zz-shit.hook", "usr/share/shit/pkg-hooks/", "644"],
+    ["../../packaging/pkg-hooks/pkg-event.conf", "usr/share/shit/pkg-hooks/", "644"],
+    ["../../packaging/pkg-hooks/dnf-plugin/*", "usr/share/shit/pkg-hooks/dnf-plugin/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "shit"
+summary = "Magic undo for the command line"
+license = "AGPL-3.0-or-later"
+url = "https://github.com/tenseleyFlow/shit"
+post_install_script = "../../packaging/rpm/post-install.sh"
+assets = [
+    { source = "../../target/release/shit", dest = "/usr/bin/shit", mode = "755" },
+    { source = "../../target/release/shitd", dest = "/usr/bin/shitd", mode = "755" },
+    { source = "../../target/release/shit-helper", dest = "/usr/bin/shit-helper", mode = "755" },
+    { source = "../../target/release/libshit_preload_shim.so", dest = "/usr/lib/shit/libshit_preload_shim.so", mode = "644" },
+    { source = "../../target/stage/share/shit/systemd/shit.service", dest = "/usr/lib/systemd/user/shit.service", mode = "644" },
+    { source = "../../shell/*", dest = "/usr/share/shit/shell/", mode = "644" },
+    { source = "../../packaging/descriptors/builtin/*", dest = "/usr/share/shit/descriptors/builtin/", mode = "644" },
+    { source = "../../packaging/descriptors/cloud/*", dest = "/usr/share/shit/descriptors/cloud/", mode = "644" },
+    { source = "../../packaging/net-hooks/*", dest = "/usr/share/shit/net-hooks/", mode = "755" },
+    { source = "../../packaging/proc-hooks/*", dest = "/usr/share/shit/proc-hooks/", mode = "755" },
+    { source = "../../packaging/svc-hooks/*", dest = "/usr/share/shit/svc-hooks/", mode = "755" },
+    { source = "../../packaging/db-hooks/*", dest = "/usr/share/shit/db-hooks/", mode = "755" },
+    { source = "../../packaging/cloud-hooks/*", dest = "/usr/share/shit/cloud-hooks/", mode = "755" },
+    { source = "../../packaging/container-hooks/*", dest = "/usr/share/shit/container-hooks/", mode = "755" },
+    { source = "../../packaging/pkg-hooks/*-wrapper", dest = "/usr/share/shit/pkg-hooks/", mode = "755" },
+    { source = "../../packaging/pkg-hooks/*.sh", dest = "/usr/share/shit/pkg-hooks/", mode = "755" },
+    { source = "../../packaging/pkg-hooks/apt-99shit", dest = "/usr/share/shit/pkg-hooks/", mode = "644" },
+    { source = "../../packaging/pkg-hooks/pacman-zz-shit.hook", dest = "/usr/share/shit/pkg-hooks/", mode = "644" },
+    { source = "../../packaging/pkg-hooks/pkg-event.conf", dest = "/usr/share/shit/pkg-hooks/", mode = "644" },
+    { source = "../../packaging/pkg-hooks/dnf-plugin/*", dest = "/usr/share/shit/pkg-hooks/dnf-plugin/", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+libcap = "*"
