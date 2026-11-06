@@ -563,10 +563,76 @@ mod policy {
         notify_inner(syscall, path, Some(path));
     }
 
-    /// `*at` variant of [`notify_pre_mutation_with_content`]: joins
-    /// `(dirfd, path)`, canonicalizes once, and ships the AU10
-    /// `CanonicalizeFailed` marker when that fails, so the daemon
-    /// journals the incomplete capture instead of a silent raw path.
+    /// Outcome of resolving an `*at` syscall's `(dirfd, path)` pair for
+    /// the journal.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    #[derive(Debug)]
+    pub enum AtResolution {
+        /// Absolute, canonical key.
+        Resolved(String),
+        /// Could not be keyed: the raw path plus the AU10 marker to
+        /// journal. Never a cwd-based absolute key.
+        Failed(String, shit_proto::ShimFailure),
+        /// Neither the target nor its parent exists, so the syscall
+        /// cannot mutate anything. Send nothing.
+        Nothing,
+    }
+
+    /// The one resolver all four `*at` interposers (unlinkat, openat,
+    /// renameat, renameat2) share. Joins `(dirfd, path)`; a path that
+    /// is still relative under a real dirfd (BSD, or Linux without
+    /// /proc) fails closed with the marker and is never canonicalized
+    /// against the cwd. Otherwise canonicalizes once; when that fails
+    /// because the parent is missing (ENOENT/ENOTDIR) there is nothing
+    /// to capture, any other failure ships the marker.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn resolve_at_for_notify(dirfd: libc::c_int, path: &str, which_arg: &str) -> AtResolution {
+        let joined = join_at_path(dirfd, path);
+        if !joined.starts_with('/') && dirfd != libc::AT_FDCWD {
+            return AtResolution::Failed(
+                path.to_string(),
+                shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg: which_arg.to_string(),
+                    attempted_path: path.to_string(),
+                    error_chain: format!("dirfd {dirfd} could not be resolved to a directory"),
+                },
+            );
+        }
+        match canonical_path(&joined) {
+            Ok(abs) => AtResolution::Resolved(abs),
+            Err(CanonicalizeError::PathAndParentBothFailed { parent_err, .. })
+                if matches!(
+                    parent_err.raw_os_error(),
+                    Some(libc::ENOENT) | Some(libc::ENOTDIR)
+                ) =>
+            {
+                AtResolution::Nothing
+            }
+            Err(e) => AtResolution::Failed(
+                joined.clone(),
+                shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg: which_arg.to_string(),
+                    attempted_path: joined,
+                    error_chain: format!("{e}"),
+                },
+            ),
+        }
+    }
+
+    /// `*at` variant of [`notify_pre_mutation_with_content`] for
+    /// unlinkat/openat: resolves via [`resolve_at_for_notify`].
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -579,12 +645,62 @@ mod policy {
         dirfd: libc::c_int,
         path: &str,
     ) {
-        let joined = join_at_path(dirfd, path);
-        let (resolved, failure) = canonicalize_or_raw(&joined, "path");
-        if should_skip_path(&resolved) {
-            return;
+        match resolve_at_for_notify(dirfd, path, "path") {
+            AtResolution::Resolved(abs) => {
+                if should_skip_path(&abs) {
+                    return;
+                }
+                notify_inner_with_failure(syscall, &abs, Some(&abs), None, true);
+            }
+            AtResolution::Failed(raw, failure) => {
+                if should_skip_path(&raw) {
+                    return;
+                }
+                notify_inner_with_failure(syscall, &raw, None, Some(failure), false);
+            }
+            AtResolution::Nothing => {}
         }
-        notify_inner_with_failure(syscall, &resolved, Some(&resolved), failure);
+    }
+
+    /// `*at` variant of [`notify_rename_with_dst_preimage`] for
+    /// renameat/renameat2, using the same shared resolver.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn notify_rename_at(
+        syscall: &'static str,
+        fromfd: libc::c_int,
+        from: &str,
+        tofd: libc::c_int,
+        to: &str,
+    ) {
+        let f = resolve_at_for_notify(fromfd, from, "from");
+        let t = resolve_at_for_notify(tofd, to, "to");
+        match (f, t) {
+            (AtResolution::Nothing, _) | (_, AtResolution::Nothing) => {}
+            (AtResolution::Resolved(a), AtResolution::Resolved(b)) => {
+                notify_rename_with_dst_preimage(syscall, &a, &b);
+            }
+            (f, t) => {
+                // Prefer the `from` failure, as notify_rename does.
+                let (fa, ff) = match f {
+                    AtResolution::Failed(p, e) => (p, Some(e)),
+                    AtResolution::Resolved(p) => (p, None),
+                    AtResolution::Nothing => return,
+                };
+                let (ta, tf) = match t {
+                    AtResolution::Failed(p, e) => (p, Some(e)),
+                    AtResolution::Resolved(p) => (p, None),
+                    AtResolution::Nothing => return,
+                };
+                let arg = format!("{fa}\t{ta}");
+                notify_inner_with_failure(syscall, &arg, None, ff.or(tf), false);
+            }
+        }
     }
 
     /// B09 — notify a chflags-family mutation with a metadata-only
@@ -875,7 +991,7 @@ mod policy {
         if should_skip_path(&abs) {
             return;
         }
-        notify_inner_with_failure(syscall, &abs, None, failure);
+        notify_inner_with_failure(syscall, &abs, None, failure, false);
     }
 
     /// macOS create-only interposers resolve the canonical parent + lexical
@@ -892,7 +1008,7 @@ mod policy {
         if should_skip_path(path) {
             return;
         }
-        notify_inner_with_failure(syscall, path, None, failure);
+        notify_inner_with_failure(syscall, path, None, failure, false);
     }
 
     /// W09.11 — paths whose mutations are NOT user-visible state
@@ -1078,7 +1194,7 @@ mod policy {
     }
 
     fn notify_inner(syscall: &'static str, arg: &str, capture_path: Option<&str>) {
-        notify_inner_with_failure(syscall, arg, capture_path, None);
+        notify_inner_with_failure(syscall, arg, capture_path, None, false);
     }
 
     /// AU10 — variant of `notify_inner` that lets the caller attach
@@ -1091,6 +1207,7 @@ mod policy {
         arg: &str,
         capture_path: Option<&str>,
         failure: Option<shit_proto::ShimFailure>,
+        path_resolved: bool,
     ) {
         if disabled() {
             return;
@@ -1103,7 +1220,7 @@ mod policy {
             // the user-visible mutation.
             return;
         }
-        let pre_image = capture_path.and_then(capture_pre_image);
+        let pre_image = capture_path.and_then(|c| capture_pre_image_resolved(c, path_resolved));
         // W09.5: when the captured pre-image canonicalized `path` AND
         // the wire arg IS that same path (single-path syscalls like
         // unlink/open/openat/truncate — but NOT rename whose arg is
@@ -1128,6 +1245,15 @@ mod policy {
     /// file), is not a regular file (device nodes, fifos), exceeds
     /// the inline cap, or the read fails.
     fn capture_pre_image(path: &str) -> Option<shit_proto::ShimPreImage> {
+        capture_pre_image_resolved(path, false)
+    }
+
+    /// [`capture_pre_image`]; `path_resolved` skips the second
+    /// canonicalize when the caller already produced a canonical key.
+    fn capture_pre_image_resolved(
+        path: &str,
+        path_resolved: bool,
+    ) -> Option<shit_proto::ShimPreImage> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata(path).ok()?;
         if !meta.is_file() {
@@ -1142,10 +1268,14 @@ mod policy {
         // identity regardless of the caller's cwd. `canonicalize`
         // follows symlinks; we'd rather emit the path the user saw,
         // so fall back to the original string on failure.
-        let resolved = std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
-            .unwrap_or_else(|| path.to_string());
+        let resolved = if path_resolved {
+            path.to_string()
+        } else {
+            std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_else(|| path.to_string())
+        };
         // M03.x.SETATTR — read BSD/macOS st_flags via raw libc::lstat.
         // std::fs::Metadata doesn't expose st_flags cross-platform;
         // 0 on Linux (no chflags). Best-effort: on stat failure use 0
@@ -1426,17 +1556,12 @@ mod interposers {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flag: c_int) -> c_int {
         let path_str = cstr_to_string(path);
-        // DR-CR-54.B — relative paths under `unlinkat(dirfd, "x", ..)`
-        // were arriving at the daemon as the bare "x", which the
-        // planner couldn't match against absolute-pathed FilePreImage
-        // events (from the recursive-walk or open-with-pre-image
-        // sites). Resolve via the dirfd → absolute path translation
-        // BEFORE notifying so the journal stores the same key
-        // everywhere.
-        // The `_at` notifier attaches the AU10 canonicalize failure.
-        // W09.5: same shape as `unlink` — capture pre-image bytes
-        // before the unlink, so unlink-then-open(O_CREAT) tools
-        // can be undone.
+        // DR-CR-54.B — a bare relative "x" under `unlinkat(dirfd, "x")`
+        // cannot be matched against absolute-pathed FilePreImage
+        // events. The `_at` notifier joins dirfd + path, canonicalizes
+        // once, fails closed on an unjoinable dirfd, and attaches the
+        // AU10 marker. W09.5: pre-image bytes are captured before the
+        // unlink so unlink-then-open(O_CREAT) tools can be undone.
         policy::notify_pre_mutation_with_content_at("unlinkat", dirfd, &path_str);
         let real = next::real_unlinkat();
         if next::is_zero(next::as_usize(real)) {
@@ -1517,9 +1642,7 @@ mod interposers {
         // and the classifier can't reach atomic-replace.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::join_at_path(fromfd, &from_str);
-        let to_abs = policy::join_at_path(tofd, &to_str);
-        policy::notify_rename_with_dst_preimage("renameat", &from_abs, &to_abs);
+        policy::notify_rename_at("renameat", fromfd, &from_str, tofd, &to_str);
         let real = next::real_renameat();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::renameat(fromfd, from, tofd, to) };
@@ -1549,9 +1672,7 @@ mod interposers {
         // DR-CR-54.B: same dirfd→absolute resolution as renameat.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::join_at_path(fromfd, &from_str);
-        let to_abs = policy::join_at_path(tofd, &to_str);
-        policy::notify_rename_with_dst_preimage("renameat2", &from_abs, &to_abs);
+        policy::notify_rename_at("renameat2", fromfd, &from_str, tofd, &to_str);
         let real = next::real_renameat2();
         if next::is_zero(next::as_usize(real)) {
             // glibc < 2.28 had no `renameat2` wrapper; fall back
@@ -2111,7 +2232,7 @@ mod canonical_tests {
     /// `AT_FDCWD` and absolute paths join to themselves; canonicalizing
     /// the join absolutizes a relative path.
     #[test]
-    fn join_at_path_passes_through_and_canonicalizes_relative() {
+    fn join_at_path_passthrough_and_relative_canonicalize() {
         assert_eq!(
             super::policy::join_at_path(libc::AT_FDCWD, "Cargo.toml"),
             "Cargo.toml"
@@ -2147,6 +2268,31 @@ mod canonical_tests {
                 assert_eq!(which_arg, "path");
                 assert_eq!(attempted_path, joined);
             }
+        }
+    }
+
+    /// Unjoinable relative path under a real dirfd fails closed: raw
+    /// path, marker, never a cwd-based absolute key.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_at_unjoinable_dirfd_fails_closed() {
+        match super::policy::resolve_at_for_notify(9_999_999, "leaf", "path") {
+            super::policy::AtResolution::Failed(raw, _) => assert_eq!(raw, "leaf"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Missing parent: syscall cannot mutate, send nothing. Missing
+    /// leaf under an existing parent: resolves (create/overwrite case).
+    #[test]
+    fn resolve_at_missing_parent_sends_nothing_missing_leaf_resolves() {
+        use super::policy::{AtResolution, resolve_at_for_notify};
+        let r = resolve_at_for_notify(libc::AT_FDCWD, "/no-such-dir-au10-xyz/stale/file", "path");
+        assert!(matches!(r, AtResolution::Nothing), "got {r:?}");
+        let r = resolve_at_for_notify(libc::AT_FDCWD, "/tmp/au10-new-leaf-xyz", "path");
+        match r {
+            AtResolution::Resolved(p) => assert!(p.ends_with("/au10-new-leaf-xyz")),
+            other => panic!("expected Resolved, got {other:?}"),
         }
     }
 
