@@ -17,16 +17,17 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - macos-14
+          - macos-15
           - ubuntu-24.04
           - ubuntu-24.04-arm
-        # macos-13 (Intel) lives in nightly.yml — GitHub's hosted Intel
-        # runner pool is heavily oversubscribed and consistently sat
-        # in queue for 15–100min on per-push runs. Nightly gives us
+        # macos-15-intel lives in nightly.yml — GitHub's hosted Intel
+        # runner pool was heavily oversubscribed (macos-13, May 2026)
+        # and consistently sat in queue for 15–100min on per-push
+        # runs; not re-measured on macos-15-intel. Nightly gives us
         # x86_64 mac coverage without blocking the feedback loop.
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -54,9 +55,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - name: install freebsd cross-target rlibs
-        # dtolnay/rust-toolchain@1.85's `targets:` parameter has been
+        # dtolnay/rust-toolchain@1.88's `targets:` parameter has been
         # observed to skip the std/core rlib drop for cross-targets
         # (E0463 "can't find crate for `core`"); explicit rustup
         # target add is the load-bearing step.
@@ -85,7 +86,14 @@ jobs:
           version: '14.2'
           shell: sh
           run: |
-            sudo pkg install -y rust gmake
+            # pkg's rust lags and drifts from the 1.88 pin used on the other
+            # runners (clippy lints differ by version); install via rustup.
+            sudo pkg install -y gmake curl ca_root_nss
+            fetch -o /tmp/rustup-init.sh https://sh.rustup.rs
+            sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88 -c rustfmt -c clippy
+            . "$HOME/.cargo/env"
+            rustc --version
+            cargo clippy --version
             cargo fmt --all -- --check
             cargo clippy --workspace --all-targets --all-features -- -D warnings
             cargo test --workspace

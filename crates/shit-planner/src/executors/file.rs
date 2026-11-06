@@ -514,10 +514,8 @@ fn restore_flags_value(path: &Path, target_flags: u32) -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
-    // libc exposes `st_flags` as u32 on both Apple and FreeBSD.
-    #[cfg(target_os = "macos")]
-    let current_flags: u32 = st.st_flags;
-    #[cfg(target_os = "freebsd")]
+    // libc types `st_flags` as u32 on both macOS and FreeBSD (fflags_t);
+    // an `as u32` cast is a no-op there and trips clippy::unnecessary_cast.
     let current_flags: u32 = st.st_flags;
     if current_flags == target_flags {
         return Ok(());

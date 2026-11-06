@@ -86,15 +86,8 @@ fn read_stat_flags(path: &Path) -> u32 {
     if rc != 0 {
         return 0;
     }
-    // libc exposes `st_flags` as u32 on both Apple and FreeBSD.
-    #[cfg(target_os = "macos")]
-    {
-        st.st_flags
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        st.st_flags
-    }
+    // libc types `st_flags` as u32 on both macOS and FreeBSD (fflags_t).
+    st.st_flags
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]

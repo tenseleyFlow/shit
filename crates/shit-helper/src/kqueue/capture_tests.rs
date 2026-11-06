@@ -9,7 +9,6 @@
 //! these tests — they reference `crate::kqueue::*` paths that
 //! only resolve under `main.rs`'s mod tree.
 
-#![cfg(test)]
 #![cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",

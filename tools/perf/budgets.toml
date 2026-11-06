@@ -122,7 +122,7 @@ p99_us = 20_000
 fail_at_p99_us = 50_000
 
 # =====================================================================
-# Mac tier (M03.x.PERF — perf-mac.yml on macos-14)
+# Mac tier (M03.x.PERF — perf-mac.yml on macos-15)
 # =====================================================================
 
 [[mac.gate]]
@@ -136,7 +136,7 @@ kind = "latency"
 # p50<80µs / p99<500µs — that was aspirational and predated
 # empirical measurement on M-series APFS.
 #
-# Budget bakes ~2x slop over the dev-Mac floor for macos-14 GHA
+# Budget bakes ~2x slop over the dev-Mac floor for macos-15 GHA (calibrated on macos-14)
 # runner jitter. fail_at p99 = 2000µs catches real regressions
 # (clonefile contract change, kernel rev, FS impl swap).
 p50_us = 200
