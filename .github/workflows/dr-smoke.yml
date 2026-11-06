@@ -266,7 +266,7 @@ jobs:
 
   daemon-boot-macos:
     name: daemon-boot smoke (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -287,7 +287,7 @@ jobs:
 
   brew-pkg:
     name: brew-pkg smoke (DR-22)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -311,7 +311,7 @@ jobs:
     # non-SIP gmake + ginstall (brew make + coreutils) so
     # DYLD_INSERT_LIBRARIES isn't stripped by SIP.
     name: make-install-undo smoke (M07.A.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -339,7 +339,7 @@ jobs:
     # my_chflags interposer fires. UF_HIDDEN is purely cosmetic
     # (Finder-visibility only); doesn't block any other operation.
     name: chflags-undo smoke (M03.x.SETATTR-FAMILY macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -370,7 +370,7 @@ jobs:
     # coverage already secures the pre-image. Same retrospective shape
     # as M07.B.4 and M03.x.MMAP.
     name: cp-clone-overwrite-undo smoke (M03.x.CLONE-COPYFILE macOS regression)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -400,7 +400,7 @@ jobs:
     # workload (same retrospective shape as M07.B.4). This smoke
     # locks that coverage in so it can't regress.
     name: mmap-write-undo smoke (M03.x.MMAP macOS regression)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -425,7 +425,7 @@ jobs:
     # my_mkfifo + my_mkfifoat shim interposers; daemon classifier
     # already routes "mkfifo"/"mkfifoat" (W09.10.1 fall-through).
     name: mkfifo-undo smoke (M03.x.CREATE mkfifo macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -450,7 +450,7 @@ jobs:
     # + my_linkat shim interposers + daemon classifier
     # link/linkat → TreeOp::Create routing.
     name: link-undo smoke (M03.x.LINK macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -476,7 +476,7 @@ jobs:
     # xattr-pre-value capture + daemon-side build_xattrs_target
     # overlay + planner RestoreMetadata xattr converge path.
     name: xattr-mutate-undo smoke (M03.x.XATTR-MUTATE macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -506,7 +506,7 @@ jobs:
     # closed by the M07.A shim's O_TRUNC handling. This smoke
     # locks that coverage in so we don't regress it.
     name: make-install-overwrite-undo smoke (M07.B.4 macOS regression)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -530,7 +530,7 @@ jobs:
   cargo-install-force-undo-macos:
     # M07.A.5 — cargo install --force overwrite undo via DYLD shim.
     name: cargo-install-force-undo smoke (M07.A.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -554,7 +554,7 @@ jobs:
     # Validates the brew planner inverse + the daemon's PkgRunner
     # not-prepending-sudo for brew (which is unprivileged on macOS).
     name: brew-install-undo smoke (M05.1 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -580,7 +580,7 @@ jobs:
     # (gui/<uid> targets are unprivileged) + the planner's
     # present-diff branch in launchctl_argv.
     name: launchctl-bootstrap-undo smoke (M05.2 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -604,9 +604,9 @@ jobs:
     # → original location restored. Validates the new verb-dispatch
     # path through the wrapper + NetworksetupInspector + planner
     # synthesise_networksetup_location. Skips on runners with only
-    # one configured location (common on default GHA macos-14).
+    # one configured location (common on the hosted macOS runner; observed on macos-14, re-verify on macos-15).
     name: networksetup-location-undo smoke (M06.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -629,9 +629,10 @@ jobs:
     # M06.1 — networksetup -setdnsservers <svc> 1.1.1.1 →
     # shit undo → DNS restored. Validates the networksetup
     # wrapper + inspector + planner inverse + executor under
-    # macos-14's passwordless-sudo posture.
+    # the hosted macOS runner's passwordless-sudo posture (observed on
+    # macos-14; re-verify on macos-15).
     name: networksetup-dns-undo smoke (M06.1 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -654,9 +655,10 @@ jobs:
     # M06.4 / DR-42 — loads a benign `pass quick all` ruleset via
     # the pfctl-wrapper, then `shit undo` reloads the captured
     # pre-state via `/sbin/pfctl -f <stashed>`. Validates the
-    # FullReload executor path on macOS-14.
+    # FullReload executor path on the hosted macOS runner (observed on
+    # macos-14; re-verify on macos-15).
     name: pfctl-undo smoke (M06.4 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -682,7 +684,7 @@ jobs:
     # restores the routing table. Validates the wrapper + RouteInspector
     # + synthesise_route + PrivilegedNetRunner end-to-end.
     name: route-add-undo smoke (M06.3 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -708,7 +710,7 @@ jobs:
     # tag (proves libproc populated argv on macOS, not the prior
     # "not implemented" empty fallback).
     name: kill-proc-libproc smoke (M06.2 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -732,7 +734,7 @@ jobs:
     # exercises the fchmodat interposer + daemon metadata-pre-image
     # ingest path + planner FilePreImage metadata restore.
     name: chmod-undo smoke (M07.B.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -758,7 +760,7 @@ jobs:
     # DYLD shim. Requires Homebrew python3 (Apple's /usr/bin/python3
     # is a SIP-stripped shim).
     name: pip-install-user-undo smoke (M07.A.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -2075,7 +2077,7 @@ jobs:
 
   sqlite3-db-macos:
     name: sqlite3-db smoke (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -2094,6 +2096,36 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  # Self-hosted runner preflight. A powered-off runner leaves
+  # linux-kernel-capture queued until GitHub cancels it after 24h; this
+  # job turns that into a visibly skipped job. See tools/ar00-runner/README.md.
+  runner-preflight:
+    name: self-hosted runner preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      online: ${{ steps.check.outputs.online }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK: ${{ vars.LSM_RUNNER_ONLINE }}
+        run: |
+          if online=$(gh api "repos/${{ github.repository }}/actions/runners?per_page=100" \
+              --jq '[.runners[] | select(.status == "online") | select(any(.labels[]; .name == "linux-kernel-capture"))] | length > 0' 2>/dev/null); then
+            echo "runner list via API: online=${online}"
+          elif [ -n "${FALLBACK}" ]; then
+            online="${FALLBACK}"
+            echo "::notice::runner list unavailable to this token; using LSM_RUNNER_ONLINE=${online}"
+          else
+            online=false
+            echo "::warning::runner list unavailable to this token and LSM_RUNNER_ONLINE is unset; treating the runner as offline. Flip it by adding a RUNNER_ADMIN_TOKEN secret (live check) or setting the repo variable LSM_RUNNER_ONLINE=true."
+          fi
+          echo "online=${online}" >> "$GITHUB_OUTPUT"
+          if [ "${online}" != "true" ]; then
+            echo "::warning::linux-kernel-capture runner is offline; skipping the LSM matrix"
+          fi
+
   # L07 — Linux kernel-capture matrix. Exercises L02 (rm/edit),
   # L03 (chmod/mkdir/touch-edit deferred), L04 (eBPF-LSM tier),
   # and L04.1 (file_open + rename) end-to-end on the runner's
@@ -2106,12 +2138,14 @@ jobs:
   # surfaces as a labeled failure instead of consuming the whole
   # 30-min job budget.
   linux-kernel-capture:
+    needs: runner-preflight
+    if: needs.runner-preflight.outputs.online == 'true'
     name: linux-kernel-capture (L02/L03/L04 smoke matrix)
     # Self-hosted DO runner provisioned in AR00 with `bpf` in the
     # active LSMs (stock `ubuntu-24.04` runners boot without it,
     # which forces L04 to degrade to fanotify-perm and the five
     # LSM-pinned smokes to refuse). Snapshot ID, registration, and
-    # refresh cadence: see .docs/audits/ar00-runner-ops.md.
+    # refresh cadence: see tools/ar00-runner/README.md.
     runs-on: [self-hosted, linux-kernel-capture]
     timeout-minutes: 30
     steps:

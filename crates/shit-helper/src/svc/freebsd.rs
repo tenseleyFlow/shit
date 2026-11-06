@@ -39,8 +39,7 @@ impl SvcInspector for ServiceInspector {
         // clear error instead of silently using the wrong scope.
         if !matches!(scope, SvcScopeWire::RcBase) {
             return Err(anyhow::anyhow!(
-                "freebsd service(8) only supports RcBase scope; got {:?}",
-                scope
+                "freebsd service(8) only supports RcBase scope; got {scope:?}"
             ));
         }
 

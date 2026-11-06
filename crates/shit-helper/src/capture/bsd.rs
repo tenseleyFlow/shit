@@ -887,6 +887,8 @@ enum FileType {
 /// fstat that also returns the file kind. register_subtree opens both
 /// directories and files; only Regular files are valid pre-image
 /// capture targets (pread on a directory returns EISDIR).
+// st_dev as u64 is a no-op only under the FreeBSD 12+ ABI (OpenBSD i32, DragonFly u32).
+#[allow(clippy::unnecessary_cast)]
 fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: fd is expected valid; st is writable.
@@ -899,7 +901,7 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
         libc::S_IFDIR => FileType::Directory,
         _ => FileType::Other,
     };
-    Some((st.st_dev as u64, st.st_ino as u64, kind))
+    Some((st.st_dev as u64, st.st_ino, kind))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -944,14 +946,14 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
     let mtime = msec.saturating_mul(1_000_000_000).saturating_add(mnsec);
     Some(StatMeta {
         mode: st.st_mode as u32,
-        uid: st.st_uid as u32,
-        gid: st.st_gid as u32,
+        uid: st.st_uid,
+        gid: st.st_gid,
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
         xattrs: crate::capture::xattr::read_user_xattrs(fd),
         // M03.x.SETATTR — BSD st_flags (chflags bitmap). libc::stat on
         // FreeBSD exposes st_flags directly.
-        flags: st.st_flags as u32,
+        flags: st.st_flags,
     })
 }
 
@@ -1069,6 +1071,8 @@ fn path_to_string(p: &Path) -> String {
 /// `cap_enter(2)`. The caller already holds `dir_fd` as a tracked
 /// kqueue watch fd (we dup before fdopendir to avoid losing the
 /// original reference).
+// st_dev as u64 is a no-op only under the FreeBSD 12+ ABI (OpenBSD i32, DragonFly u32).
+#[allow(clippy::unnecessary_cast)]
 fn read_dir_entries(
     dir_fd: RawFd,
 ) -> std::io::Result<BTreeMap<std::ffi::OsString, DirEntryBaseline>> {
