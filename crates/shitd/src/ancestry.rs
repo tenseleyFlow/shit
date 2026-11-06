@@ -23,11 +23,12 @@
 //!
 //! - **Linux**: reads `/proc/<pid>/status::PPid`. Fast (~10µs).
 //! - **FreeBSD**: `sysctl(KERN_PROC_PID)` and `kinfo_proc::ki_ppid`.
-//!   This used to fork `ps -o ppid=` per hop. On the FreeBSD VM a
-//!   chain from a smoke's rsync up to init took 60-100 ms that way,
-//!   longer than the preload shim's 50 ms ack timeout, so the shim
-//!   let the syscall run, rsync exited, the walk hit a dead pid and
-//!   the shim listener dropped the notification (#202).
+//!   This used to fork `ps -o ppid=` per hop on the daemon's single
+//!   runtime thread. Measured in the FreeBSD VM, a 10-hop walk took
+//!   8.5 ms idle and 150 ms (median) with the CPUs oversubscribed,
+//!   past the preload shim's 50 ms ack timeout. The shim then let the
+//!   syscall run, rsync exited, the walk hit a dead pid and the shim
+//!   listener dropped the notification (#202).
 //! - **macOS**: shells out to `ps -o ppid= -p <pid>` (~5 ms per hop).
 //!
 //! ## Loop guard
