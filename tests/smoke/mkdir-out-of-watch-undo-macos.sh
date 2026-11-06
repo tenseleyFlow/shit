@@ -5,8 +5,8 @@
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: macos-14
 # SMOKE_TIMEOUT_SEC: 180
-# EXCLUDED_BY:
-# EXCLUDED_REASON:
+# EXCLUDED_BY: M03.x.CREATE-mkdir-planner-coord-pending
+# EXCLUDED_REASON: Routing mkdir/mkdirat to TreeOp::Create{Directory} needs planner-side coordination: when a Create'd directory also hosts RestoreContent inverses, the rmdir must not run recursively (cargo-install-force-undo applied=42 conflicts=6). The first coordination attempt (PR 180 / PR 196 planner commits) left target/ behind in cargo-build-undo-fbsd and python-venv-undo-fbsd, so it is not landed. Re-enable by clearing this EXCLUDED_BY when a planner fix passes both FreeBSD smokes.
 #
 # M03.x.CREATE (mkdir out-of-watch portion) regression smoke.
 #

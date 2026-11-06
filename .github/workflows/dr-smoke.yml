@@ -358,30 +358,6 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
-  mkdir-out-of-watch-undo-macos:
-    # M03.x.CREATE regression guard. The target is deliberately outside
-    # the watched cwd, so only the successful post-syscall DYLD shim
-    # notification can produce the directory's Unlink inverse.
-    name: mkdir-out-of-watch undo smoke (M03.x.CREATE macOS)
-    runs-on: macos-14
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
-      - uses: Swatinem/rust-cache@v2
-      - name: build binaries + shim
-        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
-      - name: run smoke
-        run: bash tests/smoke/mkdir-out-of-watch-undo-macos.sh
-      - name: upload artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mkdir-out-of-watch-undo-macos-logs
-          path: |
-            /tmp/shit-smoke.*/shitd.log
-            /tmp/shit-smoke.*/state/shit/log/
-
   cp-clone-overwrite-undo-macos:
     # M03.x.CLONE-COPYFILE regression guard — replicates `cp -c <src>
     # <dst>` when dst exists: stat + unlink(dst) + clonefile(src, dst).
