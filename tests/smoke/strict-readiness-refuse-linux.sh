@@ -11,10 +11,11 @@
 # R3 slice A — strict capture refuses when the helper cannot attach to
 # the command's cwd; default mode proceeds best-effort.
 #
-# The PreExec names a watch cwd that does not exist. The LSM helper
-# cannot pre-open it. It still tracks the pid tree, since LSM hooks fire
-# globally, sends a CaptureRefused observation, and answers
-# WatchTreeReady. The command runs either way.
+# The shell's cwd is deleted before the PreExec, so neither the reported
+# path nor /proc/<pid>/cwd resolves and the LSM helper cannot pre-open
+# anything. It still tracks the pid tree, since LSM hooks fire globally,
+# sends a CaptureRefused observation, and answers WatchTreeReady. The
+# command runs either way.
 #
 #   Phase 1, SHIT_STRICT_CAPTURE=1: the daemon journals a command-scoped
 #   CaptureRefused row (class capture-incomplete). `shit undo` prints a
@@ -65,8 +66,7 @@ export SHIT_FORCE_TIER=ebpf-lsm
 
 SCRATCH="${SHIT_SMOKE_TMP}/scratch"
 mkdir -p "${SCRATCH}"
-MISSING_CWD="${SHIT_SMOKE_TMP}/no-such-watch-dir"
-cd "${SCRATCH}"
+MISSING_CWD="${SHIT_SMOKE_TMP}/deleted-watch-dir"
 
 # run_phase <label> <seq-tag>: one session, one command whose WatchTree
 # fails, then `shit undo --yes`. Leaves hook stderr and undo output in
@@ -81,7 +81,10 @@ run_phase() {
         --session "${session}" --pid "$$" --shell bash \
         --tty "$(tty 2>/dev/null || echo /dev/null)" \
         --sock "${SHIT_HOOK_SOCK}"
-    smoke_log "[${label}] PreExec with missing watch cwd ${MISSING_CWD}"
+    mkdir -p "${MISSING_CWD}"
+    cd "${MISSING_CWD}"
+    rm -rf "${MISSING_CWD}"
+    smoke_log "[${label}] PreExec with deleted watch cwd ${MISSING_CWD}"
     "${SHIT_BIN}" hook-send pre-exec \
         --session "${session}" --seq 1 --pid "$$" \
         --cwd "${MISSING_CWD}" --shell bash \
@@ -91,6 +94,7 @@ run_phase() {
     rm "${victim}"
     "${SHIT_BIN}" hook-send post-exec \
         --session "${session}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
+    cd "${SCRATCH}"
     [ ! -e "${victim}" ] || smoke_fail "[${label}] command did not run (victim still present)"
     if grep -q "not-ready" "${SHIT_SMOKE_TMP}/${label}.hook.log"; then
         smoke_fail "[${label}] LSM attach tracks the tree, so the hook must stay ready"
