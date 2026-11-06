@@ -286,10 +286,20 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             _ => {}
         }
     }
+    let provenance = Provenance::from_events(events);
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
     for p in creates.iter().chain(rename_destinations.iter()) {
         if !unlinks.contains(p) {
+            continue;
+        }
+        // L3: a rename moved pre-command data onto `p` and a later
+        // unlink removed it (`mv f build/; rm -rf build`). The
+        // unlink's pre-image is that data, and the rename has to run
+        // backwards after it is recreated, so leave all three events
+        // to their per-event inverses. Neither the transient nor the
+        // atomic-replace shape applies: both drop the reverse rename.
+        if provenance.unlinked_moved_data.contains(p) {
             continue;
         }
         // Three shapes (two transient, one atomic) for paths with BOTH
@@ -593,6 +603,65 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         hardlink_live_paths,
         hardlink_dead_to_source,
         paired_flags_shims: HashSet::new(),
+    }
+}
+
+/// Where the entry at a path came from, replayed in event order.
+///
+/// Built only from the journal, never from the undo-time probe: the
+/// probe says what is on disk now, which cannot tell a scratch file
+/// from user data that a later step deleted.
+#[derive(Debug, Default)]
+struct Provenance {
+    /// Paths unlinked while they held an entry a rename had moved
+    /// there from a path with no Create earlier in the command.
+    unlinked_moved_data: HashSet<PathBuf>,
+}
+
+impl Provenance {
+    /// `events` is in reverse-chronological order (as `plan` sorts it).
+    fn from_events(events: &[&CaptureEvent]) -> Self {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Origin {
+            /// Created in this command.
+            Born,
+            /// Moved here by a rename from a path not created in
+            /// this command.
+            Moved,
+        }
+        let mut origin: std::collections::HashMap<PathBuf, Origin> =
+            std::collections::HashMap::new();
+        let mut out = Self::default();
+        for ev in events.iter().rev() {
+            match &ev.kind {
+                CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
+                    origin.insert(path.clone(), Origin::Born);
+                }
+                CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
+                    // A directory rename carries the tracked entries
+                    // under it along.
+                    let under: Vec<PathBuf> = origin
+                        .keys()
+                        .filter(|k| k.starts_with(from) && *k != from)
+                        .cloned()
+                        .collect();
+                    for k in under {
+                        if let (Some(o), Ok(rel)) = (origin.remove(&k), k.strip_prefix(from)) {
+                            origin.insert(to.join(rel), o);
+                        }
+                    }
+                    let o = origin.remove(from).unwrap_or(Origin::Moved);
+                    origin.insert(to.clone(), o);
+                }
+                CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }) => {
+                    if origin.remove(path) == Some(Origin::Moved) {
+                        out.unlinked_moved_data.insert(path.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 }
 

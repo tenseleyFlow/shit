@@ -30,7 +30,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Source tag the shim's recursive dir-rename walk journals with.
-const WALK_SOURCE: FilePreImageSource = FilePreImageSource::Other;
+const WALK_SOURCE: FilePreImageSource = FilePreImageSource::ShimRenameSubtree;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
@@ -366,7 +366,6 @@ fn nested_rm_rf_restores_modes_and_empty_dirs() {
 }
 
 #[test]
-#[ignore = "fails on trunk 662af56: G01.3 marks the rename destination transient once its parent is gone"]
 fn move_into_dir_then_rm_rf_dir_restores_file() {
     // `mv important.txt build/; rm -rf build`
     let mut sim = Sim::new();
@@ -392,4 +391,16 @@ fn intermediate_write_under_replaced_dir_does_not_survive_undo() {
     sim.write("d/f", b"b\n");
     assert_restored(&sim, &before);
     assert!(!sim.p("d/f").exists(), "d/f must not exist after undo");
+}
+
+#[test]
+fn rename_then_rm_with_parent_alive_restores_source_name() {
+    // `mv a b; rm b`: the parent survives, so G01.3 used to take the
+    // atomic-replace branch and restore `b` instead of `a`.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("a", "b");
+    sim.rm_rf("b");
+    assert_restored(&sim, &before);
 }
