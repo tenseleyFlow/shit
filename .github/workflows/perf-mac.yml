@@ -23,8 +23,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  perf-mac-14:
-    name: perf-mac-14 (M03.x.PERF)
+  perf-mac:
+    name: perf-mac (M03.x.PERF)
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -66,5 +66,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: perf-mac-14-results
+          name: perf-mac-results
           path: target/bench/*.json

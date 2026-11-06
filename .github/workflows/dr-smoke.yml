@@ -604,7 +604,7 @@ jobs:
     # → original location restored. Validates the new verb-dispatch
     # path through the wrapper + NetworksetupInspector + planner
     # synthesise_networksetup_location. Skips on runners with only
-    # one configured location (common on default GHA macos-14).
+    # one configured location (common on the hosted macOS runner; observed on macos-14, re-verify on macos-15).
     name: networksetup-location-undo smoke (M06.5 macOS)
     runs-on: macos-15
     timeout-minutes: 15
@@ -629,7 +629,8 @@ jobs:
     # M06.1 — networksetup -setdnsservers <svc> 1.1.1.1 →
     # shit undo → DNS restored. Validates the networksetup
     # wrapper + inspector + planner inverse + executor under
-    # macos-14's passwordless-sudo posture.
+    # the hosted macOS runner's passwordless-sudo posture (observed on
+    # macos-14; re-verify on macos-15).
     name: networksetup-dns-undo smoke (M06.1 macOS)
     runs-on: macos-15
     timeout-minutes: 15
@@ -654,7 +655,8 @@ jobs:
     # M06.4 / DR-42 — loads a benign `pass quick all` ruleset via
     # the pfctl-wrapper, then `shit undo` reloads the captured
     # pre-state via `/sbin/pfctl -f <stashed>`. Validates the
-    # FullReload executor path on macOS-14.
+    # FullReload executor path on the hosted macOS runner (observed on
+    # macos-14; re-verify on macos-15).
     name: pfctl-undo smoke (M06.4 macOS)
     runs-on: macos-15
     timeout-minutes: 15
@@ -2109,12 +2111,15 @@ jobs:
           GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
           FALLBACK: ${{ vars.LSM_RUNNER_ONLINE }}
         run: |
-          if online=$(gh api "repos/${{ github.repository }}/actions/runners" \
+          if online=$(gh api "repos/${{ github.repository }}/actions/runners?per_page=100" \
               --jq '[.runners[] | select(.status == "online") | select(any(.labels[]; .name == "linux-kernel-capture"))] | length > 0' 2>/dev/null); then
             echo "runner list via API: online=${online}"
-          else
-            online="${FALLBACK:-true}"
+          elif [ -n "${FALLBACK}" ]; then
+            online="${FALLBACK}"
             echo "::notice::runner list unavailable to this token; using LSM_RUNNER_ONLINE=${online}"
+          else
+            online=false
+            echo "::warning::runner list unavailable to this token and LSM_RUNNER_ONLINE is unset; treating the runner as offline. Flip it by adding a RUNNER_ADMIN_TOKEN secret (live check) or setting the repo variable LSM_RUNNER_ONLINE=true."
           fi
           echo "online=${online}" >> "$GITHUB_OUTPUT"
           if [ "${online}" != "true" ]; then
@@ -2140,7 +2145,7 @@ jobs:
     # active LSMs (stock `ubuntu-24.04` runners boot without it,
     # which forces L04 to degrade to fanotify-perm and the five
     # LSM-pinned smokes to refuse). Snapshot ID, registration, and
-    # refresh cadence: see .docs/audits/ar00-runner-ops.md.
+    # refresh cadence: see tools/ar00-runner/README.md.
     runs-on: [self-hosted, linux-kernel-capture]
     timeout-minutes: 30
     steps:

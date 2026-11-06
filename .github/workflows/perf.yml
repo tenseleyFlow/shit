@@ -82,8 +82,8 @@ jobs:
         run: |
           case "${{ matrix.os }}" in
             ubuntu-24.04) bp=ubuntu-24.04-x86_64 ;;
-            # macos-14 was retired; the baseline file keeps its old name until re-recorded.
-            macos-15)     bp=macos-14-aarch64 ;;
+            # No macos baseline file is committed yet; record macos-15-aarch64-*.json.
+            macos-15)     bp=macos-15-aarch64 ;;
             *)            bp=unknown ;;
           esac
           echo "tight_loop=benches/regression/baselines/$bp-tight-loop.json" >> "$GITHUB_OUTPUT"
