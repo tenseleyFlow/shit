@@ -85,7 +85,14 @@ jobs:
           version: '14.2'
           shell: sh
           run: |
-            sudo pkg install -y rust gmake
+            # pkg's rust lags and drifts from the 1.88 pin used on the other
+            # runners (clippy lints differ by version); install via rustup.
+            sudo pkg install -y gmake curl ca_root_nss
+            fetch -o /tmp/rustup-init.sh https://sh.rustup.rs
+            sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88 -c rustfmt -c clippy
+            . "$HOME/.cargo/env"
+            rustc --version
+            cargo clippy --version
             cargo fmt --all -- --check
             cargo clippy --workspace --all-targets --all-features -- -D warnings
             cargo test --workspace
