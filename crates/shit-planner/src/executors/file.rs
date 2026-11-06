@@ -964,6 +964,40 @@ mod tests {
     }
 
     #[test]
+    fn recreate_path_creates_missing_parent_dirs() {
+        // A nested `rm -rf` unlinks children before parents, so undo
+        // can reach a child's RecreatePath while its parent is still
+        // missing. The executor must build the chain instead of
+        // failing, for directories and regular files alike.
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let dir = tmpdir.path().join("a").join("b").join("empty");
+        let file = tmpdir.path().join("c").join("d").join("f");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        for (path, kind, mode) in [
+            (&dir, crate::metadata::FileKind::Directory, 0o040711),
+            (&file, crate::metadata::FileKind::Regular, 0o100600),
+        ] {
+            let op = InverseOp::RecreatePath {
+                path: path.clone(),
+                kind,
+                mode,
+            };
+            assert_eq!(
+                e.execute(&op, false, ConflictPolicy::default()),
+                ExecutionOutcome::Applied,
+                "{path:?}"
+            );
+            let m = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(m, mode & 0o7777, "{path:?}");
+        }
+        assert!(dir.is_dir());
+        assert!(file.is_file());
+    }
+
+    #[test]
     fn recreate_path_makes_empty_regular_file_with_mode() {
         use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().expect("tempdir");
