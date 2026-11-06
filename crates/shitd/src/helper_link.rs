@@ -949,7 +949,7 @@ fn dispatch_response(
                 session,
                 seq: command_seq,
             };
-            watch_ready.mark_failed(cmd);
+            watch_ready.mark_failed(cmd, reason.clone());
             tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
         }
         HelperResponse::PrivilegedOpResult {

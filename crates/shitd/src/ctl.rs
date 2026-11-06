@@ -1156,13 +1156,20 @@ async fn handle_wait_watch_ready(
     let rx = map.await_ready(cmd);
     let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(())) => CtlResponse::WatchReady {
-            ready: true,
-            reason: None,
-        },
+        Ok(Ok(())) => {
+            map.note_wait_succeeded(cmd);
+            CtlResponse::WatchReady {
+                ready: true,
+                reason: None,
+            }
+        }
         Ok(Err(_canceled)) => CtlResponse::WatchReady {
             ready: false,
-            reason: Some("canceled".to_string()),
+            reason: Some(
+                map.failure_reason(cmd)
+                    .map(|reason| format!("capture attach failed: {reason}"))
+                    .unwrap_or_else(|| "canceled".to_string()),
+            ),
         },
         Err(_) => CtlResponse::WatchReady {
             ready: false,
