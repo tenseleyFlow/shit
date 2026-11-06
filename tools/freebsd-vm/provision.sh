@@ -49,12 +49,22 @@ fi
 # CHECKSUM.SHA512 before anything reads it.
 mkdir -p "${DOWNLOAD_DIR}"
 IMAGE_PATH="${DOWNLOAD_DIR}/${FBSD_IMAGE_NAME}"
-log "fetching ${FBSD_CHECKSUM_URL}"
-curl -fsSL -o "${DOWNLOAD_DIR}/CHECKSUM.SHA512" "${FBSD_CHECKSUM_URL}"
-EXPECTED_SHA="$(sed -n "s/^SHA512 (${FBSD_IMAGE_NAME}) = //p" "${DOWNLOAD_DIR}/CHECKSUM.SHA512")"
-if [[ -z "${EXPECTED_SHA}" ]]; then
-  log "no SHA512 line for ${FBSD_IMAGE_NAME} in CHECKSUM.SHA512"
-  exit 2
+# Once an image has matched the release file, its hash is kept beside
+# it, and later runs check the image against that copy without going
+# back to the network.
+VERIFIED_SHA_FILE="${IMAGE_PATH}.sha512.verified"
+if [[ -f "${IMAGE_PATH}" && -s "${VERIFIED_SHA_FILE}" ]]; then
+  EXPECTED_SHA="$(cat "${VERIFIED_SHA_FILE}")"
+  log "using previously verified SHA512 from ${VERIFIED_SHA_FILE}"
+else
+  rm -f "${VERIFIED_SHA_FILE}"
+  log "fetching ${FBSD_CHECKSUM_URL}"
+  curl -fsSL -o "${DOWNLOAD_DIR}/CHECKSUM.SHA512" "${FBSD_CHECKSUM_URL}"
+  EXPECTED_SHA="$(sed -n "s/^SHA512 (${FBSD_IMAGE_NAME}) = //p" "${DOWNLOAD_DIR}/CHECKSUM.SHA512")"
+  if [[ -z "${EXPECTED_SHA}" ]]; then
+    log "no SHA512 line for ${FBSD_IMAGE_NAME} in CHECKSUM.SHA512"
+    exit 2
+  fi
 fi
 if [[ ! -f "${IMAGE_PATH}" ]]; then
   log "downloading ${FBSD_IMAGE_NAME} (one-off, ~650 MB)"
@@ -68,9 +78,10 @@ if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]]; then
   log "SHA512 mismatch for ${IMAGE_PATH}; deleting it"
   log "  expected ${EXPECTED_SHA}"
   log "  actual   ${ACTUAL_SHA}"
-  rm -f "${IMAGE_PATH}"
+  rm -f "${IMAGE_PATH}" "${VERIFIED_SHA_FILE}"
   exit 1
 fi
+printf '%s\n' "${EXPECTED_SHA}" >"${VERIFIED_SHA_FILE}"
 log "SHA512 verified"
 
 # 2. Decompress into the working qcow2 (bail if the disk already
@@ -131,9 +142,6 @@ ssh_pwauth: false
 packages:
   - sudo
 runcmd:
-  - mkdir -p /usr/local/etc/sudoers.d
-  - echo 'freebsd ALL=(ALL) NOPASSWD:ALL' > /usr/local/etc/sudoers.d/freebsd
-  - chmod 0440 /usr/local/etc/sudoers.d/freebsd
   - sysrc sshd_enable=YES
   - service sshd onestart || service sshd restart
 EOF
@@ -155,6 +163,7 @@ ssh_pwauth: true
 disable_root: false
 package_update: true
 packages:
+  - sudo
   - rust
   - rsync
   - gmake
@@ -208,6 +217,20 @@ fi
 log "waiting for sshd + key (nuageinit first boot)"
 wait_for_ssh 900
 log "ssh up after $((SECONDS - BOOT_START))s"
+
+# sshd answers before nuageinit's post-network stage has installed
+# the `packages:` list, so wait for sudo itself to work.
+log "waiting for nuageinit to install sudo"
+SUDO_DEADLINE=$((SECONDS + 600))
+until ssh "${SSH_OPTS[@]}" -o BatchMode=yes freebsd@127.0.0.1 'sudo -n true' 2>/dev/null; do
+  if ((SECONDS >= SUDO_DEADLINE)); then
+    log "sudo not usable 600s after ssh came up; nuageinit packages step failed or is stuck"
+    log "check ${QEMU_LOG} and /var/log/messages in the guest"
+    exit 1
+  fi
+  sleep 5
+done
+log "sudo ready after $((SECONDS - BOOT_START))s"
 
 # 7. Guest setup over ssh: packages, rustup 1.88, doas, zpool.
 SETUP_START=${SECONDS}
