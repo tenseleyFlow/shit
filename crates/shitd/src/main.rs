@@ -137,6 +137,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    if resolved.strict_capture {
+        tracing::info!(
+            "strict capture enabled; incomplete capture is journaled as CaptureRefused"
+        );
+    }
+
     if resolved.disable {
         tracing::warn!("daemon disabled via config; exiting");
         return Ok(());
