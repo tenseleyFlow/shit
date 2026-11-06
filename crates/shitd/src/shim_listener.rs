@@ -222,7 +222,14 @@ async fn handle_one(
     // the syscall proceeds.
     let ack = ShimAck::Allow;
     let frame = encode_frame(&ack)?;
-    stream.write_all(&frame).await?;
+    // A write error here means the shim gave up waiting (50ms ack
+    // timeout) and the caller already moved on, often exiting. The
+    // notification was fully received, so journal it anyway; returning
+    // early would silently drop the event (macOS create/overwrite
+    // smokes regressed on this under slow pid resolution).
+    if let Err(e) = stream.write_all(&frame).await {
+        debug!(err = %e, pid = note.pid, "shim ack write failed; ingesting anyway");
+    }
 
     ingest_notification(
         &note,
