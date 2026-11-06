@@ -499,15 +499,9 @@ fn restore_flags_only(path: &Path, target: &crate::metadata::FileMetadata) -> Re
             std::io::Error::last_os_error()
         ));
     }
-    // `st_flags` type diverges across BSDs: Apple keeps it `c_uint`
-    // (u32); FreeBSD widened to `c_ulong` (u64 on 64-bit hosts).
-    // Coerce both to u32 for the comparison — every defined chflags
-    // constant fits in 32 bits (UF_* in the low half, SF_* in the
-    // high half of u32), so the narrowing is lossless.
-    #[cfg(target_os = "macos")]
+    // libc types `st_flags` as u32 on both macOS and FreeBSD (fflags_t);
+    // an `as u32` cast is a no-op there and trips clippy::unnecessary_cast.
     let current_flags: u32 = st.st_flags;
-    #[cfg(target_os = "freebsd")]
-    let current_flags: u32 = st.st_flags as u32;
     if current_flags == target.flags {
         return Ok(());
     }
