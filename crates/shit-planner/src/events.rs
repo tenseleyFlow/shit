@@ -127,6 +127,12 @@ pub enum FilePreImageSource {
     /// Keep new variants appended: postcard encodes enum discriminants
     /// positionally and persisted journals may contain older values.
     ShimFlagsPreMutation,
+    /// The shim's recursive walk of a directory about to be renamed
+    /// away (DR-CR-54). Keyed at the file's path under the rename
+    /// source, captured before the rename ran, so the bytes are the
+    /// file's state at that moment. The planner uses this provenance
+    /// to tell the walk's snapshots apart from in-command writes.
+    ShimRenameSubtree,
 }
 
 impl FilePreImageSource {
