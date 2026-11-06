@@ -31,10 +31,10 @@ pub struct CtlState {
     pub net_stash: Arc<NetPreStash>,
     pub proc_stash: Arc<ProcPreStash>,
     pub db_stash: Arc<crate::db_track::DbPreStash>,
-    /// Issue #6 — env pre-block stash, shared with the hook-socket
-    /// handler so `CtlRequest::HookEnv` pairs with datagram-delivered
-    /// frames.
-    pub env_stash: Arc<crate::env_track::EnvPreStash>,
+    /// Issue #6 — queue into the hook-socket consumer (`server::serve`).
+    /// `CtlRequest::Hook` frames are forwarded here so one task handles
+    /// every hook frame, whichever socket it arrived on.
+    pub hook_tx: tokio::sync::mpsc::UnboundedSender<crate::server::HookEnvelope>,
     pub active: Arc<crate::active_commands::ActiveCommands>,
     /// AR00.5 / task #105 — per-CommandId readiness rendezvous. Set
     /// to `None` when no helper is connected (degraded mode); the
@@ -112,7 +112,7 @@ async fn handle_client(
         net_stash,
         proc_stash,
         db_stash,
-        env_stash,
+        hook_tx,
         active,
         watch_ready,
         helper_link,
@@ -181,7 +181,13 @@ async fn handle_client(
             handle_container_event(req, &active, &index, &blob_store)
         }
         CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
-        CtlRequest::HookEnv(msg) => handle_hook_env(msg, cfg, &env_stash, &index),
+        CtlRequest::Hook(msg) => {
+            debug!(kind = msg.kind(), session = %msg.session(), "hook frame via ctl");
+            match hook_tx.send((msg, 0)) {
+                Ok(()) => CtlResponse::HookAck,
+                Err(_) => CtlResponse::Error("hook queue closed".into()),
+            }
+        }
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => {
             // AU22 — handle_undo blocks on HelperLinkPrivilegedOpRouter's
@@ -596,50 +602,6 @@ fn handle_container_event(
 ) -> CtlResponse {
     let _ = crate::container_track::handle(req, active, index, blob_store);
     CtlResponse::ContainerEventAck
-}
-
-/// Issue #6 — env-block frames that were too big for the hook
-/// datagram. Same handling as `server::handle` gives the datagram form.
-fn handle_hook_env(
-    msg: shit_proto::HookMessage,
-    cfg: &ResolvedConfig,
-    env_stash: &crate::env_track::EnvPreStash,
-    index: &Index,
-) -> CtlResponse {
-    use shit_planner::CommandId;
-    use shit_proto::HookMessage;
-    match msg {
-        HookMessage::PreExecEnv {
-            session,
-            seq,
-            env_block,
-            ..
-        } => {
-            debug!(%session, seq, bytes = env_block.len(), "pre-exec-env (ctl)");
-            crate::env_track::handle_pre(env_stash, CommandId { session, seq }, env_block);
-            CtlResponse::HookEnvAck
-        }
-        HookMessage::PostExecEnv {
-            session,
-            seq,
-            env_block,
-            ..
-        } => {
-            debug!(%session, seq, bytes = env_block.len(), "post-exec-env (ctl)");
-            let _ = crate::env_track::handle_post(
-                env_stash,
-                CommandId { session, seq },
-                &env_block,
-                &cfg.env.filter(),
-                index,
-            );
-            CtlResponse::HookEnvAck
-        }
-        other => CtlResponse::Error(format!(
-            "HookEnv carries only env frames, got {}",
-            other.kind()
-        )),
-    }
 }
 
 fn handle_cloud_event(

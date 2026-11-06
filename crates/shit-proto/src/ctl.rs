@@ -160,21 +160,20 @@ pub enum CtlRequest {
         #[serde(default)]
         events_limit: Option<usize>,
     },
-    /// Issue #6 — env-block carrier for frames that do not fit in one
+    /// Issue #6 — hook frame carrier for frames that do not fit in one
     /// hook-socket datagram. macOS caps `AF_UNIX SOCK_DGRAM` payloads at
-    /// `net.local.dgram.maxdgram` (2048 bytes by default), and a real
-    /// user env block is 3-5 KB. `shit hook-send pre-exec-env` /
-    /// `post-exec-env` send small blocks on the datagram socket as
-    /// before and fall back to this request, over the ctl stream
-    /// socket, when the encoded frame exceeds `HOOK_DGRAM_MAX_FRAME`.
+    /// `net.local.dgram.maxdgram` (2048 bytes by default); real env
+    /// blocks (3-5 KB), long `PreExec` command lines (up to 4 KB) and
+    /// big alias tables in `Pre/PostExecShellState` all exceed it.
+    /// `shit hook-send` picks the transport by encoded size
+    /// (`HOOK_DGRAM_MAX_FRAME`) for every frame type and sends oversize
+    /// ones here, over the ctl stream socket.
     ///
-    /// The payload must be `HookMessage::PreExecEnv` or
-    /// `HookMessage::PostExecEnv`; any other variant gets
-    /// `CtlResponse::Error`. The daemon handles it exactly as it would
-    /// the datagram form and replies `HookEnvAck` after the stash or
-    /// journal write, so the caller's ordering against the next hook
-    /// frame is preserved.
-    HookEnv(HookMessage),
+    /// The daemon forwards the decoded message into the same ordered
+    /// queue the hook-socket loop consumes, so one consumer handles all
+    /// hook frames and the handlers are shared by both transports.
+    /// Reply is `HookAck` once the frame is queued (not once handled).
+    Hook(HookMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -936,8 +935,8 @@ pub enum CtlResponse {
     CmdNotFound {
         id: String,
     },
-    /// Reply to `HookEnv` (issue #6).
-    HookEnvAck,
+    /// Reply to `Hook` (issue #6): the frame is queued for the hook consumer.
+    HookAck,
 }
 
 /// AU30 — full detail for one captured command. The CLI's
@@ -1153,10 +1152,10 @@ mod hook_env_tests {
         };
         // As a bare datagram it would be rejected by macOS.
         assert!(encode_frame(&msg).unwrap().len() > HOOK_DGRAM_MAX_FRAME);
-        let req = CtlRequest::HookEnv(msg.clone());
+        let req = CtlRequest::Hook(msg.clone());
         let bytes = encode_frame(&req).unwrap();
         match decode_frame::<CtlRequest>(&bytes).unwrap() {
-            CtlRequest::HookEnv(got) => assert_eq!(got, msg),
+            CtlRequest::Hook(got) => assert_eq!(got, msg),
             other => panic!("wrong variant: {other:?}"),
         }
     }

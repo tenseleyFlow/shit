@@ -15,6 +15,18 @@ use std::time::Duration;
 use tokio::net::UnixDatagram;
 use tracing::{debug, info, warn};
 
+/// A hook frame plus how many times it has been deferred waiting for
+/// its `commands` row (see [`ROW_RETRY_MAX`]).
+pub type HookEnvelope = (HookMessage, u8);
+
+/// A frame that journals against a command (`PostExec*`) can arrive
+/// before the `PreExec` that creates the row: the two travel on
+/// different sockets when `PreExec` was oversize. Re-queue it every
+/// `ROW_RETRY_DELAY` for up to `ROW_RETRY_MAX` times (1 s total) before
+/// handling it anyway and letting the handler log the failure.
+const ROW_RETRY_DELAY: Duration = Duration::from_millis(50);
+const ROW_RETRY_MAX: u8 = 20;
+
 const IDLE_TICK_MAX: Duration = Duration::from_secs(60);
 const IDLE_TICK_MIN: Duration = Duration::from_millis(100);
 
@@ -48,6 +60,8 @@ pub async fn serve(
     helper_link: Option<Arc<HelperLink>>,
     watch_ready: Option<Arc<crate::watch_ready::WatchReadyMap>>,
     live_baseline: Arc<crate::baseline::LiveBaseline>,
+    hook_tx: tokio::sync::mpsc::UnboundedSender<HookEnvelope>,
+    mut hook_rx: tokio::sync::mpsc::UnboundedReceiver<HookEnvelope>,
 ) -> anyhow::Result<()> {
     let env_filter = cfg.env.filter();
     if let Some(parent) = cfg.hook_socket_path.parent() {
@@ -82,30 +96,59 @@ pub async fn serve(
     }
     let mut buf = vec![0u8; MAX_FRAME_SIZE];
 
+    // One consumer for both transports (datagram socket and
+    // `CtlRequest::Hook` via `hook_rx`), so every frame is handled by
+    // `handle` on this task, in arrival order, with the same stats.
+    let dispatch = |msg: HookMessage, attempt: u8| {
+        let started = std::time::Instant::now();
+        if let Some(id) = needs_command_row(&msg)
+            && !matches!(index.command_exists(id), Ok(true))
+        {
+            if attempt < ROW_RETRY_MAX {
+                let tx = hook_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(ROW_RETRY_DELAY).await;
+                    let _ = tx.send((msg, attempt + 1));
+                });
+                return;
+            }
+            warn!(
+                session = %id.session,
+                seq = id.seq,
+                kind = msg.kind(),
+                "no commands row after retries; handling anyway (journal write may fail)"
+            );
+        }
+        stats.note_hook_msg();
+        handle(
+            msg,
+            &index,
+            &env_stash,
+            &shell_state_stash,
+            &env_filter,
+            &active,
+            helper_link.as_deref(),
+            watch_ready.as_deref(),
+            live_baseline.as_ref(),
+        );
+        stats.note_hook_latency_us(started.elapsed().as_micros() as u64);
+    };
+
     loop {
         tokio::select! {
             res = sock.recv_from(&mut buf) => {
                 match res {
-                    Ok((n, _peer)) => {
-                        // S21.4 — record hook-handling latency so
-                        // `shit metrics` can surface p50/p99. The
-                        // timer brackets decode + handle.
-                        let started = std::time::Instant::now();
-                        match decode_frame::<HookMessage>(&buf[..n]) {
-                            Ok(msg) => {
-                                stats.note_hook_msg();
-                                handle(msg, &index, &env_stash, &shell_state_stash, &env_filter, &active, helper_link.as_deref(), watch_ready.as_deref(), live_baseline.as_ref());
-                            }
-                            Err(e) => {
-                                stats.note_decode_error();
-                                warn!(err = %e, len = n, "decode failed");
-                            }
+                    Ok((n, _peer)) => match decode_frame::<HookMessage>(&buf[..n]) {
+                        Ok(msg) => dispatch(msg, 0),
+                        Err(e) => {
+                            stats.note_decode_error();
+                            warn!(err = %e, len = n, "decode failed");
                         }
-                        stats.note_hook_latency_us(started.elapsed().as_micros() as u64);
-                    }
+                    },
                     Err(e) => warn!(err = %e, "recv_from failed"),
                 }
             }
+            Some((msg, attempt)) = hook_rx.recv() => dispatch(msg, attempt),
             _ = tokio::time::sleep(tick) => {
                 if idle_disabled { continue; }
                 let idle = stats.idle_for();
@@ -119,6 +162,19 @@ pub async fn serve(
                 }
             }
         }
+    }
+}
+
+/// Frames whose handler journals an event against `(session, seq)`.
+fn needs_command_row(msg: &HookMessage) -> Option<CommandId> {
+    match msg {
+        HookMessage::PostExec { session, seq, .. }
+        | HookMessage::PostExecEnv { session, seq, .. }
+        | HookMessage::PostExecShellState { session, seq, .. } => Some(CommandId {
+            session: *session,
+            seq: *seq,
+        }),
+        _ => None,
     }
 }
 
@@ -290,13 +346,18 @@ fn handle(
         }
         HookMessage::PostExecEnv { seq, env_block, .. } => {
             debug!(%session, kind, seq, bytes = env_block.len(), "post-exec-env");
-            let _ = env_track::handle_post(
+            match env_track::handle_post(
                 env_stash,
                 CommandId { session, seq: *seq },
                 env_block,
                 env_filter,
                 index,
-            );
+            ) {
+                env_track::PostOutcome::Orphan => {
+                    warn!(%session, seq, "post-exec-env dropped: no matching pre-exec-env");
+                }
+                outcome => debug!(%session, seq, ?outcome, "post-exec-env handled"),
+            }
         }
         HookMessage::PreExecShellState {
             seq,

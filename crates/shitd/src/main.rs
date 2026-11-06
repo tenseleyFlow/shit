@@ -365,6 +365,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
         })
     };
 
+    let (hook_tx, hook_rx) = tokio::sync::mpsc::unbounded_channel::<server::HookEnvelope>();
     let ctl_handle = {
         let cfg = cfg.clone();
         let ctl_state = ctl::CtlState {
@@ -377,7 +378,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             net_stash: Arc::clone(&net_stash),
             proc_stash: Arc::clone(&proc_stash),
             db_stash: Arc::clone(&db_stash),
-            env_stash: Arc::clone(&env_stash),
+            hook_tx: hook_tx.clone(),
             active: Arc::clone(&active),
             // Task #105 — handler only meaningful when a helper is
             // wired. Pass the map only in that case so the ctl
@@ -444,6 +445,8 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             helper_link_for_server,
             watch_ready_for_server,
             live_baseline_for_server,
+            hook_tx,
+            hook_rx,
         ) => r,
         _ = shutdown_for_server.notified() => {
             tracing::info!("shutdown requested via ctl");
