@@ -231,6 +231,22 @@ if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; the
     exit 0
 fi
 
+# DR-CR-54.B (L3): the hosted CI job sets SHIT_REQUIRE_OUTCOME_A=1,
+# which makes Outcome A the only pass. Without it the smoke still
+# accepts Outcome B (loud refusal) for local runs on hosts where the
+# shim's recursive walk is not in play.
+if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
+    smoke_log "SHIT_REQUIRE_OUTCOME_A=1: Outcome B not accepted"
+    smoke_log "  undo exit:    ${UNDO_RC}"
+    smoke_log "  output now:   '${POST_OUTPUT}' (expected 'hello pip v1')"
+    smoke_log "  sha now:      ${POST_SHA:0:16}..."
+    smoke_log "  sha v1:       ${V1_SHA:0:16}..."
+    smoke_log "  sha v2:       ${V2_SHA:0:16}..."
+    smoke_log "  shim hits:    ${SHIM_HITS}"
+    smoke_log "  journal evts: ${N_EVENTS}"
+    smoke_fail "pip install --user overwrite undo didn't restore v1 (DR-CR-54.B regression)"
+fi
+
 # Outcome B — loud refusal acceptable. pip's wheel installer does
 # a transactional rename of site-packages itself
 # (site-packages -> ~ite-packages -> back), which arrives at the
