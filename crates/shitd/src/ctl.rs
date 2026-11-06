@@ -1507,7 +1507,12 @@ fn handle_undo(
         let report = orch.run(&undo_plan, req.dry_run, policy);
         for rec in &report.records {
             match rec.outcome_kind {
-                OutcomeKind::Applied | OutcomeKind::WouldApply => ops_applied += 1,
+                OutcomeKind::Applied | OutcomeKind::WouldApply => {
+                    ops_applied += 1;
+                    if let Some(d) = rec.detail.as_deref() {
+                        detail_lines.push(format!("note: {d}"));
+                    }
+                }
                 OutcomeKind::Skipped => {
                     // AR07.2: separate refuse-list short-circuits
                     // from generic skip (filtered-by-path, conflict-

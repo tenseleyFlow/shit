@@ -199,6 +199,13 @@ async fn handle_one(
         "shim pre-mutation"
     );
 
+    // The shim notifies before the real unlink runs, so the path still
+    // exists here. Stat it first: on macOS and FreeBSD `resolve_by_descendant`
+    // below shells out to `ps` once per ancestor and can outlast the shim's 50 ms ack
+    // timeout, after which the syscall has run and the path is gone. By
+    // ingest time only the wire's Regular default would be left.
+    let unlink_stat = pre_syscall_unlink_stat(&note);
+
     // Resolve `pid → CommandId` BEFORE acking. The shim returns to
     // the calling process immediately after we ack, the real
     // syscall fires, and the process (e.g. `install` invoked by
@@ -235,11 +242,68 @@ async fn handle_one(
         &note,
         resolved,
         ingest_ts,
+        unlink_stat,
         &index,
         &blob_store,
         &live_baseline,
     );
     Ok(())
+}
+
+/// Kind and mode of an unlink target, read before the syscall runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnlinkStat {
+    kind: FileKind,
+    mode: u32,
+}
+
+/// lstat the target of a shim `unlink`/`unlinkat` so the journaled
+/// `TreeOp::Unlink` carries the real kind and mode. Without it an
+/// `unlinkat(AT_REMOVEDIR)` lands as a Regular unlink and undo's
+/// RecreatePath makes a file where a directory was, which then breaks
+/// every child restore under it (ENOTDIR). Directories, regular files,
+/// fifos and sockets are reported; anything else keeps the wire default.
+fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
+    use std::os::unix::fs::MetadataExt;
+    if !matches!(note.syscall.as_str(), "unlink" | "unlinkat") {
+        return None;
+    }
+    if !Path::new(&note.arg).is_absolute() {
+        return None;
+    }
+    let meta = match std::fs::symlink_metadata(&note.arg) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
+            return None;
+        }
+    };
+    let kind = FileKind::from_mode(meta.mode()).filter(|k| {
+        matches!(
+            k,
+            FileKind::Directory | FileKind::Regular | FileKind::Fifo | FileKind::Socket
+        )
+    })?;
+    Some(UnlinkStat {
+        kind,
+        mode: meta.mode(),
+    })
+}
+
+/// Overlay a pre-syscall lstat onto a classified shim Unlink.
+fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> CaptureEventKind {
+    match (kind, stat) {
+        (
+            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path, .. }),
+            Some(UnlinkStat { kind, mode }),
+        ) => CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode,
+            path,
+            kind,
+            mode,
+        }),
+        (k, _) => k,
+    }
 }
 
 /// Convert a shim notification into a `CaptureEvent` and journal it,
@@ -249,6 +313,7 @@ fn ingest_notification(
     note: &ShimNotification,
     resolved: Option<shit_planner::events::CommandId>,
     ingest_ts: shit_planner::time::TimePoint,
+    unlink_stat: Option<UnlinkStat>,
     index: &Index,
     blob_store: &BlobStore,
     live_baseline: &LiveBaseline,
@@ -511,7 +576,14 @@ fn ingest_notification(
         let mut journaled = 0u64;
         let mut failed = 0u64;
         for pre in &note.extra_pre_images {
-            match ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
+            match ingest_pre_image_with_source(
+                command,
+                pre,
+                index,
+                blob_store,
+                shit_planner::FilePreImageSource::ShimRenameSubtree,
+                ingest_ts,
+            ) {
                 Ok(()) => journaled += 1,
                 Err(e) => {
                     failed += 1;
@@ -547,7 +619,9 @@ fn ingest_notification(
     }
     // Fall through to journal the TreeOp::Unlink below.
 
-    let Some(kind) = classify_tree_op(&note.syscall, &note.arg) else {
+    let Some(kind) =
+        classify_tree_op(&note.syscall, &note.arg).map(|k| apply_unlink_stat(k, unlink_stat))
+    else {
         // Fd-based content syscalls (ftruncate, pwrite, mmap_shared_w)
         // have no path in the wire payload; they need fd→path resolution
         // which is FreeBSD-specific (procstat/kvm). Deferred.
@@ -1202,6 +1276,7 @@ mod tests {
             &note,
             Some(command),
             reserved_ts,
+            None,
             &index,
             &blob_store,
             &LiveBaseline::new(),
@@ -1218,5 +1293,223 @@ mod tests {
                 ..
             } if meta.flags == 7
         ));
+    }
+
+    fn ingest_fixture(
+        cmd: &str,
+    ) -> (
+        tempfile::TempDir,
+        Index,
+        BlobStore,
+        shit_planner::events::CommandId,
+    ) {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let blob_store = BlobStore::open(tmp.path().join("blobs")).unwrap();
+        let session = uuid::Uuid::nil();
+        index
+            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .expect("put_session");
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some(cmd.into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: 4242,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .expect("put_command");
+        (tmp, index, blob_store, command)
+    }
+
+    fn shim_pre(path: &str, bytes: &[u8]) -> ShimPreImage {
+        ShimPreImage {
+            path: path.into(),
+            dev: 64,
+            inode: 9000,
+            mode: 0o100644,
+            uid: 1000,
+            gid: 1000,
+            size: bytes.len() as u64,
+            mtime_unix_nanos: 0,
+            bytes: bytes.to_vec(),
+            xattr: None,
+            flags: 0,
+        }
+    }
+
+    /// The recursive dir-rename walk is tagged so the planner can tell
+    /// it from in-command captures; the rename's own dst pre-image
+    /// keeps the generic source.
+    #[test]
+    fn rename_walk_pre_images_carry_subtree_source() {
+        use shit_planner::FilePreImageSource;
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("mv d d.bak");
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "rename".into(),
+            arg: "/tmp/shit-walk/d\t/tmp/shit-walk/d.bak".into(),
+            ts_unix_nanos: 0,
+            pre_image: Some(shim_pre("/tmp/shit-walk/d.bak", b"old dst")),
+            extra_pre_images: vec![
+                shim_pre("/tmp/shit-walk/d/a", b"a"),
+                shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
+            ],
+            failure: None,
+        };
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(5, 0),
+            None,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        let mut sources: Vec<(PathBuf, FilePreImageSource)> = index
+            .events_for_command(command)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                CaptureEventKind::FilePreImage { path, source, .. } => Some((path, source)),
+                _ => None,
+            })
+            .collect();
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            sources,
+            vec![
+                (
+                    PathBuf::from("/tmp/shit-walk/d/a"),
+                    FilePreImageSource::ShimRenameSubtree
+                ),
+                (
+                    PathBuf::from("/tmp/shit-walk/d/sub/b"),
+                    FilePreImageSource::ShimRenameSubtree
+                ),
+                (
+                    PathBuf::from("/tmp/shit-walk/d.bak"),
+                    FilePreImageSource::Other
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_syscall_unlink_stat_reports_dir_and_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        let file = tmp.path().join("f");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = tmp.path().join("l");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let note = |syscall: &str, p: &Path| ShimNotification {
+            pid: 1,
+            syscall: syscall.into(),
+            arg: p.to_str().unwrap().into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let fifo = tmp.path().join("p");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o640) }, 0);
+        let p = pre_syscall_unlink_stat(&note("unlink", &fifo)).expect("fifo stat");
+        assert_eq!(p.kind, FileKind::Fifo);
+        let d = pre_syscall_unlink_stat(&note("unlinkat", &dir)).expect("dir stat");
+        assert_eq!(d.kind, FileKind::Directory);
+        assert_eq!(d.mode & 0o170000, 0o040000);
+        assert_eq!(d.mode & 0o7777, 0o711);
+        let f = pre_syscall_unlink_stat(&note("unlink", &file)).expect("file stat");
+        assert_eq!(f.kind, FileKind::Regular);
+        assert_eq!(f.mode & 0o7777, 0o600);
+        assert_eq!(pre_syscall_unlink_stat(&note("unlinkat", &link)), None);
+        assert_eq!(
+            pre_syscall_unlink_stat(&note("unlinkat", &tmp.path().join("gone"))),
+            None
+        );
+        assert_eq!(pre_syscall_unlink_stat(&note("rename", &dir)), None);
+        assert_eq!(
+            pre_syscall_unlink_stat(&note("unlinkat", Path::new("relative"))),
+            None
+        );
+    }
+
+    /// `unlinkat(AT_REMOVEDIR)` journals a Directory unlink with the
+    /// mode read before the syscall, so undo recreates a directory.
+    #[test]
+    fn unlinkat_of_dir_journals_directory_kind() {
+        use shit_planner::time::TimePoint;
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "unlinkat".into(),
+            arg: "/tmp/shit-unlink-dir/d".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(6, 0),
+            Some(UnlinkStat {
+                kind: FileKind::Directory,
+                mode: 0o040750,
+            }),
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(
+            matches!(
+                &events[0].kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    kind: FileKind::Directory,
+                    mode: 0o040750,
+                    ..
+                })
+            ),
+            "{events:#?}"
+        );
+
+        // Without a stat (lstat lost the race) the wire default stays.
+        let (_tmp2, index2, blob_store2, command2) = ingest_fixture("rm -rf d");
+        ingest_notification(
+            &note,
+            Some(command2),
+            TimePoint::new(7, 0),
+            None,
+            &index2,
+            &blob_store2,
+            &LiveBaseline::new(),
+        );
+        let events = index2.events_for_command(command2);
+        assert!(
+            matches!(
+                &events[0].kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    kind: FileKind::Regular,
+                    mode: 0o100644,
+                    ..
+                })
+            ),
+            "{events:#?}"
+        );
     }
 }

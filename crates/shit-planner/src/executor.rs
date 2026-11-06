@@ -38,6 +38,9 @@ use crate::inverse::{Conflict, InverseOp, UndoPlan};
 pub enum ExecutionOutcome {
     /// Op mutated live state successfully.
     Applied,
+    /// Op applied, with something the user should know about how: undo
+    /// had to decide something the journal did not record.
+    AppliedWithNote { note: String },
     /// Dry-run: op *would* have applied. No mutation occurred.
     WouldApply,
     /// Op was deliberately skipped (e.g. `--on-conflict=skip` hit a
@@ -65,7 +68,7 @@ impl ExecutionOutcome {
 
     pub fn verb_past_tense(&self) -> &'static str {
         match self {
-            Self::Applied => "applied",
+            Self::Applied | Self::AppliedWithNote { .. } => "applied",
             Self::WouldApply => "would apply",
             Self::Skipped { .. } => "skipped",
             Self::Conflict { .. } => "conflict",
@@ -110,7 +113,7 @@ pub enum OutcomeKind {
 impl OutcomeKind {
     pub fn from_outcome(o: &ExecutionOutcome) -> Self {
         match o {
-            ExecutionOutcome::Applied => Self::Applied,
+            ExecutionOutcome::Applied | ExecutionOutcome::AppliedWithNote { .. } => Self::Applied,
             ExecutionOutcome::WouldApply => Self::WouldApply,
             ExecutionOutcome::Skipped { .. } => Self::Skipped,
             ExecutionOutcome::Conflict { kind } => match kind {
