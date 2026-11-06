@@ -25,6 +25,14 @@ pub const WIRE_VERSION: u8 = 1;
 /// buffer per concurrent connection.
 pub const MAX_FRAME_SIZE: usize = 256 * 1024;
 
+/// Largest frame the shell hooks put on the hook-socket datagram.
+/// macOS defaults `net.local.dgram.maxdgram` to 2048 bytes and rejects
+/// bigger `AF_UNIX SOCK_DGRAM` sends with `EMSGSIZE` (issue #6); the
+/// margin keeps us under that default on every platform. Env-block
+/// frames above this go over the ctl stream socket instead
+/// (`CtlRequest::HookEnv`).
+pub const HOOK_DGRAM_MAX_FRAME: usize = 1900;
+
 /// Maximum frame size for the large-payload ctl path. Used by
 /// `ContainerEvent` (AR03 PR-B) which inlines tarball bytes (`docker
 /// save <image>`) up to this cap; anything larger routes through the

@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use shit_proto::{
-    CtlRequest, CtlResponse, HookMessage, RedirectOpWire, RedirectTargetWire, ShellKind,
-    decode_frame, encode_frame,
+    CtlRequest, CtlResponse, HOOK_DGRAM_MAX_FRAME, HookMessage, RedirectOpWire, RedirectTargetWire,
+    ShellKind, decode_frame, encode_frame, encode_frame_large,
 };
 use shit_shell::redirect::{RedirectOp, parse_redirects};
 use std::io::Read;
@@ -623,10 +623,58 @@ fn stat_cwd(cwd: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 fn send_message(sock_path: &std::path::Path, msg: &HookMessage) -> Result<()> {
-    let frame = encode_frame(msg).context("encode frame")?;
+    // Encode with the large cap so the transport choice, not the
+    // encoder, decides what is too big (the ctl path accepts up to
+    // MAX_LARGE_FRAME_SIZE; env blocks are capped at MAX_ENV_BLOCK).
+    let frame = encode_frame_large(msg).context("encode frame")?;
+    // Issue #6: macOS caps AF_UNIX datagrams at 2048 bytes by default.
+    // Any frame over HOOK_DGRAM_MAX_FRAME (env blocks, long command
+    // lines, alias tables) goes over the ctl stream socket instead.
+    if frame.len() > HOOK_DGRAM_MAX_FRAME {
+        return send_over_ctl(sock_path, msg);
+    }
     let client = UnixDatagram::unbound().context("UnixDatagram::unbound")?;
     client
         .send_to(&frame, sock_path)
         .with_context(|| format!("send_to {}", sock_path.display()))?;
+    Ok(())
+}
+
+/// Deliver a hook message via `CtlRequest::Hook` on the sibling
+/// `shit-ctl.sock` of the hook socket. Pre-side frames are written and
+/// the write half is shut down without waiting for a reply, so the
+/// shell is not held on a round-trip before the user's command runs.
+/// Post-side frames wait up to `POST_ACK_WAIT` for the ack, which only
+/// bounds how long a slow daemon can delay the prompt.
+fn send_over_ctl(sock_path: &Path, msg: &HookMessage) -> Result<()> {
+    use std::io::Write;
+    use std::net::Shutdown;
+    const POST_ACK_WAIT: Duration = Duration::from_millis(200);
+    let ctl_sock = sock_path
+        .parent()
+        .map(|p| p.join("shit-ctl.sock"))
+        .unwrap_or_else(|| PathBuf::from("shit-ctl.sock"));
+    let bytes = encode_frame_large(&CtlRequest::Hook(msg.clone())).context("encode ctl request")?;
+    let mut stream = UnixStream::connect(&ctl_sock)
+        .with_context(|| format!("connect ctl {}", ctl_sock.display()))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(&bytes).context("write ctl request")?;
+    stream.shutdown(Shutdown::Write).ok();
+    let post_side = matches!(
+        msg,
+        HookMessage::PostExec { .. }
+            | HookMessage::PostExecEnv { .. }
+            | HookMessage::PostExecShellState { .. }
+            | HookMessage::SessionClose { .. }
+    );
+    if post_side {
+        stream.set_read_timeout(Some(POST_ACK_WAIT))?;
+        let mut buf = [0u8; 256];
+        if let Ok(n) = stream.read(&mut buf)
+            && let Ok(CtlResponse::Error(e)) = decode_frame::<CtlResponse>(&buf[..n])
+        {
+            anyhow::bail!("daemon rejected hook frame: {e}");
+        }
+    }
     Ok(())
 }

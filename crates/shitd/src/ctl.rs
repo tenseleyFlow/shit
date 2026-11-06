@@ -31,6 +31,10 @@ pub struct CtlState {
     pub net_stash: Arc<NetPreStash>,
     pub proc_stash: Arc<ProcPreStash>,
     pub db_stash: Arc<crate::db_track::DbPreStash>,
+    /// Issue #6 — queue into the hook-socket consumer (`server::serve`).
+    /// `CtlRequest::Hook` frames are forwarded here so one task handles
+    /// every hook frame, whichever socket it arrived on.
+    pub hook_tx: tokio::sync::mpsc::UnboundedSender<crate::server::HookEnvelope>,
     pub active: Arc<crate::active_commands::ActiveCommands>,
     /// AR00.5 / task #105 — per-CommandId readiness rendezvous. Set
     /// to `None` when no helper is connected (degraded mode); the
@@ -108,6 +112,7 @@ async fn handle_client(
         net_stash,
         proc_stash,
         db_stash,
+        hook_tx,
         active,
         watch_ready,
         helper_link,
@@ -176,6 +181,13 @@ async fn handle_client(
             handle_container_event(req, &active, &index, &blob_store)
         }
         CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
+        CtlRequest::Hook(msg) => {
+            debug!(kind = msg.kind(), session = %msg.session(), "hook frame via ctl");
+            match hook_tx.send((msg, 0)) {
+                Ok(()) => CtlResponse::HookAck,
+                Err(_) => CtlResponse::Error("hook queue closed".into()),
+            }
+        }
         CtlRequest::Metrics => CtlResponse::Metrics(metrics_snapshot(&stats, &index)),
         CtlRequest::Undo(req) => {
             // AU22 — handle_undo blocks on HelperLinkPrivilegedOpRouter's

@@ -155,6 +155,18 @@ impl Index {
         Ok(())
     }
 
+    /// True when a `commands` row exists for `id`. Events reference it
+    /// by foreign key, so event writers can check before journaling.
+    pub fn command_exists(&self, id: CommandId) -> Result<bool, IndexError> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE session = ?1 AND seq = ?2",
+            params![id.session.as_bytes().as_slice(), id.seq as i64],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Insert one event. Returns the assigned `EventId`. Increments any
     /// referenced blob's refcount.
     pub fn put_event(&self, event: &CaptureEvent) -> Result<EventId, IndexError> {

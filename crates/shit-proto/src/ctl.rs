@@ -3,7 +3,7 @@
 //! Control-plane messages exchanged on the daemon's ctl socket. Used by the
 //! `shit status` / `shit service status` paths.
 
-use crate::ShellKind;
+use crate::{HookMessage, ShellKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -160,6 +160,20 @@ pub enum CtlRequest {
         #[serde(default)]
         events_limit: Option<usize>,
     },
+    /// Issue #6 — hook frame carrier for frames that do not fit in one
+    /// hook-socket datagram. macOS caps `AF_UNIX SOCK_DGRAM` payloads at
+    /// `net.local.dgram.maxdgram` (2048 bytes by default); real env
+    /// blocks (3-5 KB), long `PreExec` command lines (up to 4 KB) and
+    /// big alias tables in `Pre/PostExecShellState` all exceed it.
+    /// `shit hook-send` picks the transport by encoded size
+    /// (`HOOK_DGRAM_MAX_FRAME`) for every frame type and sends oversize
+    /// ones here, over the ctl stream socket.
+    ///
+    /// The daemon forwards the decoded message into the same ordered
+    /// queue the hook-socket loop consumes, so one consumer handles all
+    /// hook frames and the handlers are shared by both transports.
+    /// Reply is `HookAck` once the frame is queued (not once handled).
+    Hook(HookMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -921,6 +935,8 @@ pub enum CtlResponse {
     CmdNotFound {
         id: String,
     },
+    /// Reply to `Hook` (issue #6): the frame is queued for the hook consumer.
+    HookAck,
 }
 
 /// AU30 — full detail for one captured command. The CLI's
@@ -1119,4 +1135,39 @@ pub enum HelperLinkState {
     /// Helper handshake completed, then the dispatch loop saw
     /// `HelperExited`. Capture-tier events are no longer arriving.
     Disconnected,
+}
+
+#[cfg(test)]
+mod hook_env_tests {
+    use super::*;
+    use crate::{HOOK_DGRAM_MAX_FRAME, decode_frame, encode_frame};
+
+    #[test]
+    fn six_kb_env_frame_exceeds_dgram_cap_and_round_trips_on_ctl() {
+        let msg = HookMessage::PostExecEnv {
+            session: uuid::Uuid::nil(),
+            seq: 7,
+            env_block: vec![b'x'; 6 * 1024],
+            ts_unix_nanos: 1,
+        };
+        // As a bare datagram it would be rejected by macOS.
+        assert!(encode_frame(&msg).unwrap().len() > HOOK_DGRAM_MAX_FRAME);
+        let req = CtlRequest::Hook(msg.clone());
+        let bytes = encode_frame(&req).unwrap();
+        match decode_frame::<CtlRequest>(&bytes).unwrap() {
+            CtlRequest::Hook(got) => assert_eq!(got, msg),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_env_frame_fits_a_datagram() {
+        let msg = HookMessage::PreExecEnv {
+            session: uuid::Uuid::nil(),
+            seq: 1,
+            env_block: b"A=1\0B=2".to_vec(),
+            ts_unix_nanos: 1,
+        };
+        assert!(encode_frame(&msg).unwrap().len() <= HOOK_DGRAM_MAX_FRAME);
+    }
 }

@@ -82,9 +82,19 @@ jobs:
         run: |
           case "${{ matrix.os }}" in
             ubuntu-24.04) bp=ubuntu-24.04-x86_64 ;;
-            # No macos baseline file is committed yet; record macos-15-aarch64-*.json.
+            # macos-15-aarch64-tight-loop.json is committed; see baselines/README.md.
             macos-15)     bp=macos-15-aarch64 ;;
             *)            bp=unknown ;;
+          esac
+          # Hosted macOS runners are noisy: tight-loop (`sh -c :`, no shit
+          # code in the loop) measured 3418, 3720 and 5839 us median across
+          # three runs of this PR (9-15% spread between the first two,
+          # 57% on run 42188068345 with an unrelated diff). Gate macOS at
+          # 100% median / 150% p99 to catch order-of-magnitude regressions
+          # only. Linux keeps the 10%/20% defaults.
+          case "${{ matrix.os }}" in
+            macos-15) echo "pct_args=--median-pct 100 --p99-pct 150" >> "$GITHUB_OUTPUT" ;;
+            *)        echo "pct_args=" >> "$GITHUB_OUTPUT" ;;
           esac
           echo "tight_loop=benches/regression/baselines/$bp-tight-loop.json" >> "$GITHUB_OUTPUT"
           echo "fanotify_capture=benches/regression/baselines/$bp-fanotify-capture.json" >> "$GITHUB_OUTPUT"
@@ -143,7 +153,8 @@ jobs:
             --current target/bench/tight-loop.json \
             --baseline ${{ steps.baseline.outputs.tight_loop }} \
             --gate shell-hook \
-            --no-budget
+            --no-budget \
+            ${{ steps.baseline.outputs.pct_args }}
 
       - name: upload bench JSON
         if: always()

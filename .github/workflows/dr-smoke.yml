@@ -271,6 +271,31 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  env-oversize-linux:
+    # Issue #6 — 6 KB PreExecEnv/PostExecEnv frames must reach the
+    # daemon (ctl-socket path for frames over the datagram cap).
+    name: env-oversize smoke (issue-6 Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlite + python3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/env-oversize-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-oversize-linux-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   hook-ipc:
     name: hook-IPC smoke
     runs-on: ubuntu-24.04
@@ -495,6 +520,30 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: link-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  env-oversize-macos:
+    # Issue #6 — macOS caps AF_UNIX datagrams at
+    # net.local.dgram.maxdgram=2048; a 6 KB env block must still reach
+    # the daemon via the ctl-socket path.
+    name: env-oversize smoke (issue-6 macOS)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/env-oversize-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-oversize-macos-logs
           path: |
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
