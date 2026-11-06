@@ -635,7 +635,10 @@ mod close_barrier_tests {
             <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(5)).unwrap();
         assert!(rec.ended_at.is_some());
         assert_eq!(rec.exit_code, Some(3));
-        assert_eq!(ctx.closing.wait_for_drain(Duration::from_millis(5)).await, 0);
+        assert_eq!(
+            ctx.closing.wait_for_drain(Duration::from_millis(5)).await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -676,22 +679,19 @@ mod close_barrier_tests {
                     UNWATCH_FLUSH_TIMEOUT,
                 )),
             );
-            let refusals = <Index as shit_planner::PlannerStore>::events_for_command(
-                index.as_ref(),
-                cmd(6),
-            )
-            .into_iter()
-            .filter(|ev| {
-                matches!(
-                    ev.kind,
-                    shit_planner::events::CaptureEventKind::CaptureRefused { .. }
-                )
-            })
-            .count();
+            let refusals =
+                <Index as shit_planner::PlannerStore>::events_for_command(index.as_ref(), cmd(6))
+                    .into_iter()
+                    .filter(|ev| {
+                        matches!(
+                            ev.kind,
+                            shit_planner::events::CaptureEventKind::CaptureRefused { .. }
+                        )
+                    })
+                    .count();
             assert_eq!(refusals, usize::from(strict), "strict={strict}");
-            let rec =
-                <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(6))
-                    .unwrap();
+            let rec = <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(6))
+                .unwrap();
             assert!(rec.ended_at.is_some(), "a failed barrier still finalizes");
         }
     }

@@ -134,9 +134,8 @@ pub struct HelperLink {
     pending_unwatch: UnwatchWaiters,
 }
 
-type UnwatchWaiters = std::sync::Mutex<
-    std::collections::HashMap<CommandId, tokio::sync::oneshot::Sender<()>>,
->;
+type UnwatchWaiters =
+    std::sync::Mutex<std::collections::HashMap<CommandId, tokio::sync::oneshot::Sender<()>>>;
 
 /// Why a command close could not prove the helper flushed its capture.
 #[derive(Debug, thiserror::Error)]

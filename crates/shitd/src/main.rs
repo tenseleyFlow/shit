@@ -138,9 +138,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if resolved.strict_capture {
-        tracing::info!(
-            "strict capture enabled; incomplete capture is journaled as CaptureRefused"
-        );
+        tracing::info!("strict capture enabled; incomplete capture is journaled as CaptureRefused");
     }
 
     if resolved.disable {
