@@ -35,40 +35,22 @@
 //! entry by `(session, seq)` — not just the latest — so two
 //! out-of-order backgrounded commands resolve cleanly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use shit_planner::CommandId;
 
 use crate::ancestry::ancestor_chain;
 
-/// A cap on remembered emitters per command. A command that spawns more
-/// shim-notifying processes than this loses the exit fallback for the
-/// extras; the walk still attributes them while they are alive.
-const MAX_EMITTERS_PER_COMMAND: usize = 4096;
-
 /// In-memory map of shell pid → command stack. Cleared as PostExec
 /// arrives for each command.
 #[derive(Debug, Default)]
 pub struct ActiveCommands {
-    inner: Mutex<Inner>,
-}
-
-#[derive(Debug, Default)]
-struct Inner {
     /// Per-shell-pid stack of active (session, seq). The stack lets
     /// background jobs (`cmd &`) coexist with foreground commands —
     /// most recent PreExec is at the back; resolution prefers the
     /// most recent (foreground) command.
-    stacks: HashMap<u32, Vec<CommandId>>,
-    /// Per active command, the shim emitters a walk has attributed to
-    /// it, as `(pid, process epoch)`. An emitter that sends several
-    /// notifications (rsync renaming one temp file per destination) may
-    /// exit, or lose an ancestor, before a later walk finishes; this
-    /// keeps its later notifications bound to the same command (#202).
-    /// The epoch comes from the shim, so a reused pid cannot match, even
-    /// after the emitter is gone and could no longer be stat'd.
-    emitters: HashMap<CommandId, HashSet<(u32, u64)>>,
+    inner: Mutex<HashMap<u32, Vec<CommandId>>>,
 }
 
 impl ActiveCommands {
@@ -81,7 +63,7 @@ impl ActiveCommands {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
-        g.stacks.entry(shell_pid).or_default().push(command);
+        g.entry(shell_pid).or_default().push(command);
     }
 
     /// Remove a command on PostExec. Matches by `(session, seq)` so
@@ -93,7 +75,7 @@ impl ActiveCommands {
         let Ok(mut g) = self.inner.lock() else {
             return false;
         };
-        let Some(stack) = g.stacks.get_mut(&shell_pid) else {
+        let Some(stack) = g.get_mut(&shell_pid) else {
             return false;
         };
         let Some(idx) = stack.iter().position(|c| *c == command) else {
@@ -101,9 +83,8 @@ impl ActiveCommands {
         };
         stack.remove(idx);
         if stack.is_empty() {
-            g.stacks.remove(&shell_pid);
+            g.remove(&shell_pid);
         }
-        g.emitters.remove(&command);
         true
     }
 
@@ -118,48 +99,21 @@ impl ActiveCommands {
     pub fn resolve_by_descendant(&self, emitter_pid: u32) -> Option<CommandId> {
         let chain = ancestor_chain(emitter_pid);
         let g = self.inner.lock().ok()?;
-        g.tracked_in(&chain)
-    }
-
-    /// [`Self::resolve_by_descendant`] for a shim notification, which
-    /// carries the emitter's process epoch. If the walk finds no tracked
-    /// shell, the notification still binds to the command an earlier
-    /// walk found for this same process. An epoch of 0 is no identity
-    /// and never binds.
-    pub fn resolve_shim_emitter(&self, emitter_pid: u32, epoch: u64) -> Option<CommandId> {
-        self.resolve_chain(emitter_pid, epoch, &ancestor_chain(emitter_pid))
-    }
-
-    fn resolve_chain(&self, emitter_pid: u32, epoch: u64, chain: &[u32]) -> Option<CommandId> {
-        let mut g = self.inner.lock().ok()?;
-        let key = (emitter_pid, epoch);
-        if let Some(cmd) = g.tracked_in(chain) {
-            if epoch != 0 {
-                let seen = g.emitters.entry(cmd).or_default();
-                if seen.len() < MAX_EMITTERS_PER_COMMAND {
-                    seen.insert(key);
-                }
+        for pid in chain {
+            if let Some(stack) = g.get(&pid)
+                && let Some(cmd) = stack.last()
+            {
+                return Some(*cmd);
             }
-            return Some(cmd);
         }
-        if epoch == 0 {
-            return None;
-        }
-        // Entries exist only for active commands: remove() drops them
-        // under this same lock. Newest command wins if a long-lived
-        // emitter was seen in more than one.
-        g.emitters
-            .iter()
-            .filter(|(_, seen)| seen.contains(&key))
-            .map(|(cmd, _)| *cmd)
-            .max_by_key(|cmd| cmd.seq)
+        None
     }
 
     /// Number of shell pids currently with an active command. For
     /// metrics / debug only. Wired to `shit metrics` in a later DR.
     #[allow(dead_code)]
     pub fn tracked_shell_count(&self) -> usize {
-        self.inner.lock().map(|g| g.stacks.len()).unwrap_or(0)
+        self.inner.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     /// Number of commands in flight across all shells.
@@ -167,16 +121,8 @@ impl ActiveCommands {
     pub fn active_command_count(&self) -> usize {
         self.inner
             .lock()
-            .map(|g| g.stacks.values().map(|v| v.len()).sum())
+            .map(|g| g.values().map(|v| v.len()).sum())
             .unwrap_or(0)
-    }
-}
-
-impl Inner {
-    fn tracked_in(&self, chain: &[u32]) -> Option<CommandId> {
-        chain
-            .iter()
-            .find_map(|pid| self.stacks.get(pid).and_then(|stack| stack.last()).copied())
     }
 }
 
@@ -243,97 +189,6 @@ mod tests {
         // not in our ancestry.
         a.insert(u32::MAX - 1, cmd(1));
         assert_eq!(a.resolve_by_descendant(std::process::id()), None);
-    }
-
-    const EPOCH: u64 = 1_000;
-
-    fn bound() -> ActiveCommands {
-        let a = ActiveCommands::new();
-        a.insert(100, cmd(1));
-        assert_eq!(a.resolve_chain(300, EPOCH, &[300, 200, 100]), Some(cmd(1)));
-        a
-    }
-
-    #[test]
-    fn exited_emitter_keeps_its_earlier_binding() {
-        // #202: rsync renames three temp files and exits right after the
-        // last one; the later walk stops at the dead pid.
-        assert_eq!(bound().resolve_chain(300, EPOCH, &[300]), Some(cmd(1)));
-    }
-
-    #[test]
-    fn ancestor_death_mid_walk_keeps_the_binding() {
-        // The walk stops at a dead intermediate; the start pid resolved.
-        assert_eq!(bound().resolve_chain(300, EPOCH, &[300, 200]), Some(cmd(1)));
-    }
-
-    #[test]
-    fn reparented_emitter_keeps_the_binding() {
-        // The parent exited and the emitter now sits directly under init.
-        assert_eq!(bound().resolve_chain(300, EPOCH, &[300]), Some(cmd(1)));
-    }
-
-    #[test]
-    fn reused_pid_does_not_match_a_binding() {
-        // Same pid, later process, both alive and already exited: dropped.
-        let a = bound();
-        assert_eq!(a.resolve_chain(300, EPOCH + 1, &[300, 50]), None);
-        assert_eq!(a.resolve_chain(300, EPOCH + 1, &[300]), None);
-    }
-
-    #[test]
-    fn emitter_without_earlier_binding_is_dropped() {
-        let a = ActiveCommands::new();
-        a.insert(100, cmd(1));
-        assert_eq!(a.resolve_chain(300, EPOCH, &[300]), None);
-    }
-
-    #[test]
-    fn zero_epoch_never_binds() {
-        let a = ActiveCommands::new();
-        a.insert(100, cmd(1));
-        assert_eq!(a.resolve_chain(300, 0, &[300, 100]), Some(cmd(1)));
-        assert_eq!(a.resolve_chain(300, 0, &[300]), None);
-    }
-
-    #[test]
-    fn binding_ends_with_its_command() {
-        let a = bound();
-        assert!(a.remove(100, cmd(1)));
-        a.insert(100, cmd(2));
-        assert_eq!(a.resolve_chain(300, EPOCH, &[300]), None);
-        assert!(a.inner.lock().unwrap().emitters.is_empty());
-    }
-
-    #[test]
-    fn long_lived_emitter_binds_to_its_newest_command() {
-        let a = bound();
-        a.insert(100, cmd(2));
-        assert_eq!(a.resolve_chain(300, EPOCH, &[300, 100]), Some(cmd(2)));
-        assert_eq!(a.resolve_chain(300, EPOCH, &[300]), Some(cmd(2)));
-    }
-
-    #[test]
-    fn emitters_per_command_are_bounded() {
-        let a = ActiveCommands::new();
-        a.insert(100, cmd(1));
-        let extra = MAX_EMITTERS_PER_COMMAND as u32 + 10;
-        for pid in 1000..1000 + extra {
-            assert_eq!(a.resolve_chain(pid, EPOCH, &[pid, 100]), Some(cmd(1)));
-        }
-        let g = a.inner.lock().unwrap();
-        assert_eq!(g.emitters[&cmd(1)].len(), MAX_EMITTERS_PER_COMMAND);
-    }
-
-    #[test]
-    fn walk_still_attributes_past_the_cap() {
-        let a = ActiveCommands::new();
-        a.insert(100, cmd(1));
-        for pid in 1000..1000 + MAX_EMITTERS_PER_COMMAND as u32 {
-            a.resolve_chain(pid, EPOCH, &[pid, 100]);
-        }
-        assert_eq!(a.resolve_chain(9, EPOCH, &[9, 100]), Some(cmd(1)));
-        assert_eq!(a.resolve_chain(9, EPOCH, &[9]), None);
     }
 
     #[test]

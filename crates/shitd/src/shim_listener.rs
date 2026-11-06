@@ -209,7 +209,7 @@ async fn handle_one(
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    let resolved = active.resolve_shim_emitter(note.pid, note.pid_epoch_nanos);
+    let resolved = active.resolve_by_descendant(note.pid);
 
     // Reserve journal order before allowing the intercepted syscall to
     // run. Ingestion itself remains fail-open and happens after the ACK,
