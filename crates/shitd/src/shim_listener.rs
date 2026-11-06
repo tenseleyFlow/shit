@@ -261,8 +261,8 @@ struct UnlinkStat {
 /// `TreeOp::Unlink` carries the real kind and mode. Without it an
 /// `unlinkat(AT_REMOVEDIR)` lands as a Regular unlink and undo's
 /// RecreatePath makes a file where a directory was, which then breaks
-/// every child restore under it (ENOTDIR). Only directories and
-/// regular files are reported; anything else keeps the wire default.
+/// every child restore under it (ENOTDIR). Directories, regular files,
+/// fifos and sockets are reported; anything else keeps the wire default.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat") {
@@ -278,13 +278,12 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
             return None;
         }
     };
-    let kind = if meta.is_dir() {
-        FileKind::Directory
-    } else if meta.is_file() {
-        FileKind::Regular
-    } else {
-        return None;
-    };
+    let kind = FileKind::from_mode(meta.mode()).filter(|k| {
+        matches!(
+            k,
+            FileKind::Directory | FileKind::Regular | FileKind::Fifo | FileKind::Socket
+        )
+    })?;
     Some(UnlinkStat {
         kind,
         mode: meta.mode(),
@@ -1424,6 +1423,11 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
         };
+        let fifo = tmp.path().join("p");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o640) }, 0);
+        let p = pre_syscall_unlink_stat(&note("unlink", &fifo)).expect("fifo stat");
+        assert_eq!(p.kind, FileKind::Fifo);
         let d = pre_syscall_unlink_stat(&note("unlinkat", &dir)).expect("dir stat");
         assert_eq!(d.kind, FileKind::Directory);
         assert_eq!(d.mode & 0o170000, 0o040000);
