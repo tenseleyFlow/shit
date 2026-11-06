@@ -577,19 +577,14 @@ fn ingest_notification(
         let mut journaled = 0u64;
         let mut failed = 0u64;
         for pre in &note.extra_pre_images {
-            // The walk's directory records come in on the same wire with
-            // a directory mode and no bytes, after the files. They prove
-            // the journal holds the whole walk, which stops being true
-            // once any entry fails to journal.
-            let source = if FileKind::from_mode(pre.mode) == Some(FileKind::Directory) {
-                if failed > 0 {
-                    continue;
-                }
-                shit_planner::FilePreImageSource::ShimRenameSubtreeDir
-            } else {
-                shit_planner::FilePreImageSource::ShimRenameSubtree
-            };
-            match ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts) {
+            match ingest_pre_image_with_source(
+                command,
+                pre,
+                index,
+                blob_store,
+                shit_planner::FilePreImageSource::ShimRenameSubtree,
+                ingest_ts,
+            ) {
                 Ok(()) => journaled += 1,
                 Err(e) => {
                     failed += 1;
@@ -1368,10 +1363,6 @@ mod tests {
             extra_pre_images: vec![
                 shim_pre("/tmp/shit-walk/d/a", b"a"),
                 shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
-                ShimPreImage {
-                    mode: 0o040700,
-                    ..shim_pre("/tmp/shit-walk/d", b"")
-                },
             ],
             failure: None,
         };
@@ -1397,10 +1388,6 @@ mod tests {
             sources,
             vec![
                 (
-                    PathBuf::from("/tmp/shit-walk/d"),
-                    FilePreImageSource::ShimRenameSubtreeDir
-                ),
-                (
                     PathBuf::from("/tmp/shit-walk/d/a"),
                     FilePreImageSource::ShimRenameSubtree
                 ),
@@ -1414,64 +1401,6 @@ mod tests {
                 ),
             ]
         );
-    }
-
-    /// A walk file that fails to journal means the directory records
-    /// can no longer prove the walk is complete.
-    #[test]
-    fn failed_walk_file_ingest_drops_directory_records() {
-        use shit_planner::FilePreImageSource;
-        use shit_planner::time::TimePoint;
-        let (tmp, index, blob_store, command) = ingest_fixture("mv d t");
-        // Make the store fail for this one blob: a file where its shard
-        // directory has to go.
-        let bytes = b"will not store";
-        let scratch = BlobStore::open(tmp.path().join("scratch")).unwrap();
-        let (hash, _) = scratch.put(bytes).unwrap();
-        let hex = hash.to_hex();
-        let shard = tmp.path().join("blobs/blobs").join(&hex[..2]);
-        std::fs::create_dir_all(&shard).unwrap();
-        std::fs::write(shard.join(&hex[2..4]), b"in the way").unwrap();
-        let note = ShimNotification {
-            pid: 4242,
-            syscall: "rename".into(),
-            arg: "/tmp/shit-walk/d\t/tmp/shit-walk/t".into(),
-            ts_unix_nanos: 0,
-            pre_image: None,
-            extra_pre_images: vec![
-                shim_pre("/tmp/shit-walk/d/ok", b"ok"),
-                shim_pre("/tmp/shit-walk/d/lost", bytes),
-                ShimPreImage {
-                    mode: 0o040700,
-                    ..shim_pre("/tmp/shit-walk/d", b"")
-                },
-            ],
-            failure: None,
-        };
-        ingest_notification(
-            &note,
-            Some(command),
-            TimePoint::new(5, 0),
-            None,
-            &index,
-            &blob_store,
-            &LiveBaseline::new(),
-        );
-        let records = index
-            .events_for_command(command)
-            .into_iter()
-            .filter(|e| {
-                matches!(
-                    &e.kind,
-                    CaptureEventKind::FilePreImage {
-                        source: FilePreImageSource::ShimRenameSubtreeDir,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(records, 0);
-        drop(tmp);
     }
 
     #[test]

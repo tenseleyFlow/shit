@@ -688,13 +688,8 @@ mod policy {
     /// when limits trip before the first file. Symlinks, devices,
     /// fifos, and other non-regular entries are skipped (their
     /// pre-images aren't a `RestoreContent`-shaped fix).
-    ///
-    /// When the walk saw every entry and captured every file, it also
-    /// appends one bytes-less record per directory, with `from_abs`
-    /// itself last. The planner reads that last record as proof the
-    /// walk is the whole subtree, and takes directory modes from these
-    /// records. Any skip above omits all of them.
-    pub fn collect_recursive_pre_images(from_abs: &str) -> Vec<shit_proto::ShimPreImage> {
+    fn collect_recursive_pre_images(from_abs: &str) -> Vec<shit_proto::ShimPreImage> {
+        use std::os::unix::fs::MetadataExt;
         use std::path::{Path, PathBuf};
 
         let p = Path::new(from_abs);
@@ -706,46 +701,31 @@ mod policy {
         }
 
         let mut out: Vec<shit_proto::ShimPreImage> = Vec::new();
-        let mut dirs: Vec<shit_proto::ShimPreImage> = Vec::new();
-        let mut complete = true;
         let mut total_bytes: u64 = 0;
         // Depth-first walk. (Depth bound keeps a path explosion
         // contained; file/byte caps catch fan-out separately.)
         let mut stack: Vec<(PathBuf, usize)> = vec![(p.to_path_buf(), 0)];
-        'walk: while let Some((dir, depth)) = stack.pop() {
+        while let Some((dir, depth)) = stack.pop() {
             if depth > RECURSIVE_MAX_DEPTH {
-                complete = false;
                 continue;
             }
             if out.len() >= RECURSIVE_MAX_FILES {
-                complete = false;
                 break;
             }
             let Ok(rd) = std::fs::read_dir(&dir) else {
-                complete = false;
                 continue;
             };
-            for entry in rd {
-                let Ok(entry) = entry else {
-                    complete = false;
-                    continue;
-                };
+            for entry in rd.flatten() {
                 if out.len() >= RECURSIVE_MAX_FILES {
-                    complete = false;
                     break;
                 }
                 let path = entry.path();
                 // `symlink_metadata` to avoid following symlinks
                 // into unrelated parts of the filesystem.
                 let Ok(emeta) = std::fs::symlink_metadata(&path) else {
-                    complete = false;
                     continue;
                 };
                 if emeta.is_dir() {
-                    match path.to_str() {
-                        Some(s) => dirs.push(dir_record(s, &emeta)),
-                        None => complete = false,
-                    }
                     stack.push((path, depth + 1));
                     continue;
                 }
@@ -753,53 +733,25 @@ mod policy {
                     // Symlink, fifo, socket, device — skip; their
                     // restore semantics aren't covered by a plain
                     // RestoreContent + bytes payload.
-                    complete = false;
                     continue;
                 }
-                let size = std::os::unix::fs::MetadataExt::size(&emeta);
+                let size = emeta.size();
                 if total_bytes.saturating_add(size) > RECURSIVE_MAX_BYTES {
-                    complete = false;
-                    break 'walk;
+                    return out;
                 }
                 let Some(s) = path.to_str() else {
-                    complete = false;
                     continue;
                 };
                 if should_skip_path(s) {
-                    complete = false;
                     continue;
                 }
-                match capture_pre_image(s) {
-                    Some(pre) => {
-                        total_bytes = total_bytes.saturating_add(pre.bytes.len() as u64);
-                        out.push(pre);
-                    }
-                    None => complete = false,
+                if let Some(pre) = capture_pre_image(s) {
+                    total_bytes = total_bytes.saturating_add(pre.bytes.len() as u64);
+                    out.push(pre);
                 }
             }
         }
-        if complete {
-            out.append(&mut dirs);
-            out.push(dir_record(from_abs, &meta));
-        }
         out
-    }
-
-    fn dir_record(path: &str, meta: &std::fs::Metadata) -> shit_proto::ShimPreImage {
-        use std::os::unix::fs::MetadataExt;
-        shit_proto::ShimPreImage {
-            path: path.to_string(),
-            dev: meta.dev(),
-            inode: meta.ino(),
-            mode: meta.mode(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-            size: meta.size(),
-            mtime_unix_nanos: meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128,
-            bytes: Vec::new(),
-            xattr: None,
-            flags: 0,
-        }
     }
 
     /// W09.10.1 — create-only notification (no pre-image). Used by
@@ -2241,64 +2193,6 @@ mod canonical_tests {
         let (got, failure) = super::policy::canonicalize_or_raw("/tmp", "path");
         assert!(failure.is_none(), "no failure on Ok path");
         assert!(got.starts_with('/'));
-    }
-}
-
-/// DR-CR-54.B — the rename walk's directory records are the planner's
-/// proof that the walk is the whole subtree.
-#[cfg(all(
-    test,
-    any(
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_os = "linux",
-        target_os = "macos",
-    )
-))]
-mod rename_walk_tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    fn is_dir_record(pre: &shit_proto::ShimPreImage) -> bool {
-        pre.mode & 0o170000 == 0o040000
-    }
-
-    #[test]
-    fn complete_walk_ends_with_the_source_dir_record() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let from = tmp.path().join("d");
-        std::fs::create_dir_all(from.join("empty")).unwrap();
-        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(from.join("f"), b"f").unwrap();
-        let out = super::policy::collect_recursive_pre_images(from.to_str().unwrap());
-        assert_eq!(out.iter().filter(|p| !is_dir_record(p)).count(), 1);
-        let dirs: Vec<_> = out.iter().filter(|p| is_dir_record(p)).collect();
-        assert_eq!(dirs.len(), 2);
-        let last = out.last().unwrap();
-        assert_eq!(last.path, from.to_str().unwrap());
-        assert_eq!(last.mode & 0o7777, 0o700);
-        assert!(last.bytes.is_empty());
-    }
-
-    #[test]
-    fn walk_with_a_symlink_has_no_dir_records() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let from = tmp.path().join("d");
-        std::fs::create_dir_all(from.join("sub")).unwrap();
-        std::fs::write(from.join("f"), b"f").unwrap();
-        std::os::unix::fs::symlink("f", from.join("sub/link")).unwrap();
-        let out = super::policy::collect_recursive_pre_images(from.to_str().unwrap());
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(!is_dir_record(&out[0]));
-    }
-
-    #[test]
-    fn walk_of_a_file_is_empty() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let f = tmp.path().join("f");
-        std::fs::write(&f, b"f").unwrap();
-        assert!(super::policy::collect_recursive_pre_images(f.to_str().unwrap()).is_empty());
     }
 }
 

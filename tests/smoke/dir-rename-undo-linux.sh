@@ -93,13 +93,12 @@ sleep 0.8
 # Verify the journal has FilePreImage events for the ORIGINAL
 # subtree paths (orig/*.txt, orig/sub/*.txt) — that's the
 # DR-CR-54 signal.
-# 5 files plus the walk's record for the one subdirectory.
 N_PRE="$(smoke_journal_count "discriminant = 'FilePreImage' AND path LIKE '%/orig/%'" 2>/dev/null || echo 0)"
 smoke_log "FilePreImage events under orig/: ${N_PRE}"
-if [ "${N_PRE}" -lt 6 ]; then
+if [ "${N_PRE}" -lt 5 ]; then
     smoke_log "daemon log tail:"
     tail -50 "${SHIT_SMOKE_TMP}/state/shit/log/daemon.jsonl."* 2>/dev/null | sed 's/^/    /' >&2 || true
-    smoke_fail "expected >= 6 FilePreImage events under orig/, got ${N_PRE}"
+    smoke_fail "expected >= 5 FilePreImage events under orig/, got ${N_PRE}"
 fi
 
 # Confirm rename was journaled.
@@ -111,4 +110,4 @@ fi
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-smoke_log "PASS: dir-rename-undo-linux (${N_PRE} pre-images journaled for the renamed subtree)"
+smoke_log "PASS: dir-rename-undo-linux (${N_PRE} per-file pre-images journaled for the renamed subtree)"

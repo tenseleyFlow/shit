@@ -231,10 +231,9 @@ if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; the
     exit 0
 fi
 
-# DR-CR-54.B (L3): the hosted CI job sets SHIT_REQUIRE_OUTCOME_A=1,
-# which makes Outcome A the only pass. Without it the smoke still
-# accepts Outcome B (loud refusal) for local runs on hosts where the
-# shim's recursive walk is not in play.
+# SHIT_REQUIRE_OUTCOME_A=1 makes Outcome A the only pass. No job sets it:
+# the rule that reached Outcome A here was taken out of PR #205 and moved
+# to sprint L5. Outcome B (loud refusal) is the accepted result for now.
 if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
     smoke_log "SHIT_REQUIRE_OUTCOME_A=1: Outcome B not accepted"
     smoke_log "  undo exit:    ${UNDO_RC}"
