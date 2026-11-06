@@ -685,20 +685,12 @@ mod policy {
             (AtResolution::Resolved(a), AtResolution::Resolved(b)) => {
                 notify_rename_with_dst_preimage(syscall, &a, &b);
             }
-            (f, t) => {
-                // Prefer the `from` failure, as notify_rename does.
-                let (fa, ff) = match f {
-                    AtResolution::Failed(p, e) => (p, Some(e)),
-                    AtResolution::Resolved(p) => (p, None),
-                    AtResolution::Nothing => return,
-                };
-                let (ta, tf) = match t {
-                    AtResolution::Failed(p, e) => (p, Some(e)),
-                    AtResolution::Resolved(p) => (p, None),
-                    AtResolution::Nothing => return,
-                };
+            // Prefer the `from` failure, as notify_rename does.
+            (AtResolution::Failed(fa, fe), AtResolution::Failed(ta, _))
+            | (AtResolution::Failed(fa, fe), AtResolution::Resolved(ta))
+            | (AtResolution::Resolved(fa), AtResolution::Failed(ta, fe)) => {
                 let arg = format!("{fa}\t{ta}");
-                notify_inner_with_failure(syscall, &arg, None, ff.or(tf), false);
+                notify_inner_with_failure(syscall, &arg, None, Some(fe), false);
             }
         }
     }
@@ -1031,14 +1023,34 @@ mod policy {
             || path.starts_with("/sys/")
     }
 
+    /// Resolve a directory fd to its path with `fcntl(F_KINFO)`.
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn dirfd_path(dirfd: c_int) -> Option<String> {
+        // SAFETY: kinfo_file is plain data; F_KINFO fills it for `dirfd`.
+        let mut kif: libc::kinfo_file = unsafe { std::mem::zeroed() };
+        kif.kf_structsize = std::mem::size_of::<libc::kinfo_file>() as c_int;
+        let rc = unsafe { libc::fcntl(dirfd, libc::F_KINFO, &mut kif as *mut libc::kinfo_file) };
+        if rc != 0 {
+            return None;
+        }
+        let bytes: Vec<u8> = kif
+            .kf_path
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        let path = String::from_utf8(bytes).ok()?;
+        path.starts_with('/').then_some(path)
+    }
+
     /// DR-CR-54.B — join an `*at` syscall's `(dirfd, path)` pair into
     /// the path the kernel will act on, without canonicalizing.
     ///
     /// Absolute paths and `AT_FDCWD` are returned as given (both are
     /// already relative to the right base: nothing or the cwd). For a
     /// real dirfd on Linux, `/proc/self/fd/<dirfd>` names the
-    /// directory and the result is `dir/path`. Anywhere else (BSD has
-    /// no equivalent here) the raw path is returned unchanged: a
+    /// directory and on FreeBSD `fcntl(F_KINFO)` does; the result is
+    /// `dir/path`. Anywhere else (NetBSD, OpenBSD, DragonFly) the raw path is returned unchanged: a
     /// relative key that cannot be matched fails closed, where
     /// canonicalizing it against the cwd would invent a wrong
     /// absolute key.
@@ -1061,7 +1073,25 @@ mod policy {
                 return s.to_string();
             }
         }
+        #[cfg(target_os = "freebsd")]
+        {
+            return join_with_dir(dirfd_path(dirfd), path);
+        }
+        #[allow(unreachable_code)]
         path.to_string()
+    }
+
+    /// Join a resolved directory path with `path`; an unresolved
+    /// directory leaves `path` raw (the caller then fails closed).
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn join_with_dir(dir: Option<String>, path: &str) -> String {
+        match dir {
+            Some(d) => std::path::Path::new(&d)
+                .join(path)
+                .to_str()
+                .map_or_else(|| path.to_string(), str::to_string),
+            None => path.to_string(),
+        }
     }
 
     /// AU10 — structured failure from [`canonical_path`]. Each
@@ -1956,26 +1986,6 @@ mod interposers {
         unsafe { real(dirfd, path, flags, atflag) }
     }
 
-    /// Resolve a directory fd to its path with `fcntl(F_KINFO)`.
-    #[cfg(target_os = "freebsd")]
-    fn dirfd_path(dirfd: c_int) -> Option<String> {
-        // SAFETY: kinfo_file is plain data; F_KINFO fills it for `dirfd`.
-        let mut kif: libc::kinfo_file = unsafe { std::mem::zeroed() };
-        kif.kf_structsize = std::mem::size_of::<libc::kinfo_file>() as c_int;
-        let rc = unsafe { libc::fcntl(dirfd, libc::F_KINFO, &mut kif as *mut libc::kinfo_file) };
-        if rc != 0 {
-            return None;
-        }
-        let bytes: Vec<u8> = kif
-            .kf_path
-            .iter()
-            .take_while(|c| **c != 0)
-            .map(|c| *c as u8)
-            .collect();
-        let path = String::from_utf8(bytes).ok()?;
-        path.starts_with('/').then_some(path)
-    }
-
     /// Decide whether a `chflagsat` call is replayable as a path-based
     /// RestoreFlags and, if so, return the path to snapshot plus whether
     /// the syscall follows a final symlink.
@@ -1993,7 +2003,7 @@ mod interposers {
         path: &str,
         atflag: c_int,
     ) -> Option<(String, bool)> {
-        chflagsat_target_with(dirfd, path, atflag, dirfd_path)
+        chflagsat_target_with(dirfd, path, atflag, policy::dirfd_path)
     }
 
     #[cfg(target_os = "freebsd")]
@@ -2294,6 +2304,32 @@ mod canonical_tests {
             AtResolution::Resolved(p) => assert!(p.ends_with("/au10-new-leaf-xyz")),
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    /// FreeBSD: a resolvable dirfd joins to dir/path; an unresolved
+    /// one leaves the raw path (fail closed). The F_KINFO call itself
+    /// runs in the FreeBSD VM smokes.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_join_with_dir_joins_or_stays_raw() {
+        assert_eq!(
+            super::policy::join_with_dir(Some("/a/b".into()), "x"),
+            "/a/b/x"
+        );
+        assert_eq!(super::policy::join_with_dir(None, "x"), "x");
+    }
+
+    /// FreeBSD: a real directory fd resolves through F_KINFO.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn freebsd_join_at_path_resolves_real_dirfd() {
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open("/tmp").expect("open /tmp");
+        let joined = super::policy::join_at_path(dir.as_raw_fd(), "leaf");
+        assert!(
+            joined.starts_with('/') && joined.ends_with("/leaf"),
+            "got {joined:?}"
+        );
     }
 
     /// Resolving an existing absolute path succeeds and returns the
