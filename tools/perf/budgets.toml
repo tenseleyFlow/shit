@@ -142,3 +142,9 @@ kind = "latency"
 p50_us = 200
 p99_us = 800
 fail_at_p99_us = 2_000
+
+# Relative gate on hosted macOS (perf.yml, tight-loop vs
+# macos-15-aarch64-tight-loop.json): widened to 100% median / 150% p99.
+# Two recorded samples of the same workload differed by 9-15%, and run
+# 42188068345 (a diff that does not touch the workload) measured 5839 us
+# against a 3720 us baseline (+57%). Linux keeps 10% / 20%.
