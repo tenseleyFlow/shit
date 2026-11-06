@@ -82,7 +82,7 @@ jobs:
         run: |
           case "${{ matrix.os }}" in
             ubuntu-24.04) bp=ubuntu-24.04-x86_64 ;;
-            # No macos baseline file is committed yet; record macos-15-aarch64-*.json.
+            # macos-15-aarch64-tight-loop.json is committed; see baselines/README.md.
             macos-15)     bp=macos-15-aarch64 ;;
             *)            bp=unknown ;;
           esac
