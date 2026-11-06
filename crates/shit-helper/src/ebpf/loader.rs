@@ -1025,12 +1025,6 @@ impl EbpfLoader {
         aya::maps::RingBuf::try_from(map).ok()
     }
 
-    /// L04 — Take the `unlink_events` ringbuf for the userspace
-    /// consumer. Returns `None` if the loader isn't loaded yet, or
-    /// if the ringbuf has already been taken. The loader retains
-    /// ownership of the [`aya::Ebpf`] instance so the program stays
-    /// attached for the helper's lifetime; the ringbuf is the only
-    /// piece that moves to the reader thread.
     /// Take the ring-buffer loss counter of one loaded LSM object.
     /// `object` is the program's short name (`"unlink"`, `"setattr"`,
     /// `"mkdir"`, `"create"`, `"open"`, `"rename"`, `"symlink"`, `"link"`,
@@ -1056,6 +1050,12 @@ impl EbpfLoader {
         aya::maps::Array::try_from(map).ok()
     }
 
+    /// L04 — Take the `unlink_events` ringbuf for the userspace
+    /// consumer. Returns `None` if the loader isn't loaded yet, or
+    /// if the ringbuf has already been taken. The loader retains
+    /// ownership of the [`aya::Ebpf`] instance so the program stays
+    /// attached for the helper's lifetime; the ringbuf is the only
+    /// piece that moves to the reader thread.
     pub fn take_unlink_ringbuf(&mut self) -> Option<aya::maps::RingBuf<aya::maps::MapData>> {
         let bpf = self.bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_UNLINK_EVENTS)?;

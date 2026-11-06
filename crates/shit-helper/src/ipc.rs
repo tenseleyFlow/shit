@@ -140,8 +140,6 @@ impl Conn {
         Ok(decode_frame(&buf)?)
     }
 
-    /// Receive one `HelperResponse` frame.
-    #[allow(dead_code)]
     /// Make receives fail instead of block, to assert nothing was sent.
     #[cfg(test)]
     pub fn set_nonblocking_for_test(&self) {
@@ -152,6 +150,8 @@ impl Conn {
         .unwrap();
     }
 
+    /// Receive one `HelperResponse` frame.
+    #[allow(dead_code)]
     pub fn recv_response(&self) -> Result<HelperResponse, ConnError> {
         let buf = self.recv_frame()?;
         Ok(decode_frame(&buf)?)

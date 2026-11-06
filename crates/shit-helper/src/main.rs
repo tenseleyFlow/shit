@@ -2299,11 +2299,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Synchronous daemon-request loop. Lives in `spawn_blocking` so it
-/// can use the blocking `Conn::recv_request`. Exits when the daemon
-/// disconnects or sends `Shutdown`.
-/// The daemon-supplied watch cwd, canonicalized so captured paths match
-/// what `/proc/<pid>/cwd` would report. `/proc/<pid>/cwd` itself is racy
+/// The hook-reported watch cwd, canonicalized so captured paths match
+/// what `/proc/<pid>/cwd` would report. `/proc/<pid>/cwd` alone is racy
 /// for a short-lived root process (issue #22 family).
 #[cfg(target_os = "linux")]
 fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
@@ -2317,6 +2314,29 @@ fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
         return Err(format!("watch cwd {raw:?} is not a directory"));
     }
     Ok(canonical)
+}
+
+/// Resolve the Linux watch root: the hook-reported cwd, or the root
+/// process's real cwd when that report cannot be used.
+///
+/// The hook path crosses the wire as a lossy string, so a non-UTF-8
+/// directory arrives with U+FFFD in it. It cannot name the real directory
+/// even if a path spelled that way exists. A stale `$PWD`, after the
+/// directory was renamed, does not resolve either. Canonicalizing the
+/// magic link gives real bytes, and fails for a deleted cwd.
+#[cfg(target_os = "linux")]
+fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<PathBuf, String> {
+    let reported = if raw.contains(char::REPLACEMENT_CHARACTER) {
+        Err(format!("watch cwd {raw:?} is not valid UTF-8"))
+    } else {
+        validated_linux_watch_cwd(raw)
+    };
+    reported.or_else(|reason| {
+        std::fs::canonicalize(format!("/proc/{root_pid}/cwd"))
+            .ok()
+            .filter(|cwd| cwd.is_dir())
+            .ok_or(reason)
+    })
 }
 
 /// Send a `CaptureRefused` observation. The daemon decides whether it
@@ -2404,7 +2424,7 @@ fn linux_watch_tree(
         {
             g.on_watch_tree(command);
         }
-        let cwd = validated_linux_watch_cwd(cwd_path)?;
+        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid)?;
         // L01: narrow-scope fanotify mark on the watch cwd
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
@@ -2438,7 +2458,7 @@ fn linux_watch_tree(
             .lock()
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
-        let cwd = validated_linux_watch_cwd(cwd_path);
+        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
         // L04 — pre-open every regular file under the cwd. The held
         // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
         // unlink handler can read the pre-image content even though
@@ -2498,6 +2518,51 @@ fn linux_watch_tree(
 mod linux_watch_tests {
     use super::*;
 
+    /// A pid with no /proc entry, so the fallback cannot resolve.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn watch_root_prefers_the_reported_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_linux_watch_cwd(dir.path().to_str().unwrap(), std::process::id()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn watch_root_falls_back_when_the_report_does_not_resolve() {
+        let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", std::process::id()).unwrap(),
+            own
+        );
+    }
+
+    #[test]
+    fn watch_root_never_trusts_a_lossy_report() {
+        // A real directory spelled with U+FFFD is still not the shell's cwd.
+        let dir = tempfile::tempdir().unwrap();
+        let lossy = dir.path().join("caf\u{FFFD}");
+        std::fs::create_dir(&lossy).unwrap();
+        let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            resolve_linux_watch_cwd(lossy.to_str().unwrap(), std::process::id()).unwrap(),
+            own
+        );
+    }
+
+    #[test]
+    fn watch_root_reports_the_reason_when_neither_resolves() {
+        let err = resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", dead_pid()).unwrap_err();
+        assert!(err.contains("shit-r3a-cwd"), "{err}");
+    }
+
     #[test]
     fn watch_cwd_must_be_an_absolute_existing_directory() {
         assert!(validated_linux_watch_cwd("relative/dir").is_err());
@@ -2529,7 +2594,7 @@ mod linux_watch_tests {
             seq: 4,
         };
         let dispatch = lsm_dispatch();
-        let root = std::process::id();
+        let root = dead_pid();
         assert!(
             linux_watch_tree(
                 &helper,
@@ -2571,7 +2636,7 @@ mod linux_watch_tests {
                 seq,
             };
             let state = fanotify_state_that_cannot_mark();
-            let root = std::process::id();
+            let root = dead_pid();
             let result = linux_watch_tree(&helper, Some(&state), None, command, root, cwd);
             assert!(result.is_err(), "{cwd}");
             assert_eq!(
@@ -2654,6 +2719,9 @@ mod linux_watch_tests {
     }
 }
 
+/// Synchronous daemon-request loop. Lives in `spawn_blocking` so it
+/// can use the blocking `Conn::recv_request`. Exits when the daemon
+/// disconnects or sends `Shutdown`.
 fn request_loop(
     conn: Arc<ipc::Conn>,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
@@ -2793,6 +2861,15 @@ fn request_loop(
                         command_seq,
                         "watch_tree ignored — no macos capture (degraded)"
                     );
+                    if macos_es_capture.is_none() {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            "no macOS capture tier is active; file changes are not captured"
+                                .to_string(),
+                        );
+                    }
                 }
                 // M03.1.I.5: ES producer runs alongside FSEvents per
                 // the coexistence ratification. Both receive every
@@ -2893,14 +2970,16 @@ fn request_loop(
                 active_watches.remove(&command);
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
+                    let cmd = command;
+                    // No drain needed: the reader captures before it allows
+                    // the syscall, so every mutation that completed is
+                    // already on the wire. Holding the runtime lock across
+                    // the unwatch orders this against the reader's handling
+                    // of an in-flight event, so nothing for this command
+                    // follows the marker.
+                    let runtime = state.capture_runtime.as_ref().and_then(|rt| rt.lock().ok());
                     state.tree.lock().unwrap().unwatch(session, command_seq);
-                    let cmd = shit_planner::events::CommandId {
-                        session,
-                        seq: command_seq,
-                    };
-                    if let Some(rt) = &state.capture_runtime
-                        && let Ok(mut g) = rt.lock()
-                    {
+                    if let Some(mut g) = runtime {
                         g.on_unwatch_tree(cmd);
                     }
                     if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd)
@@ -2944,15 +3023,33 @@ fn request_loop(
                 {
                     // The pump sends UnwatchTreeFlushed after it detaches,
                     // so the marker is ordered after the pump's own
-                    // responses for this command. Without a pump, or when
-                    // the detach could not be queued, send it here.
-                    let queued = bsd_capture
+                    // responses for this command.
+                    use capture::DetachOutcome;
+                    match bsd_capture
                         .as_ref()
-                        .is_some_and(|ctrl| ctrl.on_unwatch_tree(session, command_seq));
-                    if queued {
-                        tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
-                    } else {
-                        send_unwatch_flushed(&conn, command);
+                        .map(|ctrl| ctrl.on_unwatch_tree(session, command_seq))
+                    {
+                        Some(DetachOutcome::Queued) => {
+                            tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
+                        }
+                        Some(DetachOutcome::Deferred) => {
+                            send_capture_observation(
+                                &conn,
+                                command,
+                                None,
+                                capture::DETACH_DEFERRED_DETAIL.to_string(),
+                            );
+                        }
+                        Some(DetachOutcome::PumpGone) => {
+                            send_capture_observation(
+                                &conn,
+                                command,
+                                None,
+                                capture::DETACH_PUMP_GONE_DETAIL.to_string(),
+                            );
+                            send_unwatch_flushed(&conn, command);
+                        }
+                        None => send_unwatch_flushed(&conn, command),
                     }
                 }
                 // Each pump drops its clone after handling the detach. The
@@ -2960,14 +3057,52 @@ fn request_loop(
                 // one when no producer is running.
                 #[cfg(target_os = "macos")]
                 {
+                    use capture::DetachOutcome;
                     let flush = capture::UnwatchFlushMarker::new(Arc::clone(&conn), command);
+                    let mut outcomes = Vec::new();
                     if let Some(ctrl) = &macos_capture {
-                        ctrl.on_unwatch_tree(session, command_seq, Arc::clone(&flush));
+                        outcomes.push(ctrl.on_unwatch_tree(
+                            session,
+                            command_seq,
+                            Arc::clone(&flush),
+                        ));
                         tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
                     }
                     if let Some(ctrl) = &macos_es_capture {
-                        ctrl.on_unwatch_tree(session, command_seq, Arc::clone(&flush));
+                        outcomes.push(ctrl.on_unwatch_tree(
+                            session,
+                            command_seq,
+                            Arc::clone(&flush),
+                        ));
                         tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
+                    }
+                    // `flush` is still held here, so these go out ahead of
+                    // the marker however fast the pumps are.
+                    if outcomes.contains(&DetachOutcome::PumpGone) {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            capture::DETACH_PUMP_GONE_DETAIL.to_string(),
+                        );
+                    } else if outcomes.contains(&DetachOutcome::Deferred) {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            capture::DETACH_DEFERRED_DETAIL.to_string(),
+                        );
+                    }
+                    // FSEvents delivers with latency and has no way to ask
+                    // for what the kernel still holds. ES has no such gap.
+                    if macos_capture.is_some() && macos_es_capture.is_none() {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            "capture tail may be missing: FSEvents delivers with latency"
+                                .to_string(),
+                        );
                     }
                 }
                 #[cfg(not(any(

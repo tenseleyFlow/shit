@@ -1297,24 +1297,28 @@ impl CaptureControl {
         Ok(())
     }
 
+    /// Offer a detach to the pump. `flush` travels with it, so its marker
+    /// waits for the pump either way.
     pub fn on_unwatch_tree(
         &self,
         session: Uuid,
         command_seq: u64,
         flush: Arc<super::UnwatchFlushMarker>,
-    ) {
+    ) -> super::DetachOutcome {
         let command = CommandId {
             session,
             seq: command_seq,
         };
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command, flush }) {
+        let outcome = super::offer_detach(&self.tx, ControlMsg::Detach { command, flush });
+        if outcome != super::DetachOutcome::Queued {
             tracing::warn!(
                 %session,
                 command_seq,
-                err = %e,
-                "macos-es control channel full; UnwatchTree dropped"
+                ?outcome,
+                "macos-es control channel full or closed at UnwatchTree"
             );
         }
+        outcome
     }
 
     /// Signal the pump thread to exit. Best-effort.
@@ -1711,7 +1715,15 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
             Ok(ControlMsg::Detach { command, flush }) => {
                 // Handle the queued ring while tracked_pids still
                 // attributes it to this command; detach clears them.
-                while state.drain_ring_once() {}
+                // The ring is shared with every other command, so this is
+                // bounded: a busy build elsewhere must not stall this close.
+                let deadline = std::time::Instant::now() + super::DETACH_DRAIN_TIMEOUT;
+                while state.drain_ring_once() {
+                    if std::time::Instant::now() >= deadline {
+                        super::send_drain_timeout_observation(&state.conn, command);
+                        break;
+                    }
+                }
                 state.detach(command);
                 drop(flush);
                 continue;

@@ -141,24 +141,28 @@ impl CaptureControl {
         Ok(())
     }
 
+    /// Offer a detach to the pump. `flush` travels with it, so its marker
+    /// waits for the pump either way.
     pub fn on_unwatch_tree(
         &self,
         session: Uuid,
         command_seq: u64,
         flush: Arc<super::UnwatchFlushMarker>,
-    ) {
+    ) -> super::DetachOutcome {
         let command = CommandId {
             session,
             seq: command_seq,
         };
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command, flush }) {
+        let outcome = super::offer_detach(&self.tx, ControlMsg::Detach { command, flush });
+        if outcome != super::DetachOutcome::Queued {
             tracing::warn!(
                 %session,
                 command_seq,
-                err = %e,
-                "fsevents control channel full; UnwatchTree dropped"
+                ?outcome,
+                "fsevents control channel full or closed at UnwatchTree"
             );
         }
+        outcome
     }
 
     /// Signal the pump thread to exit. Best-effort.
@@ -243,16 +247,21 @@ impl PumpState {
         self.rebuild_stream();
     }
 
-    /// Handle every record the stream has already delivered.
-    fn drain_stream(&mut self) {
+    /// Handle the records the stream has already delivered, up to
+    /// `DETACH_DRAIN_TIMEOUT`. Returns false if time ran out.
+    fn drain_stream(&mut self) -> bool {
+        let deadline = std::time::Instant::now() + super::DETACH_DRAIN_TIMEOUT;
         loop {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
             let record = match &self.stream {
                 Some((_, rx)) => rx.try_recv().ok(),
                 None => None,
             };
             match record {
                 Some(record) => self.handle_event(record),
-                None => return,
+                None => return true,
             }
         }
     }
@@ -511,7 +520,9 @@ fn pump(conn: Arc<Conn>, ctrl_rx: Receiver<ControlMsg>) {
                 // FSEvents delivers with latency, so this covers what the
                 // stream has delivered, which may not be all the kernel
                 // has seen.
-                state.drain_stream();
+                if !state.drain_stream() {
+                    super::send_drain_timeout_observation(&state.conn, command);
+                }
                 state.detach(command);
                 drop(flush);
                 continue;

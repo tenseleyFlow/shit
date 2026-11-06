@@ -1283,28 +1283,29 @@ impl CaptureControl {
         })
     }
 
-    /// Queue a detach. Returns true when the pump will process it (and
-    /// send `UnwatchTreeFlushed` afterwards); false when the caller must
-    /// send the marker itself.
-    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) -> bool {
+    /// Offer a detach to the pump. For `Queued` and `Deferred` the pump
+    /// sends `UnwatchTreeFlushed` after handling it; for `PumpGone` the
+    /// caller must.
+    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) -> super::DetachOutcome {
         // AU16 — same logging treatment as on_watch_tree.
-        match self.tx.try_send(ControlMsg::Detach {
-            command: CommandId {
-                session,
-                seq: command_seq,
+        let outcome = super::offer_detach(
+            &self.tx,
+            ControlMsg::Detach {
+                command: CommandId {
+                    session,
+                    seq: command_seq,
+                },
             },
-        }) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    %session,
-                    command_seq,
-                    err = %e,
-                    "bsd capture control channel full or closed; UnwatchTree dropped"
-                );
-                false
-            }
+        );
+        if outcome != super::DetachOutcome::Queued {
+            tracing::warn!(
+                %session,
+                command_seq,
+                ?outcome,
+                "bsd capture control channel full or closed at UnwatchTree"
+            );
         }
+        outcome
     }
 
     /// Signal the pump thread to exit. Best-effort: shutdown is
@@ -1373,10 +1374,30 @@ fn drain_pending_events(
         .request_flush(token)
         .map_err(|e| format!("kqueue flush request failed: {e}"))?;
     let deadline = std::time::Instant::now() + DETACH_FLUSH_TIMEOUT;
+    drain_until_marker(&drain_session.events, token, deadline, |fd, kind| {
+        state.handle_vnode(fd, kind);
+    })
+}
+
+/// Hand vnode events to `on_vnode` until the marker for `token`, or until
+/// `deadline`. The deadline is checked before each event, since a receive
+/// with no time left still returns one that is queued, and a busy queue
+/// would otherwise never time out.
+fn drain_until_marker(
+    events: &Receiver<DrainEvent>,
+    token: u32,
+    deadline: std::time::Instant,
+    mut on_vnode: impl FnMut(RawFd, VnodeEventKind),
+) -> Result<(), String> {
     loop {
         let wait = deadline.saturating_duration_since(std::time::Instant::now());
-        match drain_session.events.recv_timeout(wait) {
-            Ok(DrainEvent::Vnode { fd, kind, .. }) => state.handle_vnode(fd, kind),
+        if wait.is_zero() {
+            return Err(format!(
+                "kqueue flush timed out after {DETACH_FLUSH_TIMEOUT:?}"
+            ));
+        }
+        match events.recv_timeout(wait) {
+            Ok(DrainEvent::Vnode { fd, kind, .. }) => on_vnode(fd, kind),
             Ok(DrainEvent::Proc { .. }) => {}
             Ok(DrainEvent::Flushed { token: got }) if got == token => return Ok(()),
             Ok(DrainEvent::Flushed { .. }) => {}
@@ -1508,6 +1529,49 @@ fn pump(
 mod tests {
     use super::*;
 
+    #[test]
+    fn drain_times_out_while_events_keep_arriving() {
+        let (tx, rx) = sync_channel::<DrainEvent>(16);
+        let feeder = std::thread::spawn(move || {
+            while tx
+                .send(DrainEvent::Vnode {
+                    fd: 3,
+                    kind: VnodeEventKind::Write,
+                    fflags: 0,
+                })
+                .is_ok()
+            {}
+        });
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        let mut handled = 0u64;
+        let result = drain_until_marker(&rx, 1, deadline, |_, _| handled += 1);
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(handled > 0);
+        drop(rx);
+        feeder.join().unwrap();
+    }
+
+    #[test]
+    fn full_channel_defers_the_detach_so_the_watch_still_ends() {
+        use super::super::DetachOutcome;
+        let (tx, rx) = sync_channel::<ControlMsg>(1);
+        let control = CaptureControl { tx };
+        let session = Uuid::nil();
+        assert_eq!(control.on_unwatch_tree(session, 1), DetachOutcome::Queued);
+        assert_eq!(control.on_unwatch_tree(session, 2), DetachOutcome::Deferred);
+        let mut seqs = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                ControlMsg::Detach { command } => seqs.push(command.seq),
+                _ => panic!("expected detach"),
+            }
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, [1, 2]);
+        drop(rx);
+        assert_eq!(control.on_unwatch_tree(session, 3), DetachOutcome::PumpGone);
+    }
+
     /// The close barrier's contract: every capture for a command is on
     /// the wire ahead of its `UnwatchTreeFlushed`. Deletes land in the
     /// kqueue, then the detach arrives while they are still queued.
@@ -1537,7 +1601,10 @@ mod tests {
         for i in 0..FILES {
             std::fs::remove_file(root.join(format!("f{i}"))).unwrap();
         }
-        assert!(control.on_unwatch_tree(session, 1));
+        assert_eq!(
+            control.on_unwatch_tree(session, 1),
+            super::super::DetachOutcome::Queued
+        );
         let mut captured = std::collections::BTreeSet::new();
         loop {
             let (resp, _fd) = daemon.recv_response_with_fd().unwrap();

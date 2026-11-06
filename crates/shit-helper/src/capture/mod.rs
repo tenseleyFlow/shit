@@ -57,6 +57,102 @@ pub mod xattr;
 ))]
 pub mod streaming;
 
+/// What happened to a command's `Detach` at the pump's control channel.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetachOutcome {
+    /// On the channel. The pump handles it in order.
+    Queued,
+    /// The channel was full. A thread is blocked sending it, so the watch
+    /// still ends, but events may be attributed to this command until then.
+    Deferred,
+    /// The pump has stopped.
+    PumpGone,
+}
+
+/// Observation for [`DetachOutcome::Deferred`].
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+))]
+pub const DETACH_DEFERRED_DETAIL: &str =
+    "capture tail may be missing: the capture control channel was full at command close";
+
+/// Observation for [`DetachOutcome::PumpGone`].
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+))]
+pub const DETACH_PUMP_GONE_DETAIL: &str =
+    "capture tail may be missing: the capture pump stopped before command close";
+
+/// Offer a `Detach` to a pump without ever blocking the request loop.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos",
+))]
+pub fn offer_detach<M: Send + 'static>(
+    tx: &std::sync::mpsc::SyncSender<M>,
+    msg: M,
+) -> DetachOutcome {
+    use std::sync::mpsc::TrySendError;
+    match tx.try_send(msg) {
+        Ok(()) => DetachOutcome::Queued,
+        Err(TrySendError::Disconnected(_)) => DetachOutcome::PumpGone,
+        Err(TrySendError::Full(msg)) => {
+            let tx = tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("shit-capture-detach".to_string())
+                .spawn(move || {
+                    let _ = tx.send(msg);
+                });
+            match spawned {
+                Ok(_) => DetachOutcome::Deferred,
+                Err(_) => DetachOutcome::PumpGone,
+            }
+        }
+    }
+}
+
+/// Bound on a macOS pump handling its queue at detach. The queue is shared
+/// with every other command, so a busy one must not stall this close.
+#[cfg(target_os = "macos")]
+pub const DETACH_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Report a detach whose drain hit [`DETACH_DRAIN_TIMEOUT`].
+#[cfg(target_os = "macos")]
+pub fn send_drain_timeout_observation(
+    conn: &crate::ipc::Conn,
+    command: shit_planner::events::CommandId,
+) {
+    let observation = shit_proto::HelperResponse::CaptureRefused {
+        session: command.session,
+        seq: command.seq,
+        path: None,
+        detail: format!(
+            "capture tail may be missing: queue drain timed out after {DETACH_DRAIN_TIMEOUT:?}"
+        ),
+    };
+    if let Err(e) = conn.send_response(&observation) {
+        tracing::warn!(err = %e, %command, "CaptureRefused observation send failed");
+    }
+}
+
 /// Sends `UnwatchTreeFlushed` when the last clone is dropped.
 ///
 /// macOS can run two producers for one command, and the daemon's barrier
