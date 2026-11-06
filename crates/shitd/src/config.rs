@@ -51,13 +51,28 @@ pub struct CaptureConfig {
 /// Env var that overrides `[capture] strict`.
 pub const STRICT_CAPTURE_ENV: &str = "SHIT_STRICT_CAPTURE";
 
-/// Resolve strict mode: the env var wins when it is set to a value we
-/// recognize; otherwise the config value; otherwise off.
-fn resolve_strict_capture(env: Option<&str>, config: Option<bool>) -> bool {
-    match env.map(str::trim) {
-        Some("1" | "true" | "yes" | "on") => true,
-        Some("0" | "false" | "no" | "off") => false,
-        _ => config.unwrap_or(false),
+/// Resolve strict mode. A recognized env value wins in either direction,
+/// so an explicit false overrides the config; otherwise the config value;
+/// otherwise off. An unrecognized env value falls through to the config
+/// and comes back as a warning for the caller to log.
+fn resolve_strict_capture(env: Option<&str>, config: Option<bool>) -> (bool, Option<String>) {
+    let Some(raw) = env else {
+        return (config.unwrap_or(false), None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => (true, None),
+        "0" | "false" | "no" | "off" => (false, None),
+        _ => {
+            let strict = config.unwrap_or(false);
+            (
+                strict,
+                Some(format!(
+                    "{STRICT_CAPTURE_ENV}={raw:?} is not recognized; strict capture is {}. \
+                     Use 1/true/yes/on or 0/false/no/off",
+                    if strict { "on" } else { "off" },
+                )),
+            )
+        }
     }
 }
 
@@ -144,6 +159,9 @@ pub struct ResolvedConfig {
     pub telemetry: ResolvedTelemetryConfig,
     /// Fail-closed capture (D-3). See [`CaptureConfig::strict`].
     pub strict_capture: bool,
+    /// Why `SHIT_STRICT_CAPTURE` was ignored, for logging at startup
+    /// (config resolves before tracing is up).
+    pub strict_capture_warning: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -178,7 +196,8 @@ impl Config {
 
     pub fn resolve(self) -> Result<ResolvedConfig> {
         let env_strict = std::env::var(STRICT_CAPTURE_ENV).ok();
-        let strict_capture = resolve_strict_capture(env_strict.as_deref(), self.capture.strict);
+        let (strict_capture, strict_capture_warning) =
+            resolve_strict_capture(env_strict.as_deref(), self.capture.strict);
         let state = self.state_dir.map(Ok).unwrap_or_else(default_state_dir)?;
         Ok(ResolvedConfig {
             idle_timeout_secs: self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_SECS),
@@ -201,6 +220,7 @@ impl Config {
                     .unwrap_or_else(|| "shitd".to_string()),
             },
             strict_capture,
+            strict_capture_warning,
         })
     }
 }
@@ -377,26 +397,47 @@ mod tests {
 
     #[test]
     fn strict_capture_defaults_off() {
-        assert!(!resolve_strict_capture(None, None));
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.capture.strict, None);
+        assert_eq!(resolve_strict_capture(None, None), (false, None));
     }
 
     #[test]
     fn strict_capture_reads_config_table() {
         let cfg: Config = toml::from_str("[capture]\nstrict = true\n").unwrap();
-        assert_eq!(cfg.capture.strict, Some(true));
-        assert!(resolve_strict_capture(None, cfg.capture.strict));
+        assert_eq!(
+            resolve_strict_capture(None, cfg.capture.strict),
+            (true, None)
+        );
     }
 
     #[test]
     fn strict_capture_env_wins_over_config() {
-        assert!(resolve_strict_capture(Some("1"), Some(false)));
-        assert!(!resolve_strict_capture(Some("0"), Some(true)));
-        assert!(resolve_strict_capture(Some("true"), None));
-        // Unrecognized values fall back to the config.
-        assert!(resolve_strict_capture(Some("maybe"), Some(true)));
-        assert!(!resolve_strict_capture(Some(""), None));
+        assert_eq!(resolve_strict_capture(Some("1"), Some(false)), (true, None));
+        assert_eq!(resolve_strict_capture(Some("0"), Some(true)), (false, None));
+        assert_eq!(resolve_strict_capture(Some("true"), None), (true, None));
+    }
+
+    #[test]
+    fn strict_capture_env_is_case_insensitive() {
+        assert_eq!(resolve_strict_capture(Some(" TRUE "), None), (true, None));
+        assert_eq!(resolve_strict_capture(Some("On"), None), (true, None));
+        assert_eq!(
+            resolve_strict_capture(Some("FALSE"), Some(true)),
+            (false, None)
+        );
+        assert_eq!(
+            resolve_strict_capture(Some("Off"), Some(true)),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn strict_capture_warns_on_unrecognized_env_and_keeps_config() {
+        let (strict, warning) = resolve_strict_capture(Some("maybe"), Some(true));
+        assert!(strict);
+        assert!(warning.unwrap().contains("maybe"));
+        let (strict, warning) = resolve_strict_capture(Some(""), None);
+        assert!(!strict);
+        assert!(warning.is_some());
     }
 
     #[test]
