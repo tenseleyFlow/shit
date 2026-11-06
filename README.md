@@ -154,7 +154,7 @@ A per-event ZFS clone engine exists in `crates/shit-capture/src/cow/` and is val
 
 Two capture paths exist. EndpointSecurity needs a signed, entitled helper. The default path is the DYLD interposer, with FSEvents for readiness and diagnostics. `shit doctor` reports the active tier.
 
-CI status: the seven `es-*` smokes and `fsevents-fallback-macos.sh` carry `EXCLUDED_BY: M03-vm-runner` and do not run in CI. Running them needs an Apple Silicon Tart host, which does not exist yet (#190). Treat the EndpointSecurity rows as built, not CI-gated. The DYLD and wrapper rows run on hosted `macos-14`.
+CI status: the seven `es-*` smokes and `fsevents-fallback-macos.sh` carry `EXCLUDED_BY: M03-vm-runner` and do not run in CI. Running them needs an Apple Silicon Tart host, which does not exist yet (#190). Treat the EndpointSecurity rows as built, not CI-gated. The DYLD and wrapper rows are pinned by smokes on hosted `macos-15`; per-smoke status is in the dr-smoke workflow.
 
 | Class | Capture | Smoke |
 |---|---|---|
@@ -241,7 +241,7 @@ These should work in practice once the underlying mechanism is wired (no archite
 | firewall | ✅ nft, iptables | ✅ same | ✅ pfctl | ✅ pfctl | ✅ pfctl |
 | shell hook | ✅ bash, zsh, fish | ✅ same | ✅ bash | ⚠️ shell hooks untested | ⚠️ shell hooks untested |
 
-✅ means a smoke that is not marked `EXCLUDED_BY` exercises it in CI. ⚠️ means structurally plausible but unpinned. "Built, not CI-gated" means the code exists but its smokes are excluded. The macOS ES column has no running smoke, so it carries no ✅ for capture. Its ✅ rows (interposer, package, services, firewall) are run on hosted `macos-14`, which has no ES entitlement; they apply to the entitled column only because those paths do not depend on ES.
+✅ means a smoke that is not marked `EXCLUDED_BY` exercises it in CI. ⚠️ means structurally plausible but unpinned. "Built, not CI-gated" means the code exists but its smokes are excluded. The macOS ES column has no running smoke, so it carries no ✅ for capture. Its ✅ rows (interposer, package, services, firewall) are pinned by smokes on hosted `macos-15` (per-smoke status is in the dr-smoke workflow), which has no ES entitlement; they apply to the entitled column only because those paths do not depend on ES.
 
 Smokes behind each ✅:
 
