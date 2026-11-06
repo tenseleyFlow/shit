@@ -945,33 +945,42 @@ pub struct LsmFlushHandle {
 
 impl LsmFlushHandle {
     /// Ask the reader to dispatch every record already in its ring
-    /// buffer, then wait for its ack until `deadline`.
-    pub fn flush_until(&self, deadline: Instant) -> Result<(), String> {
+    /// buffer. Returns the channel its ack arrives on.
+    fn request(&self) -> Result<mpsc::Receiver<()>, String> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.tx
             .send(ack_tx)
             .map_err(|_| format!("eBPF {} reader is not running", self.thread_name))?;
-        let wait = deadline.saturating_duration_since(Instant::now());
-        ack_rx
-            .recv_timeout(wait)
-            .map_err(|_| format!("eBPF {} reader flush timed out", self.thread_name))
+        Ok(ack_rx)
     }
 }
 
-/// Flush every reader in order. The first failure is returned, but every
-/// reader is still asked, so one stuck reader does not leave the others
-/// undrained.
+/// Flush every reader. All requests go out before any ack is awaited, so
+/// the readers drain in parallel and one stuck reader cannot use up the
+/// time of the rest. Every failure is reported.
 pub fn flush_all_readers(handles: &[LsmFlushHandle], timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
-    let mut first_err = None;
-    for handle in handles {
-        if let Err(e) = handle.flush_until(deadline)
-            && first_err.is_none()
-        {
-            first_err = Some(e);
+    let requests: Vec<_> = handles.iter().map(LsmFlushHandle::request).collect();
+    let mut failures = Vec::new();
+    for (handle, request) in handles.iter().zip(requests) {
+        match request {
+            Ok(ack) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                if ack.recv_timeout(wait).is_err() {
+                    failures.push(format!(
+                        "eBPF {} reader flush timed out",
+                        handle.thread_name
+                    ));
+                }
+            }
+            Err(e) => failures.push(e),
         }
     }
-    first_err.map_or(Ok(()), Err)
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// Userspace consumer of a single L04 LSM ringbuf. One OS thread per
@@ -1395,11 +1404,42 @@ mod tests {
             thread_name: "test",
             tx,
         };
-        let err = handle
-            .flush_until(Instant::now() + Duration::from_millis(10))
-            .unwrap_err();
+        let err = flush_all_readers(&[handle], Duration::from_millis(10)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         drop(rx);
+    }
+
+    #[test]
+    fn stuck_reader_does_not_starve_the_others() {
+        let (stuck_tx, stuck_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let (slow_tx, slow_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        // Acks well inside the deadline, but only after the stuck reader's
+        // whole wait would have used it up if requests went out in turn.
+        let slow = std::thread::spawn(move || {
+            let requested_at = Instant::now();
+            let ack = slow_rx.recv().unwrap();
+            let waited = requested_at.elapsed();
+            ack.send(()).unwrap();
+            waited
+        });
+        let handles = [
+            LsmFlushHandle {
+                thread_name: "stuck",
+                tx: stuck_tx,
+            },
+            LsmFlushHandle {
+                thread_name: "slow",
+                tx: slow_tx,
+            },
+        ];
+        let err = flush_all_readers(&handles, Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("stuck"), "{err}");
+        assert!(!err.contains("slow"), "{err}");
+        assert!(
+            slow.join().unwrap() < Duration::from_millis(250),
+            "the second reader was asked only after the first gave up"
+        );
+        drop(stuck_rx);
     }
 
     #[test]
