@@ -266,7 +266,7 @@ jobs:
 
   daemon-boot-macos:
     name: daemon-boot smoke (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -287,7 +287,7 @@ jobs:
 
   brew-pkg:
     name: brew-pkg smoke (DR-22)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -311,7 +311,7 @@ jobs:
     # non-SIP gmake + ginstall (brew make + coreutils) so
     # DYLD_INSERT_LIBRARIES isn't stripped by SIP.
     name: make-install-undo smoke (M07.A.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -339,7 +339,7 @@ jobs:
     # my_chflags interposer fires. UF_HIDDEN is purely cosmetic
     # (Finder-visibility only); doesn't block any other operation.
     name: chflags-undo smoke (M03.x.SETATTR-FAMILY macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -370,7 +370,7 @@ jobs:
     # coverage already secures the pre-image. Same retrospective shape
     # as M07.B.4 and M03.x.MMAP.
     name: cp-clone-overwrite-undo smoke (M03.x.CLONE-COPYFILE macOS regression)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -400,7 +400,7 @@ jobs:
     # workload (same retrospective shape as M07.B.4). This smoke
     # locks that coverage in so it can't regress.
     name: mmap-write-undo smoke (M03.x.MMAP macOS regression)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -425,7 +425,7 @@ jobs:
     # my_mkfifo + my_mkfifoat shim interposers; daemon classifier
     # already routes "mkfifo"/"mkfifoat" (W09.10.1 fall-through).
     name: mkfifo-undo smoke (M03.x.CREATE mkfifo macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -450,7 +450,7 @@ jobs:
     # + my_linkat shim interposers + daemon classifier
     # link/linkat → TreeOp::Create routing.
     name: link-undo smoke (M03.x.LINK macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -476,7 +476,7 @@ jobs:
     # xattr-pre-value capture + daemon-side build_xattrs_target
     # overlay + planner RestoreMetadata xattr converge path.
     name: xattr-mutate-undo smoke (M03.x.XATTR-MUTATE macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -506,7 +506,7 @@ jobs:
     # closed by the M07.A shim's O_TRUNC handling. This smoke
     # locks that coverage in so we don't regress it.
     name: make-install-overwrite-undo smoke (M07.B.4 macOS regression)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -530,7 +530,7 @@ jobs:
   cargo-install-force-undo-macos:
     # M07.A.5 — cargo install --force overwrite undo via DYLD shim.
     name: cargo-install-force-undo smoke (M07.A.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -554,7 +554,7 @@ jobs:
     # Validates the brew planner inverse + the daemon's PkgRunner
     # not-prepending-sudo for brew (which is unprivileged on macOS).
     name: brew-install-undo smoke (M05.1 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -580,7 +580,7 @@ jobs:
     # (gui/<uid> targets are unprivileged) + the planner's
     # present-diff branch in launchctl_argv.
     name: launchctl-bootstrap-undo smoke (M05.2 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -606,7 +606,7 @@ jobs:
     # synthesise_networksetup_location. Skips on runners with only
     # one configured location (common on default GHA macos-14).
     name: networksetup-location-undo smoke (M06.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -631,7 +631,7 @@ jobs:
     # wrapper + inspector + planner inverse + executor under
     # macos-14's passwordless-sudo posture.
     name: networksetup-dns-undo smoke (M06.1 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -656,7 +656,7 @@ jobs:
     # pre-state via `/sbin/pfctl -f <stashed>`. Validates the
     # FullReload executor path on macOS-14.
     name: pfctl-undo smoke (M06.4 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -682,7 +682,7 @@ jobs:
     # restores the routing table. Validates the wrapper + RouteInspector
     # + synthesise_route + PrivilegedNetRunner end-to-end.
     name: route-add-undo smoke (M06.3 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -708,7 +708,7 @@ jobs:
     # tag (proves libproc populated argv on macOS, not the prior
     # "not implemented" empty fallback).
     name: kill-proc-libproc smoke (M06.2 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -732,7 +732,7 @@ jobs:
     # exercises the fchmodat interposer + daemon metadata-pre-image
     # ingest path + planner FilePreImage metadata restore.
     name: chmod-undo smoke (M07.B.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -758,7 +758,7 @@ jobs:
     # DYLD shim. Requires Homebrew python3 (Apple's /usr/bin/python3
     # is a SIP-stripped shim).
     name: pip-install-user-undo smoke (M07.A.5 macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -2075,7 +2075,7 @@ jobs:
 
   sqlite3-db-macos:
     name: sqlite3-db smoke (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

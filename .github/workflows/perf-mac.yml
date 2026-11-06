@@ -25,7 +25,7 @@ env:
 jobs:
   perf-mac-14:
     name: perf-mac-14 (M03.x.PERF)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
