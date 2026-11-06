@@ -377,6 +377,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             net_stash: Arc::clone(&net_stash),
             proc_stash: Arc::clone(&proc_stash),
             db_stash: Arc::clone(&db_stash),
+            env_stash: Arc::clone(&env_stash),
             active: Arc::clone(&active),
             // Task #105 — handler only meaningful when a helper is
             // wired. Pass the map only in that case so the ctl

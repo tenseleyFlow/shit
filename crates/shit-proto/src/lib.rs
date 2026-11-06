@@ -39,8 +39,8 @@ pub use ctl::{
     SvcScopeWire, SvcToolParseError, SvcToolWire, UndoReportWire, UndoRequest,
 };
 pub use frame::{
-    DecodeError, EncodeError, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE, WIRE_VERSION, decode_frame,
-    decode_frame_large, encode_frame, encode_frame_large,
+    DecodeError, EncodeError, HOOK_DGRAM_MAX_FRAME, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE,
+    WIRE_VERSION, decode_frame, decode_frame_large, encode_frame, encode_frame_large,
 };
 
 /// AU26: maximum bytes for `HookMessage::PreExec.cmd_string`. The shell

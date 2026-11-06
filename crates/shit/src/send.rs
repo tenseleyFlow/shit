@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use shit_proto::{
-    CtlRequest, CtlResponse, HookMessage, RedirectOpWire, RedirectTargetWire, ShellKind,
-    decode_frame, encode_frame,
+    CtlRequest, CtlResponse, HOOK_DGRAM_MAX_FRAME, HookMessage, RedirectOpWire, RedirectTargetWire,
+    ShellKind, decode_frame, encode_frame,
 };
 use shit_shell::redirect::{RedirectOp, parse_redirects};
 use std::io::Read;
@@ -624,9 +624,37 @@ fn stat_cwd(cwd: &std::path::Path) -> Option<(u64, u64)> {
 
 fn send_message(sock_path: &std::path::Path, msg: &HookMessage) -> Result<()> {
     let frame = encode_frame(msg).context("encode frame")?;
+    // Issue #6: macOS caps AF_UNIX datagrams at 2048 bytes by default,
+    // and real env blocks are larger. Oversized env carriers go over
+    // the ctl stream socket instead; everything else stays on the
+    // datagram path.
+    if frame.len() > HOOK_DGRAM_MAX_FRAME
+        && matches!(
+            msg,
+            HookMessage::PreExecEnv { .. } | HookMessage::PostExecEnv { .. }
+        )
+    {
+        return send_env_over_ctl(sock_path, msg);
+    }
     let client = UnixDatagram::unbound().context("UnixDatagram::unbound")?;
     client
         .send_to(&frame, sock_path)
         .with_context(|| format!("send_to {}", sock_path.display()))?;
     Ok(())
+}
+
+/// Deliver an env-block hook message via `CtlRequest::HookEnv` on the
+/// sibling `shit-ctl.sock` of the hook socket. Waits for the ack so
+/// the daemon has stashed or journaled the block before the shell
+/// moves on.
+fn send_env_over_ctl(sock_path: &Path, msg: &HookMessage) -> Result<()> {
+    let ctl_sock = sock_path
+        .parent()
+        .map(|p| p.join("shit-ctl.sock"))
+        .unwrap_or_else(|| PathBuf::from("shit-ctl.sock"));
+    match call_ctl(&ctl_sock, &CtlRequest::HookEnv(msg.clone()), 2000)? {
+        CtlResponse::HookEnvAck => Ok(()),
+        CtlResponse::Error(e) => anyhow::bail!("daemon rejected env frame: {e}"),
+        other => anyhow::bail!("unexpected ctl response to HookEnv: {other:?}"),
+    }
 }
