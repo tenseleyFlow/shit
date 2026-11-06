@@ -417,14 +417,27 @@ fn rm_reverse_inspects_stash_then_runs_synthesized_argv() {
 }
 
 /// Regression guard: `run` must not hand the parent's stdin to the
-/// child. A stub that reads stdin (`cat`) used to hang `cargo test`
-/// under a non-tty harness. Spawning with a null stdin makes `cat`
-/// see EOF at once; the test would block forever on an inherited pipe.
+/// child. On Linux the child asserts fd 0 is /dev/null without reading
+/// it; elsewhere it drains stdin, which only returns on EOF. Either way
+/// the run is bounded by a channel timeout so a regression fails in
+/// seconds instead of hanging the suite.
 #[test]
 fn run_without_stdin_gives_child_null_stdin() {
     use shit_planner::executors::container::SystemContainerRunner;
-    let runner = SystemContainerRunner;
-    runner
-        .run(&["sh".into(), "-c".into(), "cat >/dev/null".into()])
-        .expect("child must see EOF on stdin");
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let script = if cfg!(target_os = "linux") {
+        "[ \"$(readlink /proc/self/fd/0)\" = /dev/null ]"
+    } else {
+        "cat >/dev/null"
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = SystemContainerRunner.run(&["sh".into(), "-c".into(), script.into()]);
+        let _ = tx.send(r);
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("runner did not return within 10s");
+    r.expect("child stdin must be null");
 }
