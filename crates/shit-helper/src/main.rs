@@ -2340,6 +2340,8 @@ fn send_capture_observation(
 
 /// Close-barrier marker for `UnwatchTree`. Sent on every path, degraded
 /// included: it means "nothing more will arrive for this command".
+/// macOS sends it through `capture::UnwatchFlushMarker` instead.
+#[cfg(not(target_os = "macos"))]
 fn send_unwatch_flushed(conn: &ipc::Conn, command: shit_planner::events::CommandId) {
     let resp = shit_proto::HelperResponse::UnwatchTreeFlushed {
         session: command.session,
@@ -2350,10 +2352,33 @@ fn send_unwatch_flushed(conn: &ipc::Conn, command: shit_planner::events::Command
     }
 }
 
+/// Record a WatchTree. Returns false for a command already being
+/// watched: a duplicate must not reset its capture window, and it is
+/// reported as an observation so strict mode can refuse the command.
+fn begin_watch(
+    conn: &ipc::Conn,
+    active_watches: &mut std::collections::BTreeSet<shit_planner::events::CommandId>,
+    command: shit_planner::events::CommandId,
+) -> bool {
+    if active_watches.insert(command) {
+        return true;
+    }
+    tracing::warn!(%command, "duplicate WatchTree ignored");
+    send_capture_observation(
+        conn,
+        command,
+        None,
+        "duplicate WatchTree for an active command was ignored".to_string(),
+    );
+    false
+}
+
 /// Linux WatchTree attach. `Ok` means the tier is set up for this
-/// command (or there is no tier, which is reported as an observation
-/// and still counts as ready, as on trunk). `Err` is a real attach
-/// failure on an active tier; the caller reports WatchTreeFailed.
+/// command, possibly with less than a full capture: no tier at all, or
+/// an LSM attach whose cwd is unusable. Those are reported as
+/// observations and still count as ready, as on trunk. `Err` is a
+/// fanotify attach failure, where nothing can fire; the caller reports
+/// WatchTreeFailed.
 #[cfg(target_os = "linux")]
 fn linux_watch_tree(
     conn: &ipc::Conn,
@@ -2409,15 +2434,17 @@ fn linux_watch_tree(
             }
         }
     } else if let Some(state) = lsm_state {
-        let cwd = validated_linux_watch_cwd(cwd_path)?;
         // L04: eBPF-LSM tier. No fanotify mark needed — the LSM hooks
         // fire globally. We still track the pid tree so events from
-        // untracked pids are dropped.
+        // untracked pids are dropped. The tree is tracked whatever the
+        // cwd's state: `cd /tmp/x; rm -rf /tmp/x; rm ~/important` has no
+        // usable cwd, and its descendants must stay attributed.
         state
             .tree
             .lock()
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
+        let cwd = validated_linux_watch_cwd(cwd_path);
         // L04 — pre-open every regular file under the cwd. The held
         // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
         // unlink handler can read the pre-image content even though
@@ -2426,16 +2453,36 @@ fn linux_watch_tree(
             && let Ok(mut g) = rt.lock()
         {
             g.on_watch_tree(command);
-            g.pre_open_tree(command, &cwd);
+            if let Ok(cwd) = &cwd {
+                g.pre_open_tree(command, cwd);
+            }
         }
-        tracing::info!(
-            %session,
-            command_seq,
-            root_pid,
-            cwd = %cwd.display(),
-            tier = "ebpf-lsm",
-            "watch_tree registered + cwd pre-opened (LSM tier)"
-        );
+        match &cwd {
+            Ok(cwd) => tracing::info!(
+                %session,
+                command_seq,
+                root_pid,
+                cwd = %cwd.display(),
+                tier = "ebpf-lsm",
+                "watch_tree registered + cwd pre-opened (LSM tier)"
+            ),
+            Err(reason) => {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    root_pid,
+                    %reason,
+                    tier = "ebpf-lsm",
+                    "watch_tree registered without pre-opens (LSM tier)"
+                );
+                send_capture_observation(
+                    conn,
+                    command,
+                    None,
+                    format!("capture attach failed: {reason}"),
+                );
+            }
+        }
         Ok(())
     } else {
         tracing::debug!(
@@ -2470,6 +2517,87 @@ mod linux_watch_tests {
             validated_linux_watch_cwd(dir.path().to_str().unwrap()).unwrap(),
             canonical
         );
+    }
+
+    fn lsm_dispatch() -> LsmDispatch {
+        LsmDispatch {
+            tree: Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new())),
+            runtime: None,
+            flush: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lsm_attach_with_unusable_cwd_tracks_the_tree_and_reports_an_observation() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 4,
+        };
+        let dispatch = lsm_dispatch();
+        let root = std::process::id();
+        assert!(
+            linux_watch_tree(
+                &helper,
+                None,
+                Some(&dispatch),
+                command,
+                root,
+                "/nonexistent/shit-r3a-cwd"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            dispatch.tree.lock().unwrap().is_tracked(root as i32),
+            Some((command.session, command.seq)),
+            "descendants must stay attributed without a cwd"
+        );
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            shit_proto::HelperResponse::CaptureRefused { seq: 4, detail, .. }
+                if detail.starts_with("capture attach failed: ")
+        ));
+    }
+
+    #[test]
+    fn lsm_attach_with_a_usable_cwd_sends_no_observation() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        daemon.set_nonblocking_for_test();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 5,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = lsm_dispatch();
+        assert!(
+            linux_watch_tree(
+                &helper,
+                None,
+                Some(&dispatch),
+                command,
+                1,
+                dir.path().to_str().unwrap()
+            )
+            .is_ok()
+        );
+        assert!(daemon.recv_response().is_err());
+    }
+
+    #[test]
+    fn duplicate_watch_is_refused_with_an_observation() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 6,
+        };
+        let mut active = std::collections::BTreeSet::new();
+        assert!(begin_watch(&helper, &mut active, command));
+        assert!(!begin_watch(&helper, &mut active, command));
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            shit_proto::HelperResponse::CaptureRefused { seq: 6, detail, .. }
+                if detail.contains("duplicate WatchTree")
+        ));
     }
 
     #[test]
@@ -2556,14 +2684,7 @@ fn request_loop(
                     session,
                     seq: command_seq,
                 };
-                if !active_watches.insert(command) {
-                    tracing::warn!(%session, command_seq, "duplicate WatchTree ignored");
-                    send_capture_observation(
-                        &conn,
-                        command,
-                        None,
-                        "duplicate WatchTree for an active command was ignored".to_string(),
-                    );
+                if !begin_watch(&conn, &mut active_watches, command) {
                     continue;
                 }
                 #[cfg(target_os = "linux")]
@@ -2810,15 +2931,20 @@ fn request_loop(
                         send_unwatch_flushed(&conn, command);
                     }
                 }
+                // Each pump drops its clone after handling the detach. The
+                // marker goes out when the last clone goes, including this
+                // one when no producer is running.
                 #[cfg(target_os = "macos")]
-                if let Some(ctrl) = &macos_capture {
-                    ctrl.on_unwatch_tree(session, command_seq);
-                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
-                }
-                #[cfg(target_os = "macos")]
-                if let Some(ctrl) = &macos_es_capture {
-                    ctrl.on_unwatch_tree(session, command_seq);
-                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
+                {
+                    let flush = capture::UnwatchFlushMarker::new(Arc::clone(&conn), command);
+                    if let Some(ctrl) = &macos_capture {
+                        ctrl.on_unwatch_tree(session, command_seq, Arc::clone(&flush));
+                        tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
+                    }
+                    if let Some(ctrl) = &macos_es_capture {
+                        ctrl.on_unwatch_tree(session, command_seq, Arc::clone(&flush));
+                        tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
+                    }
                 }
                 #[cfg(not(any(
                     target_os = "linux",
@@ -2836,6 +2962,7 @@ fn request_loop(
                     target_os = "netbsd",
                     target_os = "openbsd",
                     target_os = "dragonfly",
+                    target_os = "macos",
                 )))]
                 send_unwatch_flushed(&conn, command);
             }

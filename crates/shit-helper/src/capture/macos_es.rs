@@ -1236,6 +1236,8 @@ enum ControlMsg {
     },
     Detach {
         command: CommandId,
+        /// Held until this pump has handled the command's queued events.
+        flush: Arc<super::UnwatchFlushMarker>,
     },
     Shutdown,
 }
@@ -1295,12 +1297,17 @@ impl CaptureControl {
         Ok(())
     }
 
-    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
+    pub fn on_unwatch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        flush: Arc<super::UnwatchFlushMarker>,
+    ) {
         let command = CommandId {
             session,
             seq: command_seq,
         };
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command }) {
+        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command, flush }) {
             tracing::warn!(
                 %session,
                 command_seq,
@@ -1701,8 +1708,12 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
                 state.attach(command, root_path, Some(root_pid));
                 continue;
             }
-            Ok(ControlMsg::Detach { command }) => {
+            Ok(ControlMsg::Detach { command, flush }) => {
+                // Handle the queued ring while tracked_pids still
+                // attributes it to this command; detach clears them.
+                while state.drain_ring_once() {}
                 state.detach(command);
+                drop(flush);
                 continue;
             }
             Ok(ControlMsg::Shutdown) => {

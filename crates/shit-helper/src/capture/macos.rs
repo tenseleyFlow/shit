@@ -81,6 +81,8 @@ enum ControlMsg {
     },
     Detach {
         command: CommandId,
+        /// Held until this pump has handled the command's queued events.
+        flush: Arc<super::UnwatchFlushMarker>,
     },
     Shutdown,
 }
@@ -139,12 +141,17 @@ impl CaptureControl {
         Ok(())
     }
 
-    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
+    pub fn on_unwatch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        flush: Arc<super::UnwatchFlushMarker>,
+    ) {
         let command = CommandId {
             session,
             seq: command_seq,
         };
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command }) {
+        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command, flush }) {
             tracing::warn!(
                 %session,
                 command_seq,
@@ -234,6 +241,20 @@ impl PumpState {
         );
         self.watches.insert(command, canonical);
         self.rebuild_stream();
+    }
+
+    /// Handle every record the stream has already delivered.
+    fn drain_stream(&mut self) {
+        loop {
+            let record = match &self.stream {
+                Some((_, rx)) => rx.try_recv().ok(),
+                None => None,
+            };
+            match record {
+                Some(record) => self.handle_event(record),
+                None => return,
+            }
+        }
     }
 
     fn detach(&mut self, command: CommandId) {
@@ -485,8 +506,14 @@ fn pump(conn: Arc<Conn>, ctrl_rx: Receiver<ControlMsg>) {
                 state.attach(command, root_path);
                 continue;
             }
-            Ok(ControlMsg::Detach { command }) => {
+            Ok(ControlMsg::Detach { command, flush }) => {
+                // detach rebuilds the stream, which discards its queue.
+                // FSEvents delivers with latency, so this covers what the
+                // stream has delivered, which may not be all the kernel
+                // has seen.
+                state.drain_stream();
                 state.detach(command);
+                drop(flush);
                 continue;
             }
             Ok(ControlMsg::Shutdown) => {

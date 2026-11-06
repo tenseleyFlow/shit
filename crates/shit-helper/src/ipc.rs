@@ -142,6 +142,16 @@ impl Conn {
 
     /// Receive one `HelperResponse` frame.
     #[allow(dead_code)]
+    /// Make receives fail instead of block, to assert nothing was sent.
+    #[cfg(test)]
+    pub fn set_nonblocking_for_test(&self) {
+        nix::fcntl::fcntl(
+            self.fd.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .unwrap();
+    }
+
     pub fn recv_response(&self) -> Result<HelperResponse, ConnError> {
         let buf = self.recv_frame()?;
         Ok(decode_frame(&buf)?)

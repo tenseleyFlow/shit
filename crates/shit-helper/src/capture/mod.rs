@@ -56,3 +56,76 @@ pub mod xattr;
     target_os = "dragonfly",
 ))]
 pub mod streaming;
+
+/// Sends `UnwatchTreeFlushed` when the last clone is dropped.
+///
+/// macOS can run two producers for one command, and the daemon's barrier
+/// ends at the first marker, so one marker has to mean both are done. The
+/// request loop hands each pump a clone inside its `Detach`. The marker
+/// goes out once every pump has finished with its clone. A `Detach` the
+/// control channel rejected drops its clone straight away, so a full
+/// channel or a stopped pump cannot withhold the marker.
+#[cfg(any(target_os = "macos", test))]
+pub struct UnwatchFlushMarker {
+    conn: std::sync::Arc<crate::ipc::Conn>,
+    command: shit_planner::events::CommandId,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl UnwatchFlushMarker {
+    pub fn new(
+        conn: std::sync::Arc<crate::ipc::Conn>,
+        command: shit_planner::events::CommandId,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { conn, command })
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for UnwatchFlushMarker {
+    fn drop(&mut self) {
+        let flushed = shit_proto::HelperResponse::UnwatchTreeFlushed {
+            session: self.command.session,
+            command_seq: self.command.seq,
+        };
+        if let Err(e) = self.conn.send_response(&flushed) {
+            tracing::warn!(
+                err = %e,
+                command = %self.command,
+                "UnwatchTreeFlushed send failed; daemon close will time out"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod flush_marker_tests {
+    use super::*;
+    use shit_proto::HelperResponse;
+    use std::sync::Arc;
+
+    #[test]
+    fn marker_is_sent_once_after_the_last_producer_finishes() {
+        let (helper, daemon) = crate::ipc::socketpair().unwrap();
+        daemon.set_nonblocking_for_test();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(5),
+            seq: 8,
+        };
+        let marker = UnwatchFlushMarker::new(Arc::new(helper), command);
+        let fsevents = Arc::clone(&marker);
+        let endpoint_security = Arc::clone(&marker);
+        drop(marker);
+        drop(fsevents);
+        assert!(
+            daemon.recv_response().is_err(),
+            "a producer still holds the marker"
+        );
+        drop(endpoint_security);
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            HelperResponse::UnwatchTreeFlushed { command_seq: 8, .. }
+        ));
+        assert!(daemon.recv_response().is_err(), "marker sent twice");
+    }
+}
