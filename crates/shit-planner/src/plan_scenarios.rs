@@ -36,6 +36,7 @@ const WALK_SOURCE: FilePreImageSource = FilePreImageSource::ShimRenameSubtree;
 enum Entry {
     Dir { perm: u32 },
     File { perm: u32, bytes: Vec<u8> },
+    Symlink { target: PathBuf },
 }
 
 /// Recorder for one command's worth of events.
@@ -45,6 +46,8 @@ struct Sim {
     blobs: InMemoryBlobReader,
     store: InMemoryStore,
     next: u64,
+    /// Wall clock the command started at; set by the first `snapshot`.
+    started_wall_nanos: std::cell::Cell<u64>,
 }
 
 impl Sim {
@@ -55,6 +58,7 @@ impl Sim {
             blobs: InMemoryBlobReader::new(),
             store: InMemoryStore::new(),
             next: 1,
+            started_wall_nanos: std::cell::Cell::new(0),
         }
     }
 
@@ -230,6 +234,19 @@ impl Sim {
         std::fs::write(self.p(rel), bytes).unwrap();
     }
 
+    /// `rm rel` where no pre-image could be captured (unreadable file).
+    fn rm_uncaptured(&mut self, rel: &str) {
+        let p = self.p(rel);
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        self.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode: InodeRef::new(m.dev(), m.ino()),
+            path: p,
+            kind: FileKind::Regular,
+            mode: m.mode(),
+        }));
+    }
+
     fn rm_rf_path(&mut self, p: &Path) {
         let m = std::fs::symlink_metadata(p).unwrap();
         if m.is_dir() {
@@ -260,7 +277,19 @@ impl Sim {
         }
     }
 
+    /// The first call marks the command's start. File mtimes come from
+    /// the kernel's coarse clock, so sleep past a tick on both sides:
+    /// seeded files are provably older than the start, and files the
+    /// command writes are provably not.
     fn snapshot(&self) -> BTreeMap<PathBuf, Entry> {
+        if self.started_wall_nanos.get() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            self.started_wall_nanos.set(now.as_nanos() as u64);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let mut out = BTreeMap::new();
         snapshot_into(self.root.path(), self.root.path(), &mut out);
         out
@@ -270,7 +299,8 @@ impl Sim {
     /// default policy (Abort, serial).
     fn undo(&self) -> Vec<String> {
         let probe = LiveStateProbe::new();
-        let p = plan(command_record(), &self.events, &probe, &self.store);
+        let record = command_record(self.started_wall_nanos.get());
+        let p = plan(record, &self.events, &probe, &self.store);
         let exec = FileExecutor::new(&self.blobs);
         let report = Orchestrator::new(&exec, &probe).run(&p, false, ConflictPolicy::Abort);
         report
@@ -309,7 +339,10 @@ fn snapshot_into(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
         let m = std::fs::symlink_metadata(&p).unwrap();
         let rel = p.strip_prefix(root).unwrap().to_path_buf();
         let perm = m.mode() & 0o7777;
-        if m.is_dir() {
+        if m.file_type().is_symlink() {
+            let target = std::fs::read_link(&p).unwrap();
+            out.insert(rel, Entry::Symlink { target });
+        } else if m.is_dir() {
             out.insert(rel, Entry::Dir { perm });
             snapshot_into(root, &p, out);
         } else {
@@ -331,14 +364,14 @@ fn command_id() -> CommandId {
     }
 }
 
-fn command_record() -> CommandRecord {
+fn command_record(started_wall_nanos: u64) -> CommandRecord {
     CommandRecord {
         command: command_id(),
         cmd_string: Some("scenario".to_string()),
         cwd: PathBuf::from("/"),
         pid: 0,
         shell_kind: shit_proto::ShellKind::Bash,
-        started_at: TimePoint::new(0, 0),
+        started_at: TimePoint::new(0, started_wall_nanos),
         ended_at: Some(TimePoint::new(1_000_000, 0)),
         exit_code: Some(0),
         event_ids: Vec::new(),
@@ -506,5 +539,215 @@ fn pip_shape_as_the_hosted_shim_sees_it() {
     sim.mkdir_unseen("d");
     sim.write_unseen("d/f", b"new\n");
     sim.rmtree_top_unseen("d.old");
+    assert_restored(&sim, &before);
+}
+
+// Review of #205. Each of these failed against the first version of the
+// replaced-subtree and moved-data rules.
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 1, pre-rename generation dropped"]
+fn rm_mv_rm_same_name_restores_both_generations() {
+    // `rm -rf t; mv d t; rm -rf t`
+    let mut sim = Sim::new();
+    sim.seed_dir("t", 0o755);
+    sim.seed_file("t/f", b"old t\n", 0o644);
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"old d\n", 0o644);
+    let before = sim.snapshot();
+    sim.rm_rf("t");
+    sim.mv("d", "t");
+    sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 2, moved-in entry taken for a walked copy"]
+fn file_moved_over_walked_name_then_rm_rf_restores_its_source() {
+    // `mv d t; mv e/f t/f; rm -rf t`
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"from d\n", 0o644);
+    sim.seed_dir("e", 0o755);
+    sim.seed_file("e/f", b"from e\n", 0o644);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.mv("e/f", "t/f");
+    sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 3, destination not gone"]
+fn partial_delete_with_empty_dir_keeps_reverse_rename() {
+    // `mv d t; rm t/f`, d also holds an empty dir
+    let mut sim = Sim::new();
+    sim.seed_dir("d/empty", 0o700);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.rm_rf("t/f");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 3, destination not gone"]
+fn partial_delete_with_symlink_keeps_reverse_rename() {
+    // `mv d t; rm t/f`, d also holds a symlink the walk skips
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    std::os::unix::fs::symlink("f", sim.p("d/link")).unwrap();
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.rm_rf("t/f");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 3, destination not gone"]
+fn partial_delete_with_uncaptured_file_keeps_reverse_rename() {
+    // `mv d t; rm t/f`, the walk's caps missed d/big
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    sim.seed_file("d/big", b"big\n", 0o644);
+    let before = sim.snapshot();
+    sim.mv_walk_skipping("d", "t", Some("d/big"));
+    sim.rm_rf("t/f");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 4, duplicate Create overwrites moved provenance"]
+fn bsd_event_order_mv_then_rm_restores_source_name() {
+    // `mv a b; rm b` as kqueue reports it: Rename, Create(b), PreImage,
+    // Unlink.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("a", "b");
+    let b = sim.p("b");
+    let m = std::fs::symlink_metadata(&b).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: InodeRef::new(m.dev(), m.ino()),
+        path: b,
+        kind: FileKind::Regular,
+        mode: m.mode(),
+    }));
+    sim.rm_rf("b");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 5, moved-in empty dir rebuilt at the rename source"]
+fn empty_dir_moved_into_renamed_dir_then_rm_rf_restores_its_source() {
+    // `mv d t; mv o t/o; rm -rf t`
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    sim.seed_dir("o", 0o700);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.mv("o", "t/o");
+    sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 6, recreated generation Create inverses dropped"]
+fn recreated_generation_at_rename_destination_is_removed() {
+    // `mv d t; rm -rf t; mkdir t; echo new > t/f`
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"old\n", 0o644);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.rm_rf("t");
+    sim.mkdir("t");
+    sim.write("t/f", b"new\n");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 7, unjournaled source taken for pre-command data"]
+fn unseen_scratch_file_moved_then_removed_leaves_no_stray() {
+    // `echo x > tmp; mv tmp x; rm x`, the create not journaled
+    let mut sim = Sim::new();
+    sim.seed_file("keep", b"k\n", 0o644);
+    let before = sim.snapshot();
+    sim.write_unseen("tmp", b"x\n");
+    sim.mv("tmp", "x");
+    sim.rm_rf("x");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 7, read-only variant returns an empty file"]
+fn moved_file_unlinked_without_pre_image_refuses() {
+    // `mv a b; rm b`, b unreadable so no pre-image exists. The bytes
+    // are gone: undo must say so, and must not put an empty `a` back.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"secret\n", 0o600);
+    sim.seed_file("keep", b"k\n", 0o644);
+    sim.snapshot();
+    sim.mv("a", "b");
+    sim.rm_uncaptured("b");
+    let log = sim.undo();
+    assert!(
+        !sim.p("a").exists(),
+        "empty file restored\n{}",
+        log.join("\n")
+    );
+    assert!(!sim.p("b").exists(), "{}", log.join("\n"));
+    assert!(
+        log.iter().any(|l| l.contains("refused")),
+        "no refusal\n{}",
+        log.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: item 8, source dir mode only taken from a journaled unlink"]
+fn source_dir_mode_survives_unjournaled_top_rmdir() {
+    // `mv d t; rm -rf t`, rmtree's top rmdir not interposed. A 0700 dir
+    // must not come back wider.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o700);
+    sim.seed_file("d/f", b"f\n", 0o600);
+    sim.seed_dir("d/empty", 0o711);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.rmtree_top_unseen("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+#[ignore = "fails at 04258dd, review of #205: walk pre-image dropped by a transient path in the new generation"]
+fn walk_pre_image_survives_scratch_file_at_same_path() {
+    // `mv d t; mkdir d; echo n > d/f; rm d/f; rm -rf t`
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o750);
+    sim.seed_file("d/f", b"original\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.mkdir("d");
+    sim.write("d/f", b"n\n");
+    sim.rm_rf("d/f");
+    sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn file_moved_into_source_before_walk_restores_its_source() {
+    // `mv a d/a; mv d t; rm -rf t`
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o644);
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    let before = sim.snapshot();
+    sim.mv("a", "d/a");
+    sim.mv("d", "t");
+    sim.rm_rf("t");
     assert_restored(&sim, &before);
 }

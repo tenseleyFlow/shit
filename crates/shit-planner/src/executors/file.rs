@@ -1121,6 +1121,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fails at 04258dd, review of #205: item 10, parents made before checking the source"]
+    fn rename_missing_source_creates_nothing() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let from = tmpdir.path().join("nope");
+        let parent = tmpdir.path().join("gone");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Rename {
+            from,
+            to: parent.join("f"),
+        };
+        assert!(matches!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Failed { .. }
+        ));
+        assert!(
+            !parent.exists(),
+            "parent created for a rename that cannot run"
+        );
+    }
+
+    #[test]
     fn rename_creates_missing_target_parent() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let from = tmpdir.path().join("x");
