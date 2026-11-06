@@ -125,6 +125,29 @@ impl Sim {
         });
     }
 
+    fn pre_image_dir(&mut self, path: &Path) {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        let blob = BlobHash::from_bytes(*blake3::hash(b"").as_bytes());
+        self.store.put_blob(blob, 0);
+        self.emit(CaptureEventKind::FilePreImage {
+            inode: InodeRef::new(m.dev(), m.ino()),
+            path: path.to_path_buf(),
+            blob,
+            meta: FileMetadata {
+                mode: m.mode(),
+                uid: m.uid(),
+                gid: m.gid(),
+                size: m.size(),
+                mtime_unix_nanos: 0,
+                xattrs: BTreeMap::new(),
+                acl: None,
+                flags: 0,
+            },
+            post_content_hash: None,
+            source: FilePreImageSource::ShimRenameSubtreeDir,
+        });
+    }
+
     /// `echo bytes > rel`: pre-image when the target exists, Create
     /// when it does not.
     fn write(&mut self, rel: &str, bytes: &[u8]) {
@@ -174,12 +197,22 @@ impl Sim {
         }
         if from_p.is_dir() {
             let mut files = Vec::new();
-            walk_files(&from_p, &mut files);
+            let mut dirs = Vec::new();
+            let mut complete = skip.is_none();
+            walk_tree(&from_p, &mut files, &mut dirs, &mut complete);
             let skip = skip.map(|s| self.p(s));
             for f in files {
                 if Some(&f) != skip.as_ref() {
                     self.pre_image(&f, WALK_SOURCE);
                 }
+            }
+            // As the shim does: directory records only for a complete
+            // walk, the rename source itself last.
+            if complete {
+                for d in dirs {
+                    self.pre_image_dir(&d);
+                }
+                self.pre_image_dir(&from_p);
             }
         }
         if to_p.is_file() {
@@ -317,7 +350,9 @@ impl Sim {
     }
 }
 
-fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// The shim's walk: regular files and directories; any other entry
+/// makes it incomplete.
+fn walk_tree(dir: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>, complete: &mut bool) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -326,9 +361,12 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for e in entries {
         let m = std::fs::symlink_metadata(&e).unwrap();
         if m.is_dir() {
-            walk_files(&e, out);
+            dirs.push(e.clone());
+            walk_tree(&e, files, dirs, complete);
         } else if m.is_file() {
-            out.push(e);
+            files.push(e);
+        } else {
+            *complete = false;
         }
     }
 }
@@ -542,11 +580,10 @@ fn pip_shape_as_the_hosted_shim_sees_it() {
     assert_restored(&sim, &before);
 }
 
-// Review of #205. Each of these failed against the first version of the
-// replaced-subtree and moved-data rules.
+// Review of #205. All but the last failed against the first version of
+// the replaced-subtree and moved-data rules.
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 1, pre-rename generation dropped"]
 fn rm_mv_rm_same_name_restores_both_generations() {
     // `rm -rf t; mv d t; rm -rf t`
     let mut sim = Sim::new();
@@ -562,7 +599,6 @@ fn rm_mv_rm_same_name_restores_both_generations() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 2, moved-in entry taken for a walked copy"]
 fn file_moved_over_walked_name_then_rm_rf_restores_its_source() {
     // `mv d t; mv e/f t/f; rm -rf t`
     let mut sim = Sim::new();
@@ -578,7 +614,6 @@ fn file_moved_over_walked_name_then_rm_rf_restores_its_source() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 3, destination not gone"]
 fn partial_delete_with_empty_dir_keeps_reverse_rename() {
     // `mv d t; rm t/f`, d also holds an empty dir
     let mut sim = Sim::new();
@@ -591,7 +626,6 @@ fn partial_delete_with_empty_dir_keeps_reverse_rename() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 3, destination not gone"]
 fn partial_delete_with_symlink_keeps_reverse_rename() {
     // `mv d t; rm t/f`, d also holds a symlink the walk skips
     let mut sim = Sim::new();
@@ -605,7 +639,6 @@ fn partial_delete_with_symlink_keeps_reverse_rename() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 3, destination not gone"]
 fn partial_delete_with_uncaptured_file_keeps_reverse_rename() {
     // `mv d t; rm t/f`, the walk's caps missed d/big
     let mut sim = Sim::new();
@@ -619,7 +652,6 @@ fn partial_delete_with_uncaptured_file_keeps_reverse_rename() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 4, duplicate Create overwrites moved provenance"]
 fn bsd_event_order_mv_then_rm_restores_source_name() {
     // `mv a b; rm b` as kqueue reports it: Rename, Create(b), PreImage,
     // Unlink.
@@ -640,7 +672,6 @@ fn bsd_event_order_mv_then_rm_restores_source_name() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 5, moved-in empty dir rebuilt at the rename source"]
 fn empty_dir_moved_into_renamed_dir_then_rm_rf_restores_its_source() {
     // `mv d t; mv o t/o; rm -rf t`
     let mut sim = Sim::new();
@@ -655,7 +686,6 @@ fn empty_dir_moved_into_renamed_dir_then_rm_rf_restores_its_source() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 6, recreated generation Create inverses dropped"]
 fn recreated_generation_at_rename_destination_is_removed() {
     // `mv d t; rm -rf t; mkdir t; echo new > t/f`
     let mut sim = Sim::new();
@@ -670,7 +700,6 @@ fn recreated_generation_at_rename_destination_is_removed() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 7, unjournaled source taken for pre-command data"]
 fn unseen_scratch_file_moved_then_removed_leaves_no_stray() {
     // `echo x > tmp; mv tmp x; rm x`, the create not journaled
     let mut sim = Sim::new();
@@ -683,7 +712,6 @@ fn unseen_scratch_file_moved_then_removed_leaves_no_stray() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 7, read-only variant returns an empty file"]
 fn moved_file_unlinked_without_pre_image_refuses() {
     // `mv a b; rm b`, b unreadable so no pre-image exists. The bytes
     // are gone: undo must say so, and must not put an empty `a` back.
@@ -708,7 +736,6 @@ fn moved_file_unlinked_without_pre_image_refuses() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: item 8, source dir mode only taken from a journaled unlink"]
 fn source_dir_mode_survives_unjournaled_top_rmdir() {
     // `mv d t; rm -rf t`, rmtree's top rmdir not interposed. A 0700 dir
     // must not come back wider.
@@ -723,7 +750,6 @@ fn source_dir_mode_survives_unjournaled_top_rmdir() {
 }
 
 #[test]
-#[ignore = "fails at 04258dd, review of #205: walk pre-image dropped by a transient path in the new generation"]
 fn walk_pre_image_survives_scratch_file_at_same_path() {
     // `mv d t; mkdir d; echo n > d/f; rm d/f; rm -rf t`
     let mut sim = Sim::new();
@@ -749,5 +775,83 @@ fn file_moved_into_source_before_walk_restores_its_source() {
     sim.mv("a", "d/a");
     sim.mv("d", "t");
     sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn clobbering_rename_then_rm_restores_both_names() {
+    // `mv a b; rm b` with b existing
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    sim.seed_file("b", b"bravo\n", 0o600);
+    let before = sim.snapshot();
+    sim.mv("a", "b");
+    sim.rm_rf("b");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn unseen_scratch_file_over_existing_then_rm_restores_the_existing_file() {
+    // `echo x > tmp; mv tmp b; rm b` with b existing, the create not
+    // journaled: b's own pre-image is proof, tmp's history is not.
+    let mut sim = Sim::new();
+    sim.seed_file("b", b"bravo\n", 0o600);
+    let before = sim.snapshot();
+    sim.write_unseen("tmp", b"x\n");
+    sim.mv("tmp", "b");
+    sim.rm_rf("b");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn hosted_pip_shape_restores_a_private_source_dir_mode() {
+    // pip_shape_as_the_hosted_shim_sees_it with the new tree already
+    // holding the source's name at a wider mode.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o700);
+    sim.seed_file("d/f", b"original\n", 0o600);
+    sim.seed_dir("d/sub", 0o711);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir_unseen("d");
+    std::fs::set_permissions(sim.p("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    sim.write_unseen("d/f", b"new\n");
+    sim.rmtree_top_unseen("d.old");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn replaced_dir_without_a_complete_walk_stays_a_conflict() {
+    // `mv d t; mkdir d; rm -rf t` with a symlink in d, new d unseen: the
+    // walk cannot prove the subtree, so the rule stays off and the
+    // reverse rename reports the occupied source instead of guessing.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    std::os::unix::fs::symlink("f", sim.p("d/link")).unwrap();
+    sim.snapshot();
+    sim.mv("d", "t");
+    sim.mkdir_unseen("d");
+    sim.rm_uncaptured("t/link");
+    sim.rmtree_top_unseen("t");
+    let log = sim.undo();
+    assert!(
+        log.iter().any(|l| l.starts_with("!! ")),
+        "expected a loud conflict\n{}",
+        log.join("\n")
+    );
+}
+
+#[test]
+fn file_written_then_moved_then_removed_restores_the_original() {
+    // `echo new > a; mv a b; rm b`: the write's pre-image is the
+    // pre-command state; the moved bytes are not.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    sim.write("a", b"new\n");
+    sim.mv("a", "b");
+    sim.rm_rf("b");
     assert_restored(&sim, &before);
 }
