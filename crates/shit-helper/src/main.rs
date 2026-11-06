@@ -2377,8 +2377,8 @@ fn begin_watch(
 /// command, possibly with less than a full capture: no tier at all, or
 /// an LSM attach whose cwd is unusable. Those are reported as
 /// observations and still count as ready, as on trunk. `Err` is a
-/// fanotify attach failure, where nothing can fire; the caller reports
-/// WatchTreeFailed.
+/// fanotify attach failure: the tree stays tracked, as on trunk, but no
+/// mark covers the cwd, so the caller reports WatchTreeFailed.
 #[cfg(target_os = "linux")]
 fn linux_watch_tree(
     conn: &ipc::Conn,
@@ -2390,7 +2390,9 @@ fn linux_watch_tree(
 ) -> Result<(), String> {
     let (session, command_seq) = (command.session, command.seq);
     if let Some(state) = fanotify_state {
-        let cwd = validated_linux_watch_cwd(cwd_path)?;
+        // The tree is tracked before anything can fail. Another command's
+        // mark can still fire for a pid in this tree, and UnwatchTree
+        // releases the tree whatever happened here.
         state
             .tree
             .lock()
@@ -2402,6 +2404,7 @@ fn linux_watch_tree(
         {
             g.on_watch_tree(command);
         }
+        let cwd = validated_linux_watch_cwd(cwd_path)?;
         // L01: narrow-scope fanotify mark on the watch cwd
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
@@ -2422,16 +2425,7 @@ fn linux_watch_tree(
                 );
                 Ok(())
             }
-            Err(e) => {
-                // Unwind so the failed command leaves no tracked tree.
-                state.tree.lock().unwrap().unwatch(session, command_seq);
-                if let Some(rt) = &state.capture_runtime
-                    && let Ok(mut g) = rt.lock()
-                {
-                    g.on_unwatch_tree(command);
-                }
-                Err(format!("fanotify mark on {} failed: {e}", cwd.display()))
-            }
+            Err(e) => Err(format!("fanotify mark on {} failed: {e}", cwd.display())),
         }
     } else if let Some(state) = lsm_state {
         // L04: eBPF-LSM tier. No fanotify mark needed — the LSM hooks
@@ -2557,6 +2551,36 @@ mod linux_watch_tests {
             shit_proto::HelperResponse::CaptureRefused { seq: 4, detail, .. }
                 if detail.starts_with("capture attach failed: ")
         ));
+    }
+
+    /// A fd that is not a fanotify group, so marking it fails. Building a
+    /// real group needs CAP_SYS_ADMIN, which unit tests do not have.
+    fn fanotify_state_that_cannot_mark() -> fanotify::runtime::FanotifyState {
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        fanotify::runtime::FanotifyState::new(fanotify::init::FanotifyFd::for_test(fd))
+    }
+
+    #[test]
+    fn fanotify_attach_failures_keep_the_tree_tracked() {
+        let (helper, _daemon) = ipc::socketpair().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let usable = dir.path().to_str().unwrap();
+        for (seq, cwd) in [(7, "/nonexistent/shit-r3a-cwd"), (8, usable)] {
+            let command = shit_planner::events::CommandId {
+                session: uuid::Uuid::from_u128(9),
+                seq,
+            };
+            let state = fanotify_state_that_cannot_mark();
+            let root = std::process::id();
+            let result = linux_watch_tree(&helper, Some(&state), None, command, root, cwd);
+            assert!(result.is_err(), "{cwd}");
+            assert_eq!(
+                state.tree.lock().unwrap().is_tracked(root as i32),
+                Some((command.session, command.seq)),
+                "{cwd}"
+            );
+            assert!(state.marked_paths.lock().unwrap().is_empty(), "{cwd}");
+        }
     }
 
     #[test]

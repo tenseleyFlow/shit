@@ -34,6 +34,12 @@ impl FanotifyFd {
         self.fd.as_raw_fd()
     }
 
+    /// Wrap an arbitrary fd, to test paths that follow a failed mark.
+    #[cfg(test)]
+    pub fn for_test(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
     /// Take ownership of the fd. Caller closes.
     pub fn into_owned(self) -> OwnedFd {
         self.fd
