@@ -157,6 +157,12 @@ impl Sim {
     /// the Rename). A clobbered regular `to` gets the helper's
     /// pre-image + Unlink. A directory `to` means "move into".
     fn mv(&mut self, from: &str, to: &str) {
+        self.mv_walk_skipping(from, to, None);
+    }
+
+    /// `mv` where the shim's walk misses `skip` (its file or byte
+    /// caps tripped).
+    fn mv_walk_skipping(&mut self, from: &str, to: &str, skip: Option<&str>) {
         let from_p = self.p(from);
         let mut to_p = self.p(to);
         if to_p.is_dir() {
@@ -165,8 +171,11 @@ impl Sim {
         if from_p.is_dir() {
             let mut files = Vec::new();
             walk_files(&from_p, &mut files);
+            let skip = skip.map(|s| self.p(s));
             for f in files {
-                self.pre_image(&f, WALK_SOURCE);
+                if Some(&f) != skip.as_ref() {
+                    self.pre_image(&f, WALK_SOURCE);
+                }
             }
         }
         if to_p.is_file() {
@@ -193,6 +202,32 @@ impl Sim {
     fn rm_rf(&mut self, rel: &str) {
         let p = self.p(rel);
         self.rm_rf_path(&p);
+    }
+
+    /// `rm -rf rel` as Python's `shutil.rmtree` reaches the shim: the
+    /// children go through `unlinkat` (journaled), the top directory
+    /// through a plain `rmdir` the shim does not interpose.
+    fn rmtree_top_unseen(&mut self, rel: &str) {
+        let p = self.p(rel);
+        let mut children: Vec<PathBuf> = std::fs::read_dir(&p)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        children.sort();
+        for c in children {
+            self.rm_rf_path(&c);
+        }
+        std::fs::remove_dir(&p).unwrap();
+    }
+
+    fn mkdir_unseen(&mut self, rel: &str) {
+        std::fs::create_dir(self.p(rel)).unwrap();
+    }
+
+    /// A write no capture channel journals (the shim's out-of-watch
+    /// create path did not fire).
+    fn write_unseen(&mut self, rel: &str, bytes: &[u8]) {
+        std::fs::write(self.p(rel), bytes).unwrap();
     }
 
     fn rm_rf_path(&mut self, p: &Path) {
@@ -402,5 +437,74 @@ fn rename_then_rm_with_parent_alive_restores_source_name() {
     let before = sim.snapshot();
     sim.mv("a", "b");
     sim.rm_rf("b");
+    assert_restored(&sim, &before);
+}
+
+fn seed_tree(sim: &Sim) {
+    sim.seed_dir("d", 0o750);
+    sim.seed_file("d/f", b"original\n", 0o640);
+    sim.seed_dir("d/empty", 0o700);
+    sim.seed_dir("d/sub", 0o711);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+}
+
+#[test]
+fn dir_renamed_away_then_removed_is_rebuilt_in_place() {
+    // `mv d d.old; rm -rf d.old`
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.rm_rf("d.old");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn pip_shape_dir_replaced_and_stash_removed() {
+    // pip --force-reinstall: `mv d d.old; mkdir d; echo new > d/f;
+    // mkdir d/sub; echo new > d/sub/h; rm -rf d.old`
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir("d");
+    sim.write("d/f", b"new\n");
+    sim.mkdir("d/sub");
+    sim.write("d/sub/h", b"new\n");
+    sim.rm_rf("d.old");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn pip_shape_with_partial_walk_keeps_reverse_rename() {
+    // Same, but the walk missed d/sub/g: the subtree rule must not
+    // fire, and the per-event inverses still restore everything.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv_walk_skipping("d", "d.old", Some("d/sub/g"));
+    sim.mkdir("d");
+    sim.write("d/f", b"new\n");
+    sim.rm_rf("d.old");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn pip_shape_as_the_hosted_shim_sees_it() {
+    // The journal pip produces on hosted Linux (degraded helper, shim
+    // only): no Create for the new tree, no unlink for the stash's top
+    // directory. The reverse rename has nothing to move back and the
+    // new `d` is in the way; the walk pre-images carry the restore.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"original\n", 0o640);
+    sim.seed_dir("d/empty", 0o700);
+    sim.seed_dir("d/sub", 0o711);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir_unseen("d");
+    sim.write_unseen("d/f", b"new\n");
+    sim.rmtree_top_unseen("d.old");
     assert_restored(&sim, &before);
 }

@@ -201,6 +201,9 @@ struct EventClassification {
     /// Shim chflags snapshots already covered by a kqueue
     /// `MetadataChange` for the same inode and pre-value.
     paired_flags_shims: HashSet<crate::events::EventId>,
+    /// Directory renames whose moved subtree the command later deleted
+    /// file by file, keyed by `(from, to)`. See [`ReplacedSubtrees`].
+    replaced_rename_subtrees: std::collections::HashMap<(PathBuf, PathBuf), DirRebuild>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
@@ -595,6 +598,15 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
+    // L3 (DR-CR-54.B): a directory rename whose moved subtree was later
+    // deleted. The events under `to` restore copies of what the walk
+    // already captured at `from`; they are dropped here and the
+    // Rename's inverse rebuilds `from` instead (see emit_for_tree_op).
+    let replaced = ReplacedSubtrees::from_events(events);
+    for p in replaced.dropped_paths {
+        atomic.remove(&p);
+        transient.insert(p);
+    }
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -603,6 +615,120 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         hardlink_live_paths,
         hardlink_dead_to_source,
         paired_flags_shims: HashSet::new(),
+        replaced_rename_subtrees: replaced.by_rename,
+    }
+}
+
+/// Directories to recreate for one replaced rename, as `(path, mode)`.
+type DirRebuild = Vec<(PathBuf, u32)>;
+
+/// Directory renames whose destination subtree the same command
+/// deleted again: pip's `site-packages -> ~ite-packages`, install,
+/// then `rmtree(~ite-packages)`.
+///
+/// Decided from event provenance alone. A rename qualifies when the
+/// shim's recursive walk of `from` journaled
+/// [`FilePreImageSource::ShimRenameSubtree`] pre-images for it, and
+/// after the rename every walked file was unlinked at its moved path
+/// under `to`, and no other regular file under `to` was unlinked (a
+/// file the walk did not capture, because of its caps or because it
+/// was written into `to` later, keeps its own inverses and the
+/// reverse rename). The undo-time probe is never consulted: whether
+/// `from` is occupied now says nothing about whose data it is.
+#[derive(Debug, Default)]
+struct ReplacedSubtrees {
+    /// `(from, to)` → directories to recreate under `from`, as
+    /// `(path, mode)`, parent first. `from` itself is included when
+    /// the unlink of `to` was journaled with its mode.
+    by_rename: std::collections::HashMap<(PathBuf, PathBuf), DirRebuild>,
+    /// Paths under (and including) `to` whose events are copies of
+    /// walked data or of directories rebuilt at `from`.
+    dropped_paths: HashSet<PathBuf>,
+}
+
+impl ReplacedSubtrees {
+    /// `events` is in reverse-chronological order (as `plan` sorts it).
+    fn from_events(events: &[&CaptureEvent]) -> Self {
+        let chrono: Vec<&CaptureEvent> = events.iter().rev().copied().collect();
+        let mut out = Self::default();
+        let mut pending_walk: Vec<PathBuf> = Vec::new();
+        for (i, ev) in chrono.iter().enumerate() {
+            match &ev.kind {
+                CaptureEventKind::FilePreImage {
+                    path,
+                    source: FilePreImageSource::ShimRenameSubtree,
+                    ..
+                } => pending_walk.push(path.clone()),
+                CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
+                    let walked: HashSet<PathBuf> = pending_walk
+                        .drain(..)
+                        .filter_map(|p| p.strip_prefix(from).ok().map(Path::to_path_buf))
+                        .filter(|rel| !rel.as_os_str().is_empty())
+                        .collect();
+                    if walked.is_empty() {
+                        continue;
+                    }
+                    if let Some(found) = Self::check(&chrono[i + 1..], from, to, &walked) {
+                        out.dropped_paths.extend(found.1);
+                        out.by_rename.insert((from.clone(), to.clone()), found.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Events after one qualifying rename; `None` when the subtree was
+    /// not fully deleted or held files the walk missed.
+    fn check(
+        later: &[&CaptureEvent],
+        from: &Path,
+        to: &Path,
+        walked: &HashSet<PathBuf>,
+    ) -> Option<(DirRebuild, HashSet<PathBuf>)> {
+        let mut unlinked_files: HashSet<PathBuf> = HashSet::new();
+        let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
+        let mut dropped: HashSet<PathBuf> = HashSet::new();
+        for ev in later {
+            match &ev.kind {
+                // The subtree moved again; its later history is no
+                // longer about `to`.
+                CaptureEventKind::TreeOp(TreeOp::Rename { from: f, .. })
+                    if f == to || f.starts_with(to) || to.starts_with(f) =>
+                {
+                    return None;
+                }
+                CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    path, kind, mode, ..
+                }) if path.starts_with(to) => {
+                    let rel = path.strip_prefix(to).ok()?.to_path_buf();
+                    match kind {
+                        crate::metadata::FileKind::Directory => {
+                            dirs.push((from.join(&rel), *mode));
+                        }
+                        crate::metadata::FileKind::Regular if walked.contains(&rel) => {
+                            unlinked_files.insert(rel);
+                        }
+                        _ => return None,
+                    }
+                    dropped.insert(path.clone());
+                }
+                CaptureEventKind::FilePreImage { path, .. } if path.starts_with(to) => {
+                    if !walked.contains(path.strip_prefix(to).ok()?) {
+                        return None;
+                    }
+                    dropped.insert(path.clone());
+                }
+                _ => {}
+            }
+        }
+        if unlinked_files.len() != walked.len() {
+            return None;
+        }
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        dirs.dedup_by(|a, b| a.0 == b.0);
+        Some((dirs, dropped))
     }
 }
 
@@ -1509,6 +1635,29 @@ fn emit_for_tree_op(
             // gone at undo time anyway. Same suppression principle as
             // TreeOp::Create above.
             if atomic_replace_paths.contains(to) {
+                return;
+            }
+            // L3 (DR-CR-54.B): the moved subtree was deleted again
+            // later in the command, so there is nothing at `to` to
+            // move back. Rebuild the directories under `from` here,
+            // after the inverses of everything the command did later
+            // have run; the walk's pre-images (journaled just before
+            // this rename) then restore the files in place.
+            if let Some(dirs) = class
+                .replaced_rename_subtrees
+                .get(&(from.clone(), to.clone()))
+            {
+                for (path, mode) in dirs {
+                    nodes.push(PlanNode {
+                        op: InverseOp::RecreatePath {
+                            path: path.clone(),
+                            kind: crate::metadata::FileKind::Directory,
+                            mode: *mode,
+                        },
+                        cohort: 0,
+                        conflict: None,
+                    });
+                }
                 return;
             }
             // Inverse of `from -> to` is `to -> from`.
