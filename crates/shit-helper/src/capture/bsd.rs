@@ -887,6 +887,8 @@ enum FileType {
 /// fstat that also returns the file kind. register_subtree opens both
 /// directories and files; only Regular files are valid pre-image
 /// capture targets (pread on a directory returns EISDIR).
+// st_dev as u64 is a no-op only under the FreeBSD 12+ ABI (OpenBSD i32, DragonFly u32).
+#[allow(clippy::unnecessary_cast)]
 fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: fd is expected valid; st is writable.
@@ -899,7 +901,7 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
         libc::S_IFDIR => FileType::Directory,
         _ => FileType::Other,
     };
-    Some((st.st_dev, st.st_ino, kind))
+    Some((st.st_dev as u64, st.st_ino, kind))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1069,6 +1071,8 @@ fn path_to_string(p: &Path) -> String {
 /// `cap_enter(2)`. The caller already holds `dir_fd` as a tracked
 /// kqueue watch fd (we dup before fdopendir to avoid losing the
 /// original reference).
+// st_dev as u64 is a no-op only under the FreeBSD 12+ ABI (OpenBSD i32, DragonFly u32).
+#[allow(clippy::unnecessary_cast)]
 fn read_dir_entries(
     dir_fd: RawFd,
 ) -> std::io::Result<BTreeMap<std::ffi::OsString, DirEntryBaseline>> {
@@ -1133,7 +1137,7 @@ fn read_dir_entries(
         out.insert(
             name_os,
             DirEntryBaseline {
-                dev: st.st_dev,
+                dev: st.st_dev as u64,
                 inode: st.st_ino,
                 symlink_target,
             },
