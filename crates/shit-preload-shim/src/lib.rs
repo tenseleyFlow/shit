@@ -862,20 +862,44 @@ mod policy {
         canonical_path(path).unwrap_or_else(|_| path.to_string())
     }
 
-    /// DR-CR-54.B — resolve an `*at` syscall's `(dirfd, path)`
-    /// pair to an absolute path. `dirfd == AT_FDCWD` (-100) uses
-    /// the caller's cwd, so canonicalize directly. Otherwise we
-    /// read `/proc/self/fd/<dirfd>` (Linux) to discover what
-    /// directory the fd refers to, then join with `path` and
-    /// canonicalize.
+    /// DR-CR-54.B — join an `*at` syscall's `(dirfd, path)` pair into
+    /// the path the kernel will act on, without canonicalizing.
     ///
-    /// When path is already absolute, dirfd is ignored (POSIX
-    /// `*at` semantics).
-    ///
-    /// Best-effort: on any failure (proc unavailable, dirfd
-    /// invalid, canonicalize fails because target doesn't exist
-    /// yet) we fall through to the existing `canonical_path` which
-    /// tries parent-canonicalize, then bare-string.
+    /// Absolute paths and `AT_FDCWD` are returned as given (both are
+    /// already relative to the right base: nothing or the cwd). For a
+    /// real dirfd on Linux, `/proc/self/fd/<dirfd>` names the
+    /// directory and the result is `dir/path`. Anywhere else (BSD has
+    /// no equivalent here) the raw path is returned unchanged: a
+    /// relative key that cannot be matched fails closed, where
+    /// canonicalizing it against the cwd would invent a wrong
+    /// absolute key.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn join_at_path(dirfd: libc::c_int, path: &str) -> String {
+        if path.starts_with('/') || dirfd == libc::AT_FDCWD {
+            return path.to_string();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(dir) = std::fs::read_link(format!("/proc/self/fd/{dirfd}"))
+                && let Some(s) = dir.join(path).to_str()
+            {
+                return s.to_string();
+            }
+        }
+        path.to_string()
+    }
+
+    /// DR-CR-54.B — [`join_at_path`] followed by a best-effort
+    /// canonicalize. When canonicalize fails the joined path is
+    /// returned, not the raw relative input. A dirfd-relative path
+    /// that could not be joined is returned raw and not
+    /// canonicalized (see [`join_at_path`]).
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -884,33 +908,11 @@ mod policy {
         target_os = "linux",
     ))]
     pub fn resolve_at_path(dirfd: libc::c_int, path: &str) -> String {
-        use std::path::Path;
-        if path.starts_with('/') {
-            return canonical_path_or_raw(path);
+        let joined = join_at_path(dirfd, path);
+        if !joined.starts_with('/') && dirfd != libc::AT_FDCWD {
+            return joined;
         }
-        if dirfd == libc::AT_FDCWD {
-            return canonical_path_or_raw(path);
-        }
-        // Read /proc/self/fd/<dirfd> to discover the directory.
-        // FreeBSD has /dev/fd; macOS has /dev/fd too; both work
-        // similarly enough for our linux-tier interception that
-        // we keep this Linux-targeted. The shim's BSD path uses
-        // `rename`/`unlink` (non-*at) primarily.
-        #[cfg(target_os = "linux")]
-        {
-            let link = format!("/proc/self/fd/{dirfd}");
-            if let Ok(dir) = std::fs::read_link(&link) {
-                let joined = dir.join(path);
-                if let Some(s) = joined.to_str() {
-                    return canonical_path_or_raw(s);
-                }
-            }
-        }
-        // Last resort — let canonical_path try its parent-fallback
-        // dance against the raw relative input. Worse case is the
-        // existing relative-path behavior, no regression.
-        let _ = Path::new(path);
-        canonical_path_or_raw(path)
+        canonical_path_or_raw(&joined)
     }
 
     /// AU10 — structured failure from [`canonical_path`]. Each
@@ -1439,8 +1441,8 @@ mod interposers {
         // and the classifier can't reach atomic-replace.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::resolve_at_path(fromfd, &from_str);
-        let to_abs = policy::resolve_at_path(tofd, &to_str);
+        let from_abs = policy::join_at_path(fromfd, &from_str);
+        let to_abs = policy::join_at_path(tofd, &to_str);
         policy::notify_rename_with_dst_preimage("renameat", &from_abs, &to_abs);
         let real = next::real_renameat();
         if next::is_zero(next::as_usize(real)) {
@@ -1471,8 +1473,8 @@ mod interposers {
         // DR-CR-54.B: same dirfd→absolute resolution as renameat.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::resolve_at_path(fromfd, &from_str);
-        let to_abs = policy::resolve_at_path(tofd, &to_str);
+        let from_abs = policy::join_at_path(fromfd, &from_str);
+        let to_abs = policy::join_at_path(tofd, &to_str);
         policy::notify_rename_with_dst_preimage("renameat2", &from_abs, &to_abs);
         let real = next::real_renameat2();
         if next::is_zero(next::as_usize(real)) {
