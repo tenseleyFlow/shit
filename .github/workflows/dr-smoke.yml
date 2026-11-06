@@ -2094,6 +2094,33 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  # Self-hosted runner preflight. A powered-off runner leaves
+  # linux-kernel-capture queued until GitHub cancels it after 24h; this
+  # job turns that into a visibly skipped job. See tools/ar00-runner/README.md.
+  runner-preflight:
+    name: self-hosted runner preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      online: ${{ steps.check.outputs.online }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK: ${{ vars.LSM_RUNNER_ONLINE }}
+        run: |
+          if online=$(gh api "repos/${{ github.repository }}/actions/runners" \
+              --jq '[.runners[] | select(.status == "online") | select(any(.labels[]; .name == "linux-kernel-capture"))] | length > 0' 2>/dev/null); then
+            echo "runner list via API: online=${online}"
+          else
+            online="${FALLBACK:-true}"
+            echo "::notice::runner list unavailable to this token; using LSM_RUNNER_ONLINE=${online}"
+          fi
+          echo "online=${online}" >> "$GITHUB_OUTPUT"
+          if [ "${online}" != "true" ]; then
+            echo "::warning::linux-kernel-capture runner is offline; skipping the LSM matrix"
+          fi
+
   # L07 — Linux kernel-capture matrix. Exercises L02 (rm/edit),
   # L03 (chmod/mkdir/touch-edit deferred), L04 (eBPF-LSM tier),
   # and L04.1 (file_open + rename) end-to-end on the runner's
@@ -2106,6 +2133,8 @@ jobs:
   # surfaces as a labeled failure instead of consuming the whole
   # 30-min job budget.
   linux-kernel-capture:
+    needs: runner-preflight
+    if: needs.runner-preflight.outputs.online == 'true'
     name: linux-kernel-capture (L02/L03/L04 smoke matrix)
     # Self-hosted DO runner provisioned in AR00 with `bpf` in the
     # active LSMs (stock `ubuntu-24.04` runners boot without it,
