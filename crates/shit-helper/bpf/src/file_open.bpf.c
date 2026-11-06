@@ -78,11 +78,11 @@ int BPF_PROG(shit_file_open, struct file *file)
     /* f_inode is populated for any file-backed struct file. For anon inodes,
      * FIFOs and devices, the userspace snapshot lookup misses.
      * Non-regular files deliberately reach userspace, where the snapshot
-     * lookup misses and drops them. Filtering them here loses capture: the
-     * event attributes the pid to its tree while the process is alive. `git
-     * clean` opens /dev/null O_RDWR first, and without that event its later
-     * unlinks can be consumed after it exits, when /proc can no longer
-     * resolve a grandchild of the tracked root. */
+     * lookup misses and drops them. An S_IFREG filter here made `git clean`
+     * lose its captures intermittently (10 of 40 smoke runs, 0 of 40 without
+     * it). The suspected cause, not traced, is an attribution race: `git
+     * clean` opens /dev/null O_RDWR first, and that event may be what lets
+     * /proc resolve a grandchild of the tracked root while it is alive. */
     struct inode *target = BPF_CORE_READ(file, f_inode);
     e->dev = BPF_CORE_READ(target, i_sb, s_dev);
     e->inode = BPF_CORE_READ(target, i_ino);
