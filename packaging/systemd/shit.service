@@ -18,17 +18,12 @@ ExecStart=@@SHITD_BIN@@ --foreground --config @@CONFIG_PATH@@
 Restart=on-failure
 RestartSec=10
 
-# Hardening (relaxed; shitd is per-user, not privileged)
-NoNewPrivileges=true
-PrivateTmp=false
-ProtectSystem=full
-ProtectHome=false
-ProtectKernelTunables=true
-ProtectKernelLogs=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
+# No sandboxing directives. shitd spawns shit-helper, which gets its
+# privileges from file capabilities (cap_bpf, cap_perfmon, cap_sys_admin);
+# NoNewPrivileges=true would stop exec from granting them. In a user manager
+# the Protect*, Restrict* and LockPersonality options also fail with
+# status=218/CAPABILITIES when unprivileged user namespaces are restricted
+# (Ubuntu 24.04 hosted runners).
 
 [Install]
 WantedBy=default.target
