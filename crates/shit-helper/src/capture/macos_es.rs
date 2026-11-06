@@ -1260,14 +1260,20 @@ impl CaptureControl {
     /// `cwd_path` must be non-empty — macOS doesn't have a
     /// FreeBSD-style sysctl(KERN_PROC_CWD) fallback we'd want to
     /// rely on.
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32, cwd_path: &str) {
+    pub fn on_watch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        root_pid: u32,
+        cwd_path: &str,
+    ) -> Result<(), String> {
         if cwd_path.is_empty() {
             tracing::warn!(
                 %session,
                 command_seq,
                 "WatchTree without cwd_path on macOS ES; watch dropped"
             );
-            return;
+            return Err("WatchTree carried no cwd_path".to_string());
         }
         let command = CommandId {
             session,
@@ -1284,7 +1290,9 @@ impl CaptureControl {
                 err = %e,
                 "macos-es control channel full; WatchTree dropped"
             );
+            return Err(format!("control channel rejected the attach: {e}"));
         }
+        Ok(())
     }
 
     pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {

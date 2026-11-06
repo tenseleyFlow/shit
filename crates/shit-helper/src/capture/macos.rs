@@ -104,14 +104,20 @@ impl CaptureControl {
     /// `sysctl(KERN_PROC_CWD)` fallback because libproc cross-PID
     /// queries are unreliable enough (TCC, dropped privileges) that
     /// requiring the path keeps the contract honest.
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, _root_pid: u32, cwd_path: &str) {
+    pub fn on_watch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        _root_pid: u32,
+        cwd_path: &str,
+    ) -> Result<(), String> {
         if cwd_path.is_empty() {
             tracing::warn!(
                 %session,
                 command_seq,
                 "WatchTree without cwd_path on macOS; watch dropped"
             );
-            return;
+            return Err("WatchTree carried no cwd_path".to_string());
         }
         let path = PathBuf::from(cwd_path);
         let command = CommandId {
@@ -128,7 +134,9 @@ impl CaptureControl {
                 err = %e,
                 "fsevents control channel full; WatchTree dropped"
             );
+            return Err(format!("control channel rejected the attach: {e}"));
         }
+        Ok(())
     }
 
     pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {

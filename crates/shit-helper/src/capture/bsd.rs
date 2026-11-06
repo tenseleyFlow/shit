@@ -1283,20 +1283,27 @@ impl CaptureControl {
         })
     }
 
-    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
+    /// Queue a detach. Returns true when the pump will process it (and
+    /// send `UnwatchTreeFlushed` afterwards); false when the caller must
+    /// send the marker itself.
+    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) -> bool {
         // AU16 — same logging treatment as on_watch_tree.
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach {
+        match self.tx.try_send(ControlMsg::Detach {
             command: CommandId {
                 session,
                 seq: command_seq,
             },
         }) {
-            tracing::warn!(
-                %session,
-                command_seq,
-                err = %e,
-                "bsd capture control channel full or closed; UnwatchTree dropped"
-            );
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    err = %e,
+                    "bsd capture control channel full or closed; UnwatchTree dropped"
+                );
+                false
+            }
         }
     }
 
@@ -1388,6 +1395,21 @@ fn pump(
             }
             Ok(ControlMsg::Detach { command }) => {
                 state.detach(command);
+                // Close barrier: after detach the pump attributes nothing
+                // more to this command, and every response it sent for the
+                // command is already on the wire ahead of this marker.
+                let flushed = HelperResponse::UnwatchTreeFlushed {
+                    session: command.session,
+                    command_seq: command.seq,
+                };
+                if let Err(e) = state.conn.send_response(&flushed) {
+                    tracing::warn!(
+                        err = %e,
+                        %command.session,
+                        seq = command.seq,
+                        "UnwatchTreeFlushed send failed; daemon close will time out"
+                    );
+                }
                 continue;
             }
             Ok(ControlMsg::Shutdown) => {
