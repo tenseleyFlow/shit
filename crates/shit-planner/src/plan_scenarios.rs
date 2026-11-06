@@ -46,8 +46,6 @@ struct Sim {
     blobs: InMemoryBlobReader,
     store: InMemoryStore,
     next: u64,
-    /// Wall clock the command started at; set by the first `snapshot`.
-    started_wall_nanos: std::cell::Cell<u64>,
     /// Paths under here report this device in journaled events, so a
     /// tempdir can stand in for a second filesystem.
     other_fs: Option<(PathBuf, u64)>,
@@ -61,7 +59,6 @@ impl Sim {
             blobs: InMemoryBlobReader::new(),
             store: InMemoryStore::new(),
             next: 1,
-            started_wall_nanos: std::cell::Cell::new(0),
             other_fs: None,
         }
     }
@@ -320,10 +317,12 @@ impl Sim {
     fn mv_exdev(&mut self, from: &str, to: &str, journal_create: bool) {
         let from_p = self.p(from);
         let to_p = self.p(to);
+        // The daemon stats `to` for the Rename's inode: its real device.
+        let dev = self.other_fs.as_ref().map_or(0, |(_, dev)| *dev);
         self.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
             from: from_p.clone(),
             to: to_p.clone(),
-            inode: InodeRef::new(0, 0),
+            inode: InodeRef::new(dev, 1),
         }));
         std::fs::copy(&from_p, &to_p).unwrap();
         // mv preserves the source's mtime on the copy.
@@ -351,6 +350,37 @@ impl Sim {
             kind: FileKind::Regular,
             mode: m.mode(),
         }));
+    }
+
+    /// `mv from to` of a directory across filesystems: the walk and
+    /// Rename are journaled, rename fails, and mv copies and removes.
+    fn mv_exdev_dir(&mut self, from: &str, to: &str) {
+        let from_p = self.p(from);
+        let to_p = self.p(to);
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        let mut complete = true;
+        walk_tree(&from_p, &mut files, &mut dirs, &mut complete);
+        for f in &files {
+            self.pre_image(f, WALK_SOURCE);
+        }
+        for d in &dirs {
+            self.pre_image_dir(d);
+        }
+        self.pre_image_dir(&from_p);
+        self.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+            from: from_p.clone(),
+            to: to_p.clone(),
+            inode: InodeRef::new(0, 0),
+        }));
+        std::fs::create_dir(&to_p).unwrap();
+        for d in &dirs {
+            std::fs::create_dir(to_p.join(d.strip_prefix(&from_p).unwrap())).unwrap();
+        }
+        for f in &files {
+            std::fs::copy(f, to_p.join(f.strip_prefix(&from_p).unwrap())).unwrap();
+        }
+        self.rm_rf_path(&from_p);
     }
 
     /// `rm rel` where no pre-image could be captured (unreadable file).
@@ -396,19 +426,7 @@ impl Sim {
         }
     }
 
-    /// The first call marks the command's start. File mtimes come from
-    /// the kernel's coarse clock, so sleep past a tick on both sides:
-    /// seeded files are provably older than the start, and files the
-    /// command writes are provably not.
     fn snapshot(&self) -> BTreeMap<PathBuf, Entry> {
-        if self.started_wall_nanos.get() == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap();
-            self.started_wall_nanos.set(now.as_nanos() as u64);
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
         let mut out = BTreeMap::new();
         snapshot_into(self.root.path(), self.root.path(), &mut out);
         out
@@ -416,16 +434,14 @@ impl Sim {
 
     fn plan_nodes(&self) -> Vec<crate::inverse::PlanNode> {
         let probe = LiveStateProbe::new();
-        let record = command_record(self.started_wall_nanos.get());
-        plan(record, &self.events, &probe, &self.store).nodes
+        plan(command_record(), &self.events, &probe, &self.store).nodes
     }
 
     /// Plan against the live post-state and apply with the CLI's
     /// default policy (Abort, serial).
     fn undo(&self) -> Vec<String> {
         let probe = LiveStateProbe::new();
-        let record = command_record(self.started_wall_nanos.get());
-        let p = plan(record, &self.events, &probe, &self.store);
+        let p = plan(command_record(), &self.events, &probe, &self.store);
         let exec = FileExecutor::new(&self.blobs);
         let report = Orchestrator::new(&exec, &probe).run(&p, false, ConflictPolicy::Abort);
         report
@@ -494,14 +510,14 @@ fn command_id() -> CommandId {
     }
 }
 
-fn command_record(started_wall_nanos: u64) -> CommandRecord {
+fn command_record() -> CommandRecord {
     CommandRecord {
         command: command_id(),
         cmd_string: Some("scenario".to_string()),
         cwd: PathBuf::from("/"),
         pid: 0,
         shell_kind: shit_proto::ShellKind::Bash,
-        started_at: TimePoint::new(0, started_wall_nanos),
+        started_at: TimePoint::new(0, 0),
         ended_at: Some(TimePoint::new(1_000_000, 0)),
         exit_code: Some(0),
         event_ids: Vec::new(),
@@ -510,6 +526,7 @@ fn command_record(started_wall_nanos: u64) -> CommandRecord {
 
 fn assert_restored(sim: &Sim, before: &BTreeMap<PathBuf, Entry>) {
     let log = sim.undo();
+    assert_no_failures(&log);
     let after = sim.snapshot();
     assert_eq!(
         &after,
@@ -792,15 +809,25 @@ fn recreated_generation_at_rename_destination_is_removed() {
 }
 
 #[test]
-fn unseen_scratch_file_moved_then_removed_leaves_no_stray() {
-    // `echo x > tmp; mv tmp x; rm x`, the create not journaled
+fn moved_file_with_captured_bytes_is_restored_even_if_it_was_scratch() {
+    // `echo x > tmp; mv tmp x; rm x`, the create not journaled. Nothing
+    // can tell this from `mv a b; rm b`, so the bytes go back. A stray
+    // scratch file is acceptable and data loss is not.
     let mut sim = Sim::new();
     sim.seed_file("keep", b"k\n", 0o644);
-    let before = sim.snapshot();
+    sim.snapshot();
     sim.write_unseen("tmp", b"x\n");
     sim.mv("tmp", "x");
     sim.rm_rf("x");
-    assert_restored(&sim, &before);
+    let log = sim.undo();
+    assert_no_failures(&log);
+    assert!(
+        !log.iter().any(|l| l.contains("refused")),
+        "{}",
+        log.join("\n")
+    );
+    assert_eq!(std::fs::read(sim.p("tmp")).unwrap(), b"x\n");
+    assert!(!sim.p("x").exists(), "{}", log.join("\n"));
 }
 
 #[test]
@@ -885,14 +912,27 @@ fn clobbering_rename_then_rm_restores_both_names() {
 #[test]
 fn unseen_scratch_file_over_existing_then_rm_restores_the_existing_file() {
     // `echo x > tmp; mv tmp b; rm b` with b existing, the create not
-    // journaled: b's own pre-image is proof, tmp's history is not.
+    // journaled: b comes back, and tmp as a stray.
     let mut sim = Sim::new();
     sim.seed_file("b", b"bravo\n", 0o600);
-    let before = sim.snapshot();
+    sim.snapshot();
     sim.write_unseen("tmp", b"x\n");
     sim.mv("tmp", "b");
     sim.rm_rf("b");
-    assert_restored(&sim, &before);
+    let log = sim.undo();
+    assert_no_failures(&log);
+    assert_eq!(
+        std::fs::read(sim.p("b")).unwrap(),
+        b"bravo\n",
+        "{}",
+        log.join("\n")
+    );
+    assert_eq!(
+        std::fs::read(sim.p("tmp")).unwrap(),
+        b"x\n",
+        "{}",
+        log.join("\n")
+    );
 }
 
 #[test]
@@ -960,7 +1000,6 @@ fn assert_no_failures(log: &[String]) {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 1, duplicate Unlink aborts before the reverse rename"]
 fn dual_tier_mv_then_rm_restores_source_name() {
     // `mv a b; rm b` with shim and helper both reporting the unlink.
     let mut sim = Sim::new();
@@ -972,7 +1011,6 @@ fn dual_tier_mv_then_rm_restores_source_name() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 1, duplicate Unlink aborts before the reverse rename"]
 fn dual_tier_helper_first_mv_then_rm_restores_source_name() {
     let mut sim = Sim::new();
     sim.seed_file("a", b"alpha\n", 0o640);
@@ -983,7 +1021,6 @@ fn dual_tier_helper_first_mv_then_rm_restores_source_name() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 2, refused at the first Unlink before the helper pre-image"]
 fn file_above_shim_cap_moved_then_removed_restores_source_name() {
     // `mv big big2; rm big2`: the shim has no bytes, the helper does,
     // and its pre-image lands after the shim's Unlink.
@@ -1002,7 +1039,6 @@ fn file_above_shim_cap_moved_then_removed_restores_source_name() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 3, failed rename reversed"]
 fn cross_device_mv_then_rm_with_journaled_copy_restores_source() {
     // `mv f other/g; rm other/g`, with the copy's Create seen.
     let mut sim = Sim::new();
@@ -1018,7 +1054,6 @@ fn cross_device_mv_then_rm_with_journaled_copy_restores_source() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 3, failed rename reversed"]
 fn cross_device_mv_then_rm_with_unseen_copy_restores_source() {
     // Same with the create unseen: `g` may come back as a stray (its
     // pre-image is all that is known about it), `f` must come back and
@@ -1036,7 +1071,6 @@ fn cross_device_mv_then_rm_with_unseen_copy_restores_source() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 3, failed rename reversed"]
 fn cross_device_mv_with_copy_still_present_restores_source() {
     // `mv f other/g` alone: the copy is alive, and nothing moves it back.
     let mut sim = Sim::new();
@@ -1051,7 +1085,6 @@ fn cross_device_mv_with_copy_still_present_restores_source() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 4, mtime test refuses captured bytes"]
 fn future_dated_file_moved_then_removed_is_restored() {
     // `mv a b; rm b` where a's mtime is ahead of the clock: the bytes
     // were captured, so refusing loses them.
@@ -1071,7 +1104,6 @@ fn future_dated_file_moved_then_removed_is_restored() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 5, symlink not Born"]
 fn scratch_symlink_moved_then_removed_leaves_nothing_and_no_refusal() {
     // `ln -s x tmp; mv tmp link; rm link`
     let mut sim = Sim::new();
@@ -1095,7 +1127,6 @@ fn scratch_symlink_moved_then_removed_leaves_nothing_and_no_refusal() {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 5, hard link not Born"]
 fn scratch_hard_link_moved_then_removed_leaves_nothing_and_no_refusal() {
     // `ln a tmp; mv tmp link; rm link`, no pre-image at the unlink
     let mut sim = Sim::new();
@@ -1144,19 +1175,16 @@ fn read_only_tree_round_trip(mode: u32) {
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 6, directory mode applied before children"]
 fn read_only_0555_tree_is_rebuilt() {
     read_only_tree_round_trip(0o555);
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 6, directory mode applied before children"]
 fn read_only_0500_tree_is_rebuilt() {
     read_only_tree_round_trip(0o500);
 }
 
 #[test]
-#[ignore = "fails at 10dc7b7, second review of #205: item 7, no RestoreMetadata for rebuilt directories"]
 fn rebuilt_directory_gets_its_recorded_metadata_after_its_children() {
     use crate::inverse::InverseOp;
     let mut sim = Sim::new();
@@ -1186,4 +1214,86 @@ fn rebuilt_directory_gets_its_recorded_metadata_after_its_children() {
         let m = std::fs::metadata(sim.p(rel)).unwrap();
         assert_eq!(m.mtime(), 1_000_000, "{rel}\n{}", log.join("\n"));
     }
+}
+
+#[test]
+fn cross_device_dir_mv_then_rm_restores_source() {
+    // `mv d other/t; rm -rf other/t`, the copy's creates unseen: d comes
+    // back, and the undo does not abort on the failed rename.
+    let mut sim = Sim::new();
+    sim.seed_dir("other", 0o755);
+    sim.other_fs = Some((sim.p("other"), 4242));
+    sim.seed_dir("d/sub", 0o750);
+    sim.seed_file("d/f", b"f\n", 0o640);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+    let before = sim.snapshot();
+    sim.mv_exdev_dir("d", "other/t");
+    sim.rm_rf("other/t");
+    let log = sim.undo();
+    assert_no_failures(&log);
+    let after = sim.snapshot();
+    for rel in ["d", "d/f", "d/sub", "d/sub/g"] {
+        assert_eq!(
+            after.get(Path::new(rel)),
+            before.get(Path::new(rel)),
+            "{rel}\n{}",
+            log.join("\n")
+        );
+    }
+}
+
+#[test]
+fn recreated_source_is_not_mistaken_for_a_failed_rename() {
+    // `mv a b; echo new > a; rm a`, same device, the recreate unseen. The
+    // later events at `a` are a new entry and the Rename stands. Undo
+    // restores the new `a` first, so the reverse rename conflicts, loudly,
+    // with the original bytes still at `b`. Dropping the Rename would
+    // leave nothing saying where they went.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    sim.snapshot();
+    sim.mv("a", "b");
+    sim.write_unseen("a", b"new\n");
+    sim.rm_rf("a");
+    let log = sim.undo();
+    assert!(
+        log.iter().any(|l| l.contains("Rename")),
+        "Rename dropped\n{}",
+        log.join("\n")
+    );
+    assert_eq!(
+        std::fs::read(sim.p("b")).unwrap(),
+        b"alpha\n",
+        "{}",
+        log.join("\n")
+    );
+}
+
+#[test]
+fn dual_tier_rename_and_unlink_restores_source_name() {
+    // `mv a b; rm b` with both tiers reporting the Rename as well.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("a", "b");
+    let dup = sim.events.last().unwrap().kind.clone();
+    sim.emit(dup);
+    sim.rm_dual_tier("b", true, false);
+    let log = sim.undo();
+    assert_no_failures(&log);
+    assert_eq!(sim.snapshot(), before, "{}", log.join("\n"));
+}
+
+#[test]
+fn dual_tier_rename_alone_restores_source_name() {
+    // `mv a b` with both tiers reporting it.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("a", "b");
+    let dup = sim.events.last().unwrap().kind.clone();
+    sim.emit(dup);
+    let log = sim.undo();
+    assert_no_failures(&log);
+    assert_eq!(sim.snapshot(), before, "{}", log.join("\n"));
 }

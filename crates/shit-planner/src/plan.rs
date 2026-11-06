@@ -101,7 +101,7 @@ pub fn plan(
     //      within one command; the captured FilePreImage is of an
     //      already-gone file). No user-meaningful change to undo.
     //      Skip all three inverses entirely.
-    let mut class = classify_replace_paths(&live, probe, command.started_at.wallclock_unix_nanos);
+    let mut class = classify_replace_paths(&live, probe);
     // FreeBSD observes an in-watch chflags twice: the shim's pre-state
     // snapshot and kqueue's before/after MetadataChange. Pair each helper
     // event with at most one earlier shim event and drop the shim copy so
@@ -113,48 +113,24 @@ pub fn plan(
     };
 
     for ev in &live {
-        // L3: decided per event, because one path can hold several
-        // generations within a command.
-        if class.dropped_events.contains(&ev.id) {
-            continue;
+        emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
+        // L3: this is the last of a replaced subtree's restores, so its
+        // directories can take their recorded metadata: mode (which may
+        // forbid writing into them), owner, xattrs and mtime. Deepest
+        // first, so a parent's mode cannot lock out its children.
+        if let Some(dirs) = class.rebuilt_dir_metadata.get(&ev.id) {
+            for (inode, path, target) in dirs {
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreMetadata {
+                        inode: *inode,
+                        path: path.clone(),
+                        target: target.clone(),
+                    },
+                    cohort: 0,
+                    conflict: None,
+                });
+            }
         }
-        if let Some(reason) = class.refused_unlinks.get(&ev.id) {
-            nodes.push(PlanNode {
-                op: InverseOp::Refuse {
-                    class: "unproven-move".to_string(),
-                    reason: reason.clone(),
-                    remediation: None,
-                },
-                cohort: 0,
-                conflict: None,
-            });
-            continue;
-        }
-        // W01.B.fix-rename-coalescing: skip the entire event if the
-        // path is transient (Create+PreImage+Unlink AND gone at undo).
-        // A replaced subtree's walk pre-image is pre-rename data, even
-        // when a later scratch file at the same path is transient.
-        if let Some(p) = event_path(ev)
-            && class.transient_paths.contains(p)
-            && !class.walk_restores.contains(&ev.id)
-        {
-            continue;
-        }
-        // W09.20: skip the entire event for the LIVE side of a
-        // hardlink-aliased inode. bar in `ln foo bar; rm foo`
-        // generated spurious FilePreImage + Unlink events (kqueue
-        // NOTE_DELETE fires on every fd opened on the inode, not just
-        // the unlinked-name fd), but bar is currently correct on
-        // disk — emit nothing and leave it alone. The dead-side
-        // events (foo) emit one CreateHardlink that aliases foo back
-        // to bar.
-        if let Some(p) = event_path(ev)
-            && class.hardlink_live_paths.contains(p)
-            && !is_flags_only_event(ev)
-        {
-            continue;
-        }
-        emit_for_event(ev, probe, store, &class, &mut nodes, &mut warnings);
     }
 
     // DR-14: partition nodes into cohorts so the orchestrator's
@@ -168,6 +144,58 @@ pub fn plan(
         nodes,
         warnings,
     }
+}
+
+fn emit_unless_skipped(
+    ev: &CaptureEvent,
+    probe: &dyn StateProbe,
+    store: &dyn PlannerStore,
+    class: &EventClassification,
+    nodes: &mut Vec<PlanNode>,
+    warnings: &mut Vec<PlanWarning>,
+) {
+    // L3: decided per event, because one path can hold several
+    // generations within a command.
+    if class.dropped_events.contains(&ev.id) {
+        return;
+    }
+    if let Some(reason) = class.refused_unlinks.get(&ev.id) {
+        nodes.push(PlanNode {
+            op: InverseOp::Refuse {
+                class: "unproven-move".to_string(),
+                reason: reason.clone(),
+                remediation: None,
+            },
+            cohort: 0,
+            conflict: None,
+        });
+        return;
+    }
+    // W01.B.fix-rename-coalescing: skip the entire event if the
+    // path is transient (Create+PreImage+Unlink AND gone at undo).
+    // A replaced subtree's walk pre-image is pre-rename data, even
+    // when a later scratch file at the same path is transient.
+    if let Some(p) = event_path(ev)
+        && class.transient_paths.contains(p)
+        && !class.walk_restores.contains(&ev.id)
+    {
+        return;
+    }
+    // W09.20: skip the entire event for the LIVE side of a
+    // hardlink-aliased inode. bar in `ln foo bar; rm foo`
+    // generated spurious FilePreImage + Unlink events (kqueue
+    // NOTE_DELETE fires on every fd opened on the inode, not just
+    // the unlinked-name fd), but bar is currently correct on
+    // disk — emit nothing and leave it alone. The dead-side
+    // events (foo) emit one CreateHardlink that aliases foo back
+    // to bar.
+    if let Some(p) = event_path(ev)
+        && class.hardlink_live_paths.contains(p)
+        && !is_flags_only_event(ev)
+    {
+        return;
+    }
+    emit_for_event(ev, probe, store, class, nodes, warnings);
 }
 
 /// Flags mutations apply to an inode, not one directory entry. A kqueue
@@ -226,20 +254,23 @@ struct EventClassification {
     replaced_renames: std::collections::HashMap<crate::events::EventId, DirRebuild>,
     /// Walk pre-images that restore a replaced subtree.
     walk_restores: HashSet<crate::events::EventId>,
+    /// A replaced subtree's last walk event -> its directories' recorded
+    /// metadata, applied after that event's restore.
+    rebuilt_dir_metadata:
+        std::collections::HashMap<crate::events::EventId, Vec<RebuiltDirMetadata>>,
     /// Events with no inverse: copies of walked data under a replaced
-    /// rename's destination, duplicate Creates, and what a refused move
-    /// leaves over.
+    /// rename's destination, duplicate reports, unlinks a pre-image
+    /// already covers, renames that did not happen, and what a refused
+    /// move or a scratch entry leaves over.
     dropped_events: HashSet<crate::events::EventId>,
     /// Unlinks of moved data that undo cannot prove it can restore;
     /// each becomes a Refuse node with this reason.
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
 }
 
-fn classify_replace_paths(
-    events: &[&CaptureEvent],
-    probe: &dyn StateProbe,
-    started_wall_nanos: u64,
-) -> EventClassification {
+fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
+    let index = EventPathIndex::new(events);
+    let disproved = disproved_renames(events, &index, probe);
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
@@ -272,11 +303,7 @@ fn classify_replace_paths(
     for ev in events {
         match &ev.kind {
             CaptureEventKind::FilePreImage { path, source, .. } => {
-                if !matches!(
-                    source,
-                    FilePreImageSource::ShimFlagsPreMutation
-                        | FilePreImageSource::ShimRenameSubtreeDir
-                ) {
+                if source.has_content() {
                     // A flags-only shim event carries inline bytes solely
                     // because it reuses the FilePreImage wire, and a walk's
                     // directory record has no content at all. Treating
@@ -322,12 +349,14 @@ fn classify_replace_paths(
             // outright. Treating the rename's destination identically
             // to a Create for classification purposes closes the gap.
             CaptureEventKind::TreeOp(TreeOp::Rename { to, .. }) => {
-                rename_destinations.insert(to.clone());
+                if !disproved.contains(&ev.id) {
+                    rename_destinations.insert(to.clone());
+                }
             }
             _ => {}
         }
     }
-    let provenance = Provenance::from_events(events, started_wall_nanos);
+    let provenance = Provenance::from_events(events, &disproved);
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
     for p in creates.iter().chain(rename_destinations.iter()) {
@@ -489,9 +518,9 @@ fn classify_replace_paths(
         }
         // Strict descendant of any rename destination — the dir
         // rename inverse will carry it along.
-        if rename_destinations
-            .iter()
-            .any(|d| p.starts_with(d) && p != d)
+        if p.ancestors()
+            .skip(1)
+            .any(|a| rename_destinations.contains(a))
         {
             rename_subsumed_creates.insert(p.clone());
         }
@@ -640,9 +669,10 @@ fn classify_replace_paths(
     // deleted. The events under `to` restore copies of what the walk
     // already captured at `from`; they are dropped and the Rename's
     // inverse rebuilds `from` instead (see emit_for_tree_op).
-    let replaced = ReplacedSubtrees::from_events(events, probe);
+    let replaced = ReplacedSubtrees::from_events(events, &index, &disproved, probe);
     let mut dropped_events = replaced.dropped_events;
     dropped_events.extend(provenance.dropped_events);
+    dropped_events.extend(disproved);
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -653,6 +683,7 @@ fn classify_replace_paths(
         paired_flags_shims: HashSet::new(),
         replaced_renames: replaced.by_rename,
         walk_restores: replaced.walk_restores,
+        rebuilt_dir_metadata: replaced.dir_metadata,
         dropped_events,
         refused_unlinks: provenance.refused_unlinks,
     }
@@ -661,19 +692,141 @@ fn classify_replace_paths(
 /// Directories to recreate for one replaced rename, as `(path, mode)`.
 type DirRebuild = Vec<(PathBuf, u32)>;
 
-/// Does this event name `root` or anything under it? A Rename also
-/// counts when it moves an ancestor of `root`.
-fn event_touches(ev: &CaptureEvent, root: &Path) -> bool {
-    match &ev.kind {
-        CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
-            from.starts_with(root)
-                || to.starts_with(root)
-                || root.starts_with(from)
-                || root.starts_with(to)
+/// A rebuilt directory's record: `(inode, path, metadata)`.
+type RebuiltDirMetadata = (
+    crate::inode::InodeRef,
+    PathBuf,
+    crate::metadata::FileMetadata,
+);
+
+/// Chronological event positions by every path an event names, so a
+/// question about one subtree costs its own events, not the journal's.
+struct EventPathIndex<'a> {
+    chrono: Vec<&'a CaptureEvent>,
+    by_path: std::collections::BTreeMap<PathBuf, Vec<usize>>,
+}
+
+impl<'a> EventPathIndex<'a> {
+    /// `events` is in reverse-chronological order (as `plan` sorts it).
+    fn new(events: &[&'a CaptureEvent]) -> Self {
+        let chrono: Vec<&CaptureEvent> = events.iter().rev().copied().collect();
+        let mut by_path: std::collections::BTreeMap<PathBuf, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, ev) in chrono.iter().enumerate() {
+            match &ev.kind {
+                CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
+                    by_path.entry(from.clone()).or_default().push(i);
+                    by_path.entry(to.clone()).or_default().push(i);
+                }
+                CaptureEventKind::TreeOp(TreeOp::Link { target, .. }) => {
+                    by_path.entry(target.clone()).or_default().push(i);
+                }
+                _ => {
+                    if let Some(p) = event_path(ev) {
+                        by_path.entry(p.clone()).or_default().push(i);
+                    }
+                }
+            }
         }
-        CaptureEventKind::TreeOp(TreeOp::Link { target, .. }) => target.starts_with(root),
-        _ => event_path(ev).is_some_and(|p| p.starts_with(root)),
+        Self { chrono, by_path }
     }
+
+    /// Sorted positions of events naming `root` or anything under it,
+    /// and of Renames moving an ancestor of `root`.
+    fn touching(&self, root: &Path) -> Vec<usize> {
+        let mut out: Vec<usize> = btree_subtree(&self.by_path, root)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        for a in root.ancestors().skip(1) {
+            if let Some(ids) = self.by_path.get(a) {
+                out.extend(ids.iter().copied().filter(|i| {
+                    matches!(
+                        self.chrono[*i].kind,
+                        CaptureEventKind::TreeOp(TreeOp::Rename { .. })
+                    )
+                }));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// `root` and the keys under it. `Path` orders by component, so they are
+/// contiguous.
+fn btree_subtree<'m, V>(
+    map: &'m std::collections::BTreeMap<PathBuf, V>,
+    root: &'m Path,
+) -> impl Iterator<Item = (&'m PathBuf, &'m V)> {
+    use std::ops::Bound;
+    map.range::<Path, _>((Bound::Included(root), Bound::Unbounded))
+        .take_while(move |(p, _)| p.starts_with(root))
+}
+
+/// Renames the journal shows did not happen. The shim journals a Rename
+/// before the syscall and nothing retracts it, so `mv f /other-fs/g`
+/// leaves a Rename behind although rename(2) failed with EXDEV and mv
+/// copied instead. A reverse rename of that can never run, and aborts
+/// the undo.
+///
+/// Disproved takes both of: `from` and `to` are on different devices,
+/// and a later event shows `from` still held its entry (a pre-image or
+/// unlink, with nothing recreated there first). Either alone is not
+/// enough: an unjournaled recreate looks like the second, and `st_dev`
+/// can differ between capture tiers on one filesystem (btrfs subvolumes)
+/// which looks like the first. Without both the Rename stands, and a
+/// reverse rename that cannot run is a loud conflict.
+fn disproved_renames(
+    events: &[&CaptureEvent],
+    index: &EventPathIndex<'_>,
+    probe: &dyn StateProbe,
+) -> HashSet<crate::events::EventId> {
+    let mut dev_by_path: std::collections::BTreeMap<PathBuf, u64> =
+        std::collections::BTreeMap::new();
+    for ev in events {
+        let seen = match &ev.kind {
+            CaptureEventKind::FilePreImage { path, inode, .. }
+            | CaptureEventKind::TreeOp(TreeOp::Unlink { path, inode, .. }) => Some((path, inode)),
+            _ => None,
+        };
+        if let Some((path, inode)) = seen
+            && inode.dev != 0
+        {
+            dev_by_path.insert(path.clone(), inode.dev);
+        }
+    }
+    let dev_at = |root: &Path| btree_subtree(&dev_by_path, root).next().map(|(_, d)| *d);
+    let mut out = HashSet::new();
+    for (i, ev) in index.chrono.iter().enumerate() {
+        let CaptureEventKind::TreeOp(TreeOp::Rename { from, to, inode }) = &ev.kind else {
+            continue;
+        };
+        let Some(from_dev) = dev_at(from) else {
+            continue;
+        };
+        let to_dev = dev_at(to)
+            .or_else(|| (inode.dev != 0).then_some(inode.dev))
+            .or_else(|| probe.stat(to).map(|s| s.inode.dev).filter(|dev| *dev != 0));
+        if to_dev.is_none_or(|d| d == from_dev) {
+            continue;
+        }
+        for later in index.touching(from).into_iter().filter(|j| *j > i) {
+            match &index.chrono[later].kind {
+                CaptureEventKind::FilePreImage { source, .. } if source.has_content() => {
+                    out.insert(ev.id);
+                    break;
+                }
+                CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) => {
+                    out.insert(ev.id);
+                    break;
+                }
+                CaptureEventKind::FilePreImage { .. } => {}
+                _ => break,
+            }
+        }
+    }
+    out
 }
 
 /// Directory renames whose destination subtree the same command deleted
@@ -705,84 +858,123 @@ struct ReplacedSubtrees {
     dropped_events: HashSet<crate::events::EventId>,
     /// The walk's file pre-images.
     walk_restores: HashSet<crate::events::EventId>,
+    /// See [`EventClassification::rebuilt_dir_metadata`].
+    dir_metadata: std::collections::HashMap<crate::events::EventId, Vec<RebuiltDirMetadata>>,
 }
 
 /// One rename's walk, relative to its `from`.
 #[derive(Default)]
 struct RenameWalk {
     files: HashSet<PathBuf>,
-    dirs: Vec<(PathBuf, u32)>,
-    /// Earliest index in the chronological slice.
+    /// `(relative path, inode, record metadata)`.
+    dirs: Vec<(
+        PathBuf,
+        crate::inode::InodeRef,
+        crate::metadata::FileMetadata,
+    )>,
+    /// Position of the earliest walk event.
     start: Option<usize>,
-    events: HashSet<crate::events::EventId>,
+    /// Walk events, chronological.
+    events: Vec<crate::events::EventId>,
 }
 
 impl ReplacedSubtrees {
-    /// `events` is in reverse-chronological order (as `plan` sorts it).
-    fn from_events(events: &[&CaptureEvent], probe: &dyn StateProbe) -> Self {
-        let chrono: Vec<&CaptureEvent> = events.iter().rev().copied().collect();
+    fn from_events(
+        events: &[&CaptureEvent],
+        index: &EventPathIndex<'_>,
+        disproved: &HashSet<crate::events::EventId>,
+        probe: &dyn StateProbe,
+    ) -> Self {
+        debug_assert_eq!(events.len(), index.chrono.len());
         let mut out = Self::default();
-        // Walk records since the last rename: index, id, path, stat mode
-        // for a directory record.
-        let mut pending: Vec<(usize, crate::events::EventId, PathBuf, Option<u32>)> = Vec::new();
-        for (i, ev) in chrono.iter().enumerate() {
+        // Walk events since the last rename, by position.
+        let mut pending: Vec<usize> = Vec::new();
+        for (i, ev) in index.chrono.iter().enumerate() {
             match &ev.kind {
                 CaptureEventKind::FilePreImage {
-                    path,
-                    source: FilePreImageSource::ShimRenameSubtree,
+                    source:
+                        FilePreImageSource::ShimRenameSubtree | FilePreImageSource::ShimRenameSubtreeDir,
                     ..
-                } => pending.push((i, ev.id, path.clone(), None)),
-                CaptureEventKind::FilePreImage {
-                    path,
-                    source: FilePreImageSource::ShimRenameSubtreeDir,
-                    meta,
-                    ..
-                } => pending.push((i, ev.id, path.clone(), Some(meta.mode))),
+                } => pending.push(i),
                 CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
-                    let mut walk = RenameWalk::default();
-                    for (idx, id, path, dir_mode) in pending.drain(..) {
-                        let Ok(rel) = path.strip_prefix(from) else {
-                            continue;
-                        };
-                        walk.start.get_or_insert(idx);
-                        walk.events.insert(id);
-                        match dir_mode {
-                            Some(mode) => walk.dirs.push((rel.to_path_buf(), mode)),
-                            None => {
-                                walk.files.insert(rel.to_path_buf());
-                            }
-                        }
-                    }
-                    if !walk.dirs.iter().any(|(rel, _)| rel.as_os_str().is_empty()) {
-                        continue;
-                    }
-                    if probe.stat(to).is_some() {
-                        continue;
-                    }
-                    let start = walk.start.unwrap_or(i);
-                    if chrono[..start]
-                        .iter()
-                        .any(|e| event_touches(e, from) || event_touches(e, to))
+                    let walk = Self::collect_walk(index, pending.drain(..), from);
+                    if disproved.contains(&ev.id)
+                        || !walk.dirs.iter().any(|(rel, ..)| rel.as_os_str().is_empty())
+                        || probe.stat(to).is_some()
                     {
                         continue;
                     }
-                    let Some(dropped) = Self::check(&chrono[i + 1..], to, &walk) else {
+                    let start = walk.start.unwrap_or(i);
+                    let earlier = |root: &Path| index.touching(root).into_iter().any(|j| j < start);
+                    if earlier(from) || earlier(to) {
+                        continue;
+                    }
+                    let later: Vec<&CaptureEvent> = index
+                        .touching(to)
+                        .into_iter()
+                        .filter(|j| *j > i)
+                        .map(|j| index.chrono[j])
+                        .collect();
+                    let Some(dropped) = Self::check(&later, to, &walk) else {
                         continue;
                     };
                     out.dropped_events.extend(dropped);
-                    out.walk_restores.extend(walk.events);
+                    out.walk_restores.extend(walk.events.iter().copied());
+                    // Writable while the children go back in; the
+                    // recorded metadata lands after them.
                     let mut dirs: DirRebuild = walk
                         .dirs
-                        .into_iter()
-                        .map(|(rel, mode)| (from.join(rel), mode))
+                        .iter()
+                        .map(|(rel, _, meta)| (from.join(rel), meta.mode | 0o700))
                         .collect();
                     dirs.sort();
                     out.by_rename.insert(ev.id, dirs);
+                    let mut metadata: Vec<RebuiltDirMetadata> = walk
+                        .dirs
+                        .into_iter()
+                        .map(|(rel, inode, meta)| (inode, from.join(rel), meta))
+                        .collect();
+                    metadata.sort_by(|a, b| b.1.cmp(&a.1));
+                    if let Some(first) = walk.events.first() {
+                        out.dir_metadata.insert(*first, metadata);
+                    }
                 }
                 _ => {}
             }
         }
         out
+    }
+
+    fn collect_walk(
+        index: &EventPathIndex<'_>,
+        positions: impl Iterator<Item = usize>,
+        from: &Path,
+    ) -> RenameWalk {
+        let mut walk = RenameWalk::default();
+        for idx in positions {
+            let ev = index.chrono[idx];
+            let CaptureEventKind::FilePreImage {
+                path,
+                inode,
+                meta,
+                source,
+                ..
+            } = &ev.kind
+            else {
+                continue;
+            };
+            let Ok(rel) = path.strip_prefix(from) else {
+                continue;
+            };
+            walk.start.get_or_insert(idx);
+            walk.events.push(ev.id);
+            if source.has_content() {
+                walk.files.insert(rel.to_path_buf());
+            } else {
+                walk.dirs.push((rel.to_path_buf(), *inode, meta.clone()));
+            }
+        }
+        walk
     }
 
     /// The events under `to` after the rename, when they are all
@@ -792,19 +984,16 @@ impl ReplacedSubtrees {
         to: &Path,
         walk: &RenameWalk,
     ) -> Option<HashSet<crate::events::EventId>> {
-        let is_walked_dir = |rel: &Path| walk.dirs.iter().any(|(d, _)| d == rel);
+        let walked_dirs: HashSet<&Path> = walk.dirs.iter().map(|(d, ..)| d.as_path()).collect();
         let mut unlinked_files: HashSet<&Path> = HashSet::new();
         let mut unlinked_to = false;
         let mut dropped = HashSet::new();
         for ev in later {
-            if !event_touches(ev, to) {
-                continue;
-            }
             match &ev.kind {
                 CaptureEventKind::TreeOp(TreeOp::Unlink { path, kind, .. }) => {
                     let rel = path.strip_prefix(to).ok()?;
                     match kind {
-                        crate::metadata::FileKind::Directory if is_walked_dir(rel) => {
+                        crate::metadata::FileKind::Directory if walked_dirs.contains(rel) => {
                             unlinked_to |= rel.as_os_str().is_empty();
                         }
                         crate::metadata::FileKind::Regular if walk.files.contains(rel) => {
@@ -831,6 +1020,30 @@ impl ReplacedSubtrees {
     }
 }
 
+/// One entry's life at a path, from what made it to the next entry
+/// there. Capture tiers report out of order and more than once, so the
+/// decision waits until every event for the entry has been seen.
+#[derive(Debug, Default)]
+struct EntryHistory {
+    /// A journaled Create, Symlink or Link made it in this command.
+    /// Otherwise a Rename moved it here from a path with none.
+    born: bool,
+    /// The events that made it.
+    creates: Vec<crate::events::EventId>,
+    /// The renames that brought it here, oldest first.
+    renames: Vec<crate::events::EventId>,
+    /// Where the last of them moved it from.
+    moved_from: Option<PathBuf>,
+    /// Content pre-images taken at its path, once there.
+    pre_images: Vec<crate::events::EventId>,
+    /// Its unlinks, with the kind each reports. More than one tier can
+    /// report the same unlink: the shim's with the (0, 0) inode sentinel
+    /// is not merged with the helper's by `journal_unlink_idempotent`.
+    unlinks: Vec<(crate::events::EventId, crate::metadata::FileKind)>,
+    /// Path at its first unlink.
+    unlinked_at: Option<PathBuf>,
+}
+
 /// Where the entry at a path came from, replayed in event order.
 ///
 /// The undo-time probe cannot answer this: it says what is on disk now,
@@ -840,8 +1053,7 @@ struct Provenance {
     /// Paths unlinked while they held an entry a rename had moved there
     /// from a path with no Create earlier in the command.
     unlinked_moved_data: HashSet<PathBuf>,
-    /// Duplicate Creates, and the pre-images and renames of refused
-    /// moves.
+    /// See [`EventClassification::dropped_events`].
     dropped_events: HashSet<crate::events::EventId>,
     /// See [`EventClassification::refused_unlinks`].
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
@@ -849,115 +1061,147 @@ struct Provenance {
 
 impl Provenance {
     /// `events` is in reverse-chronological order (as `plan` sorts it).
-    /// `started_wall_nanos` is the command's start, 0 when unknown.
-    fn from_events(events: &[&CaptureEvent], started_wall_nanos: u64) -> Self {
-        #[derive(Debug, Clone, Default)]
-        struct Moved {
-            /// The renames that brought the entry here, oldest first.
-            renames: Vec<crate::events::EventId>,
-            /// Pre-images taken at the moved path.
-            pre_images: Vec<crate::events::EventId>,
-            /// Mtime on the first of those, the entry as it was moved.
-            first_mtime: Option<i128>,
-        }
-        #[derive(Debug, Clone)]
-        enum Origin {
-            /// Created in this command.
-            Born,
-            /// Moved here from a path with no Create in this command.
-            Moved(Moved),
-        }
-        let mut origin: std::collections::HashMap<PathBuf, Origin> =
-            std::collections::HashMap::new();
+    fn from_events(events: &[&CaptureEvent], disproved: &HashSet<crate::events::EventId>) -> Self {
+        let mut live: std::collections::BTreeMap<PathBuf, EntryHistory> =
+            std::collections::BTreeMap::new();
         let mut out = Self::default();
         for ev in events.iter().rev() {
             match &ev.kind {
-                CaptureEventKind::FilePreImage {
-                    path, meta, source, ..
-                } if !matches!(
-                    source,
-                    FilePreImageSource::ShimFlagsPreMutation
-                        | FilePreImageSource::ShimRenameSubtreeDir
-                ) =>
-                {
-                    if let Some(Origin::Moved(m)) = origin.get_mut(path) {
-                        m.pre_images.push(ev.id);
-                        m.first_mtime.get_or_insert(meta.mtime_unix_nanos);
+                CaptureEventKind::FilePreImage { path, source, .. } if source.has_content() => {
+                    if let Some(h) = live.get_mut(path) {
+                        h.pre_images.push(ev.id);
                     }
                 }
-                CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => {
-                    // A path holding moved data with no unlink since:
-                    // another capture tier reporting the same rename
-                    // (BSD's dir-diff). The Create is not a new entry.
-                    if matches!(origin.get(path), Some(Origin::Moved(_))) {
+                CaptureEventKind::TreeOp(
+                    TreeOp::Create { path, .. }
+                    | TreeOp::Symlink { path, .. }
+                    | TreeOp::Link { target: path, .. },
+                ) => match live.get_mut(path) {
+                    // Holding moved data with no unlink since: another
+                    // tier reporting the same rename (BSD's dir-diff).
+                    Some(h) if !h.born && h.unlinks.is_empty() => {
                         out.dropped_events.insert(ev.id);
-                    } else {
-                        origin.insert(path.clone(), Origin::Born);
                     }
-                }
+                    _ => {
+                        if let Some(old) = live.remove(path) {
+                            out.finish(old);
+                        }
+                        live.insert(
+                            path.clone(),
+                            EntryHistory {
+                                born: true,
+                                creates: vec![ev.id],
+                                ..EntryHistory::default()
+                            },
+                        );
+                    }
+                },
                 CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) => {
+                    if disproved.contains(&ev.id) {
+                        continue;
+                    }
+                    // The same rename again, with nothing at `from` and
+                    // nothing else having happened at `to`: a second tier
+                    // reporting it. Its inverse could only conflict.
+                    if !live.contains_key(from)
+                        && live.get(to).is_some_and(|h| {
+                            h.moved_from.as_deref() == Some(from.as_path())
+                                && h.unlinks.is_empty()
+                                && h.pre_images.is_empty()
+                        })
+                    {
+                        out.dropped_events.insert(ev.id);
+                        continue;
+                    }
                     // A directory rename carries the tracked entries
                     // under it along.
-                    let under: Vec<PathBuf> = origin
-                        .keys()
-                        .filter(|k| k.starts_with(from) && *k != from)
-                        .cloned()
+                    let under: Vec<PathBuf> = btree_subtree(&live, from)
+                        .map(|(k, _)| k.clone())
+                        .filter(|k| k != from)
                         .collect();
                     for k in under {
-                        if let (Some(o), Ok(rel)) = (origin.remove(&k), k.strip_prefix(from)) {
-                            origin.insert(to.join(rel), o);
+                        if let (Some(h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from)) {
+                            live.insert(to.join(rel), h);
                         }
                     }
-                    let o = match origin.remove(from) {
-                        Some(Origin::Born) => Origin::Born,
-                        Some(Origin::Moved(mut m)) => {
-                            m.renames.push(ev.id);
-                            Origin::Moved(m)
+                    let moved = match live.remove(from) {
+                        Some(h) if h.unlinks.is_empty() => Some(h),
+                        Some(gone) => {
+                            out.finish(gone);
+                            None
                         }
-                        None => Origin::Moved(Moved {
-                            renames: vec![ev.id],
-                            ..Moved::default()
-                        }),
+                        None => None,
                     };
-                    origin.insert(to.clone(), o);
+                    let mut h = moved.unwrap_or_default();
+                    h.renames.push(ev.id);
+                    h.moved_from = Some(from.clone());
+                    if let Some(old) = live.insert(to.clone(), h) {
+                        out.finish(old);
+                    }
                 }
                 CaptureEventKind::TreeOp(TreeOp::Unlink { path, kind, .. }) => {
-                    let Some(Origin::Moved(m)) = origin.remove(path) else {
-                        continue;
-                    };
-                    out.unlinked_moved_data.insert(path.clone());
-                    // An empty directory's inverse needs no bytes.
-                    if *kind == crate::metadata::FileKind::Directory {
-                        continue;
-                    }
-                    let reason = match m.first_mtime {
-                        None => Some(format!(
-                            "{} was moved and deleted with no pre-image; its bytes were not \
-                             captured, so the moved file is not restored",
-                            path.display()
-                        )),
-                        Some(mtime)
-                            if started_wall_nanos != 0
-                                && mtime >= i128::from(started_wall_nanos) =>
-                        {
-                            Some(format!(
-                                "{} was moved and deleted, and its last write is from this \
-                                 command: nothing shows it existed before, so it is not restored",
-                                path.display()
-                            ))
-                        }
-                        Some(_) => None,
-                    };
-                    if let Some(reason) = reason {
-                        out.refused_unlinks.insert(ev.id, reason);
-                        out.dropped_events.extend(m.pre_images);
-                        out.dropped_events.extend(m.renames);
+                    if let Some(h) = live.get_mut(path) {
+                        h.unlinks.push((ev.id, *kind));
+                        h.unlinked_at.get_or_insert_with(|| path.clone());
                     }
                 }
                 _ => {}
             }
         }
+        for (_, h) in live {
+            out.finish(h);
+        }
         out
+    }
+
+    fn finish(&mut self, h: EntryHistory) {
+        use crate::metadata::FileKind;
+        let Some(path) = h.unlinked_at else {
+            return;
+        };
+        if h.born {
+            // Nothing captured and nothing that was there before: scratch.
+            if h.pre_images.is_empty() {
+                self.dropped_events.extend(h.creates);
+                self.dropped_events.extend(h.renames);
+                self.dropped_events
+                    .extend(h.unlinks.iter().map(|(id, _)| *id));
+            }
+            return;
+        }
+        self.unlinked_moved_data.insert(path.clone());
+        // An empty directory's inverse needs no bytes. A tier that lost
+        // the race to stat it reported the wire's Regular default.
+        if h.unlinks.iter().any(|(_, k)| *k == FileKind::Directory) {
+            self.dropped_events.extend(
+                h.unlinks
+                    .iter()
+                    .filter(|(_, k)| *k != FileKind::Directory)
+                    .map(|(id, _)| *id),
+            );
+            return;
+        }
+        if h.pre_images.is_empty() {
+            let mut unlinks = h.unlinks.iter().map(|(id, _)| *id);
+            if let Some(first) = unlinks.next() {
+                self.refused_unlinks.insert(
+                    first,
+                    format!(
+                        "{} was moved and deleted with no pre-image; its bytes were not \
+                         captured, so the moved file is not restored",
+                        path.display()
+                    ),
+                );
+            }
+            self.dropped_events.extend(unlinks);
+            self.dropped_events.extend(h.renames);
+            return;
+        }
+        // RestoreContent creates the file from the blob, however many
+        // tiers reported the unlink and in whatever order against the
+        // pre-images. A RecreatePath would race it into a Phantom.
+        self.dropped_events
+            .extend(h.unlinks.iter().map(|(id, _)| *id));
     }
 }
 
@@ -1009,7 +1253,8 @@ fn emit_for_event(
             source,
         } => {
             // A walk's directory record is only evidence for the
-            // replaced-subtree rule; it has no content to restore.
+            // replaced-subtree rule and its metadata; there is no content
+            // to restore.
             if matches!(source, FilePreImageSource::ShimRenameSubtreeDir) {
                 return;
             }
@@ -1802,8 +2047,7 @@ fn emit_for_tree_op(
             // Rebuild the directories at `from` here, after the inverses
             // of everything the command did later have run; the walk's
             // pre-images (journaled just before this rename) then
-            // restore the files in place. An existing directory only
-            // gets its captured mode back.
+            // restore the files in place.
             if let Some(dirs) = class.replaced_renames.get(&id) {
                 for (path, mode) in dirs {
                     nodes.push(PlanNode {
@@ -2015,7 +2259,6 @@ mod tests {
     /// Item 9 of the second #205 review. Rename replay must not scan
     /// every tracked path per Rename; 20k would take minutes if it did.
     #[test]
-    #[ignore = "fails at 10dc7b7, second review of #205: item 9, quadratic rename replay"]
     fn plan_of_many_renames_is_not_quadratic() {
         let cmd = dummy_command();
         let mut events = Vec::new();
