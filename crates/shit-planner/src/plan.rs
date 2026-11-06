@@ -2012,6 +2012,50 @@ mod tests {
         );
     }
 
+    /// Item 9 of the second #205 review. Rename replay must not scan
+    /// every tracked path per Rename; 20k would take minutes if it did.
+    #[test]
+    #[ignore = "fails at 10dc7b7, second review of #205: item 9, quadratic rename replay"]
+    fn plan_of_many_renames_is_not_quadratic() {
+        let cmd = dummy_command();
+        let mut events = Vec::new();
+        for i in 0..20_000u64 {
+            let t = PathBuf::from(format!("/w/t{i}"));
+            let u = PathBuf::from(format!("/w/u{i}"));
+            let ev = |id: u64, kind| CaptureEvent {
+                id: crate::events::EventId(id),
+                command: cmd.command,
+                ts: crate::time::TimePoint::new(id, 0),
+                partial: false,
+                kind,
+            };
+            events.push(ev(
+                i * 2 + 1,
+                CaptureEventKind::TreeOp(TreeOp::Create {
+                    inode: crate::inode::InodeRef::new(1, i),
+                    path: t.clone(),
+                    kind: crate::metadata::FileKind::Regular,
+                    mode: 0o100644,
+                }),
+            ));
+            events.push(ev(
+                i * 2 + 2,
+                CaptureEventKind::TreeOp(TreeOp::Rename {
+                    from: t,
+                    to: u,
+                    inode: crate::inode::InodeRef::new(1, i),
+                }),
+            ));
+        }
+        let probe = InMemoryProbe::new();
+        let store = InMemoryStore::new();
+        let start = std::time::Instant::now();
+        let p = plan(cmd, &events, &probe, &store);
+        assert!(!p.nodes.is_empty());
+        let took = start.elapsed();
+        assert!(took.as_secs() < 20, "took {took:?}");
+    }
+
     #[test]
     fn unclosed_command_warns() {
         let mut cmd = dummy_command();
