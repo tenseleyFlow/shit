@@ -563,6 +563,30 @@ mod policy {
         notify_inner(syscall, path, Some(path));
     }
 
+    /// `*at` variant of [`notify_pre_mutation_with_content`]: joins
+    /// `(dirfd, path)`, canonicalizes once, and ships the AU10
+    /// `CanonicalizeFailed` marker when that fails, so the daemon
+    /// journals the incomplete capture instead of a silent raw path.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn notify_pre_mutation_with_content_at(
+        syscall: &'static str,
+        dirfd: libc::c_int,
+        path: &str,
+    ) {
+        let joined = join_at_path(dirfd, path);
+        let (resolved, failure) = canonicalize_or_raw(&joined, "path");
+        if should_skip_path(&resolved) {
+            return;
+        }
+        notify_inner_with_failure(syscall, &resolved, Some(&resolved), failure);
+    }
+
     /// B09 — notify a chflags-family mutation with a metadata-only
     /// pre-image. Unlike content capture this accepts directories,
     /// special files, unreadable files, and regular files above the
@@ -891,20 +915,6 @@ mod policy {
             || path.starts_with("/sys/")
     }
 
-    /// Canonicalize, falling back to the raw string on failure. The
-    /// `*at` interposers keep the syscall flowing either way; this
-    /// matches the pre-AU10 behavior for them.
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_os = "linux",
-    ))]
-    fn canonical_path_or_raw(path: &str) -> String {
-        canonical_path(path).unwrap_or_else(|_| path.to_string())
-    }
-
     /// DR-CR-54.B — join an `*at` syscall's `(dirfd, path)` pair into
     /// the path the kernel will act on, without canonicalizing.
     ///
@@ -936,26 +946,6 @@ mod policy {
             }
         }
         path.to_string()
-    }
-
-    /// DR-CR-54.B — [`join_at_path`] followed by a best-effort
-    /// canonicalize. When canonicalize fails the joined path is
-    /// returned, not the raw relative input. A dirfd-relative path
-    /// that could not be joined is returned raw and not
-    /// canonicalized (see [`join_at_path`]).
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-        target_os = "linux",
-    ))]
-    pub fn resolve_at_path(dirfd: libc::c_int, path: &str) -> String {
-        let joined = join_at_path(dirfd, path);
-        if !joined.starts_with('/') && dirfd != libc::AT_FDCWD {
-            return joined;
-        }
-        canonical_path_or_raw(&joined)
     }
 
     /// AU10 — structured failure from [`canonical_path`]. Each
@@ -1443,11 +1433,11 @@ mod interposers {
         // sites). Resolve via the dirfd → absolute path translation
         // BEFORE notifying so the journal stores the same key
         // everywhere.
-        let resolved = policy::resolve_at_path(dirfd, &path_str);
+        // The `_at` notifier attaches the AU10 canonicalize failure.
         // W09.5: same shape as `unlink` — capture pre-image bytes
         // before the unlink, so unlink-then-open(O_CREAT) tools
         // can be undone.
-        policy::notify_pre_mutation_with_content("unlinkat", &resolved);
+        policy::notify_pre_mutation_with_content_at("unlinkat", dirfd, &path_str);
         let real = next::real_unlinkat();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::unlinkat(dirfd, path, flag) };
@@ -1475,8 +1465,7 @@ mod interposers {
             // capture pre-image bytes when the target exists.
             // DR-CR-54.B: resolve dirfd → absolute up front.
             let path_str = cstr_to_string(path);
-            let resolved = policy::resolve_at_path(dirfd, &path_str);
-            policy::notify_pre_mutation_with_content("openat", &resolved);
+            policy::notify_pre_mutation_with_content_at("openat", dirfd, &path_str);
         }
         let real = next::real_openat();
         if next::is_zero(next::as_usize(real)) {
@@ -1528,8 +1517,8 @@ mod interposers {
         // and the classifier can't reach atomic-replace.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::resolve_at_path(fromfd, &from_str);
-        let to_abs = policy::resolve_at_path(tofd, &to_str);
+        let from_abs = policy::join_at_path(fromfd, &from_str);
+        let to_abs = policy::join_at_path(tofd, &to_str);
         policy::notify_rename_with_dst_preimage("renameat", &from_abs, &to_abs);
         let real = next::real_renameat();
         if next::is_zero(next::as_usize(real)) {
@@ -1560,8 +1549,8 @@ mod interposers {
         // DR-CR-54.B: same dirfd→absolute resolution as renameat.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::resolve_at_path(fromfd, &from_str);
-        let to_abs = policy::resolve_at_path(tofd, &to_str);
+        let from_abs = policy::join_at_path(fromfd, &from_str);
+        let to_abs = policy::join_at_path(tofd, &to_str);
         policy::notify_rename_with_dst_preimage("renameat2", &from_abs, &to_abs);
         let real = next::real_renameat2();
         if next::is_zero(next::as_usize(real)) {
@@ -2119,16 +2108,46 @@ mod tests {
     )
 ))]
 mod canonical_tests {
-    /// `AT_FDCWD` with a relative path (the shape libc `rename` takes
-    /// through `renameat`) resolves to an absolute path.
+    /// `AT_FDCWD` and absolute paths join to themselves; canonicalizing
+    /// the join absolutizes a relative path.
     #[test]
-    fn resolve_at_path_absolutizes_relative_with_at_fdcwd() {
-        let r = super::policy::resolve_at_path(libc::AT_FDCWD, "Cargo.toml");
-        assert!(r.starts_with('/'), "expected absolute path, got {r:?}");
-        assert!(r.ends_with("/Cargo.toml"), "got {r:?}");
-        // Nonexistent target with an extant parent still absolutizes.
-        let r = super::policy::resolve_at_path(libc::AT_FDCWD, "no-such-file-xyz");
-        assert!(r.starts_with('/'), "expected absolute path, got {r:?}");
+    fn join_at_path_passes_through_and_canonicalizes_relative() {
+        assert_eq!(
+            super::policy::join_at_path(libc::AT_FDCWD, "Cargo.toml"),
+            "Cargo.toml"
+        );
+        assert_eq!(super::policy::join_at_path(99, "/abs/x"), "/abs/x");
+        let (r, f) = super::policy::canonicalize_or_raw("Cargo.toml", "path");
+        assert!(
+            r.starts_with('/') && r.ends_with("/Cargo.toml"),
+            "got {r:?}"
+        );
+        assert!(f.is_none());
+    }
+
+    /// A real dirfd joins against /proc/self/fd; an unresolvable
+    /// directory yields a canonicalize failure that names the joined
+    /// path, which is what the `*at` notifiers journal as the AU10
+    /// marker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn join_at_path_with_dirfd_feeds_canonicalize_failure_marker() {
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open("/proc/self").expect("open dir");
+        let joined = super::policy::join_at_path(dir.as_raw_fd(), "no-such-dir-au10/leaf");
+        assert!(joined.starts_with('/'), "got {joined:?}");
+        let (got, failure) = super::policy::canonicalize_or_raw(&joined, "path");
+        assert_eq!(got, joined);
+        match failure.expect("canonicalize must fail under a missing dir") {
+            shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg,
+                attempted_path,
+                ..
+            } => {
+                assert_eq!(which_arg, "path");
+                assert_eq!(attempted_path, joined);
+            }
+        }
     }
 
     /// Resolving an existing absolute path succeeds and returns the
