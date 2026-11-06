@@ -239,8 +239,7 @@ struct EventClassification {
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
-    let index = EventPathIndex::new(events);
-    let disproved = disproved_renames(events, &index, probe);
+    let disproved = disproved_renames(events, probe);
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
@@ -730,9 +729,15 @@ fn btree_subtree<'m, V>(
 /// reverse rename that cannot run is a loud conflict.
 fn disproved_renames(
     events: &[&CaptureEvent],
-    index: &EventPathIndex<'_>,
     probe: &dyn StateProbe,
 ) -> HashSet<crate::events::EventId> {
+    let mut out = HashSet::new();
+    if !events
+        .iter()
+        .any(|ev| matches!(ev.kind, CaptureEventKind::TreeOp(TreeOp::Rename { .. })))
+    {
+        return out;
+    }
     let mut dev_by_path: std::collections::BTreeMap<PathBuf, u64> =
         std::collections::BTreeMap::new();
     for ev in events {
@@ -748,8 +753,9 @@ fn disproved_renames(
         }
     }
     let dev_at = |root: &Path| btree_subtree(&dev_by_path, root).next().map(|(_, d)| *d);
-    let mut out = HashSet::new();
-    for (i, ev) in index.chrono.iter().enumerate() {
+    // Chronological position, id and source of each cross-device Rename.
+    let mut cross_device = Vec::new();
+    for (i, ev) in events.iter().rev().enumerate() {
         let CaptureEventKind::TreeOp(TreeOp::Rename { from, to, inode }) = &ev.kind else {
             continue;
         };
@@ -759,17 +765,23 @@ fn disproved_renames(
         let to_dev = dev_at(to)
             .or_else(|| (inode.dev != 0).then_some(inode.dev))
             .or_else(|| probe.stat(to).map(|s| s.inode.dev).filter(|dev| *dev != 0));
-        if to_dev.is_none_or(|d| d == from_dev) {
-            continue;
+        if to_dev.is_some_and(|d| d != from_dev) {
+            cross_device.push((i, ev.id, from));
         }
+    }
+    if cross_device.is_empty() {
+        return out;
+    }
+    let index = EventPathIndex::new(events);
+    for (i, id, from) in cross_device {
         for later in index.touching(from).into_iter().filter(|j| *j > i) {
             match &index.chrono[later].kind {
                 CaptureEventKind::FilePreImage { source, .. } if source.has_content() => {
-                    out.insert(ev.id);
+                    out.insert(id);
                     break;
                 }
                 CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) => {
-                    out.insert(ev.id);
+                    out.insert(id);
                     break;
                 }
                 CaptureEventKind::FilePreImage { .. } => {}
@@ -880,8 +892,10 @@ impl Provenance {
                         .filter(|k| k != from)
                         .collect();
                     for k in under {
-                        if let (Some(h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from)) {
-                            live.insert(to.join(rel), h);
+                        if let (Some(h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from))
+                            && let Some(old) = live.insert(to.join(rel), h)
+                        {
+                            out.finish(old);
                         }
                     }
                     let moved = match live.remove(from) {
@@ -930,13 +944,16 @@ impl Provenance {
             return;
         }
         self.unlinked_moved_data.insert(path.clone());
-        // An empty directory's inverse needs no bytes. A tier that lost
-        // the race to stat it reported the wire's Regular default.
-        if h.unlinks.iter().any(|(_, k)| *k == FileKind::Directory) {
+        // An empty directory, fifo or socket needs no bytes: RecreatePath
+        // is its whole restore. A tier that lost the race to stat it
+        // reported the wire's Regular default.
+        let no_bytes =
+            |k: &FileKind| matches!(k, FileKind::Directory | FileKind::Fifo | FileKind::Socket);
+        if h.unlinks.iter().any(|(_, k)| no_bytes(k)) {
             self.dropped_events.extend(
                 h.unlinks
                     .iter()
-                    .filter(|(_, k)| *k != FileKind::Directory)
+                    .filter(|(_, k)| !no_bytes(k))
                     .map(|(id, _)| *id),
             );
             return;
@@ -1989,13 +2006,11 @@ mod tests {
         );
     }
 
-    /// Item 9 of the second #205 review. Rename replay must not scan
-    /// every tracked path per Rename; 20k would take minutes if it did.
-    #[test]
-    fn plan_of_many_renames_is_not_quadratic() {
+    /// Time to plan `n` files, each created then renamed, best of three.
+    fn plan_time_for_renames(n: u64) -> std::time::Duration {
         let cmd = dummy_command();
         let mut events = Vec::new();
-        for i in 0..20_000u64 {
+        for i in 0..n {
             let t = PathBuf::from(format!("/w/t{i}"));
             let u = PathBuf::from(format!("/w/u{i}"));
             let ev = |id: u64, kind| CaptureEvent {
@@ -2025,11 +2040,27 @@ mod tests {
         }
         let probe = InMemoryProbe::new();
         let store = InMemoryStore::new();
-        let start = std::time::Instant::now();
-        let p = plan(cmd, &events, &probe, &store);
-        assert!(!p.nodes.is_empty());
-        let took = start.elapsed();
-        assert!(took.as_secs() < 20, "took {took:?}");
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let p = plan(cmd.clone(), &events, &probe, &store);
+                assert!(!p.nodes.is_empty());
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    /// Doubling the renames must not quadruple the plan time. A ratio, so
+    /// a slow runner does not fail it; quadratic replay gives about 4.
+    #[test]
+    fn plan_time_doubles_with_the_number_of_renames() {
+        let n = plan_time_for_renames(4_000);
+        let two_n = plan_time_for_renames(8_000);
+        assert!(
+            two_n.as_secs_f64() < n.as_secs_f64() * 3.0,
+            "N: {n:?}, 2N: {two_n:?}"
+        );
     }
 
     #[test]

@@ -1357,21 +1357,18 @@ fn assert_recreated_then_renamed(nodes: &[crate::inverse::PlanNode], want: FileK
 }
 
 #[test]
-#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 5, regression from trunk"]
 fn moved_fifo_with_no_pre_image_is_recreated_and_renamed_back() {
     let nodes = moved_special_file_plan(FileKind::Fifo, 0o010644);
     assert_recreated_then_renamed(&nodes, FileKind::Fifo);
 }
 
 #[test]
-#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 5, regression from trunk"]
 fn moved_socket_with_no_pre_image_is_recreated_and_renamed_back() {
     let nodes = moved_special_file_plan(FileKind::Socket, 0o140644);
     assert_recreated_then_renamed(&nodes, FileKind::Socket);
 }
 
 #[test]
-#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 8, live entry overwritten without finish"]
 fn dir_rename_over_a_deleted_entry_still_refuses_that_entry() {
     // `mv k t/x; rm t/x` (uncaptured), `mv m d/x; mv d t` with t empty by
     // then. The rename carries d/x onto t/x; k's history must still end
@@ -1411,7 +1408,6 @@ fn dir_rename_over_a_deleted_entry_still_refuses_that_entry() {
 }
 
 #[test]
-#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 7, parent recreated at the default umask with no report"]
 fn reverse_rename_into_unseen_removed_parent_is_private_and_reported() {
     // `mv d/f x; rmdir d`, the rmdir not interposed: d's mode is unknown.
     let mut sim = Sim::new();
