@@ -64,6 +64,7 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 | `open(O_RDWR) + write/pwrite` (in-place writes, no truncate) | `file_open` + `file_release` content-diff refinement (L04.2, best-effort on kernel ≥7.0) | `write-in-place-undo-linux.sh` |
 | `mmap(MAP_SHARED)` writes | same as above; release fires on last unmap+close | `mmap-write-undo-linux.sh` |
 | `cmd > existing-file` (shell-pre-stash race) | C06 redirect parser in the bash DEBUG trap → `PreStashRedirects` ctl | `redirect-race-undo-linux.sh`, `dd-of-undo-linux.sh` |
+| `cmd >> existing-file` (append, `FileExtend` inverse) | C06 redirect parser, `RedirectOp::Append` | `shell-append-undo-linux.sh` |
 
 **Destructive git operations** (G01 family — pre-image via the LSM rename/unlink path; the planner's `.git/` smart renderer presents them as single user-readable lines):
 
@@ -199,7 +200,6 @@ These are gaps where coverage is plausible but not yet shipped. Each item is tra
 
 ### Linux
 
-- **`>>` append / `tee -a` Linux smoke** — the FileExtend wire + planner + executor all shipped in C06 (`InverseOp::FileExtend { truncate_to: pre_size }`, `FileExecutor::apply_file_extend`); pipeline integration tests in `shit-shell::c06_pipeline` are green. The remaining gap is a pinned Linux smoke — FreeBSD has `shell-append-undo-fbsd.sh` covering the round-trip; Linux needs the equivalent (proposed campaign: `AR-append-smoke-linux`).
 - **`docker pull <floating-tag>` digest journaling** — DR-CR-51. Post-phase reconciliation reserved but not implemented.
 - **multi-target `docker rmi a b c` batching** — DR-CR-52. Today only the first positional is journaled.
 - **Packaging install hooks** — `apt install shit` → `doctor`-green is the AR09 sprint goal. Today the daemon must be built + setcap'd manually.
@@ -229,36 +229,59 @@ These should work in practice once the underlying mechanism is wired (no archite
 
 ## OS support matrix
 
-| Capability | Linux (lsm=bpf) | Linux (no LSM) | FreeBSD | macOS (entitled ES) | macOS (FSEvents) |
+| Capability | Linux (lsm=bpf) | Linux (no LSM) | FreeBSD | macOS (entitled ES) | macOS (default: DYLD + FSEvents) |
 |---|---|---|---|---|---|
-| filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release†) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | ✅ EndpointSecurity AUTH events | ⚠️ post-hoc only, no pre-image |
-| pre-image via CoW | ✅ reflink/btrfs/XFS/zfs | ✅ same | ✅ zfs clone / hardlink | ✅ APFS clonefile | ✅ APFS clonefile |
-| LD_PRELOAD shim | ✅ install-pattern auto-inject | ✅ same | ✅ | ✅ DYLD interposer (M07.A install + M07.B.5 chmod smoke); SIP binaries excluded by Apple | ✅ same |
+| filesystem capture | ✅ eBPF-LSM (10 hooks: unlink/rmdir/setattr/mkdir/create/rename/symlink/link/file_open/file_release†) | ⚠️ fanotify-perm fallback | ✅ kqueue + Capsicum sandbox | built, not CI-gated (needs Tart host, #190) | ✅ DYLD for supported libc calls; FSEvents is diagnostics-only |
+| pre-image bytes | ✅ reflink where available, else copy | ✅ same | ✅ bounded staged copy; ZFS clone engine is not wired | built, not CI-gated (APFS clonefile) | ✅ DYLD byte pre-images; none from FSEvents |
+| userspace interposer | ✅ LD_PRELOAD install-pattern auto-inject | ✅ same | ✅ LD_PRELOAD | ✅ DYLD interposer (SIP binaries excluded by Apple) | ✅ same |
 | package undo | ✅ apt, dnf | ✅ same | ✅ pkg | ✅ brew | ✅ brew |
-| container undo | ✅ docker, podman, compose | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
+| container undo | ✅ docker, podman (see #186) | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
 | cloud undo | ✅ terraform, kubectl, gh | ✅ same | ⚠️ untested | ⚠️ untested | ⚠️ untested |
-| services | ✅ systemctl | ✅ same | ✅ service | ⚠️ launchctl untested | ⚠️ launchctl untested |
-| firewall | ✅ nft, iptables | ✅ same | ✅ pfctl | ❌ | ❌ |
+| services | ✅ systemctl | ✅ same | ✅ service | ✅ launchctl | ✅ launchctl |
+| firewall | ✅ nft, iptables | ✅ same | ✅ pfctl | ✅ pfctl | ✅ pfctl |
 | shell hook | ✅ bash, zsh, fish | ✅ same | ✅ bash | ⚠️ shell hooks untested | ⚠️ shell hooks untested |
 
-✅ has a green CI smoke today; ⚠️ structurally plausible but unpinned; ❌ not yet built.
+✅ means a smoke that is not marked `EXCLUDED_BY` exercises it in CI. ⚠️ means structurally plausible but unpinned. "Built, not CI-gated" means the code exists but its smokes are excluded. The macOS ES column has no running smoke, so it carries no ✅ for capture. Its ✅ rows (interposer, package, services, firewall) are run on hosted `macos-14`, which has no ES entitlement; they apply to the entitled column only because those paths do not depend on ES.
+
+Smokes behind each ✅:
+
+| Row | Smokes |
+|---|---|
+| filesystem capture | Linux: `rm-undo-linux.sh`, `mv-undo-linux.sh`, `mkdir-undo-linux.sh`, `chmod-undo-linux.sh`. FreeBSD: `rm-undo-fbsd.sh`, `capsicum-default-on-fbsd.sh`, `shim-default-on-fbsd.sh`. macOS: `chmod-undo-dyld-shim-macos.sh` |
+| pre-image bytes | Linux: `rm-undo-linux.sh`, `edit-undo-linux.sh`. FreeBSD: `dd-large-file-undo-fbsd.sh`, `rm-undo-fbsd.sh`. macOS: `chmod-undo-dyld-shim-macos.sh`, `make-install-overwrite-undo-macos.sh` |
+| userspace interposer | Linux: `make-install-undo-linux.sh`, `cargo-install-force-undo-linux.sh`. FreeBSD: `preload-shim-fbsd.sh`. macOS: `make-install-undo-macos.sh`, `cargo-install-force-undo-macos.sh` |
+| package undo | Linux: `apt-history-rollback-linux.sh`, `dnf-history-undo-linux.sh`. FreeBSD: `pkg-install-undo-fbsd.sh`. macOS: `brew-install-undo-macos.sh`, `brew-pkg.sh` |
+| container undo | `docker-rm-undo-linux.sh`, `docker-rmi-undo-linux.sh`, `docker-volume-rm-undo-linux.sh`, `docker-network-rm-undo-linux.sh`, `docker-compose-down-undo-linux.sh`, `podman-rm-undo-linux.sh` |
+| cloud undo | `terraform-apply-undo-linux.sh`, `kubectl-delete-undo-linux.sh`, `gh-release-delete-undo-linux.sh` |
+| services | Linux: `systemctl-stop-undo-linux.sh`. FreeBSD: `service-restart-undo-fbsd.sh`. macOS: `launchctl-bootstrap-undo-macos.sh` |
+| firewall | Linux: `nft-net.sh`, `iptables-net-linux.sh`. FreeBSD: `pfctl-add-undo-fbsd.sh`. macOS: `pfctl-undo-macos.sh` |
+| shell hook | Linux: `cd-undo-linux.sh`, `cd-undo-zsh-linux.sh`, `cd-undo-fish-linux.sh`. FreeBSD: `shell-redirect-undo-fbsd.sh` |
 
 † `file_release` is the in-place-write capture hook; on Linux ≥ 7.0 the LSM chain entry takes an extra `mnt_idmap` arg and the helper picks the right v1/v2 entry-point at load time via a BTF probe. Older kernels (< 7.0) use the legacy single-arg signature. A verifier-rejected attach on either fork degrades the helper to the fanotify-perm fallback rather than crashing.
 
+## Windows
+
+Windows is not a supported target. A native port is a bounded exploration, not a roadmap commitment: [docs/windows-exploration.md](docs/windows-exploration.md) surveys the options (WSL 2 first, native behind a minifilter proof of concept). No Windows code exists.
+
 ## Coverage matrix in JSON
 
-`shit doctor --json` emits `arbitrary_undo_coverage` with two stable fields you can pin a CI gate to:
+`shit doctor --json` (schema_version 2) emits `arbitrary_undo_coverage` with three class lists, their counts, and validation metadata you can pin a CI gate to. There is no coverage percentage; a percentage over an undefined denominator misleads.
 
 ```json
 "arbitrary_undo_coverage": {
-  "covered_classes": ["container-rm", "container-rmi", "fs-content-restore", "fs-metadata", "fs-rename", "fs-tree", "kubectl-delete", "package-apt", "package-dnf", "package-brew", "preload-install", "process-note", "redirect-truncate", "service-systemctl", "tool-gh", "tool-network", "tool-terraform", "..."],
+  "covered_classes": ["container-compose", "container-network", "container-rm", "container-rmi", "container-volume", "fs-content-restore", "fs-metadata", "fs-post-hash-drift-detection", "fs-rename", "fs-tree", "kubectl-delete", "package-apt", "package-brew", "package-dnf", "preload-install", "process-note", "redirect-truncate", "service-systemctl", "shell-state", "tool-gh", "tool-network", "tool-terraform"],
   "refused_classes": ["remote-push", "history-rewrite", "identity-generation", "power-state", "sandbox-escape", "opaque-shell-mutation", "system-identity"],
-  "coverage_pct": 74,
-  "last_validated_at": ""
+  "pending_classes": ["bsd-shim-default", "linux-cap-install-verify"],
+  "covered_count": 22,
+  "refused_count": 7,
+  "pending_count": 2,
+  "last_validated_at": "",
+  "snapshot_workflow_run_url": "",
+  "binary_built_at": "2026-11-06T05:27:44Z"
 }
 ```
 
-The `covered_classes` list is hand-curated against the AR08.1 audit; the `refused_classes` list is enumerated from `shit-planner::refuse::CATALOG` at runtime so the two cannot drift.
+`covered_classes` and `pending_classes` come from `shit-planner::coverage_catalog`. `refused_classes` comes from `shit-planner::refuse::CATALOG`. An empty `last_validated_at` means no CI validation has been recorded in the binary.
 
 ## License
 
