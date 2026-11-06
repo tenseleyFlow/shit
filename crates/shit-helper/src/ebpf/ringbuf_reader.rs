@@ -42,9 +42,12 @@
 //! return None deterministically).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use super::loader::RingbufLossCounter;
 
 use aya::maps::{MapData, RingBuf};
 
@@ -860,6 +863,117 @@ fn decode_event<T: Copy>(bytes: &[u8], expected_kind: u8) -> Option<T> {
 #[allow(clippy::type_complexity)]
 type RecordHandler = Box<dyn Fn(&[u8], &(dyn LsmEventSink + 'static)) + Send + 'static>;
 
+/// Total ring-buffer reserve failures observed across every LSM object
+/// since the helper started. Counting only: R3 slice A records and logs
+/// the loss; turning it into a refusal is a later slice.
+static RINGBUF_LOSSES_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// How often a reader polls its object's loss counter between flushes.
+const LOSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Upper bound on records drained for one flush request, so a reader
+/// under sustained load still acks.
+const FLUSH_DRAIN_MAX: u32 = 1 << 16;
+
+/// Ring-buffer reserve failures observed so far, summed over objects.
+pub fn ringbuf_losses_observed() -> u64 {
+    RINGBUF_LOSSES_OBSERVED.load(Ordering::Relaxed)
+}
+
+/// Tracks one object's loss counter and reports increases.
+struct LossTracker {
+    counter: Option<RingbufLossCounter>,
+    last: u64,
+    unreadable_logged: bool,
+}
+
+impl LossTracker {
+    fn new(counter: Option<RingbufLossCounter>) -> Self {
+        Self {
+            counter,
+            last: 0,
+            unreadable_logged: false,
+        }
+    }
+
+    fn poll(&mut self, thread_name: &'static str) {
+        let Some(counter) = &self.counter else {
+            return;
+        };
+        match counter.get(&0, 0) {
+            Ok(value) => {
+                let delta = note_loss_value(&mut self.last, value);
+                if delta > 0 {
+                    RINGBUF_LOSSES_OBSERVED.fetch_add(delta, Ordering::Relaxed);
+                    tracing::warn!(
+                        thread = thread_name,
+                        lost = delta,
+                        total_for_object = value,
+                        "eBPF ring buffer was full; events were dropped and capture is incomplete"
+                    );
+                }
+            }
+            Err(e) => {
+                if !self.unreadable_logged {
+                    self.unreadable_logged = true;
+                    tracing::warn!(
+                        thread = thread_name,
+                        err = %e,
+                        "eBPF ring-buffer loss counter is unreadable; drops cannot be counted"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Advance `last` to `value` and return how many losses that is. The
+/// counter is a u64 that wraps, so the difference uses wrapping math.
+fn note_loss_value(last: &mut u64, value: u64) -> u64 {
+    let delta = value.wrapping_sub(*last);
+    *last = value;
+    delta
+}
+
+/// Handle the request loop uses to make one reader drain its ring
+/// buffer and acknowledge. Cheap to clone.
+#[derive(Clone)]
+pub struct LsmFlushHandle {
+    thread_name: &'static str,
+    tx: mpsc::Sender<mpsc::SyncSender<()>>,
+}
+
+impl LsmFlushHandle {
+    /// Ask the reader to dispatch every record already in its ring
+    /// buffer, then wait for its ack until `deadline`.
+    pub fn flush_until(&self, deadline: Instant) -> Result<(), String> {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(ack_tx)
+            .map_err(|_| format!("eBPF {} reader is not running", self.thread_name))?;
+        let wait = deadline.saturating_duration_since(Instant::now());
+        ack_rx
+            .recv_timeout(wait)
+            .map_err(|_| format!("eBPF {} reader flush timed out", self.thread_name))
+    }
+}
+
+/// Flush every reader in order. The first failure is returned, but every
+/// reader is still asked, so one stuck reader does not leave the others
+/// undrained.
+pub fn flush_all_readers(handles: &[LsmFlushHandle], timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut first_err = None;
+    for handle in handles {
+        if let Err(e) = handle.flush_until(deadline)
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
 /// Userspace consumer of a single L04 LSM ringbuf. One OS thread per
 /// LsmReader instance — separate ringbufs (`unlink_events`,
 /// `setattr_events`, ...) each get their own reader. Dispatches via
@@ -867,6 +981,7 @@ type RecordHandler = Box<dyn Fn(&[u8], &(dyn LsmEventSink + 'static)) + Send + '
 pub struct LsmReader {
     alive: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    flush: LsmFlushHandle,
 }
 
 impl LsmReader {
@@ -876,6 +991,7 @@ impl LsmReader {
         unlink_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-unlink",
@@ -893,6 +1009,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -904,6 +1021,7 @@ impl LsmReader {
         rmdir_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-rmdir",
@@ -921,6 +1039,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -932,6 +1051,7 @@ impl LsmReader {
         release_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-release",
@@ -949,6 +1069,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -958,6 +1079,7 @@ impl LsmReader {
         setattr_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-setattr",
@@ -975,6 +1097,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -984,6 +1107,7 @@ impl LsmReader {
         mkdir_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-mkdir",
@@ -1001,6 +1125,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -1010,6 +1135,7 @@ impl LsmReader {
         create_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-create",
@@ -1027,6 +1153,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -1041,6 +1168,7 @@ impl LsmReader {
         mknod_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-mknod",
@@ -1058,6 +1186,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -1067,6 +1196,7 @@ impl LsmReader {
         open_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-open",
@@ -1084,6 +1214,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -1093,6 +1224,7 @@ impl LsmReader {
         rename_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-rename",
@@ -1110,6 +1242,7 @@ impl LsmReader {
                 }
             }),
             idle_sleep,
+            loss_counter,
         )
     }
 
@@ -1122,19 +1255,39 @@ impl LsmReader {
         sink: Arc<dyn LsmEventSink>,
         handler: RecordHandler,
         idle_sleep: Duration,
+        loss_counter: Option<RingbufLossCounter>,
     ) -> Self {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_t = Arc::clone(&alive);
+        let (flush_tx, flush_rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
-                reader_thread(thread_name, rb, sink, handler, alive_t, idle_sleep);
+                reader_thread(
+                    thread_name,
+                    rb,
+                    sink,
+                    handler,
+                    alive_t,
+                    idle_sleep,
+                    LossTracker::new(loss_counter),
+                    flush_rx,
+                );
             })
             .expect("spawn lsm reader");
         LsmReader {
             alive,
             handle: Some(handle),
+            flush: LsmFlushHandle {
+                thread_name,
+                tx: flush_tx,
+            },
         }
+    }
+
+    /// Handle for the UnwatchTree close barrier.
+    pub fn flush_handle(&self) -> LsmFlushHandle {
+        self.flush.clone()
     }
 
     /// Ask the reader to exit. Idempotent. The thread sees the flag
@@ -1162,6 +1315,7 @@ impl Drop for LsmReader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reader_thread(
     thread_name: &'static str,
     mut rb: RingBuf<MapData>,
@@ -1169,7 +1323,10 @@ fn reader_thread(
     handler: RecordHandler,
     alive: Arc<AtomicBool>,
     idle_sleep: Duration,
+    mut loss: LossTracker,
+    flush_rx: mpsc::Receiver<mpsc::SyncSender<()>>,
 ) {
+    let mut last_loss_poll = Instant::now();
     while alive.load(Ordering::Acquire) {
         let mut drained_this_pass = 0u32;
         while let Some(rec) = rb.next() {
@@ -1180,6 +1337,25 @@ fn reader_thread(
                 break;
             }
         }
+        // Close barrier: every record the kernel wrote before the
+        // request is already in the ring, so draining until empty
+        // dispatches the command's whole tail before the ack.
+        while let Ok(ack) = flush_rx.try_recv() {
+            let mut drained = 0u32;
+            while drained < FLUSH_DRAIN_MAX {
+                let Some(rec) = rb.next() else { break };
+                let slice: &[u8] = &rec[..];
+                handler(slice, sink.as_ref());
+                drained += 1;
+            }
+            loss.poll(thread_name);
+            last_loss_poll = Instant::now();
+            let _ = ack.send(());
+        }
+        if last_loss_poll.elapsed() >= LOSS_POLL_INTERVAL {
+            loss.poll(thread_name);
+            last_loss_poll = Instant::now();
+        }
         std::thread::sleep(idle_sleep);
     }
     tracing::info!(thread = thread_name, "lsm-rb reader exiting");
@@ -1189,6 +1365,57 @@ fn reader_thread(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn loss_delta_counts_increases_and_wraps() {
+        let mut last = 0;
+        assert_eq!(note_loss_value(&mut last, 0), 0);
+        assert_eq!(note_loss_value(&mut last, 3), 3);
+        assert_eq!(note_loss_value(&mut last, 3), 0);
+        last = u64::MAX;
+        assert_eq!(note_loss_value(&mut last, 1), 2);
+    }
+
+    #[test]
+    fn flush_reports_stopped_reader() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let handle = LsmFlushHandle {
+            thread_name: "test",
+            tx,
+        };
+        let err = flush_all_readers(&[handle], Duration::from_millis(10)).unwrap_err();
+        assert!(err.contains("not running"), "{err}");
+    }
+
+    #[test]
+    fn flush_times_out_when_reader_never_acks() {
+        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let handle = LsmFlushHandle {
+            thread_name: "test",
+            tx,
+        };
+        let err = handle
+            .flush_until(Instant::now() + Duration::from_millis(10))
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        drop(rx);
+    }
+
+    #[test]
+    fn flush_succeeds_when_reader_acks() {
+        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let t = std::thread::spawn(move || {
+            let ack = rx.recv().unwrap();
+            ack.send(()).unwrap();
+        });
+        let handle = LsmFlushHandle {
+            thread_name: "test",
+            tx,
+        };
+        flush_all_readers(&[handle], Duration::from_secs(5)).unwrap();
+        t.join().unwrap();
+    }
 
     #[test]
     fn header_layout_is_40_bytes() {
