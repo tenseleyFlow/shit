@@ -1649,6 +1649,166 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
     }
 }
 
+/// Resolve the active Linux capture tier after the selected eBPF-LSM
+/// tier has completed its real load/attach attempt.
+///
+/// Keeping the transition pure makes the safety-sensitive distinction
+/// between an operator-forced tier and automatic selection directly
+/// testable. The caller uses the returned tier to decide which reader
+/// to start before completing the helper handshake.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxCaptureStartupError {
+    /// The operator explicitly required eBPF-LSM; never silently use
+    /// a different tier.
+    ForcedEbpfLoadFailed,
+    /// The automatic eBPF attempt failed and no fanotify fd exists.
+    NoFallback,
+    /// Tier selection chose fanotify, but privileged setup did not
+    /// provide its fd. This is an internal startup invariant failure.
+    FanotifyUnavailable,
+    /// A non-Linux capture tier reached the Linux startup path.
+    InvalidPreferredTier,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_linux_capture_startup(
+    preferred_tier: CaptureTier,
+    ebpf_boot_succeeded: bool,
+    forced_tier: Option<&str>,
+    have_fanotify_fd: bool,
+) -> Result<CaptureTier, LinuxCaptureStartupError> {
+    match preferred_tier {
+        CaptureTier::EbpfLsm if ebpf_boot_succeeded => Ok(CaptureTier::EbpfLsm),
+        CaptureTier::EbpfLsm if forced_tier == Some("ebpf-lsm") => {
+            Err(LinuxCaptureStartupError::ForcedEbpfLoadFailed)
+        }
+        CaptureTier::EbpfLsm if have_fanotify_fd => Ok(CaptureTier::Fanotify),
+        CaptureTier::EbpfLsm => Err(LinuxCaptureStartupError::NoFallback),
+        CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred if have_fanotify_fd => {
+            Ok(CaptureTier::Fanotify)
+        }
+        CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred => {
+            Err(LinuxCaptureStartupError::FanotifyUnavailable)
+        }
+        CaptureTier::Degraded => Ok(CaptureTier::Degraded),
+        CaptureTier::EndpointSecurity
+        | CaptureTier::FsEventsDegraded
+        | CaptureTier::KqueueOnly
+        | CaptureTier::KqueuePreloadShim
+        | CaptureTier::ZfsSnapshot => Err(LinuxCaptureStartupError::InvalidPreferredTier),
+    }
+}
+
+/// Build the Linux capture runtime for a non-degraded tier. On failure the
+/// helper falls back to `CaptureTier::Degraded` rather than exiting.
+#[cfg(target_os = "linux")]
+fn degrade_on_runtime_failure<T, E: std::fmt::Display>(
+    tier: CaptureTier,
+    init: impl FnOnce() -> Result<T, E>,
+) -> (Option<T>, CaptureTier) {
+    if matches!(tier, CaptureTier::Degraded) {
+        return (None, CaptureTier::Degraded);
+    }
+    match init() {
+        Ok(rt) => (Some(rt), tier),
+        Err(e) => {
+            tracing::error!(
+                err = %e,
+                requested_tier = tier.label(),
+                "linux capture runtime failed to initialize; degrading (no kernel capture this boot)"
+            );
+            (None, CaptureTier::Degraded)
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod runtime_degrade_tests {
+    use super::{CaptureTier, degrade_on_runtime_failure};
+
+    #[test]
+    fn init_failure_degrades_instead_of_aborting() {
+        let (rt, tier) = degrade_on_runtime_failure::<(), _>(CaptureTier::Fanotify, || Err("boom"));
+        assert!(rt.is_none());
+        assert_eq!(tier, CaptureTier::Degraded);
+    }
+
+    #[test]
+    fn init_success_keeps_tier() {
+        let (rt, tier) = degrade_on_runtime_failure(CaptureTier::EbpfLsm, || Ok::<_, &str>(7));
+        assert_eq!(rt, Some(7));
+        assert_eq!(tier, CaptureTier::EbpfLsm);
+    }
+
+    #[test]
+    fn degraded_never_runs_init() {
+        let (rt, tier) = degrade_on_runtime_failure::<(), &str>(CaptureTier::Degraded, || {
+            panic!("must not init")
+        });
+        assert!(rt.is_none());
+        assert_eq!(tier, CaptureTier::Degraded);
+    }
+}
+
+#[cfg(test)]
+mod linux_capture_startup_tests {
+    use super::{CaptureTier, LinuxCaptureStartupError, resolve_linux_capture_startup};
+
+    #[test]
+    fn automatic_ebpf_failure_selects_fanotify_reader() {
+        assert_eq!(
+            resolve_linux_capture_startup(CaptureTier::EbpfLsm, false, None, true),
+            Ok(CaptureTier::Fanotify)
+        );
+    }
+
+    #[test]
+    fn forced_ebpf_failure_is_an_error_even_with_fanotify() {
+        assert_eq!(
+            resolve_linux_capture_startup(CaptureTier::EbpfLsm, false, Some("ebpf-lsm"), true),
+            Err(LinuxCaptureStartupError::ForcedEbpfLoadFailed)
+        );
+    }
+
+    #[test]
+    fn automatic_ebpf_failure_without_fanotify_is_an_error() {
+        assert_eq!(
+            resolve_linux_capture_startup(CaptureTier::EbpfLsm, false, None, false),
+            Err(LinuxCaptureStartupError::NoFallback)
+        );
+    }
+
+    #[test]
+    fn successful_ebpf_boot_keeps_ebpf_active() {
+        assert_eq!(
+            resolve_linux_capture_startup(CaptureTier::EbpfLsm, true, Some("ebpf-lsm"), true),
+            Ok(CaptureTier::EbpfLsm)
+        );
+    }
+
+    #[test]
+    fn selected_fanotify_requires_its_fd() {
+        assert_eq!(
+            resolve_linux_capture_startup(CaptureTier::Fanotify, false, None, false),
+            Err(LinuxCaptureStartupError::FanotifyUnavailable)
+        );
+    }
+
+    #[test]
+    fn deferred_ebpf_tier_runs_fanotify() {
+        assert_eq!(
+            resolve_linux_capture_startup(
+                CaptureTier::EbpfLsmAvailableButDeferred,
+                false,
+                Some("fanotify-perm"),
+                true,
+            ),
+            Ok(CaptureTier::Fanotify)
+        );
+    }
+}
+
 async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let shutdown = Arc::new(Notify::new());
 
@@ -1677,79 +1837,133 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // on the linux-kernel-capture matrix; fix is to make
     // handshake-complete genuinely mean "capture is live".
     //
-    // Exactly one of fanotify / ebpf-lsm gets wired per-boot —
-    // `pick_linux_tier` already chose above. The fanotify branch
-    // mirrors L01; the ebpf-lsm branch is L04's promotion path.
+    // Exactly one of fanotify / ebpf-lsm gets wired per-boot.
+    // `pick_linux_tier` chooses the preference; an automatic eBPF
+    // load failure can still activate the already-open fanotify fd.
+    // The fanotify branch mirrors L01; the ebpf-lsm branch is L04's
+    // promotion path.
     //
     // Both readers feed the SAME `LinuxCaptureRuntime` instance. The
-    // unused fd from the other tier (e.g. the fanotify_fd when tier
-    // is EbpfLsm) is left open and harmless — the kernel-side mark
-    // table is empty so no events arrive.
+    // unused fd from the other tier (the fanotify fd after a
+    // successful eBPF boot) is dropped once startup is resolved.
     #[cfg(target_os = "linux")]
     let (fanotify_state, lsm_state) = {
         let staging_dir = cli.state_dir.join("helper-staging");
-        let capture_rt = match capture::linux::LinuxCaptureRuntime::new(
-            staging_dir,
-            Arc::clone(&conn),
-        ) {
-            Ok(rt) => Some(Arc::new(std::sync::Mutex::new(rt))),
-            Err(e) => {
-                tracing::warn!(err = %e, "linux capture runtime failed to init; reader will ALLOW without capture");
-                None
-            }
-        };
+        // A runtime that fails to initialize degrades the helper (as trunk
+        // did) instead of aborting it; the daemon keeps working without
+        // kernel capture and watch_tree is ignored for this boot.
+        let (capture_rt, setup_tier) = degrade_on_runtime_failure(setup.tier, || {
+            capture::linux::LinuxCaptureRuntime::new(staging_dir, Arc::clone(&conn))
+        });
+        let capture_rt = capture_rt.map(|rt| Arc::new(std::sync::Mutex::new(rt)));
 
-        // Fanotify branch — current default tier or fallback path.
-        let fanotify_state: Option<fanotify::runtime::FanotifyState> = if matches!(
-            setup.tier,
-            CaptureTier::Fanotify | CaptureTier::EbpfLsmAvailableButDeferred
-        ) {
-            setup.fanotify_fd.map(|fd| {
-                let mut state = fanotify::runtime::FanotifyState::new(fd);
-                if let Some(rt) = capture_rt.clone() {
-                    state = state.with_capture_runtime(rt);
-                }
-                let reader_state = state.clone();
-                std::thread::Builder::new()
-                    .name("fanotify-reader".into())
-                    .spawn(move || fanotify::runtime::reader_thread(reader_state))
-                    .expect("spawn fanotify reader");
-                state
-            })
-        } else {
-            tracing::info!(
-                tier = setup.tier.label(),
-                "skipping fanotify reader for this tier"
-            );
-            None
-        };
+        let mut fanotify_fd = setup.fanotify_fd;
 
         // eBPF-LSM branch — L04. Load + attach happens here while
         // the helper still has CAP_BPF + CAP_PERFMON (before
         // sandbox::enter). The returned state carries both the
         // tree map (for WatchTree dispatch) and the LsmReader join
         // handle (for graceful shutdown).
-        let lsm_state: Option<LsmCaptureState> = if matches!(setup.tier, CaptureTier::EbpfLsm) {
-            // Exclude the helper's own pid + the daemon's pid from
-            // LSM event dispatch. Both run as descendants of the
-            // smoke harness (or the user's shell), so their internal
-            // file ops would otherwise be journaled as user-visible
-            // mutations. Daemon's blob-staging rename was the
-            // load-bearing miss surfaced by L04.1.
-            let excluded = vec![std::process::id(), cli.daemon_pid];
-            match boot_ebpf_lsm(capture_rt.clone(), excluded) {
-                Ok(state) => Some(state),
-                Err(e) => {
-                    tracing::error!(err = %e, "ebpf-lsm load failed; this tier is unusable on this boot");
-                    if std::env::var("SHIT_FORCE_TIER").as_deref() == Ok("ebpf-lsm") {
-                        return Err(anyhow::anyhow!(
-                            "SHIT_FORCE_TIER=ebpf-lsm but load failed: {e}"
-                        ));
-                    }
-                    None
+        let (lsm_state, ebpf_load_error): (Option<LsmCaptureState>, Option<anyhow::Error>) =
+            if matches!(setup_tier, CaptureTier::EbpfLsm) {
+                // Exclude the helper's own pid + the daemon's pid from
+                // LSM event dispatch. Both run as descendants of the
+                // smoke harness (or the user's shell), so their internal
+                // file ops would otherwise be journaled as user-visible
+                // mutations. Daemon's blob-staging rename was the
+                // load-bearing miss surfaced by L04.1.
+                let excluded = vec![std::process::id(), cli.daemon_pid];
+                match boot_ebpf_lsm(capture_rt.clone(), excluded) {
+                    Ok(state) => (Some(state), None),
+                    Err(e) => (None, Some(e)),
                 }
+            } else {
+                (None, None)
+            };
+
+        let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
+        let active_tier = match resolve_linux_capture_startup(
+            setup_tier,
+            lsm_state.is_some(),
+            forced_tier.as_deref(),
+            fanotify_fd.is_some(),
+        ) {
+            Ok(tier) => tier,
+            Err(LinuxCaptureStartupError::ForcedEbpfLoadFailed) => {
+                let detail = ebpf_load_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown eBPF loader error".into());
+                return Err(anyhow::anyhow!(
+                    "SHIT_FORCE_TIER=ebpf-lsm but load failed: {detail}"
+                ));
             }
+            Err(LinuxCaptureStartupError::NoFallback) => {
+                let detail = ebpf_load_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown eBPF loader error".into());
+                return Err(anyhow::anyhow!(
+                    "ebpf-lsm load failed and fanotify is unavailable; refusing to complete the helper handshake without live Linux capture: {detail}"
+                ));
+            }
+            Err(LinuxCaptureStartupError::FanotifyUnavailable) => {
+                return Err(anyhow::anyhow!(
+                    "fanotify capture selected but no fanotify fd is available; refusing to complete the helper handshake"
+                ));
+            }
+            Err(LinuxCaptureStartupError::InvalidPreferredTier) => {
+                return Err(anyhow::anyhow!(
+                    "non-Linux capture tier reached Linux startup: {}",
+                    setup_tier.label()
+                ));
+            }
+        };
+
+        if matches!(active_tier, CaptureTier::Fanotify)
+            && let Some(e) = ebpf_load_error.as_ref()
+        {
+            tracing::warn!(
+                err = %e,
+                "ebpf-lsm load failed; starting fanotify fallback"
+            );
+        }
+
+        // Start fanotify only after the eBPF load result is known so
+        // automatic selection can actually fall back. Reaching this
+        // branch without the fd violates the tier-selection invariant;
+        // fail before the handshake instead of claiming capture is live.
+        let fanotify_state: Option<fanotify::runtime::FanotifyState> = if matches!(
+            active_tier,
+            CaptureTier::Fanotify
+        ) {
+            let fd = fanotify_fd.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fanotify capture selected but no fanotify fd is available; refusing to complete the helper handshake"
+                )
+            })?;
+            let rt = capture_rt.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fanotify capture selected without a capture runtime; refusing to complete the helper handshake"
+                )
+            })?;
+            let state = fanotify::runtime::FanotifyState::new(fd).with_capture_runtime(rt);
+            let reader_state = state.clone();
+            std::thread::Builder::new()
+                .name("fanotify-reader".into())
+                .spawn(move || fanotify::runtime::reader_thread(reader_state))
+                .expect("spawn fanotify reader");
+            tracing::info!(
+                tier = CaptureTier::Fanotify.label(),
+                fallback_from_ebpf = matches!(setup_tier, CaptureTier::EbpfLsm),
+                "kernel capture tier active"
+            );
+            Some(state)
         } else {
+            tracing::info!(
+                tier = active_tier.label(),
+                "skipping fanotify reader for this tier"
+            );
             None
         };
 
@@ -2178,21 +2392,45 @@ fn request_loop(
                     target_os = "openbsd",
                     target_os = "dragonfly",
                 ))]
-                if let Some(ctrl) = &bsd_capture {
-                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                {
+                    let attach = match &bsd_capture {
+                        Some(ctrl) => ctrl
+                            .on_watch_tree(session, command_seq, root_pid, &cwd_path)
+                            .map_err(|e| e.to_string()),
+                        None => Err("BSD capture runtime unavailable".to_string()),
+                    };
+                    if let Err(reason) = attach {
+                        tracing::error!(
+                            %reason,
+                            %session,
+                            command_seq,
+                            root_pid,
+                            cwd_path = %cwd_path,
+                            "BSD watch attach could not be queued; reporting not-ready"
+                        );
+                        // Explicit not-ready so the pre-exec hook is
+                        // released now instead of at its timeout. Capture
+                        // is still not claimed for this command.
+                        let failed = HelperResponse::WatchTreeFailed {
+                            session,
+                            command_seq,
+                            reason,
+                        };
+                        if let Err(e) = conn.send_response(&failed) {
+                            tracing::warn!(err = %e, "WatchTreeFailed send failed");
+                        }
+                        continue;
+                    }
                     tracing::info!(
                         %session,
                         command_seq,
                         root_pid,
                         cwd_path = %cwd_path,
-                        "watch_tree dispatched to bsd capture"
+                        "BSD watch attach queued; pump reports readiness"
                     );
-                } else {
-                    tracing::debug!(
-                        %session,
-                        command_seq,
-                        "watch_tree ignored — no bsd capture (degraded)"
-                    );
+                    // The pump sends WatchTreeReady / WatchTreeFailed when
+                    // the attach finishes. Do not claim readiness here.
+                    continue;
                 }
                 #[cfg(target_os = "macos")]
                 if let Some(ctrl) = &macos_capture {
@@ -2261,17 +2499,27 @@ fn request_loop(
                 // send fails (helper-daemon link torn down between the
                 // WatchTree dispatch and now) the shell hook will time
                 // out on its own — the daemon doesn't hang on us.
-                let ready = HelperResponse::WatchTreeReady {
-                    session,
-                    command_seq,
-                };
-                if let Err(e) = conn.send_response(&ready) {
-                    tracing::warn!(
-                        err = %e,
-                        %session,
+                // BSD reports readiness from the capture pump once the
+                // attach completes, so it does not send it here.
+                #[cfg(not(any(
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )))]
+                {
+                    let ready = HelperResponse::WatchTreeReady {
+                        session,
                         command_seq,
-                        "WatchTreeReady send failed; shell hook will time out"
-                    );
+                    };
+                    if let Err(e) = conn.send_response(&ready) {
+                        tracing::warn!(
+                            err = %e,
+                            %session,
+                            command_seq,
+                            "WatchTreeReady send failed; shell hook will time out"
+                        );
+                    }
                 }
             }
             HelperRequest::UnwatchTree {

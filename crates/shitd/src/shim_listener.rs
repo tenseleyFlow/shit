@@ -110,7 +110,8 @@ pub async fn serve(
     }
 }
 
-/// Per-connection handler. One notification → ingest → ack → close.
+/// Per-connection handler. One notification → resolve/reserve order →
+/// ack → best-effort ingest → close.
 async fn handle_one(
     mut stream: UnixStream,
     index: Arc<Index>,
@@ -210,14 +211,34 @@ async fn handle_one(
     // budget.
     let resolved = active.resolve_by_descendant(note.pid);
 
+    // Reserve journal order before allowing the intercepted syscall to
+    // run. Ingestion itself remains fail-open and happens after the ACK,
+    // but later helper/shim events can no longer overtake this pre-
+    // mutation snapshot in the planner's logical clock.
+    let ingest_ts = crate::server::next_ts();
+
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
     // the syscall proceeds.
     let ack = ShimAck::Allow;
     let frame = encode_frame(&ack)?;
-    stream.write_all(&frame).await?;
+    // A write error here means the shim gave up waiting (50ms ack
+    // timeout) and the caller already moved on, often exiting. The
+    // notification was fully received, so journal it anyway; returning
+    // early would silently drop the event (macOS create/overwrite
+    // smokes regressed on this under slow pid resolution).
+    if let Err(e) = stream.write_all(&frame).await {
+        debug!(err = %e, pid = note.pid, "shim ack write failed; ingesting anyway");
+    }
 
-    ingest_notification(&note, resolved, &index, &blob_store, &live_baseline);
+    ingest_notification(
+        &note,
+        resolved,
+        ingest_ts,
+        &index,
+        &blob_store,
+        &live_baseline,
+    );
     Ok(())
 }
 
@@ -227,6 +248,7 @@ async fn handle_one(
 fn ingest_notification(
     note: &ShimNotification,
     resolved: Option<shit_planner::events::CommandId>,
+    ingest_ts: shit_planner::time::TimePoint,
     index: &Index,
     blob_store: &BlobStore,
     live_baseline: &LiveBaseline,
@@ -268,7 +290,7 @@ fn ingest_notification(
         let event = CaptureEvent {
             id: EventId(0),
             command,
-            ts: crate::server::next_ts(),
+            ts: ingest_ts,
             partial: false,
             kind: CaptureEventKind::CaptureRefused {
                 class,
@@ -338,16 +360,21 @@ fn ingest_notification(
             | "fsetxattr"
             | "removexattr"
             | "fremovexattr"
-            // M03.x.SETATTR — chflags family. Pre-image carries the
-            // OLD st_flags via FileMetadataWire.flags; ingest_pre_image
-            // routes through the same FilePreImage path as the chmod
-            // family. Planner-side, the inverse is RestoreMetadata
-            // (the executor's restore_flags_only call wraps chflags).
+            // B09 — chflags family. Pre-image carries the OLD st_flags;
+            // the source discriminator makes the planner emit only a
+            // RestoreFlags inverse rather than content + broad metadata.
             | "chflags"
             | "fchflags"
     ) {
         if let Some(pre) = &note.pre_image {
-            if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
+            let source = if matches!(note.syscall.as_str(), "chflags" | "fchflags") {
+                shit_planner::FilePreImageSource::ShimFlagsPreMutation
+            } else {
+                shit_planner::FilePreImageSource::Other
+            };
+            if let Err(e) =
+                ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts)
+            {
                 warn!(
                     err = %e,
                     pid = note.pid,
@@ -381,7 +408,7 @@ fn ingest_notification(
     // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
         if let Some(pre) = &note.pre_image {
-            if let Err(e) = ingest_pre_image(command, pre, index, blob_store) {
+            if let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
                 warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
             }
             return;
@@ -412,6 +439,13 @@ fn ingest_notification(
             );
             return;
         }
+        // A relative path would be resolved against the daemon's cwd at
+        // undo time; the shim's CaptureRefused marker (if any) is the only
+        // record we keep for it.
+        if !Path::new(&note.arg).is_absolute() {
+            debug!(pid = note.pid, arg = %note.arg, "shim notify: relative Create path; dropping");
+            return;
+        }
         // Inode sentinel (0,0) matches the Unlink path's convention
         // (line 347) — the executor's TreeOp::Create reverse is just
         // `unlink <path>` which doesn't need accurate (dev,inode).
@@ -423,7 +457,7 @@ fn ingest_notification(
         let event = CaptureEvent {
             id: EventId(0),
             command,
-            ts: crate::server::next_ts(),
+            ts: ingest_ts,
             partial: false,
             kind: CaptureEventKind::TreeOp(TreeOp::Create {
                 inode: InodeRef::new(0, 0),
@@ -457,7 +491,7 @@ fn ingest_notification(
     // empty and the bytes stuck at the source tmpfile path.
     if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store)
+        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
     {
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: rename pre-image ingest failed");
     }
@@ -477,7 +511,7 @@ fn ingest_notification(
         let mut journaled = 0u64;
         let mut failed = 0u64;
         for pre in &note.extra_pre_images {
-            match ingest_pre_image(command, pre, index, blob_store) {
+            match ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
                 Ok(()) => journaled += 1,
                 Err(e) => {
                     failed += 1;
@@ -507,7 +541,7 @@ fn ingest_notification(
     // planner picks the right shape.
     if matches!(note.syscall.as_str(), "unlink" | "unlinkat")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store)
+        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
     {
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: unlink pre-image ingest failed");
     }
@@ -526,6 +560,20 @@ fn ingest_notification(
         return;
     };
 
+    // Never journal a Create for a relative path: the undo executor would
+    // resolve it against the daemon's cwd and remove the wrong entry. The
+    // shim attaches a CaptureRefused marker when it could not make the
+    // path absolute (already journaled above).
+    if is_relative_create(&kind) {
+        debug!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            "shim notify: relative Create path; dropping"
+        );
+        return;
+    }
+
     // M03.x.CREATE / M03.x.LINK: gate Create-style classifications
     // on out-of-watch, mirroring the speculative-Create gating above
     // for open/openat (W09.12). In-watch creates that ALSO fire on
@@ -538,15 +586,17 @@ fn ingest_notification(
     // channel for mkfifo even in-watch. Gating it here would cause
     // the existing mkfifo-undo-fbsd smoke to lose its only signal.
     //
-    // link/linkat ARE gated — kqueue NOTE_WRITE on the dst's parent
-    // fires for hardlink creation (it appears as a fresh dirent),
-    // so in-watch link gets dir-diff coverage; the shim's notify
-    // would duplicate.
+    // link/linkat + mkdir/mkdirat ARE gated — kqueue NOTE_WRITE on
+    // the destination's parent fires when either creates a fresh
+    // dirent, so in-watch mutations get dir-diff coverage and the
+    // shim's notification would duplicate it.
     //
     // Unlink/Rename pass through (they describe in-place mutations,
     // not creates) — only the Create variants gate.
-    if matches!(note.syscall.as_str(), "link" | "linkat")
-        && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    if matches!(
+        note.syscall.as_str(),
+        "link" | "linkat" | "mkdir" | "mkdirat"
+    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
     {
         debug!(
             pid = note.pid,
@@ -557,11 +607,10 @@ fn ingest_notification(
         return;
     }
 
-    let ts = crate::server::next_ts();
     let event = CaptureEvent {
         id: EventId(0),
         command,
-        ts,
+        ts: ingest_ts,
         partial: false,
         kind,
     };
@@ -578,6 +627,14 @@ fn ingest_notification(
     );
 }
 
+/// True when `kind` is a TreeOp::Create whose path is not absolute.
+fn is_relative_create(kind: &CaptureEventKind) -> bool {
+    matches!(
+        kind,
+        CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) if !path.is_absolute()
+    )
+}
+
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
 /// journal a `FilePreImage`. Mirrors helper_link::handle_captured_pre_image
 /// but takes inline bytes rather than an SCM_RIGHTS staging fd.
@@ -586,11 +643,32 @@ fn ingest_pre_image(
     pre: &ShimPreImage,
     index: &Index,
     blob_store: &BlobStore,
+    ts: shit_planner::time::TimePoint,
+) -> anyhow::Result<()> {
+    ingest_pre_image_with_source(
+        command,
+        pre,
+        index,
+        blob_store,
+        shit_planner::FilePreImageSource::Other,
+        ts,
+    )
+}
+
+/// Variant of [`ingest_pre_image`] that preserves why the shim captured
+/// the snapshot. B09 uses this for chflags so the planner treats the
+/// inline bytes as a wire detail and restores only `st_flags`.
+fn ingest_pre_image_with_source(
+    command: shit_planner::events::CommandId,
+    pre: &ShimPreImage,
+    index: &Index,
+    blob_store: &BlobStore,
+    source: shit_planner::FilePreImageSource,
+    ts: shit_planner::time::TimePoint,
 ) -> anyhow::Result<()> {
     let (blob_hash, stat) = blob_store
         .put(&pre.bytes)
         .map_err(|e| anyhow::anyhow!("blob put: {e}"))?;
-    let ts = crate::server::next_ts();
     index
         .put_blob_record(blob_hash, stat.stored_bytes, stat.compressed, ts)
         .map_err(|e| anyhow::anyhow!("put_blob_record: {e}"))?;
@@ -636,7 +714,7 @@ fn ingest_pre_image(
             // time. The planner's post-mutation conflict detection
             // is best-effort for shim-captured events.
             post_content_hash: None,
-            source: shit_planner::FilePreImageSource::Other,
+            source,
         },
     };
     index
@@ -721,22 +799,21 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 mode: 0o644,
             }))
         }
-        // M03.x.CREATE mkdir: routed in CI but rolled back here —
-        // emitting TreeOp::Create{Directory} for out-of-watch mkdirs
-        // unconditionally caused cargo-install-force-undo to fail
-        // (applied=42, conflicts=6). Cargo's incidental parent dirs
-        // (e.g. `cargo-root/bin`) ended up rmdir-recursive'd by the
-        // executor's unlink_inner ENOTEMPTY fallback, racing the
-        // RestoreContent inverse for files INSIDE that dir.
-        //
-        // Closing this properly needs planner-side coordination:
-        // when a Create's path is a Directory AND any other inverse
-        // in the plan targets a path UNDER that directory, the
-        // rmdir should attempt empty-only (no recursive fallback)
-        // so the dir survives if it's still hosting restored
-        // content. Tracked as a follow-up; smoke
-        // `mkdir-out-of-watch-undo-macos.sh` is EXCLUDED_BY pending
-        // that work.
+        "mkdir" | "mkdirat" => {
+            // M03.x.CREATE — create notifications are emitted only
+            // after mkdir succeeds. In particular, mkdir -p calls
+            // that return EEXIST no longer fabricate Create events
+            // for pre-existing parent directories. In-watch creates
+            // are gated above; this classifies the out-of-watch path.
+            let path = PathBuf::from(arg);
+            let inode = inode_of(arg).unwrap_or_else(|| InodeRef::new(0, 0));
+            Some(CaptureEventKind::TreeOp(TreeOp::Create {
+                inode,
+                path,
+                kind: FileKind::Directory,
+                mode: 0o755,
+            }))
+        }
         _ => None,
     }
 }
@@ -905,12 +982,48 @@ pub fn shim_socket_path(cfg: &ResolvedConfig) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shit_planner::store::PlannerStore;
     use shit_proto::{decode_frame, encode_frame};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
 
     fn fresh_blob_store(tmp: &std::path::Path) -> Arc<BlobStore> {
         Arc::new(BlobStore::open(tmp.join("blobs")).unwrap())
+    }
+
+    #[test]
+    fn relative_create_paths_are_rejected() {
+        for syscall in ["mkdir", "mkfifo", "link"] {
+            let rel = classify_tree_op(syscall, "relative/child").expect("classifiable");
+            assert!(
+                is_relative_create(&rel),
+                "{syscall} relative must be dropped"
+            );
+            let abs = classify_tree_op(syscall, "/tmp/shit-abs-child").expect("classifiable");
+            assert!(!is_relative_create(&abs), "{syscall} absolute must pass");
+        }
+    }
+
+    #[test]
+    fn mkdir_notifications_classify_as_directory_creates() {
+        for syscall in ["mkdir", "mkdirat"] {
+            let path = format!("/tmp/shit-{syscall}-does-not-exist");
+            let event = classify_tree_op(syscall, &path).expect("mkdir must be classifiable");
+
+            match event {
+                CaptureEventKind::TreeOp(TreeOp::Create {
+                    path: event_path,
+                    kind,
+                    mode,
+                    ..
+                }) => {
+                    assert_eq!(event_path, PathBuf::from(&path));
+                    assert_eq!(kind, FileKind::Directory);
+                    assert_eq!(mode, 0o755);
+                }
+                other => panic!("unexpected mkdir classification: {other:?}"),
+            }
+        }
     }
 
     /// Spawn a one-shot listener, connect a sync client, send a
@@ -1009,7 +1122,19 @@ mod tests {
             xattr: None,
             flags: 0,
         };
-        ingest_pre_image(command, &pre, &index, &blob_store).expect("ingest");
+        let reserved_ts = TimePoint::new(777, 42);
+        ingest_pre_image(command, &pre, &index, &blob_store, reserved_ts).expect("ingest");
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ts, reserved_ts);
+        assert!(matches!(
+            &events[0].kind,
+            CaptureEventKind::FilePreImage {
+                source: shit_planner::FilePreImageSource::Other,
+                ..
+            }
+        ));
 
         // Blob present at canonical hash. put() is content-addressed
         // and idempotent, so re-calling on the same bytes returns
@@ -1021,5 +1146,77 @@ mod tests {
             .expect("blob present");
         let round_trip = blob_store.get(blob_hash).expect("get");
         assert_eq!(round_trip, b"hello");
+    }
+
+    #[test]
+    fn chflags_notification_uses_flags_source_and_reserved_timestamp() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        use std::path::PathBuf;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let blob_store = BlobStore::open(tmp.path().join("blobs")).unwrap();
+        let session = uuid::Uuid::nil();
+        index
+            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .expect("put_session");
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("chflags hidden target".into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: 4242,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .expect("put_command");
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "chflags".into(),
+            arg: "/tmp/flags-target".into(),
+            ts_unix_nanos: 0,
+            pre_image: Some(ShimPreImage {
+                path: "/tmp/flags-target".into(),
+                dev: 64,
+                inode: 8888,
+                mode: 0o100644,
+                uid: 1000,
+                gid: 1000,
+                size: 0,
+                mtime_unix_nanos: 1_700_000_000_000_000_000,
+                bytes: Vec::new(),
+                xattr: None,
+                flags: 7,
+            }),
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        let reserved_ts = TimePoint::new(778, 43);
+
+        ingest_notification(
+            &note,
+            Some(command),
+            reserved_ts,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ts, reserved_ts);
+        assert!(matches!(
+            &events[0].kind,
+            CaptureEventKind::FilePreImage {
+                source: shit_planner::FilePreImageSource::ShimFlagsPreMutation,
+                meta,
+                ..
+            } if meta.flags == 7
+        ));
     }
 }

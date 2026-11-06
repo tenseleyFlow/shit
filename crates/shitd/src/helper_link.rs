@@ -940,6 +940,18 @@ fn dispatch_response(
             watch_ready.mark_ready(cmd);
             tracing::debug!(%session, command_seq, "WatchTreeReady routed");
         }
+        HelperResponse::WatchTreeFailed {
+            session,
+            command_seq,
+            reason,
+        } => {
+            let cmd = CommandId {
+                session,
+                seq: command_seq,
+            };
+            watch_ready.mark_failed(cmd);
+            tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
+        }
         HelperResponse::PrivilegedOpResult {
             session,
             command_seq,

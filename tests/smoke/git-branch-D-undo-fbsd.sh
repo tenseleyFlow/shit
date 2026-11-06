@@ -5,8 +5,8 @@
 # SMOKE_TIER_REQUIRED: kqueue
 # SMOKE_RUNNER_HINT: freebsd-vm
 # SMOKE_TIMEOUT_SEC: 300
-# EXCLUDED_BY: G01.4-packed
-# EXCLUDED_REASON: packed-refs branch -D path not yet implemented; deferred
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
 # G01.4 smoke — `git branch -D <name>` force-deletes a branch.
 # `shit undo` restores the ref so `git rev-parse <name>` resolves

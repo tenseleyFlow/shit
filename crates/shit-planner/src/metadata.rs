@@ -48,6 +48,21 @@ impl FileMetadata {
             && self.acl == other.acl
             && self.flags == other.flags
     }
+
+    /// True when `other` differs only in the BSD/macOS flags bitmap.
+    /// This lets the planner choose the field-specific `RestoreFlags`
+    /// inverse and avoid unrelated ownership, mode, xattr, or mtime
+    /// syscalls for a pure `chflags(2)` mutation.
+    pub fn only_flags_changed(&self, other: &FileMetadata) -> bool {
+        self.flags != other.flags
+            && self.mode == other.mode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.size == other.size
+            && self.mtime_unix_nanos == other.mtime_unix_nanos
+            && self.xattrs == other.xattrs
+            && self.acl == other.acl
+    }
 }
 
 /// Kinds of filesystem entries we distinguish for tree-op events.
@@ -115,6 +130,17 @@ mod tests {
         let a = sample(100, 1);
         let b = sample(200, 1);
         assert!(!a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn only_flags_changed_rejects_other_metadata_drift() {
+        let before = sample(100, 1);
+        let mut flags_after = before.clone();
+        flags_after.flags = 0x2;
+        assert!(before.only_flags_changed(&flags_after));
+
+        flags_after.mode = 0o100600;
+        assert!(!before.only_flags_changed(&flags_after));
     }
 
     #[test]

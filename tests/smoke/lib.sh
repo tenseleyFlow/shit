@@ -224,7 +224,8 @@ smoke_stop_shitd() {
 }
 
 smoke_cleanup() {
-    local rc=$?
+    local prior_rc=$?
+    local rc="${1:-${prior_rc}}"
     printf '[cleanup %s] enter (rc=%d)\n' "$(date -u +%H:%M:%S)" "${rc}" >&2
     # AU09 — smoke_stop_shitd returns non-zero on a zombie daemon; in
     # cleanup we always continue (the original exit code drives the

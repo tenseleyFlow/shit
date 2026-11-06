@@ -13,14 +13,9 @@
 # even though the kqueue producer can't see them (out-of-watch).
 #
 # The capture mechanism for cross-watch observation is the
-# LD_PRELOAD shim (S24.D) — interposes libc-level mutations and
-# notifies the daemon over `$XDG_RUNTIME_DIR/shit/shim.sock`. As
-# of trunk-2026-05-23 the daemon's shim listener accepts the
-# notifications and acks Allow but does NOT ingest them into the
-# journal. W06.1 wires that.
-#
-# Expected first-run outcome (pre-W06.1): FAIL — silent partial
-# undo. Installed files remain post-undo, no refusal, exit 0.
+# LD_PRELOAD shim (S24.D) — it interposes libc-level mutations,
+# notifies the daemon over `$XDG_RUNTIME_DIR/shit/shim.sock`, and
+# the daemon persists the corresponding inverse in the journal.
 #
 # Acceptable outcomes:
 #   (A) Full undo: install files gone, source unchanged.
@@ -128,8 +123,8 @@ smoke_log "PostExec seq=1 exit=0"
 
 sleep 1.0
 
-# Diagnostic: how many shim notifications did the daemon log?
-# (Until W06.1 wires them, this is the only place they appear.)
+# Load-bearing producer checks: the workload must reach the shim
+# listener and produce at least one journal event before undo.
 # grep -c returns 1 with no matches and set -e would abort; the
 # `|| echo 0` keeps the count meaningful in either case.
 SHIM_HITS="$(grep -hc 'shim pre-mutation' "${SHIT_SMOKE_TMP}"/state/shit/log/daemon.jsonl.* 2>/dev/null || echo 0)"
@@ -139,6 +134,8 @@ smoke_log "shim notifications observed by daemon: ${SHIM_HITS}"
 
 N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 smoke_log "journal events: ${N_EVENTS}"
+[ "${SHIM_HITS}" -ge 1 ] || smoke_fail "expected at least one shim notification"
+[ "${N_EVENTS}" -ge 1 ] || smoke_fail "expected at least one journal event"
 
 # Run undo. Don't let set -e abort on a non-zero exit — we need
 # to evaluate the outcome.
@@ -167,7 +164,7 @@ fi
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
 # Outcome A — full undo
-if [ "${HELLO_GONE}" = "yes" ] && [ "${README_GONE}" = "yes" ]; then
+if [ "${HELLO_GONE}" = "yes" ] && [ "${README_GONE}" = "yes" ] && [ "${UNDO_RC}" -eq 0 ]; then
     smoke_log "OUTCOME A — full undo (install-target reverted, source unchanged, shim hits=${SHIM_HITS})"
     smoke_log "PASS: make-install-undo-fbsd (Outcome A)"
     exit 0
@@ -180,25 +177,11 @@ if [ "${UNDO_RC}" -ne 0 ] && grep -qE "install-target|out-of-scope|outside|refus
     exit 0
 fi
 
-# Outcome C — silent partial undo. Documents the cross-watch
-# capture gap W06 was scoped to close.
-#
-# As of trunk-2026-05-23 the shim infrastructure exists
-# (`shit-preload-shim` cdylib at target/release/libshit_preload_shim.so,
-# daemon listener at `${XDG_RUNTIME_DIR}/shit-shim.sock`) but
-# end-to-end shim → daemon → journal is NOT functional:
-#   - Shim notifications reaching the daemon: ${SHIM_HITS}
-#   - Journal events for install-target paths: ${N_EVENTS}
-# Even when shim notifications DO arrive, the daemon's listener
-# acks `Allow` and discards them — W06.1's load-bearing wiring.
-#
-# This smoke documents the gap and DOES NOT FAIL the run. It
-# becomes a regression-gate once W06.1 lands.
-smoke_log "OUTCOME C — silent partial undo (expected on trunk-2026-05-23)"
+# Outcome C — silent partial undo. FAIL.
+smoke_log "OUTCOME C — silent partial undo (LD_PRELOAD shim → journal/undo regression)"
 smoke_log "  undo exit:                ${UNDO_RC}"
 smoke_log "  install-target bin/hello gone: ${HELLO_GONE}"
 smoke_log "  install-target share/README gone: ${README_GONE}"
 smoke_log "  shim notifications reaching daemon: ${SHIM_HITS}"
-smoke_log "  journal events for install-target: ${N_EVENTS}"
-smoke_log "  W06 closes this; see .docs/sprints/W/W06-make-install.md"
-smoke_log "PASS: make-install-undo-fbsd (documenting cross-watch gap; W06 territory)"
+smoke_log "  journal events:                    ${N_EVENTS}"
+smoke_fail "make install undo did NOT reverse the out-of-watch install (outcome C)"
