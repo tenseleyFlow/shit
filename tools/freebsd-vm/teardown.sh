@@ -14,8 +14,9 @@ if [[ -f "${QEMU_PIDFILE}" ]]; then
   pid="$(cat "${QEMU_PIDFILE}")"
   if kill -0 "${pid}" 2>/dev/null; then
     # A clean guest shutdown keeps UFS from needing fsck on next boot.
+    # sudo comes from the seed's user-data; doas from guest-setup.sh.
     if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes freebsd@127.0.0.1 \
-      'sudo shutdown -p now' >/dev/null 2>&1; then
+      'sudo -n shutdown -p now || doas -n shutdown -p now' >/dev/null 2>&1; then
       log "guest powering off (pid ${pid})"
       for _ in $(seq 1 30); do
         if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi

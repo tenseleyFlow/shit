@@ -19,19 +19,32 @@ say() { printf '[fbsd-vm-guest] %s\n' "$*"; }
 
 say "$(uname -srm)"
 
-PKGS="gmake python3 sqlite3 doas jq git vim gawk rsync curl ca_root_nss bash"
+# Privilege: sudo from the seed's user-data, else an existing doas,
+# else running as root. Without any of them nothing below can work.
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+elif sudo -n true 2>/dev/null; then
+  SUDO="sudo"
+elif doas -n true 2>/dev/null; then
+  SUDO="doas"
+else
+  say "no working sudo or doas for $(id -un); check the cidata user-data"
+  exit 1
+fi
+
+PKGS="sudo gmake python3 sqlite3 doas jq git vim gawk rsync curl ca_root_nss bash"
 if [ "${FBSD_VM_ARCH:-amd64}" = aarch64 ]; then
   PKGS="${PKGS} rust"
 fi
 say "pkg install: ${PKGS}"
-sudo env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null 2>&1 || true
+${SUDO} env ASSUME_ALWAYS_YES=yes pkg bootstrap -f >/dev/null 2>&1 || true
 # shellcheck disable=SC2086
-sudo env ASSUME_ALWAYS_YES=yes pkg install -y ${PKGS} >/dev/null
+${SUDO} env ASSUME_ALWAYS_YES=yes pkg install -y ${PKGS} >/dev/null
 
 say "doas.conf: permit nopass $(id -un) and :wheel"
 printf 'permit nopass %s\npermit nopass :wheel\n' "$(id -un)" \
-  | sudo tee /usr/local/etc/doas.conf >/dev/null
-sudo chmod 0640 /usr/local/etc/doas.conf
+  | ${SUDO} tee /usr/local/etc/doas.conf >/dev/null
+${SUDO} chmod 0640 /usr/local/etc/doas.conf
 if [ "$(doas /sbin/sysctl -n kern.ostype)" != FreeBSD ]; then
   say "doas check failed"
   exit 1
@@ -52,16 +65,16 @@ fi
 # is what the zfs-clone smokes look for, and TMPDIR=/tmp/zfs moves a
 # smoke's whole scratch tree (watched dir + state) onto ZFS.
 if [ -c /dev/vtbd1 ]; then
-  sudo sysrc -q zfs_enable=YES >/dev/null
-  sudo kldload -n zfs
+  ${SUDO} sysrc -q zfs_enable=YES >/dev/null
+  ${SUDO} kldload -n zfs
   if ! zpool list -H shitzfs >/dev/null 2>&1; then
     say "zpool create shitzfs /dev/vtbd1"
-    sudo zpool create -f shitzfs /dev/vtbd1
+    ${SUDO} zpool create -f shitzfs /dev/vtbd1
   fi
   if ! zfs list -H shitzfs/tmp >/dev/null 2>&1; then
-    sudo zfs create -o mountpoint=/tmp/zfs shitzfs/tmp
+    ${SUDO} zfs create -o mountpoint=/tmp/zfs shitzfs/tmp
   fi
-  sudo chmod 1777 /tmp/zfs
+  ${SUDO} chmod 1777 /tmp/zfs
   say "zfs: $(zfs list -H -o name,mountpoint shitzfs/tmp | tr '\t' ' ')"
 fi
 
