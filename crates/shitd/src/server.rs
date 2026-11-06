@@ -263,56 +263,72 @@ pub async fn serve(
     }
 }
 
+/// Why strict mode must refuse this command at close, if it must.
+///
+/// Returns `None` when capture was proven, and when a `WatchTreeFailed`
+/// already journaled the command's refusal, so one failure produces one
+/// row. A failed barrier, a missing helper, and readiness no hook ever
+/// observed are each unproven capture, and strict mode fails closed on
+/// all of them.
+fn strict_close_refusal(
+    ctx: &CloseCtx,
+    command: CommandId,
+    barrier: &Result<(), crate::helper_link::UnwatchError>,
+) -> Option<String> {
+    if !ctx.strict_capture {
+        return None;
+    }
+    let map = ctx.watch_ready.as_ref();
+    if map.is_some_and(|map| map.failure_reason(command).is_some()) {
+        return None;
+    }
+    if let Err(e) = barrier {
+        return Some(format!(
+            "capture completion could not be proven at command close: {e}"
+        ));
+    }
+    if ctx.helper_link.is_none() {
+        return Some("no capture helper was running for this command".to_string());
+    }
+    if !map.is_some_and(|map| map.wait_was_observed(command)) {
+        return Some("capture readiness was not proven by a successful WaitWatchReady".to_string());
+    }
+    None
+}
+
 /// Second half of PostExec: runs once the helper flushed (or the
-/// barrier failed). Writes `ended_at` + exit code, runs the xattr
-/// post-sweep, and releases readers waiting in [`ClosingCommands`].
+/// barrier failed). Writes `ended_at` + exit code and releases readers
+/// waiting in [`ClosingCommands`].
+///
+/// `ended_at` is the PostExec frame's time, however long the barrier
+/// took. `list_recent_commands` orders by it, so a slow close must not
+/// move a command ahead of one that ended after it.
 fn finalize_post_exec(
     ctx: &CloseCtx,
     command: CommandId,
     exit_code: i32,
+    ended_at: TimePoint,
     barrier: Result<(), crate::helper_link::UnwatchError>,
 ) {
     let index = ctx.index.as_ref();
-    let readiness_proven = ctx
-        .watch_ready
-        .as_ref()
-        .is_some_and(|map| map.wait_was_observed(command));
     match &barrier {
-        Ok(()) => debug!(%command, readiness_proven, "close barrier flushed"),
-        Err(e) => {
-            warn!(%command, err = %e, readiness_proven, "close barrier failed; finalizing anyway");
-            if ctx.strict_capture
-                && let Err(je) = crate::helper_link::journal_capture_refused(
-                    index,
-                    command,
-                    None,
-                    format!("capture completion could not be proven at command close: {e}"),
-                )
-            {
-                warn!(%command, err = %je, "strict close-barrier CaptureRefused journal failed");
-            }
-        }
+        Ok(()) => debug!(%command, "close barrier flushed"),
+        Err(e) => warn!(%command, err = %e, "close barrier failed; finalizing anyway"),
+    }
+    if let Some(detail) = strict_close_refusal(ctx, command, &barrier)
+        && let Err(je) = crate::helper_link::journal_capture_refused(index, command, None, detail)
+    {
+        warn!(%command, err = %je, "strict close CaptureRefused journal failed");
     }
     // Update via re-put: ON CONFLICT replaces ended_at + exit_code.
-    // Fetch the existing row to preserve started_at. The close
-    // timestamp is allocated here, after the barrier, so every drained
-    // capture event precedes it on the logical clock.
+    // Fetch the existing row to preserve started_at.
     if let Some(mut existing) = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
     {
-        existing.ended_at = Some(next_ts());
+        existing.ended_at = Some(ended_at);
         existing.exit_code = Some(exit_code);
         if let Err(e) = index.put_command(&existing) {
             warn!(err = %e, "put_command (post) failed");
         }
-        // W09.21.1 — daemon-side xattr post-sweep. The
-        // helper can't observe xattr changes under
-        // cap_enter (extattr_*_fd blocked at the syscall
-        // level), so the daemon does a final diff between
-        // LiveBaseline's cached xattrs and the on-disk
-        // state, journaling MetadataChange events for any
-        // path whose user-namespace xattrs drifted. See
-        // `xattr::post_exec_sweep` for the why.
-        crate::xattr::post_exec_sweep(&existing.cwd, command, &ctx.live_baseline, index);
     }
     // AR00.5 / task #105 — drop the readiness entry for this
     // CommandId. A shell hook still waiting (stale hook, racy teardown)
@@ -453,6 +469,21 @@ fn handle(
                 <Index as shit_planner::PlannerStore>::command_by_id(index, command)
             {
                 active.remove(existing.pid, command);
+                // W09.21.1 — daemon-side xattr post-sweep. The helper
+                // can't observe xattr changes under cap_enter
+                // (extattr_*_fd blocked at the syscall level), so the
+                // daemon does a final diff between LiveBaseline's cached
+                // xattrs and the on-disk state, journaling MetadataChange
+                // events for any path whose user-namespace xattrs
+                // drifted. It runs here on the hook task, not after the
+                // barrier: the next PreExec is handled after this returns,
+                // so that command's changes cannot land in this sweep.
+                crate::xattr::post_exec_sweep(
+                    &existing.cwd,
+                    command,
+                    &close_ctx.live_baseline,
+                    index,
+                );
             }
             // R3 close barrier: tell the helper to stop watching and wait
             // for its UnwatchTreeFlushed marker before writing ended_at.
@@ -462,17 +493,21 @@ fn handle(
             match close_ctx.helper_link.as_ref() {
                 Some(link) => {
                     let pending = link.begin_unwatch_tree(command);
+                    let link = Arc::clone(link);
                     let ctx = close_ctx.clone();
                     let exit_code = *exit_code;
                     tokio::spawn(async move {
                         let barrier = match pending {
-                            Ok(pending) => pending.wait(UNWATCH_FLUSH_TIMEOUT).await,
+                            Ok(pending) => {
+                                link.wait_unwatch(command, pending, UNWATCH_FLUSH_TIMEOUT)
+                                    .await
+                            }
                             Err(e) => Err(e),
                         };
-                        finalize_post_exec(&ctx, command, exit_code, barrier);
+                        finalize_post_exec(&ctx, command, exit_code, ts, barrier);
                     });
                 }
-                None => finalize_post_exec(close_ctx, command, *exit_code, Ok(())),
+                None => finalize_post_exec(close_ctx, command, *exit_code, ts, Ok(())),
             }
         }
         HookMessage::PreExecEnv { seq, env_block, .. } => {
@@ -557,7 +592,197 @@ fn handle(
 #[cfg(test)]
 mod close_barrier_tests {
     use super::*;
+    use crate::watch_ready::WatchReadyMap;
     use uuid::Uuid;
+
+    fn refusal_details(index: &Index, command: CommandId) -> Vec<String> {
+        <Index as shit_planner::PlannerStore>::events_for_command(index, command)
+            .into_iter()
+            .filter_map(|ev| match ev.kind {
+                shit_planner::events::CaptureEventKind::CaptureRefused { detail, .. } => {
+                    Some(detail)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn index_with(dir: &std::path::Path, commands: &[CommandId]) -> Arc<Index> {
+        let index = Arc::new(Index::open(dir.join("db.sqlite")).unwrap());
+        index
+            .put_session(Uuid::nil(), "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        for command in commands {
+            index
+                .put_command(&CommandRecord {
+                    command: *command,
+                    cmd_string: None,
+                    cwd: dir.to_path_buf(),
+                    pid: 7,
+                    shell_kind: shit_proto::ShellKind::Bash,
+                    started_at: TimePoint::new(1, 1),
+                    ended_at: None,
+                    exit_code: None,
+                    event_ids: vec![],
+                })
+                .unwrap();
+        }
+        index
+    }
+
+    fn ctx_with(
+        index: &Arc<Index>,
+        link: Option<Arc<HelperLink>>,
+        map: Option<Arc<WatchReadyMap>>,
+        strict_capture: bool,
+    ) -> CloseCtx {
+        CloseCtx {
+            index: Arc::clone(index),
+            live_baseline: Arc::new(crate::baseline::LiveBaseline::new()),
+            watch_ready: map,
+            helper_link: link,
+            closing: Arc::new(ClosingCommands::new()),
+            strict_capture,
+        }
+    }
+
+    /// The sweep must finish before `handle` returns, with the barrier
+    /// still pending. The hook task handles the next PreExec only after
+    /// that, so the next command's changes cannot land in this sweep.
+    #[tokio::test]
+    async fn xattr_sweep_runs_before_the_next_frame_while_the_barrier_is_pending() {
+        use shit_planner::inode::{BlobHash, InodeRef};
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(30)]);
+        let (link, _peer) = crate::helper_link::HelperLink::for_test();
+        let link = Arc::new(link);
+        let ctx = ctx_with(&index, Some(Arc::clone(&link)), None, false);
+        // A cached xattr the file does not carry reads as drift on every
+        // platform, since a file with no xattrs compares unequal to it.
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let xattrs = std::collections::BTreeMap::from([("user.k".to_string(), b"v".to_vec())]);
+        ctx.live_baseline.entry_for_cwd(dir.path()).insert(
+            file,
+            crate::baseline::BaselineEntry::new(
+                InodeRef::new(1, 1),
+                BlobHash::from_bytes([7; 32]),
+                1,
+                xattrs,
+            ),
+        );
+        handle(
+            HookMessage::PostExec {
+                session: Uuid::nil(),
+                seq: 30,
+                exit_code: 0,
+                ts_unix_nanos: 0,
+            },
+            &index,
+            &EnvPreStash::new(),
+            &crate::shell_state_track::ShellStatePreStash::new(),
+            &shit_planner::EnvFilter::default(),
+            &ActiveCommands::new(),
+            Some(link.as_ref()),
+            &ctx,
+        );
+        let swept = <Index as shit_planner::PlannerStore>::events_for_command(&index, cmd(30))
+            .into_iter()
+            .filter(|ev| {
+                matches!(
+                    ev.kind,
+                    shit_planner::events::CaptureEventKind::MetadataChange { .. }
+                )
+            })
+            .count();
+        assert_eq!(swept, 1, "sweep must not wait for the close barrier");
+        let rec =
+            <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(30)).unwrap();
+        assert!(rec.ended_at.is_none(), "the barrier is still pending");
+    }
+
+    #[tokio::test]
+    async fn strict_refuses_readiness_no_hook_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(10)]);
+        let (link, _peer) = crate::helper_link::HelperLink::for_test();
+        let map = Arc::new(WatchReadyMap::new());
+        map.mark_ready(cmd(10));
+        let ctx = ctx_with(&index, Some(Arc::new(link)), Some(map), true);
+        assert!(ctx.closing.begin(cmd(10)));
+        finalize_post_exec(&ctx, cmd(10), 0, TimePoint::new(9, 9), Ok(()));
+        let rows = refusal_details(&index, cmd(10));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("readiness was not proven"), "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn strict_accepts_observed_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(11)]);
+        let (link, _peer) = crate::helper_link::HelperLink::for_test();
+        let map = Arc::new(WatchReadyMap::new());
+        map.mark_ready(cmd(11));
+        map.note_wait_succeeded(cmd(11));
+        let ctx = ctx_with(&index, Some(Arc::new(link)), Some(map), true);
+        assert!(ctx.closing.begin(cmd(11)));
+        finalize_post_exec(&ctx, cmd(11), 0, TimePoint::new(9, 9), Ok(()));
+        assert!(refusal_details(&index, cmd(11)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn strict_does_not_add_a_second_row_after_watch_tree_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(12)]);
+        let (link, _peer) = crate::helper_link::HelperLink::for_test();
+        let map = Arc::new(WatchReadyMap::new());
+        map.mark_failed(cmd(12), "attach failed".to_string());
+        let ctx = ctx_with(&index, Some(Arc::new(link)), Some(map), true);
+        assert!(ctx.closing.begin(cmd(12)));
+        finalize_post_exec(&ctx, cmd(12), 0, TimePoint::new(9, 9), Ok(()));
+        assert!(refusal_details(&index, cmd(12)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_mode_journals_nothing_for_unproven_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(13)]);
+        let ctx = ctx_with(&index, None, None, false);
+        assert!(ctx.closing.begin(cmd(13)));
+        finalize_post_exec(&ctx, cmd(13), 0, TimePoint::new(9, 9), Ok(()));
+        assert!(refusal_details(&index, cmd(13)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_close_keeps_the_post_exec_frame_time_for_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(20), cmd(21)]);
+        let ctx = ctx_with(&index, None, None, false);
+        assert!(ctx.closing.begin(cmd(20)));
+        assert!(ctx.closing.begin(cmd(21)));
+        let frame_20 = next_ts();
+        let frame_21 = next_ts();
+        // 21 ended second but closes first, as when 20's barrier times out.
+        finalize_post_exec(&ctx, cmd(21), 0, frame_21, Ok(()));
+        std::thread::sleep(Duration::from_millis(2));
+        finalize_post_exec(
+            &ctx,
+            cmd(20),
+            0,
+            frame_20,
+            Err(crate::helper_link::UnwatchError::Timeout(
+                UNWATCH_FLUSH_TIMEOUT,
+            )),
+        );
+        let recent = index.list_recent_commands(2).unwrap();
+        assert_eq!(
+            recent[0].command,
+            cmd(21),
+            "undo must target the last command to end"
+        );
+        assert_eq!(recent[0].ended_at, Some(frame_21));
+        assert_eq!(recent[1].ended_at, Some(frame_20));
+    }
 
     fn cmd(seq: u64) -> CommandId {
         CommandId {
@@ -630,7 +855,12 @@ mod close_barrier_tests {
             strict_capture: true,
         };
         assert!(ctx.closing.begin(cmd(5)));
-        finalize_post_exec(&ctx, cmd(5), 3, Ok(()));
+        finalize_post_exec(&ctx, cmd(5), 3, TimePoint::new(9, 9), Ok(()));
+        assert_eq!(
+            refusal_details(&index, cmd(5)),
+            vec!["no capture helper was running for this command".to_string()],
+            "strict must not fail open when no helper exists"
+        );
         let rec =
             <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(5)).unwrap();
         assert!(rec.ended_at.is_some());
@@ -675,6 +905,7 @@ mod close_barrier_tests {
                 &ctx,
                 cmd(6),
                 0,
+                TimePoint::new(9, 9),
                 Err(crate::helper_link::UnwatchError::Timeout(
                     UNWATCH_FLUSH_TIMEOUT,
                 )),

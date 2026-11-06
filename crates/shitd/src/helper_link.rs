@@ -188,6 +188,47 @@ impl HelperLink {
         Ok(PendingUnwatch { rx })
     }
 
+    /// Wait for `command`'s marker. A timed-out waiter is removed so the
+    /// map does not keep an entry for a command that already closed.
+    pub async fn wait_unwatch(
+        &self,
+        command: CommandId,
+        pending: PendingUnwatch,
+        timeout: std::time::Duration,
+    ) -> Result<(), UnwatchError> {
+        let result = pending.wait(timeout).await;
+        if matches!(result, Err(UnwatchError::Timeout(_))) {
+            self.pending_unwatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&command);
+        }
+        result
+    }
+
+    /// A link with no helper process, over a socketpair. The peer end is
+    /// returned so sends succeed for as long as the test holds it.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, std::os::unix::net::UnixStream) {
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        (
+            Self {
+                conn_fd: ours.into(),
+                child: std::sync::Mutex::new(None),
+                helper_pid: 0,
+                helper_uid: 0,
+                granted: HelperCaps::default(),
+                kernel_tier: String::new(),
+                degraded_reason: None,
+                priv_op_waiters: PrivOpWaiters::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                pending_unwatch: UnwatchWaiters::default(),
+            },
+            peer,
+        )
+    }
+
     fn complete_unwatch(&self, command: CommandId) {
         let waiter = self
             .pending_unwatch
@@ -1752,6 +1793,22 @@ mod tests_dispatch {
     use super::*;
     use shit_planner::PlannerStore;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn unwatch_timeout_removes_the_waiter() {
+        let (link, _peer) = HelperLink::for_test();
+        let command = CommandId {
+            session: Uuid::from_u128(40),
+            seq: 1,
+        };
+        let pending = link.begin_unwatch_tree(command).unwrap();
+        assert_eq!(link.pending_unwatch.lock().unwrap().len(), 1);
+        let result = link
+            .wait_unwatch(command, pending, std::time::Duration::from_millis(5))
+            .await;
+        assert!(matches!(result, Err(UnwatchError::Timeout(_))));
+        assert!(link.pending_unwatch.lock().unwrap().is_empty());
+    }
 
     fn index_with_command(dir: &Path, cmd: CommandId) -> Index {
         use shit_planner::{CommandRecord, TimePoint};
