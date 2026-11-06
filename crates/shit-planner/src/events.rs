@@ -142,6 +142,16 @@ pub enum FilePreImageSource {
 }
 
 impl FilePreImageSource {
+    /// False for records that reuse the FilePreImage wire without
+    /// carrying the file's content: a chflags snapshot and a walk's
+    /// directory record.
+    pub fn has_content(&self) -> bool {
+        !matches!(
+            self,
+            FilePreImageSource::ShimFlagsPreMutation | FilePreImageSource::ShimRenameSubtreeDir
+        )
+    }
+
     /// True for sources whose captured bytes are known to faithfully
     /// represent the file's state BEFORE the user's command (or, for
     /// AUTH-tier captures, before the specific mutation). Used by the

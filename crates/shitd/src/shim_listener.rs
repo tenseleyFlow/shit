@@ -578,8 +578,13 @@ fn ingest_notification(
         let mut failed = 0u64;
         for pre in &note.extra_pre_images {
             // The walk's directory records come in on the same wire with
-            // a directory mode and no bytes.
-            let source = if pre.mode & 0o170000 == 0o040000 {
+            // a directory mode and no bytes, after the files. They prove
+            // the journal holds the whole walk, which stops being true
+            // once any entry fails to journal.
+            let source = if FileKind::from_mode(pre.mode) == Some(FileKind::Directory) {
+                if failed > 0 {
+                    continue;
+                }
                 shit_planner::FilePreImageSource::ShimRenameSubtreeDir
             } else {
                 shit_planner::FilePreImageSource::ShimRenameSubtree
@@ -1414,7 +1419,6 @@ mod tests {
     /// A walk file that fails to journal means the directory records
     /// can no longer prove the walk is complete.
     #[test]
-    #[ignore = "fails at 10dc7b7, second review of #205: item 8, root record proves a walk with a lost file"]
     fn failed_walk_file_ingest_drops_directory_records() {
         use shit_planner::FilePreImageSource;
         use shit_planner::time::TimePoint;
