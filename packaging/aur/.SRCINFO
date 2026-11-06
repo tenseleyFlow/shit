@@ -13,6 +13,7 @@ pkgbase = shit-bin
 	provides = shit=0.1.0
 	conflicts = shit
 	options = !strip
+	options = !debug
 	source_x86_64 = https://github.com/tenseleyFlow/shit/releases/download/v0.1.0/shit-0.1.0-x86_64-unknown-linux-gnu.tar.zst
 	sha256sums_x86_64 = SKIP
 	source_aarch64 = https://github.com/tenseleyFlow/shit/releases/download/v0.1.0/shit-0.1.0-aarch64-unknown-linux-gnu.tar.zst

@@ -11,7 +11,7 @@ depends=('glibc' 'gcc-libs' 'libcap')
 provides=("shit=${pkgver}")
 conflicts=('shit')
 install=shit.install
-options=('!strip')
+options=('!strip' '!debug')
 _base="${url}/releases/download/v${pkgver}/shit-${pkgver}"
 source_x86_64=("${_base}-x86_64-unknown-linux-gnu.tar.zst")
 source_aarch64=("${_base}-aarch64-unknown-linux-gnu.tar.zst")
