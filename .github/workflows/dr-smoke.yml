@@ -244,7 +244,7 @@ jobs:
   env-oversize-linux:
     # Issue #6 — 6 KB PreExecEnv/PostExecEnv frames must reach the
     # daemon (ctl-socket path for frames over the datagram cap).
-    name: env-oversize smoke (issue #6 Linux)
+    name: env-oversize smoke (issue-6 Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -498,7 +498,7 @@ jobs:
     # Issue #6 — macOS caps AF_UNIX datagrams at
     # net.local.dgram.maxdgram=2048; a 6 KB env block must still reach
     # the daemon via the ctl-socket path.
-    name: env-oversize smoke (issue #6 macOS)
+    name: env-oversize smoke (issue-6 macOS)
     runs-on: macos-15
     timeout-minutes: 15
     steps:
