@@ -101,7 +101,16 @@ pub fn plan(
     //      within one command; the captured FilePreImage is of an
     //      already-gone file). No user-meaningful change to undo.
     //      Skip all three inverses entirely.
-    let class = classify_replace_paths(&live, probe);
+    let mut class = classify_replace_paths(&live, probe);
+    // FreeBSD observes an in-watch chflags twice: the shim's pre-state
+    // snapshot and kqueue's before/after MetadataChange. Pair each helper
+    // event with at most one earlier shim event and drop the shim copy so
+    // the same RestoreFlags is not planned, executed and counted twice.
+    class.paired_flags_shims = {
+        let mut chronological = live.clone();
+        chronological.reverse();
+        crate::plan_forward::paired_flags_shim_events(&chronological)
+    };
 
     for ev in &live {
         // W01.B.fix-rename-coalescing: skip the entire event if the
@@ -189,6 +198,9 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Shim chflags snapshots already covered by a kqueue
+    /// `MetadataChange` for the same inode and pre-value.
+    paired_flags_shims: HashSet<crate::events::EventId>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
@@ -580,6 +592,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
+        paired_flags_shims: HashSet::new(),
     }
 }
 
@@ -636,6 +649,9 @@ fn emit_for_event(
             // field-specific inverse before any blob checks: the blob is
             // intentionally irrelevant to flags restoration.
             if matches!(source, FilePreImageSource::ShimFlagsPreMutation) {
+                if class.paired_flags_shims.contains(&ev.id) {
+                    return;
+                }
                 // chflags mutates the inode. If this pathname was later
                 // unlinked but another hardlink survives, restore through
                 // that live alias rather than conflict on the dead name.
@@ -739,10 +755,9 @@ fn emit_for_event(
             let conflict = file_path_conflict(path, *inode, probe);
             if before.only_flags_changed(after) {
                 // FreeBSD may also have a synchronous shim snapshot for
-                // this mutation. Keep both field-specific inverses. Exact
-                // duplicates are idempotent, while global inode/value
-                // deduplication is unsafe for repeated or cyclic chflags
-                // mutations in one command.
+                // this mutation; the paired shim event is dropped in
+                // `class.paired_flags_shims` (one-to-one pairing, so
+                // repeated or cyclic mutations are unaffected).
                 let restore_path = class.hardlink_dead_to_source.get(path).unwrap_or(path);
                 nodes.push(PlanNode {
                     op: InverseOp::RestoreFlags {
@@ -1830,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn shim_and_kqueue_flags_events_emit_idempotent_field_specific_inverses() {
+    fn shim_and_kqueue_flags_events_emit_one_restore_flags() {
         let inode = InodeRef::new(1, 8);
         let path = PathBuf::from("/tmp/flags-dedupe");
         let mut probe = InMemoryProbe::new();
@@ -1870,7 +1885,7 @@ mod tests {
                 .iter()
                 .filter(|n| matches!(n.op, InverseOp::RestoreFlags { .. }))
                 .count(),
-            2,
+            1,
             "{:#?}",
             p.nodes
         );
@@ -1934,7 +1949,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(targets, vec![0, 0, 1, 0], "{:#?}", p.nodes);
+        assert_eq!(targets, vec![0, 1, 0], "{:#?}", p.nodes);
     }
 
     #[test]

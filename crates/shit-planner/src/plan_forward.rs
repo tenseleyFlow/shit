@@ -82,7 +82,7 @@ pub fn plan_forward(
     }
 }
 
-fn paired_flags_shim_events(events: &[&CaptureEvent]) -> HashSet<EventId> {
+pub(crate) fn paired_flags_shim_events(events: &[&CaptureEvent]) -> HashSet<EventId> {
     let mut pending: HashMap<(crate::inode::InodeRef, u32), Vec<EventId>> = HashMap::new();
     let mut paired = HashSet::new();
 
@@ -156,10 +156,11 @@ fn emit_forward_for_event(
         } => {
             // Forward: apply the post metadata.
             if before.only_flags_changed(after) {
-                let expected_inode = probe.stat(path).map(|s| s.inode).unwrap_or(*inode);
+                // Use the captured inode, as undo does. A live-probe inode
+                // would make the executor's Phantom guard vacuous.
                 nodes.push(PlanNode {
                     op: InverseOp::RestoreFlags {
-                        inode: expected_inode,
+                        inode: *inode,
                         path: path.clone(),
                         flags: after.flags,
                     },
@@ -814,6 +815,39 @@ mod tests {
                 assert_eq!(target.mode, 0o755, "forward targets the post mode");
             }
             other => panic!("expected RestoreMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_flags_restore_keeps_captured_inode_not_live_probe_inode() {
+        let before = meta();
+        let mut after = before.clone();
+        after.flags = 2;
+        let captured = InodeRef::new(9, 999);
+        let events = vec![ev(
+            CaptureEventKind::MetadataChange {
+                inode: captured,
+                path: PathBuf::from("/tmp/flags-forward-inode"),
+                before,
+                after,
+            },
+            1,
+        )];
+        // probe_with reports a different inode for the path.
+        let plan = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&["/tmp/flags-forward-inode"]),
+            &InMemoryStore::new(),
+        );
+        match plan.nodes.as_slice() {
+            [
+                PlanNode {
+                    op: InverseOp::RestoreFlags { inode, .. },
+                    ..
+                },
+            ] => assert_eq!(*inode, captured),
+            other => panic!("expected one RestoreFlags, got {other:?}"),
         }
     }
 
