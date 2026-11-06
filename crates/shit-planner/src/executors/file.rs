@@ -1150,6 +1150,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 7"]
+    fn rename_creates_missing_parents_private_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let from = tmpdir.path().join("x");
+        let gone = tmpdir.path().join("gone");
+        let deeper = gone.join("deeper");
+        std::fs::write(&from, b"hi").unwrap();
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Rename {
+            from,
+            to: deeper.join("f"),
+        };
+        let outcome = e.execute(&op, false, ConflictPolicy::default());
+        assert!(
+            matches!(&outcome, ExecutionOutcome::AppliedWithNote { note } if note.contains("0700")),
+            "{outcome:?}"
+        );
+        for dir in [&gone, &deeper] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{dir:?}");
+        }
+    }
+
+    #[test]
     fn rename_creates_missing_target_parent() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let from = tmpdir.path().join("x");

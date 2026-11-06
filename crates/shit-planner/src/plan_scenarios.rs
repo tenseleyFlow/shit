@@ -398,6 +398,11 @@ impl Sim {
         out
     }
 
+    fn plan_nodes(&self) -> Vec<crate::inverse::PlanNode> {
+        let probe = LiveStateProbe::new();
+        plan(command_record(), &self.events, &probe, &self.store).nodes
+    }
+
     /// Plan against the live post-state and apply with the CLI's
     /// default policy (Abort, serial).
     fn undo(&self) -> Vec<String> {
@@ -1318,4 +1323,116 @@ fn failed_enotempty_rename_then_rm_rf_restores_destination_bytes() {
     let log = sim.undo();
     let after = sim.snapshot();
     assert_eq!(after, before, "bytes lost\n{}", log.join("\n"));
+}
+
+fn moved_special_file_plan(kind: FileKind, mode: u32) -> Vec<crate::inverse::PlanNode> {
+    // `mv a b; rm b` of a fifo or socket: no content to pre-image.
+    let mut sim = Sim::new();
+    let (a, b) = (sim.p("a"), sim.p("b"));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+        from: a,
+        to: b.clone(),
+        inode: InodeRef::new(1, 1),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(1, 1),
+        path: b,
+        kind,
+        mode,
+    }));
+    sim.plan_nodes()
+}
+
+fn assert_recreated_then_renamed(nodes: &[crate::inverse::PlanNode], want: FileKind) {
+    use crate::inverse::InverseOp;
+    assert!(
+        matches!(&nodes[0].op, InverseOp::RecreatePath { kind, .. } if *kind == want),
+        "{nodes:#?}"
+    );
+    assert!(
+        matches!(&nodes[1].op, InverseOp::Rename { .. }),
+        "{nodes:#?}"
+    );
+    assert_eq!(nodes.len(), 2, "{nodes:#?}");
+}
+
+#[test]
+#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 5, regression from trunk"]
+fn moved_fifo_with_no_pre_image_is_recreated_and_renamed_back() {
+    let nodes = moved_special_file_plan(FileKind::Fifo, 0o010644);
+    assert_recreated_then_renamed(&nodes, FileKind::Fifo);
+}
+
+#[test]
+#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 5, regression from trunk"]
+fn moved_socket_with_no_pre_image_is_recreated_and_renamed_back() {
+    let nodes = moved_special_file_plan(FileKind::Socket, 0o140644);
+    assert_recreated_then_renamed(&nodes, FileKind::Socket);
+}
+
+#[test]
+#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 8, live entry overwritten without finish"]
+fn dir_rename_over_a_deleted_entry_still_refuses_that_entry() {
+    // `mv k t/x; rm t/x` (uncaptured), `mv m d/x; mv d t` with t empty by
+    // then. The rename carries d/x onto t/x; k's history must still end
+    // in a refusal, with no empty `k` put back.
+    let mut sim = Sim::new();
+    sim.seed_file("k", b"k\n", 0o644);
+    sim.seed_file("m", b"m\n", 0o644);
+    sim.seed_dir("t", 0o755);
+    sim.seed_dir("d", 0o755);
+    sim.snapshot();
+    sim.mv("k", "t/x");
+    sim.rm_uncaptured("t/x");
+    sim.mv("m", "d/x");
+    let (d, t) = (sim.p("d"), sim.p("t"));
+    let inode = Sim::inode_of(&d);
+    std::fs::rename(&d, &t).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+        from: d,
+        to: t,
+        inode,
+    }));
+    let nodes = sim.plan_nodes();
+    assert!(
+        nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::inverse::InverseOp::Refuse { .. })),
+        "{nodes:#?}"
+    );
+    let k = sim.p("k");
+    assert!(
+        !nodes.iter().any(|n| matches!(
+            &n.op,
+            crate::inverse::InverseOp::Rename { to, .. } if *to == k
+        )),
+        "{nodes:#?}"
+    );
+}
+
+#[test]
+#[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 7, parent recreated at the default umask with no report"]
+fn reverse_rename_into_unseen_removed_parent_is_private_and_reported() {
+    // `mv d/f x; rmdir d`, the rmdir not interposed: d's mode is unknown.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o700);
+    sim.seed_file("d/f", b"f\n", 0o600);
+    sim.snapshot();
+    sim.mv("d/f", "x");
+    std::fs::remove_dir(sim.p("d")).unwrap();
+    let log = sim.undo();
+    assert_no_failures(&log);
+    assert_eq!(
+        std::fs::read(sim.p("d/f")).unwrap(),
+        b"f\n",
+        "{}",
+        log.join("\n")
+    );
+    let m = std::fs::metadata(sim.p("d")).unwrap();
+    assert_eq!(m.mode() & 0o777, 0o700, "{}", log.join("\n"));
+    assert!(
+        log.iter().any(|l| l.contains("0700")),
+        "not reported\n{}",
+        log.join("\n")
+    );
 }
