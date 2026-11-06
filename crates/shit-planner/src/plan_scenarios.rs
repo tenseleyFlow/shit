@@ -1302,3 +1302,171 @@ fn dual_tier_rename_alone_restores_source_name() {
     assert_no_failures(&log);
     assert_eq!(sim.snapshot(), before, "{}", log.join("\n"));
 }
+
+// Round 4 review of #205.
+
+fn r4_report(name: &str, sim: &Sim, before: &BTreeMap<PathBuf, Entry>) {
+    let log = sim.undo();
+    let after = sim.snapshot();
+    let bad: Vec<&String> = log.iter().filter(|l| !l.starts_with("ok ")).collect();
+    let root = sim.root.path().to_string_lossy().to_string();
+    eprintln!(
+        "R4 {name}: tree_restored={} non_ok_ops={}",
+        &after == before,
+        bad.len()
+    );
+    for l in bad {
+        eprintln!(
+            "R4   {}",
+            l.replace(&root, "").chars().take(150).collect::<String>()
+        );
+    }
+    for (k, v) in before {
+        if after.get(k) != Some(v) {
+            eprintln!("R4   differs/missing: {k:?} after={:?}", after.get(k));
+        }
+    }
+    for k in after.keys() {
+        if !before.contains_key(k) {
+            eprintln!("R4   extra: {k:?}");
+        }
+    }
+}
+
+/// An `rm -rf rel` both tiers report: shim Unlink with the (0, 0)
+/// sentinel and helper Unlink with the real inode, per file.
+fn r4_rm_rf_dual(sim: &mut Sim, p: &Path) {
+    let m = std::fs::symlink_metadata(p).unwrap();
+    let kind = if m.is_dir() {
+        FileKind::Directory
+    } else {
+        FileKind::Regular
+    };
+    if m.is_dir() {
+        let mut children: Vec<PathBuf> = std::fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        children.sort();
+        for c in children {
+            r4_rm_rf_dual(sim, &c);
+        }
+    } else {
+        sim.pre_image(p, FilePreImageSource::Other);
+    }
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(0, 0),
+        path: p.to_path_buf(),
+        kind,
+        mode: m.mode(),
+    }));
+    if !m.is_dir() {
+        sim.pre_image(p, FilePreImageSource::Other);
+    }
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(m.dev(), m.ino()),
+        path: p.to_path_buf(),
+        kind,
+        mode: m.mode(),
+    }));
+    if m.is_dir() {
+        std::fs::remove_dir(p).unwrap();
+    } else {
+        std::fs::remove_file(p).unwrap();
+    }
+}
+
+fn r4_seed_pip(sim: &Sim) {
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"v1\n", 0o644);
+    sim.seed_dir("d/sub", 0o750);
+    sim.seed_file("d/sub/g", b"g1\n", 0o640);
+}
+
+#[test]
+fn r4_b_lsm_dual_tier_pip_shape() {
+    // pip with the helper's LSM tier and the shim both active: both
+    // report the Rename and the unlinks, the helper reports the creates.
+    let mut sim = Sim::new();
+    r4_seed_pip(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    let dup = sim.events.last().unwrap().kind.clone();
+    sim.emit(dup);
+    sim.mkdir("d");
+    sim.write("d/f", b"v2\n");
+    let p = sim.p("d.old");
+    r4_rm_rf_dual(&mut sim, &p);
+    r4_report("B-lsm-dual-tier", &sim, &before);
+}
+
+#[test]
+fn r4_b_bsd_dir_diff_pip_shape() {
+    // pip with BSD's dir-diff: Create events for the rename destination
+    // and everything under it, alongside the shim's Rename.
+    let mut sim = Sim::new();
+    r4_seed_pip(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    for rel in ["d.old", "d.old/f", "d.old/sub", "d.old/sub/g"] {
+        let p = sim.p(rel);
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        let kind = if m.is_dir() {
+            FileKind::Directory
+        } else {
+            FileKind::Regular
+        };
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+            inode: InodeRef::new(m.dev(), m.ino()),
+            path: p,
+            kind,
+            mode: m.mode(),
+        }));
+    }
+    sim.mkdir("d");
+    sim.write("d/f", b"v2\n");
+    sim.rm_rf("d.old");
+    r4_report("B-bsd-dir-diff", &sim, &before);
+}
+
+#[test]
+#[ignore = "fails at fb9f2a6, round 4 review of #205: the replaced-subtree rule matches t by relative name and loses it"]
+fn failed_enotempty_rename_then_rm_rf_restores_destination_bytes() {
+    // `d/` and `t/` both hold a and b. os.rename('d', 't') fails with
+    // ENOTEMPTY but the walk and Rename are journaled before the syscall.
+    // Then `rm -rf t`. Both trees must keep their own bytes.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/a", b"d-a\n", 0o644);
+    sim.seed_file("d/b", b"d-b\n", 0o644);
+    sim.seed_dir("t", 0o755);
+    sim.seed_file("t/a", b"t-a\n", 0o644);
+    sim.seed_file("t/b", b"t-b\n", 0o644);
+    let before = sim.snapshot();
+    let from = sim.p("d");
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    let mut complete = true;
+    walk_tree(&from, &mut files, &mut dirs, &mut complete);
+    for f in &files {
+        sim.pre_image(f, WALK_SOURCE);
+    }
+    r4_a_dir_records(&mut sim, &dirs, &from);
+    let inode = Sim::inode_of(&from);
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+        from,
+        to: sim.p("t"),
+        inode,
+    }));
+    sim.rm_rf("t");
+    let log = sim.undo();
+    let after = sim.snapshot();
+    assert_eq!(after, before, "bytes lost\n{}", log.join("\n"));
+}
+
+fn r4_a_dir_records(sim: &mut Sim, dirs: &[PathBuf], from: &Path) {
+    for d in dirs {
+        sim.pre_image_dir(d);
+    }
+    sim.pre_image_dir(from);
+}
