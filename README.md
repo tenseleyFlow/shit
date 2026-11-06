@@ -2,15 +2,19 @@
 
 magic undo for the command line
 
-You just made a mistake on the command line — an edit, a botched `mv`, a `rm` that took more than you meant — and you want to undo its *effects*. `shit` watches the right kernel surfaces, captures pre-images cheaply via your filesystem's native copy-on-write, and produces an approvable undo plan.
+You ran a command and want its effects undone: an edit, a botched `mv`, an `rm` that took more than you meant. `shit` watches kernel surfaces, captures pre-images with your filesystem's copy-on-write where it has one, and produces an undo plan you approve.
 
 ## Status
 
-Pre-1.0. APIs, wire formats, and on-disk layouts are unstable. The headline claim — "arbitrary command undo" — is honest only for the classes pinned by a green CI smoke today; see [Coverage today](#coverage-today) and [What doesn't work yet](#what-doesnt-work-yet) for the precise picture.
+Pre-1.0. APIs, wire formats, and on-disk layouts are unstable. "Arbitrary command undo" holds only for the classes pinned by a green CI smoke today. See [Coverage today](#coverage-today) and [What doesn't work yet](#what-doesnt-work-yet).
+
+Linux and FreeBSD run the full smoke suite in CI. On macOS, CI runs the DYLD-interposer and wrapper smokes on hosted runners. The EndpointSecurity smokes are built but excluded from CI (see [macOS](#macos)). Windows is not supported.
 
 ## Install
 
-Coming soon: `brew install tenseleyFlow/tap/shit`, AUR (`shit-bin`), FreeBSD ports, and a signed `curl … | sh`.
+There are no releases or packages yet. The Homebrew and AUR packaging directories are empty, so the only install path is building from source (below) and applying capabilities to the helper by hand. Packaging is tracked in #192.
+
+Planned: a Homebrew tap, AUR, FreeBSD ports, and a signed `curl | sh`. No dates.
 
 ## Dev quickstart
 
@@ -29,10 +33,10 @@ make ci     # everything CI runs
 
 - **`shit`** — the CLI: `shit undo`, `shit redo`, `shit list`, `shit show`, `shit pin`, `shit doctor`, …
 - **`shitd`** — a per-user daemon that owns the snapshot store, the sqlite index, the IPC sockets, and the undo planner.
-- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + LD_PRELOAD shim on FreeBSD (the shim is the supported default; running without it is reported by `shit doctor` as the degraded `kqueue-only` tier). Falls back to FSEvents-degraded on un-entitled macOS installs.
+- **`shit-helper`** — a privileged helper that drives kernel-level capture: EndpointSecurity on macOS, fanotify-perm + eBPF-LSM on Linux, kqueue + LD_PRELOAD shim on FreeBSD (the shim is the supported default; running without it is reported by `shit doctor` as the degraded `kqueue-only` tier). On un-entitled macOS installs, FSEvents supplies watch readiness and post-hoc diagnostics only; actionable capture there comes from the DYLD interposer.
 - **shell hooks** (bash, zsh, fish) that bracket each command with metadata events sent over a per-user Unix-domain-socket.
 
-When a command writes, renames, unlinks, or otherwise mutates a file inside a tracked process subtree, the helper captures the pre-image *before* the kernel allows the syscall to complete — using `clonefile` (APFS), `reflink` (btrfs/XFS), `zfs clone` (ZFS), hardlink, or streaming copy, picking the cheapest tier the underlying filesystem supports. Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`. When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
+When a command writes, renames, unlinks, or otherwise mutates a file inside a tracked process subtree, the helper captures the pre-image *before* the kernel allows the syscall to complete. Depending on the active tier and filesystem, it uses `clonefile` (APFS), `reflink` (btrfs/XFS), hardlink, or bounded streaming copy. A `zfs clone` engine exists in `shit-capture` but the helper does not call it (see [FreeBSD](#freebsd)). Blobs land in a content-addressed store (blake3 + zstd) under `$XDG_STATE_HOME/shit/`. When you run `shit undo`, the daemon's planner walks the captured events, computes an inverse-op DAG, shows you exactly what it'll do, and applies it on your `y`.
 
 Honesty principle: any command class we cannot mechanically reverse goes in the [refuse-list catalog](#refuse-list-what-we-explicitly-wont-undo) — `shit undo` exits non-zero with a one-line reason rather than silently producing a partial undo.
 
@@ -98,7 +102,7 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 | `dnf install / remove` | delegates to `dnf history undo <id>` | `dnf-history-undo-linux.sh` |
 | `apt`-tier capture wire (DR-19) | `pkg-event` IPC + journal | `apt-pkg.sh` |
 
-**Container / orchestration** (helper-side `container-event` wrapper captures `docker inspect` JSON pre-mutation; planner walks the JSON to reconstruct a `docker run` argv with ~15 flags):
+**Container / orchestration** (helper-side `container-event` wrapper captures `docker inspect` JSON pre-mutation; planner walks the JSON to reconstruct a `docker run` argv with ~15 flags). PR #185 proposes narrowing this to `docker rmi --no-prune` only; that decision is open (#186). The rows below describe trunk:
 
 | Workload | Smoke |
 |---|---|
@@ -132,7 +136,7 @@ A handful of smokes (`daemon-boot.sh`, `brew-pkg.sh`, `sqlite3-db.sh`) are **tie
 
 Capture tier: kqueue (`EVFILT_VNODE` NOTE_WRITE/RENAME/DELETE/ATTRIB) + LD_PRELOAD shim for the cross-watch / install-overwrite race. The shim is the supported default; `shit doctor` reports the `kqueue-only` tier when the shim is missing and surfaces a multi-line WARN block telling you which classes of pre-image you lose. Capsicum sandbox is default-on (B05); set `SHIT_CAPSICUM=0` to opt out.
 
-Pre-image CoW tier on ZFS-backed paths: per-event `zfs clone`. The COW engine snapshots the source dataset, clones the snapshot to a hidden mountpoint (`/tmp/.shit-clones/<id>`), reads the pre-image bytes from the clone, then destroys the clone + snapshot — all per captured event. Falls through to hardlink + streaming copy when `/sbin/zfs` is missing, the path isn't on ZFS, or the dataset is `mountpoint=none|legacy`. Coverage validated by `zfs-clone-primitives-fbsd.sh` (primitives) and `zfs-clone-engine-fbsd.sh` (engine wire).
+A per-event ZFS clone engine exists in `crates/shit-capture/src/cow/` and is validated in isolation by `zfs-clone-primitives-fbsd.sh` and `zfs-clone-engine-fbsd.sh`. Nothing in `shit-helper` or `shitd` calls it. Current BSD capture uses kqueue, the preload shim, and bounded staging copies. The ZFS smokes are engine tests, not evidence of a production ZFS tier.
 
 | Class | Smoke |
 |---|---|
@@ -147,7 +151,9 @@ Pre-image CoW tier on ZFS-backed paths: per-event `zfs clone`. The COW engine sn
 
 ### macOS
 
-Capture tier: EndpointSecurity (M03 — entitled installs) with FSEvents-degraded fallback (M01 — un-entitled, no Apple Developer ID required). The helper auto-selects at boot: ES when the entitlement is granted, FSEvents otherwise. `shit doctor` reports the active tier.
+Two capture paths exist. EndpointSecurity needs a signed, entitled helper. The default path is the DYLD interposer, with FSEvents for readiness and diagnostics. `shit doctor` reports the active tier.
+
+CI status: the seven `es-*` smokes and `fsevents-fallback-macos.sh` carry `EXCLUDED_BY: M03-vm-runner` and do not run in CI. Running them needs an Apple Silicon Tart host, which does not exist yet (#190). Treat the EndpointSecurity rows as built, not CI-gated. The DYLD and wrapper rows run on hosted `macos-14`.
 
 | Class | Capture | Smoke |
 |---|---|---|
@@ -157,8 +163,12 @@ Capture tier: EndpointSecurity (M03 — entitled installs) with FSEvents-degrade
 | content overwrites via `open(O_WRONLY)` | ES `AUTH_OPEN` + clonefile pre-image | `es-open-write-undo-macos.sh` |
 | `chmod` / `chown` / `utimes` (metadata) | ES `AUTH_SETATTRLIST` | `es-chmod-metadata-macos.sh` |
 | xattr round-trip | ES + xattr capture (M03.x.XATTR) | `es-xattr-roundtrip-macos.sh` |
-| FSEvents fallback (un-entitled) | post-hoc kqueue-style notifications, no pre-image | `fsevents-fallback-macos.sh` |
-| `brew install / uninstall` | brew JSON snapshot wrapper | `brew-pkg.sh` |
+| FSEvents fallback (un-entitled) | post-hoc notifications, no pre-image; readiness and diagnostics only | `fsevents-fallback-macos.sh` (excluded) |
+| `chmod` via the DYLD interposer | pre-image before libc call, journaled after success | `chmod-undo-dyld-shim-macos.sh` |
+| `make install`, `cargo install --force`, `pip install --user --force-reinstall` | DYLD interposer | `make-install-undo-macos.sh`, `cargo-install-force-undo-macos.sh`, `pip-install-user-undo-macos.sh` |
+| xattr set, hardlink, mkfifo, mmap write, `cp -c` overwrite, `chflags` | DYLD interposer | `xattr-mutate-undo-macos.sh`, `link-undo-macos.sh`, `mkfifo-undo-macos.sh`, `mmap-write-undo-macos.sh`, `cp-clone-overwrite-undo-macos.sh`, `chflags-undo-macos.sh` |
+| `launchctl bootstrap`, `networksetup`, `pfctl`, `route add`, `kill` | wrappers | `launchctl-bootstrap-undo-macos.sh`, `networksetup-dns-undo-macos.sh`, `networksetup-location-undo-macos.sh`, `pfctl-undo-macos.sh`, `route-add-undo-macos.sh`, `kill-proc-libproc-macos.sh` |
+| `brew install / uninstall` | brew JSON snapshot wrapper | `brew-pkg.sh`, `brew-install-undo-macos.sh` |
 | `sqlite3 file.db "<sql>"` | shim pre-image | `sqlite3-db.sh` |
 
 M03.x follow-ups (`mkfifo`/`mknod` via AUTH_CREATE, `chflags`/extended-ACL via AUTH_SETFLAGS+AUTH_SETACL, hardlink via AUTH_LINK, MAP_SHARED mmap via AUTH_MMAP, AUTH_CLONE/AUTH_COPYFILE for `cp -c`) are tracked in `.docs/sprints/macos/M03.x-followup-roadmap.md` — promote to landed when a real-workload smoke surfaces the gap.
@@ -181,6 +191,12 @@ The planner short-circuits these classes at plan-build time with a one-line reas
 
 These are gaps where coverage is plausible but not yet shipped. Each item is tracked under `.docs/sprints/` (gitignored) with implementation notes.
 
+### All platforms
+
+- **No install path** — no tagged release, no package. Tracked in #192.
+- **Loss-aware capture** — refusing an undo when capture was provably incomplete for the touched paths is not on trunk. A first attempt (PR #185) also refused undo on tiers that were never proven ready, and is on hold pending a design decision (#186).
+- **Windows** — not supported. [docs/windows-exploration.md](docs/windows-exploration.md) is a feasibility study (WSL 2 first, native behind a minifilter proof). There is no code.
+
 ### Linux
 
 - **`>>` append / `tee -a` Linux smoke** — the FileExtend wire + planner + executor all shipped in C06 (`InverseOp::FileExtend { truncate_to: pre_size }`, `FileExecutor::apply_file_extend`); pipeline integration tests in `shit-shell::c06_pipeline` are green. The remaining gap is a pinned Linux smoke — FreeBSD has `shell-append-undo-fbsd.sh` covering the round-trip; Linux needs the equivalent (proposed campaign: `AR-append-smoke-linux`).
@@ -196,7 +212,9 @@ These are gaps where coverage is plausible but not yet shipped. Each item is tra
 
 ### macOS
 
-- **Notarized helper distribution** — M04 sprint. Today the entitled-ES path requires a self-built helper with a developer-signed entitlement. Codesign self-verify infrastructure shipped in M07.C (the daemon refuses helpers whose code signature doesn't validate); the remaining M04 work is the signed-distribution + notarize CI pipeline so a `brew install shit` ships a ready-to-run binary. Un-entitled installs already get FSEvents-degraded capture out of the box.
+- **EndpointSecurity CI** — the 7 ES smokes and the FSEvents smoke are excluded until a Tart host runs them (#190). Until then the entitled-ES path has no CI evidence.
+- **Nightly Intel job** — `nightly.yml` targets `macos-13`, which GitHub has retired. Status is under investigation (#188).
+- **Notarized helper distribution** — M04 sprint. Today the entitled-ES path requires a self-built helper with a developer-signed entitlement. Codesign self-verify infrastructure shipped in M07.C (the daemon refuses helpers whose code signature doesn't validate); the remaining M04 work is the signed-distribution + notarize CI pipeline so a `brew install shit` ships a ready-to-run binary. Un-entitled installs get the DYLD interposer and FSEvents diagnostics out of the box.
 - **DYLD interposer auto-install** — DR-CR-34. The interposer itself shipped via M07.A (`shit dyld-hooks install` writes the shim to `/usr/local/lib/libshit_preload_shim.dylib` and the M07.B.5 smoke validates end-to-end against brew's `gchmod`, a non-SIP binary). The remaining work is package-manager auto-install (so `brew install shit` configures DYLD on first run), and the auth-event coverage for the long tail of dyld-strippable syscalls. SIP-protected system binaries are intentionally out of scope — Apple strips `DYLD_INSERT_LIBRARIES` on those by design.
 - **M03.x follow-ups** — see `.docs/sprints/macos/M03.x-followup-roadmap.md` for the precise list (AUTH_LINK / AUTH_MMAP / AUTH_SETFLAGS / AUTH_CLONE handlers); each gates on a real-workload smoke surfacing the gap.
 
