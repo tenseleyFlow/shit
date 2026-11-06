@@ -95,12 +95,18 @@ if "${WATCHED}/set_chflags" "${TARGET}" 2>"${SHIT_SMOKE_TMP}/probe.err"; then
 else
     smoke_log "note: chflags(UF_NODUMP) failed: $(cat "${SHIT_SMOKE_TMP}/probe.err")"
 fi
-if [ "${SUPPORTS_CHFLAGS}" -eq 0 ]; then
-    smoke_log "note: this FS does not store UF_NODUMP; only the shim-emission gate runs and the smoke ends in SKIP"
-fi
+PROBE_FS="$(df -T "${WATCHED}" 2>/dev/null | awk 'NR==2{print $2}')"
 [ "$(stat -f '%Of' "${TARGET}")" = "${PROBE_ORIG}" ] \
     || smoke_fail "probe left flags at $(stat -f '%Of' "${TARGET}"), want ${PROBE_ORIG}"
-smoke_log "flag probe: orig=${PROBE_ORIG} supported=${SUPPORTS_CHFLAGS} fs=$(df -T "${WATCHED}" 2>/dev/null | awk 'NR==2{print $2}')"
+smoke_log "flag probe: orig=${PROBE_ORIG} supported=${SUPPORTS_CHFLAGS} fs=${PROBE_FS}"
+if [ "${SUPPORTS_CHFLAGS}" -eq 0 ]; then
+    # UFS and ZFS both store UF_NODUMP. A failed probe on either is a
+    # real fault, and a SKIP here would turn CI green with no round trip.
+    case "${PROBE_FS}" in
+        ufs|zfs) smoke_fail "UF_NODUMP probe failed on ${PROBE_FS}, which must support it" ;;
+    esac
+    smoke_log "note: ${PROBE_FS:-unknown FS} does not store UF_NODUMP; only the shim-emission gate runs and the smoke ends in SKIP"
+fi
 PRE_FLAGS="$(stat -f '%Of' "${TARGET}")"
 PRE_FLAGS2="$(stat -f '%Of' "${TARGET2}")"
 
