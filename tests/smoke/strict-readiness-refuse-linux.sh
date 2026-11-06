@@ -8,13 +8,13 @@
 # EXCLUDED_BY:
 # EXCLUDED_REASON:
 #
-# R3 slice A — strict capture refuses when the helper reports
-# WatchTreeFailed; default mode proceeds best-effort.
+# R3 slice A — strict capture refuses when the helper cannot attach to
+# the command's cwd; default mode proceeds best-effort.
 #
-# The PreExec names a watch cwd that does not exist. The Linux helper
-# validates the daemon-supplied cwd, cannot attach the LSM tier to it,
-# and answers WatchTreeFailed instead of WatchTreeReady. The shell hook
-# prints one not-ready line with the reason and the command still runs.
+# The PreExec names a watch cwd that does not exist. The LSM helper
+# cannot pre-open it. It still tracks the pid tree, since LSM hooks fire
+# globally, sends a CaptureRefused observation, and answers
+# WatchTreeReady. The command runs either way.
 #
 #   Phase 1, SHIT_STRICT_CAPTURE=1: the daemon journals a command-scoped
 #   CaptureRefused row (class capture-incomplete). `shit undo` prints a
@@ -23,9 +23,7 @@
 #   Phase 2, flag unset: same command shape, no CaptureRefused row, and
 #   undo prints no capture-incomplete refusal (trunk behavior).
 #
-# Validate-the-gap: on trunk the Linux helper read /proc/<pid>/cwd and
-# sent WatchTreeReady even when the attach was incomplete, so neither
-# the not-ready line nor the strict refusal could appear.
+# Validate-the-gap: trunk has no strict mode, so the row cannot appear.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -94,8 +92,8 @@ run_phase() {
     "${SHIT_BIN}" hook-send post-exec \
         --session "${session}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
     [ ! -e "${victim}" ] || smoke_fail "[${label}] command did not run (victim still present)"
-    if ! grep -q "not-ready (reason: capture attach failed" "${SHIT_SMOKE_TMP}/${label}.hook.log"; then
-        smoke_fail "[${label}] hook did not report WatchTreeFailed as not-ready"
+    if grep -q "not-ready" "${SHIT_SMOKE_TMP}/${label}.hook.log"; then
+        smoke_fail "[${label}] LSM attach tracks the tree, so the hook must stay ready"
     fi
     set +e
     "${SHIT_BIN}" undo --yes > "${SHIT_SMOKE_TMP}/${label}.undo.log" 2>&1
