@@ -155,13 +155,18 @@ jobs:
     name: pkg-install-doctor smoke (P1)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Keep /tmp/shit-smoke.* so the failure upload below can read it.
+      SMOKE_KEEP_TMP: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deb
+          tool: cargo-deb,cargo-generate-rpm
+      - name: install rpm (to inspect the .rpm)
+        run: sudo apt-get update && sudo apt-get install -y rpm
       - name: run smoke
         run: bash tests/smoke/pkg-install-doctor-linux.sh
       - name: upload artifacts on failure

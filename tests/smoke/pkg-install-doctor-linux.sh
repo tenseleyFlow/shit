@@ -19,7 +19,10 @@
 #      shell hook sources.
 #   4. Start shitd through the systemd user unit when a user bus
 #      exists, else directly from /usr/bin.
-#   5. Assert `shit doctor --json` reports a Linux tier other than
+#   5. Assert `shit install --dry-run` resolves the packaged shim in
+#      /usr/lib/shit, and that the .rpm built from the same tree lists
+#      the same files and carries the setcap scriptlet.
+#   6. Assert `shit doctor --json` reports a Linux tier other than
 #      `degraded` and that the helper carries all three caps.
 #
 # Needs sudo. The package is removed on exit unless SHIT_PKG_KEEP=1.
@@ -28,10 +31,12 @@
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export SHIT_REPO_ROOT
 REAL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+REAL_STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
 # shellcheck source=lib.sh
 source "${SHIT_REPO_ROOT}/tests/smoke/lib.sh"
 
 VIA=direct
+STATE_MARKER=""
 
 pkg_cleanup() {
     local rc=$?
@@ -40,6 +45,11 @@ pkg_cleanup() {
     fi
     if [ "${SHIT_PKG_KEEP:-0}" != "1" ]; then
         sudo dpkg --purge shit >/dev/null 2>&1 || true
+    fi
+    # The systemd-run daemon writes to the real state dir; remove it only if
+    # this smoke created it.
+    if [ -n "${STATE_MARKER}" ] && [ -f "${STATE_MARKER}" ]; then
+        rm -rf "${REAL_STATE_HOME}/shit"
     fi
     (exit "${rc}")
     smoke_cleanup
@@ -51,6 +61,9 @@ command -v dpkg >/dev/null || smoke_fail "dpkg not found"
 command -v python3 >/dev/null || smoke_fail "python3 not found"
 cargo deb --version >/dev/null 2>&1 \
     || smoke_fail "cargo-deb missing; run: cargo install cargo-deb --locked"
+cargo generate-rpm --version >/dev/null 2>&1 \
+    || smoke_fail "cargo-generate-rpm missing; run: cargo install cargo-generate-rpm --locked"
+command -v rpm >/dev/null || smoke_fail "rpm not found (apt install rpm)"
 
 cd "${SHIT_REPO_ROOT}" || exit 1
 
@@ -63,6 +76,21 @@ DEB="$(ls -t target/debian/shit_*.deb | head -n1)"
 [ -f "${DEB}" ] || smoke_fail "no .deb produced under target/debian"
 smoke_log "package: ${DEB}"
 
+# The rpm is not installed here (no rpm-based host); inspect it against the
+# deb's layout and check the post-install scriptlet.
+cargo generate-rpm -p crates/shit
+RPM="$(ls -t target/generate-rpm/shit-*.rpm | head -n1)"
+[ -f "${RPM}" ] || smoke_fail "no .rpm produced under target/generate-rpm"
+smoke_log "package: ${RPM}"
+rpm -qpl "${RPM}" | grep -v '/$' | sort > "${SHIT_SMOKE_TMP}/rpm.files"
+dpkg -c "${DEB}" | awk '{print $NF}' | sed 's|^\./|/|' | grep -v -e '/$' -e '/usr/share/doc/' | sort > "${SHIT_SMOKE_TMP}/deb.files"
+if ! diff -u "${SHIT_SMOKE_TMP}/deb.files" "${SHIT_SMOKE_TMP}/rpm.files" >&2; then
+    smoke_fail "deb and rpm file lists differ"
+fi
+rpm -qp --scripts "${RPM}" | grep -q 'setcap "\$CAPS"' \
+    || smoke_fail "rpm post-install scriptlet lacks setcap"
+smoke_log "rpm layout matches deb; scriptlet applies setcap"
+
 smoke_log "dpkg -i"
 sudo dpkg -i "${DEB}"
 
@@ -74,6 +102,12 @@ for f in /usr/bin/shit /usr/bin/shitd /usr/bin/shit-helper \
     [ -e "${f}" ] || smoke_fail "installed file missing: ${f}"
 done
 smoke_log "installed files present"
+
+# The CLI must find the packaged shim in /usr/lib/shit.
+DRY="$(/usr/bin/shit install --dry-run -- true)"
+echo "${DRY}"
+grep -q '/usr/lib/shit/libshit_preload_shim.so' <<<"${DRY}" \
+    || smoke_fail "shit install --dry-run did not resolve /usr/lib/shit/libshit_preload_shim.so"
 
 CAPS_LINE="$(getcap /usr/bin/shit-helper)"
 smoke_log "getcap: ${CAPS_LINE}"
@@ -88,6 +122,13 @@ if XDG_RUNTIME_DIR="${REAL_RUNTIME_DIR}" systemctl --user show-environment >/dev
     smoke_log "starting shitd via systemd user unit"
     VIA=systemd
     export XDG_RUNTIME_DIR="${REAL_RUNTIME_DIR}"
+    # The unit runs shitd with the real state dir; point the failure dump at it.
+    export XDG_STATE_HOME="${REAL_STATE_HOME}"
+    if [ ! -e "${REAL_STATE_HOME}/shit" ]; then
+        mkdir -p "${REAL_STATE_HOME}/shit"
+        STATE_MARKER="${REAL_STATE_HOME}/shit/.pkg-smoke-created"
+        : > "${STATE_MARKER}"
+    fi
     systemctl --user daemon-reload
     systemctl --user enable --now shit
     for _ in $(seq 1 100); do
