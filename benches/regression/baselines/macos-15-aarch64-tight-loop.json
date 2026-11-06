@@ -1,0 +1,14 @@
+{
+  "workload": "tight-loop",
+  "host_os": "macos",
+  "host_arch": "aarch64",
+  "n_total": 500,
+  "n_kept": 423,
+  "outliers_rejected": 77,
+  "median_us": 3720,
+  "p99_us": 4858,
+  "min_us": 2734,
+  "max_us": 4898,
+  "mean_us": 3773,
+  "wall_secs": 2
+}
