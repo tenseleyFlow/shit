@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Provision a FreeBSD 14 arm64 VM under qemu-system-aarch64.
-# Designed for macOS Apple Silicon hosts. Idempotent: re-running
-# from a clean tree is the same as running for the first time.
+# Provision a FreeBSD 14 VM under qemu. On an x86_64 Linux host this
+# is an amd64 guest under KVM; on Apple Silicon it is an arm64 guest
+# under HVF (see common.sh). Idempotent: re-running from a clean tree
+# is the same as running for the first time.
 #
 # Standing rule reminder (see DEFERRED-RUNTIME.md): this is the only
 # sanctioned path for exercising shit's BSD runtime tier. Don't run
@@ -11,97 +12,141 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
-mkdir -p "${WORK_DIR}"
+# shellcheck source=common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
-# FreeBSD release / arch / variant. Bump when the project moves to a
-# newer FreeBSD; keep the URL pinned for reproducibility.
-#
-# We deliberately use the BASIC-CLOUDINIT-zfs variant. Two reasons:
-# 1. CLOUDINIT means cloud-init is pre-installed — our cidata.iso
-#    works on first boot with no manual intervention.
-# 2. zfs root unlocks the ZFS-tier code path during `shit doctor`
-#    validation. UFS would only exercise the kqueue-only tier.
-FBSD_VERSION="${FBSD_VERSION:-14.4}"
-FBSD_ARCH="${FBSD_ARCH:-aarch64}"
-FBSD_VARIANT="${FBSD_VARIANT:-BASIC-CLOUDINIT-zfs}"
-FBSD_IMAGE_NAME="FreeBSD-${FBSD_VERSION}-RELEASE-arm64-${FBSD_ARCH}-${FBSD_VARIANT}.qcow2.xz"
-FBSD_IMAGE_URL="https://download.freebsd.org/releases/VM-IMAGES/${FBSD_VERSION}-RELEASE/${FBSD_ARCH}/Latest/${FBSD_IMAGE_NAME}"
-
-DISK_QCOW2="${WORK_DIR}/freebsd14-arm64.qcow2"
-SEED_ISO="${WORK_DIR}/cidata.iso"
-SSH_KEY="${WORK_DIR}/id_ed25519"
-EFI_VARS="${WORK_DIR}/efivars.fd"
-EFI_FIRMWARE_CANDIDATES=(
-  "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
-  "/usr/local/share/qemu/edk2-aarch64-code.fd"
-)
-
-log() {
-  printf '[fbsd-vm] %s\n' "$*" >&2
-}
-
-require() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    log "missing dependency: $1"
-    exit 2
-  fi
-}
-
-require qemu-system-aarch64
+require "${QEMU_BIN}"
 require qemu-img
 require curl
 require xz
 require ssh-keygen
-if ! command -v mkisofs >/dev/null 2>&1 && ! command -v hdiutil >/dev/null 2>&1; then
-  log "need mkisofs or hdiutil to build cidata.iso (install cdrtools via brew, or use macOS hdiutil)"
+ISO_TOOL=""
+for t in mkisofs genisoimage xorriso hdiutil; do
+  if command -v "${t}" >/dev/null 2>&1; then
+    ISO_TOOL="${t}"
+    break
+  fi
+done
+if [[ -z "${ISO_TOOL}" ]]; then
+  log "need mkisofs, genisoimage, xorriso or hdiutil to build cidata.iso"
   exit 2
 fi
 
-# 1. Download base image if not present.
-if [[ ! -f "${WORK_DIR}/${FBSD_IMAGE_NAME}" ]]; then
-  log "downloading ${FBSD_IMAGE_NAME} (one-off, ~500 MB)"
-  curl -fL --progress-bar -o "${WORK_DIR}/${FBSD_IMAGE_NAME}.part" "${FBSD_IMAGE_URL}"
-  mv "${WORK_DIR}/${FBSD_IMAGE_NAME}.part" "${WORK_DIR}/${FBSD_IMAGE_NAME}"
+sha512_of() {
+  if command -v sha512sum >/dev/null 2>&1; then
+    sha512sum "$1" | awk '{print $1}'
+  else
+    shasum -a 512 "$1" | awk '{print $1}'
+  fi
+}
+
+if vm_running; then
+  log "VM already running (pid $(cat "${QEMU_PIDFILE}")); run teardown.sh first"
+  exit 2
+fi
+
+# 1. Download the base image and verify it against the release
+# CHECKSUM.SHA512 before anything reads it.
+mkdir -p "${DOWNLOAD_DIR}"
+IMAGE_PATH="${DOWNLOAD_DIR}/${FBSD_IMAGE_NAME}"
+# Once an image has matched the release file, its hash is kept beside
+# it, and later runs check the image against that copy without going
+# back to the network.
+VERIFIED_SHA_FILE="${IMAGE_PATH}.sha512.verified"
+if [[ -f "${IMAGE_PATH}" && -s "${VERIFIED_SHA_FILE}" ]]; then
+  EXPECTED_SHA="$(cat "${VERIFIED_SHA_FILE}")"
+  log "using previously verified SHA512 from ${VERIFIED_SHA_FILE}"
+else
+  rm -f "${VERIFIED_SHA_FILE}"
+  log "fetching ${FBSD_CHECKSUM_URL}"
+  curl -fsSL -o "${DOWNLOAD_DIR}/CHECKSUM.SHA512" "${FBSD_CHECKSUM_URL}"
+  EXPECTED_SHA="$(sed -n "s/^SHA512 (${FBSD_IMAGE_NAME}) = //p" "${DOWNLOAD_DIR}/CHECKSUM.SHA512")"
+  if [[ -z "${EXPECTED_SHA}" ]]; then
+    log "no SHA512 line for ${FBSD_IMAGE_NAME} in CHECKSUM.SHA512"
+    exit 2
+  fi
+fi
+if [[ ! -f "${IMAGE_PATH}" ]]; then
+  log "downloading ${FBSD_IMAGE_NAME} (one-off, ~650 MB)"
+  curl -fL --progress-bar -C - -o "${IMAGE_PATH}.part" "${FBSD_IMAGE_URL}"
+  mv "${IMAGE_PATH}.part" "${IMAGE_PATH}"
 else
   log "base image already present: ${FBSD_IMAGE_NAME}"
 fi
+ACTUAL_SHA="$(sha512_of "${IMAGE_PATH}")"
+if [[ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]]; then
+  log "SHA512 mismatch for ${IMAGE_PATH}; deleting it"
+  log "  expected ${EXPECTED_SHA}"
+  log "  actual   ${ACTUAL_SHA}"
+  rm -f "${IMAGE_PATH}" "${VERIFIED_SHA_FILE}"
+  exit 1
+fi
+printf '%s\n' "${EXPECTED_SHA}" >"${VERIFIED_SHA_FILE}"
+log "SHA512 verified"
 
-# 2. Decompress into the working qcow2 (idempotent: bail if the
-# disk already exists — call teardown.sh first to redo).
+# 2. Decompress into the working qcow2 (bail if the disk already
+# exists; call teardown.sh first to redo).
 if [[ ! -f "${DISK_QCOW2}" ]]; then
   log "decompressing base image -> ${DISK_QCOW2}"
-  xz -dc "${WORK_DIR}/${FBSD_IMAGE_NAME}" > "${DISK_QCOW2}.tmp"
+  xz -dc "${IMAGE_PATH}" >"${DISK_QCOW2}.tmp"
   mv "${DISK_QCOW2}.tmp" "${DISK_QCOW2}"
-  log "resizing disk to 20 GB to fit rust toolchain + build dirs"
-  qemu-img resize "${DISK_QCOW2}" 20G
+  DISK_SIZE=20G
+  [[ "${FBSD_VM_ARCH}" == amd64 ]] && DISK_SIZE=40G
+  log "resizing disk to ${DISK_SIZE} to fit rust toolchain + build dirs"
+  qemu-img resize -q "${DISK_QCOW2}" "${DISK_SIZE}"
 else
   log "working disk already present: ${DISK_QCOW2}"
 fi
 
+# The amd64 guest gets a blank second disk; guest-setup.sh makes it
+# the `shitzfs` pool so ZFS runs alongside the UFS root.
+if [[ "${FBSD_VM_ARCH}" == amd64 && ! -f "${ZPOOL_QCOW2}" ]]; then
+  log "creating 8 GB zpool disk -> ${ZPOOL_QCOW2}"
+  qemu-img create -q -f qcow2 "${ZPOOL_QCOW2}" 8G
+fi
+
 # 3. Generate a host-only SSH keypair if missing.
 if [[ ! -f "${SSH_KEY}" ]]; then
-  log "generating SSH keypair (VM-only, never leaves work/)"
+  log "generating SSH keypair (VM-only, never leaves the work dir)"
   ssh-keygen -q -t ed25519 -N '' -C 'shit-freebsd-vm' -f "${SSH_KEY}"
 fi
 
-# 4. Build a cidata ISO with cloud-init user-data that:
-#    - sets root password to a known value (VM-only),
-#    - installs our SSH key on the freebsd user,
-#    - enables sshd,
-#    - tells the OS to extend the root partition to the new disk size.
+# 4. Build a cidata ISO. FreeBSD 14's CLOUDINIT images run nuageinit,
+# which reads a subset of cloud-config: users with keys, packages,
+# and runcmd. The amd64 path keeps it minimal (user, key, sudo) and
+# leaves toolchain setup to guest-setup.sh over ssh, where failures
+# are visible on the host.
 SSH_PUB="$(cat "${SSH_KEY}.pub")"
-TMP_USER_DATA="$(mktemp -t fbsd-userdata)"
-TMP_META_DATA="$(mktemp -t fbsd-metadata)"
-trap 'rm -f "${TMP_USER_DATA}" "${TMP_META_DATA}"' EXIT
+STAGE_DIR="${WORK_DIR}/cidata-stage"
+rm -rf "${STAGE_DIR}"
+mkdir -p "${STAGE_DIR}"
+trap 'rm -rf "${STAGE_DIR}"' EXIT
 
-cat > "${TMP_META_DATA}" <<EOF
+cat >"${STAGE_DIR}/meta-data" <<EOF
 instance-id: shit-freebsd-vm-$(date +%s)
 local-hostname: shit-fbsd
 EOF
 
-cat > "${TMP_USER_DATA}" <<EOF
+if [[ "${FBSD_VM_ARCH}" == amd64 ]]; then
+  cat >"${STAGE_DIR}/user-data" <<EOF
+#cloud-config
+users:
+  - name: freebsd
+    gecos: shit VM user
+    groups: wheel
+    shell: /bin/sh
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ${SSH_PUB}
+ssh_pwauth: false
+packages:
+  - sudo
+runcmd:
+  - sysrc sshd_enable=YES
+  - service sshd onestart || service sshd restart
+EOF
+else
+  cat >"${STAGE_DIR}/user-data" <<EOF
 #cloud-config
 users:
   - name: freebsd
@@ -118,6 +163,7 @@ ssh_pwauth: true
 disable_root: false
 package_update: true
 packages:
+  - sudo
   - rust
   - rsync
   - gmake
@@ -128,67 +174,67 @@ runcmd:
   # own growpart module when the disk is bigger than the image —
   # nothing to do manually here.
 EOF
-
-log "building cidata.iso"
-if command -v mkisofs >/dev/null 2>&1; then
-  mkisofs -quiet -output "${SEED_ISO}" -volid cidata -joliet -rock \
-    "${TMP_USER_DATA}=user-data" "${TMP_META_DATA}=meta-data"
-else
-  # macOS-native fallback: hdiutil with -joliet
-  STAGE_DIR="$(mktemp -d -t fbsd-cidata)"
-  cp "${TMP_USER_DATA}" "${STAGE_DIR}/user-data"
-  cp "${TMP_META_DATA}" "${STAGE_DIR}/meta-data"
-  hdiutil makehybrid -quiet -o "${SEED_ISO}" -hfs -joliet -iso \
-    -default-volume-name cidata "${STAGE_DIR}"
-  rm -rf "${STAGE_DIR}"
 fi
 
-# 5. EFI firmware: qemu's aarch64 needs the edk2 binary blob. Homebrew
-# ships it with qemu under share/qemu/.
-EFI_FIRMWARE=""
-for candidate in "${EFI_FIRMWARE_CANDIDATES[@]}"; do
-  if [[ -f "${candidate}" ]]; then
-    EFI_FIRMWARE="${candidate}"
-    break
-  fi
-done
-if [[ -z "${EFI_FIRMWARE}" ]]; then
-  log "edk2-aarch64-code.fd not found in homebrew share dir; install qemu via brew"
-  exit 2
-fi
+log "building cidata.iso with ${ISO_TOOL}"
+rm -f "${SEED_ISO}"
+case "${ISO_TOOL}" in
+  mkisofs | genisoimage)
+    "${ISO_TOOL}" -quiet -output "${SEED_ISO}" -volid cidata -joliet -rock \
+      "${STAGE_DIR}/user-data" "${STAGE_DIR}/meta-data"
+    ;;
+  xorriso)
+    xorriso -as mkisofs -quiet -output "${SEED_ISO}" -volid cidata -joliet -rock \
+      "${STAGE_DIR}/user-data" "${STAGE_DIR}/meta-data"
+    ;;
+  hdiutil)
+    hdiutil makehybrid -quiet -o "${SEED_ISO}" -hfs -joliet -iso \
+      -default-volume-name cidata "${STAGE_DIR}"
+    ;;
+esac
 
-# 6. EFI vars (writable) — one-off init from a 64MB zero blob.
-if [[ ! -f "${EFI_VARS}" ]]; then
+# 5. EFI vars (aarch64 only): one-off init from a 64MB zero blob.
+if [[ "${FBSD_VM_ARCH}" == aarch64 && ! -f "${EFI_VARS}" ]]; then
   log "initializing EFI vars store"
   dd if=/dev/zero of="${EFI_VARS}" bs=1M count=64 2>/dev/null
 fi
 
-# 7. First boot: run with no graphical display, attach the cidata ISO,
-# wait for cloud-init to complete (sshd up + key installed).
-log "first boot — cloud-init runs once (~3-5 min depending on pkg install)"
-log "  (press Ctrl-A then X to abort; serial log -> ${WORK_DIR}/vm.log)"
+# 6. First boot with the seed attached.
+log "first boot (${FBSD_VM_ARCH}, ${QEMU_BIN}); serial log -> ${QEMU_LOG}"
+rm -f "${QEMU_LOG}"
+build_qemu_args "${SEED_ISO}"
+BOOT_START=${SECONDS}
+"${QEMU_BIN}" "${QEMU_ARGS[@]}"
 
-QEMU_PIDFILE="${WORK_DIR}/vm.pid"
-QEMU_LOG="${WORK_DIR}/vm.log"
+if [[ "${FBSD_VM_ARCH}" == aarch64 && "${FBSD_VM_GUEST_SETUP:-0}" != 1 ]]; then
+  # The Mac path installs pkg rust through cloud-init and stops here.
+  log "VM booting. SSH will come up at 127.0.0.1:${SSH_PORT} once cloud-init finishes."
+  log "test with: tools/freebsd-vm/ssh.sh true"
+  log "follow boot: tail -f ${QEMU_LOG}"
+  exit 0
+fi
 
-qemu-system-aarch64 \
-  -name "shit-freebsd-vm" \
-  -machine virt,accel=hvf \
-  -cpu host \
-  -smp 2 \
-  -m 2048 \
-  -drive if=pflash,format=raw,readonly=on,file="${EFI_FIRMWARE}" \
-  -drive if=pflash,format=raw,file="${EFI_VARS}" \
-  -drive if=virtio,format=qcow2,file="${DISK_QCOW2}" \
-  -drive if=virtio,format=raw,file="${SEED_ISO}",readonly=on \
-  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2225-:22 \
-  -device virtio-net-pci,netdev=net0 \
-  -display none \
-  -serial file:"${QEMU_LOG}" \
-  -pidfile "${QEMU_PIDFILE}" \
-  -monitor none \
-  -daemonize
+log "waiting for sshd + key (nuageinit first boot)"
+wait_for_ssh 900
+log "ssh up after $((SECONDS - BOOT_START))s"
 
-log "VM booting. SSH will come up at 127.0.0.1:2225 once cloud-init finishes."
-log "test with: tools/freebsd-vm/ssh.sh true"
-log "follow boot: tail -f ${QEMU_LOG}"
+# sshd answers before nuageinit's post-network stage has installed
+# the `packages:` list, so wait for sudo itself to work.
+log "waiting for nuageinit to install sudo"
+SUDO_DEADLINE=$((SECONDS + 600))
+until ssh "${SSH_OPTS[@]}" -o BatchMode=yes freebsd@127.0.0.1 'sudo -n true' 2>/dev/null; do
+  if ((SECONDS >= SUDO_DEADLINE)); then
+    log "sudo not usable 600s after ssh came up; nuageinit packages step failed or is stuck"
+    log "check ${QEMU_LOG} and /var/log/messages in the guest"
+    exit 1
+  fi
+  sleep 5
+done
+log "sudo ready after $((SECONDS - BOOT_START))s"
+
+# 7. Guest setup over ssh: packages, rustup 1.88, doas, zpool.
+SETUP_START=${SECONDS}
+ssh "${SSH_OPTS[@]}" freebsd@127.0.0.1 \
+  "FBSD_VM_ARCH=${FBSD_VM_ARCH} sh -s" <"${FBSD_VM_SCRIPT_DIR}/guest-setup.sh"
+log "guest setup done in $((SECONDS - SETUP_START))s"
+log "VM ready at 127.0.0.1:${SSH_PORT}; next: sync.sh, run-smoke.sh <name>"

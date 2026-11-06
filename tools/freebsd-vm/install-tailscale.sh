@@ -17,7 +17,8 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-if ! [ -f work/vm.pid ] || ! kill -0 "$(cat work/vm.pid)" 2>/dev/null; then
+PIDFILE="${FBSD_VM_WORK_DIR:-work}/vm.pid"
+if ! [ -f "$PIDFILE" ] || ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "FreeBSD VM not running. Run tools/freebsd-vm/boot.sh first." >&2
     exit 1
 fi

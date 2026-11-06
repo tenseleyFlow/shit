@@ -8,29 +8,25 @@
 # Usage: run-smoke.sh <smoke-script-name>
 #   e.g. ./tools/freebsd-vm/run-smoke.sh rm-undo-fbsd.sh
 #
-# Expects the smoke under tests/smoke/<name>.
+# Expects the smoke under tests/smoke/<name>. SMOKE_TMPDIR=/tmp/zfs
+# runs the smoke's scratch tree on the amd64 guest's ZFS dataset
+# instead of the UFS root.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
-SSH_KEY="${WORK_DIR}/id_ed25519"
-KNOWN_HOSTS="${WORK_DIR}/known_hosts"
+# shellcheck source=common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 SMOKE_NAME="${1:?usage: run-smoke.sh <smoke-script-name>}"
+SMOKE_TMPDIR="${SMOKE_TMPDIR:-/tmp}"
 
 # Sync first so the VM has the latest sources + smoke script.
-bash "${SCRIPT_DIR}/sync.sh" >/dev/null
+bash "${FBSD_VM_SCRIPT_DIR}/sync.sh" >/dev/null
 
-ssh \
-  -p 2225 \
-  -i "${SSH_KEY}" \
-  -o "UserKnownHostsFile=${KNOWN_HOSTS}" \
-  -o "StrictHostKeyChecking=accept-new" \
-  -o "IdentitiesOnly=yes" \
-  freebsd@127.0.0.1 \
-  "SMOKE_NAME=${SMOKE_NAME} bash -s" <<'REMOTE_SCRIPT'
+ssh "${SSH_OPTS[@]}" freebsd@127.0.0.1 \
+  "SMOKE_NAME=${SMOKE_NAME} SMOKE_TMPDIR=${SMOKE_TMPDIR} bash -s" <<'REMOTE_SCRIPT'
 set -euo pipefail
+export PATH="${HOME}/.cargo/bin:/usr/local/bin:${PATH}"
 cd ~/shit
 
 # Build release binaries we need for the smoke. Cached after the first
@@ -45,5 +41,5 @@ if [ ! -f "${SMOKE_PATH}" ]; then
   exit 2
 fi
 
-bash "${SMOKE_PATH}"
+TMPDIR="${SMOKE_TMPDIR}" bash "${SMOKE_PATH}"
 REMOTE_SCRIPT
