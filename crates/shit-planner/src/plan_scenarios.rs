@@ -1150,6 +1150,9 @@ fn scratch_hard_link_moved_then_removed_leaves_nothing_and_no_refusal() {
     assert_eq!(sim.snapshot(), before, "{}", log.join("\n"));
 }
 
+// macOS refuses rename(2) on a directory without write permission, so
+// this shape cannot arise there.
+#[cfg(not(target_os = "macos"))]
 fn read_only_tree_round_trip(mode: u32) {
     // `chmod -R u+w d` is not interposed: Go's module cache, then
     // `mv d t; chmod -R u+w t; rm -rf t`.
@@ -1175,11 +1178,13 @@ fn read_only_tree_round_trip(mode: u32) {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn read_only_0555_tree_is_rebuilt() {
     read_only_tree_round_trip(0o555);
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn read_only_0500_tree_is_rebuilt() {
     read_only_tree_round_trip(0o500);
 }
