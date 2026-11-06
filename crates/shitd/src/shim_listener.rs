@@ -199,6 +199,13 @@ async fn handle_one(
         "shim pre-mutation"
     );
 
+    // The shim notifies before the real unlink runs, so the path still
+    // exists here. Stat it first: on macOS and FreeBSD `resolve_by_descendant`
+    // below shells out to `ps` once per ancestor and can outlast the shim's 50 ms ack
+    // timeout, after which the syscall has run and the path is gone. By
+    // ingest time only the wire's Regular default would be left.
+    let unlink_stat = pre_syscall_unlink_stat(&note);
+
     // Resolve `pid → CommandId` BEFORE acking. The shim returns to
     // the calling process immediately after we ack, the real
     // syscall fires, and the process (e.g. `install` invoked by
@@ -216,11 +223,6 @@ async fn handle_one(
     // but later helper/shim events can no longer overtake this pre-
     // mutation snapshot in the planner's logical clock.
     let ingest_ts = crate::server::next_ts();
-
-    // The shim notifies before the real unlink runs, so the path still
-    // exists here. Stat it before the ack lets the syscall proceed; by
-    // ingest time it is gone and only the wire's Regular default is left.
-    let unlink_stat = pre_syscall_unlink_stat(&note);
 
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
@@ -575,14 +577,14 @@ fn ingest_notification(
         let mut journaled = 0u64;
         let mut failed = 0u64;
         for pre in &note.extra_pre_images {
-            match ingest_pre_image_with_source(
-                command,
-                pre,
-                index,
-                blob_store,
-                shit_planner::FilePreImageSource::ShimRenameSubtree,
-                ingest_ts,
-            ) {
+            // The walk's directory records come in on the same wire with
+            // a directory mode and no bytes.
+            let source = if pre.mode & 0o170000 == 0o040000 {
+                shit_planner::FilePreImageSource::ShimRenameSubtreeDir
+            } else {
+                shit_planner::FilePreImageSource::ShimRenameSubtree
+            };
+            match ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts) {
                 Ok(()) => journaled += 1,
                 Err(e) => {
                     failed += 1;
@@ -1361,6 +1363,10 @@ mod tests {
             extra_pre_images: vec![
                 shim_pre("/tmp/shit-walk/d/a", b"a"),
                 shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
+                ShimPreImage {
+                    mode: 0o040700,
+                    ..shim_pre("/tmp/shit-walk/d", b"")
+                },
             ],
             failure: None,
         };
@@ -1385,6 +1391,10 @@ mod tests {
         assert_eq!(
             sources,
             vec![
+                (
+                    PathBuf::from("/tmp/shit-walk/d"),
+                    FilePreImageSource::ShimRenameSubtreeDir
+                ),
                 (
                     PathBuf::from("/tmp/shit-walk/d/a"),
                     FilePreImageSource::ShimRenameSubtree

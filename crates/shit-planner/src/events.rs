@@ -133,6 +133,12 @@ pub enum FilePreImageSource {
     /// file's state at that moment. The planner uses this provenance
     /// to tell the walk's snapshots apart from in-command writes.
     ShimRenameSubtree,
+    /// A directory in the same walk: `path` and `meta` are its pre-rename
+    /// stat, the blob is empty and there is no content to restore. The
+    /// shim journals these only when the walk saw every entry, and the
+    /// entry for the rename source itself comes last, so its presence
+    /// proves the walk's files and directories are the whole subtree.
+    ShimRenameSubtreeDir,
 }
 
 impl FilePreImageSource {

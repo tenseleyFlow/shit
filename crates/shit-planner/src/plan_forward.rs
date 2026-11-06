@@ -135,6 +135,10 @@ fn emit_forward_for_event(
                 });
             }
         }
+        CaptureEventKind::FilePreImage {
+            source: FilePreImageSource::ShimRenameSubtreeDir,
+            ..
+        } => {}
         CaptureEventKind::FilePreImage { path, .. } => {
             // No captured post-bytes → can't redo content. Emit an
             // informational warning and skip. The metadata half
