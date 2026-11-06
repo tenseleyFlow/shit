@@ -95,9 +95,14 @@ echo "  bucket size: $(printf '%s\n' ${SMOKES} | wc -l | tr -d ' ') smokes, TMPD
 # flaky failure keeps its daemon log and journal (#202).
 RUNDIR="${HOME}/smoke-runs/$(date -u +%Y%m%dT%H%M%SZ)-${SMOKE_TAG}-$$"
 mkdir -p "${RUNDIR}"
-if [ -L "${HOME}/smoke-logs" ] || [ ! -e "${HOME}/smoke-logs" ]; then
-  ln -sfn "${RUNDIR}" "${HOME}/smoke-logs"
+# ~/smoke-logs was a real directory before per-run dirs. Keep its
+# contents and take the name, or "latest" would silently stay stale.
+if [ -e "${HOME}/smoke-logs" ] && [ ! -L "${HOME}/smoke-logs" ]; then
+  legacy="${HOME}/smoke-logs.legacy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mv "${HOME}/smoke-logs" "${legacy}"
+  echo "  moved old ~/smoke-logs to ${legacy}"
 fi
+ln -sfn "${RUNDIR}" "${HOME}/smoke-logs"
 echo "  run dir: ${RUNDIR}"
 FAIL_COUNT=0
 n=0
@@ -135,7 +140,11 @@ for smoke in ${SMOKES}; do
          FROM events ORDER BY id" > "${keep}/events.tsv" 2>/dev/null || true
     fi
   done
-  rm -rf "${scratch}" 2>/dev/null || doas rm -rf "${scratch}" 2>/dev/null || true
+  # Bounded: an open helper fd or a stuck FS must not hang the loop.
+  if ! /usr/bin/timeout 30 rm -rf "${scratch}" 2>/dev/null \
+    && ! /usr/bin/timeout 30 doas rm -rf "${scratch}" 2>/dev/null; then
+    echo "  WARN: could not remove ${scratch}; leaving it behind"
+  fi
   rc=$(cat "$rc_file" 2>/dev/null || echo 1)
   rm -f "$rc_file"
   verdict=FAIL
