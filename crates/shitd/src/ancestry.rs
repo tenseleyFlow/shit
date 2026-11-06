@@ -22,11 +22,13 @@
 //! ## Platform support
 //!
 //! - **Linux**: reads `/proc/<pid>/status::PPid`. Fast (~10µs).
-//! - **macOS / BSD**: shells out to `ps -o ppid= -p <pid>`. Slower
-//!   (~5ms for the fork+exec) but rock-solid across versions and
-//!   doesn't require a `libc::kinfo_proc` binding that varies by
-//!   target. Tier events are rare enough (a few per second on a
-//!   typical interactive workload) that the cost is invisible.
+//! - **FreeBSD**: `sysctl(KERN_PROC_PID)` and `kinfo_proc::ki_ppid`.
+//!   This used to fork `ps -o ppid=` per hop. On the FreeBSD VM a
+//!   chain from a smoke's rsync up to init took 60-100 ms that way,
+//!   longer than the preload shim's 50 ms ack timeout, so the shim
+//!   let the syscall run, rsync exited, the walk hit a dead pid and
+//!   the shim listener dropped the notification (#202).
+//! - **macOS**: shells out to `ps -o ppid= -p <pid>` (~5 ms per hop).
 //!
 //! ## Loop guard
 //!
@@ -60,9 +62,27 @@ pub const MAX_WALK_DEPTH: usize = 256;
 /// shell pid?"; returning an empty vec would force an extra branch
 /// at every callsite for the same outcome.
 pub fn ancestor_chain(start_pid: u32) -> Vec<u32> {
+    ancestor_walk(start_pid).chain
+}
+
+/// Result of [`ancestor_walk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorWalk {
+    /// Same contents as [`ancestor_chain`].
+    pub chain: Vec<u32>,
+    /// The start pid itself could not be resolved, so `chain` is just
+    /// `[start_pid]`. This is the "emitter exited before we looked"
+    /// race, as opposed to a walk that reached init without passing a
+    /// tracked shell.
+    pub start_gone: bool,
+}
+
+/// [`ancestor_chain`] plus whether the start pid had already exited.
+pub fn ancestor_walk(start_pid: u32) -> AncestorWalk {
     let mut chain = Vec::with_capacity(8);
     let mut seen: HashSet<u32> = HashSet::with_capacity(8);
     let mut cur = start_pid;
+    let mut start_gone = false;
     for _ in 0..MAX_WALK_DEPTH {
         if !seen.insert(cur) {
             // Loop — pid recycling race. Stop here.
@@ -70,12 +90,16 @@ pub fn ancestor_chain(start_pid: u32) -> Vec<u32> {
         }
         chain.push(cur);
         match parent_pid(cur) {
-            Some(0) | Some(1) | None => break,
+            None => {
+                start_gone = cur == start_pid;
+                break;
+            }
+            Some(0) | Some(1) => break,
             Some(p) if p == cur => break, // defensive: pid==ppid would also loop
             Some(p) => cur = p,
         }
     }
-    chain
+    AncestorWalk { chain, start_gone }
 }
 
 /// Look up the parent pid of `pid`. Returns `None` if the pid no
@@ -97,7 +121,37 @@ fn parse_ppid_linux(status: &str) -> Option<u32> {
     None
 }
 
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(target_os = "freebsd")]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        libc::c_int::try_from(pid).ok()?,
+    ];
+    // SAFETY: kinfo_proc is plain old data; the kernel fills it.
+    let mut kp: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+    let mut size: libc::size_t = std::mem::size_of::<libc::kinfo_proc>();
+    // SAFETY: mib has 4 valid entries, kp is writable for `size`
+    // bytes, and no new value is passed.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&mut kp as *mut libc::kinfo_proc).cast(),
+            &mut size,
+            std::ptr::null(),
+            0,
+        )
+    };
+    // A pid that has exited returns rc 0 with size 0, or ESRCH.
+    if rc != 0 || size < std::mem::size_of::<libc::kinfo_proc>() {
+        return None;
+    }
+    u32::try_from(kp.ki_ppid).ok()
+}
+
+#[cfg(target_os = "macos")]
 pub fn parent_pid(pid: u32) -> Option<u32> {
     use std::process::{Command, Stdio};
     let out = Command::new("ps")
@@ -183,6 +237,27 @@ mod tests {
         assert!(!chain.is_empty());
         assert_eq!(chain[0], pid);
         assert!(chain.len() <= MAX_WALK_DEPTH);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn walk_reports_live_start_and_parent() {
+        let w = ancestor_walk(std::process::id());
+        assert!(!w.start_gone);
+        assert_eq!(w.chain.get(1).copied(), parent_pid(std::process::id()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn walk_reports_exited_start() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        let w = ancestor_walk(pid);
+        assert!(w.start_gone, "reaped pid {pid} still resolved: {w:?}");
+        assert_eq!(w.chain, vec![pid]);
     }
 
     #[test]
