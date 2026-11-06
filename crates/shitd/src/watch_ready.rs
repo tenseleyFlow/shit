@@ -40,6 +40,9 @@ enum State {
     Pending(Vec<oneshot::Sender<()>>),
     /// Helper has signaled. Subsequent waiters complete immediately.
     Ready,
+    /// Helper reported it could not attach capture. Waiters are released
+    /// at once with a canceled (not-ready) result.
+    Failed,
 }
 
 /// Per-CommandId readiness map. Cheap to clone (Arc).
@@ -68,6 +71,15 @@ impl WatchReadyMap {
         }
     }
 
+    /// Helper reported that capture attach failed for this command.
+    /// Pending waiters are dropped (their receivers yield Err, which the
+    /// ctl handler reports as not-ready) and later waiters fail fast.
+    pub fn mark_failed(&self, cmd: CommandId) {
+        let mut map = self.inner.lock().unwrap();
+        // Dropping the previous Pending senders fires their receivers.
+        map.insert(cmd, State::Failed);
+    }
+
     /// Shell hook is asking to block until readiness. Returns a
     /// receiver the caller should await. The receiver completes when
     /// `mark_ready` fires for this CommandId, or yields Err(...) if
@@ -80,6 +92,9 @@ impl WatchReadyMap {
             Some(State::Ready) => {
                 // Already ready; fire the receiver synchronously.
                 let _ = tx.send(());
+            }
+            Some(State::Failed) => {
+                // Drop tx: the receiver yields Err immediately.
             }
             Some(State::Pending(senders)) => {
                 senders.push(tx);
@@ -146,6 +161,16 @@ mod tests {
         tokio::spawn(async move { m2.mark_ready(cmd(3)) });
         rx1.await.unwrap();
         rx2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_releases_pending_and_later_waiters() {
+        let map = WatchReadyMap::new();
+        let early = map.await_ready(cmd(5));
+        map.mark_failed(cmd(5));
+        assert!(early.await.is_err());
+        let late = map.await_ready(cmd(5));
+        assert!(late.await.is_err());
     }
 
     #[tokio::test]

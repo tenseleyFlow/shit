@@ -490,6 +490,16 @@ pub enum HelperResponse {
     Error {
         message: String,
     },
+    /// Helper could not attach capture for this (session, command_seq)
+    /// (cwd unavailable, subtree registration refused, attach timeout).
+    /// The daemon releases any `WaitWatchReady` caller immediately with
+    /// ready=false instead of letting it run to its timeout. Capture is
+    /// still not claimed for the command.
+    WatchTreeFailed {
+        session: Uuid,
+        command_seq: u64,
+        reason: String,
+    },
 }
 
 /// DR-15 helper-applied result for a privileged-op request.

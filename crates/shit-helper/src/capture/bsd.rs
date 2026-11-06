@@ -95,12 +95,33 @@ pub enum CaptureAttachError {
     ControlChannelClosed,
     #[error("BSD capture pump dropped the attach completion channel")]
     CompletionChannelClosed,
+    #[error("BSD capture attach did not complete within {0:?}")]
+    Timeout(std::time::Duration),
     #[error("register kqueue subtree at {root_path:?}: {source}")]
     RegisterSubtree {
         root_path: PathBuf,
         #[source]
         source: KqueueError,
     },
+}
+
+/// Upper bound on how long the request loop waits for the pump to finish
+/// one attach (registration plus baseline).
+const ATTACH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn wait_attach_completion(
+    rx: &Receiver<Result<(), CaptureAttachError>>,
+    timeout: std::time::Duration,
+) -> Result<(), CaptureAttachError> {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(CaptureAttachError::Timeout(timeout))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(CaptureAttachError::CompletionChannelClosed)
+        }
+    }
 }
 
 /// Producer state owned by the pump thread.
@@ -1273,9 +1294,11 @@ impl CaptureControl {
         // The pump sends this only after registration, baseline emission,
         // and insertion into its live watch map. This synchronization is
         // what makes the request loop's later WatchTreeReady truthful.
-        completion_rx
-            .recv()
-            .map_err(|_| CaptureAttachError::CompletionChannelClosed)?
+        //
+        // Bounded wait: the request loop is single-threaded, so an
+        // unbounded recv would serialize Ping/Unwatch/Shutdown and every
+        // other session behind one slow attach.
+        wait_attach_completion(&completion_rx, ATTACH_COMPLETION_TIMEOUT)
     }
 
     pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
@@ -1408,6 +1431,24 @@ fn pump(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn attach_wait_times_out_instead_of_blocking() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Result<(), CaptureAttachError>>();
+        let got = wait_attach_completion(&rx, std::time::Duration::from_millis(20));
+        assert!(matches!(got, Err(CaptureAttachError::Timeout(_))));
+    }
+
+    #[test]
+    fn attach_wait_reports_closed_channel() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), CaptureAttachError>>();
+        drop(tx);
+        let got = wait_attach_completion(&rx, std::time::Duration::from_millis(20));
+        assert!(matches!(
+            got,
+            Err(CaptureAttachError::CompletionChannelClosed)
+        ));
+    }
+
     use super::*;
 
     #[test]

@@ -1700,6 +1700,57 @@ fn resolve_linux_capture_startup(
     }
 }
 
+/// Build the Linux capture runtime for a non-degraded tier. On failure the
+/// helper falls back to `CaptureTier::Degraded` rather than exiting.
+#[cfg(target_os = "linux")]
+fn degrade_on_runtime_failure<T, E: std::fmt::Display>(
+    tier: CaptureTier,
+    init: impl FnOnce() -> Result<T, E>,
+) -> (Option<T>, CaptureTier) {
+    if matches!(tier, CaptureTier::Degraded) {
+        return (None, CaptureTier::Degraded);
+    }
+    match init() {
+        Ok(rt) => (Some(rt), tier),
+        Err(e) => {
+            tracing::error!(
+                err = %e,
+                requested_tier = tier.label(),
+                "linux capture runtime failed to initialize; degrading (no kernel capture this boot)"
+            );
+            (None, CaptureTier::Degraded)
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod runtime_degrade_tests {
+    use super::{CaptureTier, degrade_on_runtime_failure};
+
+    #[test]
+    fn init_failure_degrades_instead_of_aborting() {
+        let (rt, tier) = degrade_on_runtime_failure::<(), _>(CaptureTier::Fanotify, || Err("boom"));
+        assert!(rt.is_none());
+        assert_eq!(tier, CaptureTier::Degraded);
+    }
+
+    #[test]
+    fn init_success_keeps_tier() {
+        let (rt, tier) = degrade_on_runtime_failure(CaptureTier::EbpfLsm, || Ok::<_, &str>(7));
+        assert_eq!(rt, Some(7));
+        assert_eq!(tier, CaptureTier::EbpfLsm);
+    }
+
+    #[test]
+    fn degraded_never_runs_init() {
+        let (rt, tier) = degrade_on_runtime_failure::<(), &str>(CaptureTier::Degraded, || {
+            panic!("must not init")
+        });
+        assert!(rt.is_none());
+        assert_eq!(tier, CaptureTier::Degraded);
+    }
+}
+
 #[cfg(test)]
 mod linux_capture_startup_tests {
     use super::{CaptureTier, LinuxCaptureStartupError, resolve_linux_capture_startup};
@@ -1798,17 +1849,13 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let (fanotify_state, lsm_state) = {
         let staging_dir = cli.state_dir.join("helper-staging");
-        let capture_rt = if matches!(setup.tier, CaptureTier::Degraded) {
-            None
-        } else {
-            let rt = capture::linux::LinuxCaptureRuntime::new(staging_dir, Arc::clone(&conn))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "linux capture runtime failed to initialize; refusing to advertise live capture: {e}"
-                    )
-                })?;
-            Some(Arc::new(std::sync::Mutex::new(rt)))
-        };
+        // A runtime that fails to initialize degrades the helper (as trunk
+        // did) instead of aborting it; the daemon keeps working without
+        // kernel capture and watch_tree is ignored for this boot.
+        let (capture_rt, setup_tier) = degrade_on_runtime_failure(setup.tier, || {
+            capture::linux::LinuxCaptureRuntime::new(staging_dir, Arc::clone(&conn))
+        });
+        let capture_rt = capture_rt.map(|rt| Arc::new(std::sync::Mutex::new(rt)));
 
         let mut fanotify_fd = setup.fanotify_fd;
 
@@ -1818,7 +1865,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         // tree map (for WatchTree dispatch) and the LsmReader join
         // handle (for graceful shutdown).
         let (lsm_state, ebpf_load_error): (Option<LsmCaptureState>, Option<anyhow::Error>) =
-            if matches!(setup.tier, CaptureTier::EbpfLsm) {
+            if matches!(setup_tier, CaptureTier::EbpfLsm) {
                 // Exclude the helper's own pid + the daemon's pid from
                 // LSM event dispatch. Both run as descendants of the
                 // smoke harness (or the user's shell), so their internal
@@ -1836,7 +1883,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 
         let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
         let active_tier = match resolve_linux_capture_startup(
-            setup.tier,
+            setup_tier,
             lsm_state.is_some(),
             forced_tier.as_deref(),
             fanotify_fd.is_some(),
@@ -1868,7 +1915,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             Err(LinuxCaptureStartupError::InvalidPreferredTier) => {
                 return Err(anyhow::anyhow!(
                     "non-Linux capture tier reached Linux startup: {}",
-                    setup.tier.label()
+                    setup_tier.label()
                 ));
             }
         };
@@ -1908,7 +1955,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
                 .expect("spawn fanotify reader");
             tracing::info!(
                 tier = CaptureTier::Fanotify.label(),
-                fallback_from_ebpf = matches!(setup.tier, CaptureTier::EbpfLsm),
+                fallback_from_ebpf = matches!(setup_tier, CaptureTier::EbpfLsm),
                 "kernel capture tier active"
             );
             Some(state)
@@ -2346,23 +2393,32 @@ fn request_loop(
                     target_os = "dragonfly",
                 ))]
                 {
-                    let Some(ctrl) = &bsd_capture else {
-                        tracing::error!(
-                            %session,
-                            command_seq,
-                            "BSD capture runtime unavailable; withholding WatchTreeReady"
-                        );
-                        continue;
+                    let attach = match &bsd_capture {
+                        Some(ctrl) => ctrl
+                            .on_watch_tree(session, command_seq, root_pid, &cwd_path)
+                            .map_err(|e| e.to_string()),
+                        None => Err("BSD capture runtime unavailable".to_string()),
                     };
-                    if let Err(e) = ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path) {
+                    if let Err(reason) = attach {
                         tracing::error!(
-                            err = %e,
+                            %reason,
                             %session,
                             command_seq,
                             root_pid,
                             cwd_path = %cwd_path,
-                            "BSD watch attach failed; withholding WatchTreeReady"
+                            "BSD watch attach failed; reporting not-ready"
                         );
+                        // Explicit not-ready so the pre-exec hook is
+                        // released now instead of at its timeout. Capture
+                        // is still not claimed for this command.
+                        let failed = HelperResponse::WatchTreeFailed {
+                            session,
+                            command_seq,
+                            reason,
+                        };
+                        if let Err(e) = conn.send_response(&failed) {
+                            tracing::warn!(err = %e, "WatchTreeFailed send failed");
+                        }
                         continue;
                     }
                     tracing::info!(
