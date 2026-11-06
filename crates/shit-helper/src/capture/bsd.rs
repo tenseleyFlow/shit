@@ -1355,6 +1355,43 @@ pub fn spawn(
     Ok((CaptureControl { tx: ctrl_tx }, handle))
 }
 
+/// Bound on handling a command's pending kqueue events at detach. A
+/// pre-image read is the slow step, so this leaves room for a large tail
+/// inside the daemon's 5 s close barrier.
+const DETACH_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Handle every event the kernel or the drain channel held when this was
+/// called, then return. See [`crate::kqueue::DrainHandle::request_flush`]
+/// for why the marker is behind all of them.
+fn drain_pending_events(
+    drain_session: &DrainSession,
+    state: &mut PumpState,
+    token: u32,
+) -> Result<(), String> {
+    drain_session
+        .handle
+        .request_flush(token)
+        .map_err(|e| format!("kqueue flush request failed: {e}"))?;
+    let deadline = std::time::Instant::now() + DETACH_FLUSH_TIMEOUT;
+    loop {
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        match drain_session.events.recv_timeout(wait) {
+            Ok(DrainEvent::Vnode { fd, kind, .. }) => state.handle_vnode(fd, kind),
+            Ok(DrainEvent::Proc { .. }) => {}
+            Ok(DrainEvent::Flushed { token: got }) if got == token => return Ok(()),
+            Ok(DrainEvent::Flushed { .. }) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "kqueue flush timed out after {DETACH_FLUSH_TIMEOUT:?}"
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("kqueue drain thread stopped".to_string());
+            }
+        }
+    }
+}
+
 fn pump(
     kq: Arc<KqueueFd>,
     drain_session: DrainSession,
@@ -1364,6 +1401,7 @@ fn pump(
     slash_fd: Option<Arc<OwnedFd>>,
 ) {
     let mut state = PumpState::new(staging_dir_fd, conn, Arc::clone(&kq), slash_fd);
+    let mut flush_token = 0u32;
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
@@ -1394,10 +1432,31 @@ fn pump(
                 continue;
             }
             Ok(ControlMsg::Detach { command }) => {
+                // Close barrier: handle what is pending while the fd
+                // mappings still attribute it to this command. detach
+                // clears them, so anything handled later would be lost.
+                flush_token = flush_token.wrapping_add(1) & libc::NOTE_FFLAGSMASK;
+                if let Err(detail) = drain_pending_events(&drain_session, &mut state, flush_token) {
+                    tracing::warn!(
+                        %command.session,
+                        seq = command.seq,
+                        %detail,
+                        "bsd capture flush incomplete at detach"
+                    );
+                    let observation = HelperResponse::CaptureRefused {
+                        session: command.session,
+                        seq: command.seq,
+                        path: None,
+                        detail: format!("capture tail may be missing: {detail}"),
+                    };
+                    if let Err(e) = state.conn.send_response(&observation) {
+                        tracing::warn!(err = %e, "CaptureRefused observation send failed");
+                    }
+                }
                 state.detach(command);
-                // Close barrier: after detach the pump attributes nothing
-                // more to this command, and every response it sent for the
-                // command is already on the wire ahead of this marker.
+                // After detach the pump attributes nothing more to this
+                // command, and every response it sent for the command is
+                // already on the wire ahead of this marker.
                 let flushed = HelperResponse::UnwatchTreeFlushed {
                     session: command.session,
                     command_seq: command.seq,
@@ -1434,6 +1493,8 @@ fn pump(
                 // S24.B doesn't act on proc events; S24's tree-tracking
                 // story for descendants lands later.
             }
+            // A marker whose flush already gave up.
+            Ok(DrainEvent::Flushed { .. }) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::warn!("drain channel disconnected; pump exiting");
@@ -1446,6 +1507,54 @@ fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The close barrier's contract: every capture for a command is on
+    /// the wire ahead of its `UnwatchTreeFlushed`. Deletes land in the
+    /// kqueue, then the detach arrives while they are still queued.
+    #[test]
+    fn detach_journals_queued_tail_before_the_flushed_marker() {
+        const FILES: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..FILES {
+            std::fs::write(root.join(format!("f{i}")), b"payload").unwrap();
+        }
+        let (helper, daemon) = crate::ipc::socketpair().unwrap();
+        let (control, _pump) = spawn(Arc::new(helper), dir.path().join("staging"), None).unwrap();
+        let session = Uuid::from_u128(77);
+        control
+            .on_watch_tree(session, 1, std::process::id(), root.to_str().unwrap())
+            .unwrap();
+        // The attach streams baseline responses ahead of its outcome.
+        loop {
+            match daemon.recv_response_with_fd().unwrap().0 {
+                HelperResponse::WatchTreeReady { .. } => break,
+                HelperResponse::WatchTreeFailed { reason, .. } => panic!("attach: {reason}"),
+                _ => {}
+            }
+        }
+        for i in 0..FILES {
+            std::fs::remove_file(root.join(format!("f{i}"))).unwrap();
+        }
+        assert!(control.on_unwatch_tree(session, 1));
+        let mut captured = std::collections::BTreeSet::new();
+        loop {
+            let (resp, _fd) = daemon.recv_response_with_fd().unwrap();
+            match resp {
+                HelperResponse::UnwatchTreeFlushed { .. } => break,
+                HelperResponse::CapturedPreImage { inode, .. } => {
+                    captured.insert(inode);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            captured.len(),
+            FILES,
+            "the marker overtook the tail: {captured:?}"
+        );
+    }
 
     #[test]
     fn watch_tree_enqueues_and_returns_without_waiting() {
