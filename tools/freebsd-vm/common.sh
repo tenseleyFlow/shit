@@ -34,8 +34,6 @@ fi
 
 FBSD_VERSION="${FBSD_VERSION:-14.4}"
 SSH_PORT="${FBSD_VM_SSH_PORT:-2225}"
-VM_SMP="${FBSD_VM_SMP:-2}"
-VM_MEM="${FBSD_VM_MEM:-2048}"
 
 case "${FBSD_VM_ARCH}" in
   amd64)
@@ -56,6 +54,8 @@ case "${FBSD_VM_ARCH}" in
     FBSD_IMAGE_NAME="FreeBSD-${FBSD_VERSION}-RELEASE-arm64-aarch64-${FBSD_VARIANT}.qcow2.xz"
     FBSD_IMAGE_DIR_URL="https://download.freebsd.org/releases/VM-IMAGES/${FBSD_VERSION}-RELEASE/aarch64/Latest"
     DISK_QCOW2="${WORK_DIR}/freebsd14-arm64.qcow2"
+    VM_SMP="${FBSD_VM_SMP:-2}"
+    VM_MEM="${FBSD_VM_MEM:-2048}"
     ;;
   *)
     printf '[fbsd-vm] FBSD_VM_ARCH must be amd64 or aarch64 (got %s)\n' "${FBSD_VM_ARCH}" >&2
@@ -80,8 +80,10 @@ EFI_FIRMWARE_CANDIDATES=(
   "/usr/local/share/qemu/edk2-aarch64-code.fd"
 )
 
+# One option array for ssh, scp and rsync -e: `-o Port=` works for
+# all three, where ssh's `-p` and scp's `-P` differ.
 SSH_OPTS=(
-  -p "${SSH_PORT}"
+  -o "Port=${SSH_PORT}"
   -i "${SSH_KEY}"
   -o "UserKnownHostsFile=${KNOWN_HOSTS}"
   -o "StrictHostKeyChecking=accept-new"
@@ -91,6 +93,21 @@ SSH_OPTS=(
 
 log() {
   printf '[fbsd-vm] %s\n' "$*" >&2
+}
+
+# rsync splits its -e string itself: single and double quotes protect
+# spaces, backslashes do not, so printf %q output would break. Wrap
+# every word in single quotes and refuse words that contain one.
+rsync_rsh() {
+  local out=ssh word
+  for word in "${SSH_OPTS[@]}"; do
+    if [[ "${word}" == *"'"* ]]; then
+      log "work dir path contains a single quote; rsync -e cannot carry it: ${word}"
+      exit 2
+    fi
+    out+=" '${word}'"
+  done
+  printf '%s' "${out}"
 }
 
 require() {

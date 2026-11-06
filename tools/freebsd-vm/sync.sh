@@ -21,6 +21,6 @@ exec rsync -a --delete \
   --exclude=/tools/freebsd-vm/work/ \
   --exclude=/tools/linux-bpf-vm/work/ \
   --exclude=/tools/macos-tart-vm/work/ \
-  -e "ssh ${SSH_OPTS[*]}" \
+  -e "$(rsync_rsh)" \
   "${REPO_ROOT}/" \
   "freebsd@127.0.0.1:shit/"
