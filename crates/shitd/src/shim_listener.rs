@@ -1056,7 +1056,6 @@ mod tests {
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let note = ShimNotification {
                 pid: 4242,
-                pid_epoch_nanos: 0,
                 syscall: "unlink".into(),
                 arg: "/tmp/probe".into(),
                 ts_unix_nanos: 0,
@@ -1178,7 +1177,6 @@ mod tests {
             .expect("put_command");
         let note = ShimNotification {
             pid: 4242,
-            pid_epoch_nanos: 0,
             syscall: "chflags".into(),
             arg: "/tmp/flags-target".into(),
             ts_unix_nanos: 0,
