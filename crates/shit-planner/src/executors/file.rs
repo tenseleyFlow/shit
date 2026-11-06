@@ -308,7 +308,14 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         // The original source's parent can be gone by undo time when
         // the command removed it after moving the entry out
         // (`mv d/f x; rm -rf d`). Recreate it, as RecreatePath and
-        // RestoreContent do, instead of failing the whole plan.
+        // RestoreContent do, instead of failing the whole plan. Check
+        // the source first: a rename that cannot run must not leave
+        // new directories behind.
+        if let Err(e) = fs::symlink_metadata(from) {
+            return ExecutionOutcome::Failed {
+                err: format!("rename {from:?} -> {to:?}: {e}"),
+            };
+        }
         if let Some(parent) = to.parent()
             && !parent.as_os_str().is_empty()
             && !parent.exists()
@@ -1121,7 +1128,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fails at 04258dd, review of #205: item 10, parents made before checking the source"]
     fn rename_missing_source_creates_nothing() {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let from = tmpdir.path().join("nope");
