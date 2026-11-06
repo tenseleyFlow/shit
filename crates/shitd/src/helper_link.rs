@@ -134,8 +134,15 @@ pub struct HelperLink {
     pending_unwatch: UnwatchWaiters,
 }
 
-type UnwatchWaiters =
-    std::sync::Mutex<std::collections::HashMap<CommandId, tokio::sync::oneshot::Sender<()>>>;
+/// Close-barrier waiters. `closed` is set once the dispatch loop stops,
+/// after which no marker can arrive.
+#[derive(Debug, Default)]
+struct UnwatchState {
+    waiters: std::collections::HashMap<CommandId, tokio::sync::oneshot::Sender<()>>,
+    closed: bool,
+}
+
+type UnwatchWaiters = std::sync::Mutex<UnwatchState>;
 
 /// Why a command close could not prove the helper flushed its capture.
 #[derive(Debug, thiserror::Error)]
@@ -170,10 +177,16 @@ impl HelperLink {
     /// marker cannot arrive before anyone listens for it.
     pub fn begin_unwatch_tree(&self, command: CommandId) -> Result<PendingUnwatch, UnwatchError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_unwatch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(command, tx);
+        {
+            let mut state = self
+                .pending_unwatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.closed {
+                return Err(UnwatchError::LinkClosed);
+            }
+            state.waiters.insert(command, tx);
+        }
         let req = HelperRequest::UnwatchTree {
             session: command.session,
             command_seq: command.seq,
@@ -182,6 +195,7 @@ impl HelperLink {
             self.pending_unwatch
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .waiters
                 .remove(&command);
             return Err(UnwatchError::Send(e.to_string()));
         }
@@ -201,6 +215,7 @@ impl HelperLink {
             self.pending_unwatch
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .waiters
                 .remove(&command);
         }
         result
@@ -234,6 +249,7 @@ impl HelperLink {
             .pending_unwatch
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .waiters
             .remove(&command);
         match waiter {
             Some(tx) => {
@@ -249,11 +265,14 @@ impl HelperLink {
     /// Release every close-barrier waiter with an error. Called when the
     /// dispatch loop stops reading from the helper.
     fn fail_pending_unwatch(&self) {
-        self.pending_unwatch
+        let mut state = self
+            .pending_unwatch
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        state.waiters.clear();
     }
+
     /// Send a request to the helper. STREAM-safe (relies on the
     /// length-prefix framing in `shit_proto::frame`).
     pub fn send_request(&self, msg: &HelperRequest) -> Result<(), HelperLinkError> {
@@ -1802,12 +1821,38 @@ mod tests_dispatch {
             seq: 1,
         };
         let pending = link.begin_unwatch_tree(command).unwrap();
-        assert_eq!(link.pending_unwatch.lock().unwrap().len(), 1);
+        assert_eq!(link.pending_unwatch.lock().unwrap().waiters.len(), 1);
         let result = link
             .wait_unwatch(command, pending, std::time::Duration::from_millis(5))
             .await;
         assert!(matches!(result, Err(UnwatchError::Timeout(_))));
-        assert!(link.pending_unwatch.lock().unwrap().is_empty());
+        assert!(link.pending_unwatch.lock().unwrap().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_after_the_link_stopped_fails_at_once() {
+        let (link, _peer) = HelperLink::for_test();
+        let waiting = CommandId {
+            session: Uuid::from_u128(41),
+            seq: 1,
+        };
+        let pending = link.begin_unwatch_tree(waiting).unwrap();
+        link.fail_pending_unwatch();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            link.wait_unwatch(waiting, pending, std::time::Duration::from_secs(5))
+                .await,
+            Err(UnwatchError::LinkClosed)
+        ));
+        let later = CommandId {
+            session: Uuid::from_u128(41),
+            seq: 2,
+        };
+        assert!(matches!(
+            link.begin_unwatch_tree(later),
+            Err(UnwatchError::LinkClosed)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     fn index_with_command(dir: &Path, cmd: CommandId) -> Index {

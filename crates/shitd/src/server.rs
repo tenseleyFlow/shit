@@ -459,6 +459,14 @@ fn handle(
         HookMessage::PostExec { seq, exit_code, .. } => {
             info!(%session, kind, seq, exit_code, "post-exec");
             let command = CommandId { session, seq: *seq };
+            // A replayed PostExec must not rewrite a finalized command or
+            // judge its capture again.
+            let finalized = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+                .is_some_and(|existing| existing.ended_at.is_some());
+            if finalized {
+                warn!(%command, "ignoring PostExec for a command that already closed");
+                return;
+            }
             if !close_ctx.closing.begin(command) {
                 warn!(%command, "ignoring duplicate PostExec while close is pending");
                 return;
@@ -699,6 +707,40 @@ mod close_barrier_tests {
         let rec =
             <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(30)).unwrap();
         assert!(rec.ended_at.is_none(), "the barrier is still pending");
+    }
+
+    #[tokio::test]
+    async fn replayed_post_exec_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_with(dir.path(), &[cmd(31)]);
+        let ctx = ctx_with(&index, None, None, true);
+        let post_exec = |exit_code| {
+            handle(
+                HookMessage::PostExec {
+                    session: Uuid::nil(),
+                    seq: 31,
+                    exit_code,
+                    ts_unix_nanos: 0,
+                },
+                &index,
+                &EnvPreStash::new(),
+                &crate::shell_state_track::ShellStatePreStash::new(),
+                &shit_planner::EnvFilter::default(),
+                &ActiveCommands::new(),
+                None,
+                &ctx,
+            );
+        };
+        post_exec(3);
+        let first =
+            <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(31)).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        post_exec(99);
+        let second =
+            <Index as shit_planner::PlannerStore>::command_by_id(index.as_ref(), cmd(31)).unwrap();
+        assert_eq!(second.exit_code, Some(3));
+        assert_eq!(second.ended_at, first.ended_at);
+        assert_eq!(refusal_details(&index, cmd(31)).len(), 1);
     }
 
     #[tokio::test]
