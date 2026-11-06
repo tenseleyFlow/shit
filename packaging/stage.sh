@@ -10,8 +10,8 @@
 #
 #   bin/{shit,shitd,shit-helper}
 #   lib/libshit_preload_shim.{so,dylib}
-#   share/shit/shell/             shell hooks (placeholders filled by `shit shell-init`)
-#   share/shit/<service file>     systemd/shit.service, launchd/<label>.plist or rc.d/shitd
+#   share/shit/shell/             shell hooks (placeholders filled by `shit hooks install`)
+#   share/shit/<service file>     systemd/shit.service, launchd/<label>.plist or rc.d/shit
 #   share/shit/*-hooks/           command wrappers and package-manager hooks
 #   share/shit/descriptors/       builtin and cloud descriptors
 #
@@ -84,8 +84,8 @@ case "$OS" in
     FreeBSD)
         mkdir -p "$SHARE/rc.d"
         sed -e "s,%%PREFIX%%,$PREFIX," \
-            "$ROOT/packaging/freebsd-ports/sysutils/shit/files/shit.in" > "$SHARE/rc.d/shitd"
-        chmod 0755 "$SHARE/rc.d/shitd"
+            "$ROOT/packaging/freebsd-ports/sysutils/shit/files/shit.in" > "$SHARE/rc.d/shit"
+        chmod 0755 "$SHARE/rc.d/shit"
         ;;
 esac
 

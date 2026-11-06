@@ -1,0 +1,16 @@
+[
+{ type: install
+  message: <<EOM
+shit needs a privileged helper for pre-mutation capture. Start the daemon
+at boot with, in /etc/rc.conf:
+
+  shit_enable="YES"
+  shit_user="<your login>"
+
+or run it by hand with `shit service start`. Add the shell hook with
+`shit hooks install`, then check the install with `shit doctor`.
+
+The preload shim is installed at %%PREFIX%%/lib/shit/libshit_preload_shim.so.
+EOM
+}
+]

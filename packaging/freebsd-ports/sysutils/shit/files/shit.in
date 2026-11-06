@@ -1,43 +1,43 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# PROVIDE: shitd
+# PROVIDE: shit
 # REQUIRE: LOGIN
 # KEYWORD: shutdown
 #
 # Add these lines to /etc/rc.conf to run the shit daemon at boot:
 #
-#   shitd_enable="YES"
-#   shitd_user="alice"     # the account whose commands shit protects
+#   shit_enable="YES"
+#   shit_user="alice"     # the account whose commands shit protects
 #
 # shitd is a per-user daemon (state under the user's XDG directories),
-# so shitd_user should be the login account, not root.
+# so shit_user should be the login account, not root.
 
 . /etc/rc.subr
 
-name="shitd"
-rcvar="shitd_enable"
+name="shit"
+rcvar="shit_enable"
 desc="shit daemon: magic undo for the command line"
 
 load_rc_config $name
 
-: ${shitd_enable:="NO"}
-: ${shitd_user:="root"}
+: ${shit_enable:="NO"}
+: ${shit_user:="root"}
 
-pidfile="/var/run/${name}.pid"
-logfile="/var/log/${name}.log"
+pidfile="/var/run/shitd.pid"
+logfile="/var/log/shitd.log"
 command="/usr/sbin/daemon"
-command_args="-f -o ${logfile} -p ${pidfile} -u ${shitd_user} -- %%PREFIX%%/bin/shitd --foreground"
+command_args="-f -o ${logfile} -p ${pidfile} -u ${shit_user} -- %%PREFIX%%/bin/shitd --foreground"
 
-start_precmd="shitd_prestart"
+start_precmd="shit_prestart"
 
-shitd_prestart()
+shit_prestart()
 {
 	# daemon(8) -u does not set HOME; shitd derives its state and
 	# socket paths from it, so export the user's home here.
 	local home
-	home=$(getent passwd "${shitd_user}" | cut -d: -f6)
-	[ -n "${home}" ] || err 1 "no home directory for ${shitd_user}"
+	home=$(getent passwd "${shit_user}" | cut -d: -f6)
+	[ -n "${home}" ] || err 1 "no home directory for ${shit_user}"
 	export HOME="${home}"
 }
 
