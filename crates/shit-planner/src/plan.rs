@@ -2098,7 +2098,17 @@ mod tests {
         // is the captured mode), not the pre-G02 hard-coded
         // Regular/0o100644. Without this, `git clean -fd` undo
         // recreates removed untracked dirs as regular files.
-        let probe = InMemoryProbe::new();
+        let mut probe = InMemoryProbe::new();
+        // Populate the parent so the DR-CR-54.B orphan-parent
+        // classifier does not sweep this unlink into transient.
+        probe.insert(
+            PathBuf::from("/scratch"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let store = InMemoryStore::new();
         let inode = InodeRef::new(1, 42);
         let path = PathBuf::from("/scratch/junk");
@@ -2149,7 +2159,17 @@ mod tests {
         // G02 — same shape as the dir test but for a regular file.
         // Verifies the captured mode survives through the planner
         // (was hard-coded 0o100644 pre-G02).
-        let probe = InMemoryProbe::new();
+        let mut probe = InMemoryProbe::new();
+        // Populate the parent so the DR-CR-54.B orphan-parent
+        // classifier does not sweep this unlink into transient.
+        probe.insert(
+            PathBuf::from("/scratch"),
+            ProbeStat {
+                inode: InodeRef::new(1, 1),
+                meta: meta(0),
+            },
+            None,
+        );
         let store = InMemoryStore::new();
         let inode = InodeRef::new(1, 43);
         let path = PathBuf::from("/scratch/script.sh");
@@ -2991,6 +3011,7 @@ mod tests {
                 blob,
                 meta: meta(14),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let create = CaptureEvent {
@@ -3074,6 +3095,7 @@ mod tests {
                 blob,
                 meta: meta(5),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let evs = vec![
@@ -3133,6 +3155,7 @@ mod tests {
                 blob,
                 meta: meta(5),
                 post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
             },
         };
         let p = plan(dummy_command(), &[ev], &probe, &store);
