@@ -14,8 +14,8 @@ This is the strategic deep-dive on how `shit` interacts with macOS's defense lay
 
 | Mode | What you give up | What you get | Who it's for |
 |---|---|---|---|
-| **Default (FSEvents + DYLD shim)** | Nothing. Stock macOS. SIP stays on. | Full undo coverage for ~90% of dev workflows — anything that runs Homebrew binaries, your own builds, Python/Node tooling. | Almost everyone. |
-| **Power-user (EndpointSecurity)** | SIP disabled. AuthRoot disabled. AMFI bypassed. Significant security regression. | The other ~10% — file mutations invoked through Apple platform binaries (`/usr/bin/rm`, `/bin/mv`, `/usr/bin/python3`, etc.). | Kernel hackers, security researchers, dedicated dev machines. |
+| **Default (FSEvents + DYLD shim)** | Nothing. Stock macOS. SIP stays on. | Undo for the smoke-pinned workloads: Homebrew binaries, `make install`, `cargo install`, `pip install --user`. Other dev workflows are plausible but unpinned. | Almost everyone. |
+| **Power-user (EndpointSecurity)** | SIP disabled. AuthRoot disabled. AMFI bypassed. Significant security regression. | File mutations invoked through Apple platform binaries (`/usr/bin/rm`, `/bin/mv`, `/usr/bin/python3`, etc.). | Kernel hackers, security researchers, dedicated dev machines. |
 
 The default mode covers the cases where you want undo for what you typed. The power-user mode covers the cases where the call chain ends up in an Apple-signed system binary that you didn't explicitly type.
 
@@ -46,12 +46,12 @@ In default mode, `shit` runs as an unprivileged user-level daemon (`shitd`) plus
 1. **FSEvents** — observes file mutations across watched roots. Sees post-mutation paths but no pre-image content.
 2. **DYLD shim** — when you install `shit` and run `shit dyld-hooks install`, an `~/.zshrc` snippet exports `DYLD_INSERT_LIBRARIES=…/libshit_preload_shim.dylib`. New shells inherit this; every non-SIP-protected child process loads our shim. The shim interposes file-mutating libc syscalls (`unlink`, `rename`, `open`, `chmod`, `chown`, `utimes`, `xattr`, plus the `*at` variants modern coreutils use) and captures pre-mutation state.
 
-**Together,** the two cover everything modulo SIP-protected platform binaries:
+**Together,** the two cover these workloads, each pinned by a macOS smoke (`make-install-undo-macos.sh`, `cargo-install-force-undo-macos.sh`, `pip-install-user-undo-macos.sh`). SIP-protected platform binaries are excluded:
 - `make install` invoked from your shell → catches via shim (assuming `gmake` or any non-SIP make)
 - `cargo install --force` → catches via shim
 - `pip install --force-reinstall` → catches via shim (assuming brew Python)
-- `vim :wq` → catches via shim (vim is non-SIP)
-- `git commit` → catches via shim (Homebrew git is non-SIP)
+
+Homebrew `vim :wq` and `git commit` are plausible non-SIP workloads, but no macOS smoke covers them, so they are not support evidence.
 
 What's NOT covered in default mode:
 - Anything you invoke via `/bin/sh -c '...'` that does mutations directly in `sh`. (`sh` is SIP-stripped.) Note: `sh -c 'gchmod ...'` IS covered — the SIP-strip only applies to `sh` itself, not its non-SIP children.
