@@ -851,6 +851,13 @@ mod policy {
     /// Canonicalize, falling back to the raw string on failure. The
     /// `*at` interposers keep the syscall flowing either way; this
     /// matches the pre-AU10 behavior for them.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
     fn canonical_path_or_raw(path: &str) -> String {
         canonical_path(path).unwrap_or_else(|_| path.to_string())
     }
@@ -869,6 +876,13 @@ mod policy {
     /// invalid, canonicalize fails because target doesn't exist
     /// yet) we fall through to the existing `canonical_path` which
     /// tries parent-canonicalize, then bare-string.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
     pub fn resolve_at_path(dirfd: libc::c_int, path: &str) -> String {
         use std::path::Path;
         if path.starts_with('/') {
