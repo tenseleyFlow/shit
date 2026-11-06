@@ -274,10 +274,9 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             CaptureEventKind::FilePreImage { path, source, .. } => {
                 if source.has_content() {
                     // A flags-only shim event carries inline bytes solely
-                    // because it reuses the FilePreImage wire, and a walk's
-                    // directory record has no content at all. Treating
-                    // either as a content preimage would suppress real
-                    // Create or Rename inverses in mixed commands.
+                    // because it reuses the FilePreImage wire. Treating it
+                    // as a content preimage would suppress real Create or
+                    // Rename inverses in mixed commands.
                     pre_images.insert(path.clone());
                     if source.is_trusted_pre_mutation() {
                         pre_command_pre_images.insert(path.clone());
@@ -945,17 +944,14 @@ impl Provenance {
         }
         self.unlinked_moved_data.insert(path.clone());
         // An empty directory, fifo or socket needs no bytes: RecreatePath
-        // is its whole restore. A tier that lost the race to stat it
-        // reported the wire's Regular default.
+        // is its whole restore, once. A second tier's report of the same
+        // unlink would hit a Phantom, and a tier that lost the race to
+        // stat it reported the wire's Regular default.
         let no_bytes =
             |k: &FileKind| matches!(k, FileKind::Directory | FileKind::Fifo | FileKind::Socket);
-        if h.unlinks.iter().any(|(_, k)| no_bytes(k)) {
-            self.dropped_events.extend(
-                h.unlinks
-                    .iter()
-                    .filter(|(_, k)| !no_bytes(k))
-                    .map(|(id, _)| *id),
-            );
+        if let Some((keep, _)) = h.unlinks.iter().find(|(_, k)| no_bytes(k)) {
+            self.dropped_events
+                .extend(h.unlinks.iter().map(|(id, _)| *id).filter(|id| id != keep));
             return;
         }
         if h.pre_images.is_empty() {

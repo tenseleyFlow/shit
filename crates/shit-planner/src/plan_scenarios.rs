@@ -1507,7 +1507,6 @@ impl crate::executor::PrivilegedOpRouter for LocalMknod {
 }
 
 #[test]
-#[ignore = "fails at 6cf28b3, re-review of #205: both fifo unlinks become RecreatePath, second is a Phantom"]
 fn dual_tier_moved_fifo_is_recreated_once() {
     let (sim, log) = dual_tier_moved_fifo_plan();
     assert_no_failures(&log);
