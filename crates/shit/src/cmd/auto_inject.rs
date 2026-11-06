@@ -106,12 +106,7 @@ pub fn run(args: AutoInjectArgs) -> Result<(), CliError> {
 /// to the shell hook so the hook can substitute it once at install
 /// time.
 fn default_lib_path_for_render() -> String {
-    let ext = if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    };
-    format!("/usr/local/lib/shit/libshit_preload_shim.{ext}")
+    crate::paths::default_system_shim().display().to_string()
 }
 
 fn default_sock_path_for_render() -> String {
