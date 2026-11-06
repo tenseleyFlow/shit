@@ -1441,8 +1441,8 @@ mod interposers {
         // and the classifier can't reach atomic-replace.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::join_at_path(fromfd, &from_str);
-        let to_abs = policy::join_at_path(tofd, &to_str);
+        let from_abs = policy::resolve_at_path(fromfd, &from_str);
+        let to_abs = policy::resolve_at_path(tofd, &to_str);
         policy::notify_rename_with_dst_preimage("renameat", &from_abs, &to_abs);
         let real = next::real_renameat();
         if next::is_zero(next::as_usize(real)) {
@@ -1473,8 +1473,8 @@ mod interposers {
         // DR-CR-54.B: same dirfd→absolute resolution as renameat.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        let from_abs = policy::join_at_path(fromfd, &from_str);
-        let to_abs = policy::join_at_path(tofd, &to_str);
+        let from_abs = policy::resolve_at_path(fromfd, &from_str);
+        let to_abs = policy::resolve_at_path(tofd, &to_str);
         policy::notify_rename_with_dst_preimage("renameat2", &from_abs, &to_abs);
         let real = next::real_renameat2();
         if next::is_zero(next::as_usize(real)) {
@@ -1966,6 +1966,18 @@ mod tests {
     )
 ))]
 mod canonical_tests {
+    /// `AT_FDCWD` with a relative path (the shape libc `rename` takes
+    /// through `renameat`) resolves to an absolute path.
+    #[test]
+    fn resolve_at_path_absolutizes_relative_with_at_fdcwd() {
+        let r = super::policy::resolve_at_path(libc::AT_FDCWD, "Cargo.toml");
+        assert!(r.starts_with('/'), "expected absolute path, got {r:?}");
+        assert!(r.ends_with("/Cargo.toml"), "got {r:?}");
+        // Nonexistent target with an extant parent still absolutizes.
+        let r = super::policy::resolve_at_path(libc::AT_FDCWD, "no-such-file-xyz");
+        assert!(r.starts_with('/'), "expected absolute path, got {r:?}");
+    }
+
     /// Resolving an existing absolute path succeeds and returns the
     /// canonical form. `/tmp` exists on every unix dev host.
     #[test]
