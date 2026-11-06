@@ -6,10 +6,10 @@
  * last close(2) of a writable fd (plus the last mmap unmap for
  * MAP_SHARED regions). The hook:
  *
- *   1. Filters BPF-side on `f_mode & FMODE_WRITE` and regular-file
- *      `i_mode`. Read-only releases and non-regular writable objects
- *      (pipes, sockets, anonymous inodes) never reach userspace; the
- *      ringbuf only carries closes whose bytes can be snapshotted.
+ *   1. Filters BPF-side on `f_mode & FMODE_WRITE`. Read-only
+ *      releases (the common case) never reach userspace; the
+ *      ringbuf only carries closes that could have committed
+ *      content changes.
  *   2. Captures (dev, inode, f_mode, f_flags) so userspace can
  *      diff the inode's current content against the open-time
  *      `pre_snapshots` entry and emit a `CapturedPreImage` iff
@@ -46,11 +46,6 @@ char LICENSE[] SEC("license") = "GPL";
  * supported kernels (5.7+). Same constant as file_open.bpf.c. */
 #define SHIT_FMODE_WRITE 0x2
 
-/* File-type bits from linux/stat.h. They are stable ABI constants but are
- * macros (and therefore absent from vmlinux.h's BTF-derived declarations). */
-#define SHIT_S_IFMT  00170000
-#define SHIT_S_IFREG 0100000
-
 /* 256 KiB ringbuf — same sizing as the other LSM programs. */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -66,12 +61,6 @@ int BPF_PROG(shit_file_release, struct file *file)
      * no signal. */
     fmode_t f_mode = BPF_CORE_READ(file, f_mode);
     if (!(f_mode & SHIT_FMODE_WRITE)) {
-        return 0;
-    }
-
-    struct inode *target = BPF_CORE_READ(file, f_inode);
-    umode_t i_mode = BPF_CORE_READ(target, i_mode);
-    if ((i_mode & SHIT_S_IFMT) != SHIT_S_IFREG) {
         return 0;
     }
 
@@ -94,8 +83,15 @@ int BPF_PROG(shit_file_release, struct file *file)
     struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
     e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
 
-    /* Only regular inodes reach this point, so dev/inode identify content
-     * whose pre- and post-images userspace can compare. */
+    /* f_inode is populated for any file-backed struct file. For anon inodes,
+     * FIFOs and devices, the userspace snapshot lookup misses.
+     * Non-regular files deliberately reach userspace, where the snapshot
+     * lookup misses and drops them. Filtering them here loses capture: the
+     * event attributes the pid to its tree while the process is alive. `git
+     * clean` opens /dev/null O_RDWR first, and without that event its later
+     * unlinks can be consumed after it exits, when /proc can no longer
+     * resolve a grandchild of the tracked root. */
+    struct inode *target = BPF_CORE_READ(file, f_inode);
     e->dev = BPF_CORE_READ(target, i_sb, s_dev);
     e->inode = BPF_CORE_READ(target, i_ino);
 
