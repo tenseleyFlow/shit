@@ -80,6 +80,14 @@ The local VM uses rustup 1.88; the B04 CI job still installs pkg
 rust, so a lint-only or codegen difference between the two is
 possible.
 
+`FBSD_VM_WORK_DIR` may contain spaces but not a single quote: rsync
+parses its `-e` string itself, and the scripts single-quote each ssh
+option for it.
+
+Known issues: `rsync-incremental-undo-fbsd.sh` intermittently leaves
+a file unrestored when run with `SMOKE_TMPDIR=/tmp/zfs` (1 in 16
+runs; #202). CI runs on UFS only and does not see it.
+
 ## Working state directory
 
 Everything lives under `tools/freebsd-vm/work/` (gitignored) or
@@ -88,6 +96,7 @@ Everything lives under `tools/freebsd-vm/work/` (gitignored) or
 ```
 work/
   download/FreeBSD-*.qcow2.xz   # downloaded base image + CHECKSUM.SHA512
+  download/*.sha512.verified    # hash that matched the release file; reused offline
   freebsd14-amd64.qcow2         # working root disk (arm64: freebsd14-arm64.qcow2)
   zpool-disk.qcow2              # amd64 only: second disk for shitzfs
   efivars.fd                    # arm64 only
