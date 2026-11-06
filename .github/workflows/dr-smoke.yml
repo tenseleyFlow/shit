@@ -2354,11 +2354,16 @@ jobs:
               | sudo tee /usr/local/etc/doas.conf >/dev/null
             sudo chmod 0640 /usr/local/etc/doas.conf
             # Verify doas actually works before continuing.
-            doas /sbin/sysctl -n kern.ostype || {
-              echo "FAIL: doas misconfigured; cat /usr/local/etc/doas.conf:"
+            # The action echoes this script before running it, so the
+            # log shows every message below once as source text. Only a
+            # "doas preflight:" line without the echo prefix is a verdict.
+            if [ "$(doas /sbin/sysctl -n kern.ostype)" = FreeBSD ]; then
+              echo "doas preflight: ok"
+            else
+              echo "doas preflight: FAILED, /usr/local/etc/doas.conf is:"
               sudo cat /usr/local/etc/doas.conf
               exit 1
-            }
+            fi
 
             echo "===== build release binaries ====="
             cargo build --release \
@@ -2378,15 +2383,22 @@ jobs:
 
             echo "===== doctor JSON pre-flight ====="
             export SHIT_HELPER_BIN="$(pwd)/target/release/shit-helper"
-            ./target/release/shit doctor --json > /tmp/doctor.json
+            # A crashing doctor (PR 185: SIGBUS, rc 138) must not read
+            # as a kqueue verdict, so report its exit code on its own.
+            doctor_rc=0
+            ./target/release/shit doctor --json > /tmp/doctor.json || doctor_rc=$?
+            if [ "$doctor_rc" -ne 0 ]; then
+              echo "doctor preflight: FAILED, shit doctor --json exited rc=$doctor_rc"
+              exit 1
+            fi
             # Gate: kqueue must be functional. If not, the CI image's
             # FreeBSD kernel is unusable for our purposes — fail loud.
             if ! jq -e '.bsd.kqueue_functional == true' /tmp/doctor.json >/dev/null; then
-              echo "FAIL: doctor reports kqueue not functional in this VM image"
+              echo "doctor preflight: FAILED, kqueue_functional is not true"
               jq '.bsd' /tmp/doctor.json
               exit 1
             fi
-            echo "  doctor kqueue_functional: PASS"
+            echo "doctor preflight: ok (kqueue_functional)"
             jq -r '.bsd | "  capsicum: \(.capsicum_available)  zfs_datasets: \(.zfs_datasets|length)  runtime_capture: \(.runtime_capture)"' /tmp/doctor.json
 
             echo "===== environment diagnostics ====="
