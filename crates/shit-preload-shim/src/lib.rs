@@ -1025,10 +1025,10 @@ mod policy {
 
     /// Resolve a directory fd to its path with `fcntl(F_KINFO)`.
     #[cfg(target_os = "freebsd")]
-    pub(super) fn dirfd_path(dirfd: c_int) -> Option<String> {
+    pub(super) fn dirfd_path(dirfd: libc::c_int) -> Option<String> {
         // SAFETY: kinfo_file is plain data; F_KINFO fills it for `dirfd`.
         let mut kif: libc::kinfo_file = unsafe { std::mem::zeroed() };
-        kif.kf_structsize = std::mem::size_of::<libc::kinfo_file>() as c_int;
+        kif.kf_structsize = std::mem::size_of::<libc::kinfo_file>() as libc::c_int;
         let rc = unsafe { libc::fcntl(dirfd, libc::F_KINFO, &mut kif as *mut libc::kinfo_file) };
         if rc != 0 {
             return None;
