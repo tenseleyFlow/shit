@@ -304,6 +304,20 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         // std::fs::rename is atomic on same-fs; cross-fs returns EXDEV
         // (mapped to io::Error). Cross-fs renames are stage-2 work —
         // they need the copy+unlink fallback noted in the sprint plan.
+        //
+        // The original source's parent can be gone by undo time when
+        // the command removed it after moving the entry out
+        // (`mv d/f x; rm -rf d`). Recreate it, as RecreatePath and
+        // RestoreContent do, instead of failing the whole plan.
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            return ExecutionOutcome::Failed {
+                err: format!("mkdir -p {parent:?}: {e}"),
+            };
+        }
         match fs::rename(from, to) {
             Ok(()) => ExecutionOutcome::Applied,
             Err(e) => ExecutionOutcome::Failed {
@@ -1090,6 +1104,27 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let from = tmpdir.path().join("a");
         let to = tmpdir.path().join("b");
+        std::fs::write(&from, b"hi").unwrap();
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn rename_creates_missing_target_parent() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let from = tmpdir.path().join("x");
+        let to = tmpdir.path().join("gone").join("deeper").join("f");
         std::fs::write(&from, b"hi").unwrap();
 
         let r = InMemoryBlobReader::new();
