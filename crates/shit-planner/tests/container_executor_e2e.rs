@@ -142,6 +142,7 @@ impl ContainerRunner for PathInjectingRunner {
             .args(args)
             .env("PATH", &self.path)
             .env("SHIT_DURING_UNDO", "1")
+            .stdin(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
@@ -413,4 +414,17 @@ fn rm_reverse_inspects_stash_then_runs_synthesized_argv() {
         argv_run.contains("--restart=unless-stopped"),
         "argv-run missing restart policy: {argv_run}"
     );
+}
+
+/// Regression guard: `run` must not hand the parent's stdin to the
+/// child. A stub that reads stdin (`cat`) used to hang `cargo test`
+/// under a non-tty harness. Spawning with a null stdin makes `cat`
+/// see EOF at once; the test would block forever on an inherited pipe.
+#[test]
+fn run_without_stdin_gives_child_null_stdin() {
+    use shit_planner::executors::container::SystemContainerRunner;
+    let runner = SystemContainerRunner;
+    runner
+        .run(&["sh".into(), "-c".into(), "cat >/dev/null".into()])
+        .expect("child must see EOF on stdin");
 }
