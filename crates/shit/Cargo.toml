@@ -58,6 +58,11 @@ strum = { workspace = true }
 #   packaging/stage.sh target/stage     # renders the systemd user unit
 #   cargo deb -p shit --no-build        # target/debian/shit_<ver>_<arch>.deb
 #   cargo generate-rpm -p crates/shit   # target/generate-rpm/shit-<ver>.<arch>.rpm
+# Only the rendered systemd unit comes from target/stage; everything else is
+# read straight from the repo. cargo-generate-rpm resolves an asset `source`
+# against the current directory first, then the package directory, so the
+# `../../` paths resolve from crates/shit even though the command runs at the
+# workspace root. cargo-deb resolves them against the package directory.
 # The maintainer script applies the helper capabilities; both packages
 # install the same layout as the release tarball under /usr.
 [package.metadata.deb]
@@ -76,7 +81,7 @@ assets = [
     ["../../target/release/shit-helper", "usr/bin/shit-helper", "755"],
     ["../../target/release/libshit_preload_shim.so", "usr/lib/shit/libshit_preload_shim.so", "644"],
     ["../../target/stage/share/shit/systemd/shit.service", "usr/lib/systemd/user/shit.service", "644"],
-    ["../../target/stage/share/shit/shell/*", "usr/share/shit/shell/", "644"],
+    ["../../shell/*", "usr/share/shit/shell/", "644"],
     ["../../packaging/descriptors/builtin/*", "usr/share/shit/descriptors/builtin/", "644"],
     ["../../packaging/descriptors/cloud/*", "usr/share/shit/descriptors/cloud/", "644"],
     ["../../packaging/net-hooks/*", "usr/share/shit/net-hooks/", "755"],
@@ -105,7 +110,7 @@ assets = [
     { source = "../../target/release/shit-helper", dest = "/usr/bin/shit-helper", mode = "755" },
     { source = "../../target/release/libshit_preload_shim.so", dest = "/usr/lib/shit/libshit_preload_shim.so", mode = "644" },
     { source = "../../target/stage/share/shit/systemd/shit.service", dest = "/usr/lib/systemd/user/shit.service", mode = "644" },
-    { source = "../../target/stage/share/shit/shell/*", dest = "/usr/share/shit/shell/", mode = "644" },
+    { source = "../../shell/*", dest = "/usr/share/shit/shell/", mode = "644" },
     { source = "../../packaging/descriptors/builtin/*", dest = "/usr/share/shit/descriptors/builtin/", mode = "644" },
     { source = "../../packaging/descriptors/cloud/*", dest = "/usr/share/shit/descriptors/cloud/", mode = "644" },
     { source = "../../packaging/net-hooks/*", dest = "/usr/share/shit/net-hooks/", mode = "755" },
