@@ -15,9 +15,11 @@
 # Homebrew (recommended)
 brew install tenseleyflow/tap/shit
 
-# or: direct download
-curl -fsSL https://github.com/tenseleyFlow/shit/releases/latest/download/shit-macos-$(uname -m).tar.gz | tar -xz
-sudo mv shit shitd shit-helper /usr/local/bin/
+# or: direct download (Apple silicon)
+V=0.1.0
+curl -fsSL https://github.com/tenseleyFlow/shit/releases/download/v$V/shit-$V-aarch64-apple-darwin-unentitled.tar.zst | tar --zstd -x
+sudo cp shit-$V-*/bin/* /usr/local/bin/
+sudo mkdir -p /usr/local/lib && sudo cp shit-$V-*/lib/libshit_preload_shim.dylib /usr/local/lib/
 ```
 
 Then start the daemon and source the shell hook:
