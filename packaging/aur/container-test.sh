@@ -27,3 +27,5 @@ getcap /usr/bin/shit-helper
 shit --version
 shit doctor --json | head -c 600
 ls /usr/lib/systemd/user/shit.service /var/lib/shit
+grep ExecStart /usr/lib/systemd/user/shit.service
+shit install --dry-run -- true | grep /usr/lib/shit/libshit_preload_shim.so
