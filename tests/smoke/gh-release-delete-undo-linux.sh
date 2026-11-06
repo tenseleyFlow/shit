@@ -84,14 +84,13 @@ cleanup_release() {
         >/dev/null 2>&1 || true
     # The undo step recreates the release under the same tag, and
     # `--cleanup-tag` does not help when that delete fails or the
-    # run is cancelled. Delete the tag ref explicitly, over git and
-    # over the API, then verify it is gone.
-    git -C "${SHIT_REPO_ROOT}" push origin ":refs/tags/${TAG}" \
-        >/dev/null 2>&1 || true
+    # run is cancelled. Delete the tag ref explicitly over the API,
+    # then verify it is gone. The singular `ref` endpoint matches the
+    # tag exactly; the plural `refs` form is a prefix match.
     SHIT_DURING_UNDO=1 gh api -X DELETE \
         "repos/${REPO}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
     if SHIT_DURING_UNDO=1 gh api \
-        "repos/${REPO}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+        "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
         echo "FAIL: tag ${TAG} still exists on ${REPO} after cleanup" >&2
         [ "${rc}" -eq 0 ] && rc=1
     fi
