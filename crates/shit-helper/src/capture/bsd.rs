@@ -46,7 +46,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -69,11 +69,6 @@ enum ControlMsg {
     Attach {
         command: CommandId,
         root_path: PathBuf,
-        /// One-shot completion sent only after the subtree is registered,
-        /// its metadata maps are populated, and the live-baseline walk has
-        /// finished. The request loop must not emit WatchTreeReady before
-        /// receiving this result.
-        completion: std::sync::mpsc::Sender<Result<(), CaptureAttachError>>,
     },
     Detach {
         command: CommandId,
@@ -93,10 +88,6 @@ pub enum CaptureAttachError {
     ControlChannelFull,
     #[error("BSD capture control channel is closed")]
     ControlChannelClosed,
-    #[error("BSD capture pump dropped the attach completion channel")]
-    CompletionChannelClosed,
-    #[error("BSD capture attach did not complete within {0:?}")]
-    Timeout(std::time::Duration),
     #[error("register kqueue subtree at {root_path:?}: {source}")]
     RegisterSubtree {
         root_path: PathBuf,
@@ -105,22 +96,20 @@ pub enum CaptureAttachError {
     },
 }
 
-/// Upper bound on how long the request loop waits for the pump to finish
-/// one attach (registration plus baseline).
-const ATTACH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-fn wait_attach_completion(
-    rx: &Receiver<Result<(), CaptureAttachError>>,
-    timeout: std::time::Duration,
-) -> Result<(), CaptureAttachError> {
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err(CaptureAttachError::Timeout(timeout))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(CaptureAttachError::CompletionChannelClosed)
-        }
+/// Map the pump's attach outcome to the response the daemon is waiting
+/// for. Success means registration, metadata maps and the live-baseline
+/// walk are done, so `WatchTreeReady` is truthful.
+fn attach_response(command: CommandId, result: &Result<(), CaptureAttachError>) -> HelperResponse {
+    match result {
+        Ok(()) => HelperResponse::WatchTreeReady {
+            session: command.session,
+            command_seq: command.seq,
+        },
+        Err(e) => HelperResponse::WatchTreeFailed {
+            session: command.session,
+            command_seq: command.seq,
+            reason: e.to_string(),
+        },
     }
 }
 
@@ -1277,28 +1266,21 @@ impl CaptureControl {
                 }
             }
         };
-        let (completion_tx, completion_rx) = channel();
         let msg = ControlMsg::Attach {
             command: CommandId {
                 session,
                 seq: command_seq,
             },
             root_path: path,
-            completion: completion_tx,
         };
+        // Enqueue only. The pump performs registration and the baseline
+        // walk and then sends WatchTreeReady or WatchTreeFailed itself, so
+        // the request loop never blocks on a slow attach. The daemon's
+        // WaitWatchReady timeout is the only time bound.
         self.tx.try_send(msg).map_err(|err| match err {
             TrySendError::Full(_) => CaptureAttachError::ControlChannelFull,
             TrySendError::Disconnected(_) => CaptureAttachError::ControlChannelClosed,
-        })?;
-
-        // The pump sends this only after registration, baseline emission,
-        // and insertion into its live watch map. This synchronization is
-        // what makes the request loop's later WatchTreeReady truthful.
-        //
-        // Bounded wait: the request loop is single-threaded, so an
-        // unbounded recv would serialize Ping/Unwatch/Shutdown and every
-        // other session behind one slow attach.
-        wait_attach_completion(&completion_rx, ATTACH_COMPLETION_TIMEOUT)
+        })
     }
 
     pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
@@ -1378,18 +1360,28 @@ fn pump(
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
-            Ok(ControlMsg::Attach {
-                command,
-                root_path,
-                completion,
-            }) => {
+            Ok(ControlMsg::Attach { command, root_path }) => {
                 let result = state.attach(&kq, command, &root_path);
-                if completion.send(result).is_err() {
-                    tracing::warn!(
+                if let Err(e) = &result {
+                    // Release anything a partial attach left behind
+                    // before reporting failure (no-op when nothing was
+                    // inserted).
+                    state.detach(command);
+                    tracing::error!(
+                        err = %e,
                         %command.session,
                         seq = command.seq,
                         path = %root_path.display(),
-                        "BSD watch attach completed after requester disappeared"
+                        "BSD watch attach failed"
+                    );
+                }
+                let resp = attach_response(command, &result);
+                if let Err(e) = state.conn.send_response(&resp) {
+                    tracing::warn!(
+                        err = %e,
+                        %command.session,
+                        seq = command.seq,
+                        "attach outcome send failed; daemon wait will time out"
                     );
                 }
                 continue;
@@ -1431,41 +1423,20 @@ fn pump(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn attach_wait_times_out_instead_of_blocking() {
-        let (_tx, rx) = std::sync::mpsc::channel::<Result<(), CaptureAttachError>>();
-        let got = wait_attach_completion(&rx, std::time::Duration::from_millis(20));
-        assert!(matches!(got, Err(CaptureAttachError::Timeout(_))));
-    }
-
-    #[test]
-    fn attach_wait_reports_closed_channel() {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), CaptureAttachError>>();
-        drop(tx);
-        let got = wait_attach_completion(&rx, std::time::Duration::from_millis(20));
-        assert!(matches!(
-            got,
-            Err(CaptureAttachError::CompletionChannelClosed)
-        ));
-    }
-
     use super::*;
 
     #[test]
-    fn watch_tree_waits_until_the_pump_reports_capture_ready() {
+    fn watch_tree_enqueues_and_returns_without_waiting() {
         let (tx, rx) = sync_channel::<ControlMsg>(1);
         let control = CaptureControl { tx };
         let session = Uuid::nil();
 
-        let waiter = std::thread::spawn(move || {
-            control.on_watch_tree(session, 17, 4242, "/tmp/capture-root")
-        });
+        // Returns immediately even though nothing has consumed the Attach.
+        control
+            .on_watch_tree(session, 17, 4242, "/tmp/capture-root")
+            .expect("enqueue should not wait for the pump");
 
-        let ControlMsg::Attach {
-            command,
-            root_path,
-            completion,
-        } = rx
+        let ControlMsg::Attach { command, root_path } = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("capture pump should receive attach")
         else {
@@ -1474,48 +1445,58 @@ mod tests {
         assert_eq!(command.session, session);
         assert_eq!(command.seq, 17);
         assert_eq!(root_path, PathBuf::from("/tmp/capture-root"));
-
-        // Receiving the Attach is not readiness: the caller remains
-        // blocked until registration and the baseline have both ended.
-        assert!(!waiter.is_finished());
-        completion
-            .send(Ok(()))
-            .expect("watch request should still be waiting");
-        assert!(waiter.join().expect("watch request panicked").is_ok());
     }
 
     #[test]
-    fn watch_tree_propagates_the_pump_attach_failure() {
-        let (tx, rx) = sync_channel::<ControlMsg>(1);
+    fn watch_tree_reports_a_full_control_channel() {
+        let (tx, _rx) = sync_channel::<ControlMsg>(1);
         let control = CaptureControl { tx };
-        let failed_root = PathBuf::from("/missing/capture-root");
+        control
+            .on_watch_tree(Uuid::nil(), 1, 1, "/tmp/a")
+            .expect("first enqueue");
+        let second = control.on_watch_tree(Uuid::nil(), 2, 1, "/tmp/b");
+        assert!(matches!(
+            second,
+            Err(CaptureAttachError::ControlChannelFull)
+        ));
+    }
 
-        let waiter = std::thread::spawn(move || {
-            control.on_watch_tree(Uuid::nil(), 23, 5252, "/missing/capture-root")
-        });
-
-        let ControlMsg::Attach { completion, .. } = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("capture pump should receive attach")
-        else {
-            panic!("expected attach control message");
+    #[test]
+    fn attach_success_is_reported_as_watch_tree_ready() {
+        let command = CommandId {
+            session: Uuid::nil(),
+            seq: 31,
         };
-        completion
-            .send(Err(CaptureAttachError::RegisterSubtree {
-                root_path: failed_root.clone(),
-                source: KqueueError::NotImplemented("test attach failure"),
-            }))
-            .expect("watch request should still be waiting");
-
-        match waiter.join().expect("watch request panicked") {
-            Err(CaptureAttachError::RegisterSubtree { root_path, source }) => {
-                assert_eq!(root_path, failed_root);
-                assert!(matches!(
-                    source,
-                    KqueueError::NotImplemented("test attach failure")
-                ));
+        assert_eq!(
+            attach_response(command, &Ok(())),
+            HelperResponse::WatchTreeReady {
+                session: Uuid::nil(),
+                command_seq: 31,
             }
-            other => panic!("unexpected watch result: {other:?}"),
+        );
+    }
+
+    #[test]
+    fn attach_failure_is_reported_as_watch_tree_failed() {
+        let command = CommandId {
+            session: Uuid::nil(),
+            seq: 23,
+        };
+        let err = CaptureAttachError::RegisterSubtree {
+            root_path: PathBuf::from("/missing/capture-root"),
+            source: KqueueError::NotImplemented("test attach failure"),
+        };
+        match attach_response(command, &Err(err)) {
+            HelperResponse::WatchTreeFailed {
+                session,
+                command_seq,
+                reason,
+            } => {
+                assert_eq!(session, Uuid::nil());
+                assert_eq!(command_seq, 23);
+                assert!(reason.contains("/missing/capture-root"), "{reason}");
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 

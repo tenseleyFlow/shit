@@ -2406,7 +2406,7 @@ fn request_loop(
                             command_seq,
                             root_pid,
                             cwd_path = %cwd_path,
-                            "BSD watch attach failed; reporting not-ready"
+                            "BSD watch attach could not be queued; reporting not-ready"
                         );
                         // Explicit not-ready so the pre-exec hook is
                         // released now instead of at its timeout. Capture
@@ -2426,8 +2426,11 @@ fn request_loop(
                         command_seq,
                         root_pid,
                         cwd_path = %cwd_path,
-                        "BSD watch registered and baseline complete"
+                        "BSD watch attach queued; pump reports readiness"
                     );
+                    // The pump sends WatchTreeReady / WatchTreeFailed when
+                    // the attach finishes. Do not claim readiness here.
+                    continue;
                 }
                 #[cfg(target_os = "macos")]
                 if let Some(ctrl) = &macos_capture {
@@ -2496,17 +2499,27 @@ fn request_loop(
                 // send fails (helper-daemon link torn down between the
                 // WatchTree dispatch and now) the shell hook will time
                 // out on its own — the daemon doesn't hang on us.
-                let ready = HelperResponse::WatchTreeReady {
-                    session,
-                    command_seq,
-                };
-                if let Err(e) = conn.send_response(&ready) {
-                    tracing::warn!(
-                        err = %e,
-                        %session,
+                // BSD reports readiness from the capture pump once the
+                // attach completes, so it does not send it here.
+                #[cfg(not(any(
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )))]
+                {
+                    let ready = HelperResponse::WatchTreeReady {
+                        session,
                         command_seq,
-                        "WatchTreeReady send failed; shell hook will time out"
-                    );
+                    };
+                    if let Err(e) = conn.send_response(&ready) {
+                        tracing::warn!(
+                            err = %e,
+                            %session,
+                            command_seq,
+                            "WatchTreeReady send failed; shell hook will time out"
+                        );
+                    }
                 }
             }
             HelperRequest::UnwatchTree {
