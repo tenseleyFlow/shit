@@ -306,27 +306,44 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         // they need the copy+unlink fallback noted in the sprint plan.
         //
         // The original source's parent can be gone by undo time when
-        // the command removed it after moving the entry out
-        // (`mv d/f x; rm -rf d`). Recreate it, as RecreatePath and
-        // RestoreContent do, instead of failing the whole plan. Check
-        // the source first: a rename that cannot run must not leave
-        // new directories behind.
+        // the command removed it after moving the entry out, unseen
+        // (`mv d/f x; rmdir d`, plain rmdir is not interposed; a journaled
+        // removal has already been reversed by now). Its mode was not
+        // recorded, so create it private and say so: wider than the
+        // original would expose the file, narrower only needs a chmod.
+        //
+        // The source check stops a missing source from leaving directories
+        // behind. A rename that then fails, EXDEV included, does leave them.
         if let Err(e) = fs::symlink_metadata(from) {
             return ExecutionOutcome::Failed {
                 err: format!("rename {from:?} -> {to:?}: {e}"),
             };
         }
+        let mut note = None;
         if let Some(parent) = to.parent()
             && !parent.as_os_str().is_empty()
             && !parent.exists()
-            && let Err(e) = fs::create_dir_all(parent)
         {
-            return ExecutionOutcome::Failed {
-                err: format!("mkdir -p {parent:?}: {e}"),
-            };
+            use std::os::unix::fs::DirBuilderExt;
+            if let Err(e) = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+            {
+                return ExecutionOutcome::Failed {
+                    err: format!("mkdir -p {parent:?}: {e}"),
+                };
+            }
+            note = Some(format!(
+                "{} did not exist and its mode was not captured; recreated it 0700",
+                parent.display()
+            ));
         }
         match fs::rename(from, to) {
-            Ok(()) => ExecutionOutcome::Applied,
+            Ok(()) => match note {
+                Some(note) => ExecutionOutcome::AppliedWithNote { note },
+                None => ExecutionOutcome::Applied,
+            },
             Err(e) => ExecutionOutcome::Failed {
                 err: format!("rename {from:?} -> {to:?}: {e}"),
             },
@@ -1150,7 +1167,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fails at fb9f2a6 split, round 4 review of #205: item 7"]
     fn rename_creates_missing_parents_private_and_says_so() {
         use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().expect("tempdir");
@@ -1162,10 +1178,12 @@ mod tests {
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
         let op = InverseOp::Rename {
-            from,
+            from: from.clone(),
             to: deeper.join("f"),
         };
         let outcome = e.execute(&op, false, ConflictPolicy::default());
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(deeper.join("f")).unwrap(), b"hi");
         assert!(
             matches!(&outcome, ExecutionOutcome::AppliedWithNote { note } if note.contains("0700")),
             "{outcome:?}"
@@ -1174,27 +1192,6 @@ mod tests {
             let mode = std::fs::metadata(dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "{dir:?}");
         }
-    }
-
-    #[test]
-    fn rename_creates_missing_target_parent() {
-        let tmpdir = tempfile::tempdir().expect("tempdir");
-        let from = tmpdir.path().join("x");
-        let to = tmpdir.path().join("gone").join("deeper").join("f");
-        std::fs::write(&from, b"hi").unwrap();
-
-        let r = InMemoryBlobReader::new();
-        let e = FileExecutor::new(&r);
-        let op = InverseOp::Rename {
-            from: from.clone(),
-            to: to.clone(),
-        };
-        assert_eq!(
-            e.execute(&op, false, ConflictPolicy::default()),
-            ExecutionOutcome::Applied
-        );
-        assert!(!from.exists());
-        assert_eq!(std::fs::read(&to).unwrap(), b"hi");
     }
 
     #[test]
