@@ -25,9 +25,12 @@ package() {
     install -Dm755 -t "${pkgdir}/usr/bin" bin/shit bin/shitd bin/shit-helper
     install -Dm644 -t "${pkgdir}/usr/lib/shit" lib/libshit_preload_shim.so
 
-    # The systemd user unit goes where `systemctl --user` looks for it.
-    install -Dm644 share/shit/systemd/shit.service \
-        "${pkgdir}/usr/lib/systemd/user/shit.service"
+    # The systemd user unit goes where `systemctl --user` looks for it. The
+    # tarball's unit points at /usr/local/bin; retarget it to /usr/bin.
+    install -d "${pkgdir}/usr/lib/systemd/user"
+    sed 's|/usr/local/bin/shitd|/usr/bin/shitd|' share/shit/systemd/shit.service \
+        > "${pkgdir}/usr/lib/systemd/user/shit.service"
+    chmod 644 "${pkgdir}/usr/lib/systemd/user/shit.service"
     install -Dm644 share/shit/LICENSE \
         "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 
