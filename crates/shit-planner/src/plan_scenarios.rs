@@ -26,7 +26,7 @@ use crate::probe_live::LiveStateProbe;
 use crate::store::mock::InMemoryStore;
 use crate::time::TimePoint;
 use std::collections::BTreeMap;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Source tag the shim's recursive dir-rename walk journals with.
@@ -37,6 +37,7 @@ enum Entry {
     Dir { perm: u32 },
     File { perm: u32, bytes: Vec<u8> },
     Symlink { target: PathBuf },
+    Fifo { perm: u32 },
 }
 
 /// Recorder for one command's worth of events.
@@ -403,6 +404,21 @@ impl Sim {
         plan(command_record(), &self.events, &probe, &self.store).nodes
     }
 
+    fn undo_with_mknod(&self) -> Vec<String> {
+        let probe = LiveStateProbe::new();
+        let p = plan(command_record(), &self.events, &probe, &self.store);
+        let exec = FileExecutor::with_privileged_router(&self.blobs, LocalMknod);
+        Orchestrator::new(&exec, &probe)
+            .run(&p, false, ConflictPolicy::Abort)
+            .records
+            .iter()
+            .map(|r| match r.outcome_kind {
+                OutcomeKind::Applied => format!("ok {:?}", r.op),
+                _ => format!("!! {:?} {:?} {:?}", r.outcome_kind, r.op, r.detail),
+            })
+            .collect()
+    }
+
     /// Plan against the live post-state and apply with the CLI's
     /// default policy (Abort, serial).
     fn undo(&self) -> Vec<String> {
@@ -450,6 +466,8 @@ fn snapshot_into(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
         if m.file_type().is_symlink() {
             let target = std::fs::read_link(&p).unwrap();
             out.insert(rel, Entry::Symlink { target });
+        } else if m.file_type().is_fifo() {
+            out.insert(rel, Entry::Fifo { perm });
         } else if m.is_dir() {
             out.insert(rel, Entry::Dir { perm });
             snapshot_into(root, &p, out);
@@ -1431,4 +1449,100 @@ fn reverse_rename_into_unseen_removed_parent_is_private_and_reported() {
         "not reported\n{}",
         log.join("\n")
     );
+}
+
+// Re-review of #205 at 6cf28b3.
+
+#[test]
+fn dual_tier_moved_empty_dir_then_rm_rf_restores_source() {
+    // `mv p build/p; rm -rf build`, p an empty directory, both tiers
+    // reporting every unlink.
+    let mut sim = Sim::new();
+    sim.seed_dir("p", 0o700);
+    sim.seed_dir("build", 0o755);
+    sim.seed_file("build/out.o", b"o\n", 0o644);
+    let before = sim.snapshot();
+    sim.mv("p", "build/p");
+    let build = sim.p("build");
+    rm_rf_dual_tier(&mut sim, &build);
+    assert_restored(&sim, &before);
+}
+
+fn dual_tier_moved_fifo_plan() -> (Sim, Vec<String>) {
+    // `mv p build/p; rm -rf build`, p a fifo, both tiers reporting its
+    // unlink with its kind.
+    let mut sim = Sim::new();
+    sim.seed_dir("build", 0o755);
+    let c = std::ffi::CString::new(sim.p("p").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+    sim.mv("p", "build/p");
+    let fifo = sim.p("build/p");
+    let m = std::fs::symlink_metadata(&fifo).unwrap();
+    for inode in [InodeRef::new(0, 0), InodeRef::new(m.dev(), m.ino())] {
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode,
+            path: fifo.clone(),
+            kind: FileKind::Fifo,
+            mode: m.mode(),
+        }));
+    }
+    std::fs::remove_file(&fifo).unwrap();
+    let log = sim.undo_with_mknod();
+    (sim, log)
+}
+
+/// The helper's mknod, done in-process: fifos need no privilege.
+struct LocalMknod;
+
+impl crate::executor::PrivilegedOpRouter for LocalMknod {
+    fn chown(&self, _: &Path, _: u32, _: u32, _: bool) -> crate::executor::PrivilegedOpOutcome {
+        crate::executor::PrivilegedOpOutcome::Applied
+    }
+
+    fn mknod(&self, path: &Path, mode: u32, _: u64) -> crate::executor::PrivilegedOpOutcome {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), (mode & 0o777) as _) }, 0);
+        crate::executor::PrivilegedOpOutcome::Applied
+    }
+}
+
+#[test]
+#[ignore = "fails at 6cf28b3, re-review of #205: both fifo unlinks become RecreatePath, second is a Phantom"]
+fn dual_tier_moved_fifo_is_recreated_once() {
+    let (sim, log) = dual_tier_moved_fifo_plan();
+    assert_no_failures(&log);
+    assert!(
+        std::fs::symlink_metadata(sim.p("p"))
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "{}",
+        log.join("\n")
+    );
+}
+
+#[test]
+fn file_moved_into_new_dir_then_rm_rf_comes_back_with_a_stray_dir() {
+    // `mkdir d; mv existing/f d/; rm -rf d`. The file comes back; `d` is
+    // scratch at the planner's level, but restoring and moving f out
+    // recreates it, so an empty `d` stays behind. No data is lost.
+    let mut sim = Sim::new();
+    sim.seed_dir("existing", 0o755);
+    sim.seed_file("existing/f", b"f\n", 0o644);
+    let before = sim.snapshot();
+    sim.mkdir("d");
+    sim.mv("existing/f", "d/");
+    sim.rm_rf("d");
+    let log = sim.undo();
+    assert_no_failures(&log);
+    let mut after = sim.snapshot();
+    assert_eq!(
+        after
+            .remove(Path::new("d"))
+            .map(|e| matches!(e, Entry::Dir { .. })),
+        Some(true),
+        "{}",
+        log.join("\n")
+    );
+    assert_eq!(after, before, "{}", log.join("\n"));
 }
