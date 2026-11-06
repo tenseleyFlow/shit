@@ -449,7 +449,7 @@ unsafe extern "C" fn my_fchmodat(
 /// Same contract as `libc::chflags` — `path` must be a valid
 /// NUL-terminated C string.
 unsafe extern "C" fn my_chflags(path: *const c_char, flags: c_uint) -> c_int {
-    policy::notify_flags_mutation("chflags", &cstr_to_string(path));
+    policy::notify_flags_mutation("chflags", &cstr_to_string(path), true);
     unsafe { libc::chflags(path, flags) }
 }
 
@@ -461,7 +461,7 @@ unsafe extern "C" fn my_chflags(path: *const c_char, flags: c_uint) -> c_int {
 /// Same contract as `libc::fchflags`.
 unsafe extern "C" fn my_fchflags(fd: c_int, flags: c_uint) -> c_int {
     if let Some(path) = fd_to_path(fd) {
-        policy::notify_flags_mutation("fchflags", &path);
+        policy::notify_flags_mutation("fchflags", &path, true);
     }
     unsafe { libc::fchflags(fd, flags) }
 }

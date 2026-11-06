@@ -568,7 +568,7 @@ mod policy {
     /// special files, unreadable files, and regular files above the
     /// inline byte cap; chflags needs only the pre-syscall `st_flags`.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    pub fn notify_flags_mutation(syscall: &'static str, path: &str) {
+    pub fn notify_flags_mutation(syscall: &'static str, path: &str, follow: bool) {
         if disabled() || should_skip_path(path) {
             return;
         }
@@ -576,7 +576,7 @@ mod policy {
             return;
         }
         let (resolved, failure) = canonicalize_or_raw(path, "path");
-        let pre_image = capture_flags_pre_image(&resolved);
+        let pre_image = capture_flags_pre_image(&resolved, follow);
         let wire_arg = pre_image
             .as_ref()
             .map(|pre| pre.path.clone())
@@ -1093,7 +1093,7 @@ mod policy {
         // std::fs::Metadata doesn't expose st_flags cross-platform;
         // 0 on Linux (no chflags). Best-effort: on stat failure use 0
         // (caller's RestoreMetadata diff then has a known floor).
-        let flags = read_st_flags(path).unwrap_or(0);
+        let flags = read_st_flags(path, false).unwrap_or(0);
         Some(shit_proto::ShimPreImage {
             path: resolved,
             dev: meta.dev(),
@@ -1116,10 +1116,20 @@ mod policy {
     /// chflags-family syscall. A failed flags probe returns `None` rather
     /// than fabricating zero as an authoritative pre-state.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    pub(super) fn capture_flags_pre_image(path: &str) -> Option<shit_proto::ShimPreImage> {
+    ///
+    /// `follow` selects stat (chflags(2), chflagsat(..., 0), which follow
+    /// symlinks) versus lstat (AT_SYMLINK_NOFOLLOW, lchflags).
+    pub(super) fn capture_flags_pre_image(
+        path: &str,
+        follow: bool,
+    ) -> Option<shit_proto::ShimPreImage> {
         use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        let flags = read_st_flags(path)?;
+        let meta = if follow {
+            std::fs::metadata(path).ok()?
+        } else {
+            std::fs::symlink_metadata(path).ok()?
+        };
+        let flags = read_st_flags(path, follow)?;
         Some(shit_proto::ShimPreImage {
             path: path.to_string(),
             dev: meta.dev(),
@@ -1139,35 +1149,47 @@ mod policy {
     /// other targets have no chflags concept. libc exposes the field
     /// as u32 on both Apple and FreeBSD.
     #[cfg(target_os = "macos")]
-    fn read_st_flags(path: &str) -> Option<u32> {
+    fn read_st_flags(path: &str, follow: bool) -> Option<u32> {
         use std::ffi::CString;
         let Ok(c) = CString::new(path) else {
             return None;
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: c is a valid NUL-terminated CString; st is owned.
-        let rc = unsafe { libc::lstat(c.as_ptr(), &mut st) };
+        let rc = unsafe {
+            if follow {
+                libc::stat(c.as_ptr(), &mut st)
+            } else {
+                libc::lstat(c.as_ptr(), &mut st)
+            }
+        };
         if rc != 0 {
             return None;
         }
         Some(st.st_flags)
     }
     #[cfg(target_os = "freebsd")]
-    fn read_st_flags(path: &str) -> Option<u32> {
+    fn read_st_flags(path: &str, follow: bool) -> Option<u32> {
         use std::ffi::CString;
         let Ok(c) = CString::new(path) else {
             return None;
         };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: c is a valid NUL-terminated CString; st is owned.
-        let rc = unsafe { libc::lstat(c.as_ptr(), &mut st) };
+        let rc = unsafe {
+            if follow {
+                libc::stat(c.as_ptr(), &mut st)
+            } else {
+                libc::lstat(c.as_ptr(), &mut st)
+            }
+        };
         if rc != 0 {
             return None;
         }
         Some(st.st_flags)
     }
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-    fn read_st_flags(_path: &str) -> Option<u32> {
+    fn read_st_flags(_path: &str, _follow: bool) -> Option<u32> {
         None
     }
 
@@ -1703,7 +1725,7 @@ mod interposers {
     #[cfg(target_os = "freebsd")]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn chflags(path: *const c_char, flags: libc::c_ulong) -> c_int {
-        policy::notify_flags_mutation("chflags", &cstr_to_string(path));
+        policy::notify_flags_mutation("chflags", &cstr_to_string(path), true);
         let real = next::real_chflags();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::chflags(path, flags) };
@@ -1729,10 +1751,10 @@ mod interposers {
         atflag: c_int,
     ) -> c_int {
         let path_string = cstr_to_string(path);
-        if should_capture_chflagsat(dirfd, &path_string, atflag) {
+        if let Some((target, follow)) = chflagsat_target(dirfd, &path_string, atflag) {
             // Keep the wire name aligned with chflags so the daemon routes
             // both replayable entry points through the same source tag.
-            policy::notify_flags_mutation("chflags", &path_string);
+            policy::notify_flags_mutation("chflags", &target, follow);
         }
         let real = next::real_chflagsat();
         if next::is_zero(next::as_usize(real)) {
@@ -1741,9 +1763,76 @@ mod interposers {
         unsafe { real(dirfd, path, flags, atflag) }
     }
 
+    /// Resolve a directory fd to its path with `fcntl(F_KINFO)`.
     #[cfg(target_os = "freebsd")]
-    pub(super) fn should_capture_chflagsat(dirfd: c_int, path: &str, atflag: c_int) -> bool {
-        atflag == 0 && (dirfd == libc::AT_FDCWD || std::path::Path::new(path).is_absolute())
+    fn dirfd_path(dirfd: c_int) -> Option<String> {
+        // SAFETY: kinfo_file is plain data; F_KINFO fills it for `dirfd`.
+        let mut kif: libc::kinfo_file = unsafe { std::mem::zeroed() };
+        kif.kf_structsize = std::mem::size_of::<libc::kinfo_file>() as c_int;
+        let rc = unsafe { libc::fcntl(dirfd, libc::F_KINFO, &mut kif as *mut libc::kinfo_file) };
+        if rc != 0 {
+            return None;
+        }
+        let bytes: Vec<u8> = kif
+            .kf_path
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        let path = String::from_utf8(bytes).ok()?;
+        path.starts_with('/').then_some(path)
+    }
+
+    /// Decide whether a `chflagsat` call is replayable as a path-based
+    /// RestoreFlags and, if so, return the path to snapshot plus whether
+    /// the syscall follows a final symlink.
+    ///
+    /// - Absolute path: dirfd is ignored.
+    /// - `AT_FDCWD` with a relative path: the daemon-side canonicalizer
+    ///   resolves against the process cwd.
+    /// - Real dirfd with a relative path (what `/bin/chflags` issues via
+    ///   fts): join onto the dirfd's path.
+    /// - `AT_SYMLINK_NOFOLLOW`: replayable only when the target is not a
+    ///   symlink (then follow and no-follow agree).
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn chflagsat_target(
+        dirfd: c_int,
+        path: &str,
+        atflag: c_int,
+    ) -> Option<(String, bool)> {
+        chflagsat_target_with(dirfd, path, atflag, dirfd_path)
+    }
+
+    #[cfg(target_os = "freebsd")]
+    pub(super) fn chflagsat_target_with(
+        dirfd: c_int,
+        path: &str,
+        atflag: c_int,
+        resolve_dirfd: impl FnOnce(c_int) -> Option<String>,
+    ) -> Option<(String, bool)> {
+        let nofollow = match atflag {
+            0 => false,
+            f if f == libc::AT_SYMLINK_NOFOLLOW => true,
+            _ => return None,
+        };
+        let full = if std::path::Path::new(path).is_absolute() || dirfd == libc::AT_FDCWD {
+            path.to_string()
+        } else {
+            let base = resolve_dirfd(dirfd)?;
+            std::path::Path::new(&base)
+                .join(path)
+                .to_string_lossy()
+                .into_owned()
+        };
+        if nofollow {
+            let is_symlink = std::fs::symlink_metadata(&full)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true);
+            if is_symlink {
+                return None;
+            }
+        }
+        Some((full, !nofollow))
     }
 
     /// `truncate(2)` interposer.
@@ -2020,26 +2109,75 @@ mod flags_capture_tests {
     fn flags_pre_image_accepts_directory_without_content_bytes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().to_str().expect("utf8 temp path");
-        let pre = super::policy::capture_flags_pre_image(path).expect("flags pre-image");
+        let pre = super::policy::capture_flags_pre_image(path, true).expect("flags pre-image");
         assert!(pre.bytes.is_empty());
         assert_ne!(pre.inode, 0);
         assert_eq!(pre.path, path);
+    }
+
+    #[test]
+    fn flags_pre_image_follows_symlink_unless_nofollow() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_s = link.to_str().unwrap();
+        let followed = super::policy::capture_flags_pre_image(link_s, true).unwrap();
+        let direct = super::policy::capture_flags_pre_image(link_s, false).unwrap();
+        let target_ino = std::fs::metadata(&target).unwrap().ino();
+        assert_eq!(followed.inode, target_ino);
+        assert_ne!(direct.inode, target_ino);
     }
 }
 
 #[cfg(all(test, target_os = "freebsd"))]
 mod chflagsat_capture_tests {
-    use super::interposers::should_capture_chflagsat;
+    use super::interposers::chflagsat_target_with;
 
     #[test]
-    fn capture_gate_accepts_replayable_paths_only() {
-        assert!(should_capture_chflagsat(libc::AT_FDCWD, "relative", 0));
-        assert!(should_capture_chflagsat(42, "/absolute", 0));
-        assert!(!should_capture_chflagsat(42, "relative", 0));
-        assert!(!should_capture_chflagsat(
-            libc::AT_FDCWD,
-            "/absolute",
-            libc::AT_SYMLINK_NOFOLLOW,
-        ));
+    fn capture_gate_resolves_relative_name_against_real_dirfd() {
+        let got = chflagsat_target_with(42, "name", 0, |fd| {
+            assert_eq!(fd, 42);
+            Some("/base/dir".to_string())
+        });
+        assert_eq!(got, Some(("/base/dir/name".to_string(), true)));
+    }
+
+    #[test]
+    fn capture_gate_accepts_absolute_and_cwd_shapes() {
+        assert_eq!(
+            chflagsat_target_with(libc::AT_FDCWD, "relative", 0, |_| None),
+            Some(("relative".to_string(), true))
+        );
+        assert_eq!(
+            chflagsat_target_with(42, "/absolute", 0, |_| None),
+            Some(("/absolute".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn capture_gate_skips_when_dirfd_unresolvable() {
+        assert_eq!(chflagsat_target_with(42, "name", 0, |_| None), None);
+    }
+
+    #[test]
+    fn nofollow_is_replayable_only_for_non_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let link = tmp.path().join("l");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let f = file.to_str().unwrap();
+        let l = link.to_str().unwrap();
+        assert_eq!(
+            chflagsat_target_with(libc::AT_FDCWD, f, libc::AT_SYMLINK_NOFOLLOW, |_| None),
+            Some((f.to_string(), false))
+        );
+        assert_eq!(
+            chflagsat_target_with(libc::AT_FDCWD, l, libc::AT_SYMLINK_NOFOLLOW, |_| None),
+            None
+        );
     }
 }

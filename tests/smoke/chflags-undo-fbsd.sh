@@ -13,10 +13,11 @@
 # chflags(2). The field-specific inverse avoids unrelated chown/chmod
 # calls, so the helper's Capsicum sandbox is not involved.
 #
-# Why a direct chflags(2) C workload: modern /bin/chflags traverses with
-# dirfd-relative chflagsat(2), while the v1 shim wire has no dirfd field.
-# The interposer deliberately skips shapes it cannot faithfully replay.
-# This smoke therefore exercises the supported absolute-path API directly.
+# Two workloads run under the shim in one command:
+#   1. the real /bin/chflags, which traverses with dirfd-relative
+#      chflagsat(2) (fts dirfd + relative name, atflag 0). This is the
+#      shape users hit; the smoke fails if the shim does not notify.
+#   2. a C program calling chflags(2) with an absolute path.
 #
 # UFS supports user flags and must round-trip. OpenZFS may return
 # EOPNOTSUPP; there the producer notification remains a useful gate,
@@ -46,7 +47,9 @@ mkdir -p "${WATCHED}"
 cd "${WATCHED}"
 
 TARGET="${WATCHED}/target.txt"
+TARGET2="${WATCHED}/target2.txt"
 printf 'shim-chflags-test\n' > "${TARGET}"
+printf 'shim-chflags-test-2\n' > "${TARGET2}"
 
 CC_BIN="$(command -v cc 2>/dev/null || true)"
 [ -n "${CC_BIN}" ] || smoke_fail "cc not on PATH"
@@ -81,6 +84,7 @@ else
     smoke_log "note: chflags returns EOPNOTSUPP on this FS (likely ZFS); shim-emission gate is the load-bearing check"
 fi
 PRE_FLAGS="$(stat -f '%Of' "${TARGET}")"
+PRE_FLAGS2="$(stat -f '%Of' "${TARGET2}")"
 
 smoke_start_shitd
 
@@ -96,22 +100,39 @@ PID="$$"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.3
 
-# Workload — call chflags(2) with an absolute path under LD_PRELOAD.
-# If the FS doesn't support flags, the syscall fails after the shim
-# notification, so the producer gate remains meaningful.
-smoke_log "workload: LD_PRELOAD=${SHIM_LIB} ${WATCHED}/set_chflags ${TARGET}"
+# Workload 1 — the real /bin/chflags under LD_PRELOAD. If the FS doesn't
+# support flags the syscall fails after the shim notification, so the
+# producer gate remains meaningful.
+smoke_log "workload 1: LD_PRELOAD=${SHIM_LIB} /bin/chflags nodump ${TARGET}"
 set +e
-LD_PRELOAD="${SHIM_LIB}" "${WATCHED}/set_chflags" "${TARGET}" 2>/dev/null
+LD_PRELOAD="${SHIM_LIB}" /bin/chflags nodump "${TARGET}" 2>/dev/null
 CHFLAGS_RC=$?
+set -e
+sleep 0.5
+NOTIFY_AFTER_BIN="$(grep -cE '"syscall":"chflags"' "$(ls "${XDG_STATE_HOME}/shit/log/daemon.jsonl"* 2>/dev/null | head -1)" 2>/dev/null || true)"
+NOTIFY_AFTER_BIN="${NOTIFY_AFTER_BIN:-0}"
+smoke_log "shim chflags notifications after /bin/chflags: ${NOTIFY_AFTER_BIN}"
+[ "${NOTIFY_AFTER_BIN}" -ge 1 ] \
+    || smoke_fail "/bin/chflags produced no shim 'chflags' notification (dirfd-relative chflagsat not captured)"
+
+# Workload 2 — chflags(2) with an absolute path from a C program.
+smoke_log "workload 2: LD_PRELOAD=${SHIM_LIB} ${WATCHED}/set_chflags ${TARGET2}"
+set +e
+LD_PRELOAD="${SHIM_LIB}" "${WATCHED}/set_chflags" "${TARGET2}" 2>/dev/null
+CHFLAGS_RC2=$?
 set -e
 sleep 0.5
 
 if [ "${SUPPORTS_CHFLAGS}" -eq 1 ]; then
     POST_FLAGS="$(stat -f '%Of' "${TARGET}")"
-    smoke_log "pre-flags=${PRE_FLAGS} post-flags=${POST_FLAGS}"
-    [ "${CHFLAGS_RC}" -eq 0 ] || smoke_fail "chflags nodump exited ${CHFLAGS_RC} on a supported FS"
+    POST_FLAGS2="$(stat -f '%Of' "${TARGET2}")"
+    smoke_log "pre-flags=${PRE_FLAGS}/${PRE_FLAGS2} post-flags=${POST_FLAGS}/${POST_FLAGS2}"
+    [ "${CHFLAGS_RC}" -eq 0 ] || smoke_fail "/bin/chflags nodump exited ${CHFLAGS_RC} on a supported FS"
+    [ "${CHFLAGS_RC2}" -eq 0 ] || smoke_fail "chflags(2) nodump exited ${CHFLAGS_RC2} on a supported FS"
     [ "${POST_FLAGS}" != "${PRE_FLAGS}" ] \
-        || smoke_fail "chflags nodump did not change flags (${PRE_FLAGS})"
+        || smoke_fail "/bin/chflags nodump did not change flags (${PRE_FLAGS})"
+    [ "${POST_FLAGS2}" != "${PRE_FLAGS2}" ] \
+        || smoke_fail "chflags(2) nodump did not change flags (${PRE_FLAGS2})"
 fi
 
 "${SHIT_BIN}" hook-send post-exec \
@@ -129,10 +150,10 @@ SHIM_COUNT="$(grep -cE '"syscall":"chflags"' "${JSON_LOG}" 2>/dev/null || true)"
 SHIM_COUNT="${SHIM_COUNT:-0}"
 smoke_log "shim notifications: chflags=${SHIM_COUNT}"
 
-if [ "${SHIM_COUNT}" -lt 1 ]; then
+if [ "${SHIM_COUNT}" -lt 2 ]; then
     smoke_log "regression — no shim 'chflags' notification in daemon log"
     grep -i 'shim\|chflags' "${JSON_LOG}" | tail -10 | sed 's/^/    /' >&2 || true
-    smoke_fail "expected at least 1 'chflags' notification; got ${SHIM_COUNT}"
+    smoke_fail "expected at least 2 'chflags' notifications; got ${SHIM_COUNT}"
 fi
 
 if [ "${SUPPORTS_CHFLAGS}" -eq 0 ]; then
@@ -150,7 +171,8 @@ smoke_log "shit undo --yes exit=${UNDO_RC}"
 /usr/bin/sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 
 FINAL_FLAGS="$(stat -f '%Of' "${TARGET}")"
-smoke_log "final-flags=${FINAL_FLAGS}"
+FINAL_FLAGS2="$(stat -f '%Of' "${TARGET2}")"
+smoke_log "final-flags=${FINAL_FLAGS}/${FINAL_FLAGS2}"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
@@ -158,6 +180,8 @@ smoke_log "final-flags=${FINAL_FLAGS}"
 grep -qE 'applied=[1-9][0-9]*' "${SHIT_SMOKE_TMP}/undo.log" \
     || smoke_fail "undo reported no applied operations"
 [ "${FINAL_FLAGS}" = "${PRE_FLAGS}" ] \
-    || smoke_fail "flags mismatch after undo: got ${FINAL_FLAGS}, want ${PRE_FLAGS}"
+    || smoke_fail "flags mismatch after undo (/bin/chflags target): got ${FINAL_FLAGS}, want ${PRE_FLAGS}"
+[ "${FINAL_FLAGS2}" = "${PRE_FLAGS2}" ] \
+    || smoke_fail "flags mismatch after undo (chflags(2) target): got ${FINAL_FLAGS2}, want ${PRE_FLAGS2}"
 
 smoke_log "PASS: chflags-undo-fbsd (flags ${PRE_FLAGS} -> ${POST_FLAGS} -> ${FINAL_FLAGS}; ${SHIM_COUNT} notifications)"
