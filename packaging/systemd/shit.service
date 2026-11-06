@@ -9,7 +9,6 @@
 [Unit]
 Description=shit daemon — magic undo for the command line
 Documentation=https://github.com/tenseleyFlow/shit
-After=default.target
 
 [Service]
 Type=exec
@@ -18,7 +17,9 @@ ExecStart=@@SHITD_BIN@@ --foreground --config @@CONFIG_PATH@@
 Restart=on-failure
 RestartSec=10
 
-# No sandboxing directives. shitd spawns shit-helper, which gets its
+# No sandboxing directives. NoNewPrivileges=true stops exec from granting
+# the helper's file capabilities, so it cannot be set here.
+# shitd spawns shit-helper, which gets its
 # privileges from file capabilities (cap_bpf, cap_perfmon, cap_sys_admin);
 # NoNewPrivileges=true would stop exec from granting them. In a user manager
 # the Protect*, Restrict* and LockPersonality options also fail with
