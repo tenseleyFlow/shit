@@ -2469,8 +2469,10 @@ jobs:
             export SHIT_HELPER_BIN="$(pwd)/target/release/shit-helper"
             # A crashing doctor (PR 185: SIGBUS, rc 138) must not read
             # as a kqueue verdict, so report its exit code on its own.
+            mkdir -p smoke-artifacts
             doctor_rc=0
-            ./target/release/shit doctor --json > /tmp/doctor.json || doctor_rc=$?
+            ./target/release/shit doctor --json > smoke-artifacts/doctor.json || doctor_rc=$?
+            cp smoke-artifacts/doctor.json /tmp/doctor.json
             if [ "$doctor_rc" -ne 0 ]; then
               echo "doctor preflight: FAILED, shit doctor --json exited rc=$doctor_rc"
               exit 1
@@ -2536,13 +2538,33 @@ jobs:
               # `echo`) is always 0, which we discard.
               set +e
               (
-                TMPDIR="${leg_tmp}" /usr/bin/timeout --signal=TERM --kill-after=10 300 \
+                TMPDIR="${leg_tmp}" SMOKE_KEEP_TMP=1 /usr/bin/timeout --signal=TERM --kill-after=10 300 \
                   bash "tests/smoke/$smoke"
                 echo $? > "$rc_file"
               ) 2>&1 | tee "$passlog"
               set -e
               rc=$(cat "$rc_file" 2>/dev/null || echo 1)
               rm -f "$rc_file"
+              # The upload step runs on the Ubuntu host, which sees only
+              # the workspace the action syncs back from this VM, so copy
+              # a failing smoke's logs there. Every run's scratch dir goes
+              # away now that SMOKE_KEEP_TMP stops lib.sh deleting it.
+              if [ "$rc" != 0 ] && ! grep -q "^\[smoke .*\] PASS: " "$passlog"; then
+                keep="smoke-artifacts/${leg}/${smoke%.sh}"
+                mkdir -p "$keep"
+                cp "$passlog" "$keep/smoke.log" || true
+                for st in "${leg_tmp}"/shit-smoke.*; do
+                  [ -d "$st" ] || continue
+                  cp "$st/shitd.log" "$keep/" 2>/dev/null || true
+                  cp -R "$st/state/shit/log" "$keep/" 2>/dev/null || true
+                done
+              fi
+              for st in "${leg_tmp}"/shit-smoke.*; do
+                [ -d "$st" ] || continue
+                /usr/bin/timeout 30 rm -rf "$st" 2>/dev/null \
+                  || /usr/bin/timeout 30 doas rm -rf "$st" 2>/dev/null \
+                  || echo "  WARN: could not remove $st"
+              done
               case "$rc" in
                 0)    echo "  PASS: [${leg}] $smoke" ;;
                 124)  echo "  FAIL: [${leg}] $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
@@ -2588,7 +2610,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: freebsd-smoke-logs
-          path: |
-            /tmp/shit-smoke.*/shitd.log
-            /tmp/shit-smoke.*/state/shit/log/
-            /tmp/doctor.json
+          path: smoke-artifacts/
