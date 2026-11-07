@@ -695,6 +695,19 @@ mod policy {
         }
     }
 
+    /// A rename whose arguments could not be keyed: send `from\tto` as
+    /// given, with the AU10 marker and no capture.
+    #[cfg(target_os = "macos")]
+    pub fn notify_rename_unresolved(
+        syscall: &'static str,
+        from: &str,
+        to: &str,
+        failure: shit_proto::ShimFailure,
+    ) {
+        let arg = format!("{from}\t{to}");
+        notify_inner_with_failure(syscall, &arg, None, Some(failure), false);
+    }
+
     /// B09 — notify a chflags-family mutation with a metadata-only
     /// pre-image. Unlike content capture this accepts directories,
     /// special files, unreadable files, and regular files above the
@@ -772,7 +785,7 @@ mod policy {
         // <staging>` before writing fresh content, and without
         // recursive pre-images the original site-packages contents
         // are unreachable by the time undo runs.
-        notify_rename_inner_with_recursive(syscall, &arg, to, &from_abs, failure);
+        notify_rename_inner_with_recursive(syscall, &arg, &to_abs, &from_abs, failure);
     }
 
     /// DR-CR-54 limits. A directory rename of an enormous tree
@@ -806,11 +819,11 @@ mod policy {
         }
         let pre_image = capture_pre_image(capture_path);
         let extras = collect_recursive_pre_images(from_abs);
-        let wire_arg: String = match &pre_image {
-            Some(pre) if pre.path == capture_path => pre.path.clone(),
-            _ => arg.to_string(),
-        };
-        let _ = try_notify(syscall, &wire_arg, pre_image, extras, failure);
+        // #222: the wire arg stays `from\tto` for the whole rename
+        // family, overwrite or not. The pre-image carries the
+        // destination path on its own; replacing the arg with it left
+        // the daemon nothing to journal a TreeOp::Rename from.
+        let _ = try_notify(syscall, arg, pre_image, extras, failure);
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -1424,6 +1437,19 @@ mod policy {
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, SystemTime};
 
+        #[cfg(test)]
+        if test_capture::active() {
+            test_capture::push(ShimNotification {
+                pid: 0,
+                syscall: syscall.to_string(),
+                arg: arg.to_string(),
+                ts_unix_nanos: 0,
+                pre_image,
+                extra_pre_images,
+                failure,
+            });
+            return Ok(());
+        }
         let path = socket_path();
         // Best-effort `connect(2)` — if the socket doesn't exist (no
         // daemon, daemon down, wrong $XDG_RUNTIME_DIR), bail silently.
@@ -1497,6 +1523,33 @@ mod policy {
             let _: Result<ShimAck, _> = decode_frame(&buf[..n]);
         }
         Ok(())
+    }
+
+    /// Unit-test hook: while a capture is active on this thread,
+    /// `try_notify` records the notification instead of sending it.
+    #[cfg(test)]
+    pub mod test_capture {
+        use std::cell::RefCell;
+        thread_local! {
+            static NOTES: RefCell<Option<Vec<shit_proto::ShimNotification>>> =
+                const { RefCell::new(None) };
+        }
+        pub fn active() -> bool {
+            NOTES.with(|n| n.borrow().is_some())
+        }
+        pub fn push(note: shit_proto::ShimNotification) {
+            NOTES.with(|n| {
+                if let Some(v) = n.borrow_mut().as_mut() {
+                    v.push(note);
+                }
+            });
+        }
+        /// Run `f` with capture on and return what it would have sent.
+        pub fn capture(f: impl FnOnce()) -> Vec<shit_proto::ShimNotification> {
+            NOTES.with(|n| *n.borrow_mut() = Some(Vec::new()));
+            f();
+            NOTES.with(|n| n.borrow_mut().take().unwrap_or_default())
+        }
     }
 }
 
@@ -2477,3 +2530,15 @@ mod chflagsat_capture_tests {
         );
     }
 }
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    )
+))]
+mod rename_wire_tests;
