@@ -131,7 +131,7 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                     op: RedirectOp::DdOf,
                     path: path.to_string(),
                     quote: quotes[i],
-                    cwd_stable: cwd_stable(&tokens[..i]),
+                    cwd_stable: cwd_stable(&tokens[..i], &quotes[..i]),
                 });
             }
             i += 1;
@@ -163,7 +163,7 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                     },
                     path: p.clone(),
                     quote: quotes[pi],
-                    cwd_stable: cwd_stable(&tokens[..i]),
+                    cwd_stable: cwd_stable(&tokens[..i], &quotes[..i]),
                 });
             }
             i += 1;
@@ -198,7 +198,7 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                     op,
                     path,
                     quote,
-                    cwd_stable: cwd_stable(&tokens[..op_idx]),
+                    cwd_stable: cwd_stable(&tokens[..op_idx], &quotes[..op_idx]),
                 });
             }
         }
@@ -240,20 +240,59 @@ fn classify_redirect_token(tok: &str) -> Option<(RedirectOp, Option<&str>)> {
     None
 }
 
-/// Words that can change the shell's working directory or run code the
-/// parser cannot see through.
+/// Commands that can change the shell's working directory or run code
+/// the parser cannot see through. Matched only in command position.
 const CWD_CHANGING_WORDS: &[&str] = &[
     "cd", "pushd", "popd", "chdir", "eval", "source", ".", "exec", "builtin", "command", "env",
     "sudo", "sh", "bash", "zsh", "fish", "dash",
 ];
 
-/// True when no token in `prefix` (everything before a redirect) can
-/// change the working directory. Unsure counts as changed: a token with
-/// a subshell, brace group, backtick or `$(` is treated as a change.
-fn cwd_stable(prefix: &[String]) -> bool {
-    !prefix
-        .iter()
-        .any(|t| CWD_CHANGING_WORDS.contains(&t.as_str()) || t.contains(['(', ')', '{', '}', '`']))
+/// True for `NAME=value`, the assignment prefix that can precede a
+/// command word (`FOO=1 cd sub`).
+fn is_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            let mut chars = name.chars();
+            chars
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// True when no command before a redirect can change the working
+/// directory. Only words in command position count: the first word of
+/// each simple command, after `&&`, `||`, `;`, `|`, `&` or a newline and
+/// after `NAME=value` prefixes. `ls .`, `grep env f` and `echo "(x)"` are
+/// stable. Subshell, brace-group and backtick characters count only when
+/// they may be unquoted: in a fully quoted token they are text. A token
+/// with both quoted and bare parts is treated as if they were bare.
+/// Unsure is unstable.
+fn cwd_stable(prefix: &[String], quotes: &[Quote]) -> bool {
+    let mut command_position = true;
+    for (tok, quote) in prefix.iter().zip(quotes) {
+        let may_be_bare = matches!(quote, Quote::None | Quote::Mixed);
+        if may_be_bare && tok.contains(['(', ')', '{', '}', '`']) {
+            return false;
+        }
+        if *quote == Quote::None && is_pipe_or_control(tok) {
+            command_position = true;
+            continue;
+        }
+        if !command_position {
+            continue;
+        }
+        if *quote == Quote::None && is_assignment(tok) {
+            continue;
+        }
+        if CWD_CHANGING_WORDS.contains(&tok.as_str()) {
+            return false;
+        }
+        command_position = false;
+    }
+    true
 }
 
 /// Tokenize on whitespace, respecting single and double quotes, and
@@ -303,6 +342,18 @@ fn tokenize(line: &str) -> Vec<(String, Quote)> {
         if c == '"' && !in_single {
             in_double = !in_double;
             saw_double = true;
+            continue;
+        }
+        if c == '\n' && !in_single && !in_double {
+            // A newline ends a simple command like `;` does.
+            finish(
+                &mut cur,
+                &mut out,
+                &mut saw_single,
+                &mut saw_double,
+                &mut saw_bare,
+            );
+            out.push((";".to_string(), Quote::None));
             continue;
         }
         if c.is_whitespace() && !in_single && !in_double {
@@ -668,8 +719,29 @@ mod tests {
             "cd sub && dd if=a of=out",
             "cd sub && echo x | tee out",
             "echo $(cd sub; pwd) > out",
+            "FOO=1 cd sub && echo x > out",
+            "A=1 B=2 pushd sub; echo x > out",
+            "true\ncd sub\necho x > out",
+            "false || cd sub && echo x > out",
+            "echo a | cd sub; echo x > out",
         ] {
             assert!(!first(line).cwd_stable, "{line}");
+        }
+    }
+
+    #[test]
+    fn words_outside_command_position_and_quoted_text_stay_stable() {
+        for line in [
+            "ls . > out.txt",
+            "grep env f > o",
+            "echo cd sub > out",
+            "echo \"(x)\" > f",
+            "echo '{a}' > f",
+            "echo '`x`' > f",
+            "FOO=1 make > log",
+            "ls -l | grep source > out",
+        ] {
+            assert!(first(line).cwd_stable, "{line}");
         }
     }
 }
