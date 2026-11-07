@@ -16,14 +16,34 @@ fn helper_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_shit-helper"))
 }
 
-/// Sanity check: the helper as cargo built it (ad-hoc signed by
-/// the rustc/clang linker) should pass verify. If this fails
-/// the test environment is broken before we even get to the
-/// corruption case.
-#[test]
-fn verify_path_on_uncorrupted_helper_succeeds() {
+/// Copy the helper to a temp path and ad-hoc sign the copy. The
+/// linker signs output only on arm64; x86_64 builds are unsigned, so
+/// the tests sign explicitly to stay independent of host architecture.
+fn signed_copy(dir: &std::path::Path) -> PathBuf {
     let bin = helper_bin();
     assert!(bin.exists(), "helper bin not built at {}", bin.display());
+    let copy = dir.join("shit-helper-signed");
+    std::fs::copy(&bin, &copy).expect("copy helper bin");
+    let out = std::process::Command::new("codesign")
+        .args(["-s", "-", "--force"])
+        .arg(&copy)
+        .output()
+        .expect("run codesign");
+    assert!(
+        out.status.success(),
+        "codesign -s - failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    copy
+}
+
+/// Sanity check: an ad-hoc signed copy of the helper should pass
+/// verify. If this fails the test environment is broken before we
+/// even get to the corruption case.
+#[test]
+fn verify_path_on_uncorrupted_helper_succeeds() {
+    let tmp = tempfile::tempdir().expect("mktempdir");
+    let bin = signed_copy(tmp.path());
     let report = codesign_verify::verify_path(&bin);
     assert!(
         report.ok,
@@ -40,7 +60,8 @@ fn verify_path_on_uncorrupted_helper_succeeds() {
 /// surface `ok=false` with a reason that mentions the failure.
 #[test]
 fn verify_path_on_corrupted_copy_returns_ok_false() {
-    let bin = helper_bin();
+    let tmp = tempfile::tempdir().expect("mktempdir");
+    let bin = signed_copy(tmp.path());
     let original = std::fs::read(&bin).expect("read helper bin");
     assert!(
         original.len() > 4096,
@@ -48,7 +69,6 @@ fn verify_path_on_corrupted_copy_returns_ok_false() {
         original.len()
     );
 
-    let tmp = tempfile::tempdir().expect("mktempdir");
     let corrupt = tmp.path().join("shit-helper-corrupt");
     std::fs::write(&corrupt, &original).expect("write corrupt copy");
     // Preserve exec bit so codesign's load doesn't bail on
