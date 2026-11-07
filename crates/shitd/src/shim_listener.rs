@@ -265,7 +265,7 @@ struct UnlinkStat {
 /// fifos and sockets are reported; anything else keeps the wire default.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
-    if !matches!(note.syscall.as_str(), "unlink" | "unlinkat") {
+    if !matches!(note.syscall.as_str(), "unlink" | "unlinkat" | "rmdir") {
         return None;
     }
     if !Path::new(&note.arg).is_absolute() {
@@ -809,7 +809,7 @@ fn ingest_pre_image_with_source(
 /// path.
 fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
     match syscall {
-        "unlink" | "unlinkat" => {
+        "unlink" | "unlinkat" | "rmdir" => {
             let path = PathBuf::from(arg);
             // G02: shim doesn't carry kind/mode in its notification
             // wire (the shim's notify happens pre-syscall and
@@ -817,11 +817,17 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
             // pre-G02 hard-coded behavior. The kernel-tier LSM
             // path (helper) DOES carry kind+mode and overrides this
             // when both tiers see the same unlink.
+            // L5: rmdir(2) only ever removes a directory.
+            let (kind, mode) = if syscall == "rmdir" {
+                (shit_planner::metadata::FileKind::Directory, 0o040755)
+            } else {
+                (shit_planner::metadata::FileKind::Regular, 0o100644)
+            };
             Some(CaptureEventKind::TreeOp(TreeOp::Unlink {
                 inode: InodeRef::new(0, 0),
                 path,
-                kind: shit_planner::metadata::FileKind::Regular,
-                mode: 0o100644,
+                kind,
+                mode,
             }))
         }
         "rename" | "renameat" | "renameat2" => {
@@ -1511,5 +1517,55 @@ mod tests {
             ),
             "{events:#?}"
         );
+    }
+
+    /// L5: the Linux shim's rmdir interposer. With the stat its mode is
+    /// journaled; without one it is still a directory.
+    #[test]
+    fn rmdir_journals_a_directory_unlink() {
+        use shit_planner::time::TimePoint;
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "rmdir".into(),
+            arg: "/tmp/shit-rmdir/d".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+        };
+        for (stat, want_mode) in [
+            (
+                Some(UnlinkStat {
+                    kind: FileKind::Directory,
+                    mode: 0o040700,
+                }),
+                0o040700,
+            ),
+            (None, 0o040755),
+        ] {
+            let (_tmp, index, blob_store, command) = ingest_fixture("python3 -c rmtree");
+            ingest_notification(
+                &note,
+                Some(command),
+                TimePoint::new(6, 0),
+                stat,
+                &index,
+                &blob_store,
+                &LiveBaseline::new(),
+            );
+            let events = index.events_for_command(command);
+            assert_eq!(events.len(), 1, "{events:#?}");
+            assert!(
+                matches!(
+                    &events[0].kind,
+                    CaptureEventKind::TreeOp(TreeOp::Unlink {
+                        kind: FileKind::Directory,
+                        mode,
+                        ..
+                    }) if *mode == want_mode
+                ),
+                "{events:#?}"
+            );
+        }
     }
 }
