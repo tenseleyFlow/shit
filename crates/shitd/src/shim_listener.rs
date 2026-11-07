@@ -346,6 +346,12 @@ fn ingest_notification(
                 PathBuf::from(attempted_path),
                 format!("shim canonicalize tripped on {which_arg} argument ({error_chain})"),
             ),
+            // L5: an existing file was written without its bytes.
+            shit_proto::ShimFailure::PreImageUncaptured { path, reason } => (
+                "capture-gap".to_string(),
+                PathBuf::from(path),
+                format!("the file existed before the write, but its bytes {reason}"),
+            ),
         };
         // The primary path matters for the user-visible refusal
         // text. We deliberately use the raw `attempted_path` here
@@ -483,10 +489,16 @@ fn ingest_notification(
             if let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
                 warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
             }
-            return;
         }
-        // AR05.1: no pre-image means the file didn't exist when the
-        // shim looked. On in-watch paths the dir-diff Create event
+        // L5 (review item 1): no pre-image is not evidence the file was
+        // new. The shim sends a capture-gap marker (journaled above as a
+        // refusal) for an existing file it could not read, and an
+        // `open_create` after a call that created its target.
+        return;
+    }
+    if note.syscall == "open_create" {
+        // AR05.1: the shim saw the path absent before an O_CREAT open
+        // that then succeeded. On in-watch paths the dir-diff Create event
         // covers this; on OUT-OF-WATCH paths (e.g. `make install
         // PREFIX=/usr/local`) the kernel-capture tier doesn't see
         // the create at all — the shim is the only observation
@@ -1546,6 +1558,85 @@ mod tests {
                 })
             ),
             "{events:#?}"
+        );
+    }
+
+    fn kinds_after(note: &ShimNotification) -> Vec<CaptureEventKind> {
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        ingest_notification(
+            note,
+            Some(command),
+            TimePoint::new(6, 0),
+            None,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        index
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    fn open_note(syscall: &str, failure: Option<shit_proto::ShimFailure>) -> ShimNotification {
+        ShimNotification {
+            pid: 4242,
+            syscall: syscall.into(),
+            arg: "/tmp/shit-open/existing".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure,
+            walk: None,
+            outcome: None,
+        }
+    }
+
+    /// Review item 1: a write-open with no pre-image is never a Create.
+    /// The file may have existed (over the cap, unreadable); unlinking it
+    /// at undo would lose it.
+    #[test]
+    fn open_without_pre_image_never_journals_a_create() {
+        for syscall in ["open", "openat", "truncate"] {
+            let kinds = kinds_after(&open_note(syscall, None));
+            assert!(
+                !kinds
+                    .iter()
+                    .any(|k| matches!(k, CaptureEventKind::TreeOp(TreeOp::Create { .. }))),
+                "{syscall}: {kinds:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncaptured_existing_file_journals_a_refusal_only() {
+        let failure = shit_proto::ShimFailure::PreImageUncaptured {
+            path: "/tmp/shit-open/existing".into(),
+            reason: "over the shim's inline pre-image cap".into(),
+        };
+        let kinds = kinds_after(&open_note("open", Some(failure)));
+        assert_eq!(kinds.len(), 1, "{kinds:#?}");
+        assert!(
+            matches!(&kinds[0], CaptureEventKind::CaptureRefused { path, .. }
+                if path == Path::new("/tmp/shit-open/existing")),
+            "{kinds:#?}"
+        );
+    }
+
+    #[test]
+    fn open_create_journals_a_create() {
+        let kinds = kinds_after(&open_note("open_create", None));
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::TreeOp(TreeOp::Create {
+                    kind: FileKind::Regular,
+                    ..
+                })]
+            ),
+            "{kinds:#?}"
         );
     }
 

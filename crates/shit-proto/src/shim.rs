@@ -259,6 +259,11 @@ pub enum ShimFailure {
         attempted_path: String,
         error_chain: String,
     },
+    /// L5 — a write-capable open or truncate of a file that existed
+    /// before the call, whose bytes the shim could not capture (over the
+    /// inline cap, unreadable, or its prior state unknown). The daemon
+    /// journals a refusal and never a Create for it.
+    PreImageUncaptured { path: String, reason: String },
 }
 
 /// Ack the daemon sends back. S24.D.2 ships `Allow` only; the broader

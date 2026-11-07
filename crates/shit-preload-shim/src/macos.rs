@@ -28,7 +28,7 @@
 //! libc::foo as *const c_void)`. The dynamic linker does the rest.
 
 use super::policy;
-use libc::{O_RDWR, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, c_void, mode_t};
+use libc::{c_char, c_int, c_uint, c_void, mode_t};
 use std::path::{Path, PathBuf};
 
 /// Materialize a NUL-terminated C string into an owned `String` for
@@ -335,11 +335,16 @@ mod addr {
 /// is in `flags`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rust_shim_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
-    let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
-    if writes {
-        policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
-    }
-    unsafe { libc::open(path, flags, mode as c_int) }
+    // L5: the shared write-open policy (Create only for a path absent
+    // before a successful call; a gap marker for an uncapturable file).
+    let pending = policy::write_open_begin(
+        "open",
+        policy::OpenTarget::Path(&cstr_to_string(path)),
+        flags,
+    );
+    let rc = unsafe { libc::open(path, flags, mode as c_int) };
+    policy::write_open_end(pending, rc);
+    rc
 }
 
 /// Rust target of the C trampoline for `openat(2)`.
@@ -353,11 +358,19 @@ unsafe extern "C" fn rust_shim_openat(
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
-    let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
-    if writes {
-        policy::notify_pre_mutation_with_content("openat", &cstr_to_string(path));
-    }
-    unsafe { libc::openat(dirfd, path, flags, mode as c_int) }
+    // L5: keyed to the dirfd, then the shared write-open policy.
+    let pending = match join_dirfd(dirfd, &cstr_to_string(path)) {
+        Ok(p) => policy::write_open_begin("openat", policy::OpenTarget::Path(&p), flags),
+        Err((raw, failure)) => {
+            if policy::is_write_open(flags) {
+                policy::notify_unresolved("openat", &raw, failure);
+            }
+            None
+        }
+    };
+    let rc = unsafe { libc::openat(dirfd, path, flags, mode as c_int) };
+    policy::write_open_end(pending, rc);
+    rc
 }
 
 /// Replacement for `mkdir(2)`. Captures directory-create
@@ -1518,6 +1531,7 @@ mod tests {
                 assert_eq!(which_arg, "path");
                 assert_eq!(Path::new(attempted_path), candidate);
             }
+            other => panic!("{other:?}"),
         }
     }
 

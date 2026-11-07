@@ -1696,12 +1696,19 @@ fn emit_for_event(
                 op: InverseOp::Refuse {
                     class: class.clone(),
                     reason: format!("capture incomplete for {}: {}", path.display(), detail),
-                    remediation: Some(
+                    remediation: Some(if class == "capture-gap" {
+                        // L5: an existing file was written without its
+                        // bytes (over the inline cap, unreadable).
+                        "shit cannot restore this file's earlier content because the shim \
+                         could not read it before the write; restore it from a backup if \
+                         you need it."
+                            .to_string()
+                    } else {
                         "Re-run the command from a directory whose parent path exists; \
                          shit cannot reverse this path because the shim could not resolve \
                          an absolute path to attribute the captured pre-image to."
-                            .to_string(),
-                    ),
+                            .to_string()
+                    }),
                 },
                 cohort: 0,
                 conflict: None,
