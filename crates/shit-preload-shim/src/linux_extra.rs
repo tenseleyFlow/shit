@@ -44,10 +44,29 @@ type MkdirFn = unsafe extern "C" fn(*const c_char, mode_t) -> c_int;
 type MkdirAtFn = unsafe extern "C" fn(c_int, *const c_char, mode_t) -> c_int;
 type RmdirFn = unsafe extern "C" fn(*const c_char) -> c_int;
 
-fn enosys() -> c_int {
-    // SAFETY: errno is a valid thread-local lvalue.
-    unsafe { policy::set_errno(libc::ENOSYS) };
-    -1
+/// Review round 2, item 5: when `dlsym(RTLD_NEXT)` finds no next
+/// definition the call still runs, as the kernel syscall, the way the
+/// `open`/`openat` interposers fall back. Never fail the user's call
+/// because the shim could not find a symbol.
+mod sys {
+    use libc::{c_char, c_int, c_uint, mode_t};
+
+    pub fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+        // SAFETY: the caller's open contract; raw openat(2).
+        unsafe { libc::syscall(libc::SYS_openat, dirfd, path, flags, mode) as c_int }
+    }
+
+    pub fn mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
+        // SAFETY: the caller's mkdir contract; raw mkdirat(2).
+        unsafe { libc::syscall(libc::SYS_mkdirat, dirfd, path, mode) as c_int }
+    }
+
+    pub fn rmdir(path: *const c_char) -> c_int {
+        // SAFETY: the caller's rmdir contract; raw unlinkat(2).
+        unsafe {
+            libc::syscall(libc::SYS_unlinkat, libc::AT_FDCWD, path, libc::AT_REMOVEDIR) as c_int
+        }
+    }
 }
 
 /// Run a path open under the shared write-open policy.
@@ -82,7 +101,7 @@ fn at_open(dirfd: c_int, path: *const c_char, flags: c_int, call: impl FnOnce() 
 pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     path_open(path, flags, || match real!("open64", OpenFn) {
         Some(f) => unsafe { f(path, flags, mode) },
-        None => enosys(),
+        None => sys::openat(libc::AT_FDCWD, path, flags, mode),
     })
 }
 
@@ -99,7 +118,7 @@ pub unsafe extern "C" fn openat64(
 ) -> c_int {
     at_open(dirfd, path, flags, || match real!("openat64", OpenAtFn) {
         Some(f) => unsafe { f(dirfd, path, flags, mode) },
-        None => enosys(),
+        None => sys::openat(dirfd, path, flags, mode),
     })
 }
 
@@ -111,7 +130,7 @@ pub unsafe extern "C" fn openat64(
 pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
     path_open(path, flags, || match real!("__open_2", Open2Fn) {
         Some(f) => unsafe { f(path, flags) },
-        None => enosys(),
+        None => sys::openat(libc::AT_FDCWD, path, flags, 0),
     })
 }
 
@@ -123,7 +142,7 @@ pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
 pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: c_int) -> c_int {
     path_open(path, flags, || match real!("__open64_2", Open2Fn) {
         Some(f) => unsafe { f(path, flags) },
-        None => enosys(),
+        None => sys::openat(libc::AT_FDCWD, path, flags, 0),
     })
 }
 
@@ -136,7 +155,7 @@ pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_
     at_open(dirfd, path, flags, || {
         match real!("__openat_2", OpenAt2Fn) {
             Some(f) => unsafe { f(dirfd, path, flags) },
-            None => enosys(),
+            None => sys::openat(dirfd, path, flags, 0),
         }
     })
 }
@@ -150,7 +169,7 @@ pub unsafe extern "C" fn __openat64_2(dirfd: c_int, path: *const c_char, flags: 
     at_open(dirfd, path, flags, || {
         match real!("__openat64_2", OpenAt2Fn) {
             Some(f) => unsafe { f(dirfd, path, flags) },
-            None => enosys(),
+            None => sys::openat(dirfd, path, flags, 0),
         }
     })
 }
@@ -164,7 +183,12 @@ pub unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
     path_open(path, O_CREAT | O_WRONLY | O_TRUNC, || {
         match real!("creat", CreatFn) {
             Some(f) => unsafe { f(path, mode) },
-            None => enosys(),
+            None => sys::openat(
+                libc::AT_FDCWD,
+                path,
+                O_CREAT | O_WRONLY | O_TRUNC,
+                mode as c_uint,
+            ),
         }
     })
 }
@@ -178,7 +202,12 @@ pub unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
     path_open(path, O_CREAT | O_WRONLY | O_TRUNC, || {
         match real!("creat64", CreatFn) {
             Some(f) => unsafe { f(path, mode) },
-            None => enosys(),
+            None => sys::openat(
+                libc::AT_FDCWD,
+                path,
+                O_CREAT | O_WRONLY | O_TRUNC,
+                mode as c_uint,
+            ),
         }
     })
 }
@@ -191,7 +220,7 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
     let (resolved, failure) = policy::canonicalize_or_raw(&cstr_to_string(path), "path");
     let rc = match real!("mkdir", MkdirFn) {
         Some(f) => unsafe { f(path, mode) },
-        None => enosys(),
+        None => sys::mkdirat(libc::AT_FDCWD, path, mode),
     };
     if rc == 0 {
         policy::notify_create_resolved("mkdir", &resolved, failure);
@@ -208,7 +237,7 @@ pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t
     let target = policy::resolve_at_for_notify(dirfd, &cstr_to_string(path), "path");
     let rc = match real!("mkdirat", MkdirAtFn) {
         Some(f) => unsafe { f(dirfd, path, mode) },
-        None => enosys(),
+        None => sys::mkdirat(dirfd, path, mode),
     };
     if rc == 0 {
         match target {
@@ -235,7 +264,7 @@ pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
     let pending = policy::removal_begin("rmdir", &cstr_to_string(path));
     let rc = match real!("rmdir", RmdirFn) {
         Some(f) => unsafe { f(path) },
-        None => enosys(),
+        None => sys::rmdir(path),
     };
     policy::removal_end(pending, rc);
     rc
@@ -430,6 +459,55 @@ mod tests {
             assert!(unsafe { open64(cp.as_ptr(), O_WRONLY | O_CREAT, 0o644) } < 0);
         });
         assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review round 2, item 6: a read-only open can still create the file.
+    #[test]
+    fn read_only_open_with_o_creat_journals_the_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let p = dir.join("lock");
+        let cp = c(&p);
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(cp.as_ptr(), libc::O_RDONLY | O_CREAT, 0o644) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].syscall, "open_create");
+        assert_eq!(notes[0].arg, p.to_str().unwrap());
+    }
+
+    #[test]
+    fn read_only_open_with_o_creat_of_an_existing_file_sends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("lock");
+        std::fs::write(&p, b"held").unwrap();
+        let cp = c(&p);
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(cp.as_ptr(), libc::O_RDONLY | O_CREAT, 0o644) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review round 2, item 5: when `dlsym(RTLD_NEXT)` finds nothing the
+    /// call still happens, through the syscall.
+    #[test]
+    fn syscall_fallbacks_do_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let f = c(&dir.join("f"));
+        let fd = sys::openat(libc::AT_FDCWD, f.as_ptr(), O_WRONLY | O_CREAT, 0o600);
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        assert!(dir.join("f").exists());
+        let d = c(&dir.join("d"));
+        assert_eq!(sys::mkdirat(libc::AT_FDCWD, d.as_ptr(), 0o700), 0);
+        assert!(dir.join("d").is_dir());
+        assert_eq!(sys::rmdir(d.as_ptr()), 0);
+        assert!(!dir.join("d").exists());
     }
 
     /// Review item 3: `rmdir --ignore-fail-on-non-empty`, `os.removedirs`.
