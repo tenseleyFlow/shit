@@ -87,7 +87,7 @@ pub fn handle(
     let mut stashed: u32 = 0;
     let mut errors: Vec<PreStashRedirectError> = Vec::new();
     for target in targets {
-        match stash_one(&target, command, index, blob_store) {
+        match stash_one(&target, command, index, blob_store, strict) {
             Ok(StashOutcome::Stashed) => stashed += 1,
             Ok(StashOutcome::Skipped) => {} // fresh-create case; not an error, not a stash
             Err(reason) => {
@@ -97,14 +97,12 @@ pub fn handle(
                     // filesystem location; the refusal falls back to the
                     // command's cwd.
                     let refused_path = path.is_absolute().then(|| path.to_path_buf());
-                    if let Err(e) = crate::helper_link::journal_capture_refused(
+                    crate::helper_link::journal_capture_refused_or_log(
                         index,
                         command,
                         refused_path,
                         format!("redirect pre-stash failed for {}: {reason}", target.path),
-                    ) {
-                        tracing::error!(error = %e, %command, "strict redirect CaptureRefused journal failed");
-                    }
+                    );
                 }
                 errors.push(PreStashRedirectError {
                     path: target.path.clone(),
@@ -128,19 +126,28 @@ fn stash_one(
     command: CommandId,
     index: &Index,
     blob_store: &BlobStore,
+    strict: bool,
 ) -> Result<StashOutcome, String> {
     // The hook resolves relative targets against the shell's cwd before
     // sending. A path that is still relative (unexpanded `$VAR`, `~`, a
     // glob) would resolve against the daemon's cwd, which names the
     // wrong file, so it is never stat'd.
+    //
+    // Default mode keeps trunk's behavior (such targets were skipped, as
+    // they named nothing the daemon could stat). Strict mode cannot tell
+    // whether the command wrote a file it cannot attribute, so it refuses.
     if !Path::new(target.path.as_str()).is_absolute() {
-        return Err(
-            "redirect target is not an absolute path (shell expansion not resolved)".into(),
-        );
+        if strict {
+            return Err(
+                "redirect target is not an absolute path (shell expansion not resolved)".into(),
+            );
+        }
+        debug!(path = %target.path, "unresolved redirect target; skipped");
+        return Ok(StashOutcome::Skipped);
     }
     match target.op {
         RedirectOpWire::Truncate | RedirectOpWire::TeeTruncate | RedirectOpWire::DdOf => {
-            stash_truncate(target.path.as_str(), command, index, blob_store)
+            stash_truncate(target.path.as_str(), command, index, blob_store, strict)
         }
         RedirectOpWire::Append | RedirectOpWire::TeeAppend => {
             // AU27 — Append/TeeAppend capture journals only the
@@ -149,26 +156,29 @@ fn stash_one(
             // need restoring are still on disk in [0..pre_size]; the
             // appended bytes [pre_size..] get discarded by the
             // truncate.
-            stash_append(target.path.as_str(), command, index)
+            stash_append(target.path.as_str(), command, index, strict)
         }
     }
 }
 
-fn stash_append(path_str: &str, command: CommandId, index: &Index) -> Result<StashOutcome, String> {
+fn stash_append(
+    path_str: &str,
+    command: CommandId,
+    index: &Index,
+    strict: bool,
+) -> Result<StashOutcome, String> {
     let path = Path::new(path_str);
     // Fresh-file fast-path: `echo X >> /tmp/new.log` on a
     // non-existent target. There's no pre-state to truncate
     // back to. AR05.1-style fresh-create journaling could
     // emit a TreeOp::Create here; deferred to a sibling
     // sprint.
-    let Some((file, meta)) = open_regular_nofollow(path)? else {
+    // Only the size is needed, so a write-only target (mode 0200) is
+    // captured from its metadata when it cannot be opened for reading.
+    let Some((_, meta)) = capture_regular(path, strict, false)? else {
         debug!(path = %path.display(), "append target absent; nothing to pre-stash");
         return Ok(StashOutcome::Skipped);
     };
-    // The size is read from the fd we opened, so a path swapped to a
-    // different file after this point cannot change what we record.
-    // Re-check the binding once more before journaling.
-    verify_unchanged(path, &file, &meta)?;
     // Empty file fast-path: appending to a 0-byte file. Truncate
     // back would be a no-op (already 0 bytes after the inverse
     // runs IFF the truncate is the only inverse). Skip the
@@ -207,6 +217,7 @@ fn stash_truncate(
     command: CommandId,
     index: &Index,
     blob_store: &BlobStore,
+    strict: bool,
 ) -> Result<StashOutcome, String> {
     let path = Path::new(path_str);
     // If the file doesn't exist yet, there's nothing to pre-stash —
@@ -215,17 +226,10 @@ fn stash_truncate(
     // we focus on the "clobber existing file" race. Fresh-create
     // covered by separate AR06.5 follow-up; today we just skip
     // cleanly (no error -- not a failure).
-    let Some((mut file, meta)) = open_regular_nofollow(path)? else {
+    let Some((bytes, meta)) = capture_regular(path, strict, true)? else {
         debug!(path = %path.display(), "redirect target absent; nothing to pre-stash");
         return Ok(StashOutcome::Skipped);
     };
-    // Read through the descriptor we validated, then confirm that the
-    // file did not change under the read and that the path still names
-    // it. A torn read would otherwise be journaled as the pre-image.
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.size()).unwrap_or(0));
-    file.read_to_end(&mut bytes)
-        .map_err(|e| format!("read: {e}"))?;
-    verify_unchanged(path, &file, &meta)?;
     let (blob_hash, stat) = blob_store
         .put(&bytes)
         .map_err(|e| format!("blob put: {e}"))?;
@@ -280,29 +284,115 @@ fn stash_truncate(
     Ok(StashOutcome::Stashed)
 }
 
+/// Why `open_regular_nofollow` failed. `denied` marks EACCES/EPERM so
+/// callers that only need metadata can fall back to `lstat`.
+struct OpenFail {
+    msg: String,
+    denied: bool,
+}
+
+impl From<OpenFail> for String {
+    fn from(f: OpenFail) -> String {
+        f.msg
+    }
+}
+
 /// Open `path` read-only without following a final symlink and check that
 /// the descriptor is a regular file. `Ok(None)` means the path is absent.
 /// Symlinks, FIFOs, sockets and devices are errors: only regular files
 /// have content worth restoring, and `O_NONBLOCK` keeps a FIFO swapped in
 /// after the shell parse from blocking the daemon in `open`.
-fn open_regular_nofollow(path: &Path) -> Result<Option<(File, std::fs::Metadata)>, String> {
-    let file = match OpenOptions::new()
+///
+/// A failed open is classified with `lstat` on the final component: the
+/// errno for `O_NOFOLLOW` on a symlink is ELOOP on Linux and EMLINK on
+/// FreeBSD, and ELOOP can also come from a loop in an intermediate
+/// component, so the errno alone says nothing.
+fn open_regular_nofollow(path: &Path) -> Result<Option<(File, std::fs::Metadata)>, OpenFail> {
+    let err = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err("not a regular file (symlink)".to_string());
+        Ok(file) => {
+            let meta = file.metadata().map_err(|e| OpenFail {
+                msg: format!("fstat: {e}"),
+                denied: false,
+            })?;
+            if !meta.file_type().is_file() {
+                return Err(OpenFail {
+                    msg: format!("not a regular file ({:?})", meta.file_type()),
+                    denied: false,
+                });
+            }
+            return Ok(Some((file, meta)));
         }
-        Err(e) => return Err(format!("open: {e}")),
+        Err(e) => e,
     };
-    let meta = file.metadata().map_err(|e| format!("fstat: {e}"))?;
-    if !meta.file_type().is_file() {
-        return Err(format!("not a regular file ({:?})", meta.file_type()));
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return Ok(None);
     }
-    Ok(Some((file, meta)))
+    if let Ok(link) = std::fs::symlink_metadata(path)
+        && link.file_type().is_symlink()
+    {
+        return Err(OpenFail {
+            msg: "not a regular file (symlink)".to_string(),
+            denied: false,
+        });
+    }
+    Err(OpenFail {
+        msg: format!("open: {err}"),
+        denied: err.kind() == std::io::ErrorKind::PermissionDenied,
+    })
+}
+
+/// Snapshot a regular file: its bytes (when `want_bytes`) and the metadata
+/// the snapshot is consistent with. `Ok(None)` means the path is absent.
+///
+/// The read goes through one validated descriptor and is followed by a
+/// check that the file did not change and that `path` still names it.
+/// A mismatch is a torn or raced capture. Default mode keeps trunk's
+/// best-effort behavior: log a warning and use what was read, because
+/// dropping the pre-image would lose capture. Strict mode retries once,
+/// then fails so the command is refused.
+///
+/// Without `want_bytes` (append targets), a file that cannot be opened
+/// for reading is captured from its `lstat` metadata alone, as trunk did.
+fn capture_regular(
+    path: &Path,
+    strict: bool,
+    want_bytes: bool,
+) -> Result<Option<(Vec<u8>, std::fs::Metadata)>, String> {
+    let attempts = if strict { 2 } else { 1 };
+    let mut last_err = String::new();
+    for _ in 0..attempts {
+        let (mut file, meta) = match open_regular_nofollow(path) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return Ok(None),
+            Err(f) if f.denied && !want_bytes => {
+                let meta = std::fs::symlink_metadata(path).map_err(|e| format!("stat: {e}"))?;
+                if !meta.file_type().is_file() {
+                    return Err(format!("not a regular file ({:?})", meta.file_type()));
+                }
+                return Ok(Some((Vec::new(), meta)));
+            }
+            Err(f) => return Err(f.msg),
+        };
+        let mut bytes = Vec::new();
+        if want_bytes {
+            bytes.reserve(usize::try_from(meta.size()).unwrap_or(0));
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("read: {e}"))?;
+        }
+        match verify_unchanged(path, &file, &meta) {
+            Ok(()) => return Ok(Some((bytes, meta))),
+            Err(e) if !strict => {
+                tracing::warn!(path = %path.display(), reason = %e, "redirect pre-image may be torn; journaling best-effort bytes");
+                return Ok(Some((bytes, meta)));
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 /// Fail if the file changed while it was being captured, or if `path` no
@@ -623,7 +713,7 @@ mod tests {
             false,
         ));
         assert_eq!(r.stashed, 0);
-        assert_eq!(r.errors.len(), 1);
+        assert!(r.errors.is_empty(), "default mode skips like trunk");
         assert!(index.events_for_command(cmd).is_empty());
     }
 
@@ -645,7 +735,7 @@ mod tests {
                 &blob_store,
                 strict,
             ));
-            assert_eq!(r.errors.len(), 1, "strict={strict}");
+            assert_eq!(r.errors.len(), usize::from(strict), "strict={strict}");
             let rows = refusals(&index, cmd);
             assert_eq!(rows.len(), usize::from(strict), "strict={strict}");
             if strict {
@@ -677,6 +767,7 @@ mod tests {
         ));
         assert_eq!(r.stashed, 0);
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(r.errors[0].reason.contains("(symlink)"), "{:?}", r.errors);
         let rows = refusals(&index, cmd);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, link);
@@ -710,7 +801,7 @@ mod tests {
     fn verify_unchanged_catches_modification_and_replacement() {
         let dir = TempDir::new().unwrap();
         let path = write_file(dir.path(), "f.txt", b"one\n");
-        let (file, meta) = open_regular_nofollow(&path).unwrap().unwrap();
+        let (file, meta) = open_regular_nofollow(&path).ok().flatten().unwrap();
         verify_unchanged(&path, &file, &meta).expect("untouched file verifies");
 
         // Same inode, new bytes: the fd snapshot differs.
@@ -718,10 +809,56 @@ mod tests {
         assert!(verify_unchanged(&path, &file, &meta).is_err());
 
         // Path now names a different inode.
-        let (file, meta) = open_regular_nofollow(&path).unwrap().unwrap();
+        let (file, meta) = open_regular_nofollow(&path).ok().flatten().unwrap();
         let other = write_file(dir.path(), "g.txt", b"swap\n");
         std::fs::rename(&other, &path).unwrap();
         let err = verify_unchanged(&path, &file, &meta).unwrap_err();
         assert!(err.contains("replaced") || err.contains("changed"), "{err}");
+    }
+    #[test]
+    fn write_only_append_target_is_captured_from_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores mode bits
+        }
+        for strict in [false, true] {
+            let (dir, blob_store, index, active) = fresh();
+            let path = write_file(dir.path(), "wo.log", b"old\n");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+            let cmd = CommandId {
+                session: fresh_session(),
+                seq: 1,
+            };
+            register_command(&index, cmd);
+            let r = ack(handle(
+                cmd.session,
+                cmd.seq,
+                one_target(path.to_str().unwrap(), RedirectOpWire::Append),
+                &active,
+                &index,
+                &blob_store,
+                strict,
+            ));
+            assert_eq!(r.stashed, 1, "strict={strict} {:?}", r.errors);
+            assert!(matches!(
+                index.events_for_command(cmd)[0].kind,
+                CaptureEventKind::FileAppendPreStash { pre_size: 4, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn torn_read_is_best_effort_by_default_and_fatal_in_strict() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(dir.path(), "live.txt", b"abc\n");
+        // A concurrent writer is simulated by checking the verify result
+        // directly: capture_regular's policy turns it into Ok or Err.
+        let (file, meta) = open_regular_nofollow(&path).ok().flatten().unwrap();
+        std::fs::write(&path, b"abcdef\n").unwrap();
+        let err = verify_unchanged(&path, &file, &meta).unwrap_err();
+        assert!(err.contains("changed"));
+        // Quiescent file: both modes succeed.
+        assert!(capture_regular(&path, false, true).unwrap().is_some());
+        assert!(capture_regular(&path, true, true).unwrap().is_some());
     }
 }

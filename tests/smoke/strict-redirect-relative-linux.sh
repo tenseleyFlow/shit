@@ -46,6 +46,7 @@ run_phase() {
     local root="${SHIT_SMOKE_TMP}/${label}"
     local probe="${root}/out"
     mkdir -p "${root}/sub"
+    root="$(cd "${root}" && pwd -P)"
     printf '%s\n' "${ORIGINAL}" > "${probe}"
     local pre_sha
     pre_sha="$(sha256sum "${probe}" | awk '{print $1}')"
@@ -77,6 +78,14 @@ run_phase() {
     [ "$(sha256sum "${probe}" | awk '{print $1}')" != "${pre_sha}" ] \
         || smoke_fail "[${label}] workload did not change the probe"
     smoke_wait_for_event "discriminant = 'FilePreImage'" 1 10
+    # The journaled path is the normalized absolute one, the same string
+    # the kernel tiers record, with no "sub/.." component left in it.
+    local want="${root}/out"
+    if [ "$(smoke_journal_count "discriminant = 'FilePreImage' AND path = '${want}'")" -lt 1 ]; then
+        smoke_log "[${label}] FilePreImage paths:"
+        smoke_journal_query "SELECT path FROM events WHERE discriminant = 'FilePreImage';" >&2 || true
+        smoke_fail "[${label}] pre-image is not keyed to ${want}"
+    fi
 
     set +e
     "${SHIT_BIN}" undo --yes > "${SHIT_SMOKE_TMP}/${label}.undo.log" 2>&1

@@ -494,26 +494,64 @@ fn run_pre_exec_redirects(
     }
 }
 
-/// Resolve a redirect target against the shell's working directory.
+/// Resolve a redirect target to the path the kernel tiers will record.
 ///
-/// A relative path with no unexpanded shell syntax becomes absolute by
-/// joining it onto `cwd`. `..` components are kept: the shell opens the
-/// joined path and the kernel resolves them physically, so collapsing
-/// them lexically would pick a different file when a parent is a
-/// symlink. Anything that still carries `$`, backticks, globs, braces,
-/// escapes or a leading `~` cannot be reproduced here and is sent
-/// verbatim; the daemon refuses non-absolute paths.
+/// A leading `~`, `~/`, `$HOME` or `${HOME}` expands to `$HOME`. A
+/// relative path becomes absolute by joining it onto `cwd`. The result
+/// keeps its final component as written, so a symlink there keeps its
+/// own identity, but the parent directory is canonicalized: the kernel
+/// reports `/work/out` for `sub/../out`, and a pre-image keyed to
+/// `/work/sub/../out` would never match it in the planner.
+///
+/// Anything else that still carries `$`, backticks, globs, braces or
+/// escapes cannot be reproduced here and is sent verbatim; the daemon
+/// skips it in default mode and refuses the command in strict mode.
 fn resolve_redirect_target(raw: &str, cwd: Option<&Path>) -> String {
-    if raw.is_empty() || raw.starts_with('/') || has_unexpanded_syntax(raw) {
+    if raw.is_empty() {
         return raw.to_owned();
     }
-    match cwd {
-        Some(dir) if dir.is_absolute() => match dir.join(raw).to_str() {
-            Some(joined) => joined.to_owned(),
-            None => raw.to_owned(),
-        },
-        _ => raw.to_owned(),
+    let (base, rest) = match split_home(raw) {
+        Some((home, rest)) => (Some(home), rest),
+        None => (None, raw),
+    };
+    if has_unexpanded_syntax(rest) || (base.is_none() && raw.starts_with('~')) {
+        return raw.to_owned();
     }
+    let joined: PathBuf = match (&base, rest.starts_with('/')) {
+        (Some(home), _) => home.join(rest.trim_start_matches('/')),
+        (None, true) => PathBuf::from(rest),
+        (None, false) => match cwd {
+            Some(dir) if dir.is_absolute() => dir.join(rest),
+            _ => return raw.to_owned(),
+        },
+    };
+    let resolved = canonical_parent(&joined).unwrap_or(joined);
+    match resolved.to_str() {
+        Some(text) => text.to_owned(),
+        None => raw.to_owned(),
+    }
+}
+
+/// Split a leading home reference off `raw`. Returns `$HOME` and the
+/// remainder (empty or starting with `/`). Only the shell's own forms are
+/// accepted; `~user` is left alone.
+fn split_home(raw: &str) -> Option<(PathBuf, &str)> {
+    let rest = ["~", "${HOME}", "$HOME"]
+        .iter()
+        .find_map(|p| raw.strip_prefix(p))?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    (home.is_absolute() && home.as_os_str().len() > 1).then_some((home, rest))
+}
+
+/// `parent.canonicalize()` joined with the final component. `None` when
+/// there is no usable final component or the parent does not resolve.
+fn canonical_parent(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = path.parent()?.canonicalize().ok()?;
+    Some(parent.join(name))
 }
 
 fn has_unexpanded_syntax(raw: &str) -> bool {
@@ -718,30 +756,91 @@ fn send_over_ctl(sock_path: &Path, msg: &HookMessage) -> Result<()> {
 mod redirect_resolve_tests {
     use super::*;
 
+    fn tmp() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
+    }
+
     #[test]
     fn relative_target_joins_shell_cwd() {
-        let cwd = Path::new("/work/sub");
-        assert_eq!(resolve_redirect_target("out", Some(cwd)), "/work/sub/out");
+        let (_d, root) = tmp();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let cwd = root.join("sub");
         assert_eq!(
-            resolve_redirect_target("../out", Some(cwd)),
-            "/work/sub/../out"
-        );
-        assert_eq!(
-            resolve_redirect_target("./a/b", Some(cwd)),
-            "/work/sub/./a/b"
+            resolve_redirect_target("out", Some(&cwd)),
+            root.join("sub/out").to_str().unwrap()
         );
     }
 
     #[test]
-    fn absolute_target_is_untouched() {
-        let cwd = Path::new("/work");
-        assert_eq!(resolve_redirect_target("/tmp/x", Some(cwd)), "/tmp/x");
+    fn dotdot_is_normalized_through_the_parent() {
+        let (_d, root) = tmp();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let cwd = root.join("sub");
+        assert_eq!(
+            resolve_redirect_target("../out", Some(&cwd)),
+            root.join("out").to_str().unwrap()
+        );
+        let abs = format!("{}/sub/../out", root.display());
+        assert_eq!(
+            resolve_redirect_target(&abs, None),
+            root.join("out").to_str().unwrap()
+        );
     }
 
     #[test]
-    fn unexpanded_syntax_is_sent_verbatim() {
+    fn symlinked_parent_resolves_physically_final_symlink_is_kept() {
+        let (_d, root) = tmp();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.join("real/final")).unwrap();
+        assert_eq!(
+            resolve_redirect_target("link/f", Some(&root)),
+            root.join("real/f").to_str().unwrap()
+        );
+        assert_eq!(
+            resolve_redirect_target("link/final", Some(&root)),
+            root.join("real/final").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_parent_falls_back_to_the_plain_join() {
+        let cwd = Path::new("/nonexistent-shit-root");
+        assert_eq!(
+            resolve_redirect_target("a/b", Some(cwd)),
+            "/nonexistent-shit-root/a/b"
+        );
+    }
+
+    #[test]
+    fn home_forms_expand() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let Ok(canon) = home.canonicalize() else {
+            return;
+        };
+        if !home.is_absolute() || home.as_os_str().len() <= 1 {
+            return;
+        }
+        for raw in ["~/new.log", "$HOME/new.log", "${HOME}/new.log"] {
+            assert_eq!(
+                resolve_redirect_target(raw, Some(Path::new("/"))),
+                canon.join("new.log").to_str().unwrap(),
+                "{raw}"
+            );
+        }
+        // `~user` and `$HOMEFOO` are not the home directory.
+        assert_eq!(resolve_redirect_target("~other/x", None), "~other/x");
+        assert_eq!(resolve_redirect_target("$HOMEFOO/x", None), "$HOMEFOO/x");
+    }
+
+    #[test]
+    fn other_unexpanded_syntax_is_sent_verbatim() {
         let cwd = Path::new("/work");
-        for raw in ["$NOPE/out", "~/out", "a*b", "`pwd`/x", "{a,b}", "a\\ b"] {
+        for raw in ["$NOPE/out", "a*b", "`pwd`/x", "{a,b}", "a\\ b"] {
             assert_eq!(resolve_redirect_target(raw, Some(cwd)), raw, "{raw}");
         }
     }

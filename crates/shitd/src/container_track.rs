@@ -74,14 +74,31 @@ pub fn handle(
     };
 
     if strict && let Some(detail) = capture_gap(&req) {
-        if let Err(e) =
-            crate::helper_link::journal_capture_refused(index, command, None, detail.clone())
-        {
-            tracing::error!(error = %e, %command, %detail, "strict container CaptureRefused journal failed");
-        }
+        crate::helper_link::journal_capture_refused_or_log(index, command, None, detail.clone());
         return Err(HandleError::CaptureRefused(detail));
     }
 
+    let result = journal_event(req, command, index, blob_store);
+    // In strict mode a failure after the gap check (blob write, hash
+    // mismatch, stash registration, missing extras, journal write) means
+    // the undo evidence is incomplete; make that durable too.
+    if strict && let Err(e) = &result {
+        crate::helper_link::journal_capture_refused_or_log(
+            index,
+            command,
+            None,
+            format!("container event could not be journaled: {e}"),
+        );
+    }
+    result
+}
+
+fn journal_event(
+    req: ContainerEventReq,
+    command: shit_planner::CommandId,
+    index: &Index,
+    blob_store: &BlobStore,
+) -> Result<EventId, HandleError> {
     let runtime = wire_to_planner_runtime(req.runtime);
     let op = build_container_op(req.verb, &req.extras)?;
     let stash_tarball = req.stash_tarball.map(BlobHash::from_bytes);
@@ -177,17 +194,12 @@ pub fn handle(
     }
 }
 
-/// Extras key the helper sets when its pre-event capture could not gather
-/// the evidence the inverse needs (inspect, save or tar failed, or the
-/// tarball exceeded the inline cap). The value is the human-readable cause.
-pub(crate) const CAPTURE_FAILED_EXTRA: &str = "capture_failed";
-
 /// Why this request cannot support a faithful undo, if it cannot.
 /// Request-shape checks stay narrow: each one is a state no healthy
 /// helper produces, so flagging it never refuses a good capture.
 fn capture_gap(req: &ContainerEventReq) -> Option<String> {
     let verb = format!("{:?}", req.verb);
-    if let Some(cause) = req.extras.get(CAPTURE_FAILED_EXTRA) {
+    if let Some(cause) = req.extras.get(shit_proto::CONTAINER_CAPTURE_FAILED_EXTRA) {
         return Some(format!("container {verb} pre-capture failed: {cause}"));
     }
     let has_hash = req.stash_tarball.is_some();
@@ -469,8 +481,10 @@ mod capture_gap_tests {
     #[test]
     fn helper_marked_failure_is_a_gap() {
         let mut r = req(ContainerVerbWire::Pull);
-        r.extras
-            .insert(CAPTURE_FAILED_EXTRA.into(), "docker inspect failed".into());
+        r.extras.insert(
+            shit_proto::CONTAINER_CAPTURE_FAILED_EXTRA.into(),
+            "docker inspect failed".into(),
+        );
         let gap = capture_gap(&r).expect("gap");
         assert!(gap.contains("docker inspect failed"), "{gap}");
     }

@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use shit_proto::CONTAINER_CAPTURE_FAILED_EXTRA as CAPTURE_FAILED_EXTRA;
 use shit_proto::{
     ContainerEventReq, ContainerRuntimeWire, ContainerVerbWire, CtlRequest, CtlResponse,
     decode_frame, encode_frame_large,
@@ -49,12 +50,6 @@ const CTL_TIMEOUT: Duration = Duration::from_secs(60);
 /// 64 MiB is comfortably under `shit-proto`'s `MAX_FRAME_SIZE` and
 /// covers alpine (~5 MB), distroless (~20 MB), and small app images.
 const INLINE_TARBALL_MAX_BYTES: usize = 64 * 1024 * 1024;
-
-/// Extras key marking an event whose pre-capture is incomplete. The
-/// daemon journals the event as before and, in strict mode only, adds a
-/// `CaptureRefused` row for the command. Keep in sync with
-/// `shitd::container_track::CAPTURE_FAILED_EXTRA`.
-const CAPTURE_FAILED_EXTRA: &str = "capture_failed";
 
 /// CLI entrypoint dispatched from `main.rs` for the `container-event`
 /// subcommand.
@@ -260,7 +255,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Vec<Pre
 
     match docker_verb {
         DockerVerb::Rmi { images } => prepare_rmi(tool, runtime, images),
-        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force).into_iter().collect(),
+        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force),
         DockerVerb::VolumeRm { names } => prepare_volume_rm(tool, names),
         DockerVerb::NetworkRm { names } => prepare_network_rm(tool, names),
         // stop/kill are restart-hint events; no destructive content
@@ -592,11 +587,15 @@ fn prepare_network_rm_one(tool: &str, name: String) -> PreparedEvent {
 /// `force` (the `-f` flag on `docker rm`) is the wire-level proxy for
 /// "container may be running"; in reality the container's running
 /// state is whatever inspect reports. We trust inspect over the flag.
-fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEvent> {
-    // PR-B (AR10.9): one event per invocation; multi-id batching is
-    // tracked as DR-CR-52.
-    let id = ids.into_iter().next()?;
+fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Vec<PreparedEvent> {
+    // One event per id, like rmi / volume rm / network rm, so
+    // `docker rm -f a b c` restores all three.
+    ids.into_iter()
+        .filter_map(|id| prepare_rm_one(tool, id))
+        .collect()
+}
 
+fn prepare_rm_one(tool: &str, id: String) -> Option<PreparedEvent> {
     let mut extras = BTreeMap::new();
     extras.insert("id".into(), id.clone());
 
@@ -789,10 +788,14 @@ fn prepare_compose_down(
     // depend on cwd at undo time. Best-effort — if canonicalize fails
     // (file doesn't exist where we think), ship the raw string and
     // let the executor's apply_compose_down surface the error.
-    let compose_file_abs = std::path::PathBuf::from(&compose_file)
-        .canonicalize()
-        .map(|p| p.display().to_string())
-        .unwrap_or(compose_file);
+    let mut capture_failed: Vec<String> = Vec::new();
+    let compose_file_abs = match std::path::PathBuf::from(&compose_file).canonicalize() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => {
+            capture_failed.push(format!("compose file {compose_file} not resolvable: {e}"));
+            compose_file
+        }
+    };
 
     // Project name: --project-name wins; otherwise docker compose
     // defaults to the basename of the compose file's parent dir,
@@ -805,6 +808,14 @@ fn prepare_compose_down(
     extras.insert("project".into(), project);
     extras.insert("compose_file".into(), compose_file_abs);
     extras.insert("with_volumes".into(), with_volumes.to_string());
+    if with_volumes {
+        // `down -v` deletes named volumes; no tarball is taken, so the
+        // restored project would start with empty data.
+        capture_failed.push("`down --volumes` removes volumes that are not stashed".into());
+    }
+    if !capture_failed.is_empty() {
+        extras.insert(CAPTURE_FAILED_EXTRA.into(), capture_failed.join("; "));
+    }
     // Services empty → daemon restores all (compose default).
     // Capturing the resolved per-service list via `docker compose
     // config --services` would be more authoritative but adds an
@@ -1013,12 +1024,15 @@ mod tests {
         // No docker on PATH → inspect fails → event still ships with
         // id in extras (informational journal). was_running falls
         // back to "false" since we can't observe the real state.
-        let prepared = prepare_rm(
+        let all = prepare_rm(
             "shit-test-no-such-docker-binary",
             vec!["abc123".into(), "def456".into()],
             true,
-        )
-        .unwrap();
+        );
+        // Every id gets its own event.
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].extras.get("id").map(String::as_str), Some("def456"));
+        let prepared = all.into_iter().next().unwrap();
         assert!(matches!(prepared.verb, ContainerVerbWire::Rm));
         assert_eq!(
             prepared.extras.get("id").map(String::as_str),
@@ -1030,6 +1044,7 @@ mod tests {
         );
         assert!(prepared.captured_config.is_empty());
         assert!(prepared.stash_image.is_none());
+        assert!(prepared.extras.contains_key(CAPTURE_FAILED_EXTRA));
     }
 
     #[test]
@@ -1099,6 +1114,39 @@ mod tests {
         );
         assert!(prepared.captured_config.is_empty());
         assert!(prepared.stash_tarball.is_none());
+    }
+
+    #[test]
+    fn compose_down_marks_capture_failed_for_volumes_and_unresolvable_file() {
+        let dir = std::env::temp_dir().join(format!("shit-compose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("compose.yaml");
+        std::fs::write(&file, "services: {}\n").unwrap();
+        let file = file.to_str().unwrap().to_string();
+
+        // Resolvable file, no volumes: complete capture.
+        let ok =
+            prepare_compose_down("docker", vec![file.clone()], Some("p".into()), false).unwrap();
+        assert!(!ok.extras.contains_key(CAPTURE_FAILED_EXTRA));
+
+        // `down -v` destroys volumes that are not stashed.
+        let vols = prepare_compose_down("docker", vec![file], Some("p".into()), true).unwrap();
+        assert!(
+            vols.extras[CAPTURE_FAILED_EXTRA].contains("volumes"),
+            "{:?}",
+            vols.extras
+        );
+
+        // Compose file that cannot be canonicalized.
+        let gone = prepare_compose_down(
+            "docker",
+            vec!["/nonexistent/compose.yaml".into()],
+            Some("p".into()),
+            false,
+        )
+        .unwrap();
+        assert!(gone.extras[CAPTURE_FAILED_EXTRA].contains("not resolvable"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
