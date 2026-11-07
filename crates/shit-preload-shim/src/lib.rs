@@ -1697,6 +1697,10 @@ mod policy {
         try_notify_full(syscall, arg, pre_image, extra_pre_images, failure, None)
     }
 
+    fn frame_error(e: shit_proto::EncodeError) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+    }
+
     /// [`try_notify`] with the target's pre-call stat, for removals
     /// reported after they succeed.
     fn try_notify_full(
@@ -1707,9 +1711,7 @@ mod policy {
         failure: Option<shit_proto::ShimFailure>,
         pre_stat: Option<shit_proto::ShimStat>,
     ) -> std::io::Result<()> {
-        use shit_proto::{
-            ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
-        };
+        use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_shim_frame};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, SystemTime};
@@ -1763,8 +1765,6 @@ mod policy {
         // SAFETY: shim runs in arbitrary user processes; getpid is a
         // syscall, not an interposer target, so this is safe.
         let pid = unsafe { libc::getpid() } as u32;
-        let has_pre = pre_image.is_some();
-        let has_extras = !extra_pre_images.is_empty();
         let note = ShimNotification {
             pid,
             syscall: syscall.to_string(),
@@ -1779,18 +1779,11 @@ mod policy {
             failure,
             pre_stat,
         };
-        // Pre-image notifications can carry up to ~256 KiB of bytes;
-        // small notifications fit MAX_FRAME_SIZE comfortably. Use the
-        // large-frame encoder uniformly — the cap is the only
-        // difference, and the daemon's reader matches.
-        // DR-CR-54: a recursive batch can blow well past the small-
-        // frame cap even with `pre_image=None`; pick large-frame
-        // whenever extras are present too.
-        let frame = if has_pre || has_extras {
-            encode_frame_large(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
-        } else {
-            encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
-        };
+        // L5: shim frames carry their own version byte
+        // (`SHIM_WIRE_VERSION`) and the large cap. An encode failure is
+        // `InvalidData`, which the rename path takes to mean "too big"
+        // (review round 2, item 7); anything else is a send failure.
+        let frame = encode_shim_frame(&note).map_err(frame_error)?;
         stream.write_all(&frame)?;
 
         // Best-effort ack read. We don't actually act on the ack today

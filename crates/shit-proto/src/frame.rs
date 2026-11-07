@@ -5,6 +5,14 @@ use serde::de::DeserializeOwned;
 
 pub const WIRE_VERSION: u8 = 1;
 
+/// Version byte of shim -> daemon notification frames
+/// ([`crate::ShimNotification`]). 2 since L5 added trailing fields that a
+/// version-1 decoder cannot read (postcard is not self-describing). A
+/// daemon rejects any other version by name; shells started before an
+/// upgrade keep the old shim loaded until they restart. Full version
+/// negotiation is #225.
+pub const SHIM_WIRE_VERSION: u8 = 2;
+
 /// Maximum frame size (including length prefix). Frames over this are
 /// rejected on the decode side and never produced on the encode side.
 ///
@@ -81,7 +89,26 @@ pub fn encode_frame_large<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError>
     encode_frame_with_cap(msg, MAX_LARGE_FRAME_SIZE)
 }
 
+/// Encode a shim notification frame (large cap, [`SHIM_WIRE_VERSION`]).
+pub fn encode_shim_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> {
+    encode_versioned(msg, MAX_LARGE_FRAME_SIZE, SHIM_WIRE_VERSION)
+}
+
+/// Decode a shim notification frame; any version but
+/// [`SHIM_WIRE_VERSION`] is [`DecodeError::UnsupportedVersion`].
+pub fn decode_shim_frame<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeError> {
+    decode_versioned(buf, MAX_LARGE_FRAME_SIZE, SHIM_WIRE_VERSION)
+}
+
 fn encode_frame_with_cap<T: Serialize>(msg: &T, cap: usize) -> Result<Vec<u8>, EncodeError> {
+    encode_versioned(msg, cap, WIRE_VERSION)
+}
+
+fn encode_versioned<T: Serialize>(
+    msg: &T,
+    cap: usize,
+    version: u8,
+) -> Result<Vec<u8>, EncodeError> {
     let payload = postcard::to_allocvec(msg)?;
     let body_len = 1 + payload.len();
     let total_len = 4 + body_len;
@@ -94,7 +121,7 @@ fn encode_frame_with_cap<T: Serialize>(msg: &T, cap: usize) -> Result<Vec<u8>, E
             .expect("checked above")
             .to_be_bytes(),
     );
-    frame.push(WIRE_VERSION);
+    frame.push(version);
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
@@ -110,6 +137,14 @@ pub fn decode_frame_large<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeEr
 }
 
 fn decode_frame_with_cap<T: DeserializeOwned>(buf: &[u8], cap: usize) -> Result<T, DecodeError> {
+    decode_versioned(buf, cap, WIRE_VERSION)
+}
+
+fn decode_versioned<T: DeserializeOwned>(
+    buf: &[u8],
+    cap: usize,
+    expected: u8,
+) -> Result<T, DecodeError> {
     if buf.len() < 5 {
         return Err(DecodeError::Truncated(buf.len()));
     }
@@ -125,7 +160,7 @@ fn decode_frame_with_cap<T: DeserializeOwned>(buf: &[u8], cap: usize) -> Result<
         });
     }
     let version = buf[4];
-    if version != WIRE_VERSION {
+    if version != expected {
         return Err(DecodeError::UnsupportedVersion(version));
     }
     let payload = &buf[5..];
