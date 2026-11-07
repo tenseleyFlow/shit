@@ -127,9 +127,152 @@ pub struct HelperLink {
     /// key; the key is monotonic per router instance so collisions
     /// don't happen in practice).
     pub priv_op_waiters: PrivOpWaiters,
+    /// R3 close barrier: one waiter per command whose `UnwatchTree` was
+    /// sent and whose `UnwatchTreeFlushed` has not arrived yet. The
+    /// dispatch loop fires the waiter when the marker arrives and drops
+    /// every waiter when the helper link goes away.
+    pending_unwatch: UnwatchWaiters,
+}
+
+/// Close-barrier waiters. `closed` is set once the dispatch loop stops,
+/// after which no marker can arrive.
+#[derive(Debug, Default)]
+struct UnwatchState {
+    waiters: std::collections::HashMap<CommandId, tokio::sync::oneshot::Sender<()>>,
+    closed: bool,
+}
+
+type UnwatchWaiters = std::sync::Mutex<UnwatchState>;
+
+/// Why a command close could not prove the helper flushed its capture.
+#[derive(Debug, thiserror::Error)]
+pub enum UnwatchError {
+    #[error("UnwatchTree could not be sent to the helper: {0}")]
+    Send(String),
+    #[error("helper link closed before UnwatchTreeFlushed arrived")]
+    LinkClosed,
+    #[error("UnwatchTreeFlushed did not arrive within {0:?}")]
+    Timeout(std::time::Duration),
+}
+
+/// Receiver half of the close barrier for one command.
+pub struct PendingUnwatch {
+    rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl PendingUnwatch {
+    /// Wait for the helper's `UnwatchTreeFlushed` marker.
+    pub async fn wait(self, timeout: std::time::Duration) -> Result<(), UnwatchError> {
+        match tokio::time::timeout(timeout, self.rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(UnwatchError::LinkClosed),
+            Err(_) => Err(UnwatchError::Timeout(timeout)),
+        }
+    }
 }
 
 impl HelperLink {
+    /// Install the close-barrier waiter for `command`, then send
+    /// `UnwatchTree`. The waiter goes in first so a fast helper's
+    /// marker cannot arrive before anyone listens for it.
+    pub fn begin_unwatch_tree(&self, command: CommandId) -> Result<PendingUnwatch, UnwatchError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut state = self
+                .pending_unwatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.closed {
+                return Err(UnwatchError::LinkClosed);
+            }
+            state.waiters.insert(command, tx);
+        }
+        let req = HelperRequest::UnwatchTree {
+            session: command.session,
+            command_seq: command.seq,
+        };
+        if let Err(e) = self.send_request(&req) {
+            self.pending_unwatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .waiters
+                .remove(&command);
+            return Err(UnwatchError::Send(e.to_string()));
+        }
+        Ok(PendingUnwatch { rx })
+    }
+
+    /// Wait for `command`'s marker. A timed-out waiter is removed so the
+    /// map does not keep an entry for a command that already closed.
+    pub async fn wait_unwatch(
+        &self,
+        command: CommandId,
+        pending: PendingUnwatch,
+        timeout: std::time::Duration,
+    ) -> Result<(), UnwatchError> {
+        let result = pending.wait(timeout).await;
+        if matches!(result, Err(UnwatchError::Timeout(_))) {
+            self.pending_unwatch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .waiters
+                .remove(&command);
+        }
+        result
+    }
+
+    /// A link with no helper process, over a socketpair. The peer end is
+    /// returned so sends succeed for as long as the test holds it.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, std::os::unix::net::UnixStream) {
+        let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        (
+            Self {
+                conn_fd: ours.into(),
+                child: std::sync::Mutex::new(None),
+                helper_pid: 0,
+                helper_uid: 0,
+                granted: HelperCaps::default(),
+                kernel_tier: String::new(),
+                degraded_reason: None,
+                priv_op_waiters: PrivOpWaiters::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                pending_unwatch: UnwatchWaiters::default(),
+            },
+            peer,
+        )
+    }
+
+    fn complete_unwatch(&self, command: CommandId) {
+        let waiter = self
+            .pending_unwatch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiters
+            .remove(&command);
+        match waiter {
+            Some(tx) => {
+                let _ = tx.send(());
+            }
+            None => tracing::debug!(
+                %command,
+                "UnwatchTreeFlushed with no waiter (close already timed out)"
+            ),
+        }
+    }
+
+    /// Release every close-barrier waiter with an error. Called when the
+    /// dispatch loop stops reading from the helper.
+    fn fail_pending_unwatch(&self) {
+        let mut state = self
+            .pending_unwatch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        state.waiters.clear();
+    }
+
     /// Send a request to the helper. STREAM-safe (relies on the
     /// length-prefix framing in `shit_proto::frame`).
     pub fn send_request(&self, msg: &HelperRequest) -> Result<(), HelperLinkError> {
@@ -496,6 +639,7 @@ pub fn spawn_and_handshake(
         priv_op_waiters: PrivOpWaiters::new(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ),
+        pending_unwatch: UnwatchWaiters::default(),
     })
 }
 
@@ -624,17 +768,51 @@ pub async fn dispatch_loop(
     shutdown: Arc<tokio::sync::Notify>,
     watch_ready: Arc<crate::watch_ready::WatchReadyMap>,
     stats: Arc<crate::stats::Stats>,
+    strict_capture: bool,
 ) -> Result<(), HelperLinkError> {
-    tracing::info!("helper dispatch loop started");
+    tracing::info!(strict_capture, "helper dispatch loop started");
+    let result = dispatch_loop_inner(
+        &link,
+        index,
+        blob_store,
+        live_baseline,
+        shutdown,
+        watch_ready,
+        stats,
+        strict_capture,
+    )
+    .await;
+    link.fail_pending_unwatch();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_loop_inner(
+    link: &Arc<HelperLink>,
+    index: Arc<Index>,
+    blob_store: Arc<BlobStore>,
+    live_baseline: Arc<crate::baseline::LiveBaseline>,
+    shutdown: Arc<tokio::sync::Notify>,
+    watch_ready: Arc<crate::watch_ready::WatchReadyMap>,
+    stats: Arc<crate::stats::Stats>,
+    strict_capture: bool,
+) -> Result<(), HelperLinkError> {
     loop {
         let recv_task = {
-            let link = Arc::clone(&link);
+            let link = Arc::clone(link);
             tokio::task::spawn_blocking(move || link.recv_response_with_fd())
         };
         tokio::select! {
             r = recv_task => {
                 match r {
                     Ok(Ok((resp, fd))) => {
+                        if let HelperResponse::UnwatchTreeFlushed { session, command_seq } = &resp {
+                            link.complete_unwatch(CommandId {
+                                session: *session,
+                                seq: *command_seq,
+                            });
+                            continue;
+                        }
                         dispatch_response(
                             resp,
                             fd,
@@ -644,6 +822,7 @@ pub async fn dispatch_loop(
                             &live_baseline,
                             &link.kernel_tier,
                             &link.priv_op_waiters,
+                            strict_capture,
                         );
                     }
                     Ok(Err(HelperLinkError::HelperExited)) => {
@@ -685,6 +864,7 @@ fn dispatch_response(
     live_baseline: &crate::baseline::LiveBaseline,
     kernel_tier: &str,
     priv_op_waiters: &PrivOpWaiters,
+    strict_capture: bool,
 ) {
     match resp {
         HelperResponse::CapturedPreImage {
@@ -949,8 +1129,33 @@ fn dispatch_response(
                 session,
                 seq: command_seq,
             };
-            watch_ready.mark_failed(cmd);
+            watch_ready.mark_failed(cmd, reason.clone());
             tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
+            if strict_capture {
+                journal_capture_refused_or_log(
+                    index,
+                    cmd,
+                    None,
+                    format!("capture attach failed: {reason}"),
+                );
+            }
+        }
+        HelperResponse::CaptureRefused {
+            session,
+            seq,
+            path,
+            detail,
+        } => {
+            // An observation, not a readiness verdict: it must never touch
+            // the WatchReadyMap. Default mode logs it; strict mode journals
+            // it so the planner refuses the command's undo.
+            let cmd = CommandId { session, seq };
+            if strict_capture {
+                tracing::warn!(%session, seq, ?path, %detail, "helper capture refusal (strict; journaling)");
+                journal_capture_refused_or_log(index, cmd, path.map(PathBuf::from), detail);
+            } else {
+                tracing::info!(%session, seq, ?path, %detail, "helper capture observation (best-effort mode; not journaled)");
+            }
         }
         HelperResponse::PrivilegedOpResult {
             session,
@@ -987,6 +1192,46 @@ fn dispatch_response(
                 "unhandled helper response (S24.A handles CapturedPreImage; S29.1 handles TreeMutation; AR00.5 handles WatchTreeReady)"
             );
         }
+    }
+}
+
+/// Journal a strict-mode `CaptureRefused` row for `command`. A missing
+/// `path` (command-scoped refusal) uses the command's cwd so the user
+/// sees a real directory in the refusal line.
+pub(crate) fn journal_capture_refused(
+    index: &Index,
+    command: CommandId,
+    path: Option<PathBuf>,
+    detail: String,
+) -> Result<(), shit_store::IndexError> {
+    let path = path
+        .or_else(|| {
+            <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+                .map(|record| record.cwd)
+        })
+        .unwrap_or_default();
+    let event = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts: crate::server::next_ts(),
+        partial: false,
+        kind: CaptureEventKind::CaptureRefused {
+            class: "capture-incomplete".to_string(),
+            path,
+            detail,
+        },
+    };
+    index.put_event(&event).map(|_| ())
+}
+
+fn journal_capture_refused_or_log(
+    index: &Index,
+    command: CommandId,
+    path: Option<PathBuf>,
+    detail: String,
+) {
+    if let Err(e) = journal_capture_refused(index, command, path, detail.clone()) {
+        tracing::error!(error = %e, %command, %detail, "strict CaptureRefused journal failed");
     }
 }
 
@@ -1567,6 +1812,183 @@ mod tests_dispatch {
     use super::*;
     use shit_planner::PlannerStore;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn unwatch_timeout_removes_the_waiter() {
+        let (link, _peer) = HelperLink::for_test();
+        let command = CommandId {
+            session: Uuid::from_u128(40),
+            seq: 1,
+        };
+        let pending = link.begin_unwatch_tree(command).unwrap();
+        assert_eq!(link.pending_unwatch.lock().unwrap().waiters.len(), 1);
+        let result = link
+            .wait_unwatch(command, pending, std::time::Duration::from_millis(5))
+            .await;
+        assert!(matches!(result, Err(UnwatchError::Timeout(_))));
+        assert!(link.pending_unwatch.lock().unwrap().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_after_the_link_stopped_fails_at_once() {
+        let (link, _peer) = HelperLink::for_test();
+        let waiting = CommandId {
+            session: Uuid::from_u128(41),
+            seq: 1,
+        };
+        let pending = link.begin_unwatch_tree(waiting).unwrap();
+        link.fail_pending_unwatch();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            link.wait_unwatch(waiting, pending, std::time::Duration::from_secs(5))
+                .await,
+            Err(UnwatchError::LinkClosed)
+        ));
+        let later = CommandId {
+            session: Uuid::from_u128(41),
+            seq: 2,
+        };
+        assert!(matches!(
+            link.begin_unwatch_tree(later),
+            Err(UnwatchError::LinkClosed)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    fn index_with_command(dir: &Path, cmd: CommandId) -> Index {
+        use shit_planner::{CommandRecord, TimePoint};
+        let index = Index::open(dir.join("db.sqlite")).unwrap();
+        index
+            .put_session(cmd.session, "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command: cmd,
+                cmd_string: Some("true".into()),
+                cwd: "/tmp/watched".into(),
+                pid: 2,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(1, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        index
+    }
+
+    fn dispatch(
+        resp: HelperResponse,
+        index: &Index,
+        blob_store: &BlobStore,
+        watch_ready: &crate::watch_ready::WatchReadyMap,
+        strict: bool,
+    ) {
+        let waiters = PrivOpWaiters::default();
+        dispatch_response(
+            resp,
+            None,
+            index,
+            blob_store,
+            watch_ready,
+            &crate::baseline::LiveBaseline::new(),
+            "bpf-lsm",
+            &waiters,
+            strict,
+        );
+    }
+
+    fn refusal_details(index: &Index, cmd: CommandId) -> Vec<(PathBuf, String)> {
+        index
+            .events_for_command(cmd)
+            .into_iter()
+            .filter_map(|ev| match ev.kind {
+                CaptureEventKind::CaptureRefused { path, detail, .. } => Some((path, detail)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn capture_refused_is_journaled_only_in_strict_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(1),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let refused = || HelperResponse::CaptureRefused {
+            session: cmd.session,
+            seq: cmd.seq,
+            path: None,
+            detail: "no Linux capture tier is active".into(),
+        };
+
+        dispatch(refused(), &index, &blobs, &map, false);
+        assert!(refusal_details(&index, cmd).is_empty());
+
+        dispatch(refused(), &index, &blobs, &map, true);
+        let rows = refusal_details(&index, cmd);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, PathBuf::from("/tmp/watched"));
+        assert!(rows[0].1.contains("no Linux capture tier"));
+    }
+
+    #[tokio::test]
+    async fn capture_refused_does_not_change_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(2),
+            seq: 4,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        map.mark_ready(cmd);
+        dispatch(
+            HelperResponse::CaptureRefused {
+                session: cmd.session,
+                seq: cmd.seq,
+                path: Some("/tmp/watched/f".into()),
+                detail: "observation".into(),
+            },
+            &index,
+            &blobs,
+            &map,
+            true,
+        );
+        assert!(map.failure_reason(cmd).is_none());
+        map.await_ready(cmd).await.expect("still ready");
+    }
+
+    #[test]
+    fn watch_tree_failed_refuses_only_in_strict_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(3),
+            seq: 9,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let failed = || HelperResponse::WatchTreeFailed {
+            session: cmd.session,
+            command_seq: cmd.seq,
+            reason: "watch cwd metadata unavailable".into(),
+        };
+
+        let map = crate::watch_ready::WatchReadyMap::new();
+        dispatch(failed(), &index, &blobs, &map, false);
+        assert!(refusal_details(&index, cmd).is_empty());
+        assert!(map.failure_reason(cmd).is_some());
+
+        let map = crate::watch_ready::WatchReadyMap::new();
+        dispatch(failed(), &index, &blobs, &map, true);
+        let rows = refusal_details(&index, cmd);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.starts_with("capture attach failed: "));
+    }
 
     fn tmp_staging_fd(content: &[u8]) -> OwnedFd {
         // Open a tempfile, write content, return the owned fd. The

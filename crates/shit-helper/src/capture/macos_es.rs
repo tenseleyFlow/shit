@@ -1236,6 +1236,8 @@ enum ControlMsg {
     },
     Detach {
         command: CommandId,
+        /// Held until this pump has handled the command's queued events.
+        flush: Arc<super::UnwatchFlushMarker>,
     },
     Shutdown,
 }
@@ -1260,14 +1262,20 @@ impl CaptureControl {
     /// `cwd_path` must be non-empty — macOS doesn't have a
     /// FreeBSD-style sysctl(KERN_PROC_CWD) fallback we'd want to
     /// rely on.
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, root_pid: u32, cwd_path: &str) {
+    pub fn on_watch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        root_pid: u32,
+        cwd_path: &str,
+    ) -> Result<(), String> {
         if cwd_path.is_empty() {
             tracing::warn!(
                 %session,
                 command_seq,
                 "WatchTree without cwd_path on macOS ES; watch dropped"
             );
-            return;
+            return Err("WatchTree carried no cwd_path".to_string());
         }
         let command = CommandId {
             session,
@@ -1284,22 +1292,33 @@ impl CaptureControl {
                 err = %e,
                 "macos-es control channel full; WatchTree dropped"
             );
+            return Err(format!("control channel rejected the attach: {e}"));
         }
+        Ok(())
     }
 
-    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
+    /// Offer a detach to the pump. `flush` travels with it, so its marker
+    /// waits for the pump either way.
+    pub fn on_unwatch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        flush: Arc<super::UnwatchFlushMarker>,
+    ) -> super::DetachOutcome {
         let command = CommandId {
             session,
             seq: command_seq,
         };
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command }) {
+        let outcome = super::offer_detach(&self.tx, ControlMsg::Detach { command, flush });
+        if outcome != super::DetachOutcome::Queued {
             tracing::warn!(
                 %session,
                 command_seq,
-                err = %e,
-                "macos-es control channel full; UnwatchTree dropped"
+                ?outcome,
+                "macos-es control channel full or closed at UnwatchTree"
             );
         }
+        outcome
     }
 
     /// Signal the pump thread to exit. Best-effort.
@@ -1693,8 +1712,20 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
                 state.attach(command, root_path, Some(root_pid));
                 continue;
             }
-            Ok(ControlMsg::Detach { command }) => {
+            Ok(ControlMsg::Detach { command, flush }) => {
+                // Handle the queued ring while tracked_pids still
+                // attributes it to this command; detach clears them.
+                // The ring is shared with every other command, so this is
+                // bounded: a busy build elsewhere must not stall this close.
+                let deadline = std::time::Instant::now() + super::DETACH_DRAIN_TIMEOUT;
+                while state.drain_ring_once() {
+                    if std::time::Instant::now() >= deadline {
+                        super::send_drain_timeout_observation(&state.conn, command);
+                        break;
+                    }
+                }
                 state.detach(command);
+                drop(flush);
                 continue;
             }
             Ok(ControlMsg::Shutdown) => {

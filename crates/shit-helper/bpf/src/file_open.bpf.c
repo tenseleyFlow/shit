@@ -60,6 +60,7 @@ int BPF_PROG(shit_file_open, struct file *file)
     struct shit_open_event *e =
         bpf_ringbuf_reserve(&open_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return 0;
     }
 
@@ -74,11 +75,14 @@ int BPF_PROG(shit_file_open, struct file *file)
     struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
     e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
 
-    /* f_inode is what the kernel populates for any file with a
-     * persistent backing (regular files, dirs, FIFOs, sockets,
-     * device files). For anon-inode opens (memfd, perf fd) it's
-     * an anonymous inode whose dev/inode aren't useful — but the
-     * pre_opens lookup will simply miss in those cases. */
+    /* f_inode is populated for any file-backed struct file. For anon inodes,
+     * FIFOs and devices, the userspace snapshot lookup misses.
+     * Non-regular files deliberately reach userspace, where the snapshot
+     * lookup misses and drops them. An S_IFREG filter here made `git clean`
+     * lose its captures intermittently (10 of 40 smoke runs, 0 of 40 without
+     * it). The suspected cause, not traced, is an attribution race: `git
+     * clean` opens /dev/null O_RDWR first, and that event may be what lets
+     * /proc resolve a grandchild of the tracked root while it is alive. */
     struct inode *target = BPF_CORE_READ(file, f_inode);
     e->dev = BPF_CORE_READ(target, i_sb, s_dev);
     e->inode = BPF_CORE_READ(target, i_ino);

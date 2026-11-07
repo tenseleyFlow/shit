@@ -137,6 +137,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(warning) = &resolved.strict_capture_warning {
+        tracing::warn!("{warning}");
+    }
+    if resolved.strict_capture {
+        tracing::info!("strict capture enabled; incomplete capture is journaled as CaptureRefused");
+    }
+
     if resolved.disable {
         tracing::warn!("daemon disabled via config; exiting");
         return Ok(());
@@ -236,6 +243,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                         let dispatch_shutdown = Arc::clone(&shutdown);
                         let dispatch_watch_ready = Arc::clone(&watch_ready);
                         let dispatch_stats = Arc::clone(&stats);
+                        let dispatch_strict = cfg.strict_capture;
                         let handle = tokio::spawn(async move {
                             if let Err(e) = helper_link::dispatch_loop(
                                 dispatch_link,
@@ -245,6 +253,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
                                 dispatch_shutdown,
                                 dispatch_watch_ready,
                                 dispatch_stats,
+                                dispatch_strict,
                             )
                             .await
                             {
@@ -366,6 +375,9 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     };
 
     let (hook_tx, hook_rx) = tokio::sync::mpsc::unbounded_channel::<server::HookEnvelope>();
+    // R3 close barrier: PostExec registers here until the helper's
+    // UnwatchTreeFlushed arrives; undo/show wait on it.
+    let closing = Arc::new(server::ClosingCommands::new());
     let ctl_handle = {
         let cfg = cfg.clone();
         let ctl_state = ctl::CtlState {
@@ -390,6 +402,8 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             // mode (None) the FileExecutor uses NoOpPrivilegedOpRouter
             // and chown-needing ops surface PermissionDenied.
             helper_link: helper_link_arc.as_ref().map(Arc::clone),
+            closing: Arc::clone(&closing),
+            plan_options: cfg.plan_options(),
         };
         tokio::spawn(async move {
             if let Err(e) = ctl::serve(&cfg, ctl_state).await {
@@ -445,6 +459,7 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             helper_link_for_server,
             watch_ready_for_server,
             live_baseline_for_server,
+            Arc::clone(&closing),
             hook_tx,
             hook_rx,
         ) => r,
@@ -457,6 +472,14 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
             Ok(())
         }
     };
+
+    // Let in-flight command closes write ended_at before the helper
+    // link goes away; otherwise a command closed just before shutdown
+    // would be left without an end time.
+    let still_closing = closing.wait_for_drain(server::UNWATCH_FLUSH_TIMEOUT).await;
+    if still_closing > 0 {
+        tracing::warn!(still_closing, "shutdown with command closes still pending");
+    }
 
     ctl_handle.abort();
     shim_handle.abort();

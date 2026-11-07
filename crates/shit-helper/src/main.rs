@@ -1394,7 +1394,14 @@ struct LsmDispatch {
     /// Shared with the LsmReader's sink. WatchTree/UnwatchTree
     /// notify the same runtime instance the BPF events feed.
     runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
+    /// One flush handle per ring-buffer reader. UnwatchTree drains
+    /// them all before acknowledging the close barrier.
+    flush: Vec<ebpf::LsmFlushHandle>,
 }
+
+/// Bound on draining every eBPF ring-buffer reader at UnwatchTree.
+#[cfg(target_os = "linux")]
+const LSM_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Load the eBPF-LSM unlink program, take its ringbuf, and spawn
 /// the userspace reader thread wired to dispatch into the linux
@@ -1520,29 +1527,80 @@ fn boot_ebpf_lsm(
     // 250 µs idle sleep — keeps the race-to-open window tight on
     // unlinks. See ringbuf_reader::LsmReader::spawn doc for rationale.
     let idle = std::time::Duration::from_micros(250);
-    let unlink_reader = ebpf::LsmReader::spawn(unlink_rb, Arc::clone(&sink), idle);
-    let setattr_reader = ebpf::LsmReader::spawn_setattr(setattr_rb, Arc::clone(&sink), idle);
-    let mkdir_reader = ebpf::LsmReader::spawn_mkdir(mkdir_rb, Arc::clone(&sink), idle);
-    let create_reader = ebpf::LsmReader::spawn_create(create_rb, Arc::clone(&sink), idle);
-    let open_reader = ebpf::LsmReader::spawn_open(open_rb, Arc::clone(&sink), idle);
-    let rename_reader = ebpf::LsmReader::spawn_rename(rename_rb, Arc::clone(&sink), idle);
+    let unlink_reader = ebpf::LsmReader::spawn(
+        unlink_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("unlink"),
+    );
+    let setattr_reader = ebpf::LsmReader::spawn_setattr(
+        setattr_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("setattr"),
+    );
+    let mkdir_reader = ebpf::LsmReader::spawn_mkdir(
+        mkdir_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("mkdir"),
+    );
+    let create_reader = ebpf::LsmReader::spawn_create(
+        create_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("create"),
+    );
+    let open_reader = ebpf::LsmReader::spawn_open(
+        open_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("open"),
+    );
+    let rename_reader = ebpf::LsmReader::spawn_rename(
+        rename_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("rename"),
+    );
     // DR-CR-55: both new ringbufs carry shit_create_event records;
     // reuse spawn_create so they route through the on_create sink.
-    let symlink_reader = ebpf::LsmReader::spawn_create(symlink_rb, Arc::clone(&sink), idle);
-    let link_reader = ebpf::LsmReader::spawn_create(link_rb, Arc::clone(&sink), idle);
+    let symlink_reader = ebpf::LsmReader::spawn_create(
+        symlink_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("symlink"),
+    );
+    let link_reader = ebpf::LsmReader::spawn_create(
+        link_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("link"),
+    );
     // G03: rmdir uses the same wire shape as unlink but routes via
     // on_rmdir → handle_lsm_unlink with is_directory=true.
-    let rmdir_reader = ebpf::LsmReader::spawn_rmdir(rmdir_rb, Arc::clone(&sink), idle);
+    let rmdir_reader = ebpf::LsmReader::spawn_rmdir(
+        rmdir_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("rmdir"),
+    );
     // AU29: mknod payload mirrors inode_create's; the dispatcher
     // routes through on_create. handle_lsm_create's mode-aware
     // path resolves Fifo/Socket from the S_IF bits.
-    let mknod_reader = ebpf::LsmReader::spawn_mknod(mknod_rb, Arc::clone(&sink), idle);
+    let mknod_reader = ebpf::LsmReader::spawn_mknod(
+        mknod_rb,
+        Arc::clone(&sink),
+        idle,
+        loader.take_loss_counter("mknod"),
+    );
     // L04.2: file_release fires at last writable-fd close; the
     // handler diffs current content against the open-time
     // snapshot and emits a CapturedPreImage iff they differ.
     // Optional — only spawned on kernels where the hook loaded.
-    let release_reader =
-        release_rb_opt.map(|rb| ebpf::LsmReader::spawn_release(rb, Arc::clone(&sink), idle));
+    let release_loss = loader.take_loss_counter("release");
+    let release_reader = release_rb_opt
+        .map(|rb| ebpf::LsmReader::spawn_release(rb, Arc::clone(&sink), idle, release_loss));
 
     if release_reader.is_some() {
         tracing::info!(
@@ -1568,10 +1626,15 @@ fn boot_ebpf_lsm(
     if let Some(r) = release_reader {
         readers.push(r);
     }
+    let flush = readers.iter().map(ebpf::LsmReader::flush_handle).collect();
     Ok(LsmCaptureState {
         _readers: readers,
         _loader: loader,
-        dispatch: LsmDispatch { tree, runtime },
+        dispatch: LsmDispatch {
+            tree,
+            runtime,
+            flush,
+        },
     })
 }
 
@@ -2236,6 +2299,426 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The hook-reported watch cwd, canonicalized so captured paths match
+/// what `/proc/<pid>/cwd` would report. `/proc/<pid>/cwd` alone is racy
+/// for a short-lived root process (issue #22 family).
+#[cfg(target_os = "linux")]
+fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(format!("watch cwd {raw:?} is not absolute"));
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("watch cwd {raw:?} is unavailable: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("watch cwd {raw:?} is not a directory"));
+    }
+    Ok(canonical)
+}
+
+/// Resolve the Linux watch root: the hook-reported cwd, or the root
+/// process's real cwd when that report cannot be used.
+///
+/// The hook path crosses the wire as a lossy string, so a non-UTF-8
+/// directory arrives with U+FFFD in it. It cannot name the real directory
+/// even if a path spelled that way exists. A stale `$PWD`, after the
+/// directory was renamed, does not resolve either. Canonicalizing the
+/// magic link gives real bytes, and fails for a deleted cwd.
+#[cfg(target_os = "linux")]
+fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<PathBuf, String> {
+    let reported = if raw.contains(char::REPLACEMENT_CHARACTER) {
+        Err(format!("watch cwd {raw:?} is not valid UTF-8"))
+    } else {
+        validated_linux_watch_cwd(raw)
+    };
+    reported.or_else(|reason| {
+        std::fs::canonicalize(format!("/proc/{root_pid}/cwd"))
+            .ok()
+            .filter(|cwd| cwd.is_dir())
+            .ok_or(reason)
+    })
+}
+
+/// Send a `CaptureRefused` observation. The daemon decides whether it
+/// becomes a journal row (strict mode) or a log line.
+fn send_capture_observation(
+    conn: &ipc::Conn,
+    command: shit_planner::events::CommandId,
+    path: Option<String>,
+    detail: String,
+) {
+    let resp = shit_proto::HelperResponse::CaptureRefused {
+        session: command.session,
+        seq: command.seq,
+        path,
+        detail,
+    };
+    if let Err(e) = conn.send_response(&resp) {
+        tracing::warn!(err = %e, %command, "CaptureRefused observation send failed");
+    }
+}
+
+/// Close-barrier marker for `UnwatchTree`. Sent on every path, degraded
+/// included: it means "nothing more will arrive for this command".
+/// macOS sends it through `capture::UnwatchFlushMarker` instead.
+#[cfg(not(target_os = "macos"))]
+fn send_unwatch_flushed(conn: &ipc::Conn, command: shit_planner::events::CommandId) {
+    let resp = shit_proto::HelperResponse::UnwatchTreeFlushed {
+        session: command.session,
+        command_seq: command.seq,
+    };
+    if let Err(e) = conn.send_response(&resp) {
+        tracing::warn!(err = %e, %command, "UnwatchTreeFlushed send failed; daemon close will time out");
+    }
+}
+
+/// Record a WatchTree. Returns false for a command already being
+/// watched: a duplicate must not reset its capture window, and it is
+/// reported as an observation so strict mode can refuse the command.
+fn begin_watch(
+    conn: &ipc::Conn,
+    active_watches: &mut std::collections::BTreeSet<shit_planner::events::CommandId>,
+    command: shit_planner::events::CommandId,
+) -> bool {
+    if active_watches.insert(command) {
+        return true;
+    }
+    tracing::warn!(%command, "duplicate WatchTree ignored");
+    send_capture_observation(
+        conn,
+        command,
+        None,
+        "duplicate WatchTree for an active command was ignored".to_string(),
+    );
+    false
+}
+
+/// Linux WatchTree attach. `Ok` means the tier is set up for this
+/// command, possibly with less than a full capture: no tier at all, or
+/// an LSM attach whose cwd is unusable. Those are reported as
+/// observations and still count as ready, as on trunk. `Err` is a
+/// fanotify attach failure: the tree stays tracked, as on trunk, but no
+/// mark covers the cwd, so the caller reports WatchTreeFailed.
+#[cfg(target_os = "linux")]
+fn linux_watch_tree(
+    conn: &ipc::Conn,
+    fanotify_state: Option<&fanotify::runtime::FanotifyState>,
+    lsm_state: Option<&LsmDispatch>,
+    command: shit_planner::events::CommandId,
+    root_pid: u32,
+    cwd_path: &str,
+) -> Result<(), String> {
+    let (session, command_seq) = (command.session, command.seq);
+    if let Some(state) = fanotify_state {
+        // The tree is tracked before anything can fail. Another command's
+        // mark can still fire for a pid in this tree, and UnwatchTree
+        // releases the tree whatever happened here.
+        state
+            .tree
+            .lock()
+            .unwrap()
+            .watch(session, command_seq, root_pid as i32);
+        // L01: explicit dedupe-state init for the command.
+        if let Some(rt) = &state.capture_runtime
+            && let Ok(mut g) = rt.lock()
+        {
+            g.on_watch_tree(command);
+        }
+        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid)?;
+        // L01: narrow-scope fanotify mark on the watch cwd
+        // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
+        // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
+        // the box). Stash the path so UnwatchTree can unmark it.
+        match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
+            Ok(()) => {
+                state
+                    .marked_paths
+                    .lock()
+                    .unwrap()
+                    .insert(command, cwd.clone());
+                tracing::info!(
+                    %session,
+                    command_seq,
+                    root_pid,
+                    cwd = %cwd.display(),
+                    "watch_tree registered + cwd marked"
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!("fanotify mark on {} failed: {e}", cwd.display())),
+        }
+    } else if let Some(state) = lsm_state {
+        // L04: eBPF-LSM tier. No fanotify mark needed — the LSM hooks
+        // fire globally. We still track the pid tree so events from
+        // untracked pids are dropped. The tree is tracked whatever the
+        // cwd's state: `cd /tmp/x; rm -rf /tmp/x; rm ~/important` has no
+        // usable cwd, and its descendants must stay attributed.
+        state
+            .tree
+            .lock()
+            .unwrap()
+            .watch(session, command_seq, root_pid as i32);
+        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
+        // L04 — pre-open every regular file under the cwd. The held
+        // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
+        // unlink handler can read the pre-image content even though
+        // the dentry is gone. Linux mirror of BSD's register_subtree.
+        if let Some(rt) = &state.runtime
+            && let Ok(mut g) = rt.lock()
+        {
+            g.on_watch_tree(command);
+            if let Ok(cwd) = &cwd {
+                g.pre_open_tree(command, cwd);
+            }
+        }
+        match &cwd {
+            Ok(cwd) => tracing::info!(
+                %session,
+                command_seq,
+                root_pid,
+                cwd = %cwd.display(),
+                tier = "ebpf-lsm",
+                "watch_tree registered + cwd pre-opened (LSM tier)"
+            ),
+            Err(reason) => {
+                tracing::warn!(
+                    %session,
+                    command_seq,
+                    root_pid,
+                    %reason,
+                    tier = "ebpf-lsm",
+                    "watch_tree registered without pre-opens (LSM tier)"
+                );
+                send_capture_observation(
+                    conn,
+                    command,
+                    None,
+                    format!("capture attach failed: {reason}"),
+                );
+            }
+        }
+        Ok(())
+    } else {
+        tracing::debug!(
+            %session,
+            command_seq,
+            "watch_tree with no fanotify or lsm tier (degraded)"
+        );
+        send_capture_observation(
+            conn,
+            command,
+            None,
+            "no Linux capture tier is active; file changes are not captured".to_string(),
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_watch_tests {
+    use super::*;
+
+    /// A pid with no /proc entry, so the fallback cannot resolve.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn watch_root_prefers_the_reported_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_linux_watch_cwd(dir.path().to_str().unwrap(), std::process::id()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn watch_root_falls_back_when_the_report_does_not_resolve() {
+        let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", std::process::id()).unwrap(),
+            own
+        );
+    }
+
+    #[test]
+    fn watch_root_never_trusts_a_lossy_report() {
+        // A real directory spelled with U+FFFD is still not the shell's cwd.
+        let dir = tempfile::tempdir().unwrap();
+        let lossy = dir.path().join("caf\u{FFFD}");
+        std::fs::create_dir(&lossy).unwrap();
+        let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            resolve_linux_watch_cwd(lossy.to_str().unwrap(), std::process::id()).unwrap(),
+            own
+        );
+    }
+
+    #[test]
+    fn watch_root_reports_the_reason_when_neither_resolves() {
+        let err = resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", dead_pid()).unwrap_err();
+        assert!(err.contains("shit-r3a-cwd"), "{err}");
+    }
+
+    #[test]
+    fn watch_cwd_must_be_an_absolute_existing_directory() {
+        assert!(validated_linux_watch_cwd("relative/dir").is_err());
+        assert!(validated_linux_watch_cwd("/nonexistent/shit-r3a-cwd").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(validated_linux_watch_cwd(file.to_str().unwrap()).is_err());
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            validated_linux_watch_cwd(dir.path().to_str().unwrap()).unwrap(),
+            canonical
+        );
+    }
+
+    fn lsm_dispatch() -> LsmDispatch {
+        LsmDispatch {
+            tree: Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new())),
+            runtime: None,
+            flush: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lsm_attach_with_unusable_cwd_tracks_the_tree_and_reports_an_observation() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 4,
+        };
+        let dispatch = lsm_dispatch();
+        let root = dead_pid();
+        assert!(
+            linux_watch_tree(
+                &helper,
+                None,
+                Some(&dispatch),
+                command,
+                root,
+                "/nonexistent/shit-r3a-cwd"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            dispatch.tree.lock().unwrap().is_tracked(root as i32),
+            Some((command.session, command.seq)),
+            "descendants must stay attributed without a cwd"
+        );
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            shit_proto::HelperResponse::CaptureRefused { seq: 4, detail, .. }
+                if detail.starts_with("capture attach failed: ")
+        ));
+    }
+
+    /// A fd that is not a fanotify group, so marking it fails. Building a
+    /// real group needs CAP_SYS_ADMIN, which unit tests do not have.
+    fn fanotify_state_that_cannot_mark() -> fanotify::runtime::FanotifyState {
+        let fd = std::fs::File::open("/dev/null").unwrap().into();
+        fanotify::runtime::FanotifyState::new(fanotify::init::FanotifyFd::for_test(fd))
+    }
+
+    #[test]
+    fn fanotify_attach_failures_keep_the_tree_tracked() {
+        let (helper, _daemon) = ipc::socketpair().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let usable = dir.path().to_str().unwrap();
+        for (seq, cwd) in [(7, "/nonexistent/shit-r3a-cwd"), (8, usable)] {
+            let command = shit_planner::events::CommandId {
+                session: uuid::Uuid::from_u128(9),
+                seq,
+            };
+            let state = fanotify_state_that_cannot_mark();
+            let root = dead_pid();
+            let result = linux_watch_tree(&helper, Some(&state), None, command, root, cwd);
+            assert!(result.is_err(), "{cwd}");
+            assert_eq!(
+                state.tree.lock().unwrap().is_tracked(root as i32),
+                Some((command.session, command.seq)),
+                "{cwd}"
+            );
+            assert!(state.marked_paths.lock().unwrap().is_empty(), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn lsm_attach_with_a_usable_cwd_sends_no_observation() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        daemon.set_nonblocking_for_test();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 5,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dispatch = lsm_dispatch();
+        assert!(
+            linux_watch_tree(
+                &helper,
+                None,
+                Some(&dispatch),
+                command,
+                1,
+                dir.path().to_str().unwrap()
+            )
+            .is_ok()
+        );
+        assert!(daemon.recv_response().is_err());
+    }
+
+    #[test]
+    fn duplicate_watch_is_refused_with_an_observation() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 6,
+        };
+        let mut active = std::collections::BTreeSet::new();
+        assert!(begin_watch(&helper, &mut active, command));
+        assert!(!begin_watch(&helper, &mut active, command));
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            shit_proto::HelperResponse::CaptureRefused { seq: 6, detail, .. }
+                if detail.contains("duplicate WatchTree")
+        ));
+    }
+
+    #[test]
+    fn degraded_watch_reports_an_observation_and_stays_ready() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 2,
+        };
+        assert!(linux_watch_tree(&helper, None, None, command, 1, "/nonexistent").is_ok());
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            shit_proto::HelperResponse::CaptureRefused { seq: 2, path: None, detail, .. }
+                if detail.contains("no Linux capture tier")
+        ));
+    }
+
+    #[test]
+    fn unwatch_flushed_marker_is_sent() {
+        let (helper, daemon) = ipc::socketpair().unwrap();
+        let command = shit_planner::events::CommandId {
+            session: uuid::Uuid::from_u128(9),
+            seq: 3,
+        };
+        send_unwatch_flushed(&helper, command);
+        assert!(matches!(
+            daemon.recv_response().unwrap(),
+            shit_proto::HelperResponse::UnwatchTreeFlushed { command_seq: 3, .. }
+        ));
+    }
+}
+
 /// Synchronous daemon-request loop. Lives in `spawn_blocking` so it
 /// can use the blocking `Conn::recv_request`. Exits when the daemon
 /// disconnects or sends `Shutdown`.
@@ -2254,6 +2737,10 @@ fn request_loop(
     #[cfg(target_os = "macos")] macos_es_capture: Option<capture::macos_es::CaptureControl>,
 ) -> anyhow::Result<()> {
     use shit_proto::{HelperRequest, HelperResponse};
+
+    // Commands with a WatchTree and no UnwatchTree yet. A duplicate
+    // WatchTree must not reset an active capture window.
+    let mut active_watches = std::collections::BTreeSet::new();
 
     loop {
         let req = match conn.recv_request() {
@@ -2285,107 +2772,31 @@ fn request_loop(
                 shell_kind: _,
                 cwd_path,
             } => {
-                #[cfg(target_os = "linux")]
-                if let Some(state) = &fanotify_state {
-                    state
-                        .tree
-                        .lock()
-                        .unwrap()
-                        .watch(session, command_seq, root_pid as i32);
-                    // L01: explicit dedupe-state init for the command.
-                    // The first event would lazy-init via `entry().or_default()`
-                    // but doing it here keeps the watch_tree path explicit
-                    // and matches the BSD producer's shape.
-                    let cmd = shit_planner::events::CommandId {
-                        session,
-                        seq: command_seq,
-                    };
-                    if let Some(rt) = &state.capture_runtime
-                        && let Ok(mut g) = rt.lock()
-                    {
-                        g.on_watch_tree(cmd);
-                    }
-                    // L01: add a narrow-scope fanotify mark on the
-                    // root_pid's cwd directory (FAN_EVENT_ON_CHILD,
-                    // ONLYDIR). Without this the reader sees no events.
-                    // We deliberately do NOT use FAN_MARK_FILESYSTEM
-                    // here (HP-18: marking $HOME at boot wedged the
-                    // box). Stash the cwd path so UnwatchTree can
-                    // unmark cleanly on command end.
-                    let cwd_link = format!("/proc/{root_pid}/cwd");
-                    match std::fs::read_link(&cwd_link) {
-                        Ok(cwd) => match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
-                            Ok(()) => {
-                                state.marked_paths.lock().unwrap().insert(cmd, cwd.clone());
-                                tracing::info!(
-                                    %session,
-                                    command_seq,
-                                    root_pid,
-                                    cwd = %cwd.display(),
-                                    "watch_tree registered + cwd marked"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    err = %e,
-                                    cwd = %cwd.display(),
-                                    "mark_dir_for_capture failed; tree tracked but no events will fire"
-                                );
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                err = %e,
-                                root_pid,
-                                "cannot read /proc/<pid>/cwd; tree tracked but no fanotify mark"
-                            );
-                        }
-                    }
-                } else if let Some(state) = &lsm_state {
-                    // L04: eBPF-LSM tier. No fanotify mark needed —
-                    // the LSM hook fires globally on every unlinkat.
-                    // We still track the pid tree so events from
-                    // untracked pids are dropped.
-                    state
-                        .tree
-                        .lock()
-                        .unwrap()
-                        .watch(session, command_seq, root_pid as i32);
-                    let cmd = shit_planner::events::CommandId {
-                        session,
-                        seq: command_seq,
-                    };
-                    // L04 — pre-open every regular file in the
-                    // root_pid's cwd. The held OwnedFd keeps the
-                    // inode alive after vfs_unlink, so the LSM
-                    // unlink handler can read the pre-image content
-                    // even though the dentry's gone. Linux mirror of
-                    // BSD's kqueue register_subtree.
-                    let cwd_link = format!("/proc/{root_pid}/cwd");
-                    let pre_open_cwd = std::fs::read_link(&cwd_link).ok();
-                    if let Some(rt) = &state.runtime
-                        && let Ok(mut g) = rt.lock()
-                    {
-                        g.on_watch_tree(cmd);
-                        if let Some(cwd) = &pre_open_cwd {
-                            g.pre_open_tree(cmd, cwd);
-                        }
-                    }
-                    tracing::info!(
-                        %session,
-                        command_seq,
-                        root_pid,
-                        cwd = ?pre_open_cwd,
-                        tier = "ebpf-lsm",
-                        "watch_tree registered + cwd pre-opened (LSM tier)"
-                    );
-                } else {
-                    tracing::debug!(
-                        %session,
-                        command_seq,
-                        "watch_tree ignored — no fanotify or lsm (degraded)"
-                    );
+                let command = shit_planner::events::CommandId {
+                    session,
+                    seq: command_seq,
+                };
+                if !begin_watch(&conn, &mut active_watches, command) {
+                    continue;
                 }
+                #[cfg(target_os = "linux")]
+                let attach = linux_watch_tree(
+                    &conn,
+                    fanotify_state.as_ref(),
+                    lsm_state.as_ref(),
+                    command,
+                    root_pid,
+                    &cwd_path,
+                );
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )))]
+                #[allow(unused_mut)]
+                let mut attach: Result<(), String> = Ok(());
                 #[cfg(any(
                     target_os = "freebsd",
                     target_os = "netbsd",
@@ -2434,7 +2845,9 @@ fn request_loop(
                 }
                 #[cfg(target_os = "macos")]
                 if let Some(ctrl) = &macos_capture {
-                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                    if let Err(e) = ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path) {
+                        attach = Err(format!("fsevents attach failed: {e}"));
+                    }
                     tracing::info!(
                         %session,
                         command_seq,
@@ -2448,6 +2861,15 @@ fn request_loop(
                         command_seq,
                         "watch_tree ignored — no macos capture (degraded)"
                     );
+                    if macos_es_capture.is_none() {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            "no macOS capture tier is active; file changes are not captured"
+                                .to_string(),
+                        );
+                    }
                 }
                 // M03.1.I.5: ES producer runs alongside FSEvents per
                 // the coexistence ratification. Both receive every
@@ -2456,7 +2878,11 @@ fn request_loop(
                 // the distinct event kinds without dedup conflict.
                 #[cfg(target_os = "macos")]
                 if let Some(ctrl) = &macos_es_capture {
-                    ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path);
+                    if let Err(e) = ctrl.on_watch_tree(session, command_seq, root_pid, &cwd_path)
+                        && attach.is_ok()
+                    {
+                        attach = Err(format!("endpoint-security attach failed: {e}"));
+                    }
                     tracing::info!(
                         %session,
                         command_seq,
@@ -2475,12 +2901,6 @@ fn request_loop(
                 )))]
                 {
                     let _ = (root_pid, session, command_seq, &cwd_path);
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    // L01 fanotify path uses /proc/<pid>/cwd readlink;
-                    // cwd_path is BSD-only at the helper layer today.
-                    let _ = &cwd_path;
                 }
                 // Task #105: signal to the daemon that THIS specific
                 // (session, command_seq) is fully set up — kernel-tier
@@ -2508,16 +2928,33 @@ fn request_loop(
                     target_os = "dragonfly",
                 )))]
                 {
-                    let ready = HelperResponse::WatchTreeReady {
-                        session,
-                        command_seq,
+                    let outcome = match attach {
+                        Ok(()) => HelperResponse::WatchTreeReady {
+                            session,
+                            command_seq,
+                        },
+                        Err(reason) => {
+                            tracing::error!(
+                                %session,
+                                command_seq,
+                                root_pid,
+                                cwd_path = %cwd_path,
+                                %reason,
+                                "watch attach failed; reporting WatchTreeFailed"
+                            );
+                            HelperResponse::WatchTreeFailed {
+                                session,
+                                command_seq,
+                                reason,
+                            }
+                        }
                     };
-                    if let Err(e) = conn.send_response(&ready) {
+                    if let Err(e) = conn.send_response(&outcome) {
                         tracing::warn!(
                             err = %e,
                             %session,
                             command_seq,
-                            "WatchTreeReady send failed; shell hook will time out"
+                            "watch attach outcome send failed; shell hook will time out"
                         );
                     }
                 }
@@ -2526,16 +2963,23 @@ fn request_loop(
                 session,
                 command_seq,
             } => {
+                let command = shit_planner::events::CommandId {
+                    session,
+                    seq: command_seq,
+                };
+                active_watches.remove(&command);
                 #[cfg(target_os = "linux")]
                 if let Some(state) = &fanotify_state {
+                    let cmd = command;
+                    // No drain needed: the reader captures before it allows
+                    // the syscall, so every mutation that completed is
+                    // already on the wire. Holding the runtime lock across
+                    // the unwatch orders this against the reader's handling
+                    // of an in-flight event, so nothing for this command
+                    // follows the marker.
+                    let runtime = state.capture_runtime.as_ref().and_then(|rt| rt.lock().ok());
                     state.tree.lock().unwrap().unwatch(session, command_seq);
-                    let cmd = shit_planner::events::CommandId {
-                        session,
-                        seq: command_seq,
-                    };
-                    if let Some(rt) = &state.capture_runtime
-                        && let Ok(mut g) = rt.lock()
-                    {
+                    if let Some(mut g) = runtime {
                         g.on_unwatch_tree(cmd);
                     }
                     if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd)
@@ -2549,11 +2993,20 @@ fn request_loop(
                     }
                     tracing::info!(%session, command_seq, "unwatch_tree");
                 } else if let Some(state) = &lsm_state {
+                    // Close barrier: dispatch everything already in the
+                    // ring buffers while the pid tree still attributes it
+                    // to this command, then stop watching.
+                    if let Err(detail) = ebpf::flush_all_readers(&state.flush, LSM_FLUSH_TIMEOUT) {
+                        tracing::warn!(%session, command_seq, %detail, "eBPF reader flush incomplete");
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            format!("capture tail may be missing: {detail}"),
+                        );
+                    }
                     state.tree.lock().unwrap().unwatch(session, command_seq);
-                    let cmd = shit_planner::events::CommandId {
-                        session,
-                        seq: command_seq,
-                    };
+                    let cmd = command;
                     if let Some(rt) = &state.runtime
                         && let Ok(mut g) = rt.lock()
                     {
@@ -2567,19 +3020,90 @@ fn request_loop(
                     target_os = "openbsd",
                     target_os = "dragonfly",
                 ))]
-                if let Some(ctrl) = &bsd_capture {
-                    ctrl.on_unwatch_tree(session, command_seq);
-                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
+                {
+                    // The pump sends UnwatchTreeFlushed after it detaches,
+                    // so the marker is ordered after the pump's own
+                    // responses for this command.
+                    use capture::DetachOutcome;
+                    match bsd_capture
+                        .as_ref()
+                        .map(|ctrl| ctrl.on_unwatch_tree(session, command_seq))
+                    {
+                        Some(DetachOutcome::Queued) => {
+                            tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
+                        }
+                        Some(DetachOutcome::Deferred) => {
+                            send_capture_observation(
+                                &conn,
+                                command,
+                                None,
+                                capture::DETACH_DEFERRED_DETAIL.to_string(),
+                            );
+                        }
+                        Some(DetachOutcome::PumpGone) => {
+                            send_capture_observation(
+                                &conn,
+                                command,
+                                None,
+                                capture::DETACH_PUMP_GONE_DETAIL.to_string(),
+                            );
+                            send_unwatch_flushed(&conn, command);
+                        }
+                        None => send_unwatch_flushed(&conn, command),
+                    }
                 }
+                // Each pump drops its clone after handling the detach. The
+                // marker goes out when the last clone goes, including this
+                // one when no producer is running.
                 #[cfg(target_os = "macos")]
-                if let Some(ctrl) = &macos_capture {
-                    ctrl.on_unwatch_tree(session, command_seq);
-                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
-                }
-                #[cfg(target_os = "macos")]
-                if let Some(ctrl) = &macos_es_capture {
-                    ctrl.on_unwatch_tree(session, command_seq);
-                    tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
+                {
+                    use capture::DetachOutcome;
+                    let flush = capture::UnwatchFlushMarker::new(Arc::clone(&conn), command);
+                    let mut outcomes = Vec::new();
+                    if let Some(ctrl) = &macos_capture {
+                        outcomes.push(ctrl.on_unwatch_tree(
+                            session,
+                            command_seq,
+                            Arc::clone(&flush),
+                        ));
+                        tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos fsevents capture");
+                    }
+                    if let Some(ctrl) = &macos_es_capture {
+                        outcomes.push(ctrl.on_unwatch_tree(
+                            session,
+                            command_seq,
+                            Arc::clone(&flush),
+                        ));
+                        tracing::info!(%session, command_seq, "unwatch_tree dispatched to macos endpoint-security capture");
+                    }
+                    // `flush` is still held here, so these go out ahead of
+                    // the marker however fast the pumps are.
+                    if outcomes.contains(&DetachOutcome::PumpGone) {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            capture::DETACH_PUMP_GONE_DETAIL.to_string(),
+                        );
+                    } else if outcomes.contains(&DetachOutcome::Deferred) {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            capture::DETACH_DEFERRED_DETAIL.to_string(),
+                        );
+                    }
+                    // FSEvents delivers with latency and has no way to ask
+                    // for what the kernel still holds. ES has no such gap.
+                    if macos_capture.is_some() && macos_es_capture.is_none() {
+                        send_capture_observation(
+                            &conn,
+                            command,
+                            None,
+                            "capture tail may be missing: FSEvents delivers with latency"
+                                .to_string(),
+                        );
+                    }
                 }
                 #[cfg(not(any(
                     target_os = "linux",
@@ -2592,6 +3116,14 @@ fn request_loop(
                 {
                     let _ = (session, command_seq);
                 }
+                #[cfg(not(any(
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                    target_os = "macos",
+                )))]
+                send_unwatch_flushed(&conn, command);
             }
             HelperRequest::AuthDecision { session, seq, .. } => {
                 // S08 helper doesn't yet emit AuthEvents that need a
