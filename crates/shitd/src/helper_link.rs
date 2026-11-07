@@ -920,10 +920,22 @@ fn dispatch_response(
                         mode,
                     ) {
                         tracing::error!(error = %e, %session, seq, "marker-only Unlink journal failed");
+                        note_ingest_failure(
+                            strict_capture,
+                            index,
+                            command,
+                            format!("a deletion could not be journaled: {e}"),
+                        );
                     }
                     return;
                 }
                 tracing::error!(%session, seq, dev, inode, "CapturedPreImage missing SCM_RIGHTS fd");
+                note_ingest_failure(
+                    strict_capture,
+                    index,
+                    CommandId { session, seq },
+                    "a pre-image arrived without its staging fd".to_string(),
+                );
                 return;
             };
             // W02.B.live-baseline — if the LiveBaseline cache has a
@@ -978,6 +990,12 @@ fn dispatch_response(
                     index,
                 ) {
                     tracing::error!(error = %e, %session, seq, "baseline-promoted FilePreImage journal failed");
+                    note_ingest_failure(
+                        strict_capture,
+                        index,
+                        cmd,
+                        format!("a baseline pre-image could not be journaled: {e}"),
+                    );
                 }
                 drop(staging); // close helper's post-write fd; we don't need it
                 return;
@@ -1006,6 +1024,12 @@ fn dispatch_response(
                 kernel_tier,
             ) {
                 tracing::error!(error = %e, %session, seq, "failed to journal CapturedPreImage");
+                note_ingest_failure(
+                    strict_capture,
+                    index,
+                    cmd,
+                    format!("a pre-image could not be journaled: {e}"),
+                );
             }
         }
         HelperResponse::BaselineCaptured {
@@ -1074,6 +1098,12 @@ fn dispatch_response(
         } => {
             if let Err(e) = handle_tree_mutation(session, seq, op, ts_unix_nanos, index) {
                 tracing::error!(error = %e, %session, seq, "failed to journal TreeMutation");
+                note_ingest_failure(
+                    strict_capture,
+                    index,
+                    CommandId { session, seq },
+                    format!("a tree change could not be journaled: {e}"),
+                );
             }
         }
         HelperResponse::CapturedMetadataChange {
@@ -1102,6 +1132,12 @@ fn dispatch_response(
                     %session,
                     seq,
                     "failed to journal CapturedMetadataChange"
+                );
+                note_ingest_failure(
+                    strict_capture,
+                    index,
+                    CommandId { session, seq },
+                    format!("a metadata change could not be journaled: {e}"),
                 );
             }
         }
@@ -1222,6 +1258,16 @@ pub(crate) fn journal_capture_refused(
         },
     };
     index.put_event(&event).map(|_| ())
+}
+
+/// R3 slice B — the daemon received a capture event and could not
+/// journal it, so the command's capture is incomplete. Strict mode
+/// journals a command-scoped refusal; default mode has already logged
+/// the error.
+fn note_ingest_failure(strict_capture: bool, index: &Index, command: CommandId, detail: String) {
+    if strict_capture {
+        journal_capture_refused_or_log(index, command, None, detail);
+    }
 }
 
 fn journal_capture_refused_or_log(
@@ -1988,6 +2034,46 @@ mod tests_dispatch {
         let rows = refusal_details(&index, cmd);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].1.starts_with("capture attach failed: "));
+    }
+
+    #[test]
+    fn unjournaled_capture_refuses_only_in_strict_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(4),
+            seq: 2,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        // A content pre-image whose staging fd never arrived: the bytes
+        // are gone, so the command's capture is incomplete.
+        let no_fd = || HelperResponse::CapturedPreImage {
+            session: cmd.session,
+            seq: cmd.seq,
+            dev: 1,
+            inode: 2,
+            path: Some("/tmp/watched/f".into()),
+            blob_hash: [0u8; 32],
+            stored_bytes: 5,
+            post_content_hash: None,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            mtime_unix_nanos: 0,
+            xattrs: Default::default(),
+            flags: 0,
+            is_delete: false,
+            fd_sent_via_scm: true,
+        };
+
+        dispatch(no_fd(), &index, &blobs, &map, false);
+        assert!(refusal_details(&index, cmd).is_empty());
+
+        dispatch(no_fd(), &index, &blobs, &map, true);
+        let rows = refusal_details(&index, cmd);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("without its staging fd"), "{rows:?}");
     }
 
     fn tmp_staging_fd(content: &[u8]) -> OwnedFd {
