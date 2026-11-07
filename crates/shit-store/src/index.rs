@@ -854,7 +854,12 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
         },
         // L5 — keyed by the rename source, like the walk's pre-images.
         K::RenameWalk { root, entries, .. } => {
-            let root_inode = entries.first().map(|e| e.inode);
+            // Review round 2, item 9: the root directory's own entry, which
+            // an incomplete walk does not carry; never a file's.
+            let root_inode = entries
+                .iter()
+                .find(|e| e.path == *root && e.kind == shit_planner::metadata::FileKind::Directory)
+                .map(|e| e.inode);
             Denormalized {
                 discriminant: "RenameWalk",
                 dev: root_inode.map(|i| i.dev as i64),
@@ -1087,6 +1092,41 @@ mod tests {
     use super::*;
     use shit_planner::FileMetadata;
     use std::collections::BTreeMap;
+
+    /// L5 review round 2, item 9: an incomplete walk carries only file
+    /// entries; its row is keyed by the root directory's inode or none.
+    #[test]
+    fn rename_walk_row_takes_the_root_inode_or_none() {
+        let file = shit_planner::WalkEntry {
+            path: PathBuf::from("/tmp/d/f"),
+            inode: InodeRef::new(5, 77),
+            kind: shit_planner::metadata::FileKind::Regular,
+            meta: meta(),
+            xattrs_read: true,
+        };
+        let root = shit_planner::WalkEntry {
+            path: PathBuf::from("/tmp/d"),
+            inode: InodeRef::new(5, 70),
+            kind: shit_planner::metadata::FileKind::Directory,
+            meta: FileMetadata {
+                mode: 0o040755,
+                ..meta()
+            },
+            xattrs_read: true,
+        };
+        let walk = |complete, entries| CaptureEventKind::RenameWalk {
+            root: PathBuf::from("/tmp/d"),
+            complete,
+            files: 1,
+            entries,
+        };
+        let incomplete = walk(false, vec![file.clone()]);
+        let d = denormalize(&incomplete);
+        assert_eq!((d.dev, d.inode), (None, None));
+        let complete = walk(true, vec![root, file]);
+        let d = denormalize(&complete);
+        assert_eq!((d.dev, d.inode), (Some(5), Some(70)));
+    }
 
     fn meta() -> FileMetadata {
         FileMetadata {
