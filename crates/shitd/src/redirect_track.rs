@@ -944,7 +944,7 @@ mod tests {
         // permission to open the node at all.
         std::fs::set_permissions(&fifo, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
-        let err = open_regular_nofollow(&fifo).err().expect("rejected");
+        let err = open_regular_nofollow(&fifo).expect_err("rejected");
         assert!(err.msg.contains("not a regular file"), "{}", err.msg);
         assert!(!err.denied, "an open was attempted: {}", err.msg);
     }
