@@ -32,6 +32,48 @@ pub struct Config {
     /// Inert unless the daemon is built with `--features otel`.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// R3: capture policy. The `[capture]` table in `config.toml`.
+    #[serde(default)]
+    pub capture: CaptureConfig,
+}
+
+/// Capture policy knobs (D-3).
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct CaptureConfig {
+    /// Fail-closed capture. When true, capture the daemon cannot prove
+    /// complete is journaled as a `CaptureRefused` row, so undo refuses
+    /// it. Off by default: degraded tiers keep best-effort undo.
+    /// `SHIT_STRICT_CAPTURE` overrides this value.
+    #[serde(default)]
+    pub strict: Option<bool>,
+}
+
+/// Env var that overrides `[capture] strict`.
+pub const STRICT_CAPTURE_ENV: &str = "SHIT_STRICT_CAPTURE";
+
+/// Resolve strict mode. A recognized env value wins in either direction,
+/// so an explicit false overrides the config; otherwise the config value;
+/// otherwise off. An unrecognized env value falls through to the config
+/// and comes back as a warning for the caller to log.
+fn resolve_strict_capture(env: Option<&str>, config: Option<bool>) -> (bool, Option<String>) {
+    let Some(raw) = env else {
+        return (config.unwrap_or(false), None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => (true, None),
+        "0" | "false" | "no" | "off" => (false, None),
+        _ => {
+            let strict = config.unwrap_or(false);
+            (
+                strict,
+                Some(format!(
+                    "{STRICT_CAPTURE_ENV}={raw:?} is not recognized; strict capture is {}. \
+                     Use 1/true/yes/on or 0/false/no/off",
+                    if strict { "on" } else { "off" },
+                )),
+            )
+        }
+    }
 }
 
 /// S21.6 OTLP export config.
@@ -115,6 +157,20 @@ pub struct ResolvedConfig {
     pub disable: bool,
     pub env: EnvConfig,
     pub telemetry: ResolvedTelemetryConfig,
+    /// Fail-closed capture (D-3). See [`CaptureConfig::strict`].
+    pub strict_capture: bool,
+    /// Why `SHIT_STRICT_CAPTURE` was ignored, for logging at startup
+    /// (config resolves before tracing is up).
+    pub strict_capture_warning: Option<String>,
+}
+
+impl ResolvedConfig {
+    /// Planner options derived from this config.
+    pub fn plan_options(&self) -> shit_planner::PlanOptions {
+        shit_planner::PlanOptions {
+            strict_capture: self.strict_capture,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +195,9 @@ impl Config {
     }
 
     pub fn resolve(self) -> Result<ResolvedConfig> {
+        let env_strict = std::env::var(STRICT_CAPTURE_ENV).ok();
+        let (strict_capture, strict_capture_warning) =
+            resolve_strict_capture(env_strict.as_deref(), self.capture.strict);
         let state = self.state_dir.map(Ok).unwrap_or_else(default_state_dir)?;
         Ok(ResolvedConfig {
             idle_timeout_secs: self.idle_timeout_secs.unwrap_or(DEFAULT_IDLE_SECS),
@@ -160,6 +219,8 @@ impl Config {
                     .service_name
                     .unwrap_or_else(|| "shitd".to_string()),
             },
+            strict_capture,
+            strict_capture_warning,
         })
     }
 }
@@ -332,6 +393,58 @@ mod tests {
         let r = cfg.resolve().unwrap();
         assert!(r.telemetry.otlp_endpoint.is_some());
         assert_eq!(r.telemetry.service_name, "shitd");
+    }
+
+    #[test]
+    fn strict_capture_defaults_off() {
+        assert_eq!(resolve_strict_capture(None, None), (false, None));
+    }
+
+    #[test]
+    fn strict_capture_reads_config_table() {
+        let cfg: Config = toml::from_str("[capture]\nstrict = true\n").unwrap();
+        assert_eq!(
+            resolve_strict_capture(None, cfg.capture.strict),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn strict_capture_env_wins_over_config() {
+        assert_eq!(resolve_strict_capture(Some("1"), Some(false)), (true, None));
+        assert_eq!(resolve_strict_capture(Some("0"), Some(true)), (false, None));
+        assert_eq!(resolve_strict_capture(Some("true"), None), (true, None));
+    }
+
+    #[test]
+    fn strict_capture_env_is_case_insensitive() {
+        assert_eq!(resolve_strict_capture(Some(" TRUE "), None), (true, None));
+        assert_eq!(resolve_strict_capture(Some("On"), None), (true, None));
+        assert_eq!(
+            resolve_strict_capture(Some("FALSE"), Some(true)),
+            (false, None)
+        );
+        assert_eq!(
+            resolve_strict_capture(Some("Off"), Some(true)),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn strict_capture_warns_on_unrecognized_env_and_keeps_config() {
+        let (strict, warning) = resolve_strict_capture(Some("maybe"), Some(true));
+        assert!(strict);
+        assert!(warning.unwrap().contains("maybe"));
+        let (strict, warning) = resolve_strict_capture(Some(""), None);
+        assert!(!strict);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn plan_options_carry_strict_flag() {
+        let mut r = Config::default().resolve().unwrap();
+        r.strict_capture = true;
+        assert!(r.plan_options().strict_capture);
     }
 
     #[test]

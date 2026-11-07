@@ -47,6 +47,7 @@ int BPF_PROG(shit_inode_rmdir, struct inode *dir, struct dentry *dentry)
     struct shit_unlink_event *e =
         bpf_ringbuf_reserve(&rmdir_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return 0;
     }
 

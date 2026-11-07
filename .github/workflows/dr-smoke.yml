@@ -2396,7 +2396,7 @@ jobs:
   freebsd-smoke:
     name: freebsd-smoke (B04)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: BSD smoke matrix inside FreeBSD 14
@@ -2413,7 +2413,12 @@ jobs:
           run: |
             set -eu
             echo "===== install deps ====="
-            sudo pkg install -y rust gmake python3 sqlite3 doas jq git vim gawk rsync
+            sudo pkg install -y gmake curl ca_root_nss python3 sqlite3 doas jq git vim gawk rsync
+            # pkg rust drifts from the 1.88 pin used elsewhere; use rustup.
+            fetch -o /tmp/rustup-init.sh https://sh.rustup.rs
+            sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88
+            . "$HOME/.cargo/env"
+            rustc -V
 
             echo "===== configure doas (permit the CI runner user directly) ====="
             # The cross-platform-actions VM runs commands as a user
@@ -2452,12 +2457,27 @@ jobs:
             sudo /usr/sbin/service pf onestart || true
             ls -la /dev/pf 2>&1 || echo "WARN: /dev/pf still absent; pf smokes will SKIP"
 
+            echo "===== file-backed zpool for the ZFS leg (B2, #202) ====="
+            # The CI image's root is UFS. A vnode md(4) device on a
+            # sparse file gives a pool so the bucket can run a second
+            # time with TMPDIR on ZFS, same names as the local VM
+            # (tools/freebsd-vm/guest-setup.sh).
+            sudo kldload -n zfs
+            sudo truncate -s 4G /var/tmp/shitzfs.img
+            ZFS_MD="$(sudo mdconfig -a -t vnode -f /var/tmp/shitzfs.img)"
+            sudo zpool create -f shitzfs "/dev/${ZFS_MD}"
+            sudo zfs create -o mountpoint=/tmp/zfs shitzfs/tmp
+            sudo chmod 1777 /tmp/zfs
+            echo "  zpool: shitzfs on /dev/${ZFS_MD} ($(zfs list -H -o name,mountpoint shitzfs/tmp | tr '\t' ' '))"
+
             echo "===== doctor JSON pre-flight ====="
             export SHIT_HELPER_BIN="$(pwd)/target/release/shit-helper"
             # A crashing doctor (PR 185: SIGBUS, rc 138) must not read
             # as a kqueue verdict, so report its exit code on its own.
+            mkdir -p smoke-artifacts
             doctor_rc=0
-            ./target/release/shit doctor --json > /tmp/doctor.json || doctor_rc=$?
+            ./target/release/shit doctor --json > smoke-artifacts/doctor.json || doctor_rc=$?
+            cp smoke-artifacts/doctor.json /tmp/doctor.json
             if [ "$doctor_rc" -ne 0 ]; then
               echo "doctor preflight: FAILED, shit doctor --json exited rc=$doctor_rc"
               exit 1
@@ -2476,6 +2496,8 @@ jobs:
             echo "  bash: $(bash --version | head -1)"
             echo "  uname: $(uname -srm)"
             echo "  timeout: $(/usr/bin/timeout --version 2>&1 | head -1 || /usr/bin/timeout 2>&1 | head -1 || true)"
+            echo "  filesystems exercised (TMPDIR of each leg):"
+            df -T /tmp /tmp/zfs | sed 's/^/    /'
 
             echo "===== bucket the freebsd-vm smokes via the AU14 driver ====="
             # AU14-B — single source of truth. The driver reads
@@ -2490,10 +2512,14 @@ jobs:
             SMOKE_COUNT="$(printf '%s\n' "$SMOKES" | wc -l | tr -d ' ')"
             echo "  bucket size: $SMOKE_COUNT smokes"
 
-            echo "===== run smokes ====="
             FAIL_COUNT=0
+            run_bucket() {
+            leg="$1"
+            leg_tmp="$2"
+            leg_fail_start=$FAIL_COUNT
+            echo "===== run smokes: ${leg} leg, TMPDIR=${leg_tmp} ($(df -T "${leg_tmp}" | awk 'NR==2{print $2}')) ====="
             for smoke in $SMOKES; do
-              echo "----- $smoke -----"
+              echo "----- [${leg}] $smoke -----"
               # Capture timeout's exit code separately so we can
               # distinguish: 0=success, 124=timeout(1)-killed,
               # 137=SIGKILL'd, other=smoke explicitly exited.
@@ -2517,26 +2543,46 @@ jobs:
               # `echo`) is always 0, which we discard.
               set +e
               (
-                /usr/bin/timeout --signal=TERM --kill-after=10 300 \
+                TMPDIR="${leg_tmp}" SMOKE_KEEP_TMP=1 /usr/bin/timeout --signal=TERM --kill-after=10 300 \
                   bash "tests/smoke/$smoke"
                 echo $? > "$rc_file"
               ) 2>&1 | tee "$passlog"
               set -e
               rc=$(cat "$rc_file" 2>/dev/null || echo 1)
               rm -f "$rc_file"
+              # The upload step runs on the Ubuntu host, which sees only
+              # the workspace the action syncs back from this VM, so copy
+              # a failing smoke's logs there. Every run's scratch dir goes
+              # away now that SMOKE_KEEP_TMP stops lib.sh deleting it.
+              if [ "$rc" != 0 ] && ! grep -q "^\[smoke .*\] PASS: " "$passlog"; then
+                keep="smoke-artifacts/${leg}/${smoke%.sh}"
+                mkdir -p "$keep"
+                cp "$passlog" "$keep/smoke.log" || true
+                for st in "${leg_tmp}"/shit-smoke.*; do
+                  [ -d "$st" ] || continue
+                  cp "$st/shitd.log" "$keep/" 2>/dev/null || true
+                  cp -R "$st/state/shit/log" "$keep/" 2>/dev/null || true
+                done
+              fi
+              for st in "${leg_tmp}"/shit-smoke.*; do
+                [ -d "$st" ] || continue
+                /usr/bin/timeout 30 rm -rf "$st" 2>/dev/null \
+                  || /usr/bin/timeout 30 doas rm -rf "$st" 2>/dev/null \
+                  || echo "  WARN: could not remove $st"
+              done
               case "$rc" in
-                0)    echo "  PASS: $smoke" ;;
-                124)  echo "  FAIL: $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                0)    echo "  PASS: [${leg}] $smoke" ;;
+                124)  echo "  FAIL: [${leg}] $smoke (timeout(1) killed bash via SIGTERM)";  FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
                 137)  if grep -q "^\[smoke .*\] PASS: " "$passlog"; then
-                        echo "  PASS: $smoke (safety-net kill — bash hung after smoke logged PASS)"
+                        echo "  PASS: [${leg}] $smoke (safety-net kill — bash hung after smoke logged PASS)"
                       else
-                        echo "  FAIL: $smoke (SIGKILL'd without PASS marker)"
+                        echo "  FAIL: [${leg}] $smoke (SIGKILL'd without PASS marker)"
                         FAIL_COUNT=$((FAIL_COUNT + 1))
                       fi ;;
-                125)  echo "  FAIL: $smoke (timeout(1) error)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
-                126)  echo "  FAIL: $smoke (bash not executable)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
-                127)  echo "  FAIL: $smoke (bash not found)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
-                *)    echo "  FAIL: $smoke (exit code $rc — smoke or bash exited explicitly)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                125)  echo "  FAIL: [${leg}] $smoke (timeout(1) error)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                126)  echo "  FAIL: [${leg}] $smoke (bash not executable)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                127)  echo "  FAIL: [${leg}] $smoke (bash not found)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+                *)    echo "  FAIL: [${leg}] $smoke (exit code $rc — smoke or bash exited explicitly)"; FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
               esac
               rm -f "$passlog"
               # Dump any safety-net log so we see whether it fired.
@@ -2554,18 +2600,19 @@ jobs:
                 rm -f /tmp/watchdog.log
               fi
             done
+            echo "===== ${leg} leg: $((FAIL_COUNT - leg_fail_start)) of $SMOKE_COUNT failed ====="
+            }
+            run_bucket ufs /tmp
+            run_bucket zfs /tmp/zfs
 
             if [ "$FAIL_COUNT" -gt 0 ]; then
               echo "===== $FAIL_COUNT smoke(s) failed ====="
               exit 1
             fi
-            echo "===== all $SMOKE_COUNT BSD smokes green ====="
+            echo "===== all $SMOKE_COUNT BSD smokes green on UFS and ZFS ====="
       - name: upload artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: freebsd-smoke-logs
-          path: |
-            /tmp/shit-smoke.*/shitd.log
-            /tmp/shit-smoke.*/state/shit/log/
-            /tmp/doctor.json
+          path: smoke-artifacts/

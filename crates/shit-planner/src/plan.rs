@@ -33,6 +33,17 @@ use crate::store::PlannerStore;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// Planner knobs the daemon sets from its configuration.
+///
+/// `strict_capture` mirrors `SHIT_STRICT_CAPTURE` / `[capture] strict`.
+/// [`plan`] does not read it yet; the strict refusal rules that will
+/// consume it land with the planner slice of R3. Default is off, which
+/// is trunk behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanOptions {
+    pub strict_capture: bool,
+}
+
 pub fn plan(
     command: CommandRecord,
     events: &[CaptureEvent],

@@ -36,7 +36,8 @@ pub mod loader;
 pub mod ringbuf_reader;
 
 pub use error::EbpfError;
-pub use loader::{EbpfLoader, ProbeOutcome};
+pub use loader::{EbpfLoader, ProbeOutcome, RingbufLossCounter};
 pub use ringbuf_reader::{
-    EventHeader, LoggingSink, LsmEventSink, LsmReader, UnlinkEvent, decode_unlink, kind,
+    EventHeader, LoggingSink, LsmEventSink, LsmFlushHandle, LsmReader, UnlinkEvent, decode_unlink,
+    flush_all_readers, kind, ringbuf_losses_observed,
 };

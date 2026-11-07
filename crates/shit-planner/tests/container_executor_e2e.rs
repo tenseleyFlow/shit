@@ -142,6 +142,7 @@ impl ContainerRunner for PathInjectingRunner {
             .args(args)
             .env("PATH", &self.path)
             .env("SHIT_DURING_UNDO", "1")
+            .stdin(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
@@ -413,4 +414,30 @@ fn rm_reverse_inspects_stash_then_runs_synthesized_argv() {
         argv_run.contains("--restart=unless-stopped"),
         "argv-run missing restart policy: {argv_run}"
     );
+}
+
+/// Regression guard: `run` must not hand the parent's stdin to the
+/// child. On Linux the child asserts fd 0 is /dev/null without reading
+/// it; elsewhere it drains stdin, which only returns on EOF. Either way
+/// the run is bounded by a channel timeout so a regression fails in
+/// seconds instead of hanging the suite.
+#[test]
+fn run_without_stdin_gives_child_null_stdin() {
+    use shit_planner::executors::container::SystemContainerRunner;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let script = if cfg!(target_os = "linux") {
+        "[ \"$(readlink /proc/self/fd/0)\" = /dev/null ]"
+    } else {
+        "cat >/dev/null"
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let r = SystemContainerRunner.run(&["sh".into(), "-c".into(), script.into()]);
+        let _ = tx.send(r);
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("runner did not return within 10s");
+    r.expect("child stdin must be null");
 }

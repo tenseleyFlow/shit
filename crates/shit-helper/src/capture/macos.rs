@@ -81,6 +81,8 @@ enum ControlMsg {
     },
     Detach {
         command: CommandId,
+        /// Held until this pump has handled the command's queued events.
+        flush: Arc<super::UnwatchFlushMarker>,
     },
     Shutdown,
 }
@@ -104,14 +106,20 @@ impl CaptureControl {
     /// `sysctl(KERN_PROC_CWD)` fallback because libproc cross-PID
     /// queries are unreliable enough (TCC, dropped privileges) that
     /// requiring the path keeps the contract honest.
-    pub fn on_watch_tree(&self, session: Uuid, command_seq: u64, _root_pid: u32, cwd_path: &str) {
+    pub fn on_watch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        _root_pid: u32,
+        cwd_path: &str,
+    ) -> Result<(), String> {
         if cwd_path.is_empty() {
             tracing::warn!(
                 %session,
                 command_seq,
                 "WatchTree without cwd_path on macOS; watch dropped"
             );
-            return;
+            return Err("WatchTree carried no cwd_path".to_string());
         }
         let path = PathBuf::from(cwd_path);
         let command = CommandId {
@@ -128,22 +136,33 @@ impl CaptureControl {
                 err = %e,
                 "fsevents control channel full; WatchTree dropped"
             );
+            return Err(format!("control channel rejected the attach: {e}"));
         }
+        Ok(())
     }
 
-    pub fn on_unwatch_tree(&self, session: Uuid, command_seq: u64) {
+    /// Offer a detach to the pump. `flush` travels with it, so its marker
+    /// waits for the pump either way.
+    pub fn on_unwatch_tree(
+        &self,
+        session: Uuid,
+        command_seq: u64,
+        flush: Arc<super::UnwatchFlushMarker>,
+    ) -> super::DetachOutcome {
         let command = CommandId {
             session,
             seq: command_seq,
         };
-        if let Err(e) = self.tx.try_send(ControlMsg::Detach { command }) {
+        let outcome = super::offer_detach(&self.tx, ControlMsg::Detach { command, flush });
+        if outcome != super::DetachOutcome::Queued {
             tracing::warn!(
                 %session,
                 command_seq,
-                err = %e,
-                "fsevents control channel full; UnwatchTree dropped"
+                ?outcome,
+                "fsevents control channel full or closed at UnwatchTree"
             );
         }
+        outcome
     }
 
     /// Signal the pump thread to exit. Best-effort.
@@ -226,6 +245,25 @@ impl PumpState {
         );
         self.watches.insert(command, canonical);
         self.rebuild_stream();
+    }
+
+    /// Handle the records the stream has already delivered, up to
+    /// `DETACH_DRAIN_TIMEOUT`. Returns false if time ran out.
+    fn drain_stream(&mut self) -> bool {
+        let deadline = std::time::Instant::now() + super::DETACH_DRAIN_TIMEOUT;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            let record = match &self.stream {
+                Some((_, rx)) => rx.try_recv().ok(),
+                None => None,
+            };
+            match record {
+                Some(record) => self.handle_event(record),
+                None => return true,
+            }
+        }
     }
 
     fn detach(&mut self, command: CommandId) {
@@ -477,8 +515,16 @@ fn pump(conn: Arc<Conn>, ctrl_rx: Receiver<ControlMsg>) {
                 state.attach(command, root_path);
                 continue;
             }
-            Ok(ControlMsg::Detach { command }) => {
+            Ok(ControlMsg::Detach { command, flush }) => {
+                // detach rebuilds the stream, which discards its queue.
+                // FSEvents delivers with latency, so this covers what the
+                // stream has delivered, which may not be all the kernel
+                // has seen.
+                if !state.drain_stream() {
+                    super::send_drain_timeout_observation(&state.conn, command);
+                }
                 state.detach(command);
+                drop(flush);
                 continue;
             }
             Ok(ControlMsg::Shutdown) => {

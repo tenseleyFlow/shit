@@ -44,6 +44,10 @@ pub const DEFAULT_CAPACITY: usize = 4096;
 /// EVFILT_USER subscription (we don't register any others).
 const SHUTDOWN_IDENT: libc::uintptr_t = 0xD15E_A5E5;
 
+/// The ident of the `EVFILT_USER` flush trigger. See
+/// [`DrainHandle::request_flush`].
+const FLUSH_IDENT: libc::uintptr_t = 0xD15E_A5E6;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DrainError {
     #[error("kevent(2) at drain time: {0}")]
@@ -74,6 +78,8 @@ pub enum DrainEvent {
         kind: ProcEventKind,
         fflags: u32,
     },
+    /// The marker for a [`DrainHandle::request_flush`].
+    Flushed { token: u32 },
 }
 
 /// Handle held by the orchestrator side. Carries enough state to
@@ -88,6 +94,41 @@ pub struct DrainHandle {
 }
 
 impl DrainHandle {
+    /// Ask the drain thread to send `DrainEvent::Flushed { token }`.
+    ///
+    /// The kqueue returns active knotes in activation order, so a knote
+    /// that fired before this trigger is dequeued ahead of it. The
+    /// marker therefore arrives on the channel behind every event that
+    /// was pending in the kernel or already queued when this was called.
+    /// `token` is truncated to the 24 bits `NOTE_FFLAGSMASK` carries.
+    pub fn request_flush(&self, token: u32) -> Result<(), KqueueError> {
+        let ev = libc::kevent {
+            ident: FLUSH_IDENT,
+            filter: libc::EVFILT_USER,
+            flags: 0,
+            fflags: libc::NOTE_TRIGGER | libc::NOTE_FFCOPY | (token & libc::NOTE_FFLAGSMASK),
+            data: 0,
+            udata: std::ptr::null_mut(),
+            ext: [0; 4],
+        };
+        // SAFETY: shutdown_fd is owned for the call; changelist is a
+        // single const kevent; no eventlist.
+        let rc = unsafe {
+            libc::kevent(
+                self.shutdown_fd.as_raw_fd(),
+                &ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc < 0 {
+            return Err(KqueueError::Kevent(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// Trigger the shutdown EVFILT_USER event so the drain thread's
     /// next `kevent(2)` returns with our marker and the loop exits.
     pub fn signal_shutdown(&self) -> Result<(), KqueueError> {
@@ -170,7 +211,8 @@ impl Drop for DrainSession {
 /// first, spawn second.
 pub fn spawn(kq: Arc<KqueueFd>, capacity: usize) -> Result<DrainSession, DrainError> {
     let shutdown_fd = dup_for_shutdown(&kq)?;
-    register_shutdown_user_event(&kq)?;
+    register_user_event(&kq, SHUTDOWN_IDENT)?;
+    register_user_event(&kq, FLUSH_IDENT)?;
     let (tx, rx) = sync_channel(capacity);
     let thread = std::thread::Builder::new()
         .name("shit-kqueue-drain".to_string())
@@ -199,9 +241,9 @@ fn dup_for_shutdown(kq: &Arc<KqueueFd>) -> Result<std::os::fd::OwnedFd, DrainErr
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
 }
 
-fn register_shutdown_user_event(kq: &Arc<KqueueFd>) -> Result<(), DrainError> {
+fn register_user_event(kq: &Arc<KqueueFd>, ident: libc::uintptr_t) -> Result<(), DrainError> {
     let ev = libc::kevent {
-        ident: SHUTDOWN_IDENT,
+        ident,
         filter: libc::EVFILT_USER,
         flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
         fflags: 0,
@@ -255,8 +297,15 @@ fn run(kq: Arc<KqueueFd>, tx: SyncSender<DrainEvent>, capacity: usize) -> Result
             if ev.filter == libc::EVFILT_USER && ev.ident == SHUTDOWN_IDENT {
                 return Ok(());
             }
-            let Some(decoded) = decode(ev) else {
-                continue;
+            let decoded = if ev.filter == libc::EVFILT_USER && ev.ident == FLUSH_IDENT {
+                DrainEvent::Flushed {
+                    token: ev.fflags & libc::NOTE_FFLAGSMASK,
+                }
+            } else {
+                let Some(decoded) = decode(ev) else {
+                    continue;
+                };
+                decoded
             };
             match tx.try_send(decoded) {
                 Ok(()) => {}
@@ -312,6 +361,41 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn flush_marker_arrives_behind_pending_vnode_events() {
+        let kq = Arc::new(init().expect("kqueue"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        const FILES: usize = 32;
+        for i in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
+        }
+        let tree = register_subtree(&kq, dir.path(), 4).expect("register");
+        let session = spawn(Arc::clone(&kq), 1024).expect("spawn drain");
+        for i in 0..FILES {
+            std::fs::remove_file(dir.path().join(format!("f{i}"))).unwrap();
+        }
+        session.handle.request_flush(7).unwrap();
+        let mut fds = std::collections::BTreeSet::new();
+        loop {
+            match recv_with_timeout(&session, Duration::from_secs(5)).expect("marker") {
+                DrainEvent::Flushed { token } => {
+                    assert_eq!(token, 7);
+                    break;
+                }
+                DrainEvent::Vnode {
+                    fd,
+                    kind: VnodeEventKind::Delete,
+                    ..
+                } => {
+                    fds.insert(fd);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(fds.len(), FILES, "the marker overtook a pending delete");
+        drop(tree);
     }
 
     #[test]

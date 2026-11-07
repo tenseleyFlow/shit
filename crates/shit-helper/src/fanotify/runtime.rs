@@ -159,13 +159,18 @@ pub fn reader_thread(state: FanotifyState) {
                 // under the CAPTURE_TO_ALLOW p99 budget (10ms) means the
                 // dedupe lookup + pre-image read + staging write +
                 // SCM_RIGHTS send all complete before we return here.
+                //
+                // The runtime lock is held across the lookup so an unwatch
+                // cannot land between them. An event is handled wholly
+                // before the UnwatchTreeFlushed marker or sees no tree.
+                let mut runtime_guard = runtime.as_ref().and_then(|rt| rt.lock().ok());
                 let mut tg = tree.lock().ok()?;
                 let resolved = tg.is_tracked(ev.pid);
                 drop(tg);
                 let Some((session, command_seq)) = resolved else {
                     return Some(Decision::Allow);
                 };
-                if let Some(rt) = runtime.as_ref() {
+                if let Some(g) = runtime_guard.as_mut() {
                     let kind = if (ev.mask & libc::FAN_OPEN_EXEC_PERM) != 0 {
                         FanotifyCaptureKind::OpenExec
                     } else {
@@ -181,9 +186,7 @@ pub fn reader_thread(state: FanotifyState) {
                         kind,
                         _life: std::marker::PhantomData,
                     };
-                    if let Ok(mut g) = rt.lock() {
-                        g.handle_event(&view);
-                    }
+                    g.handle_event(&view);
                 }
                 Some(Decision::Allow)
             },

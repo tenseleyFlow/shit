@@ -19,7 +19,7 @@
  *   - Strict CO-RE via BPF_CORE_READ for every kernel-struct field.
  *   - No unbounded loops; straight-line code.
  *   - Always returns 0.
- *   - Ringbuf-reserve failures drop the event silently.
+ *   - Ringbuf-reserve failures increment the out-of-band loss counter.
  *
  * LSM hook signature (BPF-callback level, per upstream
  * include/linux/lsm_hook_defs.h):
@@ -99,6 +99,7 @@ static __always_inline void __do_setattr(struct dentry *dentry, struct iattr *at
     struct shit_setattr_event *e =
         bpf_ringbuf_reserve(&setattr_events, sizeof(*e), 0);
     if (!e) {
+        shit_note_ringbuf_loss();
         return;
     }
 
