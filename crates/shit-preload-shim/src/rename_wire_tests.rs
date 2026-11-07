@@ -30,7 +30,10 @@ fn renameat_with_real_dirfd_over_existing_file_keeps_from_and_to() {
     });
     assert_eq!(rc, 0);
     assert_eq!(std::fs::read(dir.join("alpha.txt")).unwrap(), b"new");
-    let renames: Vec<_> = notes.iter().filter(|n| n.syscall == "renameat").collect();
+    let renames: Vec<_> = notes
+        .iter()
+        .filter(|n| n.syscall == "renameat" && n.outcome.is_none())
+        .collect();
     assert_eq!(renames.len(), 1, "{notes:#?}");
     let n = renames[0];
     let want_to = dir.join("alpha.txt");
@@ -176,14 +179,59 @@ fn failed_dir_rename_reports_its_errno_and_keeps_it_for_the_caller() {
 }
 
 #[test]
-fn successful_file_rename_sends_no_outcome() {
+fn every_rename_reports_its_outcome_under_its_call_id() {
+    // Review item 2: the outcome names its call, so the daemon can tell
+    // each call's own Rename from a second tier's.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().canonicalize().unwrap();
     std::fs::write(dir.join("a"), b"a").unwrap();
-    let notes =
-        test_capture::capture(|| assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")).0, 0));
-    assert_eq!(notes.len(), 1, "{notes:#?}");
+    std::fs::write(dir.join("c"), b"c").unwrap();
+    let notes = test_capture::capture(|| {
+        assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")).0, 0);
+        assert_eq!(rename_abs(&dir.join("c"), &dir.join("d")).0, 0);
+    });
+    assert_eq!(notes.len(), 4, "{notes:#?}");
     assert!(notes[0].outcome.is_none() && notes[0].walk.is_none());
+    let out = notes[1].outcome.expect("outcome");
+    assert_eq!(out.errno, 0);
+    assert_ne!(notes[0].call_id, 0);
+    assert_eq!(notes[0].call_id, notes[1].call_id);
+    assert_eq!(notes[2].call_id, notes[3].call_id);
+    assert_ne!(notes[0].call_id, notes[2].call_id);
+}
+
+#[test]
+fn oversized_walk_frame_keeps_every_pre_image_and_the_rename() {
+    // Review item 7: the resend drops only the walk record, sending the
+    // bytes in chunks of their own first.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let d = dir.join("d");
+    std::fs::create_dir(&d).unwrap();
+    for n in ["a", "b", "c"] {
+        std::fs::write(d.join(n), vec![b'x'; 1024]).unwrap();
+    }
+    test_capture::set_frame_limit(Some(2500));
+    let notes = test_capture::capture(|| assert_eq!(rename_abs(&d, &dir.join("t")).0, 0));
+    test_capture::set_frame_limit(None);
+    let chunks: Vec<_> = notes
+        .iter()
+        .filter(|n| n.syscall == "rename_walk")
+        .collect();
+    assert!(chunks.len() >= 2, "{notes:#?}");
+    let carried: usize = chunks.iter().map(|n| n.extra_pre_images.len()).sum();
+    assert_eq!(carried, 3, "{notes:#?}");
+    assert!(
+        chunks
+            .iter()
+            .all(|n| n.call_id == notes.last().unwrap().call_id)
+    );
+    let rename = notes
+        .iter()
+        .find(|n| n.syscall == "rename" && n.outcome.is_none())
+        .expect("the Rename is still sent");
+    assert!(rename.walk.is_none() && rename.extra_pre_images.is_empty());
+    assert!(notes.last().unwrap().outcome.is_some());
 }
 
 #[test]

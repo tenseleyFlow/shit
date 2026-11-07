@@ -188,6 +188,12 @@ pub struct ShimNotification {
     /// nothing left to stat.
     #[serde(default)]
     pub pre_stat: Option<ShimStat>,
+    /// L5 — one rename-family call's id, the same on its pre-syscall
+    /// notification and its outcome, so the daemon can name in the
+    /// outcome the exact Rename (and refusal) that call journaled. 0 when
+    /// not a rename.
+    #[serde(default)]
+    pub call_id: u64,
 }
 
 /// L5 — identity and mode of a path, as the shim read it.
@@ -306,6 +312,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -337,6 +344,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
@@ -364,6 +372,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -406,6 +415,7 @@ mod tests {
                 }),
                 outcome: None,
                 pre_stat: None,
+                call_id: 0,
             },
             ShimNotification {
                 pid: 1,
@@ -428,6 +438,7 @@ mod tests {
                     inode: 2,
                     mode: 0o040700,
                 }),
+                call_id: 7,
             },
         ] {
             let frame = encode_frame(&n).expect("encode");
@@ -468,6 +479,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -505,6 +517,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -555,6 +568,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");

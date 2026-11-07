@@ -433,6 +433,12 @@ pub enum CaptureEventKind {
         errno: i32,
         source: InodeRef,
         dest: InodeRef,
+        /// The Rename the same call's pre-syscall notification journaled,
+        /// matched by the shim's per-call id. `None` when the daemon could
+        /// not match it.
+        rename: Option<EventId>,
+        /// The CaptureRefused that notification journaled, if any.
+        refusal: Option<EventId>,
     },
 }
 

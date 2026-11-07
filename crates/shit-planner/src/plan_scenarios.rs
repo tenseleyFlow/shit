@@ -88,7 +88,7 @@ impl Sim {
 
     // --- journaled operations ---
 
-    fn emit(&mut self, kind: CaptureEventKind) {
+    fn emit(&mut self, kind: CaptureEventKind) -> EventId {
         let id = self.next;
         self.next += 1;
         self.events.push(CaptureEvent {
@@ -98,6 +98,7 @@ impl Sim {
             partial: false,
             kind,
         });
+        EventId(id)
     }
 
     /// The device journaled events report for `path`.
@@ -203,22 +204,23 @@ impl Sim {
         }
         let inode = Self::inode_of(&from_p);
         let result = std::fs::rename(&from_p, &to_p);
-        self.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+        let rename = self.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
             from: from_p.clone(),
             to: to_p.clone(),
             inode,
         }));
         self.shared_ts = None;
         result.unwrap();
-        if is_dir {
-            self.emit(CaptureEventKind::RenameOutcome {
-                from: from_p,
-                to: to_p.clone(),
-                errno: 0,
-                source: inode,
-                dest: Self::inode_of(&to_p),
-            });
-        }
+        // The shim reports every rename's result after the call.
+        self.emit(CaptureEventKind::RenameOutcome {
+            from: from_p,
+            to: to_p.clone(),
+            errno: 0,
+            source: inode,
+            dest: Self::inode_of(&to_p),
+            rename: Some(rename),
+            refusal: None,
+        });
     }
 
     /// The shim's walk of directory `from` before a rename: a pre-image
@@ -1917,7 +1919,7 @@ fn failed_dir_rename(sim: &mut Sim, from: &str, to: &str, lsm_twin_after: bool) 
         // The daemon stats `to` after the ack: the existing `t`.
         inode: Sim::inode_of(&to_p),
     });
-    sim.emit(rename);
+    let rename = sim.emit(rename);
     sim.shared_ts = None;
     sim.emit(CaptureEventKind::RenameOutcome {
         from: from_p.clone(),
@@ -1925,6 +1927,8 @@ fn failed_dir_rename(sim: &mut Sim, from: &str, to: &str, lsm_twin_after: bool) 
         errno: libc::ENOTEMPTY,
         source,
         dest: InodeRef::new(0, 0),
+        rename: Some(rename),
+        refusal: None,
     });
     if lsm_twin_after {
         // The helper's LSM hook fired before the filesystem refused.
@@ -2068,5 +2072,91 @@ fn incomplete_walk_keeps_the_ordinary_inverses() {
     sim.mv_walk_skipping("d", "d.old", Some("d/sub/g"));
     sim.rm_rf("d.old");
     assert_not_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+// Review of #224, item 2: twins are second-tier reports of the same call,
+// never another call's Rename. Item 5: a failed call's refusal goes too.
+
+/// `mv a b` that fails before anything moves, as the shim journals it:
+/// Rename (inode from the daemon's post-ack stat of `to`), then the
+/// outcome naming it. `refusal` journals the AU10 marker a missing `to`
+/// parent attaches.
+fn failed_file_rename(sim: &mut Sim, from: &Path, to: &Path, errno: i32, refusal: bool) {
+    let refusal = refusal.then(|| {
+        sim.emit(CaptureEventKind::CaptureRefused {
+            class: "capture-incomplete".into(),
+            path: to.to_path_buf(),
+            detail: "shim canonicalize tripped on to argument".into(),
+        })
+    });
+    let rename = sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        inode: std::fs::symlink_metadata(to)
+            .map(|m| InodeRef::new(m.dev(), m.ino()))
+            .unwrap_or(InodeRef::new(0, 0)),
+    }));
+    let source = std::fs::symlink_metadata(from)
+        .map(|m| InodeRef::new(m.dev(), m.ino()))
+        .unwrap_or(InodeRef::new(0, 0));
+    sim.emit(CaptureEventKind::RenameOutcome {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        errno,
+        source,
+        dest: InodeRef::new(0, 0),
+        rename: Some(rename),
+        refusal,
+    });
+}
+
+#[test]
+fn failed_rename_then_mkdir_then_successful_retry_keeps_the_retry() {
+    // `mv a d/b` fails (no d), `mkdir d`, `mv a d/b` succeeds.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    let (a, db) = (sim.p("a"), sim.p("d/b"));
+    failed_file_rename(&mut sim, &a, &db, libc::ENOENT, false);
+    sim.mkdir("d");
+    sim.mv("a", "d/b");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn successful_rename_then_failed_retry_keeps_the_first() {
+    // `mv a b` succeeds, then `mv a b` again fails (no a). The daemon's
+    // post-ack stat of the first can land before the rename ran: sentinel.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("a", "b");
+    for e in &mut sim.events {
+        if let CaptureEventKind::TreeOp(TreeOp::Rename { inode, .. }) = &mut e.kind {
+            *inode = InodeRef::new(0, 0);
+        }
+    }
+    let (a, b) = (sim.p("a"), sim.p("b"));
+    failed_file_rename(&mut sim, &a, &b, libc::ENOENT, false);
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn failed_rename_drops_its_own_capture_refusal() {
+    // `mv a missing/b` fails with ENOENT; the shim's canonicalize of `to`
+    // also tripped. Nothing happened, so nothing is refused.
+    let mut sim = Sim::new();
+    sim.seed_file("a", b"alpha\n", 0o640);
+    let before = sim.snapshot();
+    let (a, b) = (sim.p("a"), sim.p("missing/b"));
+    failed_file_rename(&mut sim, &a, &b, libc::ENOENT, true);
+    let nodes = sim.plan_nodes();
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::inverse::InverseOp::Refuse { .. })),
+        "{nodes:#?}"
+    );
     assert_restored(&sim, &before);
 }

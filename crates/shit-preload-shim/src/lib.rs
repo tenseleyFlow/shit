@@ -822,8 +822,22 @@ mod policy {
         arg: String,
         to_abs: String,
         source: (u64, u64),
-        source_is_dir: bool,
+        call_id: u64,
     }
+
+    /// L5 — a process-unique id for one rename-family call, carried on its
+    /// pre-syscall notification and on its outcome. Never 0.
+    fn next_call_id() -> u64 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        // SAFETY: getpid is a plain syscall.
+        let pid = unsafe { libc::getpid() } as u64;
+        (pid << 32) | u64::from(N.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1))
+    }
+
+    /// Bytes of walk pre-images per `rename_walk` notification when a
+    /// rename's frame had to be split.
+    const WALK_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 
     /// Variant of `notify_inner` that ships a directory rename's
     /// recursive subtree pre-images alongside the primary
@@ -845,6 +859,7 @@ mod policy {
         if IN_NOTIFY.with(|f| f.replace(true)) {
             return None;
         }
+        let call_id = next_call_id();
         let source = std::fs::symlink_metadata(from_abs).ok();
         let pre_image = capture_pre_image(capture_path);
         let (extras, walk) = collect_recursive_pre_images(from_abs);
@@ -852,28 +867,32 @@ mod policy {
         // family, overwrite or not. The pre-image carries the
         // destination path on its own; replacing the arg with it left
         // the daemon nothing to journal a TreeOp::Rename from.
-        let sent = try_notify_full(
-            syscall,
-            arg,
-            pre_image.clone(),
-            extras,
-            failure.clone(),
-            Extra {
-                walk: walk.clone(),
-                ..Extra::default()
-            },
-        );
-        // Finding 6: a frame that cannot be sent with the walk must not
-        // take the Rename down with it. Resend without the walk.
-        if sent.is_err() && walk.is_some() {
-            let _ = try_notify_full(
+        let extra = |walk| Extra {
+            walk,
+            call_id,
+            ..Extra::default()
+        };
+        if walk.is_none() {
+            // A file rename: nothing to fall back to, so no copies.
+            let _ = try_notify_full(syscall, arg, pre_image, extras, failure, extra(None));
+        } else {
+            let sent = try_notify_full(
                 syscall,
                 arg,
-                pre_image,
-                Vec::new(),
-                failure,
-                Extra::default(),
+                pre_image.clone(),
+                extras.clone(),
+                failure.clone(),
+                extra(walk),
             );
+            // Finding 6, review item 7: a frame too big with the walk must
+            // lose neither the Rename nor the files' bytes. Send the
+            // pre-images on their own in chunks (`rename_walk`, which
+            // journals no Rename), then the Rename without them. Without
+            // the walk record the planner treats the walk as incomplete.
+            if sent.is_err() {
+                send_walk_chunks(arg, extras, call_id);
+                let _ = try_notify_full(syscall, arg, pre_image, Vec::new(), failure, extra(None));
+            }
         }
         IN_NOTIFY.with(|f| f.set(false));
         Some(RenamePending {
@@ -881,16 +900,56 @@ mod policy {
             arg: arg.to_string(),
             to_abs: capture_path.to_string(),
             source: source.as_ref().map_or((0, 0), |m| (m.dev(), m.ino())),
-            source_is_dir: source.as_ref().is_some_and(|m| m.is_dir()),
+            call_id,
         })
     }
 
-    /// L5 — after a rename-family call returns: report a directory
-    /// rename's result (with the inode now at `to`, the planner's proof
-    /// the rename happened) and any failure (which retracts the Rename
-    /// the pre-syscall notification journaled). Successful file renames
-    /// send nothing, so atomic writes pay no second round trip. Leaves
-    /// errno as the call set it.
+    fn send_walk_chunks(arg: &str, extras: Vec<shit_proto::ShimPreImage>, call_id: u64) {
+        let budget = walk_chunk_bytes();
+        let mut chunk: Vec<shit_proto::ShimPreImage> = Vec::new();
+        let mut bytes = 0u64;
+        let flush = |chunk: &mut Vec<shit_proto::ShimPreImage>| {
+            if !chunk.is_empty() {
+                let _ = try_notify_full(
+                    "rename_walk",
+                    arg,
+                    None,
+                    std::mem::take(chunk),
+                    None,
+                    Extra {
+                        call_id,
+                        ..Extra::default()
+                    },
+                );
+            }
+        };
+        for pre in extras {
+            let cost = pre.bytes.len() as u64 + pre.path.len() as u64 + RECORD_OVERHEAD;
+            if !chunk.is_empty() && bytes + cost > budget {
+                flush(&mut chunk);
+                bytes = 0;
+            }
+            bytes += cost;
+            chunk.push(pre);
+        }
+        flush(&mut chunk);
+    }
+
+    fn walk_chunk_bytes() -> u64 {
+        #[cfg(test)]
+        if let Some(limit) = test_capture::frame_limit() {
+            return (limit / 2) as u64;
+        }
+        WALK_CHUNK_BYTES
+    }
+
+    /// L5 — after a rename-family call returns: report its result with
+    /// the inode now at `to` (the planner's proof a directory rename
+    /// happened) or its errno (which retracts the Rename the pre-syscall
+    /// notification journaled). Every call reports, so the daemon can tell
+    /// each call's own Rename from a second tier's. Nothing waits on the
+    /// daemon's ack, and the daemon matches the call by id instead of
+    /// resolving the pid again. Leaves errno as the call set it.
     pub fn finish_rename(pending: Option<RenamePending>, rc: libc::c_int) {
         use std::os::unix::fs::MetadataExt;
         let Some(p) = pending else {
@@ -902,9 +961,6 @@ mod policy {
         } else {
             saved.raw_os_error().unwrap_or(libc::EIO)
         };
-        if errno == 0 && !p.source_is_dir {
-            return;
-        }
         if disabled() || IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }
@@ -930,6 +986,8 @@ mod policy {
             None,
             Extra {
                 outcome: Some(outcome),
+                call_id: p.call_id,
+                no_ack: true,
                 ..Extra::default()
             },
         );
@@ -1995,6 +2053,9 @@ mod policy {
         walk: Option<shit_proto::ShimWalk>,
         outcome: Option<shit_proto::ShimRenameOutcome>,
         pre_stat: Option<shit_proto::ShimStat>,
+        call_id: u64,
+        /// The outcome is not waited on: nothing acts on its ack.
+        no_ack: bool,
     }
 
     /// [`try_notify`] with the L5 rename fields.
@@ -2010,6 +2071,8 @@ mod policy {
             walk,
             outcome,
             pre_stat,
+            call_id,
+            no_ack,
         } = extra;
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
@@ -2020,7 +2083,7 @@ mod policy {
 
         #[cfg(test)]
         if test_capture::active() {
-            test_capture::push(ShimNotification {
+            let note = ShimNotification {
                 pid: 0,
                 syscall: syscall.to_string(),
                 arg: arg.to_string(),
@@ -2031,7 +2094,14 @@ mod policy {
                 walk,
                 outcome,
                 pre_stat,
-            });
+                call_id,
+            };
+            if let Some(limit) = test_capture::frame_limit()
+                && encode_frame_large(&note).map_or(true, |f| f.len() > limit)
+            {
+                return Err(std::io::Error::other("frame over the test limit"));
+            }
+            test_capture::push(note);
             return Ok(());
         }
         let path = socket_path();
@@ -2087,6 +2157,7 @@ mod policy {
             walk,
             outcome,
             pre_stat,
+            call_id,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
@@ -2105,6 +2176,11 @@ mod policy {
         // Best-effort ack read. We don't actually act on the ack today
         // (Allow-always), but draining it lets the listener's per-conn
         // task observe a clean close. Errors here are non-fatal.
+        // L5 (review item 9): a rename outcome is sent after the syscall
+        // and nothing waits on it, so do not hold the caller up for it.
+        if no_ack {
+            return Ok(());
+        }
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).unwrap_or(0);
         if n > 0 {
@@ -2121,6 +2197,16 @@ mod policy {
         thread_local! {
             static NOTES: RefCell<Option<Vec<shit_proto::ShimNotification>>> =
                 const { RefCell::new(None) };
+            static LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        }
+        /// Frames larger than this fail to send, as an oversized frame
+        /// would.
+        pub fn frame_limit() -> Option<usize> {
+            LIMIT.with(|l| l.get())
+        }
+        #[cfg_attr(target_os = "macos", allow(dead_code))]
+        pub fn set_frame_limit(limit: Option<usize>) {
+            LIMIT.with(|l| l.set(limit));
         }
         pub fn active() -> bool {
             NOTES.with(|n| n.borrow().is_some())

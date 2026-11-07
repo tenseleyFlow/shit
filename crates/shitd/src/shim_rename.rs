@@ -128,7 +128,67 @@ pub(crate) fn ingest_walk(
     }
 }
 
-/// Journal a rename's post-syscall outcome.
+/// One rename-family call's pre-syscall journal rows, by the shim's call
+/// id, until its outcome arrives.
+struct Call {
+    command: CommandId,
+    rename: Option<EventId>,
+    refusal: Option<EventId>,
+    at: std::time::Instant,
+}
+
+/// Calls older than this are dropped: their outcome is not coming.
+const CALL_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn calls() -> &'static std::sync::Mutex<HashMap<u64, Call>> {
+    static CALLS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Call>>> =
+        std::sync::OnceLock::new();
+    CALLS.get_or_init(Default::default)
+}
+
+/// Record what a rename-family call's pre-syscall notification journaled.
+pub(crate) fn remember_call(
+    call_id: u64,
+    command: CommandId,
+    rename: Option<EventId>,
+    refusal: Option<EventId>,
+) {
+    if call_id == 0 {
+        return;
+    }
+    let mut calls = calls().lock().unwrap_or_else(|e| e.into_inner());
+    calls.retain(|_, c| c.at.elapsed() < CALL_TTL);
+    calls.insert(
+        call_id,
+        Call {
+            command,
+            rename,
+            refusal,
+            at: std::time::Instant::now(),
+        },
+    );
+}
+
+fn known_command(call_id: u64) -> Option<CommandId> {
+    let calls = calls().lock().unwrap_or_else(|e| e.into_inner());
+    calls.get(&call_id).map(|c| c.command)
+}
+
+/// The command an outcome belongs to, from its call's pre-syscall
+/// notification instead of a second ancestor walk (review item 9). That
+/// notification is journaled just after its ack, so give it a moment.
+pub(crate) async fn await_call(call_id: u64) -> Option<CommandId> {
+    for _ in 0..100 {
+        if let Some(c) = known_command(call_id) {
+            return Some(c);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// Journal a rename's post-syscall outcome, naming the Rename and refusal
+/// its call journaled.
 pub(crate) fn ingest_outcome(
     note: &ShimNotification,
     outcome: &ShimRenameOutcome,
@@ -136,6 +196,11 @@ pub(crate) fn ingest_outcome(
     ts: TimePoint,
     index: &Index,
 ) {
+    let call = calls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&note.call_id);
+    let (rename, refusal) = call.map_or((None, None), |c| (c.rename, c.refusal));
     let Some((from, to)) = note.arg.split_once('\t') else {
         debug!(pid = note.pid, arg = %note.arg, "shim notify: rename outcome without from\\tto; dropping");
         return;
@@ -151,6 +216,8 @@ pub(crate) fn ingest_outcome(
             errno: outcome.errno,
             source: InodeRef::new(outcome.source_dev, outcome.source_inode),
             dest: InodeRef::new(outcome.dest_dev, outcome.dest_inode),
+            rename,
+            refusal,
         },
     };
     if let Err(e) = index.put_event(&event) {
@@ -237,6 +304,7 @@ mod tests {
             walk,
             outcome,
             pre_stat: None,
+            call_id: 0,
         }
     }
 
@@ -321,31 +389,115 @@ mod tests {
     }
 
     #[test]
-    fn outcome_journals_only_a_rename_outcome() {
-        let out = ShimRenameOutcome {
-            errno: libc::ENOTEMPTY,
-            source_dev: 64,
-            source_inode: 10,
-            dest_dev: 0,
-            dest_inode: 0,
+    fn outcome_names_the_rename_and_refusal_its_call_journaled() {
+        // Review items 2 and 5: the pre-syscall note (with an AU10
+        // marker) and its outcome share a call id; the outcome event names
+        // both rows, and no pid resolution is needed for it.
+        let (_tmp, index, blobs, command) = fixture();
+        let mut pre = note(None, None);
+        pre.extra_pre_images.clear();
+        pre.call_id = 0x1234_0000_0001;
+        pre.failure = Some(shit_proto::ShimFailure::CanonicalizeFailed {
+            which_arg: "to".into(),
+            attempted_path: "/tmp/l5/t".into(),
+            error_chain: "ENOENT".into(),
+        });
+        crate::shim_listener::ingest_notification_for_test(
+            &pre,
+            Some(command),
+            TimePoint::new(5, 0),
+            &index,
+            &blobs,
+            &LiveBaseline::new(),
+        );
+        let mut post = note(
+            None,
+            Some(ShimRenameOutcome {
+                errno: libc::ENOENT,
+                source_dev: 64,
+                source_inode: 10,
+                dest_dev: 0,
+                dest_inode: 0,
+            }),
+        );
+        post.call_id = pre.call_id;
+        let resolved = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(await_call(post.call_id));
+        assert_eq!(resolved, Some(command));
+        crate::shim_listener::ingest_notification_for_test(
+            &post,
+            resolved,
+            TimePoint::new(6, 0),
+            &index,
+            &blobs,
+            &LiveBaseline::new(),
+        );
+        let events = index.events_for_command(command);
+        let id_of = |pred: &dyn Fn(&CaptureEventKind) -> bool| {
+            events.iter().find(|e| pred(&e.kind)).map(|e| e.id)
         };
-        let kinds = ingest(&note(None, Some(out)));
-        assert_eq!(kinds.len(), 1, "{kinds:#?}");
-        match &kinds[0] {
-            CaptureEventKind::RenameOutcome {
-                from,
-                to,
-                errno,
-                source,
-                dest,
-            } => {
-                assert_eq!(from, &PathBuf::from("/tmp/l5/d"));
-                assert_eq!(to, &PathBuf::from("/tmp/l5/t"));
-                assert_eq!(*errno, libc::ENOTEMPTY);
-                assert_eq!(*source, InodeRef::new(64, 10));
-                assert_eq!(*dest, InodeRef::new(0, 0));
-            }
-            k => panic!("{k:?}"),
-        }
+        let refusal = id_of(&|k| matches!(k, CaptureEventKind::CaptureRefused { .. }));
+        let rename = id_of(&|k| {
+            matches!(
+                k,
+                CaptureEventKind::TreeOp(shit_planner::TreeOp::Rename { .. })
+            )
+        });
+        assert!(refusal.is_some() && rename.is_some(), "{events:#?}");
+        let outcome = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                CaptureEventKind::RenameOutcome {
+                    from,
+                    to,
+                    errno,
+                    source,
+                    dest,
+                    rename,
+                    refusal,
+                } => Some((
+                    from.clone(),
+                    to.clone(),
+                    *errno,
+                    *source,
+                    *dest,
+                    *rename,
+                    *refusal,
+                )),
+                _ => None,
+            })
+            .expect("outcome");
+        assert_eq!(
+            outcome,
+            (
+                PathBuf::from("/tmp/l5/d"),
+                PathBuf::from("/tmp/l5/t"),
+                libc::ENOENT,
+                InodeRef::new(64, 10),
+                InodeRef::new(0, 0),
+                rename,
+                refusal,
+            )
+        );
+    }
+
+    #[test]
+    fn walk_chunks_journal_pre_images_and_no_rename() {
+        let mut n = note(None, None);
+        n.syscall = "rename_walk".into();
+        let kinds = ingest(&n);
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::FilePreImage {
+                    source: shit_planner::FilePreImageSource::ShimRenameSubtree,
+                    ..
+                }]
+            ),
+            "{kinds:#?}"
+        );
     }
 }

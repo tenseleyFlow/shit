@@ -216,7 +216,14 @@ async fn handle_one(
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    let resolved = active.resolve_by_descendant(note.pid);
+    // L5 (review item 9): a rename's outcome belongs to the command its
+    // pre-syscall notification resolved; match it by call id, with no
+    // second ancestor walk.
+    let resolved = if note.outcome.is_some() {
+        None
+    } else {
+        active.resolve_by_descendant(note.pid)
+    };
 
     // Reserve journal order before allowing the intercepted syscall to
     // run. Ingestion itself remains fail-open and happens after the ACK,
@@ -237,6 +244,12 @@ async fn handle_one(
     if let Err(e) = stream.write_all(&frame).await {
         debug!(err = %e, pid = note.pid, "shim ack write failed; ingesting anyway");
     }
+    // The outcome's call is journaled by its pre-syscall notification's
+    // own task, which may still be running.
+    let resolved = match resolved {
+        None if note.outcome.is_some() => crate::shim_rename::await_call(note.call_id).await,
+        r => r,
+    };
 
     ingest_notification(
         &note,
@@ -340,6 +353,8 @@ fn ingest_notification(
     // the partial capture); the journaled refusal ensures the
     // planner surfaces the gap as an InverseOp::Refuse node at undo
     // time instead of silently mis-attributing.
+    // L5: the refusal this notification journals, for its rename's outcome.
+    let mut refusal_id = None;
     if let Some(failure) = &note.failure {
         let (class, primary_path, detail) = match failure {
             shit_proto::ShimFailure::CanonicalizeFailed {
@@ -374,21 +389,23 @@ fn ingest_notification(
                 detail,
             },
         };
-        if let Err(e) = index.put_event(&event) {
-            warn!(
+        match index.put_event(&event) {
+            Err(e) => warn!(
                 err = %e,
                 pid = note.pid,
                 syscall = %note.syscall,
                 "shim notify: CaptureRefused journal failed"
-            );
-        } else {
-            debug!(
+            ),
+            Ok(id) => {
+                refusal_id = Some(id);
+                debug!(
                 pid = note.pid,
                 syscall = %note.syscall,
                 session = %command.session,
                 seq = command.seq,
                 "shim notify: journaled CaptureRefused (AU10)"
-            );
+                );
+            }
         }
         // Fall through — the syscall may have attached a partial
         // pre_image too (e.g., `from` canonicalized but `to`
@@ -568,6 +585,13 @@ fn ingest_notification(
         return;
     }
 
+    // L5 (review item 7): a walk too big for one frame arrives as
+    // pre-image chunks ahead of its Rename; they journal no Rename.
+    if note.syscall == "rename_walk" {
+        crate::shim_rename::ingest_walk(note, command, ingest_ts, index, blob_store);
+        return;
+    }
+
     // W06.A.4: a rename notification with an attached pre-image is
     // an atomic-replace shape (e.g. `install` writes a tmpfile then
     // renames it over an existing dst). Journal BOTH the TreeOp::Rename
@@ -688,9 +712,15 @@ fn ingest_notification(
         partial: false,
         kind,
     };
-    if let Err(e) = index.put_event(&event) {
-        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
-        return;
+    let id = match index.put_event(&event) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
+            return;
+        }
+    };
+    if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2") {
+        crate::shim_rename::remember_call(note.call_id, command, Some(id), refusal_id);
     }
     debug!(
         pid = note.pid,
@@ -1182,6 +1212,7 @@ mod tests {
                 walk: None,
                 outcome: None,
                 pre_stat: None,
+                call_id: 0,
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
@@ -1318,6 +1349,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let reserved_ts = TimePoint::new(778, 43);
 
@@ -1416,6 +1448,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         ingest_notification(
             &note,
@@ -1477,6 +1510,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let fifo = tmp.path().join("p");
         let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -1518,6 +1552,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
         ingest_notification(
@@ -1602,6 +1637,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         }
     }
 
@@ -1685,6 +1721,7 @@ mod tests {
             walk: None,
             outcome: None,
             pre_stat: None,
+            call_id: 0,
         };
         for (stat, want_mode) in [
             (
