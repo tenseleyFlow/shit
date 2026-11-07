@@ -70,11 +70,36 @@ pub enum RedirectOp {
     DdOf,
 }
 
+/// How a token was quoted on the command line. The parser strips the
+/// quote characters, so this is the only record of whether the shell
+/// would expand `~`, `$VAR` and the like in the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Quote {
+    /// No quote characters: tilde, parameter and glob expansion apply.
+    None,
+    /// Only single-quoted segments: the text is literal.
+    Single,
+    /// Only double-quoted segments: `$` and backticks still expand,
+    /// tilde and globs do not.
+    Double,
+    /// Both kinds, or a quoted segment glued to an unquoted one.
+    Mixed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectTarget {
     pub op: RedirectOp,
-    /// Path as it appears in the command line — unexpanded.
+    /// Path as it appears in the command line, with quote characters
+    /// removed and nothing expanded.
     pub path: String,
+    /// How the path token was quoted.
+    pub quote: Quote,
+    /// True when nothing earlier on the line can change the working
+    /// directory, so a relative `path` resolves against the cwd the
+    /// parser's caller sees. False after `cd`, `pushd`, `popd`, a
+    /// subshell, a brace group, command substitution, `eval`, `source`
+    /// and the like. Aliases and functions are invisible here.
+    pub cwd_stable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -93,7 +118,7 @@ impl RedirectAnalysis {
 /// analysis if no redirects are found (or the line is too complex to
 /// parse safely).
 pub fn parse_redirects(line: &str) -> RedirectAnalysis {
-    let tokens = tokenize(line);
+    let (tokens, quotes): (Vec<String>, Vec<Quote>) = tokenize(line).into_iter().unzip();
     let mut targets = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -105,6 +130,8 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                 targets.push(RedirectTarget {
                     op: RedirectOp::DdOf,
                     path: path.to_string(),
+                    quote: quotes[i],
+                    cwd_stable: cwd_stable(&tokens[..i]),
                 });
             }
             i += 1;
@@ -118,7 +145,7 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                 .map(|s| s == "-a" || s == "--append")
                 .unwrap_or(false);
             let path_start = if append { i + 2 } else { i + 1 };
-            for p in tokens.iter().skip(path_start) {
+            for (pi, p) in tokens.iter().enumerate().skip(path_start) {
                 if is_pipe_or_control(p) {
                     break;
                 }
@@ -135,6 +162,8 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                         RedirectOp::TeeTruncate
                     },
                     path: p.clone(),
+                    quote: quotes[pi],
+                    cwd_stable: cwd_stable(&tokens[..i]),
                 });
             }
             i += 1;
@@ -144,6 +173,8 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
         // only — `>file` (no space) is also legal in real shells, so
         // catch that variant too.
         if let Some((op, attached_path)) = classify_redirect_token(tok) {
+            let op_idx = i;
+            let mut quote = quotes[i];
             let path = if let Some(p) = attached_path {
                 // `>file` glued form.
                 p.to_string()
@@ -158,11 +189,17 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
                     continue;
                 }
                 let p = tokens[j].clone();
+                quote = quotes[j];
                 i = j;
                 p
             };
             if !is_special_path(&path) && !is_fd_dup_target(&path) {
-                targets.push(RedirectTarget { op, path });
+                targets.push(RedirectTarget {
+                    op,
+                    path,
+                    quote,
+                    cwd_stable: cwd_stable(&tokens[..op_idx]),
+                });
             }
         }
         i += 1;
@@ -170,7 +207,7 @@ pub fn parse_redirects(line: &str) -> RedirectAnalysis {
     // Dedupe identical (op, path) pairs (a line like `>f >f` is
     // legal but only needs one pre-stash).
     let mut seen = HashSet::new();
-    targets.retain(|t| seen.insert((t.op, t.path.clone())));
+    targets.retain(|t| seen.insert((t.op, t.path.clone(), t.quote, t.cwd_stable)));
     RedirectAnalysis { targets }
 }
 
@@ -203,44 +240,106 @@ fn classify_redirect_token(tok: &str) -> Option<(RedirectOp, Option<&str>)> {
     None
 }
 
-/// Tokenize on whitespace, respecting single and double quotes.
+/// Words that can change the shell's working directory or run code the
+/// parser cannot see through.
+const CWD_CHANGING_WORDS: &[&str] = &[
+    "cd", "pushd", "popd", "chdir", "eval", "source", ".", "exec", "builtin", "command", "env",
+    "sudo", "sh", "bash", "zsh", "fish", "dash",
+];
+
+/// True when no token in `prefix` (everything before a redirect) can
+/// change the working directory. Unsure counts as changed: a token with
+/// a subshell, brace group, backtick or `$(` is treated as a change.
+fn cwd_stable(prefix: &[String]) -> bool {
+    !prefix
+        .iter()
+        .any(|t| CWD_CHANGING_WORDS.contains(&t.as_str()) || t.contains(['(', ')', '{', '}', '`']))
+}
+
+/// Tokenize on whitespace, respecting single and double quotes, and
+/// record how each token was quoted.
 /// Backslash-escapes are NOT honored — we treat them as literal
 /// characters (a quoted form is the common case, and getting backslash
 /// semantics right requires the full shell grammar).
-fn tokenize(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
+fn tokenize(line: &str) -> Vec<(String, Quote)> {
+    fn kind(single: bool, double: bool) -> Quote {
+        match (single, double) {
+            (false, false) => Quote::None,
+            (true, false) => Quote::Single,
+            (false, true) => Quote::Double,
+            (true, true) => Quote::Mixed,
+        }
+    }
+    let mut out: Vec<(String, Quote)> = Vec::new();
     let mut cur = String::new();
+    // Segments seen in the current token: quoted-single, quoted-double,
+    // and bare (unquoted characters).
+    let (mut saw_single, mut saw_double, mut saw_bare) = (false, false, false);
     let mut in_single = false;
     let mut in_double = false;
+    let finish = |cur: &mut String,
+                  out: &mut Vec<(String, Quote)>,
+                  s: &mut bool,
+                  d: &mut bool,
+                  b: &mut bool| {
+        if !cur.is_empty() {
+            let q = if *b && (*s || *d) {
+                Quote::Mixed
+            } else {
+                kind(*s, *d)
+            };
+            out.push((std::mem::take(cur), q));
+        }
+        *s = false;
+        *d = false;
+        *b = false;
+    };
     for c in line.chars() {
         if c == '\'' && !in_double {
             in_single = !in_single;
+            saw_single = true;
             continue;
         }
         if c == '"' && !in_single {
             in_double = !in_double;
+            saw_double = true;
             continue;
         }
         if c.is_whitespace() && !in_single && !in_double {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
+            finish(
+                &mut cur,
+                &mut out,
+                &mut saw_single,
+                &mut saw_double,
+                &mut saw_bare,
+            );
             continue;
         }
         // Pipe / semicolon / ampersand break tokens too (so `cmd|tee`
         // becomes `cmd | tee`). Same for `&&` / `||` / `;` boundaries.
         if !in_single && !in_double && matches!(c, '|' | ';' | '&') {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-            out.push(c.to_string());
+            finish(
+                &mut cur,
+                &mut out,
+                &mut saw_single,
+                &mut saw_double,
+                &mut saw_bare,
+            );
+            out.push((c.to_string(), Quote::None));
             continue;
+        }
+        if !in_single && !in_double {
+            saw_bare = true;
         }
         cur.push(c);
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
+    finish(
+        &mut cur,
+        &mut out,
+        &mut saw_single,
+        &mut saw_double,
+        &mut saw_bare,
+    );
     out
 }
 
@@ -533,5 +632,44 @@ mod tests {
         let t = parse("echo > ~/log.txt");
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].path, "~/log.txt");
+    }
+
+    // ----- quoting and cwd stability -----
+
+    fn first(line: &str) -> RedirectTarget {
+        parse(line).into_iter().next().expect("one target")
+    }
+
+    #[test]
+    fn quote_kinds_are_recorded() {
+        assert_eq!(first("echo > ~/x").quote, Quote::None);
+        assert_eq!(first("echo > '~/x'").quote, Quote::Single);
+        assert_eq!(first("echo > \"$HOME/x\"").quote, Quote::Double);
+        assert_eq!(first("echo > 'a'\"b\"").quote, Quote::Mixed);
+        assert_eq!(first("echo > 'a'b").quote, Quote::Mixed);
+        assert_eq!(first("echo > 'notes (draft).txt'").quote, Quote::Single);
+        // Glued form: the operator is bare text in the same token, so the
+        // kind is the conservative Mixed (no expansion either way).
+        assert_eq!(first("echo >'~/x'").quote, Quote::Mixed);
+    }
+
+    #[test]
+    fn cwd_stable_until_something_can_change_it() {
+        assert!(first("echo x > out").cwd_stable);
+        assert!(first("make 2>&1 | tee out").cwd_stable);
+        for line in [
+            "cd sub && echo x > out",
+            "pushd sub; echo x > out",
+            "popd && echo x > out",
+            "(cd sub; echo x) > out",
+            "{ cd sub; echo x; } > out",
+            "eval 'cd sub' && echo x > out",
+            "source env.sh && echo x > out",
+            "cd sub && dd if=a of=out",
+            "cd sub && echo x | tee out",
+            "echo $(cd sub; pwd) > out",
+        ] {
+            assert!(!first(line).cwd_stable, "{line}");
+        }
     }
 }
