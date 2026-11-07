@@ -1598,6 +1598,7 @@ impl PumpState {
             // because the original is what undo needs to restore.
             flags: rec.flags,
             rdev: 0,
+            device_token: None,
         };
 
         if let Err(e) = self

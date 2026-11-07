@@ -885,6 +885,7 @@ fn dispatch_response(
             fd_sent_via_scm: _,
             flags,
             rdev,
+            device_token,
         } => {
             let Some(staging) = fd else {
                 // AR01.1.fix-marker-only — when the helper lost the
@@ -912,15 +913,7 @@ fn dispatch_response(
                     // `git clean -fd` undo restores the dir as a
                     // dir, not a regular file.
                     let kind = kind_from_mode_bits(mode);
-                    // L4 - a device node's number and owner come from
-                    // the helper's fstat on the held fd, and only for
-                    // a node the mode bits say is a device.
-                    let device = matches!(
-                        kind,
-                        shit_planner::metadata::FileKind::BlockDevice
-                            | shit_planner::metadata::FileKind::CharDevice
-                    )
-                    .then_some(shit_planner::DeviceNode { rdev, uid, gid });
+                    let device = device_capture(kind, rdev, mode, uid, gid, device_token);
                     if let Err(e) = journal_unlink_with_device(
                         index, command, ts, inode_ref, path_buf, kind, mode, device,
                     ) {
@@ -1550,6 +1543,46 @@ fn journal_unlink_idempotent(
     journal_unlink_with_device(index, command, ts, inode_ref, path, kind, mode, None)
 }
 
+/// L4b - what the daemon journals beside a device `Unlink`. Only built
+/// from a helper capture that carries both a device number and a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceCapture {
+    rdev: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    token: shit_planner::CaptureToken,
+}
+
+/// L4 / L4b ruling 6 - a `DeviceNodeMeta` is journaled only for a node
+/// the mode bits say is a device, with a nonzero rdev and the helper's
+/// token. Anything less is no capture at all: the `Unlink` alone is
+/// journaled, and undo gives the "no device number captured" refusal.
+fn device_capture(
+    kind: shit_planner::metadata::FileKind,
+    rdev: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    token: Option<shit_proto::CaptureToken>,
+) -> Option<DeviceCapture> {
+    use shit_planner::metadata::FileKind;
+    if !matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) || rdev == 0 {
+        return None;
+    }
+    let token = token?;
+    Some(DeviceCapture {
+        rdev,
+        mode,
+        uid,
+        gid,
+        token: shit_planner::CaptureToken {
+            helper: token.helper,
+            mac: token.mac,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn journal_unlink_with_device(
     index: &Index,
@@ -1559,7 +1592,7 @@ fn journal_unlink_with_device(
     path: std::path::PathBuf,
     kind: shit_planner::metadata::FileKind,
     mode: u32,
-    device: Option<shit_planner::DeviceNode>,
+    device: Option<DeviceCapture>,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::PlannerStore;
     let already = index.events_for_command(command).into_iter().any(|e| {
@@ -1587,8 +1620,9 @@ fn journal_unlink_with_device(
     index.put_event(&unlink_ev).map_err(|e| {
         HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
     })?;
-    // L4 - the device number and owner ride in their own event, so the
-    // Unlink row keeps its stored shape. The planner pairs them.
+    // L4 - the device number, mode, owner and the helper's token ride in
+    // their own event, so the Unlink row keeps its stored shape. The
+    // planner pairs them by (dev, ino) and journal order.
     if let Some(d) = device {
         let meta_ev = CaptureEvent {
             id: EventId(0),
@@ -1599,8 +1633,10 @@ fn journal_unlink_with_device(
                 inode: inode_ref,
                 path,
                 rdev: d.rdev,
+                mode: d.mode,
                 uid: d.uid,
                 gid: d.gid,
+                token: d.token,
             }),
         };
         index.put_event(&meta_ev).map_err(|e| {
@@ -1844,6 +1880,29 @@ mod tests_kind_from_mode_bits {
     fn unknown_falls_through_to_regular() {
         // mode=0 (helper lost race to stat the unlinked inode).
         assert_eq!(kind_from_mode_bits(0), FileKind::Regular);
+    }
+
+    /// L4b ruling 6: no meta row without a device kind, a nonzero rdev
+    /// and the helper's token.
+    #[test]
+    fn device_capture_needs_kind_rdev_and_token() {
+        let t = Some(shit_proto::CaptureToken {
+            helper: [1; 16],
+            mac: [2; 32],
+        });
+        let chr = FileKind::CharDevice;
+        assert_eq!(device_capture(chr, 0, 0o020600, 1, 1, t), None);
+        assert_eq!(device_capture(chr, 0x103, 0o020600, 1, 1, None), None);
+        assert_eq!(
+            device_capture(FileKind::Fifo, 0x103, 0o010600, 1, 1, t),
+            None
+        );
+        let got = device_capture(FileKind::BlockDevice, 0x803, 0o060600, 1, 2, t).unwrap();
+        assert_eq!(
+            (got.rdev, got.mode, got.uid, got.gid),
+            (0x803, 0o060600, 1, 2)
+        );
+        assert_eq!(got.token.mac, [2; 32]);
     }
 }
 

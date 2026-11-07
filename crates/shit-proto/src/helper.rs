@@ -40,7 +40,11 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// (an observation that capture for a command is incomplete) and
 /// `HelperResponse::UnwatchTreeFlushed` (the close barrier for
 /// `UnwatchTree`).
-pub const HELPER_PROTOCOL_VERSION: u16 = 5;
+///
+/// **Version 6 (L4/L4b):** `CapturedPreImage` gained `rdev` and
+/// `device_token`; `ApplyMknod` carries `DeviceEvidence`;
+/// `PrivilegedOpOutcome` gained `Conflict` and `Refused`.
+pub const HELPER_PROTOCOL_VERSION: u16 = 6;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -242,10 +246,40 @@ pub enum HelperRequest {
         /// Major + minor packed via libc::makedev. Ignored when
         /// `mode` indicates a FIFO.
         dev: u64,
-        /// L4 - uid/gid for a block/char node. The helper applies it
-        /// to the node it just created, never to a pre-existing path.
-        owner: Option<(u32, u32)>,
+        /// L4b - the capture evidence for a block/char node: the
+        /// token the helper issued when it saw the node unlinked, and
+        /// the fields that token covers beyond `path`, `mode` and
+        /// `dev`. The helper refuses a device mknod without it, or when
+        /// the token does not verify against every requested field.
+        device: Option<DeviceEvidence>,
     },
+}
+
+/// L4b - opaque proof that this helper process observed a device node
+/// being unlinked. `helper` names the helper process that issued it (a
+/// random id chosen at helper start, so a restarted helper can say why
+/// it refuses); `mac` is HMAC-SHA256 under a key that never leaves that
+/// process. The daemon stores and returns both; it cannot mint one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureToken {
+    pub helper: [u8; 16],
+    pub mac: [u8; 32],
+}
+
+/// L4b - the captured identity of a device node, sent back with an
+/// `ApplyMknod` so the helper can check its token. `session` and
+/// `command_seq` are those of the command that removed the node, not of
+/// the undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEvidence {
+    pub uid: u32,
+    pub gid: u32,
+    /// `(st_dev, st_ino)` of the removed node.
+    pub dev: u64,
+    pub inode: u64,
+    pub session: Uuid,
+    pub command_seq: u64,
+    pub token: CaptureToken,
 }
 
 /// Helper → daemon message catalog. The helper reports its capabilities,
@@ -375,6 +409,11 @@ pub enum HelperResponse {
         /// with `is_delete` and a device `mode`.
         #[serde(default)]
         rdev: u64,
+        /// L4b - set only for a block/char node the helper saw being
+        /// unlinked through a held fd: its proof of the capture, which
+        /// a later `ApplyMknod` must present. See [`CaptureToken`].
+        #[serde(default)]
+        device_token: Option<CaptureToken>,
     },
     /// W02.B.live-baseline — one regular file's content snapshot,
     /// captured at session-open by the helper-side baseline walker
@@ -552,6 +591,13 @@ pub enum PrivilegedOpOutcome {
     PermissionDenied,
     /// Path no longer exists. Race between capture and undo.
     NotFound,
+    /// L4b - something already at the path differs from what was
+    /// captured; the helper left it alone.
+    Conflict { detail: String },
+    /// L4b - the helper will not do this on the evidence it has (no or
+    /// bad capture token, an owner it cannot give, a path it cannot
+    /// reach without following a symlink). Nothing was changed.
+    Refused { reason: String },
     /// Any other helper-side failure.
     Failed { err: String },
 }
@@ -923,7 +969,9 @@ mod tests {
         //     for chmod/chown/touch (NOTE_ATTRIB).
         //   Version 5 (R3 slice A) added `CaptureRefused` and
         //     `UnwatchTreeFlushed`.
-        assert_eq!(HELPER_PROTOCOL_VERSION, 5);
+        //   Version 6 (L4/L4b) added device rdev, capture tokens and
+        //     the Conflict/Refused privileged-op outcomes.
+        assert_eq!(HELPER_PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -1040,6 +1088,7 @@ mod tests {
             fd_sent_via_scm: true,
             flags: 0,
             rdev: 0,
+            device_token: None,
         };
         let bytes = encode_frame(&ev).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
@@ -1067,6 +1116,7 @@ mod tests {
             is_delete: false,
             fd_sent_via_scm: true,
             rdev: 0,
+            device_token: None,
         };
         let err = validate_outgoing(&ev).unwrap_err();
         assert!(matches!(err, HelperProtoError::PathHintTooLong { .. }));

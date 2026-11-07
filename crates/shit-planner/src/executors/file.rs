@@ -211,6 +211,14 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                             "chown {path:?}: ENOENT (path vanished between capture and undo)"
                         ),
                     },
+                    PrivilegedOpOutcome::Conflict { detail } => ExecutionOutcome::Conflict {
+                        kind: crate::inverse::Conflict::Hard {
+                            detail: format!("chown {path:?}: {detail}"),
+                        },
+                    },
+                    PrivilegedOpOutcome::Refused { reason } => ExecutionOutcome::Failed {
+                        err: format!("chown {path:?}: helper refused: {reason}"),
+                    },
                     PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
                         err: format!("chown {path:?} via helper: {err}"),
                     },
@@ -261,9 +269,9 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         // privileged-op router (the helper has CAP_MKNOD). The
         // local recreate_path_inner handles Regular/Directory only.
         // L4 - BlockDevice/CharDevice take the same route with the
-        // journaled rdev and owner (the helper chowns the node it just
-        // made); without a journaled device number they are refused
-        // rather than guessed.
+        // journaled capture (rdev, mode, owner, and the helper's capture
+        // token, L4b). Without a journaled device number they are
+        // refused rather than guessed.
         let is_device = matches!(kind, FileKind::BlockDevice | FileKind::CharDevice);
         if is_device && device.is_none() {
             return ExecutionOutcome::Failed {
@@ -287,10 +295,15 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             }
             // mode wire carries perm bits + S_IF* kind. The router
             // dispatches into the helper which calls libc::mknod
-            // with S_IFIFO/S_IFSOCK | perm_bits.
-            let rdev = device.map(|d| d.rdev).unwrap_or(0);
-            let owner = device.map(|d| (d.uid, d.gid));
-            let made = self.privileged_router.mknod(path, *mode, rdev, owner);
+            // with S_IFIFO/S_IFSOCK | perm_bits. A device sends the
+            // captured mode, which is what its token covers.
+            let (send_mode, rdev) = match device {
+                Some(d) => (d.mode, d.rdev),
+                None => (*mode, 0),
+            };
+            let made = self
+                .privileged_router
+                .mknod(path, send_mode, rdev, device.as_ref());
             return match made {
                 PrivilegedOpOutcome::Applied => ExecutionOutcome::Applied,
                 PrivilegedOpOutcome::OutOfScope => ExecutionOutcome::Failed {
@@ -303,6 +316,14 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                 },
                 PrivilegedOpOutcome::NotFound => ExecutionOutcome::Failed {
                     err: format!("mknod {path:?} kind={kind:?}: parent path missing"),
+                },
+                PrivilegedOpOutcome::Conflict { detail } => ExecutionOutcome::Conflict {
+                    kind: crate::inverse::Conflict::Hard {
+                        detail: format!("mknod {path:?} kind={kind:?}: {detail}"),
+                    },
+                },
+                PrivilegedOpOutcome::Refused { reason } => ExecutionOutcome::Failed {
+                    err: format!("mknod {path:?} kind={kind:?}: refused: {reason}"),
                 },
                 PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
                     err: format!("mknod {path:?} kind={kind:?}: {err}"),
@@ -1534,55 +1555,80 @@ mod tests {
         );
     }
 
+    fn captured_node(uid: u32, gid: u32) -> crate::metadata::DeviceNode {
+        crate::metadata::DeviceNode {
+            rdev: 0x103,
+            mode: 0o020640,
+            uid,
+            gid,
+            inode: crate::inode::InodeRef::new(1, 5),
+            removed_by: crate::events::CommandId {
+                session: uuid::Uuid::nil(),
+                seq: 3,
+            },
+            token: crate::metadata::CaptureToken {
+                helper: [1; 16],
+                mac: [2; 32],
+            },
+        }
+    }
+
     #[test]
-    fn device_recreate_passes_rdev_and_owner_to_one_mknod_request() {
+    fn device_recreate_sends_the_captured_node_in_one_mknod_request() {
         let reader = InMemoryBlobReader::new();
         let exec = FileExecutor::with_privileged_router(
             &reader,
             crate::executor::InMemoryPrivilegedOpRouter::new(),
         );
-        let dev = crate::metadata::DeviceNode {
-            rdev: 0x103,
-            uid: 7,
-            gid: 9,
-        };
+        let dev = captured_node(7, 9);
         let op = device_op(crate::metadata::FileKind::CharDevice, Some(dev));
         assert_eq!(
             exec.execute(&op, false, ConflictPolicy::default()),
             ExecutionOutcome::Applied
         );
+        // The captured mode (what the token covers) is sent, not the
+        // RecreatePath's own mode.
         assert_eq!(
             exec.privileged_router.mknod_calls.lock().unwrap().clone(),
             vec![(
                 PathBuf::from("/tmp/l4-dev-null"),
-                0o020666,
+                0o020640,
                 0x103,
-                Some((7, 9))
+                Some(dev)
             )]
         );
-        // The owner travels inside the mknod request; the executor
-        // makes no chown of its own.
+        // The executor makes no chown of its own.
         assert!(exec.privileged_router.chown_log().is_empty());
     }
 
     #[test]
-    fn device_recreate_surfaces_out_of_scope() {
+    fn device_recreate_surfaces_helper_refusal_and_conflict() {
         let reader = InMemoryBlobReader::new();
         let router = crate::executor::InMemoryPrivilegedOpRouter::new();
-        router.set_outcome(PrivilegedOpOutcome::OutOfScope);
+        router.set_outcome(PrivilegedOpOutcome::Refused {
+            reason: "capture evidence expired: helper restarted".into(),
+        });
         let exec = FileExecutor::with_privileged_router(&reader, router);
-        let dev = crate::metadata::DeviceNode {
-            rdev: 0x103,
-            uid: 0,
-            gid: 0,
-        };
-        let op = device_op(crate::metadata::FileKind::CharDevice, Some(dev));
+        let op = device_op(
+            crate::metadata::FileKind::CharDevice,
+            Some(captured_node(0, 0)),
+        );
         match exec.execute(&op, false, ConflictPolicy::default()) {
             ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("out of session scope"), "got: {err}");
+                assert!(err.contains("helper restarted"), "got: {err}");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+        exec.privileged_router
+            .set_outcome(PrivilegedOpOutcome::Conflict {
+                detail: "owner differs".into(),
+            });
+        assert!(matches!(
+            exec.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Conflict {
+                kind: crate::inverse::Conflict::Hard { .. }
+            }
+        ));
         assert!(exec.privileged_router.chown_log().is_empty());
     }
 }

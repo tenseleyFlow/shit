@@ -488,6 +488,7 @@ impl PumpState {
             // StatMeta. 0 if the file had no chflags set.
             flags: meta.flags,
             rdev: 0,
+            device_token: None,
             is_delete,
             fd_sent_via_scm: true,
         };

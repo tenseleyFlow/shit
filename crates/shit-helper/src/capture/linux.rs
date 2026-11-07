@@ -481,6 +481,7 @@ impl LinuxCaptureRuntime {
             is_delete,
             fd_sent_via_scm: true,
             rdev: 0,
+            device_token: None,
         };
         if let Err(e) = self
             .conn
@@ -731,6 +732,27 @@ impl LinuxCaptureRuntime {
             (0, [0u8; 32], None, None)
         };
 
+        // L4b - a device node seen through a held fd whose (dev, ino)
+        // matched the event gets a capture token over what fstat said.
+        // That token is the only thing that lets a later ApplyMknod
+        // recreate it.
+        let device_token = match (&meta_wire, race_won && file_type == FileType::Device) {
+            (Some(m), true) if m.rdev != 0 => crate::capture_token::process_key().map(|k| {
+                k.issue(&crate::capture_token::DeviceFacts {
+                    mode: m.mode,
+                    rdev: m.rdev,
+                    uid: m.uid,
+                    gid: m.gid,
+                    dev: ev_dev_userspace,
+                    ino: ev.inode,
+                    path: &resolved_path,
+                    session: ev.command.session,
+                    seq: ev.command.seq,
+                })
+            }),
+            _ => None,
+        };
+
         // Build wire. If we lost the race, `meta_wire` is None — set
         // mode/uid/gid/mtime to 0; the daemon's Delete-restore path
         // does not rely on these for marker-only events.
@@ -764,6 +786,7 @@ impl LinuxCaptureRuntime {
             } else {
                 0
             },
+            device_token,
         };
 
         let send_result = if let Some(ref fd) = staging_fd {
@@ -930,6 +953,7 @@ impl LinuxCaptureRuntime {
             is_delete: false,
             fd_sent_via_scm: true,
             rdev: 0,
+            device_token: None,
         };
         if let Err(e) = self
             .conn
@@ -1402,6 +1426,7 @@ impl LinuxCaptureRuntime {
             is_delete: false,
             fd_sent_via_scm: true,
             rdev: 0,
+            device_token: None,
         };
         if let Err(e) = self
             .conn
@@ -1557,6 +1582,7 @@ impl LinuxCaptureRuntime {
             is_delete: false,
             fd_sent_via_scm: true,
             rdev: 0,
+            device_token: None,
         };
         if let Err(e) = self
             .conn
@@ -1665,6 +1691,7 @@ impl LinuxCaptureRuntime {
                         is_delete: true,
                         fd_sent_via_scm: true,
                         rdev: 0,
+                        device_token: None,
                     };
                     if let Err(e) = self
                         .conn

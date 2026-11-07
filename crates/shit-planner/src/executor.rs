@@ -270,15 +270,15 @@ pub trait PrivilegedOpRouter {
     ) -> PrivilegedOpOutcome;
 
     /// Request mknod for a character/block special file or FIFO.
-    /// `dev` is ignored when `mode` encodes a FIFO. `owner` is the
-    /// uid/gid to give a block/char node the helper just created; the
-    /// helper does it inside the same request, on the node it made.
+    /// `dev` is ignored when `mode` encodes a FIFO. `device` is the
+    /// journaled capture of a block/char node, token included; the
+    /// helper refuses a device mknod without it.
     fn mknod(
         &self,
         path: &std::path::Path,
         mode: u32,
         dev: u64,
-        owner: Option<(u32, u32)>,
+        device: Option<&crate::metadata::DeviceNode>,
     ) -> PrivilegedOpOutcome;
 }
 
@@ -291,6 +291,14 @@ pub enum PrivilegedOpOutcome {
     OutOfScope,
     PermissionDenied,
     NotFound,
+    /// Something already at the path differs from the capture.
+    Conflict {
+        detail: String,
+    },
+    /// The helper would not act on the evidence it was given.
+    Refused {
+        reason: String,
+    },
     Failed {
         err: String,
     },
@@ -311,7 +319,7 @@ impl PrivilegedOpRouter for NoOpPrivilegedOpRouter {
         _: &std::path::Path,
         _: u32,
         _: u64,
-        _: Option<(u32, u32)>,
+        _: Option<&crate::metadata::DeviceNode>,
     ) -> PrivilegedOpOutcome {
         PrivilegedOpOutcome::PermissionDenied
     }
@@ -323,7 +331,14 @@ impl PrivilegedOpRouter for NoOpPrivilegedOpRouter {
 pub struct InMemoryPrivilegedOpRouter {
     pub chown_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u32, bool)>>,
     #[allow(clippy::type_complexity)]
-    pub mknod_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u64, Option<(u32, u32)>)>>,
+    pub mknod_calls: std::sync::Mutex<
+        Vec<(
+            std::path::PathBuf,
+            u32,
+            u64,
+            Option<crate::metadata::DeviceNode>,
+        )>,
+    >,
     pub outcome: std::sync::Mutex<PrivilegedOpOutcome>,
 }
 
@@ -364,12 +379,12 @@ impl PrivilegedOpRouter for InMemoryPrivilegedOpRouter {
         path: &std::path::Path,
         mode: u32,
         dev: u64,
-        owner: Option<(u32, u32)>,
+        device: Option<&crate::metadata::DeviceNode>,
     ) -> PrivilegedOpOutcome {
         self.mknod_calls
             .lock()
             .unwrap()
-            .push((path.to_path_buf(), mode, dev, owner));
+            .push((path.to_path_buf(), mode, dev, device.copied()));
         self.outcome.lock().unwrap().clone()
     }
 }

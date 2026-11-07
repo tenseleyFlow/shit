@@ -237,9 +237,9 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
-    /// L4 - `DeviceNodeMeta` rows by path, for pairing with the
-    /// path's `Unlink`.
-    device_nodes: std::collections::HashMap<PathBuf, (InodeRef, crate::metadata::DeviceNode)>,
+    /// L4b - device captures keyed by the id of the `Unlink` each one
+    /// pairs with exactly (see [`pair_device_nodes`]).
+    device_nodes: std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode>,
     /// Shim chflags snapshots already covered by a kqueue
     /// `MetadataChange` for the same inode and pre-value.
     paired_flags_shims: HashSet<crate::events::EventId>,
@@ -647,29 +647,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
-    let mut device_nodes = std::collections::HashMap::new();
-    for ev in events {
-        if let CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
-            inode,
-            path,
-            rdev,
-            uid,
-            gid,
-        }) = &ev.kind
-        {
-            device_nodes.insert(
-                path.clone(),
-                (
-                    *inode,
-                    crate::metadata::DeviceNode {
-                        rdev: *rdev,
-                        uid: *uid,
-                        gid: *gid,
-                    },
-                ),
-            );
-        }
-    }
+    let device_nodes = pair_device_nodes(events);
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
     EventClassification {
@@ -1233,7 +1211,7 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, class, nodes),
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(ev.id, op, probe, class, nodes),
         CaptureEventKind::ShellStateDiff {
             pwd_before,
             pwd_after,
@@ -1748,7 +1726,68 @@ fn native_delegation_for(
     }
 }
 
+/// L4b - pair each `DeviceNodeMeta` with the `Unlink` it was journaled
+/// after. A pair needs the same nonzero `(dev, ino)`, the same path, a
+/// kind that agrees with the captured mode, and a nonzero rdev; the
+/// meta takes the latest such `Unlink` before it in journal order that
+/// no earlier meta took. A zero inode (the shim's sentinel) never pairs:
+/// an `Unlink` with no exact pair carries no device and is refused at
+/// undo.
+pub(crate) fn pair_device_nodes(
+    events: &[&CaptureEvent],
+) -> std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode> {
+    use crate::metadata::{DeviceNode, FileKind};
+    let mut ordered: Vec<&CaptureEvent> = events.to_vec();
+    ordered.sort_by_key(|e| e.id);
+    let none = InodeRef::new(0, 0);
+    type Open = std::collections::HashMap<(InodeRef, PathBuf), (crate::events::EventId, FileKind)>;
+    let mut open: Open = std::collections::HashMap::new();
+    let mut out = std::collections::HashMap::new();
+    for ev in ordered {
+        match &ev.kind {
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode, path, kind, ..
+            }) if *inode != none
+                && matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) =>
+            {
+                open.insert((*inode, path.clone()), (ev.id, *kind));
+            }
+            CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+                inode,
+                path,
+                rdev,
+                mode,
+                uid,
+                gid,
+                token,
+            }) if *inode != none && *rdev != 0 => {
+                let Some((unlink_id, unlink_kind)) = open.remove(&(*inode, path.clone())) else {
+                    continue;
+                };
+                if FileKind::from_mode(*mode) != Some(unlink_kind) {
+                    continue;
+                }
+                out.insert(
+                    unlink_id,
+                    DeviceNode {
+                        rdev: *rdev,
+                        mode: *mode,
+                        uid: *uid,
+                        gid: *gid,
+                        inode: *inode,
+                        removed_by: ev.command,
+                        token: *token,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn emit_for_tree_op(
+    id: crate::events::EventId,
     op: &TreeOp,
     probe: &dyn StateProbe,
     class: &EventClassification,
@@ -1797,10 +1836,7 @@ fn emit_for_tree_op(
             });
         }
         TreeOp::Unlink {
-            inode,
-            path,
-            kind,
-            mode,
+            path, kind, mode, ..
         } => {
             // W01.B.fix-rename-coalescing: ditto Create's note above —
             // atomic-replace paths get their inverse from FilePreImage.
@@ -1851,15 +1887,7 @@ fn emit_for_tree_op(
                     path: path.clone(),
                     kind: *kind,
                     mode: *mode,
-                    device: class
-                        .device_nodes
-                        .get(path)
-                        .filter(|(meta_inode, _)| {
-                            *meta_inode == *inode
-                                || *inode == InodeRef::new(0, 0)
-                                || *meta_inode == InodeRef::new(0, 0)
-                        })
-                        .map(|(_, d)| *d),
+                    device: class.device_nodes.get(&id).copied(),
                 },
                 cohort: 0,
                 conflict,

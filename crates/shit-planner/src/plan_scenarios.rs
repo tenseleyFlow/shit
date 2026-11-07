@@ -1395,13 +1395,18 @@ fn device_unlink(path: std::path::PathBuf, inode: InodeRef) -> CaptureEventKind 
     })
 }
 
-fn device_meta(path: std::path::PathBuf, inode: InodeRef) -> CaptureEventKind {
+fn device_meta(path: std::path::PathBuf, inode: InodeRef, rdev: u64) -> CaptureEventKind {
     CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
         inode,
         path,
-        rdev: 0x103,
+        rdev,
+        mode: 0o020666,
         uid: 0,
         gid: 0,
+        token: crate::metadata::CaptureToken {
+            helper: [7; 16],
+            mac: [rdev as u8; 32],
+        },
     })
 }
 
@@ -1413,13 +1418,28 @@ fn char_device_plan(
     let p = sim.p("null");
     sim.emit(device_unlink(p.clone(), unlink_inode));
     if let Some(i) = meta_inode {
-        sim.emit(device_meta(p, i));
+        sim.emit(device_meta(p, i, 0x103));
     }
     sim.plan_nodes()
 }
 
+fn recreated_devices(nodes: &[crate::inverse::PlanNode]) -> Vec<Option<u64>> {
+    use crate::inverse::InverseOp;
+    nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            InverseOp::RecreatePath {
+                kind: FileKind::CharDevice,
+                device,
+                ..
+            } => Some(device.map(|d| d.rdev)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn removed_char_device_is_recreated_with_its_journaled_rdev_and_owner() {
+fn removed_char_device_is_recreated_with_its_journaled_capture() {
     use crate::inverse::InverseOp;
     let i = InodeRef::new(1, 5);
     let nodes = char_device_plan(i, Some(i));
@@ -1432,43 +1452,112 @@ fn removed_char_device_is_recreated_with_its_journaled_rdev_and_owner() {
                 mode: 0o020666,
                 device: Some(d),
                 ..
-            } if d.rdev == 0x103 && d.uid == 0 && d.gid == 0
+            } if d.rdev == 0x103
+                && d.uid == 0
+                && d.inode == i
+                && d.removed_by == command_id()
+                && d.token.helper == [7; 16]
         ),
         "{nodes:#?}"
     );
 }
 
 #[test]
-fn shim_unlink_without_an_inode_still_pairs_with_the_helper_meta() {
-    use crate::inverse::InverseOp;
+fn shim_unlink_with_the_zero_inode_does_not_pair() {
+    // L4b ruling 5: (0, 0) is the shim's "no inode" sentinel, not a
+    // wildcard. With no exact pair the node is refused at undo.
     let nodes = char_device_plan(InodeRef::new(0, 0), Some(InodeRef::new(1, 5)));
-    assert!(
-        matches!(
-            &nodes[0].op,
-            InverseOp::RecreatePath {
-                device: Some(_),
-                ..
-            }
-        ),
-        "{nodes:#?}"
-    );
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
+    // A meta row carrying the sentinel pairs with nothing either.
+    let nodes = char_device_plan(InodeRef::new(1, 5), Some(InodeRef::new(0, 0)));
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
 }
 
 #[test]
 fn device_unlink_without_a_meta_row_carries_no_device() {
-    use crate::inverse::InverseOp;
     let i = InodeRef::new(1, 5);
     let nodes = char_device_plan(i, None);
-    assert!(
-        matches!(&nodes[0].op, InverseOp::RecreatePath { device: None, .. }),
-        "{nodes:#?}"
-    );
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
     // A meta row for a different inode is not paired either.
     let nodes = char_device_plan(i, Some(InodeRef::new(1, 6)));
-    assert!(
-        matches!(&nodes[0].op, InverseOp::RecreatePath { device: None, .. }),
-        "{nodes:#?}"
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
+}
+
+#[test]
+fn device_meta_before_its_unlink_or_at_another_path_does_not_pair() {
+    let i = InodeRef::new(1, 5);
+    let mut sim = Sim::new();
+    let p = sim.p("null");
+    let q = sim.p("other");
+    sim.emit(device_meta(p.clone(), i, 0x103));
+    sim.emit(device_unlink(p, i));
+    sim.emit(device_unlink(q.clone(), InodeRef::new(1, 9)));
+    sim.emit(device_meta(q, InodeRef::new(1, 8), 0x105));
+    let nodes = sim.plan_nodes();
+    assert_eq!(recreated_devices(&nodes), vec![None, None], "{nodes:#?}");
+}
+
+#[test]
+fn rm_mknod_rm_pairs_each_unlink_with_its_own_capture() {
+    // The review's sequence: `rm n` (helper capture, inode 5, 1:3),
+    // `mknod n c 1 5` (a new node at the same path), `rm n` again. The
+    // second removal is seen once by the helper (inode 6, 1:5) and once
+    // by the shim (zero inode). Each helper Unlink gets its own capture;
+    // the shim's report gets none, and the first capture never leaks
+    // onto a later removal at the same path.
+    let mut sim = Sim::new();
+    let p = sim.p("n");
+    let first = InodeRef::new(1, 5);
+    let second = InodeRef::new(1, 6);
+    sim.emit(device_unlink(p.clone(), first));
+    sim.emit(device_meta(p.clone(), first, 0x103));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: second,
+        path: p.clone(),
+        kind: FileKind::CharDevice,
+        mode: 0o020666,
+    }));
+    sim.emit(device_unlink(p.clone(), InodeRef::new(0, 0)));
+    sim.emit(device_unlink(p.clone(), second));
+    sim.emit(device_meta(p.clone(), second, 0x105));
+    assert_eq!(
+        device_pairs(&sim),
+        vec![(EventId(1), 0x103), (EventId(5), 0x105)]
     );
+    // Whatever the path-level classification keeps, no capture is
+    // used twice.
+    let nodes = sim.plan_nodes();
+    let devices = recreated_devices(&nodes);
+    for rdev in [0x103, 0x105] {
+        assert!(
+            devices.iter().filter(|d| **d == Some(rdev)).count() <= 1,
+            "{nodes:#?}"
+        );
+    }
+    // Inode reuse: the second node got the first one's inode number.
+    // Journal order still keeps the captures apart, and the shim's
+    // report in between pairs with neither.
+    let mut sim = Sim::new();
+    let p = sim.p("n");
+    sim.emit(device_unlink(p.clone(), first));
+    sim.emit(device_meta(p.clone(), first, 0x103));
+    sim.emit(device_unlink(p.clone(), InodeRef::new(0, 0)));
+    sim.emit(device_unlink(p.clone(), first));
+    sim.emit(device_meta(p.clone(), first, 0x105));
+    assert_eq!(
+        device_pairs(&sim),
+        vec![(EventId(1), 0x103), (EventId(4), 0x105)]
+    );
+}
+
+fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
+    let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
+    let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)
+        .into_iter()
+        .map(|(id, d)| (id, d.rdev))
+        .collect();
+    pairs.sort();
+    pairs
 }
 
 #[test]
@@ -1589,7 +1678,7 @@ impl crate::executor::PrivilegedOpRouter for LocalMknod {
         path: &Path,
         mode: u32,
         _: u64,
-        _: Option<(u32, u32)>,
+        _: Option<&crate::metadata::DeviceNode>,
     ) -> crate::executor::PrivilegedOpOutcome {
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), (mode & 0o777) as _) }, 0);

@@ -1587,8 +1587,13 @@ mod tests {
             inode,
             path: PathBuf::from("/w/null"),
             rdev: 0x103,
+            mode: 0o020666,
             uid: 0,
             gid: 5,
+            token: shit_planner::CaptureToken {
+                helper: [3; 16],
+                mac: [4; 32],
+            },
         };
         idx.put_event(&mk(1, unlink.clone())).unwrap();
         idx.put_event(&mk(2, meta.clone())).unwrap();

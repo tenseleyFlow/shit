@@ -111,10 +111,10 @@ mod tests {
     }
 }
 pub use helper::{
-    AuthDecision, AuthEventKind, FileKindWire, FileMetadataWire, HELPER_PATH_HINT_MAX,
-    HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest, HelperResponse,
-    MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, SelfVerifyReport, SignatureKind, TreeOpWire,
-    validate_outgoing,
+    AuthDecision, AuthEventKind, CaptureToken, DeviceEvidence, FileKindWire, FileMetadataWire,
+    HELPER_PATH_HINT_MAX, HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest,
+    HelperResponse, MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, SelfVerifyReport, SignatureKind,
+    TreeOpWire, validate_outgoing,
 };
 pub use shim::{
     SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage, XattrPreImage,

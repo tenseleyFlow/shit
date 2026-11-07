@@ -26,6 +26,7 @@ mod capsicum_bsd;
     target_os = "macos",
 ))]
 mod capture;
+mod capture_token;
 mod cloud;
 #[cfg(target_os = "macos")]
 mod codesign_verify;
@@ -542,6 +543,20 @@ fn main() -> anyhow::Result<()> {
             tracing::warn!(err = %e, "self-verify: probe failed; continuing");
         }
     }
+
+    // L4b - the capture-token key is drawn now, before the sandbox, and
+    // never leaves this process. Non-dumpable keeps same-user ptrace and
+    // /proc/<pid>/mem off it (a setcap exec already clears the flag;
+    // this covers other starts and checks it stayed clear).
+    #[cfg(target_os = "linux")]
+    let dumpable = capture_token::ensure_non_dumpable();
+    #[cfg(not(target_os = "linux"))]
+    let dumpable = -1;
+    tracing::info!(
+        token_key = capture_token::process_key().is_some(),
+        dumpable,
+        "capture-token key ready"
+    );
 
     // ---- privileged phase ----
     // Open any fd that requires `CAP_SYS_ADMIN` while we still have it,
@@ -2779,7 +2794,6 @@ fn request_loop(
                 if !begin_watch(&conn, &mut active_watches, command) {
                     continue;
                 }
-                record_watched_root(&cwd_path);
                 #[cfg(target_os = "linux")]
                 let attach = linux_watch_tree(
                     &conn,
@@ -3175,9 +3189,9 @@ fn request_loop(
                 path,
                 mode,
                 dev,
-                owner,
+                device,
             } => {
-                let outcome = apply_mknod_owned(&path, mode, dev, owner);
+                let outcome = apply_mknod(&path, mode, dev, device.as_ref());
                 tracing::info!(
                     %session,
                     command_seq,
@@ -3247,100 +3261,35 @@ fn apply_chown(
     }
 }
 
-/// Directories the helper has been asked to watch, kept for the life
-/// of the helper process. A device node is only recreated under one of
-/// them: the helper cannot see the journal, so the watched tree is its
-/// evidence that the daemon is restoring something it captured. A
-/// helper restarted since the capture has an empty set and refuses.
-static WATCHED_ROOTS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
-
-/// Cap on remembered roots, so a long-lived helper cannot grow the set
-/// without bound.
-const WATCHED_ROOTS_MAX: usize = 4096;
-
-fn record_watched_root(cwd_path: &str) {
-    let raw = std::path::PathBuf::from(cwd_path);
-    if !raw.is_absolute() {
-        return;
-    }
-    let root = std::fs::canonicalize(&raw).unwrap_or(raw);
-    let mut roots = WATCHED_ROOTS.lock().unwrap();
-    if roots.len() < WATCHED_ROOTS_MAX && !roots.contains(&root) {
-        roots.push(root);
-    }
-}
-
-/// True when `path` is an absolute path whose parent directory, with
-/// symlinks resolved, sits inside a watched root. The node itself does
-/// not exist yet, so the parent is what gets resolved.
-fn path_in_watched_root(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    if !p.is_absolute() {
-        return false;
-    }
-    match p.file_name() {
-        Some(n) if n != ".." => {}
-        _ => return false,
-    }
-    let Some(parent) = p.parent().and_then(|d| std::fs::canonicalize(d).ok()) else {
-        return false;
-    };
-    WATCHED_ROOTS
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|root| parent.starts_with(root))
-}
-
 /// AU22 / DR-15.1 — helper-side ApplyMknod handler. `mode` is the
 /// wire's S_IF* | perm_bits composite; libc::mknod expects that exact
 /// shape.
 ///
-/// Fifo and Socket ignore `dev`. L4 adds BlockDevice and CharDevice:
-/// they need the `dev` the daemon read from the journaled unlink
-/// (nonzero), and the path must sit under a watched root, else the
-/// answer is OutOfScope. In the init user namespace CAP_MKNOD is enough
-/// for these; no CAP_SYS_ADMIN is involved.
-#[cfg(test)]
-fn apply_mknod(path: &str, mode: u32, dev: u64) -> shit_proto::PrivilegedOpOutcome {
-    apply_mknod_owned(path, mode, dev, None)
-}
-
-/// [`apply_mknod`] plus L4's owner step. `owner` is honoured only for a
-/// block/char node this call created: the node is re-checked with lstat
-/// (same kind, same rdev) and chowned with `AT_SYMLINK_NOFOLLOW` to the
-/// journaled uid/gid. If either step fails the node is removed again,
-/// so the helper never leaves a device node owned by the wrong user.
-/// This is the only chown the helper does for mknod, and it needs
-/// CAP_CHOWN from the file capabilities (chown to the helper's own ids
-/// needs none).
-fn apply_mknod_owned(
+/// Fifo and Socket ignore `dev` and need no privilege, so they keep the
+/// path-based flow. Block and char nodes go through
+/// [`apply_device_mknod`]: L4b, the helper acts on them only with a
+/// capture token this helper process issued for exactly the requested
+/// fields.
+fn apply_mknod(
     path: &str,
     mode: u32,
     dev: u64,
-    owner: Option<(u32, u32)>,
+    device: Option<&shit_proto::DeviceEvidence>,
 ) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::fs::FileTypeExt;
     // libc::mode_t is u32 on Linux, u16 on macOS — cast at the
     // boundary so bitops + comparisons against libc constants
     // type-check on both platforms.
     let mode_native: libc::mode_t = mode as libc::mode_t;
     let ifmt = mode_native & libc::S_IFMT;
-    let is_device = ifmt == libc::S_IFBLK || ifmt == libc::S_IFCHR;
-    if ifmt != libc::S_IFIFO && ifmt != libc::S_IFSOCK && !is_device {
+    if ifmt == libc::S_IFBLK || ifmt == libc::S_IFCHR {
+        return apply_device_mknod(path, mode, dev, device, capture_token::process_key());
+    }
+    if ifmt != libc::S_IFIFO && ifmt != libc::S_IFSOCK {
         // Regular (S_IFREG — planner shouldn't route Regular here),
         // or 0 (caller forgot to set the kind). Refused.
         return PrivilegedOpOutcome::PermissionDenied;
-    }
-    if is_device {
-        if dev == 0 {
-            // No captured device number: never make one up.
-            return PrivilegedOpOutcome::PermissionDenied;
-        }
-        if !path_in_watched_root(path) {
-            return PrivilegedOpOutcome::OutOfScope;
-        }
     }
     let c_path = match std::ffi::CString::new(path) {
         Ok(s) => s,
@@ -3357,10 +3306,8 @@ fn apply_mknod_owned(
     // conflict and bubbles up as Failed.
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         let ft = meta.file_type();
-        let already_right = (ifmt == libc::S_IFIFO && ft.is_fifo())
-            || (ifmt == libc::S_IFSOCK && ft.is_socket())
-            || (ifmt == libc::S_IFBLK && ft.is_block_device() && meta.rdev() == dev)
-            || (ifmt == libc::S_IFCHR && ft.is_char_device() && meta.rdev() == dev);
+        let already_right =
+            (ifmt == libc::S_IFIFO && ft.is_fifo()) || (ifmt == libc::S_IFSOCK && ft.is_socket());
         if already_right {
             return PrivilegedOpOutcome::Applied;
         }
@@ -3374,13 +3321,9 @@ fn apply_mknod_owned(
     // round-trips byte-identical. The helper's IPC arm is
     // single-threaded so the umask restore-before-yield is safe.
     let prev_umask = unsafe { libc::umask(0) };
-    let native_dev: libc::dev_t = if is_device { dev as libc::dev_t } else { 0 };
-    let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, native_dev) };
+    let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, 0) };
     unsafe { libc::umask(prev_umask) };
     if rc == 0 {
-        if is_device {
-            return finish_device_node(&c_path, path, ifmt, dev, owner);
-        }
         return PrivilegedOpOutcome::Applied;
     }
     let errno = std::io::Error::last_os_error();
@@ -3393,52 +3336,358 @@ fn apply_mknod_owned(
     }
 }
 
-/// After a successful device mknod: confirm what is at `path` is the
-/// node just made, then give it the journaled owner. Any failure
-/// removes the node.
-fn finish_device_node(
-    c_path: &std::ffi::CStr,
+/// L4b - block/char node restore. Every field of the request is
+/// attacker-controlled, so the order of checks is fixed:
+///
+/// 1. a nonzero rdev and capture evidence are present;
+/// 2. the token verifies under this process's key against the
+///    requested mode, rdev, owner, `(dev, ino)`, path, session and seq
+///    (another helper's token is refused as expired);
+/// 3. the captured owner is the invoking user (the helper's euid). The
+///    helper gives no other owner: that needs CAP_CHOWN, which it does
+///    not use for this (#226, #227);
+/// 4. the parent is opened one component at a time without following
+///    symlinks, and everything after that is relative to that dirfd.
+///
+/// Only then is the node made, with no permission bits, and widened to
+/// the captured mode once its owner is right.
+#[cfg(target_os = "linux")]
+fn apply_device_mknod(
     path: &str,
-    ifmt: libc::mode_t,
-    dev: u64,
-    owner: Option<(u32, u32)>,
+    mode: u32,
+    rdev: u64,
+    evidence: Option<&shit_proto::DeviceEvidence>,
+    key: Option<&capture_token::TokenKey>,
 ) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
-    use std::os::unix::fs::MetadataExt;
-    let remove = || unsafe {
-        libc::unlinkat(libc::AT_FDCWD, c_path.as_ptr(), 0);
-    };
-    let verified = std::fs::symlink_metadata(path)
-        .map(|m| (m.mode() as libc::mode_t & libc::S_IFMT) == ifmt && m.rdev() == dev)
-        .unwrap_or(false);
-    if !verified {
-        remove();
-        return PrivilegedOpOutcome::Failed {
-            err: "mknod: node at path is not the one just created; removed".to_string(),
-        };
+    let refuse = |reason: String| PrivilegedOpOutcome::Refused { reason };
+    if rdev == 0 {
+        return refuse("no device number captured for this node".to_string());
     }
-    if let Some((uid, gid)) = owner {
+    let Some(ev) = evidence else {
+        return refuse("no capture evidence for this device node".to_string());
+    };
+    let Some(key) = key else {
+        return refuse("helper has no capture-token key (kernel RNG unavailable at start)".into());
+    };
+    let facts = capture_token::DeviceFacts {
+        mode,
+        rdev,
+        uid: ev.uid,
+        gid: ev.gid,
+        dev: ev.dev,
+        ino: ev.inode,
+        path,
+        session: ev.session,
+        seq: ev.command_seq,
+    };
+    if let Err(e) = key.verify(&facts, &ev.token) {
+        return refuse(e.reason().to_string());
+    }
+    let euid = unsafe { libc::geteuid() };
+    if ev.uid != euid {
+        return refuse(format!(
+            "captured owner uid {} is not the invoking user (uid {euid}); giving the node \
+             another owner needs CAP_CHOWN, which the helper does not use",
+            ev.uid
+        ));
+    }
+    let (parent, name) = match dirfd::open_parent_nofollow(path) {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    dirfd::device_node_at(&parent, &name, mode, rdev, ev.uid, ev.gid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_device_mknod(
+    _path: &str,
+    _mode: u32,
+    _rdev: u64,
+    _evidence: Option<&shit_proto::DeviceEvidence>,
+    _key: Option<&capture_token::TokenKey>,
+) -> shit_proto::PrivilegedOpOutcome {
+    shit_proto::PrivilegedOpOutcome::Refused {
+        reason: "block/char node restore is Linux-only".to_string(),
+    }
+}
+
+/// L4b - dirfd-relative filesystem steps for the device restore. No
+/// function here re-resolves the request's path string after
+/// [`open_parent_nofollow`] has opened the parent.
+#[cfg(target_os = "linux")]
+mod dirfd {
+    use shit_proto::PrivilegedOpOutcome;
+    use std::ffi::{CStr, CString};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    fn errno() -> std::io::Error {
+        std::io::Error::last_os_error()
+    }
+
+    fn open_at(dir: libc::c_int, name: &CStr, flags: libc::c_int) -> std::io::Result<OwnedFd> {
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(errno());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn fstat_fd(fd: &OwnedFd) -> std::io::Result<libc::stat> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(errno());
+        }
+        Ok(st)
+    }
+
+    fn fstatat_nofollow(dir: &OwnedFd, name: &CStr) -> std::io::Result<libc::stat> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe {
-            libc::fchownat(
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-                uid,
-                gid,
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         };
         if rc != 0 {
-            let errno = std::io::Error::last_os_error();
-            remove();
-            return match errno.raw_os_error() {
+            return Err(errno());
+        }
+        Ok(st)
+    }
+
+    /// Open the parent directory of the absolute `path` from `/`, one
+    /// component at a time with `O_PATH|O_DIRECTORY|O_NOFOLLOW`, and
+    /// return it with the final name. A symlink anywhere in the parent
+    /// chain, a `.` or `..` component, or a relative path is refused.
+    pub(super) fn open_parent_nofollow(
+        path: &str,
+    ) -> Result<(OwnedFd, CString), PrivilegedOpOutcome> {
+        let refuse = |reason: String| PrivilegedOpOutcome::Refused { reason };
+        if !path.starts_with('/') || path.ends_with('/') {
+            return Err(refuse(format!(
+                "path {path:?} is not an absolute path to a file"
+            )));
+        }
+        let mut comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let Some(name) = comps.pop() else {
+            return Err(refuse(format!("path {path:?} has no file name")));
+        };
+        if comps
+            .iter()
+            .chain(std::iter::once(&name))
+            .any(|c| *c == "." || *c == "..")
+        {
+            return Err(refuse(format!("path {path:?} has a . or .. component")));
+        }
+        let to_c = |s: &str| {
+            CString::new(s).map_err(|e| PrivilegedOpOutcome::Failed {
+                err: format!("path contains NUL: {e}"),
+            })
+        };
+        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        let mut dir =
+            open_at(libc::AT_FDCWD, c"/", flags).map_err(|e| PrivilegedOpOutcome::Failed {
+                err: format!("open /: {e}"),
+            })?;
+        for c in comps {
+            let next = match open_at(dir.as_raw_fd(), &to_c(c)?, flags) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    return Err(match e.raw_os_error() {
+                        Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
+                        Some(libc::ELOOP) | Some(libc::ENOTDIR) => refuse(format!(
+                            "parent component {c:?} of {path:?} is a symlink or not a \
+                             directory; the helper does not follow it"
+                        )),
+                        _ => PrivilegedOpOutcome::Failed {
+                            err: format!("open parent component {c:?}: {e}"),
+                        },
+                    });
+                }
+            };
+            match fstat_fd(&next) {
+                Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+                _ => {
+                    return Err(refuse(format!(
+                        "parent component {c:?} of {path:?} is not a directory"
+                    )));
+                }
+            }
+            dir = next;
+        }
+        Ok((dir, to_c(name)?))
+    }
+
+    fn describe(st: &libc::stat) -> String {
+        format!(
+            "mode {:o}, rdev {:#x}, owner {}:{}",
+            st.st_mode, st.st_rdev, st.st_uid, st.st_gid
+        )
+    }
+
+    /// Make the node `name` under `parent`: mknodat with no permission
+    /// bits, check it is the node just made, give it the captured group
+    /// if it differs (a group the user is in; the kernel decides), then
+    /// the captured permission bits, and check the result. Any failure
+    /// after mknodat removes the node, but only if the entry at `name`
+    /// is still that node.
+    pub(super) fn device_node_at(
+        parent: &OwnedFd,
+        name: &CStr,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> PrivilegedOpOutcome {
+        let ifmt = mode & libc::S_IFMT;
+        let perms = mode & 0o7777;
+        let kind_ok = |st: &libc::stat| st.st_mode & libc::S_IFMT == ifmt && st.st_rdev == rdev;
+        let all_ok = |st: &libc::stat| {
+            kind_ok(st) && st.st_uid == uid && st.st_gid == gid && st.st_mode & 0o7777 == perms
+        };
+        // Something already there: Applied only if it is exactly the
+        // captured node (an earlier replay of this restore).
+        match fstatat_nofollow(parent, name) {
+            Ok(st) if all_ok(&st) => return PrivilegedOpOutcome::Applied,
+            Ok(st) => {
+                return PrivilegedOpOutcome::Conflict {
+                    detail: format!(
+                        "path exists as {}; captured mode {mode:o}, rdev {rdev:#x}, owner {uid}:{gid}",
+                        describe(&st)
+                    ),
+                };
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("fstatat: {e}"),
+                };
+            }
+        }
+        // umask(0) so the 0 permission bits are exact; the IPC arm is
+        // single-threaded.
+        let prev_umask = unsafe { libc::umask(0) };
+        let rc = unsafe {
+            libc::mknodat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                ifmt as libc::mode_t,
+                rdev as libc::dev_t,
+            )
+        };
+        unsafe { libc::umask(prev_umask) };
+        if rc != 0 {
+            let e = errno();
+            return match e.raw_os_error() {
                 Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+                Some(libc::EEXIST) => PrivilegedOpOutcome::Conflict {
+                    detail: "a node appeared at the path during restore".to_string(),
+                },
+                Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
                 _ => PrivilegedOpOutcome::Failed {
-                    err: format!("fchownat {uid}:{gid}: {errno}; node removed"),
+                    err: format!("mknodat: {e}"),
                 },
             };
         }
+        let euid = unsafe { libc::geteuid() };
+        let made = match fstatat_nofollow(parent, name) {
+            Ok(st) if kind_ok(&st) && st.st_uid == euid && st.st_mode & 0o7777 == 0 => st,
+            _ => {
+                // Not the node just made (swapped already); leave it.
+                return PrivilegedOpOutcome::Failed {
+                    err: "node at path is not the one just created".to_string(),
+                };
+            }
+        };
+        let ours = (made.st_dev, made.st_ino);
+        let remove = || {
+            if let Ok(st) = fstatat_nofollow(parent, name)
+                && (st.st_dev, st.st_ino) == ours
+            {
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+            }
+        };
+        let node = match open_at(parent.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW) {
+            Ok(fd) => fd,
+            Err(e) => {
+                remove();
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("open new node: {e}; removed"),
+                };
+            }
+        };
+        match fstat_fd(&node) {
+            Ok(st) if (st.st_dev, st.st_ino) == ours => {}
+            _ => {
+                remove();
+                return PrivilegedOpOutcome::Failed {
+                    err: "node at path changed during restore; removed".to_string(),
+                };
+            }
+        }
+        if made.st_gid != gid {
+            // uid -1: owner stays the invoking user.
+            let rc = unsafe {
+                libc::fchownat(
+                    node.as_raw_fd(),
+                    c"".as_ptr(),
+                    libc::uid_t::MAX,
+                    gid,
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if rc != 0 {
+                let e = errno();
+                remove();
+                return match e.raw_os_error() {
+                    Some(libc::EPERM) => PrivilegedOpOutcome::Refused {
+                        reason: format!(
+                            "captured group {gid} is not one the invoking user can give \
+                             without CAP_CHOWN; node removed"
+                        ),
+                    },
+                    _ => PrivilegedOpOutcome::Failed {
+                        err: format!("fchownat group {gid}: {e}; node removed"),
+                    },
+                };
+            }
+        }
+        // chmod through the held O_PATH fd: /proc/self/fd/N names this
+        // inode, not whatever is at `name` now.
+        let proc_path = match CString::new(format!("/proc/self/fd/{}", node.as_raw_fd())) {
+            Ok(p) => p,
+            Err(e) => {
+                remove();
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("proc path: {e}"),
+                };
+            }
+        };
+        if unsafe { libc::fchmodat(libc::AT_FDCWD, proc_path.as_ptr(), perms, 0) } != 0 {
+            let e = errno();
+            remove();
+            return PrivilegedOpOutcome::Failed {
+                err: format!("chmod {perms:o}: {e}; node removed"),
+            };
+        }
+        match fstat_fd(&node) {
+            Ok(st) if all_ok(&st) => PrivilegedOpOutcome::Applied,
+            Ok(st) => {
+                remove();
+                PrivilegedOpOutcome::Failed {
+                    err: format!("restored node is {}; node removed", describe(&st)),
+                }
+            }
+            Err(e) => {
+                remove();
+                PrivilegedOpOutcome::Failed {
+                    err: format!("fstat new node: {e}; node removed"),
+                }
+            }
+        }
     }
-    PrivilegedOpOutcome::Applied
 }
 
 #[cfg(test)]
@@ -3452,7 +3701,7 @@ mod apply_mknod_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a_fifo");
         let mode = 0o010000 | 0o644;
-        let outcome = apply_mknod(p.to_str().unwrap(), mode, 0);
+        let outcome = apply_mknod(p.to_str().unwrap(), mode, 0, None);
         assert_eq!(outcome, PrivilegedOpOutcome::Applied);
         let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
         assert!(ft.is_fifo(), "expected fifo, got {ft:?}");
@@ -3464,138 +3713,269 @@ mod apply_mknod_tests {
         let p = dir.path().join("a_fifo");
         let mode = 0o010000 | 0o644;
         assert_eq!(
-            apply_mknod(p.to_str().unwrap(), mode, 0),
+            apply_mknod(p.to_str().unwrap(), mode, 0, None),
             PrivilegedOpOutcome::Applied
         );
         // Second call on the same path with the same kind — applied.
         assert_eq!(
-            apply_mknod(p.to_str().unwrap(), mode, 0),
+            apply_mknod(p.to_str().unwrap(), mode, 0, None),
             PrivilegedOpOutcome::Applied
         );
     }
 
+    // ---- L4b: block/char nodes need this helper's capture token ----
+
+    const CHR: u32 = 0o020000;
+    /// 1:3, the number /dev/null has. Never a real disk.
+    const NULL_DEV: u64 = (1 << 8) | 3;
+
+    fn me() -> (u32, u32) {
+        unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+
+    /// Evidence as the daemon would send it back for a capture of
+    /// `path` with these fields, signed by `key`.
+    fn evidence(
+        key: &capture_token::TokenKey,
+        path: &str,
+        mode: u32,
+        rdev: u64,
+        owner: (u32, u32),
+    ) -> shit_proto::DeviceEvidence {
+        let session = uuid::Uuid::from_u128(0x4c34_62);
+        let facts = capture_token::DeviceFacts {
+            mode,
+            rdev,
+            uid: owner.0,
+            gid: owner.1,
+            dev: 0x803,
+            ino: 77,
+            path,
+            session,
+            seq: 9,
+        };
+        shit_proto::DeviceEvidence {
+            uid: owner.0,
+            gid: owner.1,
+            dev: 0x803,
+            inode: 77,
+            session,
+            command_seq: 9,
+            token: key.issue(&facts),
+        }
+    }
+
+    fn this_helper() -> &'static capture_token::TokenKey {
+        capture_token::process_key().expect("kernel RNG")
+    }
+
+    fn refused(o: &PrivilegedOpOutcome, needle: &str) -> bool {
+        matches!(o, PrivilegedOpOutcome::Refused { reason } if reason.contains(needle))
+    }
+
     #[test]
-    fn refuses_device_without_a_captured_number() {
+    fn device_mknod_without_a_captured_number_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        record_watched_root(dir.path().to_str().unwrap());
         let p = dir.path().join("blk");
-        let outcome = apply_mknod(p.to_str().unwrap(), 0o060000 | 0o644, 0);
-        assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+        let ps = p.to_str().unwrap();
+        let ev = evidence(this_helper(), ps, 0o060644, 0, me());
+        let outcome = apply_mknod(ps, 0o060644, 0, Some(&ev));
+        assert!(refused(&outcome, "no device number"), "{outcome:?}");
         assert!(!p.exists());
     }
 
     #[test]
-    fn device_outside_a_watched_root_is_out_of_scope() {
+    fn forged_device_mknod_without_a_token_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("chr");
-        // 1:3, the number /dev/null has. The root was never registered.
-        let dev = (1u64 << 8) | 3;
-        let outcome = apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, dev);
-        assert_eq!(outcome, PrivilegedOpOutcome::OutOfScope);
-        assert!(!p.exists());
+        let outcome = apply_mknod(p.to_str().unwrap(), CHR | 0o666, NULL_DEV, None);
+        assert!(refused(&outcome, "no capture evidence"), "{outcome:?}");
+        assert!(std::fs::symlink_metadata(&p).is_err());
     }
 
     #[test]
-    fn device_path_escaping_the_root_through_dotdot_is_out_of_scope() {
-        let watched = tempfile::tempdir().unwrap();
-        let other = tempfile::tempdir().unwrap();
-        record_watched_root(watched.path().to_str().unwrap());
-        let sneaky = format!(
-            "{}/../{}/chr",
-            watched.path().display(),
-            other.path().file_name().unwrap().to_str().unwrap()
-        );
-        let dev = (1u64 << 8) | 3;
-        // `other` lives next to `watched` only if both are in the same
-        // temp dir, which tempfile guarantees; the canonical parent is
-        // outside the watched root either way.
-        let outcome = apply_mknod(&sneaky, 0o020000 | 0o666, dev);
-        assert_eq!(outcome, PrivilegedOpOutcome::OutOfScope);
-    }
-
-    #[test]
-    fn device_inside_a_watched_root_reaches_mknod() {
+    fn forged_device_mknod_with_a_bad_token_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        record_watched_root(dir.path().to_str().unwrap());
         let p = dir.path().join("chr");
-        let dev = (1u64 << 8) | 3;
-        let outcome = apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, dev);
-        if unsafe { libc::geteuid() } == 0 {
-            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
-            let m = std::fs::symlink_metadata(&p).unwrap();
-            assert!(m.file_type().is_char_device());
-            assert_eq!(m.rdev(), dev);
-            // Second call is idempotent for the same number, and
-            // refuses a different one.
-            assert_eq!(
-                apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, dev),
-                PrivilegedOpOutcome::Applied
-            );
-            assert!(matches!(
-                apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, (1u64 << 8) | 5),
-                PrivilegedOpOutcome::Failed { .. }
-            ));
-        } else {
-            // Past the scope check, the kernel refuses without CAP_MKNOD.
-            assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
-        }
+        let ps = p.to_str().unwrap();
+        let mut ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+        ev.token.mac[5] ^= 0x40;
+        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+        assert!(refused(&outcome, "does not match"), "{outcome:?}");
+        assert!(std::fs::symlink_metadata(&p).is_err());
     }
 
     #[test]
-    fn device_gets_the_journaled_owner_or_is_removed() {
-        use std::os::unix::fs::MetadataExt;
+    fn token_for_other_fields_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        record_watched_root(dir.path().to_str().unwrap());
-        let dev = (1u64 << 8) | 3;
-        let (me_u, me_g) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let p = dir.path().join("owned");
-        let outcome = apply_mknod_owned(
-            p.to_str().unwrap(),
-            0o020000 | 0o666,
-            dev,
-            Some((me_u, me_g)),
-        );
-        if me_u == 0 {
-            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
-            let m = std::fs::symlink_metadata(&p).unwrap();
-            assert_eq!((m.uid(), m.gid()), (me_u, me_g));
-            // A foreign owner that cannot be applied would leave the
-            // wrong owner; here root can, so check a nonroot id sticks.
-            let q = dir.path().join("other");
-            assert_eq!(
-                apply_mknod_owned(
-                    q.to_str().unwrap(),
-                    0o020000 | 0o666,
-                    dev,
-                    Some((1234, 1234))
-                ),
-                PrivilegedOpOutcome::Applied
+        let p = dir.path().join("chr");
+        let q = dir.path().join("elsewhere");
+        let (ps, qs) = (p.to_str().unwrap(), q.to_str().unwrap());
+        let (u, g) = me();
+        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (u, g));
+        // Another rdev, another kind, wider mode, another path.
+        for (path, mode, rdev) in [
+            (ps, CHR | 0o640, (1u64 << 8) | 5),
+            (ps, 0o060640, NULL_DEV),
+            (ps, CHR | 0o666, NULL_DEV),
+            (qs, CHR | 0o640, NULL_DEV),
+        ] {
+            let outcome = apply_mknod(path, mode, rdev, Some(&ev));
+            assert!(
+                refused(&outcome, "does not match"),
+                "{path} {mode:o} {rdev:#x}: {outcome:?}"
             );
-            assert_eq!(std::fs::symlink_metadata(&q).unwrap().uid(), 1234);
-        } else {
-            // Without CAP_MKNOD nothing is created at all.
-            assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
-            assert!(!p.exists());
         }
+        // Another owner or another removed inode than the token covers.
+        for forged in [
+            shit_proto::DeviceEvidence { uid: 0, ..ev },
+            shit_proto::DeviceEvidence { gid: 0, ..ev },
+            shit_proto::DeviceEvidence { inode: 78, ..ev },
+            shit_proto::DeviceEvidence {
+                command_seq: 10,
+                ..ev
+            },
+        ] {
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&forged));
+            assert!(
+                refused(&outcome, "does not match"),
+                "{forged:?}: {outcome:?}"
+            );
+        }
+        assert!(std::fs::symlink_metadata(&p).is_err());
+        assert!(std::fs::symlink_metadata(&q).is_err());
+    }
+
+    #[test]
+    fn token_from_a_previous_helper_process_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chr");
+        let ps = p.to_str().unwrap();
+        // A key this process never held stands in for the helper that
+        // ran before a restart.
+        let previous = capture_token::TokenKey::generate().unwrap();
+        let ev = evidence(&previous, ps, CHR | 0o640, NULL_DEV, me());
+        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+        assert_eq!(
+            outcome,
+            PrivilegedOpOutcome::Refused {
+                reason: "capture evidence expired: helper restarted".to_string()
+            }
+        );
+        assert!(std::fs::symlink_metadata(&p).is_err());
+    }
+
+    #[test]
+    fn owner_other_than_the_invoking_user_is_refused_before_mknod() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chr");
+        let ps = p.to_str().unwrap();
+        let (u, g) = me();
+        let other = if u == 0 { 1 } else { 0 };
+        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (other, g));
+        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+        assert!(refused(&outcome, "not the invoking user"), "{outcome:?}");
+        assert!(std::fs::symlink_metadata(&p).is_err());
+    }
+
+    #[test]
+    fn parent_swapped_to_a_symlink_is_refused() {
+        // The token is for <dir>/sub/chr. Before the apply, `sub` is
+        // replaced by a symlink to another directory; the helper must
+        // not follow it.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let sub = dir.path().join("sub");
+        std::os::unix::fs::symlink(&elsewhere, &sub).unwrap();
+        let p = sub.join("chr");
+        let ps = p.to_str().unwrap();
+        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+        assert!(refused(&outcome, "symlink"), "{outcome:?}");
+        assert!(std::fs::symlink_metadata(elsewhere.join("chr")).is_err());
+        // A `..` in a token-backed path is refused too.
+        let dotdot = format!("{}/sub/../chr", dir.path().display());
+        let ev = evidence(this_helper(), &dotdot, CHR | 0o640, NULL_DEV, me());
+        let outcome = apply_mknod(&dotdot, CHR | 0o640, NULL_DEV, Some(&ev));
+        assert!(refused(&outcome, ".."), "{outcome:?}");
+    }
+
+    #[test]
+    fn valid_token_and_own_owner_reach_mknod_with_the_captured_mode() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chr");
+        let ps = p.to_str().unwrap();
+        let (u, g) = me();
+        let mode = CHR | 0o640;
+        let ev = evidence(this_helper(), ps, mode, NULL_DEV, (u, g));
+        let outcome = apply_mknod(ps, mode, NULL_DEV, Some(&ev));
+        if outcome == PrivilegedOpOutcome::PermissionDenied {
+            // No CAP_MKNOD in this test process: every check passed and
+            // the kernel refused mknodat. Nothing was created. Set
+            // SHIT_TEST_REQUIRE_MKNOD=1 when the binary has cap_mknod.
+            assert!(
+                std::env::var_os("SHIT_TEST_REQUIRE_MKNOD").is_none(),
+                "mknodat refused although SHIT_TEST_REQUIRE_MKNOD is set"
+            );
+            assert!(std::fs::symlink_metadata(&p).is_err());
+            return;
+        }
+        assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        assert!(m.file_type().is_char_device());
+        assert_eq!(m.rdev(), NULL_DEV);
+        assert_eq!(m.mode() & 0o7777, 0o640);
+        assert_eq!((m.uid(), m.gid()), (u, g));
+        // Replaying the same restore is idempotent.
+        assert_eq!(
+            apply_mknod(ps, mode, NULL_DEV, Some(&ev)),
+            PrivilegedOpOutcome::Applied
+        );
+        // A node whose mode now differs is a conflict and is left alone.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            apply_mknod(ps, mode, NULL_DEV, Some(&ev)),
+            PrivilegedOpOutcome::Conflict { .. }
+        ));
+        assert_eq!(
+            std::fs::symlink_metadata(&p).unwrap().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn existing_node_with_another_number_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chr");
+        let ps = p.to_str().unwrap();
+        // A fifo where the char node should go: kind differs.
+        let c = std::ffi::CString::new(ps).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+        assert!(matches!(
+            apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev)),
+            PrivilegedOpOutcome::Conflict { .. }
+        ));
     }
 
     #[test]
     fn refuses_zero_kind() {
         // No file-type bits set — caller forgot to encode the kind.
-        let outcome = apply_mknod("/tmp/au22_nokind", 0o644, 0);
+        let outcome = apply_mknod("/tmp/au22_nokind", 0o644, 0, None);
         assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
     }
 
     #[test]
     fn fifo_create_with_missing_parent_returns_not_found() {
-        let outcome = apply_mknod("/nonexistent/au22/parent/fifo", 0o010000 | 0o644, 0);
+        let outcome = apply_mknod("/nonexistent/au22/parent/fifo", 0o010000 | 0o644, 0, None);
         assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
     }
 
     #[test]
     fn rejects_path_with_nul_byte() {
-        let outcome = apply_mknod("/tmp/has\0nul", 0o010000 | 0o644, 0);
+        let outcome = apply_mknod("/tmp/has\0nul", 0o010000 | 0o644, 0, None);
         assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
     }
 
@@ -3604,7 +3984,7 @@ mod apply_mknod_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("regfile");
         std::fs::write(&p, b"x").unwrap();
-        let outcome = apply_mknod(p.to_str().unwrap(), 0o010000 | 0o644, 0);
+        let outcome = apply_mknod(p.to_str().unwrap(), 0o010000 | 0o644, 0, None);
         assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
     }
 }
