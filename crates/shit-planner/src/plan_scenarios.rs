@@ -1545,3 +1545,31 @@ fn file_moved_into_new_dir_then_rm_rf_comes_back_with_a_stray_dir() {
     );
     assert_eq!(after, before, "{}", log.join("\n"));
 }
+
+// L5: shapes that appear once the shim journals open64, mkdir and rmdir.
+
+#[test]
+fn scratch_file_moved_inside_new_dir_then_dir_removed_leaves_nothing() {
+    // pip's wheel cache: `mkdir w; echo x > w/t; mv w/t w/x; rm -rf w`.
+    let mut sim = Sim::new();
+    sim.seed_file("keep", b"k\n", 0o644);
+    let before = sim.snapshot();
+    sim.mkdir("w");
+    sim.write("w/t", b"x\n");
+    sim.mv("w/t", "w/x");
+    sim.rm_rf("w");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn scratch_file_moved_then_removed_in_existing_dir_leaves_no_stray() {
+    // `echo x > d/t; mv d/t d/x; rm d/x` with d pre-existing.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/keep", b"k\n", 0o644);
+    let before = sim.snapshot();
+    sim.write("d/t", b"x\n");
+    sim.mv("d/t", "d/x");
+    sim.rm_rf("d/x");
+    assert_restored(&sim, &before);
+}
