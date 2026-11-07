@@ -890,7 +890,13 @@ mod policy {
             // pre-images on their own in chunks (`rename_walk`, which
             // journals no Rename), then the Rename without them. Without
             // the walk record the planner treats the walk as incomplete.
-            if sent.is_err() {
+            // Review round 2, item 7: only for a frame too big to encode
+            // (`InvalidData`); a daemon that is down or slow gets nothing
+            // more from a resend.
+            if sent
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidData)
+            {
                 send_walk_chunks(arg, extras, call_id);
                 let _ = try_notify_full(syscall, arg, pre_image, Vec::new(), failure, extra(None));
             }
@@ -2148,7 +2154,11 @@ mod policy {
                     "frame over the test limit",
                 ));
             }
+            let fail = test_capture::fail_with();
             test_capture::push(note);
+            if let Some(kind) = fail {
+                return Err(std::io::Error::new(kind, "test send failure"));
+            }
             return Ok(());
         }
         let path = socket_path();
@@ -2236,6 +2246,17 @@ mod policy {
             static NOTES: RefCell<Option<Vec<shit_proto::ShimNotification>>> =
                 const { RefCell::new(None) };
             static LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+            static FAIL: std::cell::Cell<Option<std::io::ErrorKind>> =
+                const { std::cell::Cell::new(None) };
+        }
+        /// Every send fails with this kind (after being recorded), as a
+        /// daemon that is down or slow would.
+        pub fn fail_with() -> Option<std::io::ErrorKind> {
+            FAIL.with(|f| f.get())
+        }
+        #[cfg_attr(target_os = "macos", allow(dead_code))]
+        pub fn set_fail_with(kind: Option<std::io::ErrorKind>) {
+            FAIL.with(|f| f.set(kind));
         }
         /// Frames larger than this fail to send, as an oversized frame
         /// would.

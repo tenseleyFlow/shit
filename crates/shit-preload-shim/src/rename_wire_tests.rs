@@ -382,3 +382,26 @@ fn unlinkat_removedir_reports_after_success_with_the_pre_call_stat() {
     assert_eq!(notes[0].arg, dir.join("e").to_str().unwrap());
     assert_eq!(notes[0].pre_stat.map(|s| s.mode), Some(0o040750));
 }
+
+/// Review round 2, item 7: the split resend is for a frame too big to
+/// send, not for a daemon that is down or slow.
+#[test]
+fn walk_resend_only_for_an_oversized_frame() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let d = dir.join("d");
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("a"), b"a").unwrap();
+    test_capture::set_fail_with(Some(std::io::ErrorKind::ConnectionRefused));
+    let notes = test_capture::capture(|| assert_eq!(rename_abs(&d, &dir.join("t")).0, 0));
+    test_capture::set_fail_with(None);
+    assert!(
+        notes.iter().all(|n| n.syscall != "rename_walk"),
+        "{notes:#?}"
+    );
+    let pre_calls = notes
+        .iter()
+        .filter(|n| n.syscall == "rename" && n.outcome.is_none())
+        .count();
+    assert_eq!(pre_calls, 1, "{notes:#?}");
+}
