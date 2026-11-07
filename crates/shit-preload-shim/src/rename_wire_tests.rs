@@ -92,11 +92,15 @@ fn dir_rename_sends_a_complete_walk_then_its_outcome() {
     std::fs::write(d.join("f"), b"f").unwrap();
     std::fs::write(d.join("sub/g"), b"g").unwrap();
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The shim reads xattrs on Linux only (the daemon reads them on BSD).
+    #[cfg(target_os = "linux")]
     let xattr_ok = {
         let p = CString::new(d.join("f").to_str().unwrap()).unwrap();
         let n = CString::new("user.l5").unwrap();
         unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), b"v".as_ptr().cast(), 1, 0) == 0 }
     };
+    #[cfg(not(target_os = "linux"))]
+    let xattr_ok = false;
     let d_ino = std::fs::metadata(&d).unwrap().ino();
     let t = dir.join("t");
     let notes = test_capture::capture(|| assert_eq!(rename_abs(&d, &t).0, 0));
