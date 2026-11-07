@@ -108,6 +108,29 @@ smoke_snapshot_helpers() {
     done
 }
 
+# Sweep orphaned helpers exec'd from this smoke's own bin dir. Two
+# mechanisms keep helpers from leaking, each covering a gap in the other:
+#  1. pid reaping (smoke_snapshot_helpers): exact, so concurrent smokes on
+#     one host never touch each other's helper (issue 207).
+#  2. this path-anchored sweep: catches orphans that pid tracking misses,
+#     e.g. shitd was SIGKILLed or timed out before the snapshot ran and the
+#     helper was reparented away. An orphan keeps its BPF LSM programs
+#     attached and steals events from the next smoke, producing flaky
+#     "timed out waiting for event" failures on the self-hosted LSM runner.
+# The pattern matches the helper's argv[0] (shitd execs the path it was
+# given, SHIT_HELPER_BIN=${SHIT_SMOKE_BIN_DIR}/shit-helper), anchored at both
+# ends so another worktree's bin dir sharing a prefix does not match.
+# Lanes use separate bin dirs; CI shares one dir per job, where the sweep
+# clears orphans left by earlier smokes.
+smoke_sweep_helpers() {
+    local d esc
+    for d in "$(cd "${SHIT_SMOKE_BIN_DIR}" 2>/dev/null && pwd -P || true)" "${SHIT_SMOKE_BIN_DIR}"; do
+        [ -n "${d}" ] || continue
+        esc="$(printf '%s' "${d}" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+        pkill -KILL -f "^${esc}/shit-helper( |\$)" 2>/dev/null || true
+    done
+}
+
 # Start shitd in the background. Blocks until the ctl socket appears
 # (or 10s have passed, at which point we bail).
 smoke_start_shitd() {
@@ -115,6 +138,9 @@ smoke_start_shitd() {
     if [ ! -x "${shitd}" ]; then
         smoke_fail "shitd binary missing at ${shitd}"
     fi
+    smoke_sweep_helpers
+    # Brief settle for the kernel to detach an orphan's BPF links.
+    sleep 0.1
     smoke_log "starting shitd (state=${XDG_STATE_HOME}/shit)"
     # Pin RUST_LOG=debug for the daemon so per-tier handlers' debug
     # breadcrumbs (`net-pre stashed`, `svc-pre stashed`, etc.) land
@@ -247,6 +273,7 @@ smoke_stop_shitd() {
             kill -KILL "${hp}" 2>/dev/null || true
         done
     fi
+    smoke_sweep_helpers
     printf '[stop-shitd %s] return (zombie=%d)\n' "$(date -u +%H:%M:%S)" "${zombie}" >&2
     return "${zombie}"
 }
