@@ -50,6 +50,9 @@ struct Sim {
     /// Paths under here report this device in journaled events, so a
     /// tempdir can stand in for a second filesystem.
     other_fs: Option<(PathBuf, u64)>,
+    /// While set, every journaled event takes this timestamp: the events
+    /// of one shim notification share the daemon's reserved ts.
+    shared_ts: Option<TimePoint>,
 }
 
 impl Sim {
@@ -61,6 +64,7 @@ impl Sim {
             store: InMemoryStore::new(),
             next: 1,
             other_fs: None,
+            shared_ts: None,
         }
     }
 
@@ -90,7 +94,7 @@ impl Sim {
         self.events.push(CaptureEvent {
             id: EventId(id),
             command: command_id(),
-            ts: TimePoint::new(id, 0),
+            ts: self.shared_ts.unwrap_or(TimePoint::new(id, 0)),
             partial: false,
             kind,
         });
@@ -183,16 +187,6 @@ impl Sim {
         if to_p.is_dir() {
             to_p = to_p.join(from_p.file_name().unwrap());
         }
-        if from_p.is_dir() {
-            let mut files = Vec::new();
-            walk_files(&from_p, &mut files);
-            let skip = skip.map(|s| self.p(s));
-            for f in files {
-                if Some(&f) != skip.as_ref() {
-                    self.pre_image(&f, WALK_SOURCE);
-                }
-            }
-        }
         if to_p.is_file() {
             let m = std::fs::symlink_metadata(&to_p).unwrap();
             self.pre_image(&to_p, FilePreImageSource::Other);
@@ -203,13 +197,63 @@ impl Sim {
                 mode: m.mode(),
             }));
         }
+        let is_dir = from_p.is_dir();
+        if is_dir {
+            self.walk(&from_p, skip.map(|s| self.p(s)).as_ref());
+        }
         let inode = Self::inode_of(&from_p);
-        std::fs::rename(&from_p, &to_p).unwrap();
+        let result = std::fs::rename(&from_p, &to_p);
         self.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
-            from: from_p,
-            to: to_p,
+            from: from_p.clone(),
+            to: to_p.clone(),
             inode,
         }));
+        self.shared_ts = None;
+        result.unwrap();
+        if is_dir {
+            self.emit(CaptureEventKind::RenameOutcome {
+                from: from_p,
+                to: to_p.clone(),
+                errno: 0,
+                source: inode,
+                dest: Self::inode_of(&to_p),
+            });
+        }
+    }
+
+    /// The shim's walk of directory `from` before a rename: a pre-image
+    /// per regular file, then the RenameWalk record, all sharing the
+    /// notification's timestamp, which stays set for the Rename. `skip`
+    /// is a file its caps missed.
+    fn walk(&mut self, from: &Path, skip: Option<&PathBuf>) {
+        let id = self.next;
+        self.shared_ts = Some(TimePoint::new(id, 0));
+        let mut files = Vec::new();
+        walk_files(from, &mut files);
+        let mut complete = walk_is_complete(from);
+        let mut entries = vec![walk_entry(from)];
+        let mut dirs = Vec::new();
+        walk_dirs(from, &mut dirs);
+        entries.extend(dirs.iter().map(|d| walk_entry(d)));
+        let mut n = 0;
+        for f in &files {
+            if Some(f) == skip {
+                complete = false;
+                continue;
+            }
+            self.pre_image(f, WALK_SOURCE);
+            entries.push(walk_entry(f));
+            n += 1;
+        }
+        if !complete {
+            entries.retain(|e| e.kind != FileKind::Directory);
+        }
+        self.emit(CaptureEventKind::RenameWalk {
+            root: from.to_path_buf(),
+            complete,
+            files: n,
+            entries,
+        });
     }
 
     /// `rm -rf rel`: post-order, each file pre-imaged then unlinked,
@@ -440,6 +484,56 @@ impl Sim {
     }
 }
 
+/// Directories under `dir`, recursively, sorted.
+fn walk_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort();
+    for e in entries {
+        if std::fs::symlink_metadata(&e).unwrap().is_dir() {
+            out.push(e.clone());
+            walk_dirs(&e, out);
+        }
+    }
+}
+
+/// The shim's walk is complete when it holds only directories and
+/// regular files.
+fn walk_is_complete(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().all(|e| {
+        let p = e.unwrap().path();
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        if m.is_dir() {
+            walk_is_complete(&p)
+        } else {
+            m.is_file()
+        }
+    })
+}
+
+/// A walk record for `p`, as the shim reads it.
+fn walk_entry(p: &Path) -> crate::events::WalkEntry {
+    let m = std::fs::symlink_metadata(p).unwrap();
+    crate::events::WalkEntry {
+        path: p.to_path_buf(),
+        inode: InodeRef::new(m.dev(), m.ino()),
+        kind: FileKind::from_mode(m.mode()).unwrap(),
+        meta: FileMetadata {
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+            size: if m.is_dir() { 0 } else { m.size() },
+            mtime_unix_nanos: (m.mtime() as i128) * 1_000_000_000 + m.mtime_nsec() as i128,
+            xattrs: BTreeMap::new(),
+            acl: None,
+            flags: 0,
+        },
+        xattrs_read: true,
+    }
+}
+
 /// The shim's walk: regular files, recursively.
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -650,12 +744,32 @@ fn pip_shape_with_partial_walk_keeps_reverse_rename() {
 }
 
 #[test]
-fn pip_shape_as_the_hosted_shim_sees_it_conflicts_with_the_old_tree_intact() {
-    // The journal pip produces on hosted Linux (degraded helper, shim
-    // only): no Create for the new tree, no unlink for the stash's top
-    // directory. The new `d` is in the way of the reverse rename, so undo
-    // stops with a loud conflict: the smoke's Outcome B. The old tree is
-    // back at the stash name. Sprint L5 tracks getting it back to `d`.
+fn pip_shape_as_the_hosted_shim_sees_it() {
+    // The journal pip produced on hosted Linux before L5's interposers
+    // (degraded helper, shim only): no Create for the new tree, no unlink
+    // for the stash's top directory. The reverse rename has nothing to
+    // move back and the new `d` is in the way; the walk carries the
+    // restore, with d/empty and its 0700 mode.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/f", b"original\n", 0o640);
+    sim.seed_dir("d/empty", 0o700);
+    sim.seed_dir("d/sub", 0o711);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir_unseen("d");
+    sim.write_unseen("d/f", b"new\n");
+    sim.rmtree_top_unseen("d.old");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn pip_shape_without_the_rename_outcome_conflicts_with_the_old_tree_intact() {
+    // Same journal with the post-syscall outcome lost (daemon missed it):
+    // no inode proof, so the rule stays off. The new `d` is in the way of
+    // the reverse rename, so undo stops with a loud conflict: Outcome B,
+    // with the old tree back at the stash name.
     let mut sim = Sim::new();
     sim.seed_dir("d", 0o755);
     sim.seed_file("d/f", b"original\n", 0o640);
@@ -663,6 +777,8 @@ fn pip_shape_as_the_hosted_shim_sees_it_conflicts_with_the_old_tree_intact() {
     sim.seed_file("d/sub/g", b"g\n", 0o600);
     sim.snapshot();
     sim.mv("d", "d.old");
+    sim.events
+        .retain(|e| !matches!(e.kind, CaptureEventKind::RenameOutcome { .. }));
     sim.mkdir_unseen("d");
     sim.write_unseen("d/f", b"new\n");
     sim.rmtree_top_unseen("d.old");
@@ -1571,5 +1687,386 @@ fn scratch_file_moved_then_removed_in_existing_dir_leaves_no_stray() {
     sim.write("d/t", b"x\n");
     sim.mv("d/t", "d/x");
     sim.rm_rf("d/x");
+    assert_restored(&sim, &before);
+}
+
+// L5: the replaced-subtree rule, with the walk records and the rename
+// outcome the shim now journals. The first five come back from fb9f2a6.
+
+/// The plan rebuilds `rel` from its walk: it recreates `rel` and has no
+/// reverse rename back onto it.
+fn assert_rebuilt(sim: &Sim, rel: &str) {
+    use crate::inverse::InverseOp;
+    let p = sim.p(rel);
+    let nodes = sim.plan_nodes();
+    assert!(
+        nodes.iter().any(
+            |n| matches!(&n.op, InverseOp::RecreatePath { path, kind: FileKind::Directory, .. } if *path == p)
+        ),
+        "{rel} not rebuilt: {nodes:#?}"
+    );
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::Rename { to, .. } if *to == p)),
+        "reverse rename onto {rel} kept: {nodes:#?}"
+    );
+}
+
+/// Neither: the Rename keeps its ordinary inverse.
+fn assert_not_rebuilt(sim: &Sim, rel: &str) {
+    use crate::inverse::InverseOp;
+    let p = sim.p(rel);
+    let nodes = sim.plan_nodes();
+    assert!(
+        nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::Rename { to, .. } if *to == p)),
+        "rule fired for {rel}: {nodes:#?}"
+    );
+}
+
+#[test]
+fn source_dir_mode_survives_unjournaled_top_rmdir() {
+    // `mv d t; rm -rf t`, rmtree's top rmdir not interposed. A 0700 dir
+    // must not come back wider.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o700);
+    sim.seed_file("d/f", b"f\n", 0o600);
+    sim.seed_dir("d/empty", 0o711);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.rmtree_top_unseen("t");
+    assert_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn hosted_pip_shape_restores_a_private_source_dir_mode() {
+    // pip_shape_as_the_hosted_shim_sees_it with the new tree already
+    // holding the source's name at a wider mode.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o700);
+    sim.seed_file("d/f", b"original\n", 0o600);
+    sim.seed_dir("d/sub", 0o711);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir_unseen("d");
+    std::fs::set_permissions(sim.p("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    sim.write_unseen("d/f", b"new\n");
+    sim.rmtree_top_unseen("d.old");
+    assert_restored(&sim, &before);
+}
+
+// macOS refuses rename(2) on a directory without write permission, so
+// this shape cannot arise there.
+#[cfg(not(target_os = "macos"))]
+fn read_only_tree_round_trip(mode: u32) {
+    // `chmod -R u+w d` is not interposed: Go's module cache, then
+    // `mv d t; chmod -R u+w t; rm -rf t`.
+    let mut sim = Sim::new();
+    sim.seed_dir("d/sub", 0o755);
+    sim.seed_file("d/f", b"f\n", 0o644);
+    sim.seed_file("d/sub/g", b"g\n", 0o644);
+    sim.seed_dir("d/sub", mode);
+    sim.seed_dir("d", mode);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.seed_dir("t", 0o755);
+    sim.seed_dir("t/sub", 0o755);
+    sim.rm_rf("t");
+    let log = sim.undo();
+    let after = sim.snapshot();
+    // Let the tempdir clean itself up, also when the assert fires.
+    for p in ["d", "d/sub"] {
+        let _ = std::fs::set_permissions(sim.p(p), std::fs::Permissions::from_mode(0o755));
+    }
+    assert_no_failures(&log);
+    assert_eq!(after, before, "{}", log.join("\n"));
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn read_only_0555_tree_is_rebuilt() {
+    read_only_tree_round_trip(0o555);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn read_only_0500_tree_is_rebuilt() {
+    read_only_tree_round_trip(0o500);
+}
+
+#[test]
+fn rebuilt_directory_gets_its_recorded_metadata_after_its_children() {
+    use crate::inverse::InverseOp;
+    let mut sim = Sim::new();
+    sim.seed_dir("d/sub", 0o750);
+    sim.seed_file("d/sub/f", b"f\n", 0o640);
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    for rel in ["d", "d/sub"] {
+        std::fs::File::open(sim.p(rel))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    sim.snapshot();
+    sim.mv("d", "t");
+    sim.rm_rf("t");
+    let nodes = sim.plan_nodes();
+    let pos = |pred: &dyn Fn(&InverseOp) -> bool| nodes.iter().position(|n| pred(&n.op));
+    let content = pos(&|op| matches!(op, InverseOp::RestoreContent { .. })).expect("content");
+    for rel in ["d", "d/sub"] {
+        let p = sim.p(rel);
+        let meta = pos(&|op| matches!(op, InverseOp::RestoreMetadata { path, .. } if *path == p));
+        let meta = meta.unwrap_or_else(|| panic!("no RestoreMetadata for {rel}: {nodes:#?}"));
+        assert!(meta > content, "{rel} metadata before content: {nodes:#?}");
+    }
+    let log = sim.undo();
+    for rel in ["d", "d/sub"] {
+        let m = std::fs::metadata(sim.p(rel)).unwrap();
+        assert_eq!(m.mtime(), 1_000_000, "{rel}\n{}", log.join("\n"));
+    }
+}
+
+#[test]
+fn rule_fires_for_the_journaled_pip_shape() {
+    // pip_shape_dir_replaced_and_stash_removed, checked to go through the
+    // rule rather than the reverse rename.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir("d");
+    sim.write("d/f", b"new\n");
+    sim.rm_rf("d.old");
+    assert_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn pip_stash_name_used_as_scratch_first_still_fires_the_rule() {
+    // pip's AdjacentTempDirectory: `mkdir d.old; rmdir d.old` to claim the
+    // name, then `mv d d.old`, the new tree, `rm -rf d.old`.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mkdir("d.old");
+    sim.rm_rf("d.old");
+    sim.mv("d", "d.old");
+    sim.mkdir("d");
+    sim.write("d/f", b"new\n");
+    sim.rm_rf("d.old");
+    assert_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn outcome_with_another_inode_is_no_proof() {
+    // The outcome says something else is at `t` now: no rule.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    sim.mv("d", "t");
+    for e in &mut sim.events {
+        if let CaptureEventKind::RenameOutcome { dest, .. } = &mut e.kind {
+            dest.inode += 1;
+        }
+    }
+    sim.rmtree_top_unseen("t");
+    assert_not_rebuilt(&sim, "d");
+}
+
+#[test]
+fn modified_before_delete_keeps_the_ordinary_inverses() {
+    // `mv d t; echo x > t/f; rm -rf t`: the pre-image at t/f differs from
+    // the walk's bytes, so the rule cannot account for it.
+    let mut sim = Sim::new();
+    sim.seed_dir("d", 0o750);
+    sim.seed_file("d/f", b"original\n", 0o640);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.write("t/f", b"x\n");
+    sim.rm_rf("t");
+    assert_not_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn new_entry_under_the_destination_keeps_the_ordinary_inverses() {
+    // `mv d t; echo x > t/new; rm -rf t`: `t/new` is not in the walk.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "t");
+    sim.write("t/new", b"x\n");
+    sim.rm_rf("t");
+    assert_not_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+/// `os.rename('d', 't')` failing with ENOTEMPTY: the walk and Rename
+/// are journaled before the call, the outcome after it.
+fn failed_dir_rename(sim: &mut Sim, from: &str, to: &str, lsm_twin_after: bool) {
+    let (from_p, to_p) = (sim.p(from), sim.p(to));
+    sim.walk(&from_p, None);
+    let source = Sim::inode_of(&from_p);
+    let rename = CaptureEventKind::TreeOp(TreeOp::Rename {
+        from: from_p.clone(),
+        to: to_p.clone(),
+        // The daemon stats `to` after the ack: the existing `t`.
+        inode: Sim::inode_of(&to_p),
+    });
+    sim.emit(rename);
+    sim.shared_ts = None;
+    sim.emit(CaptureEventKind::RenameOutcome {
+        from: from_p.clone(),
+        to: to_p.clone(),
+        errno: libc::ENOTEMPTY,
+        source,
+        dest: InodeRef::new(0, 0),
+    });
+    if lsm_twin_after {
+        // The helper's LSM hook fired before the filesystem refused.
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+            from: from_p,
+            to: to_p,
+            inode: source,
+        }));
+    }
+}
+
+fn seed_failed_rename_trees(sim: &Sim) {
+    sim.seed_dir("d", 0o755);
+    sim.seed_file("d/a", b"d-a\n", 0o644);
+    sim.seed_file("d/b", b"d-b\n", 0o644);
+    sim.seed_dir("t", 0o755);
+    sim.seed_file("t/a", b"t-a\n", 0o644);
+    sim.seed_file("t/b", b"t-b\n", 0o644);
+}
+
+#[test]
+fn failed_enotempty_rename_is_retracted_and_rm_rf_restores_destination_bytes() {
+    // Finding A with the outcome: both trees keep their own bytes and
+    // nothing conflicts, because the Rename that did not happen is gone.
+    let mut sim = Sim::new();
+    seed_failed_rename_trees(&sim);
+    let before = sim.snapshot();
+    failed_dir_rename(&mut sim, "d", "t", false);
+    sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn failed_rename_reported_by_both_tiers_is_retracted_once_each() {
+    // The LSM twin of the failed call lands after the outcome.
+    let mut sim = Sim::new();
+    seed_failed_rename_trees(&sim);
+    let before = sim.snapshot();
+    failed_dir_rename(&mut sim, "d", "t", true);
+    sim.rm_rf("t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn failed_rename_then_a_real_one_keeps_the_real_one() {
+    // `mv d t` fails, `rm -rf t; mv d t` succeeds: only the first goes.
+    let mut sim = Sim::new();
+    seed_failed_rename_trees(&sim);
+    let before = sim.snapshot();
+    failed_dir_rename(&mut sim, "d", "t", false);
+    sim.rm_rf("t");
+    sim.mv("d", "t");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn dual_tier_pip_shape_with_unjournaled_top_rmdir_is_rebuilt() {
+    // Finding B's untried shape: both tiers report the Rename and the
+    // unlinks under the stash, the helper reports the new tree, and the
+    // stash's top rmdir is seen by neither.
+    let mut sim = Sim::new();
+    seed_pip_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    let dup = sim
+        .events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.kind, CaptureEventKind::TreeOp(TreeOp::Rename { .. })))
+        .unwrap()
+        .kind
+        .clone();
+    sim.emit(dup);
+    sim.mkdir("d");
+    sim.write("d/f", b"v2\n");
+    let stash = sim.p("d.old");
+    let mut children: Vec<PathBuf> = std::fs::read_dir(&stash)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    children.sort();
+    for c in children {
+        rm_rf_dual_tier(&mut sim, &c);
+    }
+    std::fs::remove_dir(&stash).unwrap();
+    assert_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn dir_diff_pip_shape_restores_modes_too() {
+    // dir_diff_pip_shape_restores_names_and_bytes, now through the rule:
+    // `d/sub` comes back 0750 from its walk record.
+    let mut sim = Sim::new();
+    seed_pip_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    for rel in ["d.old", "d.old/f", "d.old/sub", "d.old/sub/g"] {
+        let p = sim.p(rel);
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        let kind = if m.is_dir() {
+            FileKind::Directory
+        } else {
+            FileKind::Regular
+        };
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+            inode: InodeRef::new(m.dev(), m.ino()),
+            path: p,
+            kind,
+            mode: m.mode(),
+        }));
+    }
+    sim.mkdir("d");
+    sim.write("d/f", b"v2\n");
+    sim.rm_rf("d.old");
+    assert_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
+
+#[test]
+fn dir_diff_create_with_an_unknown_inode_keeps_the_ordinary_inverses() {
+    // A Create under the destination the walk cannot identify.
+    let mut sim = Sim::new();
+    seed_pip_tree(&sim);
+    sim.mv("d", "d.old");
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: InodeRef::new(0, 0),
+        path: sim.p("d.old/f"),
+        kind: FileKind::Regular,
+        mode: 0o100644,
+    }));
+    sim.rm_rf("d.old");
+    assert_not_rebuilt(&sim, "d");
+}
+
+#[test]
+fn incomplete_walk_keeps_the_ordinary_inverses() {
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv_walk_skipping("d", "d.old", Some("d/sub/g"));
+    sim.rm_rf("d.old");
+    assert_not_rebuilt(&sim, "d");
     assert_restored(&sim, &before);
 }

@@ -125,6 +125,23 @@ pub fn plan(
 
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
+        // L5: the last inverse of a replaced subtree's walk has run, so
+        // its directories can take their recorded metadata (mode, which
+        // may forbid writing into them, owner, xattrs, mtime). Deepest
+        // first, so a parent's mode cannot lock out its children.
+        if let Some(dirs) = class.rebuilt_dir_metadata.get(&ev.id) {
+            for (inode, path, target) in dirs {
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreMetadata {
+                        inode: *inode,
+                        path: path.clone(),
+                        target: target.clone(),
+                    },
+                    cohort: 0,
+                    conflict: None,
+                });
+            }
+        }
     }
 
     // DR-14: partition nodes into cohorts so the orchestrator's
@@ -167,8 +184,11 @@ fn emit_unless_skipped(
     }
     // W01.B.fix-rename-coalescing: skip the entire event if the
     // path is transient (Create+PreImage+Unlink AND gone at undo).
+    // L5: a replaced subtree's walk pre-image is pre-rename data, even
+    // when a later scratch file at the same path is transient.
     if let Some(p) = event_path(ev)
         && class.transient_paths.contains(p)
+        && !class.walk_restores.contains(&ev.id)
     {
         return;
     }
@@ -247,10 +267,32 @@ struct EventClassification {
     /// Unlinks of moved data that undo cannot prove it can restore;
     /// each becomes a Refuse node with this reason.
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
+    /// L5: proven directory renames whose destination the command
+    /// deleted, keyed by the Rename. See [`crate::replaced`].
+    replaced_renames:
+        std::collections::HashMap<crate::events::EventId, crate::replaced::DirRebuild>,
+    /// L5: walk pre-images that rebuild a replaced subtree in place.
+    walk_restores: HashSet<crate::events::EventId>,
+    /// L5: event -> rebuilt directories' recorded metadata, applied
+    /// after that event's inverses.
+    rebuilt_dir_metadata:
+        std::collections::HashMap<crate::events::EventId, Vec<crate::replaced::RebuiltDirMetadata>>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
-    let disproved = disproved_renames(events, probe);
+    let mut disproved = disproved_renames(events, probe);
+    // L5: the shim's post-syscall outcomes. Only commands that have one
+    // pay for the index.
+    let outcomes = events.iter().any(|ev| {
+        matches!(
+            ev.kind,
+            CaptureEventKind::RenameOutcome { .. } | CaptureEventKind::RenameWalk { .. }
+        )
+    });
+    let rename_index = outcomes.then(|| EventPathIndex::new(events));
+    if let Some(index) = &rename_index {
+        disproved.extend(crate::replaced::failed_renames(index));
+    }
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
@@ -644,8 +686,25 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
+    let replaced = match &rename_index {
+        Some(index) => crate::replaced::ReplacedSubtrees::from_events(
+            index,
+            &disproved,
+            &provenance.dropped_events,
+            probe,
+        ),
+        None => crate::replaced::ReplacedSubtrees::default(),
+    };
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
+    dropped_events.extend(replaced.dropped_events);
+    for id in replaced
+        .by_rename
+        .keys()
+        .chain(replaced.walk_restores.iter())
+    {
+        dropped_events.remove(id);
+    }
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -656,19 +715,22 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         paired_flags_shims: HashSet::new(),
         dropped_events,
         refused_unlinks: provenance.refused_unlinks,
+        replaced_renames: replaced.by_rename,
+        walk_restores: replaced.walk_restores,
+        rebuilt_dir_metadata: replaced.dir_metadata,
     }
 }
 
 /// Chronological event positions by every path an event names, so a
 /// question about one subtree costs its own events, not the journal's.
-struct EventPathIndex<'a> {
-    chrono: Vec<&'a CaptureEvent>,
+pub(crate) struct EventPathIndex<'a> {
+    pub(crate) chrono: Vec<&'a CaptureEvent>,
     by_path: std::collections::BTreeMap<PathBuf, Vec<usize>>,
 }
 
 impl<'a> EventPathIndex<'a> {
     /// `events` is in reverse-chronological order (as `plan` sorts it).
-    fn new(events: &[&'a CaptureEvent]) -> Self {
+    pub(crate) fn new(events: &[&'a CaptureEvent]) -> Self {
         let chrono: Vec<&CaptureEvent> = events.iter().rev().copied().collect();
         let mut by_path: std::collections::BTreeMap<PathBuf, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -693,7 +755,7 @@ impl<'a> EventPathIndex<'a> {
 
     /// Sorted positions of events naming `root` or anything under it,
     /// and of Renames moving an ancestor of `root`.
-    fn touching(&self, root: &Path) -> Vec<usize> {
+    pub(crate) fn touching(&self, root: &Path) -> Vec<usize> {
         let mut out: Vec<usize> = btree_subtree(&self.by_path, root)
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
@@ -1088,7 +1150,12 @@ fn emit_for_event(
             // blob (write tmpfile + rename into place is the existing
             // executor path). Only mark Missing when the parent is
             // gone too — that's the truly unrecoverable shape.
-            let mut conflict = if atomic_replace_paths.contains(path) {
+            // L5: a replaced subtree's walk restores into the directories
+            // the Rename's inverse just rebuilt, over whatever the
+            // command's new tree left at that name.
+            let mut conflict = if class.walk_restores.contains(&ev.id) {
+                None
+            } else if atomic_replace_paths.contains(path) {
                 if probe.stat(path).is_some() {
                     None
                 } else {
@@ -1208,7 +1275,7 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, class, nodes),
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(ev.id, op, probe, class, nodes),
         CaptureEventKind::ShellStateDiff {
             pwd_before,
             pwd_after,
@@ -1727,6 +1794,7 @@ fn native_delegation_for(
 }
 
 fn emit_for_tree_op(
+    id: crate::events::EventId,
     op: &TreeOp,
     probe: &dyn StateProbe,
     class: &EventClassification,
@@ -1832,6 +1900,26 @@ fn emit_for_tree_op(
             });
         }
         TreeOp::Rename { from, to, .. } => {
+            // L5: the moved subtree was deleted again later in the
+            // command, so there is nothing at `to` to move back. Rebuild
+            // the directories at `from` here, after the inverses of
+            // everything the command did later have run; the walk's
+            // pre-images (journaled just before this rename) then restore
+            // the files in place.
+            if let Some(dirs) = class.replaced_renames.get(&id) {
+                for (path, mode) in dirs {
+                    nodes.push(PlanNode {
+                        op: InverseOp::RecreatePath {
+                            path: path.clone(),
+                            kind: crate::metadata::FileKind::Directory,
+                            mode: *mode,
+                        },
+                        cohort: 0,
+                        conflict: None,
+                    });
+                }
+                return;
+            }
             // AR01.1 follow-up: if the rename's destination is in
             // atomic_replace_paths (Rename + PreImage + Unlink + path
             // present at undo), the FilePreImage's RestoreContent
