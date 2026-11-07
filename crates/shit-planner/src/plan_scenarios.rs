@@ -211,16 +211,18 @@ impl Sim {
         }));
         self.shared_ts = None;
         result.unwrap();
-        // The shim reports every rename's result after the call.
-        self.emit(CaptureEventKind::RenameOutcome {
-            from: from_p,
-            to: to_p.clone(),
-            errno: 0,
-            source: inode,
-            dest: Self::inode_of(&to_p),
-            rename: Some(rename),
-            refusal: None,
-        });
+        // The shim reports a directory rename's result after the call.
+        if is_dir {
+            self.emit(CaptureEventKind::RenameOutcome {
+                from: from_p,
+                to: to_p.clone(),
+                errno: 0,
+                source: inode,
+                dest: Self::inode_of(&to_p),
+                rename: Some(rename),
+                refusal: None,
+            });
+        }
     }
 
     /// The shim's walk of directory `from` before a rename: a pre-image
@@ -1976,14 +1978,23 @@ fn failed_enotempty_rename_is_retracted_and_rm_rf_restores_destination_bytes() {
 }
 
 #[test]
-fn failed_rename_reported_by_both_tiers_is_retracted_once_each() {
-    // The LSM twin of the failed call lands after the outcome.
+fn failed_rename_reported_by_both_tiers_keeps_both_trees_and_conflicts_loudly() {
+    // The LSM twin of the failed call lands after the outcome. Nothing
+    // marks it as the helper's, so it is not retracted (review round 2):
+    // its reverse rename conflicts at undo, after both trees are back.
     let mut sim = Sim::new();
     seed_failed_rename_trees(&sim);
     let before = sim.snapshot();
     failed_dir_rename(&mut sim, "d", "t", true);
     sim.rm_rf("t");
-    assert_restored(&sim, &before);
+    let log = sim.undo();
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("!! ") && l.contains("Rename")),
+        "{}",
+        log.join("\n")
+    );
+    assert_eq!(sim.snapshot(), before, "{}", log.join("\n"));
 }
 
 #[test]

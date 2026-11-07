@@ -822,6 +822,7 @@ mod policy {
         arg: String,
         to_abs: String,
         source: (u64, u64),
+        source_is_dir: bool,
         call_id: u64,
     }
 
@@ -900,6 +901,7 @@ mod policy {
             arg: arg.to_string(),
             to_abs: capture_path.to_string(),
             source: source.as_ref().map_or((0, 0), |m| (m.dev(), m.ino())),
+            source_is_dir: source.as_ref().is_some_and(|m| m.is_dir()),
             call_id,
         })
     }
@@ -943,13 +945,14 @@ mod policy {
         WALK_CHUNK_BYTES
     }
 
-    /// L5 — after a rename-family call returns: report its result with
-    /// the inode now at `to` (the planner's proof a directory rename
-    /// happened) or its errno (which retracts the Rename the pre-syscall
-    /// notification journaled). Every call reports, so the daemon can tell
-    /// each call's own Rename from a second tier's. Nothing waits on the
-    /// daemon's ack, and the daemon matches the call by id instead of
-    /// resolving the pid again. Leaves errno as the call set it.
+    /// L5 — after a rename-family call returns: report a directory
+    /// rename's result with the inode now at `to` (the planner's proof it
+    /// happened), and any failure with its errno (which retracts the
+    /// Rename the pre-syscall notification journaled). A successful file
+    /// rename sends nothing, so atomic saves pay no second round trip.
+    /// Nothing waits on the daemon's ack, and the daemon matches the call
+    /// by id instead of resolving the pid again. Leaves errno as the call
+    /// set it.
     pub fn finish_rename(pending: Option<RenamePending>, rc: libc::c_int) {
         use std::os::unix::fs::MetadataExt;
         let Some(p) = pending else {
@@ -961,6 +964,9 @@ mod policy {
         } else {
             saved.raw_os_error().unwrap_or(libc::EIO)
         };
+        if errno == 0 && !p.source_is_dir {
+            return;
+        }
         if disabled() || IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }

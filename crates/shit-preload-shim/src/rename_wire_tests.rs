@@ -179,25 +179,31 @@ fn failed_dir_rename_reports_its_errno_and_keeps_it_for_the_caller() {
 }
 
 #[test]
-fn every_rename_reports_its_outcome_under_its_call_id() {
-    // Review item 2: the outcome names its call, so the daemon can tell
-    // each call's own Rename from a second tier's.
+fn outcomes_only_for_directory_and_failed_renames() {
+    // Review round 2, item 3: a successful file rename (an atomic save)
+    // pays no second round trip; a directory rename and any failure
+    // report, under the call's id.
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().canonicalize().unwrap();
     std::fs::write(dir.join("a"), b"a").unwrap();
-    std::fs::write(dir.join("c"), b"c").unwrap();
+    std::fs::create_dir(dir.join("d")).unwrap();
     let notes = test_capture::capture(|| {
         assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")).0, 0);
-        assert_eq!(rename_abs(&dir.join("c"), &dir.join("d")).0, 0);
+        assert_eq!(rename_abs(&dir.join("d"), &dir.join("e")).0, 0);
+        assert_eq!(rename_abs(&dir.join("gone"), &dir.join("x")).0, -1);
     });
-    assert_eq!(notes.len(), 4, "{notes:#?}");
-    assert!(notes[0].outcome.is_none() && notes[0].walk.is_none());
-    let out = notes[1].outcome.expect("outcome");
-    assert_eq!(out.errno, 0);
-    assert_ne!(notes[0].call_id, 0);
-    assert_eq!(notes[0].call_id, notes[1].call_id);
-    assert_eq!(notes[2].call_id, notes[3].call_id);
-    assert_ne!(notes[0].call_id, notes[2].call_id);
+    let outcomes: Vec<_> = notes.iter().filter(|n| n.outcome.is_some()).collect();
+    assert_eq!(outcomes.len(), 2, "{notes:#?}");
+    assert!(outcomes[0].arg.starts_with(dir.join("d").to_str().unwrap()));
+    assert_eq!(outcomes[1].outcome.unwrap().errno, libc::ENOENT);
+    for o in outcomes {
+        let pre = notes
+            .iter()
+            .find(|n| n.outcome.is_none() && n.arg == o.arg)
+            .expect("its pre-call note");
+        assert_ne!(o.call_id, 0);
+        assert_eq!(pre.call_id, o.call_id);
+    }
 }
 
 #[test]

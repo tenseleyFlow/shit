@@ -20,9 +20,7 @@
 //! by the walk's own identities (inode, and for bytes the blob), which is
 //! what makes dropping those events lose nothing.
 
-use crate::events::{
-    CaptureEvent, CaptureEventKind, EventId, FilePreImageSource, TreeOp, WalkEntry,
-};
+use crate::events::{CaptureEventKind, EventId, FilePreImageSource, TreeOp, WalkEntry};
 use crate::inode::{BlobHash, InodeRef};
 use crate::metadata::{FileKind, FileMetadata};
 use crate::plan::EventPathIndex;
@@ -32,105 +30,29 @@ use std::path::{Path, PathBuf};
 
 /// Events a failed [`CaptureEventKind::RenameOutcome`] retracts.
 ///
-/// The shim sends an outcome for every rename-family call, and the
-/// daemon names in it the Rename (and any CaptureRefused) that the same
-/// call's pre-syscall notification journaled, matched by the shim's
-/// per-call id. A failure retracts exactly those.
+/// The shim sends an outcome for a directory rename and for any failed
+/// rename, and the daemon names in it the Rename (and any CaptureRefused)
+/// that the same call's pre-syscall notification journaled, matched by
+/// the shim's per-call id. A failure retracts exactly those.
 ///
-/// A second tier's report of the same call (the LSM hook fires before the
-/// filesystem refuses) is retracted too, and only when it is provably
-/// that: a Rename of the same pair that no outcome names (so it is not
-/// any shim call's own), whose inode is the outcome's pre-call source
-/// inode (never the sentinel), next to the call's own Rename among the
-/// events naming `from` or `to`.
+/// A second tier's report of the same failed call (the LSM hook fires
+/// before the filesystem refuses) is not retracted: nothing on a
+/// journaled Rename says which tier it came from, and a successful file
+/// rename sends no outcome, so a twin cannot be told from another call's
+/// Rename. Its reverse rename then fails loudly at undo; nothing is lost.
 pub(crate) fn failed_renames(index: &EventPathIndex<'_>) -> HashSet<EventId> {
     let mut out = HashSet::new();
-    let named: HashSet<EventId> = index
-        .chrono
-        .iter()
-        .filter_map(|ev| match &ev.kind {
-            CaptureEventKind::RenameOutcome { rename, .. } => *rename,
-            _ => None,
-        })
-        .collect();
-    let position: HashMap<EventId, usize> = index
-        .chrono
-        .iter()
-        .enumerate()
-        .map(|(i, ev)| (ev.id, i))
-        .collect();
-    for (i, ev) in index.chrono.iter().enumerate() {
-        let CaptureEventKind::RenameOutcome {
-            from,
-            to,
+    for ev in &index.chrono {
+        if let CaptureEventKind::RenameOutcome {
             errno,
-            source,
             rename,
             refusal,
             ..
         } = &ev.kind
-        else {
-            continue;
-        };
-        if *errno == 0 {
-            continue;
-        }
-        out.extend(refusal.iter().copied());
-        // Without the call's own Rename there is nothing to anchor a
-        // twin to; leave the rest to the ordinary inverses (loud).
-        let Some(own_id) = rename else {
-            continue;
-        };
-        out.insert(*own_id);
-        let Some(&own) = position.get(own_id) else {
-            continue;
-        };
-        if source.dev == 0 && source.inode == 0 {
-            continue;
-        }
-        let is_pair = |e: &CaptureEvent| {
-            matches!(&e.kind, CaptureEventKind::TreeOp(TreeOp::Rename { from: f, to: t, .. })
-                if f == from && t == to)
-        };
-        let mut near: Vec<usize> = index.touching(from);
-        near.extend(index.touching(to));
-        near.push(i);
-        near.sort_unstable();
-        near.dedup();
-        let Some(at) = near.iter().position(|p| *p == own) else {
-            continue;
-        };
-        let twin = |p: usize| {
-            let e = index.chrono[p];
-            match &e.kind {
-                CaptureEventKind::TreeOp(TreeOp::Rename { inode, .. }) if is_pair(e) => {
-                    Some(*inode == *source && !named.contains(&e.id))
-                }
-                // The walk and the outcome itself sit between the shim's
-                // Rename and a late twin.
-                CaptureEventKind::RenameOutcome { .. } | CaptureEventKind::RenameWalk { .. } => {
-                    None
-                }
-                CaptureEventKind::FilePreImage {
-                    source: FilePreImageSource::ShimRenameSubtree,
-                    ..
-                } => None,
-                _ => Some(false),
-            }
-        };
-        for dir in [-1isize, 1] {
-            let mut k = at as isize + dir;
-            while k >= 0 && (k as usize) < near.len() {
-                let p = near[k as usize];
-                match twin(p) {
-                    Some(true) => {
-                        out.insert(index.chrono[p].id);
-                    }
-                    Some(false) => break,
-                    None => {}
-                }
-                k += dir;
-            }
+            && *errno != 0
+        {
+            out.extend(rename.iter().copied());
+            out.extend(refusal.iter().copied());
         }
     }
     out
