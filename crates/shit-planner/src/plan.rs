@@ -818,6 +818,9 @@ struct EntryHistory {
     moved_from: Option<PathBuf>,
     /// Content pre-images taken at its path, once there.
     pre_images: Vec<crate::events::EventId>,
+    /// One of them is a trusted pre-mutation snapshot: the entry existed
+    /// before the command whatever the Create says.
+    trusted_pre_image: bool,
     /// Its unlinks, with the kind each reports. More than one tier can
     /// report the same unlink: the shim's with the (0, 0) inode sentinel
     /// is not merged with the helper's by `journal_unlink_idempotent`.
@@ -852,6 +855,7 @@ impl Provenance {
                 CaptureEventKind::FilePreImage { path, source, .. } if source.has_content() => {
                     if let Some(h) = live.get_mut(path) {
                         h.pre_images.push(ev.id);
+                        h.trusted_pre_image |= source.is_trusted_pre_mutation();
                     }
                 }
                 CaptureEventKind::TreeOp(
@@ -945,7 +949,13 @@ impl Provenance {
         };
         if h.born {
             // Nothing captured and nothing that was there before: scratch.
-            if h.pre_images.is_empty() {
+            // L5: so is a born entry that was renamed before its unlink
+            // (`echo > w/t; mv w/t w/x; rm -rf w`, pip's temp files): its
+            // pre-images are of bytes this command wrote. The transient
+            // rule covers that shape at one path, but not the reverse
+            // rename, which would hit a missing source.
+            if h.pre_images.is_empty() || (!h.renames.is_empty() && !h.trusted_pre_image) {
+                self.dropped_events.extend(h.pre_images);
                 self.dropped_events.extend(h.creates);
                 self.dropped_events.extend(h.renames);
                 self.dropped_events
