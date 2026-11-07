@@ -246,3 +246,91 @@ fn failed_file_rename_sends_an_outcome() {
     let out = notes.last().unwrap().outcome.expect("outcome");
     assert_eq!(out.errno, libc::EISDIR);
 }
+
+/// Review item 9: what the post-syscall outcome adds to a directory
+/// rename, against a stand-in daemon that acks each frame after
+/// `SHIT_L5_BENCH_ACK_US` microseconds (default 0). Run alone:
+/// `cargo test -p shit-preload-shim --lib -- --ignored --exact
+/// rename_wire_tests::bench_dir_rename_outcome_latency --nocapture`.
+#[test]
+#[ignore]
+fn bench_dir_rename_outcome_latency() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // The env first: the shim caches its socket path on first use, and
+    // creating the tempdir already goes through the mkdir interposer.
+    let dir = std::env::temp_dir().join(format!("l5-bench-{}", std::process::id()));
+    // SAFETY: the test runs alone (see above); nothing else reads the env.
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", &dir) };
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let sock = dir.join("shit-shim.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    static CONNS: AtomicUsize = AtomicUsize::new(0);
+    let ack_delay = std::time::Duration::from_micros(
+        std::env::var("SHIT_L5_BENCH_ACK_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    );
+    std::thread::spawn(move || {
+        let ack = shit_proto::encode_frame(&shit_proto::ShimAck::Allow).unwrap();
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            CONNS.fetch_add(1, Ordering::Relaxed);
+            let mut len = [0u8; 4];
+            if s.read_exact(&mut len).is_err() {
+                continue;
+            }
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+            let _ = s.read_exact(&mut body);
+            std::thread::sleep(ack_delay);
+            let _ = s.write_all(&ack);
+        }
+    });
+    let n = 300;
+    let (mut pre, mut post) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        let d = dir.join(format!("d{i}"));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), b"f").unwrap();
+        let t = dir.join(format!("t{i}"));
+        let t0 = std::time::Instant::now();
+        let pending = super::policy::notify_rename_with_dst_preimage(
+            "rename",
+            d.to_str().unwrap(),
+            t.to_str().unwrap(),
+        );
+        let t1 = std::time::Instant::now();
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                CString::new(d.to_str().unwrap()).unwrap().as_ptr(),
+                libc::AT_FDCWD,
+                CString::new(t.to_str().unwrap()).unwrap().as_ptr(),
+                0,
+            ) as i32
+        };
+        let t2 = std::time::Instant::now();
+        super::policy::finish_rename(pending, rc);
+        let t3 = std::time::Instant::now();
+        assert_eq!(rc, 0);
+        pre.push((t1 - t0).as_micros());
+        post.push((t3 - t2).as_micros());
+    }
+    pre.sort_unstable();
+    post.sort_unstable();
+    let med = |v: &[u128]| v[v.len() / 2];
+    let p95 = |v: &[u128]| v[v.len() * 95 / 100];
+    println!(
+        "ack delay {:?}: pre-call notify median {} us p95 {} us; outcome median {} us p95 {} us (n={n}, connections {})",
+        ack_delay,
+        med(&pre),
+        p95(&pre),
+        med(&post),
+        p95(&post),
+        CONNS.load(Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
