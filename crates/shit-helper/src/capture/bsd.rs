@@ -41,7 +41,7 @@
     target_os = "dragonfly",
 ))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -54,6 +54,7 @@ use shit_planner::events::CommandId;
 use shit_proto::HelperResponse;
 use uuid::Uuid;
 
+use crate::capture::accounting::{CloseAccounting, send_observations};
 use crate::ipc::Conn;
 use crate::kqueue::{
     DrainEvent, DrainSession, KqueueError, KqueueFd, STREAM_COPY_CAP, TrackedSubtree,
@@ -130,6 +131,18 @@ struct WatchState {
     /// changed, emit `CapturedMetadataChange` with this baseline as
     /// `before`, and update the baseline.
     meta_baselines: HashMap<RawFd, StatMeta>,
+    /// R3 slice B — identities present at attach and the born set. A
+    /// tracked fd whose identity is not in the attach listing was added
+    /// by a directory diff, so it was born in the command.
+    acct: CloseAccounting,
+    /// Regular files the live-baseline walk shipped a pre-image for.
+    /// kqueue reports writes after they happen, so a pre-existing file
+    /// outside this set has no pre-write content anywhere.
+    baselined: HashSet<(u64, u64)>,
+    /// False when `SHIT_BASELINE_PREEXEC=0` turned the walk off.
+    baseline_ran: bool,
+    /// Capture responses that never reached the daemon.
+    send_failures: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -301,14 +314,31 @@ impl PumpState {
         // Default-on after the W02.B regression sweep landed 12/12
         // BSD smokes green. Opt out with `SHIT_BASELINE_PREEXEC=0`
         // for diagnostics / emergency rollback.
-        if std::env::var("SHIT_BASELINE_PREEXEC").as_deref() != Ok("0") {
-            let (n, partial) = baseline_walk_and_emit(
+        let mut acct = CloseAccounting::default();
+        for baseline in dir_baselines.values() {
+            for (name, e) in &baseline.entries {
+                acct.note_baseline_entry((e.dev, e.inode), &baseline.path.join(name));
+            }
+        }
+        for raw in tracked_fds(&subtree) {
+            if let (Some((dev, inode, _)), Some(path)) =
+                (fstat_dev_inode_kind(raw), subtree.path_for_fd(raw))
+            {
+                acct.note_baseline_entry((dev, inode), path);
+            }
+        }
+        acct.note_walked();
+        let mut baselined = HashSet::new();
+        let baseline_ran = std::env::var("SHIT_BASELINE_PREEXEC").as_deref() != Ok("0");
+        if baseline_ran {
+            let (n, partial, shipped) = baseline_walk_and_emit(
                 &subtree,
                 &self.conn,
                 self.staging_dir_fd.as_raw_fd(),
                 command.session,
                 root_path,
             );
+            baselined = shipped;
             tracing::info!(
                 %command.session,
                 seq = command.seq,
@@ -325,6 +355,10 @@ impl PumpState {
                 dedupe: HashMap::new(),
                 dir_baselines,
                 meta_baselines,
+                acct,
+                baselined,
+                baseline_ran,
+                send_failures: 0,
             },
         );
         Ok(())
@@ -335,6 +369,9 @@ impl PumpState {
             for raw in tracked_fds(&ws.subtree) {
                 self.fd_to_command.remove(&raw);
             }
+            // Before the caller's UnwatchTreeFlushed, so the daemon sees
+            // every loss for the command ahead of the close barrier.
+            send_observations(&self.conn, command, ws.acct.close(ws.send_failures, None));
             tracing::info!(
                 %command.session,
                 seq = command.seq,
@@ -388,6 +425,8 @@ impl PumpState {
             Some(t) => t,
             None => {
                 tracing::warn!(fd, "fstat failed; skipping capture");
+                ws.acct
+                    .note_unkeyed("kqueue event fd could not be identified (fstat failed)");
                 return;
             }
         };
@@ -417,12 +456,33 @@ impl PumpState {
             return;
         }
         let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
+        // R3 slice B — kqueue fires after the write, so a pre-existing
+        // file's only pre-write content is its live-baseline pre-image.
+        // A tracked file absent from the attach listing was born.
+        if !is_delete && !ws.baselined.contains(&(dev, inode)) {
+            ws.acct.note_missing(
+                (dev, inode),
+                true,
+                path.as_deref().map(path_to_string),
+                if ws.baseline_ran {
+                    "pre-existing file was written but the baseline walk captured no pre-image for it"
+                } else {
+                    "pre-existing file was written with the baseline walk turned off"
+                },
+            );
+        }
         // Stat for metadata. After Delete the fstat above already
         // returned valid (dev, inode); same call works for mode/uid/gid/mtime.
         let meta = match fstat_meta(fd) {
             Some(m) => m,
             None => {
                 tracing::warn!(fd, "fstat for meta failed; skipping capture");
+                ws.acct.note_missing(
+                    (dev, inode),
+                    true,
+                    path.as_deref().map(path_to_string),
+                    "pre-image metadata could not be read",
+                );
                 return;
             }
         };
@@ -439,6 +499,12 @@ impl PumpState {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(fd, error = %e, "stream_copy_to_staging failed");
+                    ws.acct.note_missing(
+                        (dev, inode),
+                        true,
+                        path.as_deref().map(path_to_string),
+                        format!("pre-image could not be staged: {e}"),
+                    );
                     return;
                 }
             };
@@ -495,6 +561,12 @@ impl PumpState {
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "send_response_with_fd failed");
+            ws.send_failures = ws.send_failures.saturating_add(1);
+        } else if is_delete {
+            // A delete's fd still holds the bytes, so its capture is
+            // evidence. A write's is post-write content, and its
+            // evidence is the baseline pre-image checked above.
+            ws.acct.note_captured((dev, inode));
         }
         // Mark as captured. Don't insert a NEW key — we used or_insert
         // above; just update the invalidated flag based on Delete.
@@ -845,6 +917,12 @@ impl PumpState {
         }
         let Some(after) = fstat_meta(fd) else {
             tracing::warn!(fd, "fstat_meta failed during attrib handling");
+            ws.acct.note_missing(
+                (dev, inode),
+                true,
+                ws.subtree.path_for_fd(fd).map(path_to_string),
+                "attribute change could not be read",
+            );
             return;
         };
         let before = match ws.meta_baselines.get(&fd).cloned() {
@@ -854,6 +932,12 @@ impl PumpState {
                 // race with detach). Take the current as baseline and
                 // skip emission — we have nothing to compare to.
                 ws.meta_baselines.insert(fd, after);
+                ws.acct.note_missing(
+                    (dev, inode),
+                    true,
+                    ws.subtree.path_for_fd(fd).map(path_to_string),
+                    "attribute change had no pre-change metadata",
+                );
                 return;
             }
         };
@@ -878,6 +962,7 @@ impl PumpState {
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "send CapturedMetadataChange failed");
+            ws.send_failures = ws.send_failures.saturating_add(1);
             return;
         }
         ws.meta_baselines.insert(fd, after);
@@ -1009,9 +1094,10 @@ fn baseline_walk_and_emit(
     staging_dir_fd: RawFd,
     session: uuid::Uuid,
     cwd_path: &Path,
-) -> (u64, bool) {
+) -> (u64, bool, HashSet<(u64, u64)>) {
     let mut count = 0u64;
     let mut partial = false;
+    let mut shipped = HashSet::new();
 
     for (fd, path) in subtree.iter_entries() {
         let Some((dev, inode, kind)) = fstat_dev_inode_kind(fd) else {
@@ -1071,6 +1157,7 @@ fn baseline_walk_and_emit(
             partial = true;
             continue;
         }
+        shipped.insert((dev, inode));
         count += 1;
     }
 
@@ -1086,7 +1173,7 @@ fn baseline_walk_and_emit(
         tracing::warn!(error = %e, "baseline: BaselineWalkComplete send failed");
     }
 
-    (count, partial)
+    (count, partial, shipped)
 }
 
 fn path_to_string(p: &Path) -> String {

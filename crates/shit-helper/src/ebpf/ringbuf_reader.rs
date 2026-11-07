@@ -438,8 +438,9 @@ impl LinuxCaptureSink {
 /// Start-up tap for the `FMODE_CREATED` probe. While active, open events
 /// from `tgid` are recorded before the exclusion filter drops them.
 static FMODE_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
-static FMODE_PROBE: std::sync::Mutex<Option<(u32, Vec<(u64, u64, u32)>)>> =
-    std::sync::Mutex::new(None);
+/// `(kernel dev, inode, f_mode)` of one open event.
+type ProbedOpen = (u64, u64, u32);
+static FMODE_PROBE: std::sync::Mutex<Option<(u32, Vec<ProbedOpen>)>> = std::sync::Mutex::new(None);
 
 /// Record open events from `tgid` until [`fmode_probe_finish`].
 pub fn fmode_probe_begin(tgid: u32) {
