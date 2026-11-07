@@ -452,12 +452,15 @@ fn run_pre_exec_redirects(
     if analysis.is_empty() {
         return Ok(());
     }
+    // This process runs in the shell's working directory, so relative
+    // targets resolve here and not against the daemon's cwd.
+    let cwd = std::env::current_dir().ok();
     let targets: Vec<RedirectTargetWire> = analysis
         .targets
         .into_iter()
         .map(|t| RedirectTargetWire {
             op: to_op_wire(t.op),
-            path: t.path,
+            path: resolve_redirect_target(&t.path, cwd.as_deref()),
         })
         .collect();
     let ctl_path = ctl_sock
@@ -489,6 +492,38 @@ fn run_pre_exec_redirects(
             Ok(())
         }
     }
+}
+
+/// Resolve a redirect target against the shell's working directory.
+///
+/// A relative path with no unexpanded shell syntax becomes absolute by
+/// joining it onto `cwd`. `..` components are kept: the shell opens the
+/// joined path and the kernel resolves them physically, so collapsing
+/// them lexically would pick a different file when a parent is a
+/// symlink. Anything that still carries `$`, backticks, globs, braces,
+/// escapes or a leading `~` cannot be reproduced here and is sent
+/// verbatim; the daemon refuses non-absolute paths.
+fn resolve_redirect_target(raw: &str, cwd: Option<&Path>) -> String {
+    if raw.is_empty() || raw.starts_with('/') || has_unexpanded_syntax(raw) {
+        return raw.to_owned();
+    }
+    match cwd {
+        Some(dir) if dir.is_absolute() => match dir.join(raw).to_str() {
+            Some(joined) => joined.to_owned(),
+            None => raw.to_owned(),
+        },
+        _ => raw.to_owned(),
+    }
+}
+
+fn has_unexpanded_syntax(raw: &str) -> bool {
+    raw.starts_with('~')
+        || raw.chars().any(|ch| {
+            matches!(
+                ch,
+                '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '\\' | '(' | ')'
+            )
+        })
 }
 
 fn to_op_wire(op: RedirectOp) -> RedirectOpWire {
@@ -677,4 +712,46 @@ fn send_over_ctl(sock_path: &Path, msg: &HookMessage) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod redirect_resolve_tests {
+    use super::*;
+
+    #[test]
+    fn relative_target_joins_shell_cwd() {
+        let cwd = Path::new("/work/sub");
+        assert_eq!(resolve_redirect_target("out", Some(cwd)), "/work/sub/out");
+        assert_eq!(
+            resolve_redirect_target("../out", Some(cwd)),
+            "/work/sub/../out"
+        );
+        assert_eq!(
+            resolve_redirect_target("./a/b", Some(cwd)),
+            "/work/sub/./a/b"
+        );
+    }
+
+    #[test]
+    fn absolute_target_is_untouched() {
+        let cwd = Path::new("/work");
+        assert_eq!(resolve_redirect_target("/tmp/x", Some(cwd)), "/tmp/x");
+    }
+
+    #[test]
+    fn unexpanded_syntax_is_sent_verbatim() {
+        let cwd = Path::new("/work");
+        for raw in ["$NOPE/out", "~/out", "a*b", "`pwd`/x", "{a,b}", "a\\ b"] {
+            assert_eq!(resolve_redirect_target(raw, Some(cwd)), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn missing_or_relative_cwd_leaves_target_alone() {
+        assert_eq!(resolve_redirect_target("out", None), "out");
+        assert_eq!(
+            resolve_redirect_target("out", Some(Path::new("rel"))),
+            "out"
+        );
+    }
 }
