@@ -127,9 +127,22 @@ pub enum FilePreImageSource {
     /// Keep new variants appended: postcard encodes enum discriminants
     /// positionally and persisted journals may contain older values.
     ShimFlagsPreMutation,
+    /// The shim's recursive walk of a directory about to be renamed
+    /// away (DR-CR-54). Keyed at the file's path under the rename
+    /// source, captured before the rename ran, so the bytes are the
+    /// file's state at that moment. Only regular files are journaled
+    /// this way. The planner treats it as any other content pre-image
+    /// for now; sprint L5 is the intended reader of the tag.
+    ShimRenameSubtree,
 }
 
 impl FilePreImageSource {
+    /// False for records that reuse the FilePreImage wire without
+    /// carrying the file's content: a chflags snapshot.
+    pub fn has_content(&self) -> bool {
+        !matches!(self, FilePreImageSource::ShimFlagsPreMutation)
+    }
+
     /// True for sources whose captured bytes are known to faithfully
     /// represent the file's state BEFORE the user's command (or, for
     /// AUTH-tier captures, before the specific mutation). Used by the
