@@ -29,6 +29,15 @@ pub mod bsd;
 ))]
 pub mod cwd;
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+pub mod accounting;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
