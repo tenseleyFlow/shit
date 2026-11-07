@@ -2286,9 +2286,10 @@ jobs:
           # libc::mknod via helper-IPC. cap_mknod is the standard
           # POSIX-capability gate for mknod(2). L4 restores block/char
           # nodes through the same call (CAP_MKNOD is enough in the
-          # init user namespace) and puts the captured owner back, which
-          # needs cap_chown (mknod-restore-undo-linux).
-          sudo setcap cap_mknod,cap_chown,cap_sys_admin,cap_bpf,cap_perfmon+ep \
+          # init user namespace), only with the helper's capture token
+          # and only for nodes the invoking user owned. No cap_chown:
+          # other owners wait on #226/#227 (mknod-restore-undo-linux).
+          sudo setcap cap_mknod,cap_sys_admin,cap_bpf,cap_perfmon+ep \
             target/release/shit-helper
           getcap target/release/shit-helper
 
