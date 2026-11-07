@@ -2249,3 +2249,29 @@ fn unjournaled_file_under_a_journaled_mkdir_keeps_the_ordinary_loud_inverses() {
     sim.rm_rf("d.old");
     assert_not_rebuilt(&sim, "d");
 }
+
+#[test]
+fn rebuilt_subtree_ops_are_ordered_across_cohorts_by_ancestry() {
+    // Review round 2, item 8: a parent is recreated in an earlier cohort
+    // than its children's restores, and its metadata lands in a later
+    // one, so a parallel run cannot reorder them.
+    use crate::inverse::InverseOp;
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    sim.mv("d", "d.old");
+    sim.rmtree_top_unseen("d.old");
+    let nodes = sim.plan_nodes();
+    let (d, f) = (sim.p("d"), sim.p("d/f"));
+    let cohort = |pred: &dyn Fn(&InverseOp) -> bool| {
+        nodes
+            .iter()
+            .find(|n| pred(&n.op))
+            .map(|n| n.cohort)
+            .unwrap_or_else(|| panic!("{nodes:#?}"))
+    };
+    let mkdir_d = cohort(&|op| matches!(op, InverseOp::RecreatePath { path, .. } if *path == d));
+    let write_f = cohort(&|op| matches!(op, InverseOp::RestoreContent { path, .. } if *path == f));
+    let meta_d = cohort(&|op| matches!(op, InverseOp::RestoreMetadata { path, .. } if *path == d));
+    assert!(mkdir_d < write_f, "{nodes:#?}");
+    assert!(write_f < meta_d, "{nodes:#?}");
+}
