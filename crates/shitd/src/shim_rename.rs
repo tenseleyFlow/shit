@@ -128,63 +128,159 @@ pub(crate) fn ingest_walk(
     }
 }
 
-/// One rename-family call's pre-syscall journal rows, by the shim's call
-/// id, until its outcome arrives.
+/// One rename-family call, by the shim's call id: registered before the
+/// pre-syscall notification is acked, filled while it is ingested, and
+/// done when that ingest returns.
 struct Call {
     command: CommandId,
     rename: Option<EventId>,
     refusal: Option<EventId>,
-    at: std::time::Instant,
+    done: bool,
 }
 
-/// Calls older than this are dropped: their outcome is not coming.
-const CALL_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-
-fn calls() -> &'static std::sync::Mutex<HashMap<u64, Call>> {
-    static CALLS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Call>>> =
-        std::sync::OnceLock::new();
-    CALLS.get_or_init(Default::default)
+/// An outcome that arrived for a call the daemon has no record of.
+pub(crate) struct Parked {
+    pub note: ShimNotification,
+    pub ts: TimePoint,
 }
 
-/// Record what a rename-family call's pre-syscall notification journaled.
-pub(crate) fn remember_call(
-    call_id: u64,
-    command: CommandId,
-    rename: Option<EventId>,
-    refusal: Option<EventId>,
-) {
+/// Done calls and parked outcomes older than this are dropped. A failed
+/// call's outcome is sent right after the syscall returns, and a
+/// directory rename's right after its ingest is done, so a minute is far
+/// more than either needs. Pending calls never expire: their ingest is
+/// still running.
+const DONE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Parked outcomes kept at most (oldest dropped first).
+const MAX_PARKED: usize = 4096;
+
+#[derive(Default)]
+struct Registry {
+    calls: HashMap<u64, Call>,
+    /// Done calls by when they finished, oldest first: expiry pops the
+    /// front, so a burst costs O(1) per call, not a scan of the map.
+    done_order: std::collections::VecDeque<(std::time::Instant, u64)>,
+    parked: HashMap<u64, Parked>,
+    parked_order: std::collections::VecDeque<(std::time::Instant, u64)>,
+}
+
+impl Registry {
+    fn expire(&mut self) {
+        let now = std::time::Instant::now();
+        while let Some((at, id)) = self.done_order.front().copied() {
+            if now.duration_since(at) < DONE_TTL {
+                break;
+            }
+            self.done_order.pop_front();
+            if self.calls.get(&id).is_some_and(|c| c.done) {
+                self.calls.remove(&id);
+            }
+        }
+        while let Some((at, id)) = self.parked_order.front().copied() {
+            if now.duration_since(at) < DONE_TTL && self.parked.len() <= MAX_PARKED {
+                break;
+            }
+            self.parked_order.pop_front();
+            self.parked.remove(&id);
+        }
+    }
+}
+
+fn registry() -> &'static std::sync::Mutex<Registry> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<Registry>> = std::sync::OnceLock::new();
+    REG.get_or_init(Default::default)
+}
+
+fn lock() -> std::sync::MutexGuard<'static, Registry> {
+    registry().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wakes outcomes waiting on a call.
+fn changed() -> &'static tokio::sync::Notify {
+    static N: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Review round 2, item 1: register a rename-family call before its
+/// pre-syscall notification is acked, so its outcome (sent only after the
+/// syscall, so after the ack) always finds it.
+pub(crate) fn register_call(call_id: u64, command: CommandId) {
     if call_id == 0 {
         return;
     }
-    let mut calls = calls().lock().unwrap_or_else(|e| e.into_inner());
-    calls.retain(|_, c| c.at.elapsed() < CALL_TTL);
-    calls.insert(
+    let mut reg = lock();
+    reg.expire();
+    reg.calls.insert(
         call_id,
         Call {
             command,
-            rename,
-            refusal,
-            at: std::time::Instant::now(),
+            rename: None,
+            refusal: None,
+            done: false,
         },
     );
 }
 
-fn known_command(call_id: u64) -> Option<CommandId> {
-    let calls = calls().lock().unwrap_or_else(|e| e.into_inner());
-    calls.get(&call_id).map(|c| c.command)
+/// The Rename the call's notification journaled.
+pub(crate) fn record_rename(call_id: u64, id: EventId) {
+    if let Some(c) = lock().calls.get_mut(&call_id) {
+        c.rename = Some(id);
+    }
 }
 
-/// The command an outcome belongs to, from its call's pre-syscall
-/// notification instead of a second ancestor walk (review item 9). That
-/// notification is journaled just after its ack, so give it a moment.
-pub(crate) async fn await_call(call_id: u64) -> Option<CommandId> {
-    for _ in 0..100 {
-        if let Some(c) = known_command(call_id) {
-            return Some(c);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+/// The CaptureRefused the call's notification journaled.
+pub(crate) fn record_refusal(call_id: u64, id: EventId) {
+    if let Some(c) = lock().calls.get_mut(&call_id) {
+        c.refusal = Some(id);
     }
-    None
+}
+
+/// The call's pre-syscall ingest returned, whatever it journaled. Wakes
+/// its waiting outcome, and hands back one that was parked for it.
+pub(crate) fn finish_call(call_id: u64) -> Option<Parked> {
+    if call_id == 0 {
+        return None;
+    }
+    let parked = {
+        let mut reg = lock();
+        if let Some(c) = reg.calls.get_mut(&call_id) {
+            c.done = true;
+            reg.done_order
+                .push_back((std::time::Instant::now(), call_id));
+        }
+        reg.parked.remove(&call_id)
+    };
+    changed().notify_waiters();
+    parked
+}
+
+/// The command an outcome belongs to, once its call's pre-syscall ingest
+/// is done (review item 9: no second ancestor walk). Waits as long as
+/// that ingest runs. `None` when the daemon has no record of the call:
+/// the caller parks the outcome.
+pub(crate) async fn await_call(call_id: u64) -> Option<CommandId> {
+    loop {
+        let wake = changed().notified();
+        tokio::pin!(wake);
+        // Arm before checking, so a finish between the check and the
+        // wait is not missed.
+        wake.as_mut().enable();
+        match lock().calls.get(&call_id) {
+            None => return None,
+            Some(c) if c.done => return Some(c.command),
+            Some(_) => {}
+        }
+        wake.await;
+    }
+}
+
+/// Keep an outcome whose call is not known yet; [`finish_call`] hands it
+/// back if the call's notification is ingested later.
+pub(crate) fn park(note: ShimNotification, ts: TimePoint) {
+    let mut reg = lock();
+    reg.expire();
+    let id = note.call_id;
+    reg.parked_order.push_back((std::time::Instant::now(), id));
+    reg.parked.insert(id, Parked { note, ts });
 }
 
 /// Journal a rename's post-syscall outcome, naming the Rename and refusal
@@ -196,10 +292,7 @@ pub(crate) fn ingest_outcome(
     ts: TimePoint,
     index: &Index,
 ) {
-    let call = calls()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&note.call_id);
+    let call = lock().calls.remove(&note.call_id);
     let (rename, refusal) = call.map_or((None, None), |c| (c.rename, c.refusal));
     let Some((from, to)) = note.arg.split_once('\t') else {
         debug!(pid = note.pid, arg = %note.arg, "shim notify: rename outcome without from\\tto; dropping");
@@ -397,6 +490,7 @@ mod tests {
         let mut pre = note(None, None);
         pre.extra_pre_images.clear();
         pre.call_id = 0x1234_0000_0001;
+        register_call(pre.call_id, command);
         pre.failure = Some(shit_proto::ShimFailure::CanonicalizeFailed {
             which_arg: "to".into(),
             attempted_path: "/tmp/l5/t".into(),
@@ -410,6 +504,7 @@ mod tests {
             &blobs,
             &LiveBaseline::new(),
         );
+        assert!(finish_call(pre.call_id).is_none());
         let mut post = note(
             None,
             Some(ShimRenameOutcome {
@@ -499,5 +594,54 @@ mod tests {
             ),
             "{kinds:#?}"
         );
+    }
+
+    /// Review round 2, item 1: a pre-call note whose ingest (a big walk)
+    /// takes longer than any fixed wait must not lose its outcome.
+    #[test]
+    fn outcome_waits_for_a_slow_pre_call_ingest() {
+        let (_tmp, _index, _blobs, command) = fixture();
+        let call_id = 0x5150_0000_0001;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async {
+            // Registered before the ack; the ingest then takes 1.5 s.
+            register_call(call_id, command);
+            let slow = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                record_rename(call_id, EventId(9));
+                finish_call(call_id);
+            });
+            let got = await_call(call_id).await;
+            slow.await.unwrap();
+            got
+        });
+        assert_eq!(got, Some(command));
+        assert_eq!(
+            lock().calls.get(&call_id).and_then(|c| c.rename),
+            Some(EventId(9))
+        );
+    }
+
+    /// An outcome for a call with no record is parked, and handed back
+    /// when that call's notification is ingested.
+    #[test]
+    fn outcome_for_an_unknown_call_is_parked_until_its_call_finishes() {
+        let call_id = 0x5150_0000_0002;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(await_call(call_id)), None);
+        let mut n = note(None, None);
+        n.call_id = call_id;
+        park(n, TimePoint::new(9, 0));
+        let (_tmp, _index, _blobs, command) = fixture();
+        register_call(call_id, command);
+        let parked = finish_call(call_id).expect("parked outcome handed back");
+        assert_eq!(parked.note.call_id, call_id);
+        assert_eq!(parked.ts, TimePoint::new(9, 0));
     }
 }

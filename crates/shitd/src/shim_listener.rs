@@ -243,6 +243,14 @@ async fn handle_one(
     // mutation snapshot in the planner's logical clock.
     let ingest_ts = crate::server::next_ts();
 
+    // L5 (review round 2, item 1): a rename call is registered before its
+    // ack, so its outcome, which the shim sends only after the syscall,
+    // always finds it, however long this ingest then takes.
+    let rename_call = is_rename_call(&note).then_some(note.call_id);
+    if let (Some(call_id), Some(command)) = (rename_call, resolved) {
+        crate::shim_rename::register_call(call_id, command);
+    }
+
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
     // the syscall proceeds.
@@ -259,7 +267,17 @@ async fn handle_one(
     // The outcome's call is journaled by its pre-syscall notification's
     // own task, which may still be running.
     let resolved = match resolved {
-        None if note.outcome.is_some() => crate::shim_rename::await_call(note.call_id).await,
+        None if note.outcome.is_some() => {
+            match crate::shim_rename::await_call(note.call_id).await {
+                Some(c) => Some(c),
+                None => {
+                    // No record of the call: keep the outcome for when it
+                    // is ingested (bounded by the registry's TTL).
+                    crate::shim_rename::park(note, ingest_ts);
+                    return Ok(());
+                }
+            }
+        }
         r => r,
     };
 
@@ -272,7 +290,28 @@ async fn handle_one(
         &blob_store,
         &live_baseline,
     );
+    if let Some(call_id) = rename_call
+        && let Some(parked) = crate::shim_rename::finish_call(call_id)
+    {
+        ingest_notification(
+            &parked.note,
+            resolved,
+            parked.ts,
+            None,
+            &index,
+            &blob_store,
+            &live_baseline,
+        );
+    }
     Ok(())
+}
+
+/// A rename-family call's pre-syscall notification (not its outcome,
+/// and not a walk chunk).
+fn is_rename_call(note: &ShimNotification) -> bool {
+    note.call_id != 0
+        && note.outcome.is_none()
+        && matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
 }
 
 /// Kind and mode of an unlink target, read before the syscall runs.
@@ -365,8 +404,6 @@ fn ingest_notification(
     // the partial capture); the journaled refusal ensures the
     // planner surfaces the gap as an InverseOp::Refuse node at undo
     // time instead of silently mis-attributing.
-    // L5: the refusal this notification journals, for its rename's outcome.
-    let mut refusal_id = None;
     if let Some(failure) = &note.failure {
         let (class, primary_path, detail) = match failure {
             shit_proto::ShimFailure::CanonicalizeFailed {
@@ -409,7 +446,10 @@ fn ingest_notification(
                 "shim notify: CaptureRefused journal failed"
             ),
             Ok(id) => {
-                refusal_id = Some(id);
+                // L5: the refusal goes with its rename call's outcome.
+                if is_rename_call(note) {
+                    crate::shim_rename::record_refusal(note.call_id, id);
+                }
                 debug!(
                 pid = note.pid,
                 syscall = %note.syscall,
@@ -731,8 +771,8 @@ fn ingest_notification(
             return;
         }
     };
-    if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2") {
-        crate::shim_rename::remember_call(note.call_id, command, Some(id), refusal_id);
+    if is_rename_call(note) {
+        crate::shim_rename::record_rename(note.call_id, id);
     }
     debug!(
         pid = note.pid,
