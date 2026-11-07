@@ -385,6 +385,35 @@ mod tests {
         }
     }
 
+    /// L5 (review round 2, item 10): shim frames carry their own version.
+    /// A version-1 frame (a shim loaded before the upgrade) is rejected by
+    /// name rather than misread.
+    #[test]
+    fn shim_frames_are_versioned_and_old_ones_are_rejected() {
+        use crate::frame::{SHIM_WIRE_VERSION, decode_shim_frame, encode_shim_frame};
+        let n = ShimNotification {
+            pid: 1,
+            syscall: "unlink".into(),
+            arg: "/tmp/x".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            walk: None,
+            outcome: None,
+            pre_stat: None,
+            call_id: 0,
+        };
+        let frame = encode_shim_frame(&n).unwrap();
+        assert_eq!(frame[4], SHIM_WIRE_VERSION);
+        assert_eq!(decode_shim_frame::<ShimNotification>(&frame).unwrap(), n);
+        let old = encode_frame(&n).unwrap();
+        assert!(matches!(
+            decode_shim_frame::<ShimNotification>(&old),
+            Err(crate::frame::DecodeError::UnsupportedVersion(1))
+        ));
+    }
+
     /// L5 — walk records and the post-syscall rename outcome.
     #[test]
     fn shim_notification_with_walk_and_outcome_round_trips() {

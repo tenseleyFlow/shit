@@ -39,7 +39,7 @@ use shit_planner::TreeOp;
 use shit_planner::events::{CaptureEvent, CaptureEventKind, EventId};
 use shit_planner::inode::InodeRef;
 use shit_planner::metadata::{FileKind, FileMetadata};
-use shit_proto::{ShimAck, ShimNotification, ShimPreImage, decode_frame_large, encode_frame};
+use shit_proto::{ShimAck, ShimNotification, ShimPreImage, decode_shim_frame, encode_frame};
 use shit_store::{BlobStore, Index};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -184,8 +184,20 @@ async fn handle_one(
     if total == 0 {
         return Ok(());
     }
-    let note: ShimNotification = match decode_frame_large(&buf[..total]) {
+    let note: ShimNotification = match decode_shim_frame(&buf[..total]) {
         Ok(n) => n,
+        // L5: a shell started before an upgrade still has the old shim
+        // loaded. Say so by name; its notifications cannot be read.
+        Err(shit_proto::DecodeError::UnsupportedVersion(got)) => {
+            let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
+            warn!(
+                got,
+                expected = shit_proto::SHIM_WIRE_VERSION,
+                peer_pid = ?peer_pid,
+                "shim notification from a different shim version; restart that shell after upgrading"
+            );
+            return Ok(());
+        }
         Err(e) => {
             warn!(err = %e, "shim notification decode failed");
             return Ok(());
@@ -1130,7 +1142,7 @@ pub fn shim_socket_path(cfg: &ResolvedConfig) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use shit_planner::store::PlannerStore;
-    use shit_proto::{decode_frame, encode_frame};
+    use shit_proto::decode_frame;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
 
@@ -1214,7 +1226,7 @@ mod tests {
                 pre_stat: None,
                 call_id: 0,
             };
-            let frame = encode_frame(&note).unwrap();
+            let frame = shit_proto::encode_shim_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
             let mut buf = vec![0u8; 64];
             let n = s.read(&mut buf).unwrap();
