@@ -563,6 +563,36 @@ mod policy {
         notify_inner(syscall, path, Some(path));
     }
 
+    /// Plain-path (`unlink`, `open`) counterpart of the `*at` marker
+    /// handling. A path that resolves keeps the long-standing flow
+    /// ([`notify_pre_mutation_with_content`], unchanged, so a symlink
+    /// being unlinked is not rewritten to its target). One that cannot
+    /// be keyed ships the AU10 marker instead of a silent raw-path
+    /// fallback, and one whose parent is missing sends nothing, as the
+    /// `*at` forms do.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn notify_plain_pre_mutation_with_content(syscall: &'static str, path: &str) {
+        if should_skip_path(path) {
+            return;
+        }
+        match resolve_at_for_notify(libc::AT_FDCWD, path, "path") {
+            AtResolution::Resolved(_) => notify_inner(syscall, path, Some(path)),
+            AtResolution::Failed(raw, failure) => {
+                if should_skip_path(&raw) {
+                    return;
+                }
+                notify_inner_with_failure(syscall, &raw, None, Some(failure), false);
+            }
+            AtResolution::Nothing => {}
+        }
+    }
+
     /// Outcome of resolving an `*at` syscall's `(dirfd, path)` pair for
     /// the journal.
     #[cfg(any(
@@ -1540,7 +1570,7 @@ mod interposers {
         // Unlink + PreImage shape and emits RestoreContent for the
         // path's old bytes; the Unlink's RecreatePath inverse is
         // suppressed in that case.
-        policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(path));
+        policy::notify_plain_pre_mutation_with_content("unlink", &cstr_to_string(path));
         let real = next::real_unlink();
         if next::is_zero(next::as_usize(real)) {
             // dlsym failed; fall through to libc's wrapper. The libc
@@ -1568,7 +1598,7 @@ mod interposers {
             // file is the canonical content-overwrite shape (e.g.
             // `install -m … src dst` where dst already exists). Capture
             // the pre-image so undo can restore.
-            policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
+            policy::notify_plain_pre_mutation_with_content("open", &cstr_to_string(path));
         }
         let real = next::real_open();
         if next::is_zero(next::as_usize(real)) {
@@ -2239,6 +2269,32 @@ mod tests {
     )
 ))]
 mod canonical_tests {
+    /// The plain `unlink`/`open` interposers use the same resolver with
+    /// `AT_FDCWD`: an unresolvable parent that is not ENOENT/ENOTDIR
+    /// (here a 300-byte component, ENAMETOOLONG) ships the marker
+    /// naming the path, rather than falling back silently.
+    #[test]
+    fn plain_path_with_unresolvable_parent_carries_the_marker() {
+        use super::policy::{AtResolution, resolve_at_for_notify};
+        let long = "x".repeat(300);
+        let path = format!("/tmp/{long}/leaf");
+        match resolve_at_for_notify(libc::AT_FDCWD, &path, "path") {
+            AtResolution::Failed(
+                raw,
+                shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg,
+                    attempted_path,
+                    ..
+                },
+            ) => {
+                assert_eq!(raw, path);
+                assert_eq!(which_arg, "path");
+                assert_eq!(attempted_path, path);
+            }
+            other => panic!("expected the AU10 marker, got {other:?}"),
+        }
+    }
+
     /// `AT_FDCWD` and absolute paths join to themselves; canonicalizing
     /// the join absolutizes a relative path.
     #[test]
