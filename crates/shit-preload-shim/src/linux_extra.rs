@@ -3,57 +3,34 @@
 //! L5 — Linux interposers for the symbols glibc programs reach instead
 //! of `open`/`openat`, and for directory creation and removal.
 //!
-//! Anything built with `_FILE_OFFSET_BITS=64` (CPython among them)
-//! calls `open64`/`openat64`, and with `_FORTIFY_SOURCE` the two-argument
-//! forms become `__open64_2`/`__openat64_2`. `os.makedirs` is `mkdir`,
-//! and `shutil.rmtree` removes its top directory with a plain `rmdir`.
-//! None of these reached the shim, so pip's new tree and the top of its
-//! stash were unjournaled.
+//! Anything built with `_FILE_OFFSET_BITS=64` (CPython and Rust's std
+//! among them) calls `open64`/`openat64`, and with `_FORTIFY_SOURCE` the
+//! two-argument forms become `__open64_2`/`__openat64_2`. `os.makedirs`
+//! is `mkdir`, and `shutil.rmtree` removes its top directory with a plain
+//! `rmdir`. None of these reached the shim, so pip's new tree and the top
+//! of its stash were unjournaled.
 //!
-//! The open family keeps `open`'s policy exactly: notify before the
-//! syscall on any write-capable open, with the pre-image when the target
-//! exists. `mkdir`/`mkdirat` resolve their target before the syscall and
-//! notify only after it succeeds, so a `mkdir -p` step that returns
-//! EEXIST journals no Create. `rmdir` notifies before the syscall, while
-//! the directory still exists for the daemon's kind and mode read.
+//! The open family uses the same policy as `open`/`openat`
+//! ([`policy::write_open_begin`]): a Create only for a path that was
+//! absent before a call that succeeded, the bytes of an existing file,
+//! or a capture-gap marker when they could not be read. `mkdir`/`mkdirat`
+//! resolve their target before the syscall and notify only after it
+//! succeeds, so a `mkdir -p` step that returns EEXIST journals no Create.
 
-use super::policy;
-use libc::{O_CREAT, O_RDWR, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, mode_t};
+use super::interposers::cstr_to_string;
+use super::{next, policy};
+use libc::{O_CREAT, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, mode_t};
 use std::sync::OnceLock;
 
-fn cstr_to_string(path: *const c_char) -> String {
-    if path.is_null() {
-        return String::new();
-    }
-    // SAFETY: libc contract: non-null `path` is NUL-terminated.
-    unsafe { std::ffi::CStr::from_ptr(path) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn writes(flags: c_int) -> bool {
-    (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0
-}
-
-/// `dlsym(RTLD_NEXT, name)`, cached; 0 when the symbol is absent.
-fn next_sym(cache: &'static OnceLock<usize>, name: &'static [u8]) -> usize {
-    *cache.get_or_init(|| {
-        debug_assert!(name.last() == Some(&0));
-        // SAFETY: NUL-terminated name, RTLD_NEXT pseudo-handle.
-        unsafe { libc::dlsym(libc::RTLD_NEXT, name.as_ptr().cast::<c_char>()) as usize }
-    })
-}
-
+/// The next definition of `$name`, typed `$ty`, or `None`.
 macro_rules! real {
     ($name:literal, $ty:ty) => {{
         static SYM: OnceLock<usize> = OnceLock::new();
-        let addr = next_sym(&SYM, concat!($name, "\0").as_bytes());
-        if addr == 0 {
-            None
-        } else {
+        match next::lookup(&SYM, concat!($name, "\0").as_bytes()) {
+            0 => None,
             // SAFETY: dlsym returned the next definition of this libc
             // symbol, whose C signature is `$ty`.
-            Some(unsafe { std::mem::transmute::<usize, $ty>(addr) })
+            addr => Some(unsafe { std::mem::transmute::<usize, $ty>(addr) }),
         }
     }};
 }
@@ -68,37 +45,48 @@ type MkdirAtFn = unsafe extern "C" fn(c_int, *const c_char, mode_t) -> c_int;
 type RmdirFn = unsafe extern "C" fn(*const c_char) -> c_int;
 
 fn enosys() -> c_int {
-    // SAFETY: errno location is thread-local and always valid.
-    unsafe { *libc::__errno_location() = libc::ENOSYS };
+    // SAFETY: errno is a valid thread-local lvalue.
+    unsafe { policy::set_errno(libc::ENOSYS) };
     -1
 }
 
-fn notify_open(flags: c_int, path: *const c_char) {
-    if writes(flags) {
-        policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
-    }
+/// Run a path open under the shared write-open policy.
+fn path_open(path: *const c_char, flags: c_int, call: impl FnOnce() -> c_int) -> c_int {
+    let pending = policy::write_open_begin(
+        "open",
+        policy::OpenTarget::Path(&cstr_to_string(path)),
+        flags,
+    );
+    let rc = call();
+    policy::write_open_end(pending, rc);
+    rc
 }
 
-fn notify_openat(dirfd: c_int, flags: c_int, path: *const c_char) {
-    if writes(flags) {
-        policy::notify_pre_mutation_with_content_at("openat", dirfd, &cstr_to_string(path));
-    }
+/// Run a dirfd-relative open under the shared write-open policy.
+fn at_open(dirfd: c_int, path: *const c_char, flags: c_int, call: impl FnOnce() -> c_int) -> c_int {
+    let pending = policy::write_open_begin(
+        "openat",
+        policy::OpenTarget::At(dirfd, &cstr_to_string(path)),
+        flags,
+    );
+    let rc = call();
+    policy::write_open_end(pending, rc);
+    rc
 }
 
-/// `open64(2)`: same policy as the `open` interposer.
+/// `open64(2)`.
 ///
 /// # Safety
 /// libc `open64` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
-    notify_open(flags, path);
-    match real!("open64", OpenFn) {
+    path_open(path, flags, || match real!("open64", OpenFn) {
         Some(f) => unsafe { f(path, flags, mode) },
         None => enosys(),
-    }
+    })
 }
 
-/// `openat64(2)`: same policy as the `openat` interposer.
+/// `openat64(2)`.
 ///
 /// # Safety
 /// libc `openat64` contract.
@@ -109,11 +97,10 @@ pub unsafe extern "C" fn openat64(
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
-    notify_openat(dirfd, flags, path);
-    match real!("openat64", OpenAtFn) {
+    at_open(dirfd, path, flags, || match real!("openat64", OpenAtFn) {
         Some(f) => unsafe { f(dirfd, path, flags, mode) },
         None => enosys(),
-    }
+    })
 }
 
 /// glibc's `_FORTIFY_SOURCE` entry for a two-argument `open`.
@@ -122,11 +109,10 @@ pub unsafe extern "C" fn openat64(
 /// glibc `__open_2` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
-    notify_open(flags, path);
-    match real!("__open_2", Open2Fn) {
+    path_open(path, flags, || match real!("__open_2", Open2Fn) {
         Some(f) => unsafe { f(path, flags) },
         None => enosys(),
-    }
+    })
 }
 
 /// glibc's `_FORTIFY_SOURCE` entry for a two-argument `open64`.
@@ -135,37 +121,38 @@ pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
 /// glibc `__open64_2` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: c_int) -> c_int {
-    notify_open(flags, path);
-    match real!("__open64_2", Open2Fn) {
+    path_open(path, flags, || match real!("__open64_2", Open2Fn) {
         Some(f) => unsafe { f(path, flags) },
         None => enosys(),
-    }
+    })
 }
 
-/// glibc's `_FORTIFY_SOURCE` entry for a three-argument-less `openat`.
+/// glibc's `_FORTIFY_SOURCE` entry for a two-argument `openat`.
 ///
 /// # Safety
 /// glibc `__openat_2` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
-    notify_openat(dirfd, flags, path);
-    match real!("__openat_2", OpenAt2Fn) {
-        Some(f) => unsafe { f(dirfd, path, flags) },
-        None => enosys(),
-    }
+    at_open(dirfd, path, flags, || {
+        match real!("__openat_2", OpenAt2Fn) {
+            Some(f) => unsafe { f(dirfd, path, flags) },
+            None => enosys(),
+        }
+    })
 }
 
-/// glibc's `_FORTIFY_SOURCE` entry for a three-argument-less `openat64`.
+/// glibc's `_FORTIFY_SOURCE` entry for a two-argument `openat64`.
 ///
 /// # Safety
 /// glibc `__openat64_2` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __openat64_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
-    notify_openat(dirfd, flags, path);
-    match real!("__openat64_2", OpenAt2Fn) {
-        Some(f) => unsafe { f(dirfd, path, flags) },
-        None => enosys(),
-    }
+    at_open(dirfd, path, flags, || {
+        match real!("__openat64_2", OpenAt2Fn) {
+            Some(f) => unsafe { f(dirfd, path, flags) },
+            None => enosys(),
+        }
+    })
 }
 
 /// `creat(2)`, which is `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`.
@@ -174,11 +161,12 @@ pub unsafe extern "C" fn __openat64_2(dirfd: c_int, path: *const c_char, flags: 
 /// libc `creat` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
-    notify_open(O_CREAT | O_WRONLY | O_TRUNC, path);
-    match real!("creat", CreatFn) {
-        Some(f) => unsafe { f(path, mode) },
-        None => enosys(),
-    }
+    path_open(path, O_CREAT | O_WRONLY | O_TRUNC, || {
+        match real!("creat", CreatFn) {
+            Some(f) => unsafe { f(path, mode) },
+            None => enosys(),
+        }
+    })
 }
 
 /// `creat64(2)`.
@@ -187,13 +175,13 @@ pub unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
 /// libc `creat64` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
-    notify_open(O_CREAT | O_WRONLY | O_TRUNC, path);
-    match real!("creat64", CreatFn) {
-        Some(f) => unsafe { f(path, mode) },
-        None => enosys(),
-    }
+    path_open(path, O_CREAT | O_WRONLY | O_TRUNC, || {
+        match real!("creat64", CreatFn) {
+            Some(f) => unsafe { f(path, mode) },
+            None => enosys(),
+        }
+    })
 }
-
 /// `mkdir(2)`: resolve first, notify after success only.
 ///
 /// # Safety
@@ -263,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn open64_create_journals_like_open() {
+    fn open64_create_is_notified_after_success() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let p = dir.join("new.txt");
@@ -274,7 +262,7 @@ mod tests {
             unsafe { libc::close(fd) };
         });
         assert_eq!(notes.len(), 1, "{notes:#?}");
-        assert_eq!(notes[0].syscall, "open");
+        assert_eq!(notes[0].syscall, "open_create");
         assert_eq!(notes[0].arg, p.to_str().unwrap());
         assert!(notes[0].pre_image.is_none());
     }
@@ -355,6 +343,88 @@ mod tests {
         assert_eq!(notes[0].arg, dir.join("gone").to_str().unwrap());
         assert!(notes[0].failure.is_none());
         assert!(!dir.join("gone").exists());
+    }
+
+    /// Review item 1: an existing file the shim cannot read must not look
+    /// like a fresh create (the daemon would journal a Create and undo
+    /// would unlink the user's file).
+    #[test]
+    fn open64_of_an_unreadable_existing_file_sends_a_gap_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let p = dir.join("wo");
+        std::fs::write(&p, b"keep me").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::read(&p).is_ok() {
+            return; // running as root: the file is readable anyway
+        }
+        let cp = c(&p);
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(cp.as_ptr(), O_WRONLY, 0) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(notes[0].pre_image.is_none());
+        assert!(
+            matches!(
+                notes[0].failure,
+                Some(shit_proto::ShimFailure::PreImageUncaptured { .. })
+            ),
+            "{notes:#?}"
+        );
+        assert_ne!(notes[0].syscall, "open_create");
+    }
+
+    #[test]
+    fn open64_of_a_file_over_the_cap_sends_a_gap_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let p = dir.join("big");
+        std::fs::File::create(&p)
+            .unwrap()
+            .set_len(shit_proto::SHIM_INLINE_PREIMAGE_CAP + 1)
+            .unwrap();
+        let cp = c(&p);
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(cp.as_ptr(), O_WRONLY | O_TRUNC, 0) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(
+            matches!(
+                notes[0].failure,
+                Some(shit_proto::ShimFailure::PreImageUncaptured { .. })
+            ),
+            "{notes:#?}"
+        );
+    }
+
+    /// Review item 4: `O_TMPFILE` names nothing.
+    #[test]
+    fn open64_with_o_tmpfile_sends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp = c(&tmp.path().canonicalize().unwrap());
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(cp.as_ptr(), libc::O_TMPFILE | O_WRONLY, 0o600) };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// A failed create journals nothing.
+    #[test]
+    fn open64_create_that_fails_sends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cp = c(&tmp.path().join("missing/x"));
+        let notes = test_capture::capture(|| {
+            assert!(unsafe { open64(cp.as_ptr(), O_WRONLY | O_CREAT, 0o644) } < 0);
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
     }
 
     #[test]

@@ -471,6 +471,13 @@ mod next {
         }
     }
 
+    /// L5 — cached `dlsym(RTLD_NEXT, name)` for interposers kept outside
+    /// this module; 0 when absent.
+    #[cfg(target_os = "linux")]
+    pub fn lookup(cache: &'static OnceLock<usize>, name: &'static [u8]) -> usize {
+        *cache.get_or_init(|| unsafe { dlsym_next(name) })
+    }
+
     /// Return the magic null fn pointer test, used by `disabled()` to
     /// short-circuit when dlsym failed to resolve any symbol. Cheap.
     pub fn is_zero(p: usize) -> bool {
@@ -825,6 +832,21 @@ mod policy {
         IN_NOTIFY.with(|f| f.set(false));
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) unsafe fn set_errno(e: libc::c_int) {
+        unsafe { *libc::__errno_location() = e };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
+    pub(crate) unsafe fn set_errno(e: libc::c_int) {
+        unsafe { *libc::__error() = e };
+    }
+
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    pub(crate) unsafe fn set_errno(e: libc::c_int) {
+        unsafe { *libc::__errno() = e };
+    }
+
     /// Walk `from_abs` if it is a directory and capture per-file
     /// pre-images for every regular file in the subtree. Returns
     /// an empty Vec for non-directories, unreadable paths, or
@@ -1029,6 +1051,192 @@ mod policy {
         }
         let resolved = failure.is_none();
         notify_inner_with_failure(syscall, &abs, None, failure, resolved);
+    }
+
+    /// L5 — the target of a write-capable open, before resolution.
+    pub enum OpenTarget<'a> {
+        /// `open`, `open64`, `creat*`, `truncate`: a path as given.
+        Path(&'a str),
+        /// `openat`, `openat64`: a name relative to a dirfd.
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "linux",
+        ))]
+        At(libc::c_int, &'a str),
+    }
+
+    /// L5 — an open that may create its target, to settle after the call.
+    pub struct PendingCreate {
+        path: String,
+        /// Set when the shim could not show the path was absent before
+        /// the call: then a successful open is a capture gap, not a
+        /// Create.
+        gap: Option<shit_proto::ShimFailure>,
+    }
+
+    /// True for opens that can change a file's bytes or create it.
+    /// `O_TMPFILE` creates no name (a later `linkat` is its own event).
+    pub fn is_write_open(flags: libc::c_int) -> bool {
+        #[cfg(target_os = "linux")]
+        if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+            return false;
+        }
+        flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC) != 0
+    }
+
+    fn uncaptured(path: &str, reason: &str) -> shit_proto::ShimFailure {
+        shit_proto::ShimFailure::PreImageUncaptured {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn resolve_open_target(
+        target: OpenTarget<'_>,
+    ) -> Option<(String, Option<shit_proto::ShimFailure>)> {
+        match target {
+            OpenTarget::Path(p) => Some(canonicalize_or_raw(p, "path")),
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                target_os = "linux",
+            ))]
+            OpenTarget::At(dirfd, p) => match resolve_at_for_notify(dirfd, p, "path") {
+                AtResolution::Resolved(abs) => Some((abs, None)),
+                AtResolution::Failed(raw, f) => Some((raw, Some(f))),
+                AtResolution::Nothing => None,
+            },
+        }
+    }
+
+    /// L5 — the one policy for write-capable opens (`open`, `openat`,
+    /// `open64`, `openat64`, the fortify entries, `creat*`, macOS `open`
+    /// and `openat`), run before the call.
+    ///
+    /// An existing regular file is captured and sent with its bytes. One
+    /// the shim cannot capture (over the inline cap, unreadable) is sent
+    /// with a capture-gap marker and no bytes, so undo refuses it instead
+    /// of unlinking the user's file. A path that is absent before an
+    /// `O_CREAT` open comes back as a [`PendingCreate`]: the Create is
+    /// journaled by [`write_open_end`] only if the call succeeded.
+    pub fn write_open_begin(
+        syscall: &'static str,
+        target: OpenTarget<'_>,
+        flags: libc::c_int,
+    ) -> Option<PendingCreate> {
+        if disabled() || !is_write_open(flags) || IN_NOTIFY.with(|f| f.get()) {
+            return None;
+        }
+        let (abs, failure) = resolve_open_target(target)?;
+        if should_skip_path(&abs) {
+            return None;
+        }
+        let creates = flags & libc::O_CREAT != 0;
+        match (std::fs::symlink_metadata(&abs), std::fs::metadata(&abs)) {
+            // Exists (or is a symlink to something that does).
+            (Ok(_), Ok(m)) => {
+                if !m.is_file() {
+                    // Fifos, sockets, devices outside /dev: no bytes to
+                    // restore and nothing created.
+                    return None;
+                }
+                notify_existing_file(syscall, &abs, &m, failure);
+                None
+            }
+            (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => {
+                creates.then_some(PendingCreate {
+                    path: abs,
+                    gap: failure,
+                })
+            }
+            // A dangling symlink (the open would create its target
+            // elsewhere) or a stat that failed: the prior state is not
+            // known, so a success is a gap.
+            _ => creates.then(|| PendingCreate {
+                gap: Some(failure.unwrap_or_else(|| uncaptured(&abs, "prior state unknown"))),
+                path: abs,
+            }),
+        }
+    }
+
+    /// L5 — after a write-capable open: a Create for a target that was
+    /// absent before and now exists because the call succeeded. Leaves
+    /// errno as the call set it.
+    pub fn write_open_end(pending: Option<PendingCreate>, rc: libc::c_int) {
+        let Some(p) = pending else {
+            return;
+        };
+        if rc < 0 {
+            return;
+        }
+        let saved = std::io::Error::last_os_error();
+        match p.gap {
+            None => notify_inner_with_failure("open_create", &p.path, None, None, false),
+            Some(f) => notify_inner_with_failure("open", &p.path, None, Some(f), false),
+        }
+        if let Some(e) = saved.raw_os_error() {
+            // SAFETY: errno is a valid thread-local lvalue.
+            unsafe { set_errno(e) };
+        }
+    }
+
+    /// L5 — `truncate(2)` on a path: capture the existing file, or send
+    /// the gap marker. Nothing is created.
+    #[cfg(not(target_os = "macos"))]
+    pub fn notify_existing_content(syscall: &'static str, path: &str) {
+        if disabled() || IN_NOTIFY.with(|f| f.get()) {
+            return;
+        }
+        let (abs, failure) = canonicalize_or_raw(path, "path");
+        if should_skip_path(&abs) {
+            return;
+        }
+        if let Ok(m) = std::fs::metadata(&abs)
+            && m.is_file()
+        {
+            notify_existing_file(syscall, &abs, &m, failure);
+        }
+    }
+
+    fn notify_existing_file(
+        syscall: &'static str,
+        abs: &str,
+        meta: &std::fs::Metadata,
+        failure: Option<shit_proto::ShimFailure>,
+    ) {
+        if failure.is_some() {
+            notify_inner_with_failure(syscall, abs, None, failure, false);
+            return;
+        }
+        if IN_NOTIFY.with(|f| f.replace(true)) {
+            return;
+        }
+        match capture_pre_image_resolved(abs, true) {
+            Some(pre) => {
+                let arg = pre.path.clone();
+                let _ = try_notify(syscall, &arg, Some(pre), Vec::new(), None);
+            }
+            None => {
+                let reason = if meta.len() > shit_proto::SHIM_INLINE_PREIMAGE_CAP {
+                    "over the shim's inline pre-image cap"
+                } else {
+                    "could not be read"
+                };
+                let _ = try_notify(
+                    syscall,
+                    abs,
+                    None,
+                    Vec::new(),
+                    Some(uncaptured(abs, reason)),
+                );
+            }
+        }
+        IN_NOTIFY.with(|f| f.set(false));
     }
 
     /// W09.11 — paths whose mutations are NOT user-visible state
@@ -1577,11 +1785,9 @@ mod policy {
 ))]
 mod interposers {
     use super::{next, policy};
-    use libc::{
-        O_RDWR, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, c_void, mode_t, off_t, size_t, ssize_t,
-    };
+    use libc::{c_char, c_int, c_uint, c_void, mode_t, off_t, size_t, ssize_t};
 
-    fn cstr_to_string(path: *const c_char) -> String {
+    pub(crate) fn cstr_to_string(path: *const c_char) -> String {
         if path.is_null() {
             return String::new();
         }
@@ -1630,19 +1836,24 @@ mod interposers {
     /// `path` must be a valid C string.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
-        let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
-        if writes {
-            // W06.A.4: open(..., O_TRUNC|O_WRONLY|O_RDWR) on an existing
-            // file is the canonical content-overwrite shape (e.g.
-            // `install -m … src dst` where dst already exists). Capture
-            // the pre-image so undo can restore.
-            policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
-        }
+        // W06.A.4: open(..., O_TRUNC|O_WRONLY|O_RDWR) on an existing
+        // file is the canonical content-overwrite shape (e.g.
+        // `install -m … src dst` where dst already exists). L5: one
+        // policy for every write-capable open; see
+        // `policy::write_open_begin`.
+        let pending = policy::write_open_begin(
+            "open",
+            policy::OpenTarget::Path(&cstr_to_string(path)),
+            flags,
+        );
         let real = next::real_open();
-        if next::is_zero(next::as_usize(real)) {
-            return unsafe { libc::open(path, flags, mode as c_uint) };
-        }
-        unsafe { real(path, flags, mode) }
+        let rc = if next::is_zero(next::as_usize(real)) {
+            unsafe { libc::open(path, flags, mode as c_uint) }
+        } else {
+            unsafe { real(path, flags, mode) }
+        };
+        policy::write_open_end(pending, rc);
+        rc
     }
 
     /// `unlinkat(2)` interposer. W06.A.1 — modern FreeBSD `rm` /
@@ -1682,19 +1893,21 @@ mod interposers {
         flags: c_int,
         mode: c_uint,
     ) -> c_int {
-        let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
-        if writes {
-            // W06.A.4: same content-overwrite shape as `open` —
-            // capture pre-image bytes when the target exists.
-            // DR-CR-54.B: resolve dirfd → absolute up front.
-            let path_str = cstr_to_string(path);
-            policy::notify_pre_mutation_with_content_at("openat", dirfd, &path_str);
-        }
+        // W06.A.4 / DR-CR-54.B / L5: same policy as `open`, with the
+        // dirfd resolved to an absolute key up front.
+        let pending = policy::write_open_begin(
+            "openat",
+            policy::OpenTarget::At(dirfd, &cstr_to_string(path)),
+            flags,
+        );
         let real = next::real_openat();
-        if next::is_zero(next::as_usize(real)) {
-            return unsafe { libc::openat(dirfd, path, flags, mode as c_uint) };
-        }
-        unsafe { real(dirfd, path, flags, mode) }
+        let rc = if next::is_zero(next::as_usize(real)) {
+            unsafe { libc::openat(dirfd, path, flags, mode as c_uint) }
+        } else {
+            unsafe { real(dirfd, path, flags, mode) }
+        };
+        policy::write_open_end(pending, rc);
+        rc
     }
 
     /// `rename(2)` interposer. W06.A.1 — `install`'s atomic move
@@ -2114,7 +2327,8 @@ mod interposers {
     pub unsafe extern "C" fn truncate(path: *const c_char, len: off_t) -> c_int {
         // W06.A.4: truncate(path, 0) before re-writing is a common
         // overwrite shape; capture pre-image to enable undo.
-        policy::notify_pre_mutation_with_content("truncate", &cstr_to_string(path));
+        // L5: an uncapturable file gets the gap marker, never a Create.
+        policy::notify_existing_content("truncate", &cstr_to_string(path));
         let real = next::real_truncate();
         if next::is_zero(next::as_usize(real)) {
             return unsafe { libc::truncate(path, len) };
@@ -2346,6 +2560,7 @@ mod canonical_tests {
                 assert_eq!(which_arg, "path");
                 assert_eq!(attempted_path, joined);
             }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -2452,6 +2667,7 @@ mod canonical_tests {
                 assert_eq!(which_arg, "from");
                 assert_eq!(attempted_path, raw);
             }
+            other => panic!("{other:?}"),
         }
     }
 
