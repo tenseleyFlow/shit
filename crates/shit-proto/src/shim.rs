@@ -183,6 +183,19 @@ pub struct ShimNotification {
     /// same `from\tto` as the pre-syscall notification.
     #[serde(default)]
     pub outcome: Option<ShimRenameOutcome>,
+    /// L5 — the target's lstat before the call, for removals the shim
+    /// reports after they succeed (`rmdir`): by then the daemon has
+    /// nothing left to stat.
+    #[serde(default)]
+    pub pre_stat: Option<ShimStat>,
+}
+
+/// L5 — identity and mode of a path, as the shim read it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimStat {
+    pub dev: u64,
+    pub inode: u64,
+    pub mode: u32,
 }
 
 /// L5 — what a rename-family syscall did, as the shim saw it.
@@ -292,6 +305,7 @@ mod tests {
             failure: None,
             walk: None,
             outcome: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -322,6 +336,7 @@ mod tests {
             failure: None,
             walk: None,
             outcome: None,
+            pre_stat: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
@@ -348,6 +363,7 @@ mod tests {
             }),
             walk: None,
             outcome: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -389,6 +405,7 @@ mod tests {
                     entries: vec![entry.clone()],
                 }),
                 outcome: None,
+                pre_stat: None,
             },
             ShimNotification {
                 pid: 1,
@@ -405,6 +422,11 @@ mod tests {
                     source_inode: 2,
                     dest_dev: 0,
                     dest_inode: 0,
+                }),
+                pre_stat: Some(ShimStat {
+                    dev: 1,
+                    inode: 2,
+                    mode: 0o040700,
                 }),
             },
         ] {
@@ -445,6 +467,7 @@ mod tests {
             failure: None,
             walk: None,
             outcome: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -481,6 +504,7 @@ mod tests {
             failure: None,
             walk: None,
             outcome: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -530,6 +554,7 @@ mod tests {
             failure: None,
             walk: None,
             outcome: None,
+            pre_stat: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");

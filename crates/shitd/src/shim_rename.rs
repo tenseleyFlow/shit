@@ -236,6 +236,7 @@ mod tests {
             failure: None,
             walk,
             outcome,
+            pre_stat: None,
         }
     }
 

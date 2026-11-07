@@ -858,13 +858,22 @@ mod policy {
             pre_image.clone(),
             extras,
             failure.clone(),
-            walk.clone(),
-            None,
+            Extra {
+                walk: walk.clone(),
+                ..Extra::default()
+            },
         );
         // Finding 6: a frame that cannot be sent with the walk must not
         // take the Rename down with it. Resend without the walk.
         if sent.is_err() && walk.is_some() {
-            let _ = try_notify_full(syscall, arg, pre_image, Vec::new(), failure, None, None);
+            let _ = try_notify_full(
+                syscall,
+                arg,
+                pre_image,
+                Vec::new(),
+                failure,
+                Extra::default(),
+            );
         }
         IN_NOTIFY.with(|f| f.set(false));
         Some(RenamePending {
@@ -919,8 +928,10 @@ mod policy {
             None,
             Vec::new(),
             None,
-            None,
-            Some(outcome),
+            Extra {
+                outcome: Some(outcome),
+                ..Extra::default()
+            },
         );
         IN_NOTIFY.with(|f| f.set(false));
         if let Some(e) = saved.raw_os_error() {
@@ -1301,20 +1312,71 @@ mod policy {
         notify_inner_with_failure(syscall, path, None, failure, false);
     }
 
-    /// L5 — `rmdir(2)`: notify before the syscall with the canonical path
-    /// (the directory still exists), or the raw path plus the AU10 marker.
-    /// No content to capture; the daemon reads kind and mode.
+    /// L5 — an `rmdir(2)` resolved and stat'ed before the call.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(super) fn notify_removal(syscall: &'static str, path: &str) {
-        if should_skip_path(path) {
-            return;
+    pub struct PendingRemoval {
+        syscall: &'static str,
+        path: String,
+        failure: Option<shit_proto::ShimFailure>,
+        stat: Option<shit_proto::ShimStat>,
+    }
+
+    /// L5 — before `rmdir(2)`: resolve the path (the directory still
+    /// exists) and keep its lstat for the notification.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn removal_begin(syscall: &'static str, path: &str) -> Option<PendingRemoval> {
+        use std::os::unix::fs::MetadataExt;
+        if disabled() || should_skip_path(path) {
+            return None;
         }
         let (abs, failure) = canonicalize_or_raw(path, "path");
         if should_skip_path(&abs) {
+            return None;
+        }
+        let stat = std::fs::symlink_metadata(&abs)
+            .ok()
+            .map(|m| shit_proto::ShimStat {
+                dev: m.dev(),
+                inode: m.ino(),
+                mode: m.mode(),
+            });
+        Some(PendingRemoval {
+            syscall,
+            path: abs,
+            failure,
+            stat,
+        })
+    }
+
+    /// L5 (review item 3) — after `rmdir(2)`: notify only when it
+    /// removed the directory. A refused rmdir (ENOTEMPTY from
+    /// `--ignore-fail-on-non-empty` or `os.removedirs`) removed nothing.
+    /// Leaves errno as the call set it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn removal_end(pending: Option<PendingRemoval>, rc: libc::c_int) {
+        let Some(p) = pending else {
+            return;
+        };
+        if rc != 0 || IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }
-        let resolved = failure.is_none();
-        notify_inner_with_failure(syscall, &abs, None, failure, resolved);
+        let saved = std::io::Error::last_os_error();
+        let _ = try_notify_full(
+            p.syscall,
+            &p.path,
+            None,
+            Vec::new(),
+            p.failure,
+            Extra {
+                pre_stat: p.stat,
+                ..Extra::default()
+            },
+        );
+        IN_NOTIFY.with(|f| f.set(false));
+        if let Some(e) = saved.raw_os_error() {
+            // SAFETY: errno is a valid thread-local lvalue.
+            unsafe { set_errno(e) };
+        }
     }
 
     /// L5 — the target of a write-capable open, before resolution.
@@ -1923,9 +1985,16 @@ mod policy {
             pre_image,
             extra_pre_images,
             failure,
-            None,
-            None,
+            Extra::default(),
         )
+    }
+
+    /// The L5 fields of a notification.
+    #[derive(Default)]
+    struct Extra {
+        walk: Option<shit_proto::ShimWalk>,
+        outcome: Option<shit_proto::ShimRenameOutcome>,
+        pre_stat: Option<shit_proto::ShimStat>,
     }
 
     /// [`try_notify`] with the L5 rename fields.
@@ -1935,9 +2004,13 @@ mod policy {
         pre_image: Option<shit_proto::ShimPreImage>,
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
-        walk: Option<shit_proto::ShimWalk>,
-        outcome: Option<shit_proto::ShimRenameOutcome>,
+        extra: Extra,
     ) -> std::io::Result<()> {
+        let Extra {
+            walk,
+            outcome,
+            pre_stat,
+        } = extra;
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
         };
@@ -1957,6 +2030,7 @@ mod policy {
                 failure,
                 walk,
                 outcome,
+                pre_stat,
             });
             return Ok(());
         }
@@ -2012,6 +2086,7 @@ mod policy {
             failure,
             walk,
             outcome,
+            pre_stat,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
