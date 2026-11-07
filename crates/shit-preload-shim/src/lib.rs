@@ -1203,18 +1203,21 @@ mod policy {
         target: OpenTarget<'_>,
         flags: libc::c_int,
     ) -> Option<PendingCreate> {
-        if disabled() || !is_write_open(flags) || IN_NOTIFY.with(|f| f.get()) {
+        // Review round 2, item 6: `O_RDONLY|O_CREAT` writes no bytes but can
+        // still create the file.
+        let writes = is_write_open(flags);
+        let creates = flags & libc::O_CREAT != 0;
+        if disabled() || !(writes || creates) || IN_NOTIFY.with(|f| f.get()) {
             return None;
         }
         let (abs, failure) = resolve_open_target(target)?;
         if should_skip_path(&abs) {
             return None;
         }
-        let creates = flags & libc::O_CREAT != 0;
         match (std::fs::symlink_metadata(&abs), std::fs::metadata(&abs)) {
             // Exists (or is a symlink to something that does).
             (Ok(_), Ok(m)) => {
-                if !m.is_file() {
+                if !writes || !m.is_file() {
                     // Fifos, sockets, devices outside /dev: no bytes to
                     // restore and nothing created.
                     return None;

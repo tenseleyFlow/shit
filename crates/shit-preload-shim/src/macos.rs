@@ -368,7 +368,7 @@ unsafe extern "C" fn rust_shim_openat(
     let pending = match join_dirfd(dirfd, &cstr_to_string(path)) {
         Ok(p) => policy::write_open_begin("openat", policy::OpenTarget::Path(&p), flags),
         Err((raw, failure)) => {
-            if policy::is_write_open(flags) {
+            if policy::is_write_open(flags) || flags & libc::O_CREAT != 0 {
                 policy::notify_unresolved("openat", &raw, failure);
             }
             None
