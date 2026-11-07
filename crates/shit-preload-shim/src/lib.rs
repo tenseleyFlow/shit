@@ -563,13 +563,12 @@ mod policy {
         notify_inner(syscall, path, Some(path));
     }
 
-    /// Plain-path (`unlink`, `open`) counterpart of the `*at` marker
-    /// handling. A path that resolves keeps the long-standing flow
-    /// ([`notify_pre_mutation_with_content`], unchanged, so a symlink
-    /// being unlinked is not rewritten to its target). One that cannot
-    /// be keyed ships the AU10 marker instead of a silent raw-path
-    /// fallback, and one whose parent is missing sends nothing, as the
-    /// `*at` forms do.
+    /// Plain-path (`unlink`, `open`) counterpart of
+    /// [`notify_pre_mutation_with_content_at`]: the same resolver with
+    /// `AT_FDCWD`, and the resolved path is what gets sent and captured
+    /// (one realpath per call). A path that cannot be keyed ships the
+    /// AU10 marker instead of a silent raw-path fallback; one whose
+    /// parent is missing sends nothing.
     #[cfg(any(
         target_os = "freebsd",
         target_os = "netbsd",
@@ -578,19 +577,35 @@ mod policy {
         target_os = "linux",
     ))]
     pub fn notify_plain_pre_mutation_with_content(syscall: &'static str, path: &str) {
-        if should_skip_path(path) {
-            return;
+        if let Some(r) = plain_resolution(path) {
+            notify_resolved(syscall, r);
         }
-        match resolve_at_for_notify(libc::AT_FDCWD, path, "path") {
-            AtResolution::Resolved(_) => notify_inner(syscall, path, Some(path)),
-            AtResolution::Failed(raw, failure) => {
-                if should_skip_path(&raw) {
-                    return;
-                }
-                notify_inner_with_failure(syscall, &raw, None, Some(failure), false);
-            }
-            AtResolution::Nothing => {}
+    }
+
+    /// L4b ruling 7 - the muted and re-entrant cases return before any
+    /// canonicalize, so a disabled shim or a nested call (the
+    /// pre-image read's own `open`) costs no realpath.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn plain_resolution(path: &str) -> Option<AtResolution> {
+        if disabled() || should_skip_path(path) || IN_NOTIFY.with(|f| f.get()) {
+            return None;
         }
+        Some(resolve_at_for_notify(libc::AT_FDCWD, path, "path"))
+    }
+
+    /// Test hook: run `f` as if inside a notification on this thread.
+    #[cfg(test)]
+    pub(super) fn with_in_notify<R>(f: impl FnOnce() -> R) -> R {
+        let prev = IN_NOTIFY.with(|c| c.replace(true));
+        let out = f();
+        IN_NOTIFY.with(|c| c.set(prev));
+        out
     }
 
     /// Outcome of resolving an `*at` syscall's `(dirfd, path)` pair for
@@ -675,7 +690,21 @@ mod policy {
         dirfd: libc::c_int,
         path: &str,
     ) {
-        match resolve_at_for_notify(dirfd, path, "path") {
+        notify_resolved(syscall, resolve_at_for_notify(dirfd, path, "path"));
+    }
+
+    /// Send one resolved single-path notification: a keyed path is the
+    /// wire arg and the capture path, already resolved; a marker ships
+    /// the raw path; `Nothing` sends nothing.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn notify_resolved(syscall: &'static str, resolution: AtResolution) {
+        match resolution {
             AtResolution::Resolved(abs) => {
                 if should_skip_path(&abs) {
                     return;
@@ -2269,6 +2298,27 @@ mod tests {
     )
 ))]
 mod canonical_tests {
+    /// L4b ruling 7: a re-entrant plain-path notification returns
+    /// before canonicalizing; a normal one resolves once and that
+    /// resolved path is what is sent.
+    #[test]
+    fn plain_path_skips_canonicalize_when_reentrant_and_resolves_once_otherwise() {
+        use super::policy::{AtResolution, plain_resolution, with_in_notify};
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("via")).unwrap();
+        let path = format!("{}/via/f", dir.path().display());
+        assert!(with_in_notify(|| plain_resolution(&path)).is_none());
+        match plain_resolution(&path) {
+            Some(AtResolution::Resolved(abs)) => {
+                let want = std::fs::canonicalize(&real).unwrap().join("f");
+                assert_eq!(abs, want.to_str().unwrap());
+            }
+            other => panic!("expected a resolved path, got {other:?}"),
+        }
+    }
+
     /// The plain `unlink`/`open` interposers use the same resolver with
     /// `AT_FDCWD`: an unresolvable parent that is not ENOENT/ENOTDIR
     /// (here a 300-byte component, ENAMETOOLONG) ships the marker
