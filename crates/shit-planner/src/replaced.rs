@@ -200,6 +200,68 @@ impl ReplacedSubtrees {
         self.dir_metadata.insert(key, f.metadata);
     }
 
+    /// Entries at `from` an undo-time listing may hold before the rule
+    /// gives up on accounting for them.
+    const MAX_LEFTOVERS: usize = 10_000;
+
+    /// True when nothing is at `from` at undo, or everything under it is
+    /// removed by inverses of events after the rename at `r`.
+    fn from_is_accounted(
+        index: &EventPathIndex<'_>,
+        r: usize,
+        from: &Path,
+        walked_dirs: &HashSet<PathBuf>,
+        probe: &dyn StateProbe,
+    ) -> bool {
+        if probe.stat(from).is_none() {
+            return true;
+        }
+        let created: HashSet<&Path> = index
+            .touching(from)
+            .into_iter()
+            .filter(|j| *j > r)
+            .filter_map(|j| match &index.chrono[j].kind {
+                CaptureEventKind::TreeOp(
+                    TreeOp::Create { path, .. }
+                    | TreeOp::Symlink { path, .. }
+                    | TreeOp::Link { target: path, .. },
+                ) => Some(path.as_path()),
+                CaptureEventKind::TreeOp(TreeOp::Rename { to, .. }) => Some(to.as_path()),
+                _ => None,
+            })
+            .collect();
+        if created.contains(from) {
+            return true;
+        }
+        let mut stack = vec![from.to_path_buf()];
+        let mut seen = 0usize;
+        while let Some(dir) = stack.pop() {
+            let Some(entries) = probe.read_dir(&dir) else {
+                return false;
+            };
+            for e in entries {
+                seen += 1;
+                if seen > Self::MAX_LEFTOVERS {
+                    return false;
+                }
+                if created.contains(e.as_path()) {
+                    continue;
+                }
+                // An unjournaled directory the rebuild recreates anyway (a
+                // walked one) is fine if what is in it is accounted for.
+                let is_dir = probe
+                    .stat(&e)
+                    .is_some_and(|s| FileKind::from_mode(s.meta.mode) == Some(FileKind::Directory));
+                if is_dir && walked_dirs.contains(&e) {
+                    stack.push(e);
+                    continue;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn check(
         index: &EventPathIndex<'_>,
@@ -367,6 +429,21 @@ impl ReplacedSubtrees {
             .filter(|wk| wk.entry.kind == FileKind::Regular)
             .all(|wk| unlinked.contains(&wk.rel));
         if !all_files_unlinked {
+            return None;
+        }
+        // Review item 6: the walk restores land at `from` with no conflict
+        // check, so everything the new tree left there must go first,
+        // through its own journaled inverses: an entry the command
+        // created (a Create, Symlink or Link, or a Rename landing it)
+        // after the rename, or anything under a directory it created
+        // (removed with it). Anything else there would sit beside v1
+        // unreported; keep the ordinary, loud inverses instead.
+        let walked_dirs: HashSet<PathBuf> = walked
+            .values()
+            .filter(|wk| wk.entry.kind == FileKind::Directory)
+            .map(|wk| wk.entry.path.clone())
+            .collect();
+        if !Self::from_is_accounted(index, r, from, &walked_dirs, probe) {
             return None;
         }
         // A second tier reporting the walked entries leaving `from`.

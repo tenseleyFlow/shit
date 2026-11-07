@@ -746,24 +746,37 @@ fn pip_shape_with_partial_walk_keeps_reverse_rename() {
 }
 
 #[test]
-fn pip_shape_as_the_hosted_shim_sees_it() {
+fn pip_shape_as_the_hosted_shim_saw_it_conflicts_with_the_old_tree_intact() {
     // The journal pip produced on hosted Linux before L5's interposers
     // (degraded helper, shim only): no Create for the new tree, no unlink
-    // for the stash's top directory. The reverse rename has nothing to
-    // move back and the new `d` is in the way; the walk carries the
-    // restore, with d/empty and its 0700 mode.
+    // for the stash's top directory. The rename is proven, but `d/f` is a
+    // v2 file no inverse removes, so rebuilding v1 there would leave it
+    // beside v1 unreported (review item 6). Undo stays loud: Outcome B,
+    // with the old tree back at the stash name.
     let mut sim = Sim::new();
     sim.seed_dir("d", 0o755);
     sim.seed_file("d/f", b"original\n", 0o640);
     sim.seed_dir("d/empty", 0o700);
     sim.seed_dir("d/sub", 0o711);
     sim.seed_file("d/sub/g", b"g\n", 0o600);
-    let before = sim.snapshot();
+    sim.snapshot();
     sim.mv("d", "d.old");
     sim.mkdir_unseen("d");
     sim.write_unseen("d/f", b"new\n");
     sim.rmtree_top_unseen("d.old");
-    assert_restored(&sim, &before);
+    assert_not_rebuilt(&sim, "d");
+    let log = sim.undo();
+    assert!(
+        log.iter().any(|l| l.starts_with("!! ")),
+        "{}",
+        log.join("\n")
+    );
+    assert_eq!(
+        std::fs::read(sim.p("d.old/sub/g")).unwrap(),
+        b"g\n",
+        "{}",
+        log.join("\n")
+    );
 }
 
 #[test]
@@ -1744,9 +1757,9 @@ fn source_dir_mode_survives_unjournaled_top_rmdir() {
 }
 
 #[test]
-fn hosted_pip_shape_restores_a_private_source_dir_mode() {
-    // pip_shape_as_the_hosted_shim_sees_it with the new tree already
-    // holding the source's name at a wider mode.
+fn pip_shape_restores_a_private_source_dir_mode() {
+    // The new tree takes the source's name at a wider mode; the rebuild
+    // brings back the 0700 from the walk.
     let mut sim = Sim::new();
     sim.seed_dir("d", 0o700);
     sim.seed_file("d/f", b"original\n", 0o600);
@@ -1754,10 +1767,11 @@ fn hosted_pip_shape_restores_a_private_source_dir_mode() {
     sim.seed_file("d/sub/g", b"g\n", 0o600);
     let before = sim.snapshot();
     sim.mv("d", "d.old");
-    sim.mkdir_unseen("d");
+    sim.mkdir("d");
     std::fs::set_permissions(sim.p("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    sim.write_unseen("d/f", b"new\n");
+    sim.write("d/f", b"new\n");
     sim.rmtree_top_unseen("d.old");
+    assert_rebuilt(&sim, "d");
     assert_restored(&sim, &before);
 }
 
@@ -2158,5 +2172,53 @@ fn failed_rename_drops_its_own_capture_refusal() {
             .any(|n| matches!(n.op, crate::inverse::InverseOp::Refuse { .. })),
         "{nodes:#?}"
     );
+    assert_restored(&sim, &before);
+}
+
+// Review of #224, item 6: the rule proves `to`, but it only rebuilds at
+// `from` when everything the new tree left there is removed by journaled
+// inverses. Otherwise v1 would land beside v2 leftovers with no report.
+
+#[test]
+fn partly_journaled_new_tree_keeps_the_ordinary_loud_inverses() {
+    // `mv d d.old; mkdir d` (unseen); `echo > d/f` (journaled);
+    // `echo > d/x` (unseen); `rm -rf d.old`.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir_unseen("d");
+    sim.write("d/new", b"v2\n");
+    sim.write_unseen("d/x", b"v2\n");
+    sim.rm_rf("d.old");
+    assert_not_rebuilt(&sim, "d");
+    let log = sim.undo();
+    assert!(
+        log.iter().any(|l| l.starts_with("!! ")),
+        "expected a loud conflict\n{}",
+        log.join("\n")
+    );
+    assert_eq!(
+        std::fs::read(sim.p("d.old/f")).unwrap(),
+        b"original\n",
+        "{}",
+        log.join("\n")
+    );
+}
+
+#[test]
+fn fully_journaled_new_tree_inside_an_unseen_mkdir_is_rebuilt() {
+    // The new `d` itself unseen, every entry in it journaled: after their
+    // inverses `d` is empty, so the rebuild has nothing to land beside.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir_unseen("d");
+    sim.write("d/new", b"v2\n");
+    sim.mkdir("d/sub");
+    sim.write("d/sub/h", b"v2\n");
+    sim.rm_rf("d.old");
+    assert_rebuilt(&sim, "d");
     assert_restored(&sim, &before);
 }

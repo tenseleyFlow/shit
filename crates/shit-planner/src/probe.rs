@@ -24,6 +24,13 @@ pub trait StateProbe {
     fn exists(&self, path: &Path) -> bool {
         self.stat(path).is_some()
     }
+
+    /// L5 — the entries of directory `path`, or `None` when it cannot be
+    /// listed. The default lists nothing, so a rule that needs to know
+    /// what is in a directory stays off.
+    fn read_dir(&self, _path: &Path) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
 }
 
 /// Result of a [`StateProbe::stat`] call: enough to identify and classify

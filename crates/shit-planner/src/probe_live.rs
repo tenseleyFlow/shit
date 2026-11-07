@@ -32,6 +32,13 @@ impl LiveStateProbe {
 }
 
 impl StateProbe for LiveStateProbe {
+    fn read_dir(&self, path: &Path) -> Option<Vec<std::path::PathBuf>> {
+        std::fs::read_dir(path)
+            .ok()?
+            .map(|e| e.ok().map(|e| e.path()))
+            .collect()
+    }
+
     fn stat(&self, path: &Path) -> Option<ProbeStat> {
         use std::os::unix::fs::MetadataExt;
 
