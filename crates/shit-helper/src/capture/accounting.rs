@@ -24,6 +24,10 @@
 //! order in which per-hook ring readers deliver events. A file whose
 //! unlink is handled before its creating open is still born.
 
+// The kqueue producer uses a subset: it has no walk cap, unlisted
+// directories, renames or kernel loss counter.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `(dev, inode)` in the userspace (glibc) encoding.
@@ -133,8 +137,6 @@ impl CloseAccounting {
         self.captured.insert(id);
     }
 
-    /// Rename-over checks need it; only the Linux producer sees renames.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn baseline_id_at(&self, path: &std::path::Path) -> Option<Id> {
         self.baseline_paths.get(path).copied()
     }
