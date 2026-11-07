@@ -13,6 +13,12 @@
 #   to <work dir>/smoke-results-<tag>.tsv on the host.
 #   SMOKE_TMPDIR=/tmp/zfs puts each smoke's scratch tree on ZFS.
 #   SMOKE_TAG names the host copy (default: ufs or zfs).
+#
+# Each invocation writes a fresh run directory in the guest,
+# ~/smoke-runs/<UTC stamp>-<tag>-<pid>/, and never deletes an earlier
+# one. Per smoke it holds <NNN>-<smoke>/smoke.log, shitd.log, the daemon's
+# daemon.jsonl* files, index.sqlite and events.tsv (a dump of the
+# journal's events table). ~/smoke-logs is a symlink to the latest run.
 
 set -euo pipefail
 
@@ -34,7 +40,7 @@ bash "${FBSD_VM_SCRIPT_DIR}/sync.sh" >/dev/null
 
 set +e
 ssh "${SSH_OPTS[@]}" freebsd@127.0.0.1 \
-  "SMOKE_TMPDIR=${SMOKE_TMPDIR} SMOKE_ONLY='$*' sh -s" <<'REMOTE_SCRIPT'
+  "SMOKE_TMPDIR=${SMOKE_TMPDIR} SMOKE_TAG=${SMOKE_TAG} SMOKE_ONLY='$*' sh -s" <<'REMOTE_SCRIPT'
 set -eu
 export PATH="${HOME}/.cargo/bin:/usr/local/bin:${PATH}"
 cd ~/shit
@@ -85,22 +91,60 @@ fi
 echo "  bucket size: $(printf '%s\n' ${SMOKES} | wc -l | tr -d ' ') smokes, TMPDIR=${SMOKE_TMPDIR}"
 
 : > "${RESULTS}"
-LOGDIR="${HOME}/smoke-logs"
-rm -rf "${LOGDIR}"
-mkdir -p "${LOGDIR}"
+# A run directory per invocation, never cleared by a later run, so a
+# flaky failure keeps its daemon log and journal (#202).
+RUNDIR="${HOME}/smoke-runs/$(date -u +%Y%m%dT%H%M%SZ)-${SMOKE_TAG}-$$"
+mkdir -p "${RUNDIR}"
+# ~/smoke-logs was a real directory before per-run dirs. Keep its
+# contents and take the name, or "latest" would silently stay stale.
+if [ -e "${HOME}/smoke-logs" ] && [ ! -L "${HOME}/smoke-logs" ]; then
+  legacy="${HOME}/smoke-logs.legacy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  mv "${HOME}/smoke-logs" "${legacy}"
+  echo "  moved old ~/smoke-logs to ${legacy}"
+fi
+ln -sfn "${RUNDIR}" "${HOME}/smoke-logs"
+echo "  run dir: ${RUNDIR}"
 FAIL_COUNT=0
+n=0
 for smoke in ${SMOKES}; do
-  passlog="${LOGDIR}/${smoke}.log"
+  # Numbered so a smoke named more than once (a flake loop) keeps
+  # every iteration.
+  n=$((n + 1))
+  keep="${RUNDIR}/$(printf '%03d' "$n")-${smoke%.sh}"
+  mkdir -p "${keep}"
+  passlog="${keep}/smoke.log"
   rc_file="$(mktemp /tmp/smoke-rc.XXXXXX)"
+  # A private TMPDIR per smoke lets us find lib.sh's shit-smoke.*
+  # scratch dir afterwards; SMOKE_KEEP_TMP=1 stops lib.sh deleting it
+  # before the logs and journal are copied out.
+  scratch="$(mktemp -d "${SMOKE_TMPDIR}/fbsd-smoke.XXXXXX")"
   start=$(date +%s)
   set +e
   (
-    TMPDIR="${SMOKE_TMPDIR}" /usr/bin/timeout --signal=TERM --kill-after=10 300 \
+    TMPDIR="${scratch}" SMOKE_KEEP_TMP=1 \
+      /usr/bin/timeout --signal=TERM --kill-after=10 300 \
       bash "tests/smoke/$smoke"
     echo $? > "$rc_file"
   ) > "$passlog" 2>&1
   set -e
   secs=$(( $(date +%s) - start ))
+  for st in "${scratch}"/shit-smoke.*; do
+    [ -d "$st" ] || continue
+    cp "$st/shitd.log" "${keep}/" 2>/dev/null || true
+    cp "$st"/state/shit/log/daemon.jsonl* "${keep}/" 2>/dev/null || true
+    if [ -f "$st/state/shit/index.sqlite" ]; then
+      sqlite3 "$st/state/shit/index.sqlite" ".backup '${keep}/index.sqlite'" 2>/dev/null || true
+      sqlite3 -header -separator "$(printf '\t')" "$st/state/shit/index.sqlite" \
+        "SELECT id, seq, ts_logical, discriminant, dev, inode, path,
+                hex(blob_hash) AS blob, hex(post_content_hash) AS post
+         FROM events ORDER BY id" > "${keep}/events.tsv" 2>/dev/null || true
+    fi
+  done
+  # Bounded: an open helper fd or a stuck FS must not hang the loop.
+  if ! /usr/bin/timeout 30 rm -rf "${scratch}" 2>/dev/null \
+    && ! /usr/bin/timeout 30 doas rm -rf "${scratch}" 2>/dev/null; then
+    echo "  WARN: could not remove ${scratch}; leaving it behind"
+  fi
   rc=$(cat "$rc_file" 2>/dev/null || echo 1)
   rm -f "$rc_file"
   verdict=FAIL
@@ -117,7 +161,8 @@ for smoke in ${SMOKES}; do
   printf '  %-48s %-16s rc=%-4s %ss\n' "$smoke" "$verdict" "$rc" "$secs"
   rm -f /tmp/safety-net.*.log /tmp/watchdog.log
 done
-echo "===== ${FAIL_COUNT} failed ====="
+cp "${RESULTS}" "${RUNDIR}/results.tsv"
+echo "===== ${FAIL_COUNT} failed (run dir ${RUNDIR}) ====="
 [ "${FAIL_COUNT}" -eq 0 ]
 REMOTE_SCRIPT
 rc=$?
@@ -130,5 +175,5 @@ if ! scp -q "${SSH_OPTS[@]}" freebsd@127.0.0.1:smoke-results.tsv "${HOST_TSV}" \
   [[ "${rc}" -ne 0 ]] || rc=1
   exit "${rc}"
 fi
-log "results: ${HOST_TSV} (logs in guest ~/smoke-logs/)"
+log "results: ${HOST_TSV} (logs in the guest run dir printed above; ~/smoke-logs links the latest)"
 exit "${rc}"
