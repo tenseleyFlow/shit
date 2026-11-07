@@ -35,6 +35,18 @@ pub struct FileMetadata {
     pub flags: u32,
 }
 
+/// What a block or char device node needs beyond its mode to be
+/// recreated: the device number and the owner. Captured from the held
+/// fd's `fstat` before the unlink commits, so it is journal data and
+/// never derived from anything the planner guesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceNode {
+    /// `st_rdev`, glibc-encoded. This is the `dev_t` `mknod(2)` takes.
+    pub rdev: u64,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 impl FileMetadata {
     /// Coarse equality used for "are we still in the captured state?" probes.
     /// Excludes `mtime`, which legitimately changes for read-only opens on

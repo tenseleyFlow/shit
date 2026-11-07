@@ -10,7 +10,7 @@
 
 use crate::inode::{BlobHash, InodeRef};
 use crate::inverse::{ContainerOp, ContainerRuntime};
-use crate::metadata::{FileKind, FileMetadata};
+use crate::metadata::{DeviceNode, FileKind, FileMetadata};
 use crate::time::TimePoint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -466,6 +466,14 @@ pub enum TreeOp {
         kind: FileKind,
         #[serde(default = "default_unlink_mode_event")]
         mode: u32,
+        /// L4 - device number and owner of a block/char node. `None`
+        /// for every other kind. Keep this the last field of the last
+        /// `CaptureEvent` member: postcard encodes `None` as one zero
+        /// byte, so the store decodes a pre-L4 row by appending that
+        /// byte (see `shit_store::index::decode_event_payload`), and a
+        /// pre-L4 reader ignores the trailing bytes of a new row.
+        #[serde(default)]
+        device: Option<DeviceNode>,
     },
     Rename {
         from: PathBuf,
@@ -667,6 +675,7 @@ mod tests {
                 path: PathBuf::from("/tmp/x"),
                 kind: FileKind::Regular,
                 mode: 0o100644,
+                device: None,
             }),
         };
         let bytes = postcard::to_allocvec(&ev).unwrap();

@@ -429,6 +429,7 @@ mod tests {
             is_delete: false,
             fd_sent_via_scm: true,
             flags: 0,
+            rdev: 0,
         };
         a.send_response_with_fd(&resp, staging_fd.as_raw_fd())
             .unwrap();

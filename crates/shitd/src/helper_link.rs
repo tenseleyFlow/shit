@@ -884,6 +884,7 @@ fn dispatch_response(
             is_delete,
             fd_sent_via_scm: _,
             flags,
+            rdev,
         } => {
             let Some(staging) = fd else {
                 // AR01.1.fix-marker-only — when the helper lost the
@@ -910,14 +911,18 @@ fn dispatch_response(
                     // the planner emits RecreatePath{Directory} so
                     // `git clean -fd` undo restores the dir as a
                     // dir, not a regular file.
-                    if let Err(e) = journal_unlink_idempotent(
-                        index,
-                        command,
-                        ts,
-                        inode_ref,
-                        path_buf,
-                        kind_from_mode_bits(mode),
-                        mode,
+                    let kind = kind_from_mode_bits(mode);
+                    // L4 - a device node's number and owner come from
+                    // the helper's fstat on the held fd, and only for
+                    // a node the mode bits say is a device.
+                    let device = matches!(
+                        kind,
+                        shit_planner::metadata::FileKind::BlockDevice
+                            | shit_planner::metadata::FileKind::CharDevice
+                    )
+                    .then_some(shit_planner::DeviceNode { rdev, uid, gid });
+                    if let Err(e) = journal_unlink_with_device(
+                        index, command, ts, inode_ref, path_buf, kind, mode, device,
                     ) {
                         tracing::error!(error = %e, %session, seq, "marker-only Unlink journal failed");
                     }
@@ -1520,10 +1525,9 @@ fn kind_from_mode_bits(mode: u32) -> shit_planner::metadata::FileKind {
         // Regular-file inverse, which silently lost the kind.
         0o010000 => FileKind::Fifo,
         0o140000 => FileKind::Socket,
-        // BlockDevice + CharDevice need CAP_SYS_ADMIN at the
-        // helper (deferred to DR-15.2); recording the kind is
-        // correct, the executor's recreate_path_inner returns the
-        // DR-15.2 deferral message when it sees these.
+        // BlockDevice + CharDevice restore through the helper's
+        // mknod once the journal row also carries the captured rdev
+        // (L4); a row without one is refused at undo.
         0o060000 => FileKind::BlockDevice,
         0o020000 => FileKind::CharDevice,
         // Unknown / no S_IF bits set — fall through to Regular as
@@ -1542,6 +1546,20 @@ fn journal_unlink_idempotent(
     path: std::path::PathBuf,
     kind: shit_planner::metadata::FileKind,
     mode: u32,
+) -> Result<(), HelperLinkError> {
+    journal_unlink_with_device(index, command, ts, inode_ref, path, kind, mode, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn journal_unlink_with_device(
+    index: &Index,
+    command: CommandId,
+    ts: shit_planner::TimePoint,
+    inode_ref: InodeRef,
+    path: std::path::PathBuf,
+    kind: shit_planner::metadata::FileKind,
+    mode: u32,
+    device: Option<shit_planner::DeviceNode>,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::PlannerStore;
     let already = index.events_for_command(command).into_iter().any(|e| {
@@ -1564,6 +1582,7 @@ fn journal_unlink_idempotent(
             path,
             kind,
             mode,
+            device,
         }),
     };
     index.put_event(&unlink_ev).map_err(|e| {

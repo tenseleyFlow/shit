@@ -1597,6 +1597,7 @@ impl PumpState {
             // record (rec.flags) rather than the staging fd's stat
             // because the original is what undo needs to restore.
             flags: rec.flags,
+            rdev: 0,
         };
 
         if let Err(e) = self

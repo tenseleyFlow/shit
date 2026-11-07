@@ -367,6 +367,11 @@ pub enum HelperResponse {
         /// M03.x.SETATTR; `#[serde(default)]` keeps those decodable.
         #[serde(default)]
         flags: u32,
+        /// L4 — `st_rdev` of a block/char node being unlinked, from the
+        /// held fd's fstat. 0 for every other capture. Only meaningful
+        /// with `is_delete` and a device `mode`.
+        #[serde(default)]
+        rdev: u64,
     },
     /// W02.B.live-baseline — one regular file's content snapshot,
     /// captured at session-open by the helper-side baseline walker
@@ -1031,6 +1036,7 @@ mod tests {
             is_delete: true,
             fd_sent_via_scm: true,
             flags: 0,
+            rdev: 0,
         };
         let bytes = encode_frame(&ev).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
@@ -1057,6 +1063,7 @@ mod tests {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
         };
         let err = validate_outgoing(&ev).unwrap_err();
         assert!(matches!(err, HelperProtoError::PathHintTooLong { .. }));

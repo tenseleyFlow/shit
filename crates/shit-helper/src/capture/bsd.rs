@@ -487,6 +487,7 @@ impl PumpState {
             // M03.x.SETATTR — BSD st_flags from the pre-mutation
             // StatMeta. 0 if the file had no chflags set.
             flags: meta.flags,
+            rdev: 0,
             is_delete,
             fd_sent_via_scm: true,
         };

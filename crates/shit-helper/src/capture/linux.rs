@@ -480,6 +480,7 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete,
             fd_sent_via_scm: true,
+            rdev: 0,
         };
         if let Err(e) = self
             .conn
@@ -657,7 +658,7 @@ impl LinuxCaptureRuntime {
             } else {
                 matches!(
                     file_type,
-                    FileType::Regular | FileType::Fifo | FileType::Socket
+                    FileType::Regular | FileType::Fifo | FileType::Socket | FileType::Device
                 )
             });
         let race_fd = capture_fd_owned;
@@ -669,7 +670,12 @@ impl LinuxCaptureRuntime {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
             let meta = fstat_meta(fd);
             (0, [0u8; 32], None, meta)
-        } else if race_won && matches!(file_type, FileType::Fifo | FileType::Socket) {
+        } else if race_won
+            && matches!(
+                file_type,
+                FileType::Fifo | FileType::Socket | FileType::Device
+            )
+        {
             // AU29 follow-up — Fifo/Socket capture: O_PATH fd held
             // by pre_open can be fstat'd for mode/uid/gid but can't
             // be read from (O_PATH semantics). Without this branch
@@ -753,6 +759,11 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: true,
             fd_sent_via_scm: staging_fd.is_some(),
+            rdev: if file_type == FileType::Device {
+                meta_wire.as_ref().map(|m| m.rdev).unwrap_or(0)
+            } else {
+                0
+            },
         };
 
         let send_result = if let Some(ref fd) = staging_fd {
@@ -918,6 +929,7 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
         };
         if let Err(e) = self
             .conn
@@ -1389,6 +1401,7 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
         };
         if let Err(e) = self
             .conn
@@ -1543,6 +1556,7 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
         };
         if let Err(e) = self
             .conn
@@ -1650,6 +1664,7 @@ impl LinuxCaptureRuntime {
                         flags: 0,
                         is_delete: true,
                         fd_sent_via_scm: true,
+                        rdev: 0,
                     };
                     if let Err(e) = self
                         .conn
@@ -1791,7 +1806,9 @@ fn pre_open_recurse(
         // shape as the dir branch above; fstat returns the right
         // mode bits via the held fd.
         use std::os::unix::fs::FileTypeExt;
-        if ft.is_fifo() || ft.is_socket() {
+        // L4 - block/char nodes get the same O_PATH hold so the
+        // unlink can fstat st_rdev; O_PATH never opens the device.
+        if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
             if let Ok(f) = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
@@ -2020,6 +2037,7 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
         libc::S_IFDIR => FileType::Directory,
         libc::S_IFIFO => FileType::Fifo,
         libc::S_IFSOCK => FileType::Socket,
+        libc::S_IFBLK | libc::S_IFCHR => FileType::Device,
         _ => FileType::Other,
     };
     Some((st.st_dev, st.st_ino, kind))
@@ -2031,6 +2049,8 @@ enum FileType {
     Directory,
     Fifo,
     Socket,
+    /// L4 - block or char device node.
+    Device,
     Other,
 }
 
@@ -2042,6 +2062,8 @@ struct StatMeta {
     size: u64,
     mtime_unix_nanos: i128,
     xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// `st_rdev`; nonzero only for device nodes.
+    rdev: u64,
 }
 
 impl StatMeta {
@@ -2077,6 +2099,7 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
         xattrs: crate::capture::xattr::read_user_xattrs(fd),
+        rdev: st.st_rdev,
     })
 }
 

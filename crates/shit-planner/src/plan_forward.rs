@@ -520,6 +520,7 @@ fn emit_forward_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec
                     path: path.clone(),
                     kind: *kind,
                     mode: *mode,
+                    device: None,
                 },
                 cohort: 0,
                 conflict: phantom_if_exists(path, probe),
@@ -1061,6 +1062,7 @@ mod tests {
                 path: PathBuf::from("/tmp/gone"),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
+                device: None,
             }),
             1,
         )];

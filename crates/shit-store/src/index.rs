@@ -870,10 +870,34 @@ fn collect_events(
     }
 }
 
+/// Decode a stored event payload.
+///
+/// `serde(default)` does not help a postcard row that ends early: the
+/// decoder reads every declared field and fails at end of input. L4
+/// added `device: Option<DeviceNode>` as the last field of the last
+/// member of `CaptureEvent` (`TreeOp::Unlink`), and postcard encodes
+/// `None` as a single zero byte. A row written before that ends right
+/// where the field would start, so when the first decode fails, retry
+/// with that byte appended. A row that fails for another reason fails
+/// again and returns the first error. This keeps the schema as it is
+/// (no migration, so a trunk build still opens the database) and new
+/// rows stay readable by trunk, which ignores trailing bytes.
+fn decode_event_payload(payload: &[u8]) -> Result<CaptureEvent, postcard::Error> {
+    match postcard::from_bytes::<CaptureEvent>(payload) {
+        Ok(ev) => Ok(ev),
+        Err(first) => {
+            let mut padded = Vec::with_capacity(payload.len() + 1);
+            padded.extend_from_slice(payload);
+            padded.push(0);
+            postcard::from_bytes::<CaptureEvent>(&padded).map_err(|_| first)
+        }
+    }
+}
+
 fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<CaptureEvent> {
     let payload: Vec<u8> = row.get("payload")?;
     let id: i64 = row.get("id")?;
-    let mut ev: CaptureEvent = postcard::from_bytes(&payload).map_err(|e| {
+    let mut ev: CaptureEvent = decode_event_payload(&payload).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
     })?;
     // Overlay the sqlite rowid onto the in-memory event. The payload's
@@ -1507,5 +1531,86 @@ mod tests {
         idx.put_blob_record(blob, 999, false, TimePoint::new(0, 0))
             .unwrap();
         assert_eq!(idx.blob_size_hint(blob), Some(999));
+    }
+
+    /// D-13 fixture: `tests/fixtures/trunk-device-unlink.db` was written
+    /// by trunk before L4 (no `device` field on `TreeOp::Unlink`). The
+    /// current build must open it and read every row, with the old
+    /// unlinks coming back as `device: None`.
+    #[test]
+    fn opens_trunk_written_database_with_old_unlink_rows() {
+        use shit_planner::TreeOp;
+        use shit_planner::metadata::FileKind;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("trunk.db");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/trunk-device-unlink.db"
+            ),
+            &db,
+        )
+        .unwrap();
+        let idx = Index::open(&db).unwrap();
+        let session = Uuid::from_u128(0x4c34);
+        let events = idx.events_for_command(CommandId { session, seq: 1 });
+        assert_eq!(events.len(), 3, "{events:#?}");
+        let mut unlinks = events.iter().filter_map(|e| match &e.kind {
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                path,
+                kind,
+                mode,
+                device,
+                ..
+            }) => Some((path.clone(), *kind, *mode, *device)),
+            _ => None,
+        });
+        assert_eq!(
+            unlinks.next(),
+            Some((
+                PathBuf::from("/w/dev-null"),
+                FileKind::CharDevice,
+                0o020666,
+                None
+            ))
+        );
+        assert_eq!(
+            unlinks.next(),
+            Some((PathBuf::from("/w/plain"), FileKind::Regular, 0o100644, None))
+        );
+        assert!(unlinks.next().is_none());
+    }
+
+    #[test]
+    fn device_unlink_round_trips() {
+        use shit_planner::metadata::FileKind;
+        use shit_planner::{DeviceNode, TreeOp};
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        let want = TreeOp::Unlink {
+            inode: InodeRef::new(2, 3),
+            path: PathBuf::from("/w/null"),
+            kind: FileKind::CharDevice,
+            mode: 0o020666,
+            device: Some(DeviceNode {
+                rdev: 0x103,
+                uid: 0,
+                gid: 5,
+            }),
+        };
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(want.clone()),
+        })
+        .unwrap();
+        let got = idx.events_for_command(CommandId { session, seq: 1 });
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, CaptureEventKind::TreeOp(want));
     }
 }
