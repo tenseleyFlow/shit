@@ -404,6 +404,50 @@ pub enum CaptureEventKind {
         path: PathBuf,
         detail: String,
     },
+    /// L5 — the shim's record of a directory about to be renamed away,
+    /// read before the syscall: every directory under `root` (and `root`
+    /// itself) with its metadata, and every walked file's metadata,
+    /// xattrs included. The walk's file bytes are the
+    /// [`FilePreImageSource::ShimRenameSubtree`] pre-images journaled
+    /// just before this event; `files` counts them.
+    ///
+    /// `complete` holds only when the walk saw every entry, captured
+    /// every regular file, stayed within its caps, and every one of its
+    /// pre-images was journaled. Directory entries are present only
+    /// then. No inverse of its own.
+    RenameWalk {
+        root: PathBuf,
+        complete: bool,
+        files: u32,
+        entries: Vec<WalkEntry>,
+    },
+    /// L5 — what a rename-family syscall did, from the shim's
+    /// post-syscall notification. Sent for directory renames and for
+    /// any failed rename. `errno` is 0 on success. `source` is the
+    /// inode at `from` before the call, `dest` the inode at `to` after a
+    /// success (`(0, 0)` otherwise). A failure retracts the Rename
+    /// journaled before the call. No inverse of its own.
+    RenameOutcome {
+        from: PathBuf,
+        to: PathBuf,
+        errno: i32,
+        source: InodeRef,
+        dest: InodeRef,
+    },
+}
+
+/// One entry of a [`CaptureEventKind::RenameWalk`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalkEntry {
+    pub path: PathBuf,
+    pub inode: InodeRef,
+    pub kind: FileKind,
+    /// `size` is 0 for directories; `xattrs` is empty when they could
+    /// not be read (see `xattrs_read`).
+    pub meta: FileMetadata,
+    /// The shim read this entry's xattrs. When false, `meta.xattrs` is
+    /// not evidence that it had none.
+    pub xattrs_read: bool,
 }
 
 /// Mirror of [`shit_proto::DbEngineWire`] on the planner side so

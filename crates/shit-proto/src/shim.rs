@@ -172,6 +172,61 @@ pub struct ShimNotification {
     /// negligible.
     #[serde(default)]
     pub failure: Option<ShimFailure>,
+    /// L5 — the rename walk's record of the source subtree: every
+    /// directory, every walked file's xattrs, and whether the walk saw
+    /// the whole tree. `Some` only on a directory rename's pre-syscall
+    /// notification. Read by the shim before the syscall.
+    #[serde(default)]
+    pub walk: Option<ShimWalk>,
+    /// L5 — set on the post-syscall notification the shim sends after a
+    /// rename-family call that moved a directory or failed. `arg` is the
+    /// same `from\tto` as the pre-syscall notification.
+    #[serde(default)]
+    pub outcome: Option<ShimRenameOutcome>,
+}
+
+/// L5 — what a rename-family syscall did, as the shim saw it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimRenameOutcome {
+    /// 0 when the call returned 0, else its errno.
+    pub errno: i32,
+    /// lstat of `from` before the call; `(0, 0)` if it failed.
+    pub source_dev: u64,
+    pub source_inode: u64,
+    /// lstat of `to` after a successful call; `(0, 0)` otherwise.
+    pub dest_dev: u64,
+    pub dest_inode: u64,
+}
+
+/// L5 — a directory rename's walk of its source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimWalk {
+    /// The walk saw every entry, captured every regular file into
+    /// `extra_pre_images`, and stayed within its caps. Only then are
+    /// directory records sent.
+    pub complete: bool,
+    /// Number of file pre-images in `extra_pre_images`.
+    pub files: u32,
+    /// The walked directories (the source itself first) and files, with
+    /// their stat and xattrs. Directories appear only when `complete`.
+    pub entries: Vec<ShimWalkEntry>,
+}
+
+/// One walked entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimWalkEntry {
+    pub path: String,
+    pub dev: u64,
+    pub inode: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_unix_nanos: i128,
+    /// st_flags on macOS and the BSDs, 0 on Linux.
+    pub flags: u32,
+    /// The entry's xattrs (Linux `user.*`; macOS all but `com.apple.*`).
+    /// `None` when they could not be read.
+    pub xattrs: Option<Vec<(String, Vec<u8>)>>,
 }
 
 /// AU10 — structured failure reported by the shim when capture
@@ -230,6 +285,8 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -258,6 +315,8 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
@@ -282,6 +341,8 @@ mod tests {
                 attempted_path: "foo/bar/baz".into(),
                 error_chain: "ENOENT (path), ENOENT (parent)".into(),
             }),
+            walk: None,
+            outcome: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -291,6 +352,60 @@ mod tests {
                 assert_eq!(which_arg, "from");
             }
             _ => panic!("expected CanonicalizeFailed"),
+        }
+    }
+
+    /// L5 — walk records and the post-syscall rename outcome.
+    #[test]
+    fn shim_notification_with_walk_and_outcome_round_trips() {
+        let entry = ShimWalkEntry {
+            path: "/tmp/d".into(),
+            dev: 1,
+            inode: 2,
+            mode: 0o040700,
+            uid: 1000,
+            gid: 1000,
+            mtime_unix_nanos: -5,
+            flags: 0,
+            xattrs: Some(vec![("user.k".into(), b"v".to_vec())]),
+        };
+        for n in [
+            ShimNotification {
+                pid: 1,
+                syscall: "rename".into(),
+                arg: "/tmp/d\t/tmp/t".into(),
+                ts_unix_nanos: 0,
+                pre_image: None,
+                extra_pre_images: Vec::new(),
+                failure: None,
+                walk: Some(ShimWalk {
+                    complete: true,
+                    files: 0,
+                    entries: vec![entry.clone()],
+                }),
+                outcome: None,
+            },
+            ShimNotification {
+                pid: 1,
+                syscall: "rename".into(),
+                arg: "/tmp/d\t/tmp/t".into(),
+                ts_unix_nanos: 0,
+                pre_image: None,
+                extra_pre_images: Vec::new(),
+                failure: None,
+                walk: None,
+                outcome: Some(ShimRenameOutcome {
+                    errno: 39,
+                    source_dev: 1,
+                    source_inode: 2,
+                    dest_dev: 0,
+                    dest_inode: 0,
+                }),
+            },
+        ] {
+            let frame = encode_frame(&n).expect("encode");
+            let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+            assert_eq!(decoded, n);
         }
     }
 
@@ -323,6 +438,8 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -357,6 +474,8 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -404,6 +523,8 @@ mod tests {
                 pre("/abs/site-packages/pkg/sub/inner.py", b"x = 1\n"),
             ],
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");

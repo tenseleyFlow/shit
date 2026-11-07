@@ -504,6 +504,9 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        // L5 — evidence for the undo planner's rename rules; nothing to
+        // redo on their own.
+        CaptureEventKind::RenameWalk { .. } | CaptureEventKind::RenameOutcome { .. } => {}
     }
 }
 

@@ -852,6 +852,27 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        // L5 — keyed by the rename source, like the walk's pre-images.
+        K::RenameWalk { root, entries, .. } => {
+            let root_inode = entries.first().map(|e| e.inode);
+            Denormalized {
+                discriminant: "RenameWalk",
+                dev: root_inode.map(|i| i.dev as i64),
+                inode: root_inode.map(|i| i.inode as i64),
+                path: Some(root.to_string_lossy().into_owned()),
+                blob_hash: None,
+                post_content_hash: None,
+            }
+        }
+        // Keyed by the destination, like the Rename row.
+        K::RenameOutcome { to, dest, .. } => Denormalized {
+            discriminant: "RenameOutcome",
+            dev: Some(dest.dev as i64),
+            inode: Some(dest.inode as i64),
+            path: Some(to.to_string_lossy().into_owned()),
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 

@@ -1640,6 +1640,9 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        // L5 — evidence for the rename rules in classify_replace_paths;
+        // their inverses come from the Rename and the walk pre-images.
+        CaptureEventKind::RenameWalk { .. } | CaptureEventKind::RenameOutcome { .. } => {}
     }
 }
 

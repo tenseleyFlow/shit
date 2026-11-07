@@ -69,6 +69,12 @@ const JSON_ONLY_CAPTURE_EVENT_KINDS: &[&str] = &[
     "TerraformOp",
     "KubectlOp",
     "GhOp",
+    // rationale (L5): RenameWalk and RenameOutcome are planner evidence
+    // for a directory rename (its walk records and its post-syscall
+    // result), with no inverse of their own. The JSON shows them in full
+    // for debugging; a summary line is a later polish.
+    "RenameWalk",
+    "RenameOutcome",
 ];
 
 /// Subvariants of `TreeOp` that intentionally render via the JSON

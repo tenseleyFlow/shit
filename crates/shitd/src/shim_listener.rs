@@ -385,6 +385,13 @@ fn ingest_notification(
         // additive.
     }
 
+    // L5: the post-syscall notification of a rename. Its pre-syscall
+    // twin already journaled the Rename; this records what happened.
+    if let Some(outcome) = &note.outcome {
+        crate::shim_rename::ingest_outcome(note, outcome, command, ingest_ts, index);
+        return;
+    }
+
     // M07.B.5: metadata-mutation syscalls (chmod / chown / utimes /
     // xattr families). The shim's pre-image carries the OLD
     // mode/uid/gid/mtime; ingest as a FilePreImage event so the
@@ -571,35 +578,11 @@ fn ingest_notification(
     // fresh content lose all pre-state and undo can only emit a
     // refusal.
     if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
-        && !note.extra_pre_images.is_empty()
+        && (!note.extra_pre_images.is_empty() || note.walk.is_some())
     {
-        let mut journaled = 0u64;
-        let mut failed = 0u64;
-        for pre in &note.extra_pre_images {
-            match ingest_pre_image_with_source(
-                command,
-                pre,
-                index,
-                blob_store,
-                shit_planner::FilePreImageSource::ShimRenameSubtree,
-                ingest_ts,
-            ) {
-                Ok(()) => journaled += 1,
-                Err(e) => {
-                    failed += 1;
-                    warn!(err = %e, pid = note.pid, path = %pre.path, "shim notify: recursive pre-image ingest failed");
-                }
-            }
-        }
-        debug!(
-            pid = note.pid,
-            session = %command.session,
-            seq = command.seq,
-            n = note.extra_pre_images.len(),
-            journaled,
-            failed,
-            "shim notify: recursive rename pre-images ingested (DR-CR-54)"
-        );
+        // L5: the walk's pre-images, then one RenameWalk event recording
+        // its directories and whether all of it was journaled.
+        crate::shim_rename::ingest_walk(note, command, ingest_ts, index, blob_store);
     }
     // Fall through to journal the TreeOp::Rename below.
 
@@ -701,6 +684,28 @@ fn ingest_notification(
     );
 }
 
+/// [`ingest_notification`] without a pre-syscall stat, for other
+/// modules' tests.
+#[cfg(test)]
+pub(crate) fn ingest_notification_for_test(
+    note: &ShimNotification,
+    resolved: Option<shit_planner::events::CommandId>,
+    ingest_ts: shit_planner::time::TimePoint,
+    index: &Index,
+    blob_store: &BlobStore,
+    live_baseline: &LiveBaseline,
+) {
+    ingest_notification(
+        note,
+        resolved,
+        ingest_ts,
+        None,
+        index,
+        blob_store,
+        live_baseline,
+    );
+}
+
 /// True when `kind` is a TreeOp::Create whose path is not absolute.
 fn is_relative_create(kind: &CaptureEventKind) -> bool {
     matches!(
@@ -740,6 +745,21 @@ fn ingest_pre_image_with_source(
     source: shit_planner::FilePreImageSource,
     ts: shit_planner::time::TimePoint,
 ) -> anyhow::Result<()> {
+    ingest_pre_image_full(command, pre, index, blob_store, source, ts, None)
+}
+
+/// [`ingest_pre_image_with_source`]; `shim_xattrs` (L5) are the file's
+/// xattrs as the shim read them before the syscall, used instead of the
+/// daemon's own read after the ack.
+pub(crate) fn ingest_pre_image_full(
+    command: shit_planner::events::CommandId,
+    pre: &ShimPreImage,
+    index: &Index,
+    blob_store: &BlobStore,
+    source: shit_planner::FilePreImageSource,
+    ts: shit_planner::time::TimePoint,
+    shim_xattrs: Option<BTreeMap<String, Vec<u8>>>,
+) -> anyhow::Result<()> {
     let (blob_hash, stat) = blob_store
         .put(&pre.bytes)
         .map_err(|e| anyhow::anyhow!("blob put: {e}"))?;
@@ -761,7 +781,7 @@ fn ingest_pre_image_with_source(
     // multiple xattrs concurrently might lose attribution for
     // ones not the syscall's primary target. Acceptable for v1;
     // a future hardening could have the shim capture all xattrs.
-    let xattrs = build_xattrs_target(&pre.path, pre.xattr.as_ref());
+    let xattrs = shim_xattrs.unwrap_or_else(|| build_xattrs_target(&pre.path, pre.xattr.as_ref()));
     let meta = FileMetadata {
         mode: pre.mode,
         uid: pre.uid,
@@ -1142,6 +1162,8 @@ mod tests {
                 pre_image: None,
                 extra_pre_images: Vec::new(),
                 failure: None,
+                walk: None,
+                outcome: None,
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
@@ -1275,6 +1297,8 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let reserved_ts = TimePoint::new(778, 43);
 
@@ -1370,6 +1394,8 @@ mod tests {
                 shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
             ],
             failure: None,
+            walk: None,
+            outcome: None,
         };
         ingest_notification(
             &note,
@@ -1428,6 +1454,8 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let fifo = tmp.path().join("p");
         let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -1466,6 +1494,8 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
         ingest_notification(
@@ -1532,6 +1562,8 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            walk: None,
+            outcome: None,
         };
         for (stat, want_mode) in [
             (

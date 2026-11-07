@@ -681,13 +681,13 @@ mod policy {
         from: &str,
         tofd: libc::c_int,
         to: &str,
-    ) {
+    ) -> Option<RenamePending> {
         let f = resolve_at_for_notify(fromfd, from, "from");
         let t = resolve_at_for_notify(tofd, to, "to");
         match (f, t) {
-            (AtResolution::Nothing, _) | (_, AtResolution::Nothing) => {}
+            (AtResolution::Nothing, _) | (_, AtResolution::Nothing) => None,
             (AtResolution::Resolved(a), AtResolution::Resolved(b)) => {
-                notify_rename_with_dst_preimage(syscall, &a, &b);
+                notify_rename_with_dst_preimage(syscall, &a, &b)
             }
             // Prefer the `from` failure, as notify_rename does.
             (AtResolution::Failed(fa, fe), AtResolution::Failed(ta, _))
@@ -695,6 +695,7 @@ mod policy {
             | (AtResolution::Resolved(fa), AtResolution::Failed(ta, fe)) => {
                 let arg = format!("{fa}\t{ta}");
                 notify_inner_with_failure(syscall, &arg, None, Some(fe), false);
+                None
             }
         }
     }
@@ -735,7 +736,11 @@ mod policy {
     /// `None` and the planner falls back to ReverseRename. When `to`
     /// pre-exists (install over an existing file), the captured bytes
     /// drive a RestoreContent inverse instead.
-    pub fn notify_rename_with_dst_preimage(syscall: &'static str, from: &str, to: &str) {
+    pub fn notify_rename_with_dst_preimage(
+        syscall: &'static str,
+        from: &str,
+        to: &str,
+    ) -> Option<RenamePending> {
         // W09.7: canonicalize both `from` and `to` so the daemon's
         // TreeOp::Rename carries absolute paths. Otherwise tools like
         // `rsync` that call rename(2) with paths relative to their own
@@ -773,7 +778,7 @@ mod policy {
         // canonicalization above this also catches `./foo` vs
         // `foo`, symlink-equal pairs, etc.
         if from_abs == to_abs {
-            return;
+            return None;
         }
         let arg = format!("{from_abs}\t{to_abs}");
         // DR-CR-54 — when `from` is a directory, snapshot every
@@ -783,18 +788,35 @@ mod policy {
         // <staging>` before writing fresh content, and without
         // recursive pre-images the original site-packages contents
         // are unreachable by the time undo runs.
-        notify_rename_inner_with_recursive(syscall, &arg, &to_abs, &from_abs, failure);
+        notify_rename_inner_with_recursive(syscall, &arg, &to_abs, &from_abs, failure)
     }
 
     /// DR-CR-54 limits. A directory rename of an enormous tree
     /// would saturate memory and the shim→daemon UDS; cap the walk
     /// to bound worst-case overhead. When a limit trips we ship
-    /// what we have and log; the planner still gets a partial
-    /// restore which is strictly better than current "loud
-    /// refusal".
+    /// what we have, marked incomplete (L5): the planner restores
+    /// those files but does not treat the walk as the whole subtree.
     const RECURSIVE_MAX_FILES: usize = 1000;
     const RECURSIVE_MAX_BYTES: u64 = 50 * 1024 * 1024;
     const RECURSIVE_MAX_DEPTH: usize = 5;
+    /// L5 (finding 6): directories count too, or a directory-heavy tree
+    /// could outgrow the frame with no file cap tripping.
+    const RECURSIVE_MAX_DIRS: usize = 1000;
+    /// L5 (finding 6): everything the frame carries (bytes, paths,
+    /// xattrs, per-record overhead) stays under this, well inside the
+    /// wire's 64 MiB `MAX_LARGE_FRAME_SIZE`.
+    const RECURSIVE_FRAME_BUDGET: u64 = 60 * 1024 * 1024;
+    /// Rough postcard cost of one record beyond its path, bytes and xattrs.
+    const RECORD_OVERHEAD: u64 = 128;
+
+    /// L5 — a rename the shim notified, for the post-syscall outcome.
+    pub struct RenamePending {
+        syscall: &'static str,
+        arg: String,
+        to_abs: String,
+        source: (u64, u64),
+        source_is_dir: bool,
+    }
 
     /// Variant of `notify_inner` that ships a directory rename's
     /// recursive subtree pre-images alongside the primary
@@ -808,93 +830,350 @@ mod policy {
         capture_path: &str,
         from_abs: &str,
         failure: Option<shit_proto::ShimFailure>,
-    ) {
+    ) -> Option<RenamePending> {
+        use std::os::unix::fs::MetadataExt;
         if disabled() {
-            return;
+            return None;
         }
         if IN_NOTIFY.with(|f| f.replace(true)) {
-            return;
+            return None;
         }
+        let source = std::fs::symlink_metadata(from_abs).ok();
         let pre_image = capture_pre_image(capture_path);
-        let extras = collect_recursive_pre_images(from_abs);
+        let (extras, walk) = collect_recursive_pre_images(from_abs);
         // #222: the wire arg stays `from\tto` for the whole rename
         // family, overwrite or not. The pre-image carries the
         // destination path on its own; replacing the arg with it left
         // the daemon nothing to journal a TreeOp::Rename from.
-        let _ = try_notify(syscall, arg, pre_image, extras, failure);
+        let sent = try_notify_full(
+            syscall,
+            arg,
+            pre_image.clone(),
+            extras,
+            failure.clone(),
+            walk.clone(),
+            None,
+        );
+        // Finding 6: a frame that cannot be sent with the walk must not
+        // take the Rename down with it. Resend without the walk.
+        if sent.is_err() && walk.is_some() {
+            let _ = try_notify_full(syscall, arg, pre_image, Vec::new(), failure, None, None);
+        }
         IN_NOTIFY.with(|f| f.set(false));
+        Some(RenamePending {
+            syscall,
+            arg: arg.to_string(),
+            to_abs: capture_path.to_string(),
+            source: source.as_ref().map_or((0, 0), |m| (m.dev(), m.ino())),
+            source_is_dir: source.as_ref().is_some_and(|m| m.is_dir()),
+        })
+    }
+
+    /// L5 — after a rename-family call returns: report a directory
+    /// rename's result (with the inode now at `to`, the planner's proof
+    /// the rename happened) and any failure (which retracts the Rename
+    /// the pre-syscall notification journaled). Successful file renames
+    /// send nothing, so atomic writes pay no second round trip. Leaves
+    /// errno as the call set it.
+    pub fn finish_rename(pending: Option<RenamePending>, rc: libc::c_int) {
+        use std::os::unix::fs::MetadataExt;
+        let Some(p) = pending else {
+            return;
+        };
+        let saved = std::io::Error::last_os_error();
+        let errno = if rc == 0 {
+            0
+        } else {
+            saved.raw_os_error().unwrap_or(libc::EIO)
+        };
+        if errno == 0 && !p.source_is_dir {
+            return;
+        }
+        if disabled() || IN_NOTIFY.with(|f| f.replace(true)) {
+            return;
+        }
+        let dest = if errno == 0 {
+            std::fs::symlink_metadata(&p.to_abs)
+                .ok()
+                .map_or((0, 0), |m| (m.dev(), m.ino()))
+        } else {
+            (0, 0)
+        };
+        let outcome = shit_proto::ShimRenameOutcome {
+            errno,
+            source_dev: p.source.0,
+            source_inode: p.source.1,
+            dest_dev: dest.0,
+            dest_inode: dest.1,
+        };
+        let _ = try_notify_full(
+            p.syscall,
+            &p.arg,
+            None,
+            Vec::new(),
+            None,
+            None,
+            Some(outcome),
+        );
+        IN_NOTIFY.with(|f| f.set(false));
+        if let Some(e) = saved.raw_os_error() {
+            // SAFETY: errno is a valid thread-local lvalue.
+            unsafe { set_errno(e) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn set_errno(e: libc::c_int) {
+        unsafe { *libc::__errno_location() = e };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
+    unsafe fn set_errno(e: libc::c_int) {
+        unsafe { *libc::__error() = e };
+    }
+
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    unsafe fn set_errno(e: libc::c_int) {
+        unsafe { *libc::__errno() = e };
+    }
+
+    /// One walked entry's record.
+    fn walk_entry(path: &str, meta: &std::fs::Metadata) -> shit_proto::ShimWalkEntry {
+        use std::os::unix::fs::MetadataExt;
+        shit_proto::ShimWalkEntry {
+            path: path.to_string(),
+            dev: meta.dev(),
+            inode: meta.ino(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mtime_unix_nanos: meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128,
+            flags: read_st_flags(path, false).unwrap_or(0),
+            xattrs: read_xattrs(path),
+        }
+    }
+
+    fn entry_cost(e: &shit_proto::ShimWalkEntry) -> u64 {
+        let x: u64 = e
+            .xattrs
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.len() + v.len()) as u64 + 16)
+            .sum();
+        e.path.len() as u64 + x + RECORD_OVERHEAD
     }
 
     /// Walk `from_abs` if it is a directory and capture per-file
-    /// pre-images for every regular file in the subtree. Returns
-    /// an empty Vec for non-directories, unreadable paths, or
-    /// when limits trip before the first file. Symlinks, devices,
-    /// fifos, and other non-regular entries are skipped (their
-    /// pre-images aren't a `RestoreContent`-shaped fix).
-    fn collect_recursive_pre_images(from_abs: &str) -> Vec<shit_proto::ShimPreImage> {
+    /// pre-images for every regular file in the subtree, plus (L5) a
+    /// record of every entry. Returns nothing for non-directories.
+    /// Symlinks, devices, fifos, and other non-regular entries are
+    /// skipped (their pre-images aren't a `RestoreContent`-shaped fix),
+    /// which makes the walk incomplete.
+    ///
+    /// Directory records are sent only when the walk saw every entry,
+    /// captured every file and stayed within its caps. The source
+    /// directory's record comes first.
+    pub(super) fn collect_recursive_pre_images(
+        from_abs: &str,
+    ) -> (Vec<shit_proto::ShimPreImage>, Option<shit_proto::ShimWalk>) {
         use std::os::unix::fs::MetadataExt;
         use std::path::{Path, PathBuf};
 
         let p = Path::new(from_abs);
         let Ok(meta) = std::fs::symlink_metadata(p) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         if !meta.is_dir() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
 
         let mut out: Vec<shit_proto::ShimPreImage> = Vec::new();
+        let mut file_entries: Vec<shit_proto::ShimWalkEntry> = Vec::new();
+        let mut dirs: Vec<shit_proto::ShimWalkEntry> = vec![walk_entry(from_abs, &meta)];
+        let mut complete = true;
         let mut total_bytes: u64 = 0;
+        let mut frame: u64 = entry_cost(&dirs[0]);
         // Depth-first walk. (Depth bound keeps a path explosion
         // contained; file/byte caps catch fan-out separately.)
         let mut stack: Vec<(PathBuf, usize)> = vec![(p.to_path_buf(), 0)];
-        while let Some((dir, depth)) = stack.pop() {
+        'walk: while let Some((dir, depth)) = stack.pop() {
             if depth > RECURSIVE_MAX_DEPTH {
+                complete = false;
                 continue;
-            }
-            if out.len() >= RECURSIVE_MAX_FILES {
-                break;
             }
             let Ok(rd) = std::fs::read_dir(&dir) else {
+                complete = false;
                 continue;
             };
-            for entry in rd.flatten() {
+            for entry in rd {
+                let Ok(entry) = entry else {
+                    complete = false;
+                    continue;
+                };
                 if out.len() >= RECURSIVE_MAX_FILES {
-                    break;
+                    complete = false;
+                    break 'walk;
                 }
                 let path = entry.path();
                 // `symlink_metadata` to avoid following symlinks
                 // into unrelated parts of the filesystem.
                 let Ok(emeta) = std::fs::symlink_metadata(&path) else {
+                    complete = false;
+                    continue;
+                };
+                let Some(s) = path.to_str() else {
+                    complete = false;
                     continue;
                 };
                 if emeta.is_dir() {
+                    if dirs.len() >= RECURSIVE_MAX_DIRS {
+                        complete = false;
+                        break 'walk;
+                    }
+                    let rec = walk_entry(s, &emeta);
+                    frame = frame.saturating_add(entry_cost(&rec));
+                    dirs.push(rec);
                     stack.push((path, depth + 1));
                     continue;
                 }
-                if !emeta.is_file() {
+                if !emeta.is_file() || should_skip_path(s) {
                     // Symlink, fifo, socket, device — skip; their
                     // restore semantics aren't covered by a plain
                     // RestoreContent + bytes payload.
+                    complete = false;
                     continue;
                 }
                 let size = emeta.size();
-                if total_bytes.saturating_add(size) > RECURSIVE_MAX_BYTES {
-                    return out;
+                if total_bytes.saturating_add(size) > RECURSIVE_MAX_BYTES
+                    || frame.saturating_add(size) > RECURSIVE_FRAME_BUDGET
+                {
+                    complete = false;
+                    break 'walk;
                 }
-                let Some(s) = path.to_str() else {
-                    continue;
-                };
-                if should_skip_path(s) {
-                    continue;
-                }
-                if let Some(pre) = capture_pre_image(s) {
-                    total_bytes = total_bytes.saturating_add(pre.bytes.len() as u64);
-                    out.push(pre);
+                match capture_pre_image(s) {
+                    Some(pre) => {
+                        let rec = walk_entry(&pre.path, &emeta);
+                        total_bytes = total_bytes.saturating_add(pre.bytes.len() as u64);
+                        frame = frame
+                            .saturating_add(pre.bytes.len() as u64)
+                            .saturating_add(pre.path.len() as u64 + RECORD_OVERHEAD)
+                            .saturating_add(entry_cost(&rec));
+                        out.push(pre);
+                        file_entries.push(rec);
+                    }
+                    None => complete = false,
                 }
             }
         }
-        out
+        if frame > RECURSIVE_FRAME_BUDGET {
+            complete = false;
+        }
+        let mut entries = if complete { dirs } else { Vec::new() };
+        entries.append(&mut file_entries);
+        let walk = shit_proto::ShimWalk {
+            complete,
+            files: out.len() as u32,
+            entries,
+        };
+        (out, Some(walk))
+    }
+
+    /// L5 (finding 3): an entry's xattrs, read before the syscall.
+    /// Linux: the `user.` namespace, which is what restore writes back.
+    #[cfg(target_os = "linux")]
+    fn read_xattrs(path: &str) -> Option<Vec<(String, Vec<u8>)>> {
+        xattrs_with(path, |name| name.starts_with("user."))
+    }
+
+    /// macOS: everything but `com.apple.*`, as the daemon reads them.
+    #[cfg(target_os = "macos")]
+    fn read_xattrs(path: &str) -> Option<Vec<(String, Vec<u8>)>> {
+        xattrs_with(path, |name| !name.starts_with("com.apple."))
+    }
+
+    /// BSD: not read here; the daemon reads them after the ack.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn read_xattrs(_path: &str) -> Option<Vec<(String, Vec<u8>)>> {
+        None
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn xattrs_with(path: &str, keep: impl Fn(&str) -> bool) -> Option<Vec<(String, Vec<u8>)>> {
+        let c = std::ffi::CString::new(path).ok()?;
+        let size = unsafe { list_xattrs(&c, &mut []) };
+        if size < 0 {
+            return None;
+        }
+        let mut names = vec![0u8; size as usize];
+        let n = unsafe { list_xattrs(&c, &mut names) };
+        if n < 0 {
+            return None;
+        }
+        let mut out = Vec::new();
+        for raw in names[..n as usize].split(|b| *b == 0) {
+            let Ok(name) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            if name.is_empty() || !keep(name) {
+                continue;
+            }
+            let cn = std::ffi::CString::new(name).ok()?;
+            let vsize = unsafe { get_xattr(&c, &cn, &mut []) };
+            if vsize < 0 {
+                return None;
+            }
+            let mut val = vec![0u8; vsize as usize];
+            let got = unsafe { get_xattr(&c, &cn, &mut val) };
+            if got < 0 {
+                return None;
+            }
+            val.truncate(got as usize);
+            out.push((name.to_string(), val));
+        }
+        Some(out)
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn list_xattrs(path: &std::ffi::CStr, buf: &mut [u8]) -> isize {
+        unsafe { libc::llistxattr(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) }
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn get_xattr(path: &std::ffi::CStr, name: &std::ffi::CStr, buf: &mut [u8]) -> isize {
+        unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn list_xattrs(path: &std::ffi::CStr, buf: &mut [u8]) -> isize {
+        unsafe {
+            libc::listxattr(
+                path.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::XATTR_NOFOLLOW,
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn get_xattr(path: &std::ffi::CStr, name: &std::ffi::CStr, buf: &mut [u8]) -> isize {
+        unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        }
     }
 
     /// W09.10.1 — create-only notification (no pre-image). Used by
@@ -1445,6 +1724,27 @@ mod policy {
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
     ) -> std::io::Result<()> {
+        try_notify_full(
+            syscall,
+            arg,
+            pre_image,
+            extra_pre_images,
+            failure,
+            None,
+            None,
+        )
+    }
+
+    /// [`try_notify`] with the L5 rename fields.
+    fn try_notify_full(
+        syscall: &'static str,
+        arg: &str,
+        pre_image: Option<shit_proto::ShimPreImage>,
+        extra_pre_images: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
+        walk: Option<shit_proto::ShimWalk>,
+        outcome: Option<shit_proto::ShimRenameOutcome>,
+    ) -> std::io::Result<()> {
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
         };
@@ -1462,6 +1762,8 @@ mod policy {
                 pre_image,
                 extra_pre_images,
                 failure,
+                walk,
+                outcome,
             });
             return Ok(());
         }
@@ -1485,7 +1787,8 @@ mod policy {
         // immediately scheduled). For notifications without
         // pre-image, the original 50 ms stays — those are tiny and a
         // hung daemon shouldn't pause a user's `unlink` for 5s.
-        let write_timeout = if pre_image.is_some() || !extra_pre_images.is_empty() {
+        let write_timeout = if pre_image.is_some() || !extra_pre_images.is_empty() || walk.is_some()
+        {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(50)
@@ -1501,7 +1804,7 @@ mod policy {
         // syscall, not an interposer target, so this is safe.
         let pid = unsafe { libc::getpid() } as u32;
         let has_pre = pre_image.is_some();
-        let has_extras = !extra_pre_images.is_empty();
+        let has_extras = !extra_pre_images.is_empty() || walk.is_some();
         let note = ShimNotification {
             pid,
             syscall: syscall.to_string(),
@@ -1514,6 +1817,8 @@ mod policy {
             // silent fallback. The daemon's shim_listener journals
             // a Refuse marker keyed by this field.
             failure,
+            walk,
+            outcome,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
@@ -1709,16 +2014,20 @@ mod interposers {
         // it exists) so the planner can RestoreContent rather than
         // ReverseRename (which would leave dst empty + content stuck
         // at the source tmpfile path).
-        policy::notify_rename_with_dst_preimage(
+        let pending = policy::notify_rename_with_dst_preimage(
             "rename",
             &cstr_to_string(from),
             &cstr_to_string(to),
         );
         let real = next::real_rename();
-        if next::is_zero(next::as_usize(real)) {
-            return unsafe { libc::rename(from, to) };
-        }
-        unsafe { real(from, to) }
+        let rc = if next::is_zero(next::as_usize(real)) {
+            unsafe { libc::rename(from, to) }
+        } else {
+            unsafe { real(from, to) }
+        };
+        // L5: report a directory rename's result and any failure.
+        policy::finish_rename(pending, rc);
+        rc
     }
 
     /// `renameat(2)` interposer.
@@ -1740,12 +2049,15 @@ mod interposers {
         // and the classifier can't reach atomic-replace.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        policy::notify_rename_at("renameat", fromfd, &from_str, tofd, &to_str);
+        let pending = policy::notify_rename_at("renameat", fromfd, &from_str, tofd, &to_str);
         let real = next::real_renameat();
-        if next::is_zero(next::as_usize(real)) {
-            return unsafe { libc::renameat(fromfd, from, tofd, to) };
-        }
-        unsafe { real(fromfd, from, tofd, to) }
+        let rc = if next::is_zero(next::as_usize(real)) {
+            unsafe { libc::renameat(fromfd, from, tofd, to) }
+        } else {
+            unsafe { real(fromfd, from, tofd, to) }
+        };
+        policy::finish_rename(pending, rc);
+        rc
     }
 
     /// DR-CR-54 — `renameat2(2)` interposer. Linux-only. The
@@ -1770,18 +2082,21 @@ mod interposers {
         // DR-CR-54.B: same dirfd→absolute resolution as renameat.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        policy::notify_rename_at("renameat2", fromfd, &from_str, tofd, &to_str);
+        let pending = policy::notify_rename_at("renameat2", fromfd, &from_str, tofd, &to_str);
         let real = next::real_renameat2();
-        if next::is_zero(next::as_usize(real)) {
+        let rc = if next::is_zero(next::as_usize(real)) {
             // glibc < 2.28 had no `renameat2` wrapper; fall back
             // through raw syscall. This branch is unreachable on
             // any glibc shipped within the project's MSRV-era
             // distros, but defensive.
-            return unsafe {
+            unsafe {
                 libc::syscall(libc::SYS_renameat2, fromfd, from, tofd, to, flags as c_uint) as c_int
-            };
-        }
-        unsafe { real(fromfd, from, tofd, to, flags) }
+            }
+        } else {
+            unsafe { real(fromfd, from, tofd, to, flags) }
+        };
+        policy::finish_rename(pending, rc);
+        rc
     }
 
     /// W09.10.1 — `mkfifo(2)` interposer. FreeBSD's kqueue

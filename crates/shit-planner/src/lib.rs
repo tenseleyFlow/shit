@@ -47,6 +47,7 @@ pub use env::{
 pub use events::{
     CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, FilePreImageSource,
     NetworkTool, PackageManager, PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
+    WalkEntry,
 };
 pub use exec_log::{ExecLog, ExecLogError, default_dir as exec_log_default_dir, read_all};
 pub use executor::{

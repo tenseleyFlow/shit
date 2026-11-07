@@ -27,6 +27,7 @@ mod redirect_track;
 mod server;
 mod shell_state_track;
 mod shim_listener;
+mod shim_rename;
 mod stats;
 mod svc_track;
 mod telemetry;

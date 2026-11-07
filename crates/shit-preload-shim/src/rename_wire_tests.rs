@@ -66,3 +66,131 @@ fn rename_with_absolute_paths_over_existing_file_keeps_from_and_to() {
     assert_eq!(n.arg, format!("{}\t{}", a.display(), b.display()));
     assert_eq!(n.pre_image.as_ref().unwrap().path, b.to_str().unwrap());
 }
+
+// L5: the rename walk's records and the post-syscall outcome.
+
+fn rename_abs(from: &std::path::Path, to: &std::path::Path) -> (i32, Option<i32>) {
+    let cf = CString::new(from.to_str().unwrap()).unwrap();
+    let ct = CString::new(to.to_str().unwrap()).unwrap();
+    let rc = unsafe { super::interposers::rename(cf.as_ptr(), ct.as_ptr()) };
+    (rc, std::io::Error::last_os_error().raw_os_error())
+}
+
+fn mode_of(p: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p).unwrap().mode()
+}
+
+#[test]
+fn dir_rename_sends_a_complete_walk_then_its_outcome() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let d = dir.join("d");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::create_dir(d.join("empty")).unwrap();
+    std::fs::write(d.join("f"), b"f").unwrap();
+    std::fs::write(d.join("sub/g"), b"g").unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let xattr_ok = {
+        let p = CString::new(d.join("f").to_str().unwrap()).unwrap();
+        let n = CString::new("user.l5").unwrap();
+        unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), b"v".as_ptr().cast(), 1, 0) == 0 }
+    };
+    let d_ino = std::fs::metadata(&d).unwrap().ino();
+    let t = dir.join("t");
+    let notes = test_capture::capture(|| assert_eq!(rename_abs(&d, &t).0, 0));
+    assert_eq!(notes.len(), 2, "{notes:#?}");
+    let walk = notes[0].walk.as_ref().expect("walk");
+    assert!(walk.complete, "{walk:#?}");
+    assert_eq!(walk.files, 2);
+    assert_eq!(notes[0].extra_pre_images.len(), 2);
+    assert_eq!(walk.entries[0].path, d.to_str().unwrap());
+    assert_eq!(walk.entries[0].mode & 0o7777, 0o700);
+    assert_eq!(walk.entries[0].inode, d_ino);
+    let dirs = walk
+        .entries
+        .iter()
+        .filter(|e| e.mode & 0o170000 == 0o040000)
+        .count();
+    assert_eq!(dirs, 3, "{walk:#?}");
+    if xattr_ok {
+        let f = walk
+            .entries
+            .iter()
+            .find(|e| e.path == d.join("f").to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            f.xattrs.as_deref(),
+            Some(&[("user.l5".to_string(), b"v".to_vec())][..])
+        );
+    }
+    let out = notes[1].outcome.expect("outcome");
+    assert_eq!(out.errno, 0);
+    assert_eq!((out.source_inode, out.dest_inode), (d_ino, d_ino));
+    assert_eq!(notes[1].arg, notes[0].arg);
+    assert_eq!(mode_of(&t) & 0o7777, 0o700);
+}
+
+#[test]
+fn walk_with_a_symlink_is_incomplete_and_has_no_dir_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let d = dir.join("d");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    std::fs::write(d.join("f"), b"f").unwrap();
+    std::os::unix::fs::symlink("f", d.join("sub/link")).unwrap();
+    let notes = test_capture::capture(|| assert_eq!(rename_abs(&d, &dir.join("t")).0, 0));
+    let walk = notes[0].walk.as_ref().expect("walk");
+    assert!(!walk.complete);
+    assert!(
+        walk.entries.iter().all(|e| e.mode & 0o170000 != 0o040000),
+        "{walk:#?}"
+    );
+    assert_eq!(notes[0].extra_pre_images.len(), 1);
+}
+
+#[test]
+fn failed_dir_rename_reports_its_errno_and_keeps_it_for_the_caller() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let (d, t) = (dir.join("d"), dir.join("t"));
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("a"), b"d-a").unwrap();
+    std::fs::create_dir(&t).unwrap();
+    std::fs::write(t.join("a"), b"t-a").unwrap();
+    let mut got = (0, None);
+    let notes = test_capture::capture(|| got = rename_abs(&d, &t));
+    assert_eq!(got.0, -1);
+    assert!(
+        matches!(got.1, Some(libc::ENOTEMPTY) | Some(libc::EEXIST)),
+        "{got:?}"
+    );
+    let out = notes.last().unwrap().outcome.expect("outcome");
+    assert_eq!(Some(out.errno), got.1);
+    assert_eq!((out.dest_dev, out.dest_inode), (0, 0));
+}
+
+#[test]
+fn successful_file_rename_sends_no_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::write(dir.join("a"), b"a").unwrap();
+    let notes =
+        test_capture::capture(|| assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")).0, 0));
+    assert_eq!(notes.len(), 1, "{notes:#?}");
+    assert!(notes[0].outcome.is_none() && notes[0].walk.is_none());
+}
+
+#[test]
+fn failed_file_rename_sends_an_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::write(dir.join("a"), b"a").unwrap();
+    std::fs::create_dir(dir.join("b")).unwrap();
+    std::fs::write(dir.join("b/x"), b"x").unwrap();
+    let notes =
+        test_capture::capture(|| assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")).0, -1));
+    let out = notes.last().unwrap().outcome.expect("outcome");
+    assert_eq!(out.errno, libc::EISDIR);
+}

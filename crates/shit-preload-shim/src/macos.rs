@@ -222,8 +222,15 @@ unsafe extern "C" fn my_rmdir(pathname: *const c_char) -> c_int {
 /// Same contract as `libc::rename` — both args must be valid
 /// NUL-terminated C strings for the duration of the call.
 unsafe extern "C" fn my_rename(from: *const c_char, to: *const c_char) -> c_int {
-    policy::notify_rename_with_dst_preimage("rename", &cstr_to_string(from), &cstr_to_string(to));
-    unsafe { libc::rename(from, to) }
+    let pending = policy::notify_rename_with_dst_preimage(
+        "rename",
+        &cstr_to_string(from),
+        &cstr_to_string(to),
+    );
+    let rc = unsafe { libc::rename(from, to) };
+    // L5: report a directory rename's result and any failure.
+    policy::finish_rename(pending, rc);
+    rc
 }
 
 /// Replacement for `renameat(2)`. Dirfd-relative variant; modern
@@ -240,16 +247,19 @@ unsafe extern "C" fn my_renameat(
 ) -> c_int {
     // #222 / L5: a relative name under a real dirfd names an entry of
     // that directory, not of the cwd. Join it with F_GETPATH first.
-    match (
+    let pending = match (
         join_dirfd(fromfd, &cstr_to_string(from)),
         join_dirfd(tofd, &cstr_to_string(to)),
     ) {
         (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
         (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
-            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure)
+            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure);
+            None
         }
-    }
-    unsafe { libc::renameat(fromfd, from, tofd, to) }
+    };
+    let rc = unsafe { libc::renameat(fromfd, from, tofd, to) };
+    policy::finish_rename(pending, rc);
+    rc
 }
 
 /// `path` joined with `dirfd`'s directory when it is relative to a real
