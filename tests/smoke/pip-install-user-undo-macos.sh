@@ -111,7 +111,8 @@ EOF
 PIP_FLAGS="--user --quiet"
 # Some Homebrew Pythons are PEP-668-enforced; --break-system-packages
 # opts in if supported.
-if ${PIP_BIN} install --help 2>&1 | grep -q -- "--break-system-packages"; then
+PIP_HELP="$(${PIP_BIN} install --help 2>&1 || true)"
+if [[ "${PIP_HELP}" == *--break-system-packages* ]]; then
     PIP_FLAGS="${PIP_FLAGS} --break-system-packages"
 fi
 
@@ -142,6 +143,15 @@ INSTALLED_MOD="${PY_USER_SITE}/${MOD_NAME}.py"
 [ -f "${INSTALLED_MOD}" ] || smoke_fail "module file not found at ${INSTALLED_MOD}"
 V1_SHA="$(sha256_of "${INSTALLED_MOD}")"
 smoke_log "pre-state: v1 module at ${INSTALLED_MOD}, sha=${V1_SHA:0:16}..."
+
+# L5: the whole ~/.local tree (names, kinds, modes, bytes), so Outcome A
+# can also require that nothing of v2 is left beside v1.
+tree_snapshot() {
+    ( cd "${HOME}/.local" \
+        && find . -print0 | sort -z | xargs -0 stat -f '%Lp %HT %N' \
+        && find . -type f -print0 | sort -z | xargs -0 shasum -a 256 )
+}
+tree_snapshot > "${SHIT_SMOKE_TMP}/tree-before.txt"
 
 # v2 source + version bump.
 cat > "${PKG_DIR}/${MOD_NAME}.py" <<'EOF'
@@ -236,11 +246,33 @@ POST_SHA="$(sha256_of "${INSTALLED_MOD}")"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
+tree_snapshot > "${SHIT_SMOKE_TMP}/tree-after.txt"
+TREE_SAME=1
+if ! diff "${SHIT_SMOKE_TMP}/tree-before.txt" "${SHIT_SMOKE_TMP}/tree-after.txt" > "${SHIT_SMOKE_TMP}/tree.diff"; then
+    TREE_SAME=0
+    smoke_log "~/.local differs from the pre-state after undo:"
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/tree.diff" >&2
+fi
+if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ] && [ "${TREE_SAME}" != "1" ]; then
+    smoke_fail "SHIT_REQUIRE_OUTCOME_A=1: ~/.local does not match the pre-state"
+fi
+
 # Outcome A — full undo (v1 module restored byte-identical)
 if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; then
     smoke_log "OUTCOME A — full undo (module restored to v1 byte-identical, output='${POST_OUTPUT}', shim hits=${SHIM_HITS})"
     smoke_log "PASS: pip-install-user-undo-macos (Outcome A)"
     exit 0
+fi
+
+# L5: SHIT_REQUIRE_OUTCOME_A=1 (set on the hosted job) makes Outcome A
+# the only pass.
+if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
+    smoke_log "SHIT_REQUIRE_OUTCOME_A=1: Outcome B not accepted"
+    smoke_log "  undo exit:    ${UNDO_RC}"
+    smoke_log "  output now:   '${POST_OUTPUT}' (expected 'hello pip v1')"
+    smoke_log "  sha now:      ${POST_SHA:0:16}..."
+    smoke_log "  sha v1:       ${V1_SHA:0:16}..."
+    smoke_fail "pip install --user overwrite undo didn't restore v1"
 fi
 
 # Outcome B — loud refusal acceptable (see Linux smoke's rationale
