@@ -152,6 +152,15 @@ const RINGBUF_RMDIR_EVENTS: &str = "rmdir_events";
 const RINGBUF_RELEASE_EVENTS: &str = "release_events";
 const RINGBUF_MKNOD_EVENTS: &str = "mknod_events";
 
+/// Every LSM object carries a private one-element ARRAY with this name.
+/// Its u64 value is atomically incremented whenever that object's
+/// `bpf_ringbuf_reserve` fails. It lives outside the ringbuf because a
+/// full ringbuf cannot report its own overflow.
+const RINGBUF_LOSS_COUNT: &str = "ringbuf_loss_count";
+
+/// Userspace handle for one object's monotonic ring-buffer loss counter.
+pub type RingbufLossCounter = aya::maps::Array<aya::maps::MapData, u64>;
+
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
 /// the helper whether it's worth invoking `load`.
@@ -376,8 +385,8 @@ impl EbpfLoader {
     /// unlinkat on the box. Mitigation: the program (a) always
     /// returns 0 (allow), (b) uses BPF_CORE_READ for every
     /// kernel-struct field, (c) is straight-line code with no
-    /// loops, and (d) drops events silently when the ringbuf
-    /// fills rather than returning non-zero. See the .bpf.c
+    /// loops, and (d) allows on ringbuf pressure while incrementing
+    /// an out-of-band loss counter. See the .bpf.c
     /// comment block for the full contract.
     pub fn load_lsm_unlink(&mut self) -> Result<(), EbpfError> {
         let outcome = self.probe();
@@ -1014,6 +1023,31 @@ impl EbpfLoader {
         let bpf = self.mknod_bpf.as_mut()?;
         let map = bpf.take_map(RINGBUF_MKNOD_EVENTS)?;
         aya::maps::RingBuf::try_from(map).ok()
+    }
+
+    /// Take the ring-buffer loss counter of one loaded LSM object.
+    /// `object` is the program's short name (`"unlink"`, `"setattr"`,
+    /// `"mkdir"`, `"create"`, `"open"`, `"rename"`, `"symlink"`, `"link"`,
+    /// `"rmdir"`, `"release"`, `"mknod"`). Returns `None` when the object
+    /// is not loaded, the map was already taken, or the object predates
+    /// the counter.
+    pub fn take_loss_counter(&mut self, object: &str) -> Option<RingbufLossCounter> {
+        let bpf = match object {
+            "unlink" => self.bpf.as_mut(),
+            "setattr" => self.setattr_bpf.as_mut(),
+            "mkdir" => self.mkdir_bpf.as_mut(),
+            "create" => self.create_bpf.as_mut(),
+            "open" => self.open_bpf.as_mut(),
+            "rename" => self.rename_bpf.as_mut(),
+            "symlink" => self.symlink_bpf.as_mut(),
+            "link" => self.link_bpf.as_mut(),
+            "rmdir" => self.rmdir_bpf.as_mut(),
+            "release" => self.release_bpf.as_mut(),
+            "mknod" => self.mknod_bpf.as_mut(),
+            _ => None,
+        }?;
+        let map = bpf.take_map(RINGBUF_LOSS_COUNT)?;
+        aya::maps::Array::try_from(map).ok()
     }
 
     /// L04 — Take the `unlink_events` ringbuf for the userspace
