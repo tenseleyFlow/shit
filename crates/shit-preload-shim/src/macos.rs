@@ -223,8 +223,43 @@ unsafe extern "C" fn my_renameat(
     tofd: c_int,
     to: *const c_char,
 ) -> c_int {
-    policy::notify_rename_with_dst_preimage("renameat", &cstr_to_string(from), &cstr_to_string(to));
+    // #222 / L5: a relative name under a real dirfd names an entry of
+    // that directory, not of the cwd. Join it with F_GETPATH first.
+    match (
+        join_dirfd(fromfd, &cstr_to_string(from)),
+        join_dirfd(tofd, &cstr_to_string(to)),
+    ) {
+        (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
+        (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
+            policy::notify_rename_unresolved("renameat", &f, &t, failure)
+        }
+    }
     unsafe { libc::renameat(fromfd, from, tofd, to) }
+}
+
+/// `path` joined with `dirfd`'s directory when it is relative to a real
+/// dirfd. Absolute paths and `AT_FDCWD` pass through for the policy
+/// layer's canonicalize. When `F_GETPATH` fails the raw name comes back
+/// with an AU10 marker: resolving it against the cwd would key the event
+/// to the wrong file.
+fn join_dirfd(dirfd: c_int, path: &str) -> Result<String, (String, shit_proto::ShimFailure)> {
+    if path.starts_with('/') || dirfd == libc::AT_FDCWD {
+        return Ok(path.to_string());
+    }
+    match fd_to_path(dirfd) {
+        Some(base) => Ok(PathBuf::from(base)
+            .join(path)
+            .to_string_lossy()
+            .into_owned()),
+        None => Err((
+            path.to_string(),
+            shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg: "path".to_string(),
+                attempted_path: path.to_string(),
+                error_chain: format!("F_GETPATH failed for dirfd {dirfd}"),
+            },
+        )),
+    }
 }
 
 // Open/openat replacements live in the C trampoline (`macos_shim.c`)
@@ -1511,5 +1546,48 @@ mod tests {
             assert!(!e.target.is_null());
             assert_ne!(e.replacement, e.target);
         }
+    }
+}
+
+/// #222: renameat with a real dirfd keys both names to that directory
+/// and keeps `from\tto` on the wire when the destination exists.
+#[cfg(test)]
+mod rename_wire_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn renameat_with_real_dirfd_over_existing_file_keeps_from_and_to() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join(".alpha.txt.X"), b"new").unwrap();
+        std::fs::write(dir.join("alpha.txt"), b"old").unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let from = CString::new(".alpha.txt.X").unwrap();
+        let to = CString::new("alpha.txt").unwrap();
+        let mut rc = -1;
+        let notes = policy::test_capture::capture(|| {
+            rc = unsafe {
+                my_renameat(dfd.as_raw_fd(), from.as_ptr(), dfd.as_raw_fd(), to.as_ptr())
+            };
+        });
+        assert_eq!(rc, 0);
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "renameat")
+            .expect("renameat notification");
+        let want_to = dir.join("alpha.txt");
+        assert_eq!(
+            n.arg,
+            format!(
+                "{}\t{}",
+                dir.join(".alpha.txt.X").display(),
+                want_to.display()
+            )
+        );
+        let pre = n.pre_image.as_ref().expect("destination pre-image");
+        assert_eq!(pre.path, want_to.to_str().unwrap());
+        assert_eq!(pre.bytes, b"old");
     }
 }
