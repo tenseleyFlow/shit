@@ -36,6 +36,8 @@ SHITD_PID=""
 
 # Append every started bg process into here; smoke_cleanup kills them.
 SHIT_SMOKE_PIDS=()
+# Helper pids spawned under this smoke's shitd; reaped at stop.
+SHIT_HELPER_PIDS=()
 
 smoke_log() {
     printf '[smoke %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
@@ -75,6 +77,37 @@ smoke_dump_daemon_logs() {
     fi
 }
 
+# Print the pids of every descendant of $1 (children, grandchildren, ...).
+# Uses pgrep -P, available on Linux, FreeBSD and macOS. Scoping by parent
+# pid keeps concurrent smokes on one host from touching each other's
+# helpers (a host-wide `pkill -f shit-helper` did, see issue 207).
+smoke_descendants() {
+    local parent="$1" child
+    for child in $(pgrep -P "${parent}" 2>/dev/null || true); do
+        printf '%s\n' "${child}"
+        smoke_descendants "${child}"
+    done
+}
+
+# Record this smoke's own shit-helper pids (descendants of shitd whose
+# command name is shit-helper) into SHIT_HELPER_PIDS. Called while shitd
+# is still alive, since an orphaned helper is reparented away from it.
+smoke_snapshot_helpers() {
+    [ -n "${SHITD_PID:-}" ] || return 0
+    local pid comm
+    for pid in $(smoke_descendants "${SHITD_PID}"); do
+        comm="$(ps -p "${pid}" -o comm= 2>/dev/null || true)"
+        case "${comm##*/}" in
+            shit-helper*)
+                case " ${SHIT_HELPER_PIDS[*]:-} " in
+                    *" ${pid} "*) ;;
+                    *) SHIT_HELPER_PIDS+=("${pid}") ;;
+                esac
+                ;;
+        esac
+    done
+}
+
 # Start shitd in the background. Blocks until the ctl socket appears
 # (or 10s have passed, at which point we bail).
 smoke_start_shitd() {
@@ -82,18 +115,6 @@ smoke_start_shitd() {
     if [ ! -x "${shitd}" ]; then
         smoke_fail "shitd binary missing at ${shitd}"
     fi
-    # Cross-smoke hygiene: a previous smoke can leak a `shit-helper`
-    # subprocess (visible in this smoke's safety-net's pgrep dump as
-    # an "any shit-* processes anywhere" entry). When a stale helper
-    # is alive its BPF LSM programs are still attached to the kernel
-    # hooks; events from THIS smoke's mutation hit BOTH the orphan's
-    # ringbufs (drained by no live reader) and THIS smoke's helper's
-    # ringbufs. Some events apparently get routed to the orphan and
-    # dropped, producing intermittent "timed out waiting for event"
-    # failures on the same commit across reruns. Sweep them here.
-    pkill -f 'target/release/shit-helper' 2>/dev/null || true
-    # Brief settle for the kernel to detach the orphan's BPF links.
-    sleep 0.1
     smoke_log "starting shitd (state=${XDG_STATE_HOME}/shit)"
     # Pin RUST_LOG=debug for the daemon so per-tier handlers' debug
     # breadcrumbs (`net-pre stashed`, `svc-pre stashed`, etc.) land
@@ -151,6 +172,8 @@ smoke_stop_shitd() {
     local zombie=0
     local shit_bin="${SHIT_SMOKE_BIN_DIR}/shit"
     printf '[stop-shitd %s] enter (SHITD_PID=%s)\n' "$(date -u +%H:%M:%S)" "${SHITD_PID:-unset}" >&2
+    # Remember our helper before shitd goes away and orphans it.
+    smoke_snapshot_helpers
 
     if [ -z "${SHITD_PID:-}" ] || ! kill -0 "${SHITD_PID}" 2>/dev/null; then
         printf '[stop-shitd %s] not alive (no SHITD_PID or kill -0 failed)\n' "$(date -u +%H:%M:%S)" >&2
@@ -213,12 +236,17 @@ smoke_stop_shitd() {
     # outlive its parent. On the cross-platform-actions FreeBSD VM,
     # an orphaned helper keeps bash's exit blocked (the SSH session
     # waits for tty-fd-sharing processes). Wait for `wait` to reap
-    # the shitd job, then nuke any leftover helpers by name.
+    # the shitd job, then kill the helper pids recorded above
+    # (not by name: other smokes on the host have helpers of their own).
     printf '[stop-shitd %s] before wait\n' "$(date -u +%H:%M:%S)" >&2
     wait "${SHITD_PID}" 2>/dev/null || true
-    printf '[stop-shitd %s] after wait; pkill shit-helper\n' "$(date -u +%H:%M:%S)" >&2
-    pkill -f 'target/release/shit-helper' 2>/dev/null || true
-    pkill -f 'target/debug/shit-helper' 2>/dev/null || true
+    printf '[stop-shitd %s] after wait; reaping own helpers (%s)\n' "$(date -u +%H:%M:%S)" "${SHIT_HELPER_PIDS[*]:-none}" >&2
+    if [ "${#SHIT_HELPER_PIDS[@]}" -gt 0 ]; then
+        local hp
+        for hp in "${SHIT_HELPER_PIDS[@]}"; do
+            kill -KILL "${hp}" 2>/dev/null || true
+        done
+    fi
     printf '[stop-shitd %s] return (zombie=%d)\n' "$(date -u +%H:%M:%S)" "${zombie}" >&2
     return "${zombie}"
 }
