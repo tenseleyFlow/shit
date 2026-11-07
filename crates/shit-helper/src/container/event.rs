@@ -50,6 +50,12 @@ const CTL_TIMEOUT: Duration = Duration::from_secs(60);
 /// covers alpine (~5 MB), distroless (~20 MB), and small app images.
 const INLINE_TARBALL_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Extras key marking an event whose pre-capture is incomplete. The
+/// daemon journals the event as before and, in strict mode only, adds a
+/// `CaptureRefused` row for the command. Keep in sync with
+/// `shitd::container_track::CAPTURE_FAILED_EXTRA`.
+const CAPTURE_FAILED_EXTRA: &str = "capture_failed";
+
 /// CLI entrypoint dispatched from `main.rs` for the `container-event`
 /// subcommand.
 pub async fn run_event(
@@ -370,6 +376,10 @@ fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
             if let Some(d) = digest {
                 extras.insert("digest".into(), d);
             }
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("{tool} save failed: {e}"),
+            );
             return PreparedEvent {
                 verb: ContainerVerbWire::Rmi,
                 captured_config: Vec::new(),
@@ -397,6 +407,10 @@ fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
         if let Some(d) = digest {
             extras.insert("digest".into(), d);
         }
+        extras.insert(
+            CAPTURE_FAILED_EXTRA.into(),
+            format!("image tarball exceeds the {INLINE_TARBALL_MAX_BYTES}-byte inline cap"),
+        );
         return PreparedEvent {
             verb: ContainerVerbWire::Rmi,
             captured_config: Vec::new(),
@@ -547,6 +561,10 @@ fn prepare_network_rm_one(tool: &str, name: String) -> PreparedEvent {
                 err = %e,
                 "container-event: network inspect failed; event will ship without captured_config"
             );
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("{tool} network inspect failed: {e}"),
+            );
             PreparedEvent {
                 verb: ContainerVerbWire::NetworkRm,
                 captured_config: Vec::new(),
@@ -592,6 +610,10 @@ fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEven
                 "container-event: docker inspect failed; event will ship without captured_config"
             );
             extras.insert("was_running".into(), "false".into());
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("{tool} inspect failed: {e}"),
+            );
             return Some(PreparedEvent {
                 verb: ContainerVerbWire::Rm,
                 captured_config: Vec::new(),
@@ -614,6 +636,10 @@ fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEven
         match docker_commit_running_container(tool, &id) {
             Ok(tag) => Some(tag),
             Err(e) => {
+                extras.insert(
+                    CAPTURE_FAILED_EXTRA.into(),
+                    format!("{tool} commit failed: {e}"),
+                );
                 tracing::warn!(
                     tool,
                     id = %id,
@@ -861,6 +887,10 @@ fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
             if let Some(d) = driver {
                 extras.insert("driver".into(), d);
             }
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("volume tar failed: {e}"),
+            );
             return PreparedEvent {
                 verb: ContainerVerbWire::VolumeRm,
                 captured_config: Vec::new(),
@@ -885,6 +915,10 @@ fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
         if let Some(d) = driver {
             extras.insert("driver".into(), d);
         }
+        extras.insert(
+            CAPTURE_FAILED_EXTRA.into(),
+            format!("volume tarball exceeds the {INLINE_TARBALL_MAX_BYTES}-byte inline cap"),
+        );
         return PreparedEvent {
             verb: ContainerVerbWire::VolumeRm,
             captured_config: Vec::new(),

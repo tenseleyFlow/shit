@@ -37,7 +37,9 @@ use shit_proto::{
 };
 use shit_store::{BlobStore, Index};
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 use uuid::Uuid;
@@ -51,6 +53,11 @@ use uuid::Uuid;
 /// kernel-tier capture for the same path, which is acceptable
 /// degradation. A torpedoing top-level `Error` would block the shell
 /// instead.
+///
+/// With `strict` set (`SHIT_STRICT_CAPTURE`), a per-target failure also
+/// journals a `CaptureRefused` row for the path, so `shit undo` refuses
+/// that command instead of silently restoring less than the shell
+/// destroyed. The shell still gets its ack either way.
 pub fn handle(
     session: Uuid,
     command_seq: u64,
@@ -58,6 +65,7 @@ pub fn handle(
     active: &ActiveCommands,
     index: &Index,
     blob_store: &BlobStore,
+    strict: bool,
 ) -> CtlResponse {
     let command = CommandId {
         session,
@@ -82,10 +90,27 @@ pub fn handle(
         match stash_one(&target, command, index, blob_store) {
             Ok(StashOutcome::Stashed) => stashed += 1,
             Ok(StashOutcome::Skipped) => {} // fresh-create case; not an error, not a stash
-            Err(reason) => errors.push(PreStashRedirectError {
-                path: target.path.clone(),
-                reason,
-            }),
+            Err(reason) => {
+                if strict {
+                    let path = Path::new(target.path.as_str());
+                    // A path the shell could not resolve is not a
+                    // filesystem location; the refusal falls back to the
+                    // command's cwd.
+                    let refused_path = path.is_absolute().then(|| path.to_path_buf());
+                    if let Err(e) = crate::helper_link::journal_capture_refused(
+                        index,
+                        command,
+                        refused_path,
+                        format!("redirect pre-stash failed for {}: {reason}", target.path),
+                    ) {
+                        tracing::error!(error = %e, %command, "strict redirect CaptureRefused journal failed");
+                    }
+                }
+                errors.push(PreStashRedirectError {
+                    path: target.path.clone(),
+                    reason,
+                });
+            }
         }
     }
     CtlResponse::PreStashRedirectsAck(PreStashRedirectsResult { stashed, errors })
@@ -104,6 +129,15 @@ fn stash_one(
     index: &Index,
     blob_store: &BlobStore,
 ) -> Result<StashOutcome, String> {
+    // The hook resolves relative targets against the shell's cwd before
+    // sending. A path that is still relative (unexpanded `$VAR`, `~`, a
+    // glob) would resolve against the daemon's cwd, which names the
+    // wrong file, so it is never stat'd.
+    if !Path::new(target.path.as_str()).is_absolute() {
+        return Err(
+            "redirect target is not an absolute path (shell expansion not resolved)".into(),
+        );
+    }
     match target.op {
         RedirectOpWire::Truncate | RedirectOpWire::TeeTruncate | RedirectOpWire::DdOf => {
             stash_truncate(target.path.as_str(), command, index, blob_store)
@@ -127,19 +161,14 @@ fn stash_append(path_str: &str, command: CommandId, index: &Index) -> Result<Sta
     // back to. AR05.1-style fresh-create journaling could
     // emit a TreeOp::Create here; deferred to a sibling
     // sprint.
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!(path = %path.display(), "append target absent; nothing to pre-stash");
-            return Ok(StashOutcome::Skipped);
-        }
-        Err(e) => return Err(format!("stat: {e}")),
+    let Some((file, meta)) = open_regular_nofollow(path)? else {
+        debug!(path = %path.display(), "append target absent; nothing to pre-stash");
+        return Ok(StashOutcome::Skipped);
     };
-    // Same special-file defense as stash_truncate — only
-    // regular files have a pre_size that means "truncate-back."
-    if !meta.file_type().is_file() {
-        return Err(format!("not a regular file ({:?})", meta.file_type()));
-    }
+    // The size is read from the fd we opened, so a path swapped to a
+    // different file after this point cannot change what we record.
+    // Re-check the binding once more before journaling.
+    verify_unchanged(path, &file, &meta)?;
     // Empty file fast-path: appending to a 0-byte file. Truncate
     // back would be a no-op (already 0 bytes after the inverse
     // runs IFF the truncate is the only inverse). Skip the
@@ -186,22 +215,17 @@ fn stash_truncate(
     // we focus on the "clobber existing file" race. Fresh-create
     // covered by separate AR06.5 follow-up; today we just skip
     // cleanly (no error -- not a failure).
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!(path = %path.display(), "redirect target absent; nothing to pre-stash");
-            return Ok(StashOutcome::Skipped);
-        }
-        Err(e) => return Err(format!("stat: {e}")),
+    let Some((mut file, meta)) = open_regular_nofollow(path)? else {
+        debug!(path = %path.display(), "redirect target absent; nothing to pre-stash");
+        return Ok(StashOutcome::Skipped);
     };
-    // Refuse symlinks, FIFOs, sockets, devices — only regular files
-    // have content worth restoring. Pre-stashing a /dev path was
-    // already filtered at the shell-side parser (is_special_path),
-    // but we defense-in-depth here too.
-    if !meta.file_type().is_file() {
-        return Err(format!("not a regular file ({:?})", meta.file_type()));
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+    // Read through the descriptor we validated, then confirm that the
+    // file did not change under the read and that the path still names
+    // it. A torn read would otherwise be journaled as the pre-image.
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.size()).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("read: {e}"))?;
+    verify_unchanged(path, &file, &meta)?;
     let (blob_hash, stat) = blob_store
         .put(&bytes)
         .map_err(|e| format!("blob put: {e}"))?;
@@ -254,6 +278,60 @@ fn stash_truncate(
         "redirect pre-stashed"
     );
     Ok(StashOutcome::Stashed)
+}
+
+/// Open `path` read-only without following a final symlink and check that
+/// the descriptor is a regular file. `Ok(None)` means the path is absent.
+/// Symlinks, FIFOs, sockets and devices are errors: only regular files
+/// have content worth restoring, and `O_NONBLOCK` keeps a FIFO swapped in
+/// after the shell parse from blocking the daemon in `open`.
+fn open_regular_nofollow(path: &Path) -> Result<Option<(File, std::fs::Metadata)>, String> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err("not a regular file (symlink)".to_string());
+        }
+        Err(e) => return Err(format!("open: {e}")),
+    };
+    let meta = file.metadata().map_err(|e| format!("fstat: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("not a regular file ({:?})", meta.file_type()));
+    }
+    Ok(Some((file, meta)))
+}
+
+/// Fail if the file changed while it was being captured, or if `path` no
+/// longer names the inode we opened.
+fn verify_unchanged(path: &Path, file: &File, before: &std::fs::Metadata) -> Result<(), String> {
+    let after = file
+        .metadata()
+        .map_err(|e| format!("post-read fstat: {e}"))?;
+    if !same_snapshot(before, &after) {
+        return Err("target changed while its redirect pre-image was captured".to_string());
+    }
+    let bound = std::fs::symlink_metadata(path).map_err(|e| format!("post-read path stat: {e}"))?;
+    if bound.file_type().is_symlink() || bound.dev() != before.dev() || bound.ino() != before.ino()
+    {
+        return Err(
+            "target path was replaced while its redirect pre-image was captured".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn same_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.size() == right.size()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
 }
 
 fn mtime_unix_nanos(meta: &std::fs::Metadata) -> i128 {
@@ -333,6 +411,7 @@ mod tests {
             &active,
             &index,
             &blob_store,
+            false,
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
@@ -371,6 +450,7 @@ mod tests {
             &active,
             &index,
             &blob_store,
+            false,
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
@@ -406,6 +486,7 @@ mod tests {
             &active,
             &index,
             &blob_store,
+            false,
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
@@ -442,6 +523,7 @@ mod tests {
             &active,
             &index,
             &blob_store,
+            false,
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
@@ -486,6 +568,7 @@ mod tests {
             &active,
             &index,
             &blob_store,
+            false,
         );
         match resp {
             CtlResponse::PreStashRedirectsAck(r) => {
@@ -494,5 +577,151 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    fn one_target(path: &str, op: RedirectOpWire) -> Vec<RedirectTargetWire> {
+        vec![RedirectTargetWire {
+            op,
+            path: path.to_string(),
+        }]
+    }
+
+    fn ack(resp: CtlResponse) -> PreStashRedirectsResult {
+        match resp {
+            CtlResponse::PreStashRedirectsAck(r) => r,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn refusals(index: &Index, cmd: CommandId) -> Vec<(PathBuf, String)> {
+        index
+            .events_for_command(cmd)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                CaptureEventKind::CaptureRefused { path, detail, .. } => Some((path, detail)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn relative_target_errors_and_is_not_resolved_against_daemon_cwd() {
+        let (_dir, blob_store, index, active) = fresh();
+        let cmd = CommandId {
+            session: fresh_session(),
+            seq: 1,
+        };
+        register_command(&index, cmd);
+        // Cargo.toml exists relative to the test's cwd; it must not be stashed.
+        let r = ack(handle(
+            cmd.session,
+            cmd.seq,
+            one_target("Cargo.toml", RedirectOpWire::Truncate),
+            &active,
+            &index,
+            &blob_store,
+            false,
+        ));
+        assert_eq!(r.stashed, 0);
+        assert_eq!(r.errors.len(), 1);
+        assert!(index.events_for_command(cmd).is_empty());
+    }
+
+    #[test]
+    fn strict_unresolved_target_journals_refusal_default_does_not() {
+        for strict in [false, true] {
+            let (_dir, blob_store, index, active) = fresh();
+            let cmd = CommandId {
+                session: fresh_session(),
+                seq: 1,
+            };
+            register_command(&index, cmd);
+            let r = ack(handle(
+                cmd.session,
+                cmd.seq,
+                one_target("$NOPE/out", RedirectOpWire::Truncate),
+                &active,
+                &index,
+                &blob_store,
+                strict,
+            ));
+            assert_eq!(r.errors.len(), 1, "strict={strict}");
+            let rows = refusals(&index, cmd);
+            assert_eq!(rows.len(), usize::from(strict), "strict={strict}");
+            if strict {
+                assert_eq!(rows[0].0, PathBuf::from("/tmp"), "falls back to cwd");
+                assert!(rows[0].1.contains("$NOPE/out"), "{}", rows[0].1);
+            }
+        }
+    }
+
+    #[test]
+    fn symlink_target_is_refused_not_followed() {
+        let (dir, blob_store, index, active) = fresh();
+        let real = write_file(dir.path(), "real.txt", b"secret\n");
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cmd = CommandId {
+            session: fresh_session(),
+            seq: 1,
+        };
+        register_command(&index, cmd);
+        let r = ack(handle(
+            cmd.session,
+            cmd.seq,
+            one_target(link.to_str().unwrap(), RedirectOpWire::Truncate),
+            &active,
+            &index,
+            &blob_store,
+            true,
+        ));
+        assert_eq!(r.stashed, 0);
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        let rows = refusals(&index, cmd);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, link);
+    }
+
+    #[test]
+    fn fifo_target_does_not_block_the_daemon() {
+        let (dir, blob_store, index, active) = fresh();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let cmd = CommandId {
+            session: fresh_session(),
+            seq: 1,
+        };
+        register_command(&index, cmd);
+        let r = ack(handle(
+            cmd.session,
+            cmd.seq,
+            one_target(fifo.to_str().unwrap(), RedirectOpWire::Truncate),
+            &active,
+            &index,
+            &blob_store,
+            false,
+        ));
+        assert_eq!(r.stashed, 0);
+        assert_eq!(r.errors.len(), 1);
+    }
+
+    #[test]
+    fn verify_unchanged_catches_modification_and_replacement() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(dir.path(), "f.txt", b"one\n");
+        let (file, meta) = open_regular_nofollow(&path).unwrap().unwrap();
+        verify_unchanged(&path, &file, &meta).expect("untouched file verifies");
+
+        // Same inode, new bytes: the fd snapshot differs.
+        std::fs::write(&path, b"two two\n").unwrap();
+        assert!(verify_unchanged(&path, &file, &meta).is_err());
+
+        // Path now names a different inode.
+        let (file, meta) = open_regular_nofollow(&path).unwrap().unwrap();
+        let other = write_file(dir.path(), "g.txt", b"swap\n");
+        std::fs::rename(&other, &path).unwrap();
+        let err = verify_unchanged(&path, &file, &meta).unwrap_err();
+        assert!(err.contains("replaced") || err.contains("changed"), "{err}");
     }
 }

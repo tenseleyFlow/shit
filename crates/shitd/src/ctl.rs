@@ -186,9 +186,13 @@ async fn handle_client(
         CtlRequest::NetEvent(req) => handle_net_event(req, &net_stash, &active, &index),
         CtlRequest::ProcEvent(req) => handle_proc_event(req, &proc_stash, &active, &index),
         CtlRequest::DbEvent(req) => handle_db_event(req, &db_stash, &active, &index),
-        CtlRequest::ContainerEvent(req) => {
-            handle_container_event(req, &active, &index, &blob_store)
-        }
+        CtlRequest::ContainerEvent(req) => handle_container_event(
+            req,
+            &active,
+            &index,
+            &blob_store,
+            plan_options.strict_capture,
+        ),
         CtlRequest::CloudEvent(req) => handle_cloud_event(req, &active, &index),
         CtlRequest::Hook(msg) => {
             debug!(kind = msg.kind(), session = %msg.session(), "hook frame via ctl");
@@ -243,6 +247,7 @@ async fn handle_client(
             &active,
             &index,
             &blob_store,
+            plan_options.strict_capture,
         ),
         CtlRequest::CmdDetail { id, events_limit } => {
             // AU30 — same tokio lesson as the AU22 fix above:
@@ -626,8 +631,9 @@ fn handle_container_event(
     active: &crate::active_commands::ActiveCommands,
     index: &Index,
     blob_store: &BlobStore,
+    strict: bool,
 ) -> CtlResponse {
-    let _ = crate::container_track::handle(req, active, index, blob_store);
+    let _ = crate::container_track::handle(req, active, index, blob_store, strict);
     CtlResponse::ContainerEventAck
 }
 
