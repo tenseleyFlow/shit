@@ -1370,8 +1370,8 @@ mod policy {
         notify_inner_with_failure(syscall, path, None, failure, false);
     }
 
-    /// L5 — an `rmdir(2)` resolved and stat'ed before the call.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// L5 — an `rmdir(2)` (or `unlinkat(AT_REMOVEDIR)`) resolved and
+    /// stat'ed before the call.
     pub struct PendingRemoval {
         syscall: &'static str,
         path: String,
@@ -1381,13 +1381,47 @@ mod policy {
 
     /// L5 — before `rmdir(2)`: resolve the path (the directory still
     /// exists) and keep its lstat for the notification.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub(super) fn removal_begin(syscall: &'static str, path: &str) -> Option<PendingRemoval> {
-        use std::os::unix::fs::MetadataExt;
         if disabled() || should_skip_path(path) {
             return None;
         }
         let (abs, failure) = canonicalize_or_raw(path, "path");
+        removal_pending(syscall, abs, failure)
+    }
+
+    /// L5 (review round 2, item 2) — before `unlinkat(dirfd, name,
+    /// AT_REMOVEDIR)`, keyed to the dirfd.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn removal_begin_at(
+        syscall: &'static str,
+        dirfd: libc::c_int,
+        path: &str,
+    ) -> Option<PendingRemoval> {
+        if disabled() {
+            return None;
+        }
+        match resolve_at_for_notify(dirfd, path, "path") {
+            AtResolution::Resolved(abs) => removal_pending(syscall, abs, None),
+            AtResolution::Failed(raw, f) => removal_pending(syscall, raw, Some(f)),
+            AtResolution::Nothing => None,
+        }
+    }
+
+    /// A removal to report after the call. `failure` is set when the
+    /// path could not be keyed; it is then reported with the marker.
+    pub(super) fn removal_pending(
+        syscall: &'static str,
+        abs: String,
+        failure: Option<shit_proto::ShimFailure>,
+    ) -> Option<PendingRemoval> {
+        use std::os::unix::fs::MetadataExt;
         if should_skip_path(&abs) {
             return None;
         }
@@ -1410,7 +1444,6 @@ mod policy {
     /// removed the directory. A refused rmdir (ENOTEMPTY from
     /// `--ignore-fail-on-non-empty` or `os.removedirs`) removed nothing.
     /// Leaves errno as the call set it.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn removal_end(pending: Option<PendingRemoval>, rc: libc::c_int) {
         let Some(p) = pending else {
             return;
@@ -2318,6 +2351,19 @@ mod interposers {
         // once, fails closed on an unjoinable dirfd, and attaches the
         // AU10 marker. W09.5: pre-image bytes are captured before the
         // unlink so unlink-then-open(O_CREAT) tools can be undone.
+        // L5 (review round 2, item 2): a directory removal is reported
+        // after it succeeded, with the stat from before, like rmdir.
+        if flag & libc::AT_REMOVEDIR != 0 {
+            let pending = policy::removal_begin_at("unlinkat", dirfd, &path_str);
+            let real = next::real_unlinkat();
+            let rc = if next::is_zero(next::as_usize(real)) {
+                unsafe { libc::unlinkat(dirfd, path, flag) }
+            } else {
+                unsafe { real(dirfd, path, flag) }
+            };
+            policy::removal_end(pending, rc);
+            return rc;
+        }
         policy::notify_pre_mutation_with_content_at("unlinkat", dirfd, &path_str);
         let real = next::real_unlinkat();
         if next::is_zero(next::as_usize(real)) {
