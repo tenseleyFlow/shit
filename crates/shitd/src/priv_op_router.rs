@@ -88,7 +88,7 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
         wire_to_planner(outcome)
     }
 
-    fn mknod(&self, path: &Path, mode: u32, dev: u64) -> PlannerOutcome {
+    fn mknod(&self, path: &Path, mode: u32, dev: u64, owner: Option<(u32, u32)>) -> PlannerOutcome {
         // AU22 / DR-15.1 — Fifo/Socket dispatch through the helper
         // (which calls libc::mknod with the S_IFIFO/S_IFSOCK |
         // perm_bits composite). BlockDevice/CharDevice still
@@ -101,6 +101,7 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
             path: path.to_string_lossy().into_owned(),
             mode,
             dev,
+            owner,
         };
         let outcome = self
             .helper
@@ -137,10 +138,10 @@ impl PrivilegedOpRouter for EitherRouter {
             EitherRouter::NoOp(r) => r.chown(path, uid, gid, no_dereference),
         }
     }
-    fn mknod(&self, path: &Path, mode: u32, dev: u64) -> PlannerOutcome {
+    fn mknod(&self, path: &Path, mode: u32, dev: u64, owner: Option<(u32, u32)>) -> PlannerOutcome {
         match self {
-            EitherRouter::Helper(r) => r.mknod(path, mode, dev),
-            EitherRouter::NoOp(r) => r.mknod(path, mode, dev),
+            EitherRouter::Helper(r) => r.mknod(path, mode, dev, owner),
+            EitherRouter::NoOp(r) => r.mknod(path, mode, dev, owner),
         }
     }
 }

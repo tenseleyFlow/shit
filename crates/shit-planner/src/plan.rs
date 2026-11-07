@@ -237,6 +237,9 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+    /// L4 - `DeviceNodeMeta` rows by path, for pairing with the
+    /// path's `Unlink`.
+    device_nodes: std::collections::HashMap<PathBuf, (InodeRef, crate::metadata::DeviceNode)>,
     /// Shim chflags snapshots already covered by a kqueue
     /// `MetadataChange` for the same inode and pre-value.
     paired_flags_shims: HashSet<crate::events::EventId>,
@@ -644,6 +647,29 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
+    let mut device_nodes = std::collections::HashMap::new();
+    for ev in events {
+        if let CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+            inode,
+            path,
+            rdev,
+            uid,
+            gid,
+        }) = &ev.kind
+        {
+            device_nodes.insert(
+                path.clone(),
+                (
+                    *inode,
+                    crate::metadata::DeviceNode {
+                        rdev: *rdev,
+                        uid: *uid,
+                        gid: *gid,
+                    },
+                ),
+            );
+        }
+    }
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
     EventClassification {
@@ -653,6 +679,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
+        device_nodes,
         paired_flags_shims: HashSet::new(),
         dropped_events,
         refused_unlinks: provenance.refused_unlinks,
@@ -1770,11 +1797,10 @@ fn emit_for_tree_op(
             });
         }
         TreeOp::Unlink {
+            inode,
             path,
             kind,
             mode,
-            device,
-            ..
         } => {
             // W01.B.fix-rename-coalescing: ditto Create's note above —
             // atomic-replace paths get their inverse from FilePreImage.
@@ -1825,7 +1851,15 @@ fn emit_for_tree_op(
                     path: path.clone(),
                     kind: *kind,
                     mode: *mode,
-                    device: *device,
+                    device: class
+                        .device_nodes
+                        .get(path)
+                        .filter(|(meta_inode, _)| {
+                            *meta_inode == *inode
+                                || *inode == InodeRef::new(0, 0)
+                                || *meta_inode == InodeRef::new(0, 0)
+                        })
+                        .map(|(_, d)| *d),
                 },
                 cohort: 0,
                 conflict,
@@ -1874,6 +1908,8 @@ fn emit_for_tree_op(
                 conflict: None,
             });
         }
+        // Consumed by the path's Unlink above; no inverse of its own.
+        TreeOp::DeviceNodeMeta { .. } => {}
         TreeOp::SymlinkRemoved { target, path } => {
             // W09.16.1 — the OLD symlink at `path` was removed
             // (by `ln -sf` or `rm + ln -s`); recreate it. The
@@ -2468,7 +2504,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let events = vec![flags_pre_image(inode, path.to_str().unwrap(), 0, 1), unlink];
@@ -2516,7 +2551,6 @@ mod tests {
                 path,
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let events = vec![
@@ -2561,7 +2595,6 @@ mod tests {
                 path,
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let events = vec![
@@ -2733,7 +2766,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let p = plan(dummy_command(), &[pre, unlink], &probe, &store);
@@ -2779,7 +2811,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Directory,
                 mode: 0o040700,
-                device: None,
             }),
         };
         let p = plan(dummy_command(), &[unlink_dir], &probe, &store);
@@ -2831,7 +2862,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100755,
-                device: None,
             }),
         };
         let p = plan(dummy_command(), &[unlink_exec], &probe, &store);
@@ -2925,7 +2955,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let p = plan(dummy_command(), &[create, pre, unlink], &probe, &store);
@@ -3083,7 +3112,6 @@ mod tests {
                 path: dest.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let rename = CaptureEvent {
@@ -3182,7 +3210,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let p = plan(dummy_command(), &[create, pre, unlink], &probe, &store);
@@ -3246,7 +3273,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let p = plan(dummy_command(), &[create, unlink], &probe, &store);
@@ -3640,7 +3666,6 @@ mod tests {
                 path: dst.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let pre_image = CaptureEvent {
@@ -3968,7 +3993,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let p = plan(
@@ -4064,7 +4088,6 @@ mod tests {
                 path: path.clone(),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let p = plan(

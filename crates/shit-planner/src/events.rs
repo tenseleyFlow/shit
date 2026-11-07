@@ -10,7 +10,7 @@
 
 use crate::inode::{BlobHash, InodeRef};
 use crate::inverse::{ContainerOp, ContainerRuntime};
-use crate::metadata::{DeviceNode, FileKind, FileMetadata};
+use crate::metadata::{FileKind, FileMetadata};
 use crate::time::TimePoint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -466,14 +466,6 @@ pub enum TreeOp {
         kind: FileKind,
         #[serde(default = "default_unlink_mode_event")]
         mode: u32,
-        /// L4 - device number and owner of a block/char node. `None`
-        /// for every other kind. Keep this the last field of the last
-        /// `CaptureEvent` member: postcard encodes `None` as one zero
-        /// byte, so the store decodes a pre-L4 row by appending that
-        /// byte (see `shit_store::index::decode_event_payload`), and a
-        /// pre-L4 reader ignores the trailing bytes of a new row.
-        #[serde(default)]
-        device: Option<DeviceNode>,
     },
     Rename {
         from: PathBuf,
@@ -496,6 +488,21 @@ pub enum TreeOp {
     SymlinkRemoved {
         target: String, // the OLD symlink's target
         path: PathBuf,  // path of the symlink that was replaced
+    },
+    /// L4 - device number and owner of a block/char node that was
+    /// unlinked, journaled next to its `Unlink`. The planner pairs the
+    /// two by path (and inode when the unlink carries one) and puts the
+    /// result on `RecreatePath`. It is a separate event so `Unlink`
+    /// keeps its stored shape; this variant sits last in the enum, so
+    /// older rows decode as before. A build that predates it fails to
+    /// decode the row, and the store skips undecodable rows, so such a
+    /// build never sees it and cannot restore the node (it refuses).
+    DeviceNodeMeta {
+        inode: InodeRef,
+        path: PathBuf,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
     },
 }
 
@@ -675,7 +682,6 @@ mod tests {
                 path: PathBuf::from("/tmp/x"),
                 kind: FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         };
         let bytes = postcard::to_allocvec(&ev).unwrap();

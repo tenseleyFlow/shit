@@ -270,8 +270,16 @@ pub trait PrivilegedOpRouter {
     ) -> PrivilegedOpOutcome;
 
     /// Request mknod for a character/block special file or FIFO.
-    /// `dev` is ignored when `mode` encodes a FIFO.
-    fn mknod(&self, path: &std::path::Path, mode: u32, dev: u64) -> PrivilegedOpOutcome;
+    /// `dev` is ignored when `mode` encodes a FIFO. `owner` is the
+    /// uid/gid to give a block/char node the helper just created; the
+    /// helper does it inside the same request, on the node it made.
+    fn mknod(
+        &self,
+        path: &std::path::Path,
+        mode: u32,
+        dev: u64,
+        owner: Option<(u32, u32)>,
+    ) -> PrivilegedOpOutcome;
 }
 
 /// Local-friendly mirror of `shit_proto::PrivilegedOpOutcome` so the
@@ -298,7 +306,13 @@ impl PrivilegedOpRouter for NoOpPrivilegedOpRouter {
     fn chown(&self, _: &std::path::Path, _: u32, _: u32, _: bool) -> PrivilegedOpOutcome {
         PrivilegedOpOutcome::PermissionDenied
     }
-    fn mknod(&self, _: &std::path::Path, _: u32, _: u64) -> PrivilegedOpOutcome {
+    fn mknod(
+        &self,
+        _: &std::path::Path,
+        _: u32,
+        _: u64,
+        _: Option<(u32, u32)>,
+    ) -> PrivilegedOpOutcome {
         PrivilegedOpOutcome::PermissionDenied
     }
 }
@@ -308,7 +322,8 @@ impl PrivilegedOpRouter for NoOpPrivilegedOpRouter {
 #[derive(Debug, Default)]
 pub struct InMemoryPrivilegedOpRouter {
     pub chown_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u32, bool)>>,
-    pub mknod_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u64)>>,
+    #[allow(clippy::type_complexity)]
+    pub mknod_calls: std::sync::Mutex<Vec<(std::path::PathBuf, u32, u64, Option<(u32, u32)>)>>,
     pub outcome: std::sync::Mutex<PrivilegedOpOutcome>,
 }
 
@@ -344,11 +359,17 @@ impl PrivilegedOpRouter for InMemoryPrivilegedOpRouter {
             .push((path.to_path_buf(), uid, gid, no_dereference));
         self.outcome.lock().unwrap().clone()
     }
-    fn mknod(&self, path: &std::path::Path, mode: u32, dev: u64) -> PrivilegedOpOutcome {
+    fn mknod(
+        &self,
+        path: &std::path::Path,
+        mode: u32,
+        dev: u64,
+        owner: Option<(u32, u32)>,
+    ) -> PrivilegedOpOutcome {
         self.mknod_calls
             .lock()
             .unwrap()
-            .push((path.to_path_buf(), mode, dev));
+            .push((path.to_path_buf(), mode, dev, owner));
         self.outcome.lock().unwrap().clone()
     }
 }

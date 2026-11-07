@@ -242,6 +242,9 @@ pub enum HelperRequest {
         /// Major + minor packed via libc::makedev. Ignored when
         /// `mode` indicates a FIFO.
         dev: u64,
+        /// L4 - uid/gid for a block/char node. The helper applies it
+        /// to the node it just created, never to a pre-existing path.
+        owner: Option<(u32, u32)>,
     },
 }
 

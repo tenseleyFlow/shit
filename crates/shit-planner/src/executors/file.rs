@@ -261,8 +261,9 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         // privileged-op router (the helper has CAP_MKNOD). The
         // local recreate_path_inner handles Regular/Directory only.
         // L4 - BlockDevice/CharDevice take the same route with the
-        // journaled rdev, then an owner restore; without a journaled
-        // device number they are refused rather than guessed.
+        // journaled rdev and owner (the helper chowns the node it just
+        // made); without a journaled device number they are refused
+        // rather than guessed.
         let is_device = matches!(kind, FileKind::BlockDevice | FileKind::CharDevice);
         if is_device && device.is_none() {
             return ExecutionOutcome::Failed {
@@ -288,25 +289,8 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             // dispatches into the helper which calls libc::mknod
             // with S_IFIFO/S_IFSOCK | perm_bits.
             let rdev = device.map(|d| d.rdev).unwrap_or(0);
-            let made = match self.privileged_router.mknod(path, *mode, rdev) {
-                PrivilegedOpOutcome::Applied if is_device => {
-                    // The helper creates the node as itself. Put the
-                    // captured owner back; chown to its own ids needs no
-                    // capability, anything else needs CAP_CHOWN.
-                    let d = device.expect("checked above");
-                    return match self.privileged_router.chown(path, d.uid, d.gid, true) {
-                        PrivilegedOpOutcome::Applied => ExecutionOutcome::Applied,
-                        other => ExecutionOutcome::Failed {
-                            err: format!(
-                                "mknod {path:?} kind={kind:?}: node recreated but owner \
-                                 {}:{} not restored ({other:?})",
-                                d.uid, d.gid
-                            ),
-                        },
-                    };
-                }
-                other => other,
-            };
+            let owner = device.map(|d| (d.uid, d.gid));
+            let made = self.privileged_router.mknod(path, *mode, rdev, owner);
             return match made {
                 PrivilegedOpOutcome::Applied => ExecutionOutcome::Applied,
                 PrivilegedOpOutcome::OutOfScope => ExecutionOutcome::Failed {
@@ -1551,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn device_recreate_passes_rdev_to_mknod_then_restores_owner() {
+    fn device_recreate_passes_rdev_and_owner_to_one_mknod_request() {
         let reader = InMemoryBlobReader::new();
         let exec = FileExecutor::with_privileged_router(
             &reader,
@@ -1569,42 +1553,16 @@ mod tests {
         );
         assert_eq!(
             exec.privileged_router.mknod_calls.lock().unwrap().clone(),
-            vec![(PathBuf::from("/tmp/l4-dev-null"), 0o020666, 0x103)]
+            vec![(
+                PathBuf::from("/tmp/l4-dev-null"),
+                0o020666,
+                0x103,
+                Some((7, 9))
+            )]
         );
-        assert_eq!(
-            exec.privileged_router.chown_log(),
-            vec![(PathBuf::from("/tmp/l4-dev-null"), 7, 9, true)]
-        );
-    }
-
-    #[test]
-    fn device_recreate_reports_a_refused_owner_restore() {
-        struct ChownDenied(crate::executor::InMemoryPrivilegedOpRouter);
-        impl crate::executor::PrivilegedOpRouter for ChownDenied {
-            fn chown(&self, _: &Path, _: u32, _: u32, _: bool) -> PrivilegedOpOutcome {
-                PrivilegedOpOutcome::PermissionDenied
-            }
-            fn mknod(&self, p: &Path, m: u32, d: u64) -> PrivilegedOpOutcome {
-                self.0.mknod(p, m, d)
-            }
-        }
-        let reader = InMemoryBlobReader::new();
-        let exec = FileExecutor::with_privileged_router(
-            &reader,
-            ChownDenied(crate::executor::InMemoryPrivilegedOpRouter::new()),
-        );
-        let dev = crate::metadata::DeviceNode {
-            rdev: 0x103,
-            uid: 0,
-            gid: 0,
-        };
-        let op = device_op(crate::metadata::FileKind::CharDevice, Some(dev));
-        match exec.execute(&op, false, ConflictPolicy::default()) {
-            ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("owner 0:0 not restored"), "got: {err}");
-            }
-            other => panic!("expected Failed, got {other:?}"),
-        }
+        // The owner travels inside the mknod request; the executor
+        // makes no chown of its own.
+        assert!(exec.privileged_router.chown_log().is_empty());
     }
 
     #[test]

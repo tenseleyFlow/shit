@@ -3175,8 +3175,9 @@ fn request_loop(
                 path,
                 mode,
                 dev,
+                owner,
             } => {
-                let outcome = apply_mknod(&path, mode, dev);
+                let outcome = apply_mknod_owned(&path, mode, dev, owner);
                 tracing::info!(
                     %session,
                     command_seq,
@@ -3300,7 +3301,25 @@ fn path_in_watched_root(path: &str) -> bool {
 /// (nonzero), and the path must sit under a watched root, else the
 /// answer is OutOfScope. In the init user namespace CAP_MKNOD is enough
 /// for these; no CAP_SYS_ADMIN is involved.
+#[cfg(test)]
 fn apply_mknod(path: &str, mode: u32, dev: u64) -> shit_proto::PrivilegedOpOutcome {
+    apply_mknod_owned(path, mode, dev, None)
+}
+
+/// [`apply_mknod`] plus L4's owner step. `owner` is honoured only for a
+/// block/char node this call created: the node is re-checked with lstat
+/// (same kind, same rdev) and chowned with `AT_SYMLINK_NOFOLLOW` to the
+/// journaled uid/gid. If either step fails the node is removed again,
+/// so the helper never leaves a device node owned by the wrong user.
+/// This is the only chown the helper does for mknod, and it needs
+/// CAP_CHOWN from the file capabilities (chown to the helper's own ids
+/// needs none).
+fn apply_mknod_owned(
+    path: &str,
+    mode: u32,
+    dev: u64,
+    owner: Option<(u32, u32)>,
+) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     // libc::mode_t is u32 on Linux, u16 on macOS — cast at the
@@ -3359,6 +3378,9 @@ fn apply_mknod(path: &str, mode: u32, dev: u64) -> shit_proto::PrivilegedOpOutco
     let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, native_dev) };
     unsafe { libc::umask(prev_umask) };
     if rc == 0 {
+        if is_device {
+            return finish_device_node(&c_path, path, ifmt, dev, owner);
+        }
         return PrivilegedOpOutcome::Applied;
     }
     let errno = std::io::Error::last_os_error();
@@ -3369,6 +3391,54 @@ fn apply_mknod(path: &str, mode: u32, dev: u64) -> shit_proto::PrivilegedOpOutco
             err: format!("mknod: {errno}"),
         },
     }
+}
+
+/// After a successful device mknod: confirm what is at `path` is the
+/// node just made, then give it the journaled owner. Any failure
+/// removes the node.
+fn finish_device_node(
+    c_path: &std::ffi::CStr,
+    path: &str,
+    ifmt: libc::mode_t,
+    dev: u64,
+    owner: Option<(u32, u32)>,
+) -> shit_proto::PrivilegedOpOutcome {
+    use shit_proto::PrivilegedOpOutcome;
+    use std::os::unix::fs::MetadataExt;
+    let remove = || unsafe {
+        libc::unlinkat(libc::AT_FDCWD, c_path.as_ptr(), 0);
+    };
+    let verified = std::fs::symlink_metadata(path)
+        .map(|m| (m.mode() as libc::mode_t & libc::S_IFMT) == ifmt && m.rdev() == dev)
+        .unwrap_or(false);
+    if !verified {
+        remove();
+        return PrivilegedOpOutcome::Failed {
+            err: "mknod: node at path is not the one just created; removed".to_string(),
+        };
+    }
+    if let Some((uid, gid)) = owner {
+        let rc = unsafe {
+            libc::fchownat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                uid,
+                gid,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let errno = std::io::Error::last_os_error();
+            remove();
+            return match errno.raw_os_error() {
+                Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+                _ => PrivilegedOpOutcome::Failed {
+                    err: format!("fchownat {uid}:{gid}: {errno}; node removed"),
+                },
+            };
+        }
+    }
+    PrivilegedOpOutcome::Applied
 }
 
 #[cfg(test)]
@@ -3469,6 +3539,44 @@ mod apply_mknod_tests {
         } else {
             // Past the scope check, the kernel refuses without CAP_MKNOD.
             assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn device_gets_the_journaled_owner_or_is_removed() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        record_watched_root(dir.path().to_str().unwrap());
+        let dev = (1u64 << 8) | 3;
+        let (me_u, me_g) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let p = dir.path().join("owned");
+        let outcome = apply_mknod_owned(
+            p.to_str().unwrap(),
+            0o020000 | 0o666,
+            dev,
+            Some((me_u, me_g)),
+        );
+        if me_u == 0 {
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert_eq!((m.uid(), m.gid()), (me_u, me_g));
+            // A foreign owner that cannot be applied would leave the
+            // wrong owner; here root can, so check a nonroot id sticks.
+            let q = dir.path().join("other");
+            assert_eq!(
+                apply_mknod_owned(
+                    q.to_str().unwrap(),
+                    0o020000 | 0o666,
+                    dev,
+                    Some((1234, 1234))
+                ),
+                PrivilegedOpOutcome::Applied
+            );
+            assert_eq!(std::fs::symlink_metadata(&q).unwrap().uid(), 1234);
+        } else {
+            // Without CAP_MKNOD nothing is created at all.
+            assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+            assert!(!p.exists());
         }
     }
 

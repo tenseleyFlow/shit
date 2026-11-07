@@ -1579,15 +1579,36 @@ fn journal_unlink_with_device(
         partial: false,
         kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
             inode: inode_ref,
-            path,
+            path: path.clone(),
             kind,
             mode,
-            device,
         }),
     };
     index.put_event(&unlink_ev).map_err(|e| {
         HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
     })?;
+    // L4 - the device number and owner ride in their own event, so the
+    // Unlink row keeps its stored shape. The planner pairs them.
+    if let Some(d) = device {
+        let meta_ev = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts,
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+                inode: inode_ref,
+                path,
+                rdev: d.rdev,
+                uid: d.uid,
+                gid: d.gid,
+            }),
+        };
+        index.put_event(&meta_ev).map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "put_event (device meta): {e}"
+            )))
+        })?;
+    }
     Ok(())
 }
 

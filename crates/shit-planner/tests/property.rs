@@ -112,7 +112,6 @@ fn arb_unlink(id: u64, ts: u64) -> impl Strategy<Value = CaptureEvent> {
             path,
             kind: shit_planner::metadata::FileKind::Regular,
             mode: 0o100644,
-            device: None,
         }),
     })
 }

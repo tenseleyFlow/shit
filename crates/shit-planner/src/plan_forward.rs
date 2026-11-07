@@ -561,6 +561,7 @@ fn emit_forward_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec
                 conflict: phantom_if_exists(path, probe),
             });
         }
+        TreeOp::DeviceNodeMeta { .. } => {}
         TreeOp::SymlinkRemoved { path, .. } => {
             // W09.16.1 — forward of "symlink at `path` was removed"
             // is to remove it. The paired Create event (for the new
@@ -1062,7 +1063,6 @@ mod tests {
                 path: PathBuf::from("/tmp/gone"),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
             1,
         )];

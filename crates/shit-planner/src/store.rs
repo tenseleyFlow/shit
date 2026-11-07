@@ -212,7 +212,6 @@ mod tests {
                 path: PathBuf::from("/tmp/x"),
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }),
         });
         let fetched = s.events_for_command(cmd);

@@ -255,8 +255,6 @@ async fn handle_one(
 struct UnlinkStat {
     kind: FileKind,
     mode: u32,
-    /// Device number and owner, for block/char nodes only.
-    device: Option<shit_planner::DeviceNode>,
 }
 
 /// lstat the target of a shim `unlink`/`unlinkat` so the journaled
@@ -264,8 +262,9 @@ struct UnlinkStat {
 /// `unlinkat(AT_REMOVEDIR)` lands as a Regular unlink and undo's
 /// RecreatePath makes a file where a directory was, which then breaks
 /// every child restore under it (ENOTDIR). Directories, regular files,
-/// fifos, sockets and block/char nodes (with their rdev and owner) are
-/// reported; anything else keeps the wire default.
+/// fifos, sockets and block/char nodes are reported (the device number
+/// comes from the helper's `DeviceNodeMeta`, not from here); anything
+/// else keeps the wire default.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat") {
@@ -292,17 +291,9 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
                 | FileKind::CharDevice
         )
     })?;
-    let device = matches!(kind, FileKind::BlockDevice | FileKind::CharDevice).then(|| {
-        shit_planner::DeviceNode {
-            rdev: meta.rdev(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-        }
-    });
     Some(UnlinkStat {
         kind,
         mode: meta.mode(),
-        device,
     })
 }
 
@@ -311,13 +302,12 @@ fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> Captur
     match (kind, stat) {
         (
             CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path, .. }),
-            Some(UnlinkStat { kind, mode, device }),
+            Some(UnlinkStat { kind, mode }),
         ) => CaptureEventKind::TreeOp(TreeOp::Unlink {
             inode,
             path,
             kind,
             mode,
-            device,
         }),
         (k, _) => k,
     }
@@ -839,7 +829,6 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
                 path,
                 kind: shit_planner::metadata::FileKind::Regular,
                 mode: 0o100644,
-                device: None,
             }))
         }
         "rename" | "renameat" | "renameat2" => {
@@ -1453,12 +1442,11 @@ mod tests {
         let f = pre_syscall_unlink_stat(&note("unlink", &file)).expect("file stat");
         assert_eq!(f.kind, FileKind::Regular);
         assert_eq!(f.mode & 0o7777, 0o600);
-        // A char node reports its rdev and owner (stat only; /dev/null
-        // is not touched).
+        // A char node reports its kind (stat only; /dev/null is not
+        // touched).
         let n = pre_syscall_unlink_stat(&note("unlink", Path::new("/dev/null")))
             .expect("char device stat");
         assert_eq!(n.kind, FileKind::CharDevice);
-        assert_eq!(n.device.map(|d| d.rdev), Some((1 << 8) | 3));
         assert_eq!(pre_syscall_unlink_stat(&note("unlinkat", &link)), None);
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", &tmp.path().join("gone"))),
@@ -1493,7 +1481,6 @@ mod tests {
             Some(UnlinkStat {
                 kind: FileKind::Directory,
                 mode: 0o040750,
-                device: None,
             }),
             &index,
             &blob_store,

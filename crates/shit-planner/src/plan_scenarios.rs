@@ -201,7 +201,6 @@ impl Sim {
                 path: to_p.clone(),
                 kind: FileKind::Regular,
                 mode: m.mode(),
-                device: None,
             }));
         }
         let inode = Self::inode_of(&from_p);
@@ -259,14 +258,12 @@ impl Sim {
             path: p.clone(),
             kind: FileKind::Regular,
             mode: 0o100644,
-            device: None,
         };
         let helper_unlink = TreeOp::Unlink {
             inode: InodeRef::new(m.dev(), m.ino()),
             path: p.clone(),
             kind: FileKind::Regular,
             mode: m.mode(),
-            device: None,
         };
         if helper_first {
             self.pre_image(&p, FilePreImageSource::Other);
@@ -325,7 +322,6 @@ impl Sim {
             path: from_p,
             kind: FileKind::Regular,
             mode: m.mode(),
-            device: None,
         }));
     }
 
@@ -362,7 +358,6 @@ impl Sim {
             path: p,
             kind: FileKind::Regular,
             mode: m.mode(),
-            device: None,
         }));
     }
 
@@ -384,7 +379,6 @@ impl Sim {
                 path: p.to_path_buf(),
                 kind: FileKind::Directory,
                 mode: m.mode(),
-                device: None,
             }));
         } else {
             self.pre_image(p, FilePreImageSource::Other);
@@ -395,7 +389,6 @@ impl Sim {
                 path: p.to_path_buf(),
                 kind: FileKind::Regular,
                 mode: m.mode(),
-                device: None,
             }));
         }
     }
@@ -1234,7 +1227,6 @@ fn rm_rf_dual_tier(sim: &mut Sim, p: &Path) {
         path: p.to_path_buf(),
         kind,
         mode: m.mode(),
-        device: None,
     }));
     if !m.is_dir() {
         sim.pre_image(p, FilePreImageSource::Other);
@@ -1244,7 +1236,6 @@ fn rm_rf_dual_tier(sim: &mut Sim, p: &Path) {
         path: p.to_path_buf(),
         kind,
         mode: m.mode(),
-        device: None,
     }));
     if m.is_dir() {
         std::fs::remove_dir(p).unwrap();
@@ -1366,7 +1357,6 @@ fn moved_special_file_plan(kind: FileKind, mode: u32) -> Vec<crate::inverse::Pla
         path: b,
         kind,
         mode,
-        device: None,
     }));
     sim.plan_nodes()
 }
@@ -1396,38 +1386,87 @@ fn moved_socket_with_no_pre_image_is_recreated_and_renamed_back() {
     assert_recreated_then_renamed(&nodes, FileKind::Socket);
 }
 
-fn device_unlink(
-    path: std::path::PathBuf,
-    device: Option<crate::metadata::DeviceNode>,
-) -> CaptureEventKind {
+fn device_unlink(path: std::path::PathBuf, inode: InodeRef) -> CaptureEventKind {
     CaptureEventKind::TreeOp(TreeOp::Unlink {
-        inode: InodeRef::new(1, 5),
+        inode,
         path,
         kind: FileKind::CharDevice,
         mode: 0o020666,
-        device,
     })
+}
+
+fn device_meta(path: std::path::PathBuf, inode: InodeRef) -> CaptureEventKind {
+    CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+        inode,
+        path,
+        rdev: 0x103,
+        uid: 0,
+        gid: 0,
+    })
+}
+
+fn char_device_plan(
+    unlink_inode: InodeRef,
+    meta_inode: Option<InodeRef>,
+) -> Vec<crate::inverse::PlanNode> {
+    let mut sim = Sim::new();
+    let p = sim.p("null");
+    sim.emit(device_unlink(p.clone(), unlink_inode));
+    if let Some(i) = meta_inode {
+        sim.emit(device_meta(p, i));
+    }
+    sim.plan_nodes()
 }
 
 #[test]
 fn removed_char_device_is_recreated_with_its_journaled_rdev_and_owner() {
     use crate::inverse::InverseOp;
-    let dev = crate::metadata::DeviceNode {
-        rdev: 0x103,
-        uid: 0,
-        gid: 0,
-    };
-    let mut sim = Sim::new();
-    let p = sim.p("null");
-    sim.emit(device_unlink(p.clone(), Some(dev)));
-    let nodes = sim.plan_nodes();
+    let i = InodeRef::new(1, 5);
+    let nodes = char_device_plan(i, Some(i));
     assert_eq!(nodes.len(), 1, "{nodes:#?}");
     assert!(
         matches!(
             &nodes[0].op,
-            InverseOp::RecreatePath { path, kind: FileKind::CharDevice, mode: 0o020666, device: Some(d) }
-                if *path == p && *d == dev
+            InverseOp::RecreatePath {
+                kind: FileKind::CharDevice,
+                mode: 0o020666,
+                device: Some(d),
+                ..
+            } if d.rdev == 0x103 && d.uid == 0 && d.gid == 0
         ),
+        "{nodes:#?}"
+    );
+}
+
+#[test]
+fn shim_unlink_without_an_inode_still_pairs_with_the_helper_meta() {
+    use crate::inverse::InverseOp;
+    let nodes = char_device_plan(InodeRef::new(0, 0), Some(InodeRef::new(1, 5)));
+    assert!(
+        matches!(
+            &nodes[0].op,
+            InverseOp::RecreatePath {
+                device: Some(_),
+                ..
+            }
+        ),
+        "{nodes:#?}"
+    );
+}
+
+#[test]
+fn device_unlink_without_a_meta_row_carries_no_device() {
+    use crate::inverse::InverseOp;
+    let i = InodeRef::new(1, 5);
+    let nodes = char_device_plan(i, None);
+    assert!(
+        matches!(&nodes[0].op, InverseOp::RecreatePath { device: None, .. }),
+        "{nodes:#?}"
+    );
+    // A meta row for a different inode is not paired either.
+    let nodes = char_device_plan(i, Some(InodeRef::new(1, 6)));
+    assert!(
+        matches!(&nodes[0].op, InverseOp::RecreatePath { device: None, .. }),
         "{nodes:#?}"
     );
 }
@@ -1530,7 +1569,6 @@ fn dual_tier_moved_fifo_plan() -> (Sim, Vec<String>) {
             path: fifo.clone(),
             kind: FileKind::Fifo,
             mode: m.mode(),
-            device: None,
         }));
     }
     std::fs::remove_file(&fifo).unwrap();
@@ -1546,7 +1584,13 @@ impl crate::executor::PrivilegedOpRouter for LocalMknod {
         crate::executor::PrivilegedOpOutcome::Applied
     }
 
-    fn mknod(&self, path: &Path, mode: u32, _: u64) -> crate::executor::PrivilegedOpOutcome {
+    fn mknod(
+        &self,
+        path: &Path,
+        mode: u32,
+        _: u64,
+        _: Option<(u32, u32)>,
+    ) -> crate::executor::PrivilegedOpOutcome {
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), (mode & 0o777) as _) }, 0);
         crate::executor::PrivilegedOpOutcome::Applied
