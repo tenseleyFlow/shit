@@ -457,14 +457,7 @@ fn run_pre_exec_redirects(
     // targets resolve here and not against the daemon's cwd.
     let cwd = std::env::current_dir().ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let targets: Vec<RedirectTargetWire> = analysis
-        .targets
-        .into_iter()
-        .map(|t| RedirectTargetWire {
-            op: to_op_wire(t.op),
-            path: resolve_redirect_target(&t, cwd.as_deref(), home.as_deref()),
-        })
-        .collect();
+    let targets = resolve_targets(analysis.targets, cwd.as_deref(), home.as_deref());
     let ctl_path = ctl_sock
         .or_else(|| {
             sock.as_ref()
@@ -494,6 +487,28 @@ fn run_pre_exec_redirects(
             Ok(())
         }
     }
+}
+
+/// Resolve every parsed target and drop repeats. Identity is the operator
+/// plus the resolved path: `> f` and `> "f"` name one file, while
+/// `> ~/x` and `> '~/x'` resolve to different ones and stay separate.
+fn resolve_targets(
+    targets: Vec<RedirectTarget>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<RedirectTargetWire> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in targets {
+        let path = resolve_redirect_target(&t, cwd, home);
+        if seen.insert((t.op, path.clone())) {
+            out.push(RedirectTargetWire {
+                op: to_op_wire(t.op),
+                path,
+            });
+        }
+    }
+    out
 }
 
 /// Resolve a redirect target to the path the kernel tiers will record.
@@ -794,6 +809,21 @@ mod redirect_resolve_tests {
 
     fn resolve_q(raw: &str, quote: Quote, cwd: &Path, home: &Path) -> String {
         resolve_redirect_target(&tgt(raw, quote, true), Some(cwd), Some(home))
+    }
+
+    #[test]
+    fn dedup_is_by_resolved_path_not_quoting() {
+        let (_d, root) = tmp();
+        let go = |line: &str, home: Option<&Path>| {
+            resolve_targets(parse_redirects(line).targets, Some(&root), home)
+        };
+        // Same file written two ways: one target.
+        assert_eq!(go("echo a > f > \"f\"", None).len(), 1);
+        assert_eq!(go("echo a > f > ./f", None).len(), 1);
+        // Same text, different files: `~/x` is $HOME/x, `'~/x'` is ./~/x.
+        assert_eq!(go("echo a > ~/x > '~/x'", Some(&root)).len(), 2);
+        // Different operators on one path stay separate.
+        assert_eq!(go("echo a > f >> f", None).len(), 2);
     }
 
     #[test]
