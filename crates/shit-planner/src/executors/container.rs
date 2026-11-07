@@ -60,6 +60,7 @@ impl ContainerRunner for SystemContainerRunner {
         let status = std::process::Command::new(cmd)
             .args(args)
             .env("SHIT_DURING_UNDO", "1")
+            .stdin(std::process::Stdio::null())
             .status()
             .map_err(|e| format!("spawn {cmd}: {e}"))?;
         if status.success() {
