@@ -60,7 +60,7 @@ Apple Silicon macOS:
 | `ssh.sh` | `ssh -p 2225 freebsd@localhost ...` wrapper with a private known_hosts. |
 | `sync.sh` | rsync the checkout into the VM under `~/shit/`. Excludes `target/`, `vendor/`, `.git`, `.docs/`, `.refs/`. |
 | `run-smoke.sh <name>` | sync, release build, run one `tests/smoke/<name>`. `SMOKE_TMPDIR=/tmp/zfs` runs it on ZFS. |
-| `run-fbsd-smokes.sh [name ...]` | sync, then the B04 job's loop: pf, doctor gate, the `freebsd-vm` bucket under `timeout 300`, per-smoke TSV copied to the work dir. |
+| `run-fbsd-smokes.sh [name ...]` | sync, then the B04 job's loop: pf, doctor gate, the `freebsd-vm` bucket under `timeout 300`, per-smoke TSV copied to the work dir. Each run keeps every smoke's log, `shitd.log`, daemon JSON log and journal under `~/smoke-runs/<stamp>-<tag>-<pid>/` in the guest. A name given N times runs N times. |
 | `doctor.sh` | Build `shit` in the VM and print `shit doctor`. |
 | `teardown.sh [--stop]` | Power the guest off; without `--stop`, delete the disks. The downloaded image stays cached. |
 
@@ -84,9 +84,18 @@ possible.
 parses its `-e` string itself, and the scripts single-quote each ssh
 option for it.
 
-Known issues: `rsync-incremental-undo-fbsd.sh` intermittently leaves
-a file unrestored when run with `SMOKE_TMPDIR=/tmp/zfs` (1 in 16
-runs; #202). CI runs on UFS only and does not see it.
+The B04 CI job runs the bucket twice, with TMPDIR on the image's UFS
+root and on a file-backed `shitzfs` pool at `/tmp/zfs`, so CI covers
+the same two filesystems as this VM.
+
+To chase a flake, repeat the name and read the failing iteration's
+directory afterwards; a later run never clears an earlier one:
+
+```
+SMOKE_TMPDIR=/tmp/zfs SMOKE_TAG=rsync-loop tools/freebsd-vm/run-fbsd-smokes.sh \
+  rsync-incremental-undo-fbsd.sh rsync-incremental-undo-fbsd.sh ...
+tools/freebsd-vm/ssh.sh 'ls ~/smoke-logs/'   # 001-..., 002-..., each with events.tsv
+```
 
 ## Working state directory
 
@@ -105,7 +114,7 @@ work/
   known_hosts                   # the VM's host key, kept out of ~/.ssh
   vm.log                        # serial console log
   vm.pid                        # running qemu PID when up
-  smoke-results-{ufs,zfs}.tsv   # last run-fbsd-smokes.sh results
+  smoke-results-<tag>.tsv       # last run-fbsd-smokes.sh results per SMOKE_TAG
 ```
 
 ## Standing rule (paired with `DEFERRED-RUNTIME.md` standing rule)

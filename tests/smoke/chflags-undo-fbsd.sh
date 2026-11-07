@@ -19,9 +19,9 @@
 #      shape users hit; the smoke fails if the shim does not notify.
 #   2. a C program calling chflags(2) with an absolute path.
 #
-# UFS supports user flags and must round-trip. OpenZFS may return
-# EOPNOTSUPP; there the producer notification remains a useful gate,
-# but the mutation/undo assertions are explicitly skipped.
+# UFS and OpenZFS both store UF_NODUMP and must round-trip. A FS that
+# does not (the probe below reads the bit back) keeps only the
+# producer notification gate and the smoke ends in SKIP.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -73,15 +73,39 @@ CSRC
     2> "${SHIT_SMOKE_TMP}/cc.log"
 [ -x "${WATCHED}/set_chflags" ] || smoke_fail "cc failed to build chflags workload"
 
-# FS-capability probe. Use UF_NODUMP rather than UF_IMMUTABLE so a
-# failed undo never makes smoke cleanup itself fail.
-SUPPORTS_CHFLAGS=1
-if "${WATCHED}/set_chflags" "${TARGET}" 2>/dev/null; then
-    /bin/chflags 0 "${TARGET}" 2>/dev/null \
-        || smoke_fail "could not clear probe flag"
+# FS-capability probe. It sets the same flag the workloads set
+# (UF_NODUMP, which unlike UF_IMMUTABLE cannot make cleanup fail) and
+# reads it back, then restores the file's original flags. A probe that
+# only ran `chflags 0` succeeded on OpenZFS, where `uchg` is
+# EOPNOTSUPP, so the round trip could be skipped or run against a flag
+# the FS never stored. Restoring the original value keeps flags the FS
+# sets on its own (UF_ARCHIVE on new ZFS files) in PRE_FLAGS.
+UF_NODUMP_BIT=1
+SUPPORTS_CHFLAGS=0
+PROBE_ORIG="$(stat -f '%Of' "${TARGET}")"
+if "${WATCHED}/set_chflags" "${TARGET}" 2>"${SHIT_SMOKE_TMP}/probe.err"; then
+    PROBE_SET="$(stat -f '%Of' "${TARGET}")"
+    /bin/chflags "${PROBE_ORIG}" "${TARGET}" 2>/dev/null \
+        || smoke_fail "could not restore probe flags ${PROBE_ORIG}"
+    if [ $(( 0${PROBE_SET} & UF_NODUMP_BIT )) -ne 0 ]; then
+        SUPPORTS_CHFLAGS=1
+    else
+        smoke_log "note: chflags(UF_NODUMP) returned 0 but st_flags reads ${PROBE_SET}"
+    fi
 else
-    SUPPORTS_CHFLAGS=0
-    smoke_log "note: chflags returns EOPNOTSUPP on this FS (likely ZFS); shim-emission gate is the load-bearing check"
+    smoke_log "note: chflags(UF_NODUMP) failed: $(cat "${SHIT_SMOKE_TMP}/probe.err")"
+fi
+PROBE_FS="$(df -T "${WATCHED}" 2>/dev/null | awk 'NR==2{print $2}')"
+[ "$(stat -f '%Of' "${TARGET}")" = "${PROBE_ORIG}" ] \
+    || smoke_fail "probe left flags at $(stat -f '%Of' "${TARGET}"), want ${PROBE_ORIG}"
+smoke_log "flag probe: orig=${PROBE_ORIG} supported=${SUPPORTS_CHFLAGS} fs=${PROBE_FS}"
+if [ "${SUPPORTS_CHFLAGS}" -eq 0 ]; then
+    # UFS and ZFS both store UF_NODUMP. A failed probe on either is a
+    # real fault, and a SKIP here would turn CI green with no round trip.
+    case "${PROBE_FS}" in
+        ufs|zfs) smoke_fail "UF_NODUMP probe failed on ${PROBE_FS}, which must support it" ;;
+    esac
+    smoke_log "note: ${PROBE_FS:-unknown FS} does not store UF_NODUMP; only the shim-emission gate runs and the smoke ends in SKIP"
 fi
 PRE_FLAGS="$(stat -f '%Of' "${TARGET}")"
 PRE_FLAGS2="$(stat -f '%Of' "${TARGET2}")"
