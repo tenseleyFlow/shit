@@ -2779,6 +2779,7 @@ fn request_loop(
                 if !begin_watch(&conn, &mut active_watches, command) {
                     continue;
                 }
+                record_watched_root(&cwd_path);
                 #[cfg(target_os = "linux")]
                 let attach = linux_watch_tree(
                     &conn,
@@ -3245,31 +3246,82 @@ fn apply_chown(
     }
 }
 
-/// AU22 / DR-15.1 — helper-side ApplyMknod handler for Fifo +
-/// Socket kinds. `mode` is the wire's S_IFIFO/S_IFSOCK | perm_bits
-/// composite; libc::mknod expects that exact shape. `dev` is
-/// ignored for Fifo/Socket (only meaningful for BlockDevice /
-/// CharDevice, which we refuse — see CAP_SYS_ADMIN note below).
+/// Directories the helper has been asked to watch, kept for the life
+/// of the helper process. A device node is only recreated under one of
+/// them: the helper cannot see the journal, so the watched tree is its
+/// evidence that the daemon is restoring something it captured. A
+/// helper restarted since the capture has an empty set and refuses.
+static WATCHED_ROOTS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Cap on remembered roots, so a long-lived helper cannot grow the set
+/// without bound.
+const WATCHED_ROOTS_MAX: usize = 4096;
+
+fn record_watched_root(cwd_path: &str) {
+    let raw = std::path::PathBuf::from(cwd_path);
+    if !raw.is_absolute() {
+        return;
+    }
+    let root = std::fs::canonicalize(&raw).unwrap_or(raw);
+    let mut roots = WATCHED_ROOTS.lock().unwrap();
+    if roots.len() < WATCHED_ROOTS_MAX && !roots.contains(&root) {
+        roots.push(root);
+    }
+}
+
+/// True when `path` is an absolute path whose parent directory, with
+/// symlinks resolved, sits inside a watched root. The node itself does
+/// not exist yet, so the parent is what gets resolved.
+fn path_in_watched_root(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return false;
+    }
+    match p.file_name() {
+        Some(n) if n != ".." => {}
+        _ => return false,
+    }
+    let Some(parent) = p.parent().and_then(|d| std::fs::canonicalize(d).ok()) else {
+        return false;
+    };
+    WATCHED_ROOTS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|root| parent.starts_with(root))
+}
+
+/// AU22 / DR-15.1 — helper-side ApplyMknod handler. `mode` is the
+/// wire's S_IF* | perm_bits composite; libc::mknod expects that exact
+/// shape.
 ///
-/// BlockDevice / CharDevice need CAP_SYS_ADMIN even when the
-/// helper holds CAP_MKNOD; the standard helper capset doesn't
-/// grant it. We return PermissionDenied for those kinds so the
-/// executor's error surface mirrors what an unprivileged caller
-/// would see, deferring DR-15.2 (block/char) to a separate sprint
-/// with explicit policy review.
-fn apply_mknod(path: &str, mode: u32, _dev: u64) -> shit_proto::PrivilegedOpOutcome {
+/// Fifo and Socket ignore `dev`. L4 adds BlockDevice and CharDevice:
+/// they need the `dev` the daemon read from the journaled unlink
+/// (nonzero), and the path must sit under a watched root, else the
+/// answer is OutOfScope. In the init user namespace CAP_MKNOD is enough
+/// for these; no CAP_SYS_ADMIN is involved.
+fn apply_mknod(path: &str, mode: u32, dev: u64) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     // libc::mode_t is u32 on Linux, u16 on macOS — cast at the
     // boundary so bitops + comparisons against libc constants
     // type-check on both platforms.
     let mode_native: libc::mode_t = mode as libc::mode_t;
     let ifmt = mode_native & libc::S_IFMT;
-    if ifmt != libc::S_IFIFO && ifmt != libc::S_IFSOCK {
-        // BlockDevice/CharDevice (S_IFBLK/S_IFCHR), Regular
-        // (S_IFREG — planner shouldn't route Regular here), or 0
-        // (caller forgot to set the kind). All refused.
+    let is_device = ifmt == libc::S_IFBLK || ifmt == libc::S_IFCHR;
+    if ifmt != libc::S_IFIFO && ifmt != libc::S_IFSOCK && !is_device {
+        // Regular (S_IFREG — planner shouldn't route Regular here),
+        // or 0 (caller forgot to set the kind). Refused.
         return PrivilegedOpOutcome::PermissionDenied;
+    }
+    if is_device {
+        if dev == 0 {
+            // No captured device number: never make one up.
+            return PrivilegedOpOutcome::PermissionDenied;
+        }
+        if !path_in_watched_root(path) {
+            return PrivilegedOpOutcome::OutOfScope;
+        }
     }
     let c_path = match std::ffi::CString::new(path) {
         Ok(s) => s,
@@ -3286,8 +3338,10 @@ fn apply_mknod(path: &str, mode: u32, _dev: u64) -> shit_proto::PrivilegedOpOutc
     // conflict and bubbles up as Failed.
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         let ft = meta.file_type();
-        let already_right =
-            (ifmt == libc::S_IFIFO && ft.is_fifo()) || (ifmt == libc::S_IFSOCK && ft.is_socket());
+        let already_right = (ifmt == libc::S_IFIFO && ft.is_fifo())
+            || (ifmt == libc::S_IFSOCK && ft.is_socket())
+            || (ifmt == libc::S_IFBLK && ft.is_block_device() && meta.rdev() == dev)
+            || (ifmt == libc::S_IFCHR && ft.is_char_device() && meta.rdev() == dev);
         if already_right {
             return PrivilegedOpOutcome::Applied;
         }
@@ -3301,7 +3355,8 @@ fn apply_mknod(path: &str, mode: u32, _dev: u64) -> shit_proto::PrivilegedOpOutc
     // round-trips byte-identical. The helper's IPC arm is
     // single-threaded so the umask restore-before-yield is safe.
     let prev_umask = unsafe { libc::umask(0) };
-    let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, 0) };
+    let native_dev: libc::dev_t = if is_device { dev as libc::dev_t } else { 0 };
+    let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, native_dev) };
     unsafe { libc::umask(prev_umask) };
     if rc == 0 {
         return PrivilegedOpOutcome::Applied;
@@ -3350,9 +3405,71 @@ mod apply_mknod_tests {
     }
 
     #[test]
-    fn refuses_block_device_kind() {
-        let outcome = apply_mknod("/tmp/au22_blk", 0o060000 | 0o644, 0);
+    fn refuses_device_without_a_captured_number() {
+        let dir = tempfile::tempdir().unwrap();
+        record_watched_root(dir.path().to_str().unwrap());
+        let p = dir.path().join("blk");
+        let outcome = apply_mknod(p.to_str().unwrap(), 0o060000 | 0o644, 0);
         assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn device_outside_a_watched_root_is_out_of_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("chr");
+        // 1:3, the number /dev/null has. The root was never registered.
+        let dev = (1u64 << 8) | 3;
+        let outcome = apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, dev);
+        assert_eq!(outcome, PrivilegedOpOutcome::OutOfScope);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn device_path_escaping_the_root_through_dotdot_is_out_of_scope() {
+        let watched = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        record_watched_root(watched.path().to_str().unwrap());
+        let sneaky = format!(
+            "{}/../{}/chr",
+            watched.path().display(),
+            other.path().file_name().unwrap().to_str().unwrap()
+        );
+        let dev = (1u64 << 8) | 3;
+        // `other` lives next to `watched` only if both are in the same
+        // temp dir, which tempfile guarantees; the canonical parent is
+        // outside the watched root either way.
+        let outcome = apply_mknod(&sneaky, 0o020000 | 0o666, dev);
+        assert_eq!(outcome, PrivilegedOpOutcome::OutOfScope);
+    }
+
+    #[test]
+    fn device_inside_a_watched_root_reaches_mknod() {
+        let dir = tempfile::tempdir().unwrap();
+        record_watched_root(dir.path().to_str().unwrap());
+        let p = dir.path().join("chr");
+        let dev = (1u64 << 8) | 3;
+        let outcome = apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, dev);
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert!(m.file_type().is_char_device());
+            assert_eq!(m.rdev(), dev);
+            // Second call is idempotent for the same number, and
+            // refuses a different one.
+            assert_eq!(
+                apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, dev),
+                PrivilegedOpOutcome::Applied
+            );
+            assert!(matches!(
+                apply_mknod(p.to_str().unwrap(), 0o020000 | 0o666, (1u64 << 8) | 5),
+                PrivilegedOpOutcome::Failed { .. }
+            ));
+        } else {
+            // Past the scope check, the kernel refuses without CAP_MKNOD.
+            assert_eq!(outcome, PrivilegedOpOutcome::PermissionDenied);
+        }
     }
 
     #[test]
