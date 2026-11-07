@@ -210,8 +210,12 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
 /// # Safety
 /// Same contract as `libc::rmdir`.
 unsafe extern "C" fn my_rmdir(pathname: *const c_char) -> c_int {
-    policy::notify_removal("rmdir", &cstr_to_string(pathname));
-    unsafe { libc::rmdir(pathname) }
+    // L5: notify only after it removed the directory, with the stat read
+    // before the call.
+    let pending = policy::removal_begin("rmdir", &cstr_to_string(pathname));
+    let rc = unsafe { libc::rmdir(pathname) };
+    policy::removal_end(pending, rc);
+    rc
 }
 
 /// Replacement for `rename(2)`. The atomic-move syscall behind

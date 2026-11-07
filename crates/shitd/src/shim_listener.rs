@@ -268,6 +268,11 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat" | "rmdir") {
         return None;
     }
+    // L5: rmdir is reported after it succeeded, with the shim's own stat
+    // from before the call; there is nothing left here to stat.
+    if let Some(s) = note.pre_stat {
+        return FileKind::from_mode(s.mode).map(|kind| UnlinkStat { kind, mode: s.mode });
+    }
     if !Path::new(&note.arg).is_absolute() {
         return None;
     }
@@ -1154,6 +1159,7 @@ mod tests {
                 pre_image: None,
                 extra_pre_images: Vec::new(),
                 failure: None,
+                pre_stat: None,
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
@@ -1287,6 +1293,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let reserved_ts = TimePoint::new(778, 43);
 
@@ -1382,6 +1389,7 @@ mod tests {
                 shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
             ],
             failure: None,
+            pre_stat: None,
         };
         ingest_notification(
             &note,
@@ -1440,6 +1448,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let fifo = tmp.path().join("p");
         let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -1478,6 +1487,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
         ingest_notification(
@@ -1559,6 +1569,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure,
+            pre_stat: None,
         }
     }
 
@@ -1611,6 +1622,24 @@ mod tests {
     /// L5: the Linux shim's rmdir interposer. With the stat its mode is
     /// journaled; without one it is still a directory.
     #[test]
+    fn rmdir_takes_kind_and_mode_from_the_shims_pre_call_stat() {
+        let mut note = open_note("rmdir", None);
+        note.pre_stat = Some(shit_proto::ShimStat {
+            dev: 1,
+            inode: 2,
+            mode: 0o040750,
+        });
+        let stat = pre_syscall_unlink_stat(&note);
+        assert_eq!(
+            stat,
+            Some(UnlinkStat {
+                kind: FileKind::Directory,
+                mode: 0o040750
+            })
+        );
+    }
+
+    #[test]
     fn rmdir_journals_a_directory_unlink() {
         use shit_planner::time::TimePoint;
         let note = ShimNotification {
@@ -1621,6 +1650,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         for (stat, want_mode) in [
             (

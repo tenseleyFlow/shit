@@ -172,6 +172,19 @@ pub struct ShimNotification {
     /// negligible.
     #[serde(default)]
     pub failure: Option<ShimFailure>,
+    /// The target's lstat before the call, for removals the shim
+    /// reports after they succeed (`rmdir`): by then the daemon has
+    /// nothing left to stat.
+    #[serde(default)]
+    pub pre_stat: Option<ShimStat>,
+}
+
+/// Identity and mode of a path, as the shim read it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimStat {
+    pub dev: u64,
+    pub inode: u64,
+    pub mode: u32,
 }
 
 /// AU10 — structured failure reported by the shim when capture
@@ -235,6 +248,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -263,6 +277,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
@@ -287,6 +302,7 @@ mod tests {
                 attempted_path: "foo/bar/baz".into(),
                 error_chain: "ENOENT (path), ENOENT (parent)".into(),
             }),
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -297,6 +313,28 @@ mod tests {
             }
             _ => panic!("expected CanonicalizeFailed"),
         }
+    }
+
+    /// `pre_stat` survives the shim wire.
+    #[test]
+    fn shim_notification_with_pre_stat_round_trips() {
+        let n = ShimNotification {
+            pid: 1,
+            syscall: "rmdir".into(),
+            arg: "/tmp/d".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(ShimStat {
+                dev: 1,
+                inode: 2,
+                mode: 0o040700,
+            }),
+        };
+        let frame = encode_frame(&n).expect("encode");
+        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        assert_eq!(decoded, n);
     }
 
     /// M07.B.4.1 — pin the xattr-pre-image wire shape on the
@@ -328,6 +366,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -362,6 +401,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -409,6 +449,7 @@ mod tests {
                 pre("/abs/site-packages/pkg/sub/inner.py", b"x = 1\n"),
             ],
             failure: None,
+            pre_stat: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");

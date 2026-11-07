@@ -232,11 +232,13 @@ pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t
 /// libc `rmdir` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
-    policy::notify_removal("rmdir", &cstr_to_string(path));
-    match real!("rmdir", RmdirFn) {
+    let pending = policy::removal_begin("rmdir", &cstr_to_string(path));
+    let rc = match real!("rmdir", RmdirFn) {
         Some(f) => unsafe { f(path) },
         None => enosys(),
-    }
+    };
+    policy::removal_end(pending, rc);
+    rc
 }
 
 #[cfg(test)]
@@ -330,10 +332,12 @@ mod tests {
     }
 
     #[test]
-    fn rmdir_notifies_before_with_the_canonical_path() {
+    fn rmdir_notifies_after_success_with_its_pre_call_stat() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         std::fs::create_dir(dir.join("gone")).unwrap();
+        std::fs::set_permissions(dir.join("gone"), std::fs::Permissions::from_mode(0o700)).unwrap();
         let p = c(&dir.join("gone"));
         let notes = test_capture::capture(|| {
             assert_eq!(unsafe { rmdir(p.as_ptr()) }, 0);
@@ -342,6 +346,7 @@ mod tests {
         assert_eq!(notes[0].syscall, "rmdir");
         assert_eq!(notes[0].arg, dir.join("gone").to_str().unwrap());
         assert!(notes[0].failure.is_none());
+        assert_eq!(notes[0].pre_stat.map(|s| s.mode), Some(0o040700));
         assert!(!dir.join("gone").exists());
     }
 
@@ -425,6 +430,22 @@ mod tests {
             assert!(unsafe { open64(cp.as_ptr(), O_WRONLY | O_CREAT, 0o644) } < 0);
         });
         assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review item 3: `rmdir --ignore-fail-on-non-empty`, `os.removedirs`.
+    /// A refused rmdir removed nothing and must journal nothing.
+    #[test]
+    fn rmdir_of_a_non_empty_dir_sends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("full")).unwrap();
+        std::fs::write(dir.join("full/f"), b"f").unwrap();
+        let p = c(&dir.join("full"));
+        let notes = test_capture::capture(|| {
+            assert_eq!(unsafe { rmdir(p.as_ptr()) }, -1);
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+        assert!(dir.join("full/f").exists());
     }
 
     #[test]

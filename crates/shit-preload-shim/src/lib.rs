@@ -1037,20 +1037,61 @@ mod policy {
         notify_inner_with_failure(syscall, path, None, failure, false);
     }
 
-    /// L5 — `rmdir(2)`: notify before the syscall with the canonical path
-    /// (the directory still exists), or the raw path plus the AU10 marker.
-    /// No content to capture; the daemon reads kind and mode.
+    /// L5 — an `rmdir(2)` resolved and stat'ed before the call.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(super) fn notify_removal(syscall: &'static str, path: &str) {
-        if should_skip_path(path) {
-            return;
+    pub struct PendingRemoval {
+        syscall: &'static str,
+        path: String,
+        failure: Option<shit_proto::ShimFailure>,
+        stat: Option<shit_proto::ShimStat>,
+    }
+
+    /// L5 — before `rmdir(2)`: resolve the path (the directory still
+    /// exists) and keep its lstat for the notification.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn removal_begin(syscall: &'static str, path: &str) -> Option<PendingRemoval> {
+        use std::os::unix::fs::MetadataExt;
+        if disabled() || should_skip_path(path) {
+            return None;
         }
         let (abs, failure) = canonicalize_or_raw(path, "path");
         if should_skip_path(&abs) {
+            return None;
+        }
+        let stat = std::fs::symlink_metadata(&abs)
+            .ok()
+            .map(|m| shit_proto::ShimStat {
+                dev: m.dev(),
+                inode: m.ino(),
+                mode: m.mode(),
+            });
+        Some(PendingRemoval {
+            syscall,
+            path: abs,
+            failure,
+            stat,
+        })
+    }
+
+    /// L5 (review item 3) — after `rmdir(2)`: notify only when it
+    /// removed the directory. A refused rmdir (ENOTEMPTY from
+    /// `--ignore-fail-on-non-empty` or `os.removedirs`) removed nothing.
+    /// Leaves errno as the call set it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn removal_end(pending: Option<PendingRemoval>, rc: libc::c_int) {
+        let Some(p) = pending else {
+            return;
+        };
+        if rc != 0 || IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }
-        let resolved = failure.is_none();
-        notify_inner_with_failure(syscall, &abs, None, failure, resolved);
+        let saved = std::io::Error::last_os_error();
+        let _ = try_notify_full(p.syscall, &p.path, None, Vec::new(), p.failure, p.stat);
+        IN_NOTIFY.with(|f| f.set(false));
+        if let Some(e) = saved.raw_os_error() {
+            // SAFETY: errno is a valid thread-local lvalue.
+            unsafe { set_errno(e) };
+        }
     }
 
     /// L5 — the target of a write-capable open, before resolution.
@@ -1653,6 +1694,19 @@ mod policy {
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
     ) -> std::io::Result<()> {
+        try_notify_full(syscall, arg, pre_image, extra_pre_images, failure, None)
+    }
+
+    /// [`try_notify`] with the target's pre-call stat, for removals
+    /// reported after they succeed.
+    fn try_notify_full(
+        syscall: &'static str,
+        arg: &str,
+        pre_image: Option<shit_proto::ShimPreImage>,
+        extra_pre_images: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
+        pre_stat: Option<shit_proto::ShimStat>,
+    ) -> std::io::Result<()> {
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
         };
@@ -1670,6 +1724,7 @@ mod policy {
                 pre_image,
                 extra_pre_images,
                 failure,
+                pre_stat,
             });
             return Ok(());
         }
@@ -1722,6 +1777,7 @@ mod policy {
             // silent fallback. The daemon's shim_listener journals
             // a Refuse marker keyed by this field.
             failure,
+            pre_stat,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
