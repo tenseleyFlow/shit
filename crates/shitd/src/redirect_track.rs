@@ -297,52 +297,51 @@ impl From<OpenFail> for String {
     }
 }
 
-/// Open `path` read-only without following a final symlink and check that
-/// the descriptor is a regular file. `Ok(None)` means the path is absent.
-/// Symlinks, FIFOs, sockets and devices are errors: only regular files
-/// have content worth restoring, and `O_NONBLOCK` keeps a FIFO swapped in
-/// after the shell parse from blocking the daemon in `open`.
+/// Open a regular file read-only, never opening anything else.
 ///
-/// A failed open is classified with `lstat` on the final component: the
-/// errno for `O_NOFOLLOW` on a symlink is ELOOP on Linux and EMLINK on
-/// FreeBSD, and ELOOP can also come from a loop in an intermediate
-/// component, so the errno alone says nothing.
+/// The final component is `lstat`ed first. Only a regular file is
+/// opened: a symlink, FIFO, socket or device is rejected from the stat
+/// alone, because opening a device or FIFO can block or have side effects
+/// even with `O_NONBLOCK`. The open then uses `O_NOFOLLOW` and the
+/// descriptor's `fstat` must name the same dev/ino, which catches a swap
+/// between the stat and the open. `Ok(None)` means the path is absent.
+/// No errno is interpreted to detect symlinks (ELOOP on Linux, EMLINK on
+/// FreeBSD, and ELOOP can also mean a loop in a parent component).
 fn open_regular_nofollow(path: &Path) -> Result<Option<(File, std::fs::Metadata)>, OpenFail> {
-    let err = match OpenOptions::new()
+    let fail = |msg: String| OpenFail { msg, denied: false };
+    let link = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(fail(format!("stat: {e}"))),
+    };
+    if link.file_type().is_symlink() {
+        return Err(fail("not a regular file (symlink)".to_string()));
+    }
+    if !link.file_type().is_file() {
+        return Err(fail(format!("not a regular file ({:?})", link.file_type())));
+    }
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
-        Ok(file) => {
-            let meta = file.metadata().map_err(|e| OpenFail {
-                msg: format!("fstat: {e}"),
-                denied: false,
-            })?;
-            if !meta.file_type().is_file() {
-                return Err(OpenFail {
-                    msg: format!("not a regular file ({:?})", meta.file_type()),
-                    denied: false,
-                });
-            }
-            return Ok(Some((file, meta)));
+        Ok(f) => f,
+        // Removed between the stat and the open.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(OpenFail {
+                msg: format!("open: {e}"),
+                denied: e.kind() == std::io::ErrorKind::PermissionDenied,
+            });
         }
-        Err(e) => e,
     };
-    if err.kind() == std::io::ErrorKind::NotFound {
-        return Ok(None);
+    let meta = file.metadata().map_err(|e| fail(format!("fstat: {e}")))?;
+    if !meta.file_type().is_file() || meta.dev() != link.dev() || meta.ino() != link.ino() {
+        return Err(fail(
+            "target path was replaced between stat and open".to_string(),
+        ));
     }
-    if let Ok(link) = std::fs::symlink_metadata(path)
-        && link.file_type().is_symlink()
-    {
-        return Err(OpenFail {
-            msg: "not a regular file (symlink)".to_string(),
-            denied: false,
-        });
-    }
-    Err(OpenFail {
-        msg: format!("open: {err}"),
-        denied: err.kind() == std::io::ErrorKind::PermissionDenied,
-    })
+    Ok(Some((file, meta)))
 }
 
 /// Snapshot a regular file: its bytes (when `want_bytes`) and the metadata
@@ -362,9 +361,21 @@ fn capture_regular(
     strict: bool,
     want_bytes: bool,
 ) -> Result<Option<(Vec<u8>, std::fs::Metadata)>, String> {
+    capture_regular_with(path, strict, want_bytes, &mut |_| {})
+}
+
+/// `capture_regular` with a hook that runs after each attempt's read and
+/// before its verification, given the attempt number. Tests use it to
+/// change the file at exactly the racy moment.
+fn capture_regular_with(
+    path: &Path,
+    strict: bool,
+    want_bytes: bool,
+    after_read: &mut dyn FnMut(u32),
+) -> Result<Option<(Vec<u8>, std::fs::Metadata)>, String> {
     let attempts = if strict { 2 } else { 1 };
     let mut last_err = String::new();
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         let (mut file, meta) = match open_regular_nofollow(path) {
             Ok(Some(opened)) => opened,
             Ok(None) => return Ok(None),
@@ -379,10 +390,16 @@ fn capture_regular(
         };
         let mut bytes = Vec::new();
         if want_bytes {
-            bytes.reserve(usize::try_from(meta.size()).unwrap_or(0));
+            // A huge or sparse file must not abort the daemon on
+            // allocation failure; report it through the per-target path.
+            let want = usize::try_from(meta.size()).unwrap_or(usize::MAX);
+            bytes
+                .try_reserve(want)
+                .map_err(|e| format!("read: cannot reserve {want} bytes: {e}"))?;
             file.read_to_end(&mut bytes)
                 .map_err(|e| format!("read: {e}"))?;
         }
+        after_read(attempt);
         match verify_unchanged(path, &file, &meta) {
             Ok(()) => return Ok(Some((bytes, meta))),
             Err(e) if !strict => {
@@ -695,26 +712,45 @@ mod tests {
     }
 
     #[test]
-    fn relative_target_errors_and_is_not_resolved_against_daemon_cwd() {
-        let (_dir, blob_store, index, active) = fresh();
-        let cmd = CommandId {
-            session: fresh_session(),
-            seq: 1,
-        };
-        register_command(&index, cmd);
-        // Cargo.toml exists relative to the test's cwd; it must not be stashed.
-        let r = ack(handle(
-            cmd.session,
-            cmd.seq,
-            one_target("Cargo.toml", RedirectOpWire::Truncate),
-            &active,
-            &index,
-            &blob_store,
-            false,
-        ));
-        assert_eq!(r.stashed, 0);
-        assert!(r.errors.is_empty(), "default mode skips like trunk");
-        assert!(index.events_for_command(cmd).is_empty());
+    fn relative_target_is_skipped_by_default_refused_in_strict_never_statted() {
+        for strict in [false, true] {
+            let (_dir, blob_store, index, active) = fresh();
+            let cmd = CommandId {
+                session: fresh_session(),
+                seq: 1,
+            };
+            register_command(&index, cmd);
+            // Cargo.toml exists relative to the test's cwd; it must not be stashed.
+            let r = ack(handle(
+                cmd.session,
+                cmd.seq,
+                one_target("Cargo.toml", RedirectOpWire::Truncate),
+                &active,
+                &index,
+                &blob_store,
+                strict,
+            ));
+            assert_eq!(r.stashed, 0, "strict={strict}");
+            assert!(
+                index
+                    .events_for_command(cmd)
+                    .iter()
+                    .all(|e| !matches!(e.kind, CaptureEventKind::FilePreImage { .. })),
+                "strict={strict}: the daemon's cwd file was stashed"
+            );
+            if strict {
+                assert_eq!(r.errors.len(), 1);
+                assert!(
+                    r.errors[0].reason.contains("not an absolute path"),
+                    "{:?}",
+                    r.errors
+                );
+                assert_eq!(refusals(&index, cmd).len(), 1);
+            } else {
+                assert!(r.errors.is_empty(), "default mode skips like trunk");
+                assert!(refusals(&index, cmd).is_empty());
+            }
+        }
     }
 
     #[test]
@@ -848,17 +884,68 @@ mod tests {
     }
 
     #[test]
-    fn torn_read_is_best_effort_by_default_and_fatal_in_strict() {
+    fn torn_read_is_best_effort_by_default_and_retried_then_fatal_in_strict() {
+        use std::io::Write as _;
+        let append = |path: &Path| {
+            let mut f = OpenOptions::new().append(true).open(path).unwrap();
+            f.write_all(b"more\n").unwrap();
+        };
+
+        // Default: the file changes after the read; the bytes read are
+        // journaled anyway, with one attempt only.
         let dir = TempDir::new().unwrap();
         let path = write_file(dir.path(), "live.txt", b"abc\n");
-        // A concurrent writer is simulated by checking the verify result
-        // directly: capture_regular's policy turns it into Ok or Err.
-        let (file, meta) = open_regular_nofollow(&path).ok().flatten().unwrap();
-        std::fs::write(&path, b"abcdef\n").unwrap();
-        let err = verify_unchanged(&path, &file, &meta).unwrap_err();
-        assert!(err.contains("changed"));
-        // Quiescent file: both modes succeed.
-        assert!(capture_regular(&path, false, true).unwrap().is_some());
-        assert!(capture_regular(&path, true, true).unwrap().is_some());
+        let mut calls = 0;
+        let (bytes, _) = capture_regular_with(&path, false, true, &mut |_| {
+            calls += 1;
+            append(&path);
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"abc\n");
+        assert_eq!(calls, 1);
+
+        // Strict, changes on every attempt: one retry, then an error.
+        let path = write_file(dir.path(), "live2.txt", b"abc\n");
+        let mut calls = 0;
+        let err = capture_regular_with(&path, true, true, &mut |_| {
+            calls += 1;
+            append(&path);
+        })
+        .unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+        assert_eq!(calls, 2);
+
+        // Strict, changes only during the first attempt: the retry
+        // reads the settled file and succeeds.
+        let path = write_file(dir.path(), "live3.txt", b"abc\n");
+        let mut calls = 0;
+        let (bytes, _) = capture_regular_with(&path, true, true, &mut |attempt| {
+            calls += 1;
+            if attempt == 0 {
+                append(&path);
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"abc\nmore\n");
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn fifo_is_rejected_from_the_stat_without_opening() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // A reader open of a FIFO with no writer would block without
+        // O_NONBLOCK, and any open of a device can have side effects. The
+        // check must come from lstat, so it succeeds even with no
+        // permission to open the node at all.
+        std::fs::set_permissions(&fifo, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let err = open_regular_nofollow(&fifo).err().expect("rejected");
+        assert!(err.msg.contains("not a regular file"), "{}", err.msg);
+        assert!(!err.denied, "an open was attempted: {}", err.msg);
     }
 }
