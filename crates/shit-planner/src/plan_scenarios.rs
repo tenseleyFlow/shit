@@ -2233,3 +2233,19 @@ fn fully_journaled_new_tree_inside_an_unseen_mkdir_is_rebuilt() {
     assert_rebuilt(&sim, "d");
     assert_restored(&sim, &before);
 }
+
+#[test]
+fn unjournaled_file_under_a_journaled_mkdir_keeps_the_ordinary_loud_inverses() {
+    // Review round 2, item 4: `mkdir d` is journaled, `echo > d/x` is not.
+    // Removing d recursively would take d/x with it unreported, and leaving
+    // it would put it beside v1. Either way the rule must not decide.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    sim.snapshot();
+    sim.mv("d", "d.old");
+    sim.mkdir("d");
+    sim.write("d/new", b"v2\n");
+    sim.write_unseen("d/x", b"v2\n");
+    sim.rm_rf("d.old");
+    assert_not_rebuilt(&sim, "d");
+}

@@ -152,9 +152,11 @@ impl ReplacedSubtrees {
                 _ => None,
             })
             .collect();
-        if created.contains(from) {
-            return true;
-        }
+        // Review round 2, item 4: a created directory is removed
+        // recursively by its inverse, which would also take anything in it
+        // that no event journaled. So `from` itself and every directory in
+        // it, created or walked, count only when what is inside them is
+        // accounted for as well.
         let mut stack = vec![from.to_path_buf()];
         let mut seen = 0usize;
         while let Some(dir) = stack.pop() {
@@ -166,14 +168,17 @@ impl ReplacedSubtrees {
                 if seen > Self::MAX_LEFTOVERS {
                     return false;
                 }
+                let is_dir = probe
+                    .stat(&e)
+                    .is_some_and(|s| FileKind::from_mode(s.meta.mode) == Some(FileKind::Directory));
                 if created.contains(e.as_path()) {
+                    if is_dir {
+                        stack.push(e);
+                    }
                     continue;
                 }
                 // An unjournaled directory the rebuild recreates anyway (a
                 // walked one) is fine if what is in it is accounted for.
-                let is_dir = probe
-                    .stat(&e)
-                    .is_some_and(|s| FileKind::from_mode(s.meta.mode) == Some(FileKind::Directory));
                 if is_dir && walked_dirs.contains(&e) {
                     stack.push(e);
                     continue;
