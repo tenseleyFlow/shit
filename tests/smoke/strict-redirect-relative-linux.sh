@@ -93,6 +93,31 @@ run_phase() {
     set -e
     smoke_log "[${label}] shit undo --yes exit=${rc}"
     sed 's/^/    undo: /' "${SHIT_SMOKE_TMP}/${label}.undo.log" >&2 || true
+
+    # A cd earlier on the line moves the redirect: `cd sub && echo x > other`
+    # writes ${root}/sub/other, so a relative "other" must not be resolved
+    # against the shell's cwd (${root}). No pre-image may be journaled for
+    # the outer path.
+    printf 'outer\n' > "${root}/other"
+    cd "${root}"
+    "${SHIT_BIN}" hook-send pre-exec \
+        --session "${session}" --seq 2 --pid "$$" \
+        --cwd "${root}" --shell bash --sock "${SHIT_HOOK_SOCK}"
+    sleep 0.5
+    "${SHIT_BIN}" hook-send pre-exec-redirects \
+        --session "${session}" --seq 2 \
+        --cmdline "cd sub && echo x > other" \
+        --sock "${SHIT_HOOK_SOCK}" 2> /dev/null
+    sleep 0.3
+    "${SHIT_BIN}" hook-send post-exec \
+        --session "${session}" --seq 2 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
+    cd "${SHIT_SMOKE_TMP}"
+    sleep 0.5
+    if [ "$(smoke_journal_count "discriminant IN ('FilePreImage','FileAppendPreStash') AND path = '${root}/other'")" -ne 0 ]; then
+        smoke_fail "[${label}] a pre-image was journaled for ${root}/other although a cd precedes the redirect"
+    fi
+    smoke_log "[${label}] no pre-image for the outer path after a cd"
+
     "${SHIT_BIN}" hook-send session-close --session "${session}" --sock "${SHIT_HOOK_SOCK}"
 
     local post_sha
