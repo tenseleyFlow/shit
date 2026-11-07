@@ -195,8 +195,23 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
 /// valid NUL-terminated C string; `dirfd` must be `AT_FDCWD` or
 /// an open dirfd; `flags` is `0` or `AT_REMOVEDIR`.
 unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
-    policy::notify_pre_mutation_with_content("unlinkat", &cstr_to_string(pathname));
+    // L5: `shutil.rmtree` passes names relative to a real dirfd. Keyed
+    // against the cwd they named the wrong files.
+    match join_dirfd(dirfd, &cstr_to_string(pathname)) {
+        Ok(p) => policy::notify_pre_mutation_with_content("unlinkat", &p),
+        Err((raw, failure)) => policy::notify_unresolved("unlinkat", &raw, failure),
+    }
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
+}
+
+/// Replacement for `rmdir(2)` (L5). `shutil.rmtree` removes its top
+/// directory this way; notify while the directory still exists.
+///
+/// # Safety
+/// Same contract as `libc::rmdir`.
+unsafe extern "C" fn my_rmdir(pathname: *const c_char) -> c_int {
+    policy::notify_removal("rmdir", &cstr_to_string(pathname));
+    unsafe { libc::rmdir(pathname) }
 }
 
 /// Replacement for `rename(2)`. The atomic-move syscall behind
@@ -231,7 +246,7 @@ unsafe extern "C" fn my_renameat(
     ) {
         (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
         (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
-            policy::notify_rename_unresolved("renameat", &f, &t, failure)
+            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure)
         }
     }
     unsafe { libc::renameat(fromfd, from, tofd, to) }
@@ -798,6 +813,14 @@ static INTERPOSE_UNLINK: InterposeEntry = InterposeEntry {
 static INTERPOSE_UNLINKAT: InterposeEntry = InterposeEntry {
     replacement: my_unlinkat as *const c_void,
     target: libc::unlinkat as *const c_void,
+};
+
+/// L5: `rmdir`.
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_RMDIR: InterposeEntry = InterposeEntry {
+    replacement: my_rmdir as *const c_void,
+    target: libc::rmdir as *const c_void,
 };
 
 #[used]
@@ -1500,6 +1523,7 @@ mod tests {
         let entries: &[&InterposeEntry] = &[
             &INTERPOSE_UNLINK,
             &INTERPOSE_UNLINKAT,
+            &INTERPOSE_RMDIR,
             &INTERPOSE_RENAME,
             &INTERPOSE_RENAMEAT,
             &INTERPOSE_OPEN,
@@ -1538,7 +1562,7 @@ mod tests {
         ];
         assert_eq!(
             entries.len(),
-            29,
+            30,
             "M07.A.2 + M07.B.1..5 + M03.x.SETATTR + M03.x.LINK + M03.x.CREATE interposer count"
         );
         for e in entries {
@@ -1589,5 +1613,38 @@ mod rename_wire_tests {
         let pre = n.pre_image.as_ref().expect("destination pre-image");
         assert_eq!(pre.path, want_to.to_str().unwrap());
         assert_eq!(pre.bytes, b"old");
+    }
+
+    #[test]
+    fn unlinkat_with_real_dirfd_is_keyed_to_that_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("f"), b"bytes").unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("f").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), 0) }, 0);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "unlinkat")
+            .expect("unlinkat");
+        let want = dir.join("f");
+        assert_eq!(n.arg, want.to_str().unwrap());
+        assert_eq!(n.pre_image.as_ref().unwrap().bytes, b"bytes");
+    }
+
+    #[test]
+    fn rmdir_notifies_before_the_directory_goes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let p = CString::new(dir.join("d").to_str().unwrap()).unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_rmdir(p.as_ptr()) }, 0);
+        });
+        let n = notes.iter().find(|n| n.syscall == "rmdir").expect("rmdir");
+        assert_eq!(n.arg, dir.join("d").to_str().unwrap());
+        assert!(!dir.join("d").exists());
     }
 }

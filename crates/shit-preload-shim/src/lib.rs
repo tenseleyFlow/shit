@@ -153,6 +153,10 @@ pub mod runtime;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+// L5 — open64/openat64/fortify/creat and mkdir/mkdirat/rmdir.
+#[cfg(target_os = "linux")]
+mod linux_extra;
+
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
@@ -695,17 +699,11 @@ mod policy {
         }
     }
 
-    /// A rename whose arguments could not be keyed: send `from\tto` as
-    /// given, with the AU10 marker and no capture.
+    /// A mutation whose path could not be keyed: send the raw arg (for a
+    /// rename, `from\tto`) with the AU10 marker and no capture.
     #[cfg(target_os = "macos")]
-    pub fn notify_rename_unresolved(
-        syscall: &'static str,
-        from: &str,
-        to: &str,
-        failure: shit_proto::ShimFailure,
-    ) {
-        let arg = format!("{from}\t{to}");
-        notify_inner_with_failure(syscall, &arg, None, Some(failure), false);
+    pub fn notify_unresolved(syscall: &'static str, arg: &str, failure: shit_proto::ShimFailure) {
+        notify_inner_with_failure(syscall, arg, None, Some(failure), false);
     }
 
     /// B09 — notify a chflags-family mutation with a metadata-only
@@ -1004,7 +1002,8 @@ mod policy {
     /// Trust that already-absolute destination here: canonicalizing the final
     /// name post-syscall could follow a replacement raced in by another thread
     /// and journal an inverse for the wrong path.
-    #[cfg(target_os = "macos")]
+    /// The Linux `mkdir`/`mkdirat` interposers (L5) use it the same way.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn notify_create_resolved(
         syscall: &'static str,
         path: &str,
@@ -1014,6 +1013,22 @@ mod policy {
             return;
         }
         notify_inner_with_failure(syscall, path, None, failure, false);
+    }
+
+    /// L5 — `rmdir(2)`: notify before the syscall with the canonical path
+    /// (the directory still exists), or the raw path plus the AU10 marker.
+    /// No content to capture; the daemon reads kind and mode.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn notify_removal(syscall: &'static str, path: &str) {
+        if should_skip_path(path) {
+            return;
+        }
+        let (abs, failure) = canonicalize_or_raw(path, "path");
+        if should_skip_path(&abs) {
+            return;
+        }
+        let resolved = failure.is_none();
+        notify_inner_with_failure(syscall, &abs, None, failure, resolved);
     }
 
     /// W09.11 — paths whose mutations are NOT user-visible state
