@@ -304,8 +304,46 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         // std::fs::rename is atomic on same-fs; cross-fs returns EXDEV
         // (mapped to io::Error). Cross-fs renames are stage-2 work —
         // they need the copy+unlink fallback noted in the sprint plan.
+        //
+        // The original source's parent can be gone by undo time when
+        // the command removed it after moving the entry out, unseen
+        // (`mv d/f x; rmdir d`, plain rmdir is not interposed; a journaled
+        // removal has already been reversed by now). Its mode was not
+        // recorded, so create it private and say so: wider than the
+        // original would expose the file, narrower only needs a chmod.
+        //
+        // The source check stops a missing source from leaving directories
+        // behind. A rename that then fails, EXDEV included, does leave them.
+        if let Err(e) = fs::symlink_metadata(from) {
+            return ExecutionOutcome::Failed {
+                err: format!("rename {from:?} -> {to:?}: {e}"),
+            };
+        }
+        let mut note = None;
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            if let Err(e) = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+            {
+                return ExecutionOutcome::Failed {
+                    err: format!("mkdir -p {parent:?}: {e}"),
+                };
+            }
+            note = Some(format!(
+                "{} did not exist and its mode was not captured; recreated it 0700",
+                parent.display()
+            ));
+        }
         match fs::rename(from, to) {
-            Ok(()) => ExecutionOutcome::Applied,
+            Ok(()) => match note {
+                Some(note) => ExecutionOutcome::AppliedWithNote { note },
+                None => ExecutionOutcome::Applied,
+            },
             Err(e) => ExecutionOutcome::Failed {
                 err: format!("rename {from:?} -> {to:?}: {e}"),
             },
@@ -964,6 +1002,40 @@ mod tests {
     }
 
     #[test]
+    fn recreate_path_creates_missing_parent_dirs() {
+        // A nested `rm -rf` unlinks children before parents, so undo
+        // can reach a child's RecreatePath while its parent is still
+        // missing. The executor must build the chain instead of
+        // failing, for directories and regular files alike.
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let dir = tmpdir.path().join("a").join("b").join("empty");
+        let file = tmpdir.path().join("c").join("d").join("f");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        for (path, kind, mode) in [
+            (&dir, crate::metadata::FileKind::Directory, 0o040711),
+            (&file, crate::metadata::FileKind::Regular, 0o100600),
+        ] {
+            let op = InverseOp::RecreatePath {
+                path: path.clone(),
+                kind,
+                mode,
+            };
+            assert_eq!(
+                e.execute(&op, false, ConflictPolicy::default()),
+                ExecutionOutcome::Applied,
+                "{path:?}"
+            );
+            let m = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(m, mode & 0o7777, "{path:?}");
+        }
+        assert!(dir.is_dir());
+        assert!(file.is_file());
+    }
+
+    #[test]
     fn recreate_path_makes_empty_regular_file_with_mode() {
         use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().expect("tempdir");
@@ -1070,6 +1142,56 @@ mod tests {
         );
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn rename_missing_source_creates_nothing() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let from = tmpdir.path().join("nope");
+        let parent = tmpdir.path().join("gone");
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Rename {
+            from,
+            to: parent.join("f"),
+        };
+        assert!(matches!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Failed { .. }
+        ));
+        assert!(
+            !parent.exists(),
+            "parent created for a rename that cannot run"
+        );
+    }
+
+    #[test]
+    fn rename_creates_missing_parents_private_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let from = tmpdir.path().join("x");
+        let gone = tmpdir.path().join("gone");
+        let deeper = gone.join("deeper");
+        std::fs::write(&from, b"hi").unwrap();
+
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let op = InverseOp::Rename {
+            from: from.clone(),
+            to: deeper.join("f"),
+        };
+        let outcome = e.execute(&op, false, ConflictPolicy::default());
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(deeper.join("f")).unwrap(), b"hi");
+        assert!(
+            matches!(&outcome, ExecutionOutcome::AppliedWithNote { note } if note.contains("0700")),
+            "{outcome:?}"
+        );
+        for dir in [&gone, &deeper] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{dir:?}");
+        }
     }
 
     #[test]

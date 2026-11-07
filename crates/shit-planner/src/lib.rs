@@ -26,6 +26,8 @@ pub mod network_diff;
 pub mod orchestrator;
 pub mod plan;
 pub mod plan_forward;
+#[cfg(test)]
+mod plan_scenarios;
 pub mod probe;
 pub mod probe_live;
 pub mod proc;
