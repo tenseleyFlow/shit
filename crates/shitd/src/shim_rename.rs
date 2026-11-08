@@ -119,7 +119,14 @@ pub(crate) fn ingest_walk(
         && failed == 0
         && journaled == u64::from(walk.files)
         && entries.len() == walk.entries.len()
-        && entries.first().is_some_and(|e| e.path.as_os_str() == from);
+        && entries.first().is_some_and(|e| e.path.as_os_str() == from)
+        // Review round 4, item 3: a pre-image with no entry has no shim-read
+        // xattrs (its set is empty, not known), so the walk cannot be
+        // rebuilt from as a whole.
+        && note
+            .extra_pre_images
+            .iter()
+            .all(|p| by_path.contains_key(p.path.as_str()));
     let event = CaptureEvent {
         id: EventId(0),
         command,
@@ -915,5 +922,27 @@ mod tests {
         e.xattrs = None;
         assert!(walk_file_xattrs(Some(&&e)).is_empty());
         assert!(walk_file_xattrs(None).is_empty());
+    }
+
+    /// Review round 4, item 3: a walk whose pre-image has no entry (so
+    /// no xattrs the shim read) is not complete.
+    #[test]
+    fn walk_with_a_pre_image_missing_from_its_entries_is_incomplete() {
+        let walk = ShimWalk {
+            complete: true,
+            files: 1,
+            entries: vec![entry("/tmp/l5/d", 0o040700, 10)],
+        };
+        let kinds = ingest(&note(Some(walk), None));
+        assert!(
+            kinds.iter().any(|k| matches!(
+                k,
+                CaptureEventKind::RenameWalk {
+                    complete: false,
+                    ..
+                }
+            )),
+            "{kinds:#?}"
+        );
     }
 }
