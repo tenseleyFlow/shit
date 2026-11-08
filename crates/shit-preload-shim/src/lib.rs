@@ -596,7 +596,7 @@ mod policy {
         if disabled() || should_skip_path(path) || IN_NOTIFY.with(|f| f.get()) {
             return None;
         }
-        Some(resolve_at_for_notify(libc::AT_FDCWD, path, "path"))
+        Some(resolve_leaf_at_for_notify(libc::AT_FDCWD, path, "path"))
     }
 
     /// Test hook: run `f` as if inside a notification on this thread.
@@ -653,6 +653,42 @@ mod policy {
         target_os = "linux",
     ))]
     pub fn resolve_at_for_notify(dirfd: libc::c_int, path: &str, which_arg: &str) -> AtResolution {
+        resolve_at_with(dirfd, path, which_arg, canonical_path)
+    }
+
+    /// L4b - single-path variant for calls that act on the final
+    /// component itself (`unlink`, `unlinkat`, and the `open` forms this
+    /// shim keys by name): canonicalizes only the parent directory and
+    /// joins the final component unresolved, so a symlink is journaled
+    /// as the link, never as its target.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn resolve_leaf_at_for_notify(
+        dirfd: libc::c_int,
+        path: &str,
+        which_arg: &str,
+    ) -> AtResolution {
+        resolve_at_with(dirfd, path, which_arg, canonical_parent_join)
+    }
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn resolve_at_with(
+        dirfd: libc::c_int,
+        path: &str,
+        which_arg: &str,
+        canon: fn(&str) -> Result<String, CanonicalizeError>,
+    ) -> AtResolution {
         let joined = join_at_path(dirfd, path);
         if !joined.starts_with('/') && dirfd != libc::AT_FDCWD {
             return AtResolution::Failed(
@@ -664,7 +700,7 @@ mod policy {
                 },
             );
         }
-        match canonical_path(&joined) {
+        match canon(&joined) {
             Ok(abs) => AtResolution::Resolved(abs),
             Err(CanonicalizeError::PathAndParentBothFailed { parent_err, .. })
                 if matches!(
@@ -699,7 +735,7 @@ mod policy {
         dirfd: libc::c_int,
         path: &str,
     ) {
-        notify_resolved(syscall, resolve_at_for_notify(dirfd, path, "path"));
+        notify_resolved(syscall, resolve_leaf_at_for_notify(dirfd, path, "path"));
     }
 
     /// Send one resolved single-path notification: a keyed path is the
@@ -718,7 +754,13 @@ mod policy {
                 if should_skip_path(&abs) {
                     return;
                 }
-                notify_inner_with_failure(syscall, &abs, Some(&abs), None, true);
+                // L4b - the removed entry's identity, read before the
+                // call, so the daemon can pair this report with the
+                // kernel tier's report of the same removal.
+                let pre_stat = matches!(syscall, "unlink" | "unlinkat")
+                    .then(|| lstat_identity(&abs))
+                    .flatten();
+                notify_inner_stat(syscall, &abs, Some(&abs), None, true, pre_stat);
             }
             AtResolution::Failed(raw, failure) => {
                 if should_skip_path(&raw) {
@@ -1246,6 +1288,30 @@ mod policy {
         }
     }
 
+    /// L4b - `canonicalize(parent).join(name)`, never resolving the
+    /// final component (it may be a symlink the call acts on).
+    pub(super) fn canonical_parent_join(path: &str) -> Result<String, CanonicalizeError> {
+        use std::path::{Path, PathBuf};
+        let p = Path::new(path);
+        let Some(name) = p.file_name() else {
+            return Err(CanonicalizeError::NoFileName(path.to_string()));
+        };
+        let parent_in = match p.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+            Some(parent) => parent.to_path_buf(),
+            None => return Err(CanonicalizeError::NoParent(path.to_string())),
+        };
+        match std::fs::canonicalize(&parent_in) {
+            Ok(parent_abs) => Ok(parent_abs.join(name).to_string_lossy().into_owned()),
+            Err(parent_err) => Err(CanonicalizeError::PathAndParentBothFailed {
+                path: path.to_string(),
+                path_err: std::io::Error::new(parent_err.kind(), "final component not resolved"),
+                parent: parent_in.to_string_lossy().into_owned(),
+                parent_err,
+            }),
+        }
+    }
+
     /// AU10 — Convenience for callers that need to keep the syscall
     /// flowing even when canonicalize fails: returns
     /// `(best_effort_path, Option<ShimFailure>)`. The path is the
@@ -1307,6 +1373,37 @@ mod policy {
         failure: Option<shit_proto::ShimFailure>,
         path_resolved: bool,
     ) {
+        notify_inner_stat(syscall, arg, capture_path, failure, path_resolved, None);
+    }
+
+    /// lstat `path` into the wire's identity triple.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn lstat_identity(path: &str) -> Option<shit_proto::ShimStat> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| shit_proto::ShimStat {
+                dev: m.dev(),
+                inode: m.ino(),
+                mode: m.mode(),
+            })
+    }
+
+    /// [`notify_inner_with_failure`] plus the target's pre-call lstat.
+    fn notify_inner_stat(
+        syscall: &'static str,
+        arg: &str,
+        capture_path: Option<&str>,
+        failure: Option<shit_proto::ShimFailure>,
+        path_resolved: bool,
+        pre_stat: Option<shit_proto::ShimStat>,
+    ) {
         if disabled() {
             return;
         }
@@ -1333,7 +1430,7 @@ mod policy {
             (Some(pre), Some(cap)) if cap == arg => pre.path.clone(),
             _ => arg.to_string(),
         };
-        let _ = try_notify(syscall, &wire_arg, pre_image, Vec::new(), failure);
+        let _ = try_notify_stat(syscall, &wire_arg, pre_image, Vec::new(), failure, pre_stat);
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -1485,6 +1582,17 @@ mod policy {
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
     ) -> std::io::Result<()> {
+        try_notify_stat(syscall, arg, pre_image, extra_pre_images, failure, None)
+    }
+
+    fn try_notify_stat(
+        syscall: &'static str,
+        arg: &str,
+        pre_image: Option<shit_proto::ShimPreImage>,
+        extra_pre_images: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
+        pre_stat: Option<shit_proto::ShimStat>,
+    ) -> std::io::Result<()> {
         use shit_proto::{
             ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
         };
@@ -1541,6 +1649,7 @@ mod policy {
             // silent fallback. The daemon's shim_listener journals
             // a Refuse marker keyed by this field.
             failure,
+            pre_stat,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
@@ -2307,6 +2416,35 @@ mod tests {
     )
 ))]
 mod canonical_tests {
+    /// L4b: `unlink`/`unlinkat`/`open` of a symlink are keyed by the
+    /// link's own path (parent canonicalized, final component as
+    /// given), never by the link's target.
+    #[test]
+    fn single_path_calls_key_a_symlink_by_the_link_not_its_target() {
+        use super::policy::{AtResolution, plain_resolution, resolve_leaf_at_for_notify};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let want = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("link")
+            .to_str()
+            .unwrap()
+            .to_string();
+        match plain_resolution(link.to_str().unwrap()) {
+            Some(AtResolution::Resolved(abs)) => assert_eq!(abs, want),
+            other => panic!("plain: expected the link path, got {other:?}"),
+        }
+        let d = std::fs::File::open(dir.path()).unwrap();
+        match resolve_leaf_at_for_notify(d.as_raw_fd(), "link", "path") {
+            AtResolution::Resolved(abs) => assert_eq!(abs, want),
+            other => panic!("at: expected the link path, got {other:?}"),
+        }
+    }
+
     /// L4b ruling 7: a re-entrant plain-path notification returns
     /// before canonicalizing; a normal one resolves once and that
     /// resolved path is what is sent.

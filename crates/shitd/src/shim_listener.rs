@@ -250,21 +250,30 @@ async fn handle_one(
     Ok(())
 }
 
-/// Kind and mode of an unlink target, read before the syscall runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Kind, mode and identity of an unlink target, read before the syscall
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UnlinkStat {
     kind: FileKind,
     mode: u32,
+    /// `(st_dev, st_ino)`; set only for block/char nodes (L4b), so the
+    /// shim's report pairs with the helper's `DeviceNodeMeta`. Other
+    /// kinds keep the `(0, 0)` sentinel the planner already expects.
+    inode: InodeRef,
+    /// The link's target when the entry is a symlink (L4b).
+    link_target: Option<String>,
 }
 
 /// lstat the target of a shim `unlink`/`unlinkat` so the journaled
-/// `TreeOp::Unlink` carries the real kind and mode. Without it an
+/// event carries the real kind and mode. Without it an
 /// `unlinkat(AT_REMOVEDIR)` lands as a Regular unlink and undo's
 /// RecreatePath makes a file where a directory was, which then breaks
 /// every child restore under it (ENOTDIR). Directories, regular files,
 /// fifos, sockets and block/char nodes are reported (the device number
-/// comes from the helper's `DeviceNodeMeta`, not from here); anything
-/// else keeps the wire default.
+/// comes from the helper's `DeviceNodeMeta`, not from here); a symlink
+/// is reported with its target so undo recreates the link. The shim's
+/// own pre-call lstat (`pre_stat`) is preferred; the daemon's lstat is
+/// the fallback for a shim that did not send one.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat") {
@@ -273,36 +282,66 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     if !Path::new(&note.arg).is_absolute() {
         return None;
     }
-    let meta = match std::fs::symlink_metadata(&note.arg) {
-        Ok(m) => m,
-        Err(e) => {
-            debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
-            return None;
-        }
+    let (dev, ino, mode) = match note.pre_stat {
+        Some(st) => (st.dev, st.inode, st.mode),
+        None => match std::fs::symlink_metadata(&note.arg) {
+            Ok(m) => (m.dev(), m.ino(), m.mode()),
+            Err(e) => {
+                debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
+                return None;
+            }
+        },
     };
-    let kind = FileKind::from_mode(meta.mode()).filter(|k| {
-        matches!(
-            k,
-            FileKind::Directory
-                | FileKind::Regular
-                | FileKind::Fifo
-                | FileKind::Socket
-                | FileKind::BlockDevice
-                | FileKind::CharDevice
-        )
-    })?;
+    let kind = FileKind::from_mode(mode)?;
+    if kind == FileKind::Symlink {
+        let target = std::fs::read_link(&note.arg).ok()?;
+        return Some(UnlinkStat {
+            kind,
+            mode,
+            inode: InodeRef::new(0, 0),
+            link_target: Some(target.to_string_lossy().into_owned()),
+        });
+    }
+    if !matches!(
+        kind,
+        FileKind::Directory
+            | FileKind::Regular
+            | FileKind::Fifo
+            | FileKind::Socket
+            | FileKind::BlockDevice
+            | FileKind::CharDevice
+    ) {
+        return None;
+    }
+    let inode = if matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) {
+        InodeRef::new(dev, ino)
+    } else {
+        InodeRef::new(0, 0)
+    };
     Some(UnlinkStat {
         kind,
-        mode: meta.mode(),
+        mode,
+        inode,
+        link_target: None,
     })
 }
 
-/// Overlay a pre-syscall lstat onto a classified shim Unlink.
+/// Overlay a pre-syscall lstat onto a classified shim Unlink. A removed
+/// symlink becomes `SymlinkRemoved`, whose inverse recreates the link.
 fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> CaptureEventKind {
     match (kind, stat) {
         (
-            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path, .. }),
-            Some(UnlinkStat { kind, mode }),
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }),
+            Some(UnlinkStat {
+                link_target: Some(target),
+                ..
+            }),
+        ) => CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target, path }),
+        (
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }),
+            Some(UnlinkStat {
+                kind, mode, inode, ..
+            }),
         ) => CaptureEventKind::TreeOp(TreeOp::Unlink {
             inode,
             path,
@@ -1143,6 +1182,7 @@ mod tests {
                 pre_image: None,
                 extra_pre_images: Vec::new(),
                 failure: None,
+                pre_stat: None,
             };
             let frame = encode_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
@@ -1276,6 +1316,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let reserved_ts = TimePoint::new(778, 43);
 
@@ -1371,6 +1412,7 @@ mod tests {
                 shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
             ],
             failure: None,
+            pre_stat: None,
         };
         ingest_notification(
             &note,
@@ -1429,6 +1471,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let fifo = tmp.path().join("p");
         let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -1447,7 +1490,13 @@ mod tests {
         let n = pre_syscall_unlink_stat(&note("unlink", Path::new("/dev/null")))
             .expect("char device stat");
         assert_eq!(n.kind, FileKind::CharDevice);
-        assert_eq!(pre_syscall_unlink_stat(&note("unlinkat", &link)), None);
+        // L4b: a symlink reports its target, and only device nodes
+        // carry an identity.
+        let l = pre_syscall_unlink_stat(&note("unlinkat", &link)).expect("symlink stat");
+        assert_eq!(l.kind, FileKind::Symlink);
+        assert_eq!(l.link_target.as_deref(), Some(file.to_str().unwrap()));
+        assert_eq!(f.inode, InodeRef::new(0, 0));
+        assert_ne!(n.inode, InodeRef::new(0, 0));
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", &tmp.path().join("gone"))),
             None
@@ -1456,6 +1505,80 @@ mod tests {
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", Path::new("relative"))),
             None
+        );
+    }
+
+    /// L4b: the shim's `unlink` of a symlink journals a
+    /// `SymlinkRemoved` for the link's own path with its target, so
+    /// undo recreates the link and leaves the target alone.
+    #[test]
+    fn unlink_of_a_symlink_journals_the_link_and_its_target() {
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "unlinkat".into(),
+            arg: link.to_str().unwrap().into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: None,
+        };
+        let stat = pre_syscall_unlink_stat(&note);
+        let (_t, index, blob_store, command) = ingest_fixture("rm link");
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(6, 0),
+            stat,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        match &events[0].kind {
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target: t, path }) => {
+                assert_eq!(path, &link);
+                assert_eq!(t, target.to_str().unwrap());
+            }
+            other => panic!("expected SymlinkRemoved, got {other:?}"),
+        }
+    }
+
+    /// L4b: a shim `unlink` of a device node carries the shim's pre-call
+    /// identity, so it pairs with the helper's `DeviceNodeMeta`.
+    #[test]
+    fn unlink_of_a_device_node_journals_the_shim_identity() {
+        let note = ShimNotification {
+            pid: 1,
+            syscall: "unlink".into(),
+            arg: "/w/null".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: 0x803,
+                inode: 77,
+                mode: 0o020640,
+            }),
+        };
+        let stat = pre_syscall_unlink_stat(&note).expect("stat from pre_stat");
+        let kind = apply_unlink_stat(classify_tree_op("unlink", "/w/null").unwrap(), Some(stat));
+        assert_eq!(
+            kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: InodeRef::new(0x803, 77),
+                path: PathBuf::from("/w/null"),
+                kind: FileKind::CharDevice,
+                mode: 0o020640,
+            })
         );
     }
 
@@ -1472,6 +1595,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
         ingest_notification(
@@ -1481,6 +1605,8 @@ mod tests {
             Some(UnlinkStat {
                 kind: FileKind::Directory,
                 mode: 0o040750,
+                inode: InodeRef::new(0, 0),
+                link_target: None,
             }),
             &index,
             &blob_store,

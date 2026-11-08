@@ -172,6 +172,20 @@ pub struct ShimNotification {
     /// negligible.
     #[serde(default)]
     pub failure: Option<ShimFailure>,
+    /// The target's lstat before the call, for `unlink`/`unlinkat`
+    /// (L4b; the same field L5 adds for `rmdir`). Lets the daemon
+    /// journal the removed entry's identity, so the shim's report and
+    /// the kernel tier's report of one removal pair exactly.
+    #[serde(default)]
+    pub pre_stat: Option<ShimStat>,
+}
+
+/// Identity and mode of a path, as the shim read it (lstat).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimStat {
+    pub dev: u64,
+    pub inode: u64,
+    pub mode: u32,
 }
 
 /// AU10 — structured failure reported by the shim when capture
@@ -230,6 +244,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -258,6 +273,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
@@ -323,6 +339,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -357,6 +374,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -404,6 +422,7 @@ mod tests {
                 pre("/abs/site-packages/pkg/sub/inner.py", b"x = 1\n"),
             ],
             failure: None,
+            pre_stat: None,
         };
         let frame = crate::frame::encode_frame_large(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
