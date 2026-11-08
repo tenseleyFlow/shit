@@ -2421,6 +2421,10 @@ jobs:
           if [ "$TIER" = "ebpf-lsm" ]; then
             export SHIT_FORCE_TIER=ebpf-lsm
             RUN=( "${TIER_AGNOSTIC[@]}" "${LSM_SMOKES[@]}" )
+            # #209 verification: repeat the flaky smoke.
+            for _ in $(seq 1 20); do
+              RUN+=( tests/smoke/strict-preexisting-loss-refuses-linux.sh )
+            done
             echo "Runner has ebpf-lsm functional; running full smoke matrix (${#RUN[@]} smokes)"
           else
             RUN=( "${TIER_AGNOSTIC[@]}" )
