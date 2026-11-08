@@ -321,7 +321,12 @@ impl LinuxCaptureRuntime {
             return;
         };
         ws.acct.note_tree_dev(root.dev());
+        // The listing ran even if it fails, so a failure makes the walk
+        // incomplete rather than absent.
+        ws.acct.note_walked();
+        let root_id = (root.dev(), root.ino());
         let Ok(read) = std::fs::read_dir(cwd) else {
+            ws.acct.note_unwalked_dir(root_id);
             return;
         };
         let mut subdirs = 0usize;
@@ -341,8 +346,8 @@ impl LinuxCaptureRuntime {
                 subdirs += 1;
             }
         }
-        if complete {
-            ws.acct.note_walked();
+        if !complete {
+            ws.acct.note_unwalked_dir(root_id);
         }
         if subdirs > 0 {
             ws.acct.note_uncovered(format!(
@@ -353,9 +358,11 @@ impl LinuxCaptureRuntime {
         }
     }
 
+    /// True when `path` is a direct child of the cwd and the cwd listing
+    /// taken at WatchTree stat'd every entry.
     fn fanotify_parent_walked(ws: &WatchState, path: Option<&Path>) -> bool {
         match (path.and_then(Path::parent), ws.cwd.as_deref()) {
-            (Some(parent), Some(cwd)) => parent == cwd,
+            (Some(parent), Some(cwd)) => parent == cwd && ws.acct.listing_complete(),
             _ => false,
         }
     }
@@ -3613,6 +3620,33 @@ mod born_set_tests {
                 None,
                 "the eBPF ring buffers dropped 2 event(s) while this command ran".into()
             )]
+        );
+    }
+
+    #[test]
+    fn fanotify_unlisted_cwd_proves_no_birth() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root reads a mode-000 directory; the listing cannot fail.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old"), b"x").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (helper, _daemon) = crate::ipc::socketpair().unwrap();
+        let mut rt =
+            LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(0xf1),
+            seq: 1,
+        };
+        rt.note_direct_children_baseline(cmd, dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ws = rt.watches.get(&cmd).unwrap();
+        assert!(
+            !LinuxCaptureRuntime::fanotify_parent_walked(ws, Some(&dir.path().join("old"))),
+            "a cwd whose listing failed must not prove that its children were born"
         );
     }
 

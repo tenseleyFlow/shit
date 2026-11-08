@@ -119,6 +119,12 @@ impl CloseAccounting {
         self.unwalked_dirs.insert(dir);
     }
 
+    /// True when a walk ran and listed every directory it recorded,
+    /// without hitting its cap.
+    pub fn listing_complete(&self) -> bool {
+        self.walked && !self.capped && self.unwalked_dirs.is_empty()
+    }
+
     /// True when the walk listed `dir` completely.
     pub fn dir_walked(&self, dir: Id) -> bool {
         self.walked && !self.unwalked_dirs.contains(&dir)
