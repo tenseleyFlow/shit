@@ -378,10 +378,14 @@ fn ingest_notification(
     // L5 (review round 4, item 2): inside a watched tree the kernel tier
     // captures the file's pre-image, as it does the create the shim then
     // defers (`open_create` below). A shim capture gap there is no gap.
+    // Watched means BSD's baseline cwds, or the root the daemon sent the
+    // helper for this command (any platform) unless the helper said it
+    // could not watch it.
     let gap_in_watch = matches!(
         &note.failure,
         Some(shit_proto::ShimFailure::PreImageUncaptured { path, .. })
             if live_baseline.path_in_watched_subtree(Path::new(path))
+                || live_baseline.command_watches(command, Path::new(path))
     );
     if let Some(failure) = &note.failure
         && !gap_in_watch
@@ -1703,6 +1707,64 @@ mod tests {
         // Out of watch, the same note is a refusal (as in
         // `uncaptured_existing_file_journals_a_refusal_only`).
         assert_eq!(kinds_after(&note).len(), 1);
+    }
+
+    /// Review round 4, item 2 on Linux: the daemon records the root it
+    /// sent the helper in WatchTree for each command. A gap in that tree
+    /// journals nothing; outside it, or once the helper said it cannot
+    /// watch the command, it is a refusal.
+    #[test]
+    fn uncaptured_file_in_the_commands_watch_root_journals_no_refusal() {
+        use shit_planner::time::TimePoint;
+        let gap = |path: &str| {
+            open_note(
+                "open",
+                Some(shit_proto::ShimFailure::PreImageUncaptured {
+                    path: path.into(),
+                    reason: "over the shim's inline pre-image cap".into(),
+                }),
+            )
+        };
+        let run = |note: &ShimNotification, lb: &LiveBaseline, command, index: &Index, blobs| {
+            ingest_notification(
+                note,
+                Some(command),
+                TimePoint::new(6, 0),
+                None,
+                index,
+                blobs,
+                lb,
+            );
+        };
+        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        let lb = LiveBaseline::new();
+        lb.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
+        run(
+            &gap("/tmp/shit-open/big.bin"),
+            &lb,
+            command,
+            &index,
+            &blob_store,
+        );
+        assert!(index.events_for_command(command).is_empty());
+        run(
+            &gap("/tmp/elsewhere/big.bin"),
+            &lb,
+            command,
+            &index,
+            &blob_store,
+        );
+        assert_eq!(index.events_for_command(command).len(), 1);
+        // WatchTreeFailed (or the helper's no-tier observation) drops it.
+        lb.forget_command_watch(command);
+        run(
+            &gap("/tmp/shit-open/big.bin"),
+            &lb,
+            command,
+            &index,
+            &blob_store,
+        );
+        assert_eq!(index.events_for_command(command).len(), 2);
     }
 
     #[test]

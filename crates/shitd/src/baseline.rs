@@ -244,6 +244,11 @@ impl BaselineCacheEntry {
 #[derive(Default)]
 pub struct LiveBaseline {
     by_cwd: RwLock<HashMap<PathBuf, Arc<BaselineCacheEntry>>>,
+    /// L5 (review round 4, item 2): the watch root the daemon sent the
+    /// helper in `WatchTree` for each running command, on every platform.
+    /// Dropped when the helper says it cannot watch that command, and at
+    /// PostExec.
+    command_roots: RwLock<HashMap<CommandId, PathBuf>>,
 }
 
 impl LiveBaseline {
@@ -321,6 +326,26 @@ impl LiveBaseline {
     pub fn path_in_watched_subtree(&self, path: &Path) -> bool {
         let map = self.by_cwd.read().unwrap();
         map.keys().any(|cwd| path.starts_with(cwd))
+    }
+
+    /// L5: the daemon asked the helper to watch `command` under `root`.
+    pub fn record_command_watch(&self, command: CommandId, root: PathBuf) {
+        self.command_roots.write().unwrap().insert(command, root);
+    }
+
+    /// L5: `command` is not watched after all (the helper failed to
+    /// attach, or has no capture tier), or it ended.
+    pub fn forget_command_watch(&self, command: CommandId) {
+        self.command_roots.write().unwrap().remove(&command);
+    }
+
+    /// L5: `path` is under the tree a kernel tier watches for `command`.
+    pub fn command_watches(&self, command: CommandId, path: &Path) -> bool {
+        self.command_roots
+            .read()
+            .unwrap()
+            .get(&command)
+            .is_some_and(|root| path.starts_with(root))
     }
 }
 

@@ -451,14 +451,19 @@ fn handle(
                     shell_kind: *shell_kind,
                     cwd_path: cwd_path.clone(),
                 };
-                if let Err(e) = link.send_request(&req) {
-                    warn!(err = %e, "WatchTree dispatch to helper failed");
+                match link.send_request(&req) {
+                    // L5: the root a kernel tier will watch for this command.
+                    Ok(_) => close_ctx
+                        .live_baseline
+                        .record_command_watch(command, PathBuf::from(cwd_path)),
+                    Err(e) => warn!(err = %e, "WatchTree dispatch to helper failed"),
                 }
             }
         }
         HookMessage::PostExec { seq, exit_code, .. } => {
             info!(%session, kind, seq, exit_code, "post-exec");
             let command = CommandId { session, seq: *seq };
+            close_ctx.live_baseline.forget_command_watch(command);
             // A replayed PostExec must not rewrite a finalized command or
             // judge its capture again.
             let finalized = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
