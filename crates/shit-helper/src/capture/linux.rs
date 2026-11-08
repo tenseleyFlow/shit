@@ -608,12 +608,8 @@ impl LinuxCaptureRuntime {
                 // the mutating pid has exited between hook fire and
                 // handler dispatch -- same fix scope as the resolved
                 // path used for the journal entry (Issue #22).
-                let opened = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&resolved_path);
-                match opened {
-                    Ok(f) => (Some(OwnedFd::from(f)), "race"),
+                match open_unlink_fallback(&resolved_path) {
+                    Ok(fd) => (Some(fd), "race"),
                     Err(_) => (None, "miss"),
                 }
             };
@@ -1913,6 +1909,46 @@ fn kernel_dev_to_userspace(kdev: u64) -> u64 {
 /// encoding `pre_open_tree` keyed dir_paths with. BPF callers must
 /// pass `kernel_dev_to_userspace(ev.parent_dev)` (or use the file's
 /// own dev for unlink/rename, since those can't cross filesystems).
+/// Review item 6 - the unlink path's race-to-open fallback. Opens the
+/// path `O_PATH|O_NOFOLLOW` first (fstat works on it and nothing is
+/// opened for I/O). Only a regular file is then reopened for reading,
+/// through `/proc/self/fd/N` so it is the same inode, with
+/// `O_NONBLOCK|O_NOCTTY`. A fifo, socket or device node keeps the
+/// `O_PATH` fd: the helper never opens one for reading, so it cannot
+/// block on a fifo or open a device.
+fn open_unlink_fallback(path: &str) -> std::io::Result<OwnedFd> {
+    let c = std::ffi::CString::new(path).map_err(std::io::Error::other)?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let opath = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(opath.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(opath);
+    }
+    let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", opath.as_raw_fd()))
+        .map_err(std::io::Error::other)?;
+    let rd = unsafe {
+        libc::open(
+            proc.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if rd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(rd) })
+}
+
 fn resolve_via_parent(
     ws_dir_paths: &BTreeMap<(u64, u64), PathBuf>,
     parent_dev: u64,
@@ -2641,6 +2677,38 @@ mod tests {
     /// the correct nested-dir absolute path, where the prior
     /// flat-join resolver would have produced `repo/index.lock` for
     /// git's actual `repo/.git/index.lock`.
+    /// Review item 6: the fallback must not block on a fifo with no
+    /// writer (a plain O_RDONLY open would), must not open a device for
+    /// reading, and still gives a readable fd for a regular file.
+    #[test]
+    fn unlink_fallback_never_opens_a_fifo_or_device_for_reading() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let r = open_unlink_fallback(&path);
+            let _ = tx.send(r.map(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }));
+        });
+        let flags = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("fallback blocked on a fifo")
+            .unwrap();
+        assert_ne!(flags & libc::O_PATH, 0, "fifo must stay O_PATH");
+        let dev = open_unlink_fallback("/dev/null").unwrap();
+        let fl = unsafe { libc::fcntl(dev.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(fl & libc::O_PATH, 0, "device must stay O_PATH");
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"bytes").unwrap();
+        let fd = open_unlink_fallback(file.to_str().unwrap()).unwrap();
+        let mut got = String::new();
+        std::fs::File::from(fd).read_to_string(&mut got).unwrap();
+        assert_eq!(got, "bytes");
+    }
+
     #[test]
     fn resolve_via_parent_uses_dir_map() {
         let mut dir_paths: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
