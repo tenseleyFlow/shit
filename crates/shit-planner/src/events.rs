@@ -142,6 +142,12 @@ pub enum FilePreImageSource {
     ShimPreMutation,
 }
 
+/// L5: the `CaptureRefused` class for a refusal about a whole command
+/// rather than one path: an old shim whose notes could not be read, or
+/// Creates left to a kernel tier that then stopped watching. Its `path`
+/// is the command's cwd.
+pub const COMMAND_CAPTURE_GAP: &str = "command-capture-gap";
+
 impl FilePreImageSource {
     /// False for records that reuse the FilePreImage wire without
     /// carrying the file's content: a chflags snapshot.

@@ -200,12 +200,11 @@ async fn handle_one(
             // then ack Allow. Acks are version-1 frames, which every shim
             // reads, so the old shim does not wait out its timeout.
             let command = peer_pid.and_then(|p| active.resolve_by_descendant(p));
-            let ts = crate::server::next_ts();
             if let Ok(frame) = encode_frame(&ShimAck::Allow) {
                 let _ = stream.write_all(&frame).await;
             }
             if let Some(command) = command {
-                journal_version_gap(&index, command, got, ts);
+                journal_version_gap(&index, command, got);
             }
             return Ok(());
         }
@@ -449,44 +448,36 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 /// version is writing for `command`, and none of its notifications can be
 /// read. Journal one capture-gap refusal per command, so undo says the
 /// command's changes were not captured instead of passing over them.
-fn journal_version_gap(
-    index: &Index,
-    command: shit_planner::events::CommandId,
-    got: u8,
-    ts: shit_planner::time::TimePoint,
-) {
+fn journal_version_gap(index: &Index, command: shit_planner::events::CommandId, got: u8) {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<std::collections::HashSet<shit_planner::events::CommandId>>> =
         OnceLock::new();
-    {
-        let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
-        if seen.len() > 4096 {
-            seen.clear();
-        }
-        if !seen.insert(command) {
-            return;
-        }
+    // Held across the write, and marked only once it succeeded (review
+    // of #232 medium review, item 5), so a failed write is retried on the
+    // old shim's next note.
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if seen.contains(&command) {
+        return;
     }
-    let cwd = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
-        .map(|r| r.cwd)
-        .unwrap_or_default();
-    let event = CaptureEvent {
-        id: EventId(0),
+    match crate::helper_link::journal_refusal(
+        index,
         command,
-        ts,
-        partial: false,
-        kind: CaptureEventKind::CaptureRefused {
-            class: "capture-gap".to_string(),
-            path: cwd,
-            detail: format!(
-                "shim from an older version (wire {got}, daemon expects {}); its changes were \
-                 not captured. Restart the shell to load the current shim",
-                shit_proto::SHIM_WIRE_VERSION
-            ),
-        },
-    };
-    if let Err(e) = index.put_event(&event) {
-        warn!(err = %e, %command, "shim version-gap refusal journal failed");
+        None,
+        shit_planner::COMMAND_CAPTURE_GAP,
+        format!(
+            "a shim from an older version (wire {got}, daemon expects {}) was loaded in this \
+             command's shell; none of its changes were captured. Restart the shell to load the \
+             current shim",
+            shit_proto::SHIM_WIRE_VERSION
+        ),
+    ) {
+        Ok(()) => {
+            if seen.len() >= 4096 {
+                seen.clear();
+            }
+            seen.insert(command);
+        }
+        Err(e) => warn!(err = %e, %command, "shim version-gap refusal journal failed"),
     }
 }
 
@@ -2323,7 +2314,7 @@ mod tests {
             matches!(
                 kinds.as_slice(),
                 [CaptureEventKind::CaptureRefused { class, detail, .. }]
-                    if class == "capture-gap" && detail.contains("Restart the shell")
+                    if class == shit_planner::COMMAND_CAPTURE_GAP && detail.contains("Restart the shell")
             ),
             "{kinds:#?}"
         );
@@ -2371,6 +2362,40 @@ mod tests {
             })
             .collect();
         assert_eq!(creates, vec![PathBuf::from("/tmp/shit-open/early")]);
+    }
+
+    /// Review of #232 medium review, item 5: a version-gap refusal whose
+    /// write failed (here the command row is not there yet) is written
+    /// on the next note, not skipped as already seen.
+    #[test]
+    fn failed_version_gap_write_is_retried() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let session = uuid::Uuid::from_u128(0x5eed);
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        journal_version_gap(&index, command, 1);
+        assert!(index.events_for_command(command).is_empty());
+        index
+            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("python3 x.py".into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: 1,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        journal_version_gap(&index, command, 1);
+        journal_version_gap(&index, command, 1);
+        assert_eq!(index.events_for_command(command).len(), 1);
     }
 
     #[test]

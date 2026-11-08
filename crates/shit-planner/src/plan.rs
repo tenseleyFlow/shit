@@ -1747,7 +1747,13 @@ fn emit_for_event(
                 op: InverseOp::Refuse {
                     class: class.clone(),
                     reason: format!("capture incomplete for {}: {}", path.display(), detail),
-                    remediation: Some(if class == "capture-gap" {
+                    remediation: Some(if class == crate::events::COMMAND_CAPTURE_GAP {
+                        // L5: the whole command, not one path.
+                        "shit could not capture some of this command's changes (the reason \
+                         is above), so undo cannot reverse them; check what the command \
+                         changed and undo those parts by hand."
+                            .to_string()
+                    } else if class == "capture-gap" {
                         // L5: an existing file was written without its
                         // bytes (over the inline cap, unreadable), or the
                         // shim's notes could not be read at all.
@@ -2492,6 +2498,41 @@ mod tests {
             .iter()
             .filter(|n| matches!(&n.op, InverseOp::Refuse { class, .. } if class == "capture-gap"))
             .count()
+    }
+
+    /// Review of #232 medium review, item 6: a command-scoped refusal reads
+    /// as one about the command, not about one path's earlier state.
+    #[test]
+    fn command_capture_gap_has_command_level_wording() {
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: crate::events::COMMAND_CAPTURE_GAP.into(),
+                path: PathBuf::from("/tmp"),
+                detail: "a shim from an older version".into(),
+            },
+        };
+        let p = plan(
+            dummy_command(),
+            &[ev],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        let [node] = p.nodes.as_slice() else {
+            panic!("{:#?}", p.nodes);
+        };
+        let InverseOp::Refuse { remediation, .. } = &node.op else {
+            panic!("{node:#?}");
+        };
+        let text = remediation.as_deref().unwrap();
+        assert!(text.contains("this command's changes"), "{text}");
+        assert!(!text.contains("this path"), "{text}");
     }
 
     #[test]

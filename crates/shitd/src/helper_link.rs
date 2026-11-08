@@ -1272,6 +1272,18 @@ pub(crate) fn journal_capture_refused(
     path: Option<PathBuf>,
     detail: String,
 ) -> Result<(), shit_store::IndexError> {
+    journal_refusal(index, command, path, "capture-incomplete", detail)
+}
+
+/// [`journal_capture_refused`] with an explicit refusal class. A missing
+/// `path` (command-scoped refusal) uses the command's cwd.
+pub(crate) fn journal_refusal(
+    index: &Index,
+    command: CommandId,
+    path: Option<PathBuf>,
+    class: &str,
+    detail: String,
+) -> Result<(), shit_store::IndexError> {
     let path = path
         .or_else(|| {
             <Index as shit_planner::PlannerStore>::command_by_id(index, command)
@@ -1284,7 +1296,7 @@ pub(crate) fn journal_capture_refused(
         ts: crate::server::next_ts(),
         partial: false,
         kind: CaptureEventKind::CaptureRefused {
-            class: "capture-incomplete".to_string(),
+            class: class.to_string(),
             path,
             detail,
         },
@@ -1297,23 +1309,15 @@ pub(crate) fn journal_capture_refused(
 /// Those notes are gone and the kernel tier may not have the Creates
 /// either, so the command gets a loud capture-gap refusal in every mode.
 fn journal_lost_deferred_creates(index: &Index, command: CommandId) {
-    let cwd = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
-        .map(|r| r.cwd)
-        .unwrap_or_default();
-    let event = CaptureEvent {
-        id: EventId(0),
+    if let Err(e) = journal_refusal(
+        index,
         command,
-        ts: crate::server::next_ts(),
-        partial: false,
-        kind: CaptureEventKind::CaptureRefused {
-            class: "capture-gap".to_string(),
-            path: cwd,
-            detail: "the shim left file creations to the kernel tier, which then stopped \
-                     watching this command; some created files may not be undone"
-                .to_string(),
-        },
-    };
-    if let Err(e) = index.put_event(&event) {
+        None,
+        shit_planner::COMMAND_CAPTURE_GAP,
+        "the shim left file creations to the kernel tier, which then stopped watching this \
+         command; some files it created may not be removed by undo"
+            .to_string(),
+    ) {
         tracing::error!(error = %e, %command, "lost-deferred-creates refusal journal failed");
     }
 }
@@ -2424,7 +2428,7 @@ mod tests_dispatch {
             assert!(
                 matches!(
                     kinds.as_slice(),
-                    [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-gap"
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == shit_planner::COMMAND_CAPTURE_GAP
                 ),
                 "{kinds:#?}"
             );
