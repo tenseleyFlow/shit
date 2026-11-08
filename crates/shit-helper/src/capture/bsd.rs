@@ -459,6 +459,9 @@ impl PumpState {
         // R3 slice B — kqueue fires after the write, so a pre-existing
         // file's only pre-write content is its live-baseline pre-image.
         // A tracked file absent from the attach listing was born.
+        if !is_delete {
+            ws.acct.note_written((dev, inode));
+        }
         if !is_delete && !ws.baselined.contains(&(dev, inode)) {
             ws.acct.note_missing(
                 (dev, inode),
@@ -563,10 +566,11 @@ impl PumpState {
             tracing::warn!(error = %e, "send_response_with_fd failed");
             ws.send_failures = ws.send_failures.saturating_add(1);
         } else if is_delete {
-            // A delete's fd still holds the bytes, so its capture is
-            // evidence. A write's is post-write content, and its
-            // evidence is the baseline pre-image checked above.
-            ws.acct.note_captured((dev, inode));
+            // A delete's fd still holds the bytes. They are evidence
+            // only if this command did not write the file first; a
+            // write's capture is post-write content, and its evidence
+            // is the baseline pre-image checked above.
+            ws.acct.note_delete_captured((dev, inode));
         }
         // Mark as captured. Don't insert a NEW key — we used or_insert
         // above; just update the invalidated flag based on Delete.
@@ -915,6 +919,7 @@ impl PumpState {
             tracing::trace!(fd, ?ft, "attrib on non-regular; skipping");
             return;
         }
+        ws.acct.note_written((dev, inode));
         let Some(after) = fstat_meta(fd) else {
             tracing::warn!(fd, "fstat_meta failed during attrib handling");
             ws.acct.note_missing(

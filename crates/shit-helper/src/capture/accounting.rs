@@ -82,6 +82,13 @@ pub struct CloseAccounting {
     born: BTreeSet<Id>,
     /// Identities with a pre-image or metadata capture on the wire.
     captured: BTreeSet<Id>,
+    /// Identities whose bytes a delete capture read from a held fd.
+    /// Evidence only if this command never wrote the identity: after a
+    /// write the fd holds post-write bytes.
+    delete_captured: BTreeSet<Id>,
+    /// Identities this command opened for write, wrote, or changed the
+    /// attributes of.
+    written: BTreeSet<Id>,
     lost: BTreeMap<Id, Observation>,
     unlocated: BTreeSet<Id>,
     /// Losses with no identity (an fstat that failed).
@@ -129,6 +136,23 @@ impl CloseAccounting {
 
     pub fn note_captured(&mut self, id: Id) {
         self.captured.insert(id);
+    }
+
+    /// A delete's capture went out, read from an fd that survives the
+    /// unlink. See [`Self::note_written`].
+    pub fn note_delete_captured(&mut self, id: Id) {
+        self.delete_captured.insert(id);
+    }
+
+    /// This command wrote `id` (or opened it for write, or changed its
+    /// attributes). A later delete capture of it holds post-write state.
+    pub fn note_written(&mut self, id: Id) {
+        self.written.insert(id);
+    }
+
+    fn has_evidence(&self, id: &Id) -> bool {
+        self.captured.contains(id)
+            || (self.delete_captured.contains(id) && !self.written.contains(id))
     }
 
     pub fn baseline_id_at(&self, path: &std::path::Path) -> Option<Id> {
@@ -217,13 +241,12 @@ impl CloseAccounting {
     /// `send_failures` is the producer's count of capture responses
     /// that never reached the daemon. `kernel_now` is the current value
     /// of the counter given to [`Self::mark_kernel_losses`].
-    pub fn close(self, send_failures: u32, kernel_now: Option<u64>) -> Vec<Observation> {
+    pub fn close(mut self, send_failures: u32, kernel_now: Option<u64>) -> Vec<Observation> {
         let mut out = Vec::new();
         let reason = self.incomplete_reason();
-        let mut lost: Vec<Observation> = self
-            .lost
+        let mut lost: Vec<Observation> = std::mem::take(&mut self.lost)
             .into_iter()
-            .filter(|(id, _)| !self.captured.contains(id))
+            .filter(|(id, _)| !self.has_evidence(id))
             .map(|(_, obs)| obs)
             .collect();
         let hidden = lost.len().saturating_sub(MAX_PATH_OBSERVATIONS);
@@ -240,7 +263,7 @@ impl CloseAccounting {
         let unlocated = self
             .unlocated
             .iter()
-            .filter(|id| !self.born.contains(id) && !self.captured.contains(id))
+            .filter(|id| !self.born.contains(id) && !self.has_evidence(id))
             .count();
         if unlocated > 0
             && let Some(reason) = reason
@@ -352,6 +375,20 @@ mod tests {
         a.note_missing((1, 10), true, None, "unlink race lost");
         a.note_captured((1, 10));
         assert!(a.close(0, None).is_empty());
+    }
+
+    #[test]
+    fn delete_capture_is_evidence_only_without_an_earlier_write() {
+        let mut a = walked();
+        a.note_missing((1, 10), true, None, "unlink race lost");
+        a.note_delete_captured((1, 10));
+        assert!(a.close(0, None).is_empty());
+
+        let mut a = walked();
+        a.note_written((1, 10));
+        a.note_missing((1, 10), true, None, "no snapshot");
+        a.note_delete_captured((1, 10));
+        assert_eq!(a.close(0, None).len(), 1);
     }
 
     #[test]

@@ -926,7 +926,7 @@ impl LinuxCaptureRuntime {
             tracing::warn!(error = %e, "lsm send_response failed");
             ws.note_silent_send_failure();
         } else if evidence {
-            ws.acct.note_captured((ev_dev_userspace, ev.inode));
+            ws.acct.note_delete_captured((ev_dev_userspace, ev.inode));
         }
         if !evidence {
             ws.acct.note_missing(
@@ -978,6 +978,7 @@ impl LinuxCaptureRuntime {
         let ws = self.watches.entry(ev.command).or_default();
 
         let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
+        ws.acct.note_written((ev_dev_userspace, ev.inode));
 
         // Dedupe — first capture per (dev, inode) wins. Important
         // for the open(O_WRONLY|O_TRUNC) path: file_open LSM fires
@@ -1526,6 +1527,7 @@ impl LinuxCaptureRuntime {
         if created_now {
             ws.acct.note_born((ev_dev, ev.inode));
         }
+        ws.acct.note_written((ev_dev, ev.inode));
 
         // Dedupe: first write-open per (dev, inode) per watch window.
         if !should_capture_dedupe(&ws.dedupe, (ev_dev, ev.inode)) {
@@ -1675,6 +1677,7 @@ impl LinuxCaptureRuntime {
         let ws = self.watches.entry(ev.command).or_default();
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
+        ws.acct.note_written((ev_dev, ev.inode));
 
         // Dedupe: another LSM handler may have already captured
         // for this (dev, inode) in this watch window. First handler
@@ -3476,6 +3479,40 @@ mod born_set_tests {
         std::fs::remove_file(&path).unwrap();
         rig.unlink(id, root, "kept");
         assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn delete_capture_after_a_write_does_not_clear_the_write_loss() {
+        // `echo new > f; rm f` on a pre-existing file with no snapshot:
+        // the unlink reads the held fd, which now holds the new bytes.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("f");
+        let id = Rig::id(&path);
+        rig.drop_snapshot(id);
+        std::fs::write(&path, b"new").unwrap();
+        rig.open(id, false);
+        rig.release(id);
+        std::fs::remove_file(&path).unwrap();
+        rig.unlink(id, root, "f");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("no pre-mutation snapshot"), "{obs:?}");
+    }
+
+    #[test]
+    fn delete_capture_after_a_write_does_not_clear_the_loss_in_any_order() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("f");
+        let id = Rig::id(&path);
+        rig.drop_snapshot(id);
+        std::fs::write(&path, b"new").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // The unlink reader runs first, then the open reader.
+        rig.unlink(id, root, "f");
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
     }
 
     #[test]
