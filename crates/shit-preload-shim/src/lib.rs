@@ -610,6 +610,36 @@ mod policy {
         target_os = "linux",
     ))]
     pub fn resolve_at_for_notify(dirfd: libc::c_int, path: &str, which_arg: &str) -> AtResolution {
+        resolve_at(dirfd, path, which_arg, canonical_path)
+    }
+
+    /// [`resolve_at_for_notify`] for an entry the call acts on itself
+    /// (a rename source or destination): the parent is canonicalized and
+    /// the final name kept, so a symlink is never replaced by its target.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn resolve_entry_at(dirfd: libc::c_int, path: &str, which_arg: &str) -> AtResolution {
+        resolve_at(dirfd, path, which_arg, canonical_entry_path)
+    }
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn resolve_at(
+        dirfd: libc::c_int,
+        path: &str,
+        which_arg: &str,
+        canon: fn(&str) -> Result<String, CanonicalizeError>,
+    ) -> AtResolution {
         let joined = join_at_path(dirfd, path);
         if !joined.starts_with('/') && dirfd != libc::AT_FDCWD {
             return AtResolution::Failed(
@@ -621,7 +651,7 @@ mod policy {
                 },
             );
         }
-        match canonical_path(&joined) {
+        match canon(&joined) {
             Ok(abs) => AtResolution::Resolved(abs),
             Err(CanonicalizeError::PathAndParentBothFailed { parent_err, .. })
                 if matches!(
@@ -689,8 +719,8 @@ mod policy {
         tofd: libc::c_int,
         to: &str,
     ) {
-        let f = resolve_at_for_notify(fromfd, from, "from");
-        let t = resolve_at_for_notify(tofd, to, "to");
+        let f = resolve_entry_at(fromfd, from, "from");
+        let t = resolve_entry_at(tofd, to, "to");
         match (f, t) {
             (AtResolution::Nothing, _) | (_, AtResolution::Nothing) => {}
             (AtResolution::Resolved(a), AtResolution::Resolved(b)) => {
@@ -762,8 +792,13 @@ mod policy {
         // marker. The syscall itself still flows through with the
         // raw user arg — we never block the user's command on a
         // capture issue.
-        let (from_abs, from_failure) = canonicalize_or_raw(from, "from");
-        let (to_abs, to_failure) = canonicalize_or_raw(to, "to");
+        //
+        // L5 (review round 5, item 3): rename acts on the entries
+        // themselves. Only the parents are canonicalized; resolving the
+        // final component would turn `mv link x` into a rename of the
+        // link's target.
+        let (from_abs, from_failure) = entry_or_raw(from, "from");
+        let (to_abs, to_failure) = entry_or_raw(to, "to");
         // Prefer the `from`-side failure when both arms tripped:
         // `from`'s pre-image is the load-bearing input for
         // RestoreContent, so its capture incompleteness is the more
@@ -1522,6 +1557,54 @@ mod policy {
                 };
                 (path.to_string(), Some(failure))
             }
+        }
+    }
+
+    /// L5 (review round 5, item 3): the absolute path of the entry
+    /// `path` names, with its parent canonicalized and its final name
+    /// kept as given, so a symlink stays the symlink. A final `.` or
+    /// `..`, or a trailing slash, names a directory through the path:
+    /// those resolve fully, as [`canonical_path`].
+    pub(super) fn canonical_entry_path(path: &str) -> Result<String, CanonicalizeError> {
+        use std::path::{Path, PathBuf};
+        let p = Path::new(path);
+        let (Some(name), Some(parent)) = (p.file_name(), p.parent()) else {
+            return canonical_path(path);
+        };
+        if path.ends_with('/') || path.ends_with("/.") || path == "." {
+            return canonical_path(path);
+        }
+        let parent_in = if parent.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            parent.to_path_buf()
+        };
+        match std::fs::canonicalize(&parent_in) {
+            Ok(parent_abs) => Ok(parent_abs.join(name).to_string_lossy().into_owned()),
+            Err(parent_err) => Err(CanonicalizeError::PathAndParentBothFailed {
+                path: path.to_string(),
+                path_err: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "not resolved: its parent did not resolve",
+                ),
+                parent: parent_in.to_string_lossy().into_owned(),
+                parent_err,
+            }),
+        }
+    }
+
+    /// [`canonicalize_or_raw`] with [`canonical_entry_path`].
+    fn entry_or_raw(path: &str, which_arg: &str) -> (String, Option<shit_proto::ShimFailure>) {
+        match canonical_entry_path(path) {
+            Ok(abs) => (abs, None),
+            Err(e) => (
+                path.to_string(),
+                Some(shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg: which_arg.to_string(),
+                    attempted_path: path.to_string(),
+                    error_chain: format!("{e}"),
+                }),
+            ),
         }
     }
 
