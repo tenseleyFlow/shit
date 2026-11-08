@@ -59,7 +59,7 @@ int BPF_PROG(shit_inode_rmdir, struct inode *dir, struct dentry *dentry)
     bpf_get_current_comm(&e->hdr.comm, sizeof(e->hdr.comm));
     struct task_struct *__t = (struct task_struct *)bpf_get_current_task();
     struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
-    e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
+    shit_fill_ancestry(&e->hdr, __parent);
 
     struct inode *target = BPF_CORE_READ(dentry, d_inode);
     e->inode = BPF_CORE_READ(target, i_ino);

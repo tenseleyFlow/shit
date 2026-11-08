@@ -87,59 +87,40 @@ impl TreeMap {
         resolved
     }
 
-    /// AR00.5 — like `is_tracked`, but uses a `parent_pid` value
-    /// captured AT BPF-hook-fire time (from the kernel's
-    /// `task->real_parent->tgid`) instead of walking `/proc/<pid>/stat`
-    /// at event-consume time.
+    /// Like `is_tracked`, but matches against the ancestry the BPF
+    /// program recorded at hook-fire time (`task->real_parent->tgid`,
+    /// then each tgid above it, nearest first; 0 past the top) instead
+    /// of walking `/proc/<pid>/stat` at event-consume time.
     ///
-    /// Why: the userspace ringbuf reader runs ASYNC wrt the syscall.
-    /// For short-lived subprocesses (rm, mv, chmod, mkdir, etc.)
-    /// the process exits between the kernel hook firing and the
-    /// reader thread consuming -- by then `/proc/<rm-pid>/stat` is
-    /// gone and the `/proc`-walk in `resolve()` returns None,
-    /// dropping the event. The smoke shell (a typical tracked root)
-    /// is still alive though, so matching the event's recorded
-    /// parent_pid against tracked roots closes the race for any
-    /// direct child of a tracked root -- which covers every smoke
-    /// in the matrix and the vast majority of real shell-spawned
-    /// commands.
+    /// The ringbuf reader runs async to the syscall. A short-lived tool
+    /// (rm, chmod, mkdir) has usually exited by the time its event is
+    /// consumed, and its `/proc` entry is gone. AR00.5 recorded only
+    /// the parent, which covers a direct child of the tracked shell.
+    /// A shell that forks for the last command of `sh -c '...'` (dash
+    /// on Ubuntu 24.04) puts the tool two levels down, and the `/proc`
+    /// walk then loses the race to the tool's exit (#209). Matching
+    /// every recorded ancestor closes it for trees up to the recorded
+    /// depth.
     ///
-    /// For pids more than one level deep (grandchildren and beyond)
-    /// the parent_pid alone isn't enough; we still fall back to the
-    /// classic `/proc` walk and may still lose those events. That's
-    /// a follow-up: deep-tree tracking needs either a BPF map of
-    /// active descendants populated via sched_process_fork, or a
-    /// bounded ancestor walk inside the BPF program itself.
-    pub fn is_tracked_with_parent(&mut self, pid: i32, parent_pid: i32) -> Option<(Uuid, u64)> {
+    /// Deeper trees still fall back to the `/proc` walk, first from the
+    /// pid, then from the topmost recorded ancestor, which is the one
+    /// most likely to still be alive.
+    pub fn is_tracked_with_ancestry(&mut self, pid: i32, ancestry: &[i32]) -> Option<(Uuid, u64)> {
         if let Some(cached) = self.pid_cache.get(&pid) {
             return *cached;
         }
-        // First check: is the event's pid itself a tracked root?
-        for ((s, seq), tree) in &self.trees {
-            if pid == tree.root_pid {
-                let resolved = Some((*s, *seq));
-                self.pid_cache.insert(pid, resolved);
-                return resolved;
-            }
-        }
-        // Second check: is the event's parent_pid (from BPF) a
-        // tracked root? Handles the canonical shell-spawns-tool case
-        // even when the tool has already exited.
-        if parent_pid > 0 {
-            for ((s, seq), tree) in &self.trees {
-                if parent_pid == tree.root_pid {
-                    let resolved = Some((*s, *seq));
-                    self.pid_cache.insert(pid, resolved);
-                    if let Some(tree) = self.trees.get_mut(&(*s, *seq)) {
-                        tree.members.insert(pid);
-                    }
-                    return resolved;
-                }
-            }
-        }
-        // Fall back to the /proc-walking resolver. Best-effort: if
-        // the pid has already exited, this returns None.
-        let resolved = self.resolve(pid);
+        // A 0 slot means the kernel walk ran past the top of the tree.
+        let recorded = ancestry
+            .iter()
+            .position(|&a| a <= 0)
+            .map_or(ancestry, |end| &ancestry[..end]);
+        let resolved = self
+            .root_in(std::iter::once(pid).chain(recorded.iter().copied()))
+            .or_else(|| self.resolve(pid))
+            .or_else(|| match recorded.last() {
+                Some(&top) if top > 1 => self.resolve(top),
+                _ => None,
+            });
         self.pid_cache.insert(pid, resolved);
         if let Some((s, seq)) = resolved
             && let Some(tree) = self.trees.get_mut(&(s, seq))
@@ -147,6 +128,18 @@ impl TreeMap {
             tree.members.insert(pid);
         }
         resolved
+    }
+
+    /// The first tracked tree whose root is one of `pids`.
+    fn root_in(&self, pids: impl Iterator<Item = i32>) -> Option<(Uuid, u64)> {
+        for p in pids {
+            for ((s, seq), tree) in &self.trees {
+                if p == tree.root_pid {
+                    return Some((*s, *seq));
+                }
+            }
+        }
+        None
     }
 
     /// Walk `/proc/<pid>/stat` up the parent chain looking for a
@@ -243,6 +236,84 @@ mod tests {
         let res = tm.is_tracked(i32::MAX);
         assert_eq!(res, None);
         assert_eq!(tm.pid_cache.get(&i32::MAX), Some(&None));
+    }
+
+    /// Pids no live process has, so the `/proc` fallback finds nothing
+    /// and only the recorded ancestry can attribute the event.
+    const GONE_CHILD: i32 = i32::MAX - 1;
+    const GONE_SH: i32 = i32::MAX - 2;
+    const ROOT: i32 = i32::MAX - 3;
+
+    #[test]
+    fn exited_grandchild_is_tracked_through_recorded_ancestry() {
+        // #209: `sh -c 'chmod 600 big'` under a shell that forks for the
+        // last command. Both chmod and sh are gone when the event is read.
+        let mut tm = TreeMap::new();
+        let s = Uuid::from_u128(209);
+        tm.watch(s, 1, ROOT);
+        assert_eq!(
+            tm.is_tracked_with_ancestry(GONE_CHILD, &[GONE_SH, ROOT, 0, 0]),
+            Some((s, 1))
+        );
+        assert!(tm.trees[&(s, 1)].members.contains(&GONE_CHILD));
+    }
+
+    #[test]
+    fn parent_alone_does_not_reach_a_grandparent_root() {
+        // The AR00.5 behavior this replaces: with only the parent
+        // recorded, an exited grandchild is dropped.
+        let mut tm = TreeMap::new();
+        let s = Uuid::from_u128(209);
+        tm.watch(s, 1, ROOT);
+        assert_eq!(tm.is_tracked_with_ancestry(GONE_CHILD, &[GONE_SH]), None);
+    }
+
+    #[test]
+    fn direct_child_and_root_are_tracked() {
+        let mut tm = TreeMap::new();
+        let s = Uuid::from_u128(1);
+        tm.watch(s, 3, ROOT);
+        assert_eq!(tm.is_tracked_with_ancestry(ROOT, &[0]), Some((s, 3)));
+        assert_eq!(
+            tm.is_tracked_with_ancestry(GONE_CHILD, &[ROOT, 1, 0]),
+            Some((s, 3))
+        );
+    }
+
+    #[test]
+    fn ancestry_stops_at_the_first_zero() {
+        // A 0 slot means the walk ran past the top. Anything after it is
+        // not ancestry and must not match.
+        let mut tm = TreeMap::new();
+        let s = Uuid::from_u128(2);
+        tm.watch(s, 1, ROOT);
+        assert_eq!(
+            tm.is_tracked_with_ancestry(GONE_CHILD, &[GONE_SH, 0, ROOT]),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_ancestry_is_untracked() {
+        let mut tm = TreeMap::new();
+        tm.watch(Uuid::from_u128(3), 1, ROOT);
+        assert_eq!(
+            tm.is_tracked_with_ancestry(GONE_CHILD, &[GONE_SH, 1, 0, 0]),
+            None
+        );
+    }
+
+    #[test]
+    fn live_process_deeper_than_the_recorded_ancestry_uses_proc() {
+        // This test process is alive and its parent chain reaches the
+        // test runner's parent, so the /proc fallback finds that root
+        // even though no recorded ancestor matches.
+        let me = std::process::id() as i32;
+        let parent = parent_pid(me).expect("own ppid");
+        let mut tm = TreeMap::new();
+        let s = Uuid::from_u128(4);
+        tm.watch(s, 1, parent);
+        assert_eq!(tm.is_tracked_with_ancestry(me, &[GONE_SH, 0]), Some((s, 1)));
     }
 
     #[test]

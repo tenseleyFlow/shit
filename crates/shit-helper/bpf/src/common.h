@@ -77,10 +77,16 @@ enum shit_event_kind {
  * `/proc` entries are then gone and a `/proc`-based ancestry walk
  * fails. The smoke shell (the WatchTree root_pid) is still alive,
  * so checking `parent_pid` directly against the tracked root closes
- * the race for any direct child of the tracked root. Deeper trees
- * (grandchildren and beyond) still need the slow `/proc` walk as a
- * fallback, but most CLI tools spawned by a shell are direct
- * children. */
+ * the race for any direct child of the tracked root.
+ *
+ * ancestors: the tgids above parent_pid, nearest first
+ * (grandparent, great-grandparent, ...), read at hook-fire time like
+ * parent_pid. `sh -c 'chmod ...'` on a shell that forks for the last
+ * command puts chmod two levels below the tracked root; by the time
+ * the reader consumes the event, chmod and often sh are gone and the
+ * /proc walk fails (#209). Slots past the top of the tree read 0. */
+#define SHIT_ANCESTRY_DEPTH 8
+
 struct shit_event_hdr {
     __u8  kind;
     __u8  _pad[3];
@@ -89,7 +95,23 @@ struct shit_event_hdr {
     __u32 parent_pid;
     __u64 ts_ns;
     char  comm[SHIT_COMM_LEN];
+    __u32 ancestors[SHIT_ANCESTRY_DEPTH];
 };
+
+/* Fill parent_pid and ancestors from the current task's parent.
+ * bpf_probe_read_kernel zero-fills on a failed read, so a NULL link
+ * yields 0 for that slot and every slot above it. */
+static __always_inline void shit_fill_ancestry(struct shit_event_hdr *h,
+                                               struct task_struct *parent)
+{
+    h->parent_pid = BPF_CORE_READ(parent, tgid);
+    struct task_struct *t = parent;
+#pragma unroll
+    for (int i = 0; i < SHIT_ANCESTRY_DEPTH; i++) {
+        t = BPF_CORE_READ(t, real_parent);
+        h->ancestors[i] = BPF_CORE_READ(t, tgid);
+    }
+}
 
 /* Max bytes captured for a file's basename. Matches kernel NAME_MAX.
  * Used as the buffer size in `shit_unlink_event::name`. We do NOT

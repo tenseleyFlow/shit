@@ -84,7 +84,7 @@ int BPF_PROG(shit_inode_unlink, struct inode *dir, struct dentry *dentry)
      * `parent` variable round-trips through bpf_probe_read fine. */
     struct task_struct *__t = (struct task_struct *)bpf_get_current_task();
     struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
-    e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
+    shit_fill_ancestry(&e->hdr, __parent);
 
     /* Body — read (dev, inode) via CO-RE so the program stays
      * portable across kernels whose struct layouts differ. */

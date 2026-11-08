@@ -73,7 +73,7 @@ int BPF_PROG(shit_file_open, struct file *file)
     /* AR00.5 ancestry — see inode_unlink.bpf.c for rationale. */
     struct task_struct *__t = (struct task_struct *)bpf_get_current_task();
     struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
-    e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
+    shit_fill_ancestry(&e->hdr, __parent);
 
     /* f_inode is populated for any file-backed struct file. For anon inodes,
      * FIFOs and devices, the userspace snapshot lookup misses.

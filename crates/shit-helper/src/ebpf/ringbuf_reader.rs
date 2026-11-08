@@ -16,7 +16,7 @@
 //! Wire layout — must stay byte-identical with `bpf/src/common.h`:
 //!
 //! ```text
-//! shit_event_hdr     (40 bytes)
+//! shit_event_hdr     (72 bytes)
 //!   u8  kind              offset  0
 //!   u8  _pad[3]           offset  1
 //!   u32 pid               offset  4
@@ -24,14 +24,15 @@
 //!   u32 parent_pid        offset 12   (task->real_parent->tgid)
 //!   u64 ts_ns             offset 16
 //!   u8  comm[16]          offset 24
-//! shit_unlink_event  (328 bytes total)
+//!   u32 ancestors[8]      offset 40   (grandparent upward, 0 past the top)
+//! shit_unlink_event  (360 bytes total)
 //!   shit_event_hdr hdr    offset   0
-//!   u64 dev               offset  40
-//!   u64 inode             offset  48
-//!   u64 parent_inode      offset  56
-//!   u32 name_len          offset  64
-//!   u32 _pad3             offset  68
-//!   u8  name[256]         offset  72  (NAME_MAX+1, NUL-terminated)
+//!   u64 dev               offset  72
+//!   u64 inode             offset  80
+//!   u64 parent_inode      offset  88
+//!   u32 name_len          offset  96
+//!   u32 _pad3             offset 100
+//!   u8  name[256]         offset 104  (NAME_MAX+1, NUL-terminated)
 //! ```
 //!
 //! Lifetime model: the reader owns a `RingBuf<MapData>` (taken from
@@ -66,9 +67,31 @@ pub struct EventHeader {
     pub parent_pid: u32,
     pub ts_ns: u64,
     pub comm: [u8; 16],
+    /// Tgids above `parent_pid`, nearest first, read at hook-fire
+    /// time. 0 past the top of the tree. Lets a grandchild of the
+    /// tracked root be attributed after it and its parent have exited
+    /// (#209: `sh -c 'chmod ...'` forks chmod under sh).
+    pub ancestors: [u32; ANCESTRY_DEPTH],
 }
 
-const _: () = assert!(std::mem::size_of::<EventHeader>() == 40);
+/// Ancestors above the parent that the BPF programs record. Mirrors
+/// `SHIT_ANCESTRY_DEPTH` in common.h.
+pub const ANCESTRY_DEPTH: usize = 8;
+
+const _: () = assert!(std::mem::size_of::<EventHeader>() == 72);
+
+impl EventHeader {
+    /// The event task's ancestry as recorded by BPF: parent first,
+    /// then each tgid above it.
+    pub fn ancestry(&self) -> [i32; ANCESTRY_DEPTH + 1] {
+        let mut out = [0i32; ANCESTRY_DEPTH + 1];
+        out[0] = self.parent_pid as i32;
+        for (slot, a) in out[1..].iter_mut().zip(self.ancestors) {
+            *slot = a as i32;
+        }
+        out
+    }
+}
 
 /// `kind` values, matching `enum shit_event_kind` in common.h.
 pub mod kind {
@@ -117,7 +140,7 @@ pub struct UnlinkEvent {
     pub name: [u8; NAME_BUF_LEN],
 }
 
-const _: () = assert!(std::mem::size_of::<UnlinkEvent>() == 328);
+const _: () = assert!(std::mem::size_of::<UnlinkEvent>() == 360);
 
 impl Default for UnlinkEvent {
     fn default() -> Self {
@@ -179,7 +202,7 @@ pub struct SetattrEvent {
     pub new_size: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 104);
+const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 136);
 
 /// `lsm/inode_mkdir` event — mirrors `struct shit_mkdir_event`.
 /// Captures the parent directory's (dev, inode), the basename of
@@ -198,7 +221,7 @@ pub struct MkdirEvent {
     pub name: [u8; NAME_BUF_LEN],
 }
 
-const _: () = assert!(std::mem::size_of::<MkdirEvent>() == 320);
+const _: () = assert!(std::mem::size_of::<MkdirEvent>() == 352);
 
 impl Default for MkdirEvent {
     fn default() -> Self {
@@ -245,7 +268,7 @@ pub struct CreateEvent {
     pub name: [u8; NAME_BUF_LEN],
 }
 
-const _: () = assert!(std::mem::size_of::<CreateEvent>() == 320);
+const _: () = assert!(std::mem::size_of::<CreateEvent>() == 352);
 
 impl Default for CreateEvent {
     fn default() -> Self {
@@ -292,7 +315,7 @@ pub struct OpenEvent {
     pub f_flags: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<OpenEvent>() == 64);
+const _: () = assert!(std::mem::size_of::<OpenEvent>() == 96);
 
 /// `lsm/file_release` event — same C-struct shape as
 /// [`OpenEvent`], discriminated by `kind::RELEASE`. Fires when the
@@ -311,7 +334,7 @@ pub struct ReleaseEvent {
     pub f_flags: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 64);
+const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 96);
 
 /// `lsm/inode_rename` event — mirrors `struct shit_rename_event`.
 /// Carries both ends of the rename. `dev`/`inode` are the target's
@@ -330,7 +353,7 @@ pub struct RenameEvent {
     pub new_name: [u8; NAME_BUF_LEN],
 }
 
-const _: () = assert!(std::mem::size_of::<RenameEvent>() == 592);
+const _: () = assert!(std::mem::size_of::<RenameEvent>() == 624);
 
 impl Default for RenameEvent {
     fn default() -> Self {
@@ -484,7 +507,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm unlink event");
             return;
@@ -515,7 +538,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm rmdir event");
             return;
@@ -544,7 +567,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm release event");
             return;
@@ -569,7 +592,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm setattr event");
             return;
@@ -601,7 +624,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm mkdir event");
             return;
@@ -627,7 +650,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm create event");
             return;
@@ -654,7 +677,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm open event");
             return;
@@ -679,7 +702,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm rename event");
             return;
@@ -1646,14 +1669,14 @@ mod tests {
     }
 
     #[test]
-    fn header_layout_is_40_bytes() {
-        assert_eq!(std::mem::size_of::<EventHeader>(), 40);
+    fn header_layout_is_72_bytes() {
+        assert_eq!(std::mem::size_of::<EventHeader>(), 72);
         assert_eq!(std::mem::align_of::<EventHeader>(), 8);
     }
 
     #[test]
-    fn unlink_event_layout_is_328_bytes() {
-        assert_eq!(std::mem::size_of::<UnlinkEvent>(), 328);
+    fn unlink_event_layout_is_360_bytes() {
+        assert_eq!(std::mem::size_of::<UnlinkEvent>(), 360);
         assert_eq!(std::mem::align_of::<UnlinkEvent>(), 8);
     }
 
@@ -1668,6 +1691,7 @@ mod tests {
                 pid: 12345,
                 tgid: 12345,
                 parent_pid: 0,
+                ancestors: [0; ANCESTRY_DEPTH],
                 ts_ns: 0xdead_beef_cafe_babe,
                 comm: *b"rm\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
             },
@@ -1678,7 +1702,7 @@ mod tests {
             _pad3: 0,
             name: name_buf,
         };
-        let bytes: [u8; 328] = unsafe { std::mem::transmute(original) };
+        let bytes: [u8; 360] = unsafe { std::mem::transmute(original) };
         let decoded = decode_unlink(&bytes).expect("decode");
         assert_eq!(decoded.hdr.kind, kind::UNLINK);
         assert_eq!(decoded.hdr.pid, 12345);
@@ -1693,7 +1717,7 @@ mod tests {
 
     #[test]
     fn decode_unlink_rejects_short_record() {
-        let bytes = [0u8; 32]; // shorter than the 328-byte struct
+        let bytes = [0u8; 32]; // shorter than the 360-byte struct
         assert!(decode_unlink(&bytes).is_none());
     }
 
@@ -1725,8 +1749,8 @@ mod tests {
     }
 
     #[test]
-    fn setattr_event_layout_is_104_bytes() {
-        assert_eq!(std::mem::size_of::<SetattrEvent>(), 104);
+    fn setattr_event_layout_is_136_bytes() {
+        assert_eq!(std::mem::size_of::<SetattrEvent>(), 136);
         assert_eq!(std::mem::align_of::<SetattrEvent>(), 8);
     }
 
@@ -1739,6 +1763,7 @@ mod tests {
                 pid: 7777,
                 tgid: 7777,
                 parent_pid: 0,
+                ancestors: [0; ANCESTRY_DEPTH],
                 ts_ns: 0x1122_3344_5566_7788,
                 comm: *b"chmod\0\0\0\0\0\0\0\0\0\0\0",
             },
@@ -1755,7 +1780,7 @@ mod tests {
             old_size: 1024,
             new_size: 0,
         };
-        let bytes: [u8; 104] = unsafe { std::mem::transmute(original) };
+        let bytes: [u8; 136] = unsafe { std::mem::transmute(original) };
         let decoded = decode_setattr(&bytes).expect("decode");
         assert_eq!(decoded.hdr.kind, kind::SETATTR);
         assert_eq!(decoded.attr_valid, attr::MODE);
@@ -1766,15 +1791,31 @@ mod tests {
     }
 
     #[test]
+    fn ancestry_decodes_from_the_wire_offsets() {
+        // common.h: parent_pid at 12, ancestors[8] at 40, header 72.
+        let mut bytes = [0u8; 136];
+        bytes[0] = kind::SETATTR;
+        bytes[4..8].copy_from_slice(&300u32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&300u32.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&200u32.to_ne_bytes());
+        bytes[40..44].copy_from_slice(&100u32.to_ne_bytes());
+        bytes[44..48].copy_from_slice(&1u32.to_ne_bytes());
+        bytes[72..80].copy_from_slice(&0x802u64.to_ne_bytes());
+        let decoded = decode_setattr(&bytes).expect("decode");
+        assert_eq!(decoded.hdr.ancestry(), [200, 100, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(decoded.dev, 0x802);
+    }
+
+    #[test]
     fn decode_setattr_rejects_unlink_kind() {
-        let mut bytes = [0u8; 104];
+        let mut bytes = [0u8; 136];
         bytes[0] = kind::UNLINK;
         assert!(decode_setattr(&bytes).is_none());
     }
 
     #[test]
-    fn mkdir_event_layout_is_320_bytes() {
-        assert_eq!(std::mem::size_of::<MkdirEvent>(), 320);
+    fn mkdir_event_layout_is_352_bytes() {
+        assert_eq!(std::mem::size_of::<MkdirEvent>(), 352);
         assert_eq!(std::mem::align_of::<MkdirEvent>(), 8);
     }
 
@@ -1789,6 +1830,7 @@ mod tests {
                 pid: 999,
                 tgid: 999,
                 parent_pid: 0,
+                ancestors: [0; ANCESTRY_DEPTH],
                 ts_ns: 0xfedc_ba98_7654_3210,
                 comm: *b"mkdir\0\0\0\0\0\0\0\0\0\0\0",
             },
@@ -1798,7 +1840,7 @@ mod tests {
             name_len: 3,
             name: name_buf,
         };
-        let bytes: [u8; 320] = unsafe { std::mem::transmute(original) };
+        let bytes: [u8; 352] = unsafe { std::mem::transmute(original) };
         let decoded = decode_mkdir(&bytes).expect("decode");
         assert_eq!(decoded.hdr.kind, kind::MKDIR);
         assert_eq!(decoded.parent_inode, 42);
