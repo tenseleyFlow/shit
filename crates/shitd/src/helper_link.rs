@@ -1000,6 +1000,20 @@ fn dispatch_response(
                 drop(staging); // close helper's post-write fd; we don't need it
                 return;
             }
+            // R3 slice B — kqueue captures after the write, and the
+            // baseline that held the pre-write bytes never made it into
+            // the store. The journaled bytes below are post-write.
+            if !is_delete && live_baseline.ingest_failed(dev, inode) {
+                note_ingest_failure(
+                    strict_capture,
+                    index,
+                    cmd,
+                    format!(
+                        "the baseline pre-image of {} could not be ingested before it was written",
+                        path.as_deref().unwrap_or("a file")
+                    ),
+                );
+            }
             if let Err(e) = handle_captured_pre_image(
                 CapturedPreImageArgs {
                     session,
@@ -1049,9 +1063,10 @@ fn dispatch_response(
         } => {
             let Some(staging) = fd else {
                 tracing::error!(%session, dev, inode, "BaselineCaptured missing SCM_RIGHTS fd");
+                live_baseline.mark_ingest_failed(dev, inode);
                 return;
             };
-            if let Err(e) = handle_baseline_captured(
+            let ingested = handle_baseline_captured(
                 session,
                 std::path::PathBuf::from(&cwd),
                 dev,
@@ -1063,8 +1078,13 @@ fn dispatch_response(
                 blob_store,
                 index,
                 live_baseline,
-            ) {
-                tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
+            );
+            match ingested {
+                Ok(_) => live_baseline.clear_ingest_failed(dev, inode),
+                Err(e) => {
+                    tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
+                    live_baseline.mark_ingest_failed(dev, inode);
+                }
             }
         }
         HelperResponse::BaselineWalkComplete {
@@ -2074,6 +2094,80 @@ mod tests_dispatch {
         let rows = refusal_details(&index, cmd);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].1.contains("without its staging fd"), "{rows:?}");
+    }
+
+    /// Review round 2, item 2: the BSD helper counts a file as baselined
+    /// once its BaselineCaptured is sent. If the daemon then fails to
+    /// ingest it, the write that follows has no pre-write content, and
+    /// strict mode must refuse the writing command.
+    #[test]
+    fn failed_baseline_ingest_refuses_the_write_only_in_strict_mode() {
+        for strict in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cmd = CommandId {
+                session: Uuid::from_u128(5),
+                seq: 3,
+            };
+            let index = index_with_command(dir.path(), cmd);
+            let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+            let map = crate::watch_ready::WatchReadyMap::new();
+            let baseline = crate::baseline::LiveBaseline::new();
+            let waiters = PrivOpWaiters::default();
+            let send = |resp: HelperResponse, fd: Option<OwnedFd>| {
+                dispatch_response(
+                    resp, fd, &index, &blobs, &map, &baseline, "kqueue", &waiters, strict,
+                );
+            };
+            // BaselineCaptured without its fd: not ingested.
+            send(
+                HelperResponse::BaselineCaptured {
+                    session: cmd.session,
+                    cwd: "/tmp/watched".into(),
+                    dev: 1,
+                    inode: 7,
+                    path: "/tmp/watched/f".into(),
+                    blob_hash: [0u8; 32],
+                    stored_bytes: 3,
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    mtime_unix_nanos: 0,
+                    xattrs: Default::default(),
+                    fd_sent_via_scm: true,
+                },
+                None,
+            );
+            let post = b"new";
+            let claimed: [u8; 32] = *blobs.put(post).unwrap().0.as_bytes();
+            send(
+                HelperResponse::CapturedPreImage {
+                    session: cmd.session,
+                    seq: cmd.seq,
+                    dev: 1,
+                    inode: 7,
+                    path: Some("/tmp/watched/f".into()),
+                    blob_hash: claimed,
+                    stored_bytes: post.len() as u64,
+                    post_content_hash: Some(claimed),
+                    mode: 0o100644,
+                    uid: 0,
+                    gid: 0,
+                    mtime_unix_nanos: 0,
+                    xattrs: Default::default(),
+                    flags: 0,
+                    is_delete: false,
+                    fd_sent_via_scm: true,
+                },
+                Some(tmp_staging_fd(post)),
+            );
+            let rows = refusal_details(&index, cmd);
+            if strict {
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                assert!(rows[0].1.contains("baseline"), "{rows:?}");
+            } else {
+                assert!(rows.is_empty(), "{rows:?}");
+            }
+        }
     }
 
     fn tmp_staging_fd(content: &[u8]) -> OwnedFd {

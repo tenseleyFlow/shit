@@ -244,11 +244,38 @@ impl BaselineCacheEntry {
 #[derive(Default)]
 pub struct LiveBaseline {
     by_cwd: RwLock<HashMap<PathBuf, Arc<BaselineCacheEntry>>>,
+    /// R3 slice B — `(dev, inode)` whose BaselineCaptured the daemon
+    /// could not ingest. The helper already counts them as baselined,
+    /// so a later write has no pre-write content anywhere.
+    ingest_failed: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 impl LiveBaseline {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that the baseline for `(dev, inode)` was not ingested.
+    pub fn mark_ingest_failed(&self, dev: u64, inode: u64) {
+        self.ingest_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((dev, inode));
+    }
+
+    /// A later baseline for `(dev, inode)` was ingested.
+    pub fn clear_ingest_failed(&self, dev: u64, inode: u64) {
+        self.ingest_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(dev, inode));
+    }
+
+    pub fn ingest_failed(&self, dev: u64, inode: u64) -> bool {
+        self.ingest_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(dev, inode))
     }
 
     /// Get or create the cache entry for `cwd`. Newly-created
