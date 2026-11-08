@@ -1573,3 +1573,25 @@ fn scratch_file_moved_then_removed_in_existing_dir_leaves_no_stray() {
     sim.rm_rf("d/x");
     assert_restored(&sim, &before);
 }
+
+#[test]
+fn scratch_file_carried_by_its_dirs_rename_then_removed_leaves_nothing() {
+    // Review round 4, item 4: `mkdir w; echo x > w/t; mv w w2; rm -rf w2`.
+    // w/t moved with its directory, not by a rename of its own; it is
+    // still scratch.
+    let mut sim = Sim::new();
+    sim.seed_file("keep", b"k\n", 0o644);
+    let before = sim.snapshot();
+    sim.mkdir("w");
+    sim.write("w/t", b"x\n");
+    sim.mv("w", "w2");
+    sim.rm_rf("w2");
+    let nodes = sim.plan_nodes();
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::inverse::InverseOp::RestoreContent { .. })),
+        "{nodes:#?}"
+    );
+    assert_restored(&sim, &before);
+}
