@@ -88,12 +88,34 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
         wire_to_planner(outcome)
     }
 
-    fn mknod(&self, path: &Path, mode: u32, dev: u64) -> PlannerOutcome {
+    fn mknod(
+        &self,
+        path: &Path,
+        mode: u32,
+        dev: u64,
+        device: Option<&shit_planner::DeviceNode>,
+    ) -> PlannerOutcome {
         // AU22 / DR-15.1 — Fifo/Socket dispatch through the helper
         // (which calls libc::mknod with the S_IFIFO/S_IFSOCK |
-        // perm_bits composite). BlockDevice/CharDevice still
-        // return PermissionDenied at the helper since the standard
-        // capset doesn't include CAP_SYS_ADMIN (deferred DR-15.2).
+        // perm_bits composite). L4b - BlockDevice/CharDevice carry the
+        // journaled capture and the helper's token back; the helper
+        // checks the token against every field before it acts.
+        // A capture without a token is refused by the executor before
+        // it gets here; none is sent if one slips through.
+        let device = device.and_then(|d| {
+            d.token.map(|t| shit_proto::DeviceEvidence {
+                uid: d.uid,
+                gid: d.gid,
+                dev: d.inode.dev,
+                inode: d.inode.inode,
+                session: d.removed_by.session,
+                command_seq: d.removed_by.seq,
+                token: shit_proto::CaptureToken {
+                    helper: t.helper,
+                    mac: t.mac,
+                },
+            })
+        });
         let seq = self.next_seq();
         let req = HelperRequest::ApplyMknod {
             session: self.session,
@@ -101,6 +123,7 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
             path: path.to_string_lossy().into_owned(),
             mode,
             dev,
+            device,
         };
         let outcome = self
             .helper
@@ -137,10 +160,16 @@ impl PrivilegedOpRouter for EitherRouter {
             EitherRouter::NoOp(r) => r.chown(path, uid, gid, no_dereference),
         }
     }
-    fn mknod(&self, path: &Path, mode: u32, dev: u64) -> PlannerOutcome {
+    fn mknod(
+        &self,
+        path: &Path,
+        mode: u32,
+        dev: u64,
+        device: Option<&shit_planner::DeviceNode>,
+    ) -> PlannerOutcome {
         match self {
-            EitherRouter::Helper(r) => r.mknod(path, mode, dev),
-            EitherRouter::NoOp(r) => r.mknod(path, mode, dev),
+            EitherRouter::Helper(r) => r.mknod(path, mode, dev, device),
+            EitherRouter::NoOp(r) => r.mknod(path, mode, dev, device),
         }
     }
 }
@@ -151,6 +180,8 @@ fn wire_to_planner(w: WireOutcome) -> PlannerOutcome {
         WireOutcome::OutOfScope => PlannerOutcome::OutOfScope,
         WireOutcome::PermissionDenied => PlannerOutcome::PermissionDenied,
         WireOutcome::NotFound => PlannerOutcome::NotFound,
+        WireOutcome::Conflict { detail } => PlannerOutcome::Conflict { detail },
+        WireOutcome::Refused { reason } => PlannerOutcome::Refused { reason },
         WireOutcome::Failed { err } => PlannerOutcome::Failed { err },
     }
 }
@@ -176,6 +207,14 @@ mod tests {
         assert_eq!(
             wire_to_planner(WireOutcome::NotFound),
             PlannerOutcome::NotFound
+        );
+        assert_eq!(
+            wire_to_planner(WireOutcome::Conflict { detail: "c".into() }),
+            PlannerOutcome::Conflict { detail: "c".into() }
+        );
+        assert_eq!(
+            wire_to_planner(WireOutcome::Refused { reason: "r".into() }),
+            PlannerOutcome::Refused { reason: "r".into() }
         );
         assert_eq!(
             wire_to_planner(WireOutcome::Failed { err: "x".into() }),

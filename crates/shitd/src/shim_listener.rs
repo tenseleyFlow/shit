@@ -276,14 +276,19 @@ async fn handle_one(
     Ok(())
 }
 
-/// Kind and mode of an unlink target, read before the syscall runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Kind, mode and identity of an unlink target, read before the syscall
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UnlinkStat {
     kind: FileKind,
     mode: u32,
-    /// The removed entry's identity, when the shim read it before the
-    /// call (L5 review round 3, item 5).
+    /// The removed entry's identity, when it is known: the shim's
+    /// pre-call stat for a post-call removal (L5), `(st_dev, st_ino)` for
+    /// a block/char node so the shim's report pairs with the helper's
+    /// `DeviceNodeMeta` (L4b). `None` keeps the wire's `(0, 0)` sentinel.
     inode: Option<InodeRef>,
+    /// The link's target when the entry is a symlink (L4b).
+    link_target: Option<String>,
 }
 
 /// L5 — removals the shim reports after they succeeded: `rmdir` and
@@ -294,11 +299,15 @@ fn is_post_call_removal(syscall: &str) -> bool {
 }
 
 /// lstat the target of a shim `unlink`/`unlinkat` so the journaled
-/// `TreeOp::Unlink` carries the real kind and mode. Without it an
+/// event carries the real kind and mode. Without it an
 /// `unlinkat(AT_REMOVEDIR)` lands as a Regular unlink and undo's
 /// RecreatePath makes a file where a directory was, which then breaks
 /// every child restore under it (ENOTDIR). Directories, regular files,
-/// fifos and sockets are reported; anything else keeps the wire default.
+/// fifos, sockets and block/char nodes are reported (the device number
+/// comes from the helper's `DeviceNodeMeta`, not from here); a symlink
+/// is reported with its target so undo recreates the link. The shim's
+/// own pre-call lstat (`pre_stat`) is preferred; the daemon's lstat is
+/// the fallback for a shim that did not send one.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat")
@@ -315,41 +324,81 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
                 kind,
                 mode: s.mode,
                 inode: Some(InodeRef::new(s.dev, s.inode)),
+                link_target: None,
             })
         });
     }
     if !Path::new(&note.arg).is_absolute() {
         return None;
     }
-    let meta = match std::fs::symlink_metadata(&note.arg) {
-        Ok(m) => m,
-        Err(e) => {
-            debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
-            return None;
-        }
+    let (dev, ino, mode, shim_target) = match &note.pre_stat {
+        Some(st) => (st.dev, st.inode, st.mode, st.link_target.clone()),
+        None => match std::fs::symlink_metadata(&note.arg) {
+            Ok(m) => (m.dev(), m.ino(), m.mode(), None),
+            Err(e) => {
+                debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
+                return None;
+            }
+        },
     };
-    let kind = FileKind::from_mode(meta.mode()).filter(|k| {
-        matches!(
-            k,
-            FileKind::Directory | FileKind::Regular | FileKind::Fifo | FileKind::Socket
-        )
-    })?;
+    let kind = FileKind::from_mode(mode)?;
+    if kind == FileKind::Symlink {
+        // The shim's target, read before the call; else the daemon's
+        // read now. An empty target means unknown (no symlink can have
+        // one): the planner then refuses rather than make a regular file.
+        let target = shim_target
+            .or_else(|| {
+                std::fs::read_link(&note.arg)
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        return Some(UnlinkStat {
+            kind,
+            mode,
+            inode: None,
+            link_target: Some(target),
+        });
+    }
+    if !matches!(
+        kind,
+        FileKind::Directory
+            | FileKind::Regular
+            | FileKind::Fifo
+            | FileKind::Socket
+            | FileKind::BlockDevice
+            | FileKind::CharDevice
+    ) {
+        return None;
+    }
+    let inode = matches!(kind, FileKind::BlockDevice | FileKind::CharDevice)
+        .then(|| InodeRef::new(dev, ino));
     Some(UnlinkStat {
         kind,
-        mode: meta.mode(),
-        inode: None,
+        mode,
+        inode,
+        link_target: None,
     })
 }
 
-/// Overlay a pre-syscall lstat onto a classified shim Unlink.
+/// Overlay a pre-syscall lstat onto a classified shim Unlink. A removed
+/// symlink becomes `SymlinkRemoved`, whose inverse recreates the link.
 fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> CaptureEventKind {
     match (kind, stat) {
+        (
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }),
+            Some(UnlinkStat {
+                link_target: Some(target),
+                ..
+            }),
+        ) => CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target, path }),
         (
             CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path, .. }),
             Some(UnlinkStat {
                 kind,
                 mode,
                 inode: shim_inode,
+                ..
             }),
         ) => CaptureEventKind::TreeOp(TreeOp::Unlink {
             inode: shim_inode.unwrap_or(inode),
@@ -919,6 +968,7 @@ fn relative_tree_path(kind: &CaptureEventKind) -> Option<PathBuf> {
         | TreeOp::SymlinkRemoved { path, .. } => vec![path],
         TreeOp::Rename { from, to, .. } => vec![from, to],
         TreeOp::Link { target, .. } => vec![target],
+        TreeOp::DeviceNodeMeta { path, .. } => vec![path],
     };
     paths
         .into_iter()
@@ -1701,7 +1751,18 @@ mod tests {
         let f = pre_syscall_unlink_stat(&note("unlink", &file)).expect("file stat");
         assert_eq!(f.kind, FileKind::Regular);
         assert_eq!(f.mode & 0o7777, 0o600);
-        assert_eq!(pre_syscall_unlink_stat(&note("unlinkat", &link)), None);
+        // A char node reports its kind (stat only; /dev/null is not
+        // touched).
+        let n = pre_syscall_unlink_stat(&note("unlink", Path::new("/dev/null")))
+            .expect("char device stat");
+        assert_eq!(n.kind, FileKind::CharDevice);
+        // L4b: a symlink reports its target, and only device nodes
+        // carry an identity.
+        let l = pre_syscall_unlink_stat(&note("unlinkat", &link)).expect("symlink stat");
+        assert_eq!(l.kind, FileKind::Symlink);
+        assert_eq!(l.link_target.as_deref(), Some(file.to_str().unwrap()));
+        assert_eq!(f.inode, None);
+        assert!(n.inode.is_some_and(|i| i != InodeRef::new(0, 0)));
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", &tmp.path().join("gone"))),
             None
@@ -1710,6 +1771,124 @@ mod tests {
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", Path::new("relative"))),
             None
+        );
+    }
+
+    /// L4b: the shim's `unlink` of a symlink journals a
+    /// `SymlinkRemoved` for the link's own path with its target, so
+    /// undo recreates the link and leaves the target alone.
+    #[test]
+    fn unlink_of_a_symlink_journals_the_link_and_its_target() {
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "unlinkat".into(),
+            arg: link.to_str().unwrap().into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: None,
+        };
+        let stat = pre_syscall_unlink_stat(&note);
+        let (_t, index, blob_store, command) = ingest_fixture("rm link");
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(6, 0),
+            stat,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        match &events[0].kind {
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target: t, path }) => {
+                assert_eq!(path, &link);
+                assert_eq!(t, target.to_str().unwrap());
+            }
+            other => panic!("expected SymlinkRemoved, got {other:?}"),
+        }
+    }
+
+    /// Review round 3, item 2: the symlink is gone by the time the daemon
+    /// reads it. The shim's target is used; with none, the removal is
+    /// still a SymlinkRemoved (target unknown), never a Regular Unlink.
+    #[test]
+    fn symlink_removal_uses_the_shim_target_when_the_link_is_gone() {
+        let gone = "/nonexistent-shit-l4b/link";
+        let note = |target: Option<&str>| ShimNotification {
+            pid: 1,
+            syscall: "unlinkat".into(),
+            arg: gone.into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: 1,
+                inode: 2,
+                mode: 0o120777,
+                link_target: target.map(str::to_string),
+            }),
+        };
+        let kind = |n: &ShimNotification| {
+            apply_unlink_stat(
+                classify_tree_op("unlinkat", gone).unwrap(),
+                pre_syscall_unlink_stat(n),
+            )
+        };
+        assert_eq!(
+            kind(&note(Some("t"))),
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: "t".into(),
+                path: PathBuf::from(gone),
+            })
+        );
+        assert_eq!(
+            kind(&note(None)),
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: String::new(),
+                path: PathBuf::from(gone),
+            })
+        );
+    }
+
+    /// L4b: a shim `unlink` of a device node carries the shim's pre-call
+    /// identity, so it pairs with the helper's `DeviceNodeMeta`.
+    #[test]
+    fn unlink_of_a_device_node_journals_the_shim_identity() {
+        let note = ShimNotification {
+            pid: 1,
+            syscall: "unlink".into(),
+            arg: "/w/null".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: 0x803,
+                inode: 77,
+                mode: 0o020640,
+                link_target: None,
+            }),
+        };
+        let stat = pre_syscall_unlink_stat(&note).expect("stat from pre_stat");
+        let kind = apply_unlink_stat(classify_tree_op("unlink", "/w/null").unwrap(), Some(stat));
+        assert_eq!(
+            kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: InodeRef::new(0x803, 77),
+                path: PathBuf::from("/w/null"),
+                kind: FileKind::CharDevice,
+                mode: 0o020640,
+            })
         );
     }
 
@@ -1737,6 +1916,7 @@ mod tests {
                 kind: FileKind::Directory,
                 mode: 0o040750,
                 inode: None,
+                link_target: None,
             }),
             &index,
             &blob_store,
@@ -2068,12 +2248,28 @@ mod tests {
         );
     }
 
-    /// Review of #232, item 4: a version-1 frame from a process running
-    /// under a tracked command. The peer gets an Allow ack it can decode,
-    /// and the command gets one capture-gap refusal.
+    /// Review of #232, item 4: a frame from an older shim (version 1, or
+    /// version 2 from #223's shim) from a process running under a tracked
+    /// command. The peer gets an Allow ack it can decode, and the command
+    /// gets one capture-gap refusal.
     #[test]
     fn old_shim_frame_is_acked_and_journals_a_version_gap() {
-        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        for version in [1u8, 2] {
+            old_shim_frame_case(version);
+        }
+    }
+
+    fn old_shim_frame_case(version: u8) {
+        let (_tmp, index, blob_store, fixture) = ingest_fixture("python3 save.py");
+        // One command per case: the refusal is journaled once per command.
+        let command = shit_planner::events::CommandId {
+            seq: 100 + u64::from(version),
+            ..fixture
+        };
+        let mut record =
+            <Index as shit_planner::PlannerStore>::command_by_id(&index, fixture).unwrap();
+        record.command = command;
+        index.put_command(&record).unwrap();
         let index = Arc::new(index);
         let active = Arc::new(ActiveCommands::default());
         active.insert(std::process::id(), command);
@@ -2098,8 +2294,15 @@ mod tests {
             ))
         };
         let mut ours = ours;
-        // A version-1 frame, as a shim from before the upgrade sends.
-        let old = encode_frame(&open_note("open", None)).unwrap();
+        // A frame as a shim from before the upgrade sends it: the
+        // generic version-1 frame, or a current frame stamped 2.
+        let old = if version == 1 {
+            encode_frame(&open_note("open", None)).unwrap()
+        } else {
+            let mut f = shit_proto::encode_shim_frame(&open_note("open", None)).unwrap();
+            f[4] = version;
+            f
+        };
         std::io::Write::write_all(&mut ours, &old).unwrap();
         ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut len = [0u8; 4];
@@ -2203,6 +2406,7 @@ mod tests {
                 kind: FileKind::Directory,
                 mode: 0o040750,
                 inode: Some(InodeRef::new(1, 2)),
+                link_target: None,
             })
         );
     }
@@ -2276,6 +2480,7 @@ mod tests {
                     kind: FileKind::Directory,
                     mode: 0o040700,
                     inode: None,
+                    link_target: None,
                 }),
                 0o040700,
             ),

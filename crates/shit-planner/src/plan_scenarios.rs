@@ -1386,6 +1386,449 @@ fn moved_socket_with_no_pre_image_is_recreated_and_renamed_back() {
     assert_recreated_then_renamed(&nodes, FileKind::Socket);
 }
 
+fn device_unlink(path: std::path::PathBuf, inode: InodeRef) -> CaptureEventKind {
+    CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode,
+        path,
+        kind: FileKind::CharDevice,
+        mode: 0o020666,
+    })
+}
+
+fn device_meta(path: std::path::PathBuf, inode: InodeRef, rdev: u64) -> CaptureEventKind {
+    CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+        inode,
+        path,
+        rdev,
+        mode: 0o020666,
+        uid: 0,
+        gid: 0,
+        token: Some(crate::metadata::CaptureToken {
+            helper: [7; 16],
+            mac: [rdev as u8; 32],
+        }),
+        untrusted: None,
+    })
+}
+
+fn char_device_plan(
+    unlink_inode: InodeRef,
+    meta_inode: Option<InodeRef>,
+) -> Vec<crate::inverse::PlanNode> {
+    let mut sim = Sim::new();
+    let p = sim.p("null");
+    sim.emit(device_unlink(p.clone(), unlink_inode));
+    if let Some(i) = meta_inode {
+        sim.emit(device_meta(p, i, 0x103));
+    }
+    sim.plan_nodes()
+}
+
+fn recreated_devices(nodes: &[crate::inverse::PlanNode]) -> Vec<Option<u64>> {
+    use crate::inverse::InverseOp;
+    nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            InverseOp::RecreatePath {
+                kind: FileKind::CharDevice,
+                device,
+                ..
+            } => Some(device.map(|d| d.rdev)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn removed_char_device_is_recreated_with_its_journaled_capture() {
+    use crate::inverse::InverseOp;
+    let i = InodeRef::new(1, 5);
+    let nodes = char_device_plan(i, Some(i));
+    assert_eq!(nodes.len(), 1, "{nodes:#?}");
+    assert!(
+        matches!(
+            &nodes[0].op,
+            InverseOp::RecreatePath {
+                kind: FileKind::CharDevice,
+                mode: 0o020666,
+                device: Some(d),
+                ..
+            } if d.rdev == 0x103
+                && d.uid == 0
+                && d.inode == i
+                && d.removed_by == command_id()
+                && d.token.is_some_and(|t| t.helper == [7; 16])
+        ),
+        "{nodes:#?}"
+    );
+}
+
+#[test]
+fn shim_unlink_with_the_zero_inode_does_not_pair() {
+    // L4b ruling 5: (0, 0) is the shim's "no inode" sentinel, not a
+    // wildcard. With no exact pair the node is refused at undo.
+    let nodes = char_device_plan(InodeRef::new(0, 0), Some(InodeRef::new(1, 5)));
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
+    // A meta row carrying the sentinel pairs with nothing either.
+    let nodes = char_device_plan(InodeRef::new(1, 5), Some(InodeRef::new(0, 0)));
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
+}
+
+#[test]
+fn device_unlink_without_a_meta_row_carries_no_device() {
+    let i = InodeRef::new(1, 5);
+    let nodes = char_device_plan(i, None);
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
+    // A meta row for a different inode is not paired either.
+    let nodes = char_device_plan(i, Some(InodeRef::new(1, 6)));
+    assert_eq!(recreated_devices(&nodes), vec![None], "{nodes:#?}");
+}
+
+#[test]
+fn device_meta_before_its_unlink_or_at_another_path_does_not_pair() {
+    let i = InodeRef::new(1, 5);
+    let mut sim = Sim::new();
+    let p = sim.p("null");
+    let q = sim.p("other");
+    sim.emit(device_meta(p.clone(), i, 0x103));
+    sim.emit(device_unlink(p, i));
+    sim.emit(device_unlink(q.clone(), InodeRef::new(1, 9)));
+    sim.emit(device_meta(q, InodeRef::new(1, 8), 0x105));
+    let nodes = sim.plan_nodes();
+    assert_eq!(recreated_devices(&nodes), vec![None, None], "{nodes:#?}");
+}
+
+#[test]
+fn rm_mknod_rm_pairs_each_unlink_with_its_own_capture() {
+    // The review's sequence: `rm n` (helper capture, inode 5, 1:3),
+    // `mknod n c 1 5` (a new node at the same path), `rm n` again. The
+    // second removal is seen once by the helper (inode 6, 1:5) and once
+    // by the shim (zero inode). Each helper Unlink gets its own capture;
+    // the shim's report gets none, and the first capture never leaks
+    // onto a later removal at the same path.
+    let mut sim = Sim::new();
+    let p = sim.p("n");
+    let first = InodeRef::new(1, 5);
+    let second = InodeRef::new(1, 6);
+    sim.emit(device_unlink(p.clone(), first));
+    sim.emit(device_meta(p.clone(), first, 0x103));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: second,
+        path: p.clone(),
+        kind: FileKind::CharDevice,
+        mode: 0o020666,
+    }));
+    sim.emit(device_unlink(p.clone(), InodeRef::new(0, 0)));
+    sim.emit(device_unlink(p.clone(), second));
+    sim.emit(device_meta(p.clone(), second, 0x105));
+    assert_eq!(
+        device_pairs(&sim),
+        vec![(EventId(1), 0x103), (EventId(5), 0x105)]
+    );
+    // Whatever the path-level classification keeps, no capture is
+    // used twice.
+    let nodes = sim.plan_nodes();
+    let devices = recreated_devices(&nodes);
+    for rdev in [0x103, 0x105] {
+        assert!(
+            devices.iter().filter(|d| **d == Some(rdev)).count() <= 1,
+            "{nodes:#?}"
+        );
+    }
+    // Inode reuse: the second node got the first one's inode number.
+    // Journal order still keeps the captures apart, and the shim's
+    // report in between pairs with neither.
+    let mut sim = Sim::new();
+    let p = sim.p("n");
+    sim.emit(device_unlink(p.clone(), first));
+    sim.emit(device_meta(p.clone(), first, 0x103));
+    sim.emit(device_unlink(p.clone(), InodeRef::new(0, 0)));
+    sim.emit(device_unlink(p.clone(), first));
+    sim.emit(device_meta(p.clone(), first, 0x105));
+    assert_eq!(
+        device_pairs(&sim),
+        vec![(EventId(1), 0x103), (EventId(4), 0x105)]
+    );
+}
+
+/// L4b: the normal Linux setup reports one `rm` of a device twice: the
+/// shim (pre-call lstat identity) and the LSM tier (Unlink and
+/// DeviceNodeMeta). Whatever order the reports land in, undo makes one
+/// RecreatePath with the capture, and it applies.
+#[test]
+fn dual_tier_rm_of_a_device_node_restores_it_once() {
+    use crate::inverse::InverseOp;
+    let node = InodeRef::new(1, 5);
+    // 0: shim first, helper saw the shim's Unlink and wrote only the
+    //    meta; 1: both Unlinks, then the meta; 2: helper first.
+    for order in 0..3 {
+        let mut sim = Sim::new();
+        let p = sim.p("null");
+        let shim = device_unlink(p.clone(), node);
+        let helper = device_unlink(p.clone(), node);
+        match order {
+            0 => {
+                sim.emit(shim);
+                sim.emit(device_meta(p.clone(), node, 0x103));
+            }
+            1 => {
+                sim.emit(shim);
+                sim.emit(helper);
+                sim.emit(device_meta(p.clone(), node, 0x103));
+            }
+            _ => {
+                sim.emit(helper);
+                sim.emit(device_meta(p.clone(), node, 0x103));
+                sim.emit(shim);
+            }
+        }
+        let nodes = sim.plan_nodes();
+        let recreates: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.op, InverseOp::RecreatePath { .. }))
+            .collect();
+        assert_eq!(recreates.len(), 1, "order {order}: {nodes:#?}");
+        assert!(
+            matches!(
+                &recreates[0].op,
+                InverseOp::RecreatePath { device: Some(d), .. } if d.rdev == 0x103
+            ),
+            "order {order}: {nodes:#?}"
+        );
+        let log = sim.undo_with_mknod();
+        assert_eq!(log.len(), 1, "order {order}: {log:#?}");
+        assert!(log[0].starts_with("ok "), "order {order}: {log:#?}");
+    }
+}
+
+/// L4b: `rm link` reported by the shim as SymlinkRemoved (the link's
+/// own path and target) and by the LSM tier as a marker-only Unlink
+/// (mode 0, it could not stat a symlink). Undo recreates the link and
+/// leaves the target untouched.
+#[test]
+fn rm_of_a_symlink_recreates_the_link_and_leaves_the_target() {
+    let mut sim = Sim::new();
+    sim.seed_file("target", b"keep", 0o644);
+    let target = sim.p("target");
+    let link = sim.p("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let m = std::fs::symlink_metadata(&link).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: target.to_str().unwrap().to_string(),
+        path: link.clone(),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(m.dev(), m.ino()),
+        path: link.clone(),
+        kind: FileKind::Regular,
+        mode: 0,
+    }));
+    std::fs::remove_file(&link).unwrap();
+    let log = sim.undo();
+    assert!(log.iter().all(|l| l.starts_with("ok ")), "{log:#?}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+}
+
+/// D-22: `echo new > link` where `link` points at `target`. The shim
+/// follows the link for a write-open and captures the target's
+/// pre-image under the target's path; undo restores the target's bytes
+/// and the link is left as it was.
+#[test]
+fn write_through_a_symlink_restores_the_target_and_keeps_the_link() {
+    let mut sim = Sim::new();
+    sim.seed_file("target", b"old bytes", 0o644);
+    let target = sim.p("target");
+    let link = sim.p("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    sim.pre_image(&target, FilePreImageSource::Other);
+    std::fs::write(&link, b"new").unwrap();
+    let log = sim.undo();
+    assert!(log.iter().all(|l| l.starts_with("ok ")), "{log:#?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"old bytes");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+}
+
+/// Review item 1: `mv d1 d2 && rm d2` of a device, both tiers reporting
+/// the rm. Provenance's no-bytes dedup and the device pairing must agree
+/// on the Unlink to keep, in either report order: the node is recreated
+/// once, with its capture, and renamed back.
+#[test]
+fn moved_then_removed_device_dual_tier_keeps_the_paired_unlink() {
+    use crate::inverse::InverseOp;
+    let node = InodeRef::new(1, 5);
+    for helper_first in [false, true] {
+        let mut sim = Sim::new();
+        let (d1, d2) = (sim.p("d1"), sim.p("d2"));
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+            from: d1,
+            to: d2.clone(),
+            inode: node,
+        }));
+        if helper_first {
+            sim.emit(device_unlink(d2.clone(), node));
+            sim.emit(device_meta(d2.clone(), node, 0x103));
+            sim.emit(device_unlink(d2.clone(), node));
+        } else {
+            sim.emit(device_unlink(d2.clone(), node));
+            sim.emit(device_unlink(d2.clone(), node));
+            sim.emit(device_meta(d2.clone(), node, 0x103));
+        }
+        let nodes = sim.plan_nodes();
+        assert_eq!(nodes.len(), 2, "helper_first={helper_first}: {nodes:#?}");
+        assert!(
+            matches!(
+                &nodes[0].op,
+                InverseOp::RecreatePath { device: Some(d), .. } if d.rdev == 0x103
+            ),
+            "helper_first={helper_first}: {nodes:#?}"
+        );
+        assert!(
+            matches!(&nodes[1].op, InverseOp::Rename { .. }),
+            "helper_first={helper_first}: {nodes:#?}"
+        );
+    }
+}
+
+/// Review item 3: `ln -s t l && rm l` made and removed the link inside
+/// the command. The shim's SymlinkRemoved is that entry's unlink, so the
+/// whole thing is scratch: undo leaves no link behind.
+#[test]
+fn symlink_made_and_removed_in_the_command_is_scratch() {
+    let mut sim = Sim::new();
+    let link = sim.p("l");
+    let target = sim.p("t").to_str().unwrap().to_string();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Symlink {
+        target: target.clone(),
+        path: link.clone(),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target,
+        path: link.clone(),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(1, 9),
+        path: link.clone(),
+        kind: FileKind::Regular,
+        mode: 0,
+    }));
+    let nodes = sim.plan_nodes();
+    assert!(nodes.is_empty(), "{nodes:#?}");
+    let log = sim.undo();
+    assert!(log.is_empty(), "{log:#?}");
+    assert!(std::fs::symlink_metadata(&link).is_err());
+}
+
+/// Review item 4: `rm l` (a symlink), `echo x > l`, `rm l`. Only the
+/// LSM marker next to the SymlinkRemoved is its twin; the marker of the
+/// later regular file at the same path is kept.
+#[test]
+fn only_the_marker_beside_a_symlink_removal_is_dropped() {
+    let mut sim = Sim::new();
+    let l = sim.p("l");
+    let marker = |sim: &mut Sim, ino| {
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode: InodeRef::new(1, ino),
+            path: sim.p("l"),
+            kind: FileKind::Regular,
+            mode: 0,
+        }))
+    };
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: "/elsewhere".into(),
+        path: l.clone(),
+    }));
+    marker(&mut sim, 7);
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: InodeRef::new(1, 8),
+        path: l.clone(),
+        kind: FileKind::Regular,
+        mode: 0o100644,
+    }));
+    marker(&mut sim, 8);
+    let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
+    assert_eq!(
+        crate::plan::symlink_removal_markers(&refs),
+        vec![EventId(2)],
+        "{:#?}",
+        sim.events
+    );
+}
+
+/// Review item 2: `mknod n c 1 3 && rm n` in one command. The helper
+/// journals the node's Create, so the node is scratch: undo makes
+/// nothing, even with the removal's capture journaled.
+#[test]
+fn device_made_and_removed_in_the_command_is_scratch() {
+    let mut sim = Sim::new();
+    let p = sim.p("n");
+    let node = InodeRef::new(1, 5);
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: node,
+        path: p.clone(),
+        kind: FileKind::CharDevice,
+        mode: 0o020666,
+    }));
+    sim.emit(device_unlink(p.clone(), node));
+    sim.emit(device_meta(p.clone(), node, 0x103));
+    let nodes = sim.plan_nodes();
+    assert!(nodes.is_empty(), "{nodes:#?}");
+    assert!(sim.undo_with_mknod().is_empty());
+    assert!(std::fs::symlink_metadata(&p).is_err());
+}
+
+/// Review round 3, item 5: a mode-0 marker journaled before the
+/// SymlinkRemoved belongs to an earlier entry at the path (here a file
+/// whose removal the kernel tier could not stat) and is kept.
+#[test]
+fn marker_before_a_symlink_removal_is_kept() {
+    let mut sim = Sim::new();
+    let l = sim.p("l");
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(1, 7),
+        path: l.clone(),
+        kind: FileKind::Regular,
+        mode: 0,
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: "/elsewhere".into(),
+        path: l.clone(),
+    }));
+    let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
+    assert!(crate::plan::symlink_removal_markers(&refs).is_empty());
+}
+
+/// Review round 3, item 2: a removed symlink whose target is unknown
+/// (empty) is refused; undo makes neither a link nor a regular file.
+#[test]
+fn symlink_removal_with_unknown_target_is_refused() {
+    use crate::inverse::InverseOp;
+    let mut sim = Sim::new();
+    let l = sim.p("l");
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: String::new(),
+        path: l.clone(),
+    }));
+    let nodes = sim.plan_nodes();
+    assert_eq!(nodes.len(), 1, "{nodes:#?}");
+    assert!(
+        matches!(&nodes[0].op, InverseOp::Refuse { class, .. } if class == "symlink-target-unknown"),
+        "{nodes:#?}"
+    );
+    sim.undo();
+    assert!(std::fs::symlink_metadata(&l).is_err());
+}
+
+fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
+    let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
+    let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)
+        .into_iter()
+        .map(|(id, d)| (id, d.rdev))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 #[test]
 fn dir_rename_over_a_deleted_entry_still_refuses_that_entry() {
     // `mv k t/x; rm t/x` (uncaptured), `mv m d/x; mv d t` with t empty by
@@ -1499,7 +1942,13 @@ impl crate::executor::PrivilegedOpRouter for LocalMknod {
         crate::executor::PrivilegedOpOutcome::Applied
     }
 
-    fn mknod(&self, path: &Path, mode: u32, _: u64) -> crate::executor::PrivilegedOpOutcome {
+    fn mknod(
+        &self,
+        path: &Path,
+        mode: u32,
+        _: u64,
+        _: Option<&crate::metadata::DeviceNode>,
+    ) -> crate::executor::PrivilegedOpOutcome {
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), (mode & 0o777) as _) }, 0);
         crate::executor::PrivilegedOpOutcome::Applied

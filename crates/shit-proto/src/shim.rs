@@ -165,17 +165,19 @@ pub struct ShimNotification {
     /// failure on rename arguments being the canonical example).
     /// `None` for successful captures.
     ///
-    /// `#[serde(default)]` keeps the wire backwards-compatible with
-    /// pre-AU10 shims; older daemons see the field as absent and
-    /// older shims serialize without it. Postcard's optional encoding
-    /// is one byte (`0` for None) so the cost on the happy path is
-    /// negligible.
+    /// postcard is not self-describing, so `#[serde(default)]` does not
+    /// make an older or newer frame readable: compatibility comes from
+    /// the frame's [`crate::SHIM_WIRE_VERSION`] byte, and a mismatch is
+    /// rejected by name.
     #[serde(default)]
     pub failure: Option<ShimFailure>,
-    /// The target's lstat before the call: for removals the shim reports
-    /// after they succeed (`rmdir`), when the daemon has nothing left to
-    /// stat, and for a rename's destination when it is a symlink, so
-    /// undo can recreate the link.
+    /// The target's lstat before the call. Sent for `unlink`/`unlinkat`
+    /// (L4b), so the shim's report and the kernel tier's report of one
+    /// removal pair exactly; for removals the shim reports after they
+    /// succeed (`rmdir`, `unlinkat(AT_REMOVEDIR)`), when the daemon has
+    /// nothing left to stat; and for a rename's destination when it is a
+    /// symlink, so undo can recreate the link (L5). Adding it changed the
+    /// frame shape; [`crate::SHIM_WIRE_VERSION`] says so.
     #[serde(default)]
     pub pre_stat: Option<ShimStat>,
 }
@@ -187,8 +189,7 @@ pub struct ShimStat {
     pub inode: u64,
     pub mode: u32,
     /// The link's target, read before the call, when the entry is a
-    /// symlink. `None` for other kinds, or when readlink failed. (The
-    /// same field #223 adds for unlink.)
+    /// symlink. `None` for other kinds, or when readlink failed.
     pub link_target: Option<String>,
 }
 
@@ -255,8 +256,8 @@ mod tests {
             failure: None,
             pre_stat: None,
         };
-        let frame = encode_frame(&n).expect("encode");
-        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        let frame = crate::frame::encode_shim_frame(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
         assert_eq!(decoded, n);
     }
 
@@ -284,8 +285,8 @@ mod tests {
             failure: None,
             pre_stat: None,
         };
-        let frame = crate::frame::encode_frame_large(&n).expect("encode");
-        let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
+        let frame = crate::frame::encode_shim_frame(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
         assert_eq!(decoded, n);
     }
 
@@ -309,8 +310,8 @@ mod tests {
             }),
             pre_stat: None,
         };
-        let frame = encode_frame(&n).expect("encode");
-        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        let frame = crate::frame::encode_shim_frame(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
         assert_eq!(decoded, n);
         match decoded.failure {
             Some(ShimFailure::CanonicalizeFailed { which_arg, .. }) => {
@@ -318,32 +319,6 @@ mod tests {
             }
             _ => panic!("expected CanonicalizeFailed"),
         }
-    }
-
-    /// L5 (review round 2, item 10): shim frames carry their own version.
-    /// A version-1 frame (a shim loaded before the upgrade) is rejected by
-    /// name rather than misread.
-    #[test]
-    fn shim_frames_are_versioned_and_old_ones_are_rejected() {
-        use crate::frame::{SHIM_WIRE_VERSION, decode_shim_frame, encode_shim_frame};
-        let n = ShimNotification {
-            pid: 1,
-            syscall: "unlink".into(),
-            arg: "/tmp/x".into(),
-            ts_unix_nanos: 0,
-            pre_image: None,
-            extra_pre_images: Vec::new(),
-            failure: None,
-            pre_stat: None,
-        };
-        let frame = encode_shim_frame(&n).unwrap();
-        assert_eq!(frame[4], SHIM_WIRE_VERSION);
-        assert_eq!(decode_shim_frame::<ShimNotification>(&frame).unwrap(), n);
-        let old = encode_frame(&n).unwrap();
-        assert!(matches!(
-            decode_shim_frame::<ShimNotification>(&old),
-            Err(crate::frame::DecodeError::UnsupportedVersion(1))
-        ));
     }
 
     /// `pre_stat` survives the shim wire.
@@ -400,8 +375,8 @@ mod tests {
             failure: None,
             pre_stat: None,
         };
-        let frame = encode_frame(&n).expect("encode");
-        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        let frame = crate::frame::encode_shim_frame(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
         assert_eq!(decoded, n);
         let xattr = decoded.pre_image.unwrap().xattr.unwrap();
         assert_eq!(xattr.name, "user.shit.test");
@@ -435,8 +410,8 @@ mod tests {
             failure: None,
             pre_stat: None,
         };
-        let frame = encode_frame(&n).expect("encode");
-        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        let frame = crate::frame::encode_shim_frame(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
         assert_eq!(decoded, n);
         assert!(decoded.pre_image.unwrap().xattr.unwrap().value.is_none());
     }
@@ -483,13 +458,56 @@ mod tests {
             failure: None,
             pre_stat: None,
         };
-        let frame = crate::frame::encode_frame_large(&n).expect("encode");
-        let decoded: ShimNotification = crate::frame::decode_frame_large(&frame).expect("decode");
+        let frame = crate::frame::encode_shim_frame(&n).expect("encode");
+        let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
         assert_eq!(decoded, n);
         assert_eq!(decoded.extra_pre_images.len(), 3);
         assert_eq!(
             decoded.extra_pre_images[1].path,
             "/abs/site-packages/pkg/mod.py"
         );
+    }
+
+    /// Shim frames carry their own version byte. A version-1 frame (a
+    /// shim loaded before the upgrade, without `pre_stat`) is rejected
+    /// by name rather than misread.
+    #[test]
+    fn shim_frames_are_versioned_and_old_ones_are_rejected() {
+        use crate::frame::{
+            DecodeError, SHIM_WIRE_VERSION, decode_shim_frame, encode_frame_large,
+            encode_shim_frame,
+        };
+        let n = ShimNotification {
+            pid: 1,
+            syscall: "unlink".into(),
+            arg: "/w/x".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(ShimStat {
+                dev: 1,
+                inode: 2,
+                mode: 0o020640,
+                link_target: None,
+            }),
+        };
+        let frame = encode_shim_frame(&n).unwrap();
+        assert_eq!(frame[4], SHIM_WIRE_VERSION);
+        assert_eq!(decode_shim_frame::<ShimNotification>(&frame).unwrap(), n);
+        let old = encode_frame_large(&n).unwrap();
+        assert!(matches!(
+            decode_shim_frame::<ShimNotification>(&old),
+            Err(DecodeError::UnsupportedVersion(1))
+        ));
+        // A version-2 frame (#223's shim, before PreImageUncaptured) is
+        // refused by name too.
+        let mut v2 = frame.clone();
+        v2[4] = 2;
+        assert!(matches!(
+            decode_shim_frame::<ShimNotification>(&v2),
+            Err(DecodeError::UnsupportedVersion(2))
+        ));
+        assert_eq!(SHIM_WIRE_VERSION, 3);
     }
 }

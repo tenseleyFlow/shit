@@ -657,6 +657,7 @@ mod tests {
                 path: target,
                 kind: crate::metadata::FileKind::Regular,
                 mode: 0o100644,
+                device: None,
             },
             cohort: 0,
             conflict: None,
