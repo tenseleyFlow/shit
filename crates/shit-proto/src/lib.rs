@@ -119,8 +119,8 @@ pub use helper::{
     TreeOpWire, UntrustedSource, validate_outgoing,
 };
 pub use shim::{
-    SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage, ShimStat,
-    XattrPreImage,
+    SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage,
+    ShimRenameOutcome, ShimStat, XattrPreImage,
 };
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.

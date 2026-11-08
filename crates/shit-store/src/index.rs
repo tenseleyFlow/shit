@@ -860,6 +860,24 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
+        // L5 (PR B): the existing columns, no new ones (D-13). The call id
+        // and the rows it names live in the payload.
+        K::RenameCall { .. } => Denormalized {
+            discriminant: "RenameCall",
+            dev: None,
+            inode: None,
+            path: None,
+            blob_hash: None,
+            post_content_hash: None,
+        },
+        K::RenameOutcome { to, source, .. } => Denormalized {
+            discriminant: "RenameOutcome",
+            dev: Some(source.dev as i64),
+            inode: Some(source.inode as i64),
+            path: Some(to.to_string_lossy().into_owned()),
+            blob_hash: None,
+            post_content_hash: None,
+        },
     }
 }
 
@@ -1622,5 +1640,66 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:#?}");
         assert_eq!(got[0].kind, CaptureEventKind::TreeOp(unlink));
         assert_eq!(got[1].kind, CaptureEventKind::TreeOp(meta));
+    }
+
+    /// L5 (PR B), D-13: the call-id rows are new variants appended to
+    /// the event enum. They add no column and no migration, the existing
+    /// variants keep their encoding (so rows written before them decode;
+    /// `opens_trunk_written_database` reads such a database), and a build
+    /// without them skips the new rows like any row it cannot decode.
+    #[test]
+    fn rename_call_rows_round_trip_and_leave_old_encodings_alone() {
+        use shit_planner::TreeOp;
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        let command = CommandId { session, seq: 1 };
+        let mk = |t, kind| CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: TimePoint::new(t, 0),
+            partial: false,
+            kind,
+        };
+        let rename = CaptureEventKind::TreeOp(TreeOp::Rename {
+            from: PathBuf::from("/w/a"),
+            to: PathBuf::from("/w/b"),
+            inode: InodeRef::new(0, 0),
+        });
+        // The encoding a pre-PR-B build writes for this Rename. The new
+        // variants were appended after the last one and nothing else in
+        // the event types changed, so no variant index moved.
+        assert_eq!(
+            postcard::to_allocvec(&mk(1, rename.clone())).unwrap(),
+            vec![
+                0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 3, 2, 4, 47,
+                119, 47, 97, 4, 47, 119, 47, 98, 0, 0
+            ]
+        );
+        let id = idx.put_event(&mk(1, rename.clone())).unwrap();
+        let call = CaptureEventKind::RenameCall {
+            pid: 7,
+            call_id: 3,
+            events: vec![id],
+        };
+        let outcome = CaptureEventKind::RenameOutcome {
+            pid: 7,
+            call_id: 3,
+            from: PathBuf::from("/w/a"),
+            to: PathBuf::from("/w/b"),
+            errno: 18,
+            source: InodeRef::new(8, 42),
+            dest: InodeRef::new(0, 0),
+        };
+        idx.put_event(&mk(1, call.clone())).unwrap();
+        idx.put_event(&mk(2, outcome.clone())).unwrap();
+        let got: Vec<_> = idx
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(got, vec![rename, call, outcome]);
     }
 }

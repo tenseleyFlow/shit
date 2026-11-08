@@ -1385,6 +1385,8 @@ fn capture_event_kind_label(kind: &shit_planner::events::CaptureEventKind) -> &'
         K::KubectlOp { .. } => "KubectlOp",
         K::GhOp { .. } => "GhOp",
         K::CaptureRefused { .. } => "CaptureRefused",
+        K::RenameCall { .. } => "RenameCall",
+        K::RenameOutcome { .. } => "RenameOutcome",
     }
 }
 

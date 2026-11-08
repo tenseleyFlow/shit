@@ -32,6 +32,7 @@ pub mod probe;
 pub mod probe_live;
 pub mod proc;
 pub mod refuse;
+mod rename_calls;
 pub mod services;
 pub mod shell_state_render;
 pub mod store;

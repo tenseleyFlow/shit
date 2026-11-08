@@ -2778,6 +2778,8 @@ mod tests_dispatch {
                     reason: "over the shim's inline pre-image cap".into(),
                 }),
                 pre_stat: None,
+                call_id: 0,
+                outcome: None,
             };
             crate::shim_listener::ingest_notification(
                 &gap,

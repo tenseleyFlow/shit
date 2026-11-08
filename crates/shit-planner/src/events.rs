@@ -426,6 +426,31 @@ pub enum CaptureEventKind {
         path: PathBuf,
         detail: String,
     },
+    /// L5 (PR B): the rows one shim note about a rename-family call
+    /// journaled (its Rename, the destination's pre-image, the subtree
+    /// pre-images, a refusal), under the call's id. `pid` and `call_id`
+    /// together name the call; every note of the call writes its own
+    /// row. This is how a call id reaches rows whose variants have no
+    /// field for it: stored rows of those variants keep decoding. No
+    /// inverse of its own.
+    RenameCall {
+        pid: u32,
+        call_id: u64,
+        events: Vec<EventId>,
+    },
+    /// L5 (PR B): what a rename-family call did, from the note the shim
+    /// sends after it returns. `errno` is 0 on success. `source` is the
+    /// inode at `from` before the call; `dest` the inode at `to` after a
+    /// success, `(0, 0)` otherwise. No inverse of its own.
+    RenameOutcome {
+        pid: u32,
+        call_id: u64,
+        from: PathBuf,
+        to: PathBuf,
+        errno: i32,
+        source: InodeRef,
+        dest: InodeRef,
+    },
 }
 
 /// Mirror of [`shit_proto::DbEngineWire`] on the planner side so

@@ -490,6 +490,8 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        // L5 (PR B): records about rename calls; nothing to redo.
+        CaptureEventKind::RenameCall { .. } | CaptureEventKind::RenameOutcome { .. } => {}
         CaptureEventKind::CaptureRefused { path, detail, .. } => {
             // AU10 — the original capture was incomplete; redo
             // (forward) has nothing to apply either. Surface the

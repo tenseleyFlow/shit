@@ -69,6 +69,11 @@ const JSON_ONLY_CAPTURE_EVENT_KINDS: &[&str] = &[
     "TerraformOp",
     "KubectlOp",
     "GhOp",
+    // rationale (L5 PR B): RenameCall and RenameOutcome are planner
+    // evidence joining a rename call's rows by its id, with no inverse of
+    // their own. The JSON shows them in full for debugging.
+    "RenameCall",
+    "RenameOutcome",
 ];
 
 /// Subvariants of `TreeOp` that intentionally render via the JSON

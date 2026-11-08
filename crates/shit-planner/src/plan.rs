@@ -92,6 +92,11 @@ pub fn plan(
     }
 
     let mut live: Vec<&CaptureEvent> = events.iter().filter(|e| !e.partial).collect();
+    // L5 (PR B): a rename call that failed moved nothing, and the kernel
+    // tier's report of a call is the same rename again. Both leave the
+    // plan before anything reads the events (see `rename_calls`).
+    let by_calls = crate::rename_calls::dropped_by_rename_calls(&live);
+    live.retain(|e| !by_calls.contains(&e.id));
     // Reverse-chronological: latest events first.
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.id)));
 
@@ -1727,6 +1732,8 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        // L5 (PR B): read by `rename_calls`; no inverse of their own.
+        CaptureEventKind::RenameCall { .. } | CaptureEventKind::RenameOutcome { .. } => {}
         CaptureEventKind::CaptureRefused {
             class,
             path,
