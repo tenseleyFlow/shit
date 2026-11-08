@@ -14,7 +14,8 @@
 //!
 //! - A call that failed (errno set) moved nothing. Every row its notes
 //!   journaled is dropped, and so is the kernel tier's report of the same
-//!   call.
+//!   call. Its refusals stay: a path the shim could not key is still
+//!   reported at undo (AU10), whether or not the call then failed.
 //! - A call that succeeded is one rename. The kernel tier's report of it
 //!   is dropped, so undo reverses it once.
 //!
@@ -46,6 +47,13 @@ pub(crate) fn dropped_by_rename_calls(events: &[&CaptureEvent]) -> HashSet<Event
             CaptureEventKind::TreeOp(TreeOp::Rename { inode, .. }) => Some((e.id, *inode)),
             _ => None,
         })
+        .collect();
+    // A call's refusals stay even when it failed: the shim could not key
+    // a path the command named (AU10), which undo still reports.
+    let refusals: HashSet<EventId> = events
+        .iter()
+        .filter(|e| matches!(e.kind, CaptureEventKind::CaptureRefused { .. }))
+        .map(|e| e.id)
         .collect();
     let mut calls: HashMap<(u32, u64), Call> = HashMap::new();
     for e in events {
@@ -90,7 +98,12 @@ pub(crate) fn dropped_by_rename_calls(events: &[&CaptureEvent]) -> HashSet<Event
     for call in with_outcome {
         let (errno, source, at) = call.outcome.expect("filtered");
         if errno != 0 {
-            out.extend(call.events.iter().copied());
+            out.extend(
+                call.events
+                    .iter()
+                    .copied()
+                    .filter(|id| !refusals.contains(id)),
+            );
         }
         // The kernel tier's report of this call: same source inode,
         // nearest in the journal, each paired once.
@@ -186,7 +199,7 @@ mod tests {
     const FILE: InodeRef = InodeRef { dev: 8, inode: 42 };
 
     /// The call id joins a call's rows to its outcome: a failed call's
-    /// Rename and refusal go, another call's rows stay.
+    /// Rename goes, its refusal stays, another call's rows stay.
     #[test]
     fn a_failed_call_drops_exactly_its_own_rows() {
         let refusal = ev(
@@ -206,7 +219,7 @@ mod tests {
             outcome(6, 10, 1, libc::EXDEV, FILE),
             outcome(7, 10, 2, 0, InodeRef::new(8, 43)),
         ];
-        assert_eq!(dropped(&events), vec![1, 2]);
+        assert_eq!(dropped(&events), vec![1]);
     }
 
     /// The same call id in another process is another call.
