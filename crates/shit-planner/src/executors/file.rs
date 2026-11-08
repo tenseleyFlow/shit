@@ -211,6 +211,14 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                             "chown {path:?}: ENOENT (path vanished between capture and undo)"
                         ),
                     },
+                    PrivilegedOpOutcome::Conflict { detail } => ExecutionOutcome::Conflict {
+                        kind: crate::inverse::Conflict::Hard {
+                            detail: format!("chown {path:?}: {detail}"),
+                        },
+                    },
+                    PrivilegedOpOutcome::Refused { reason } => ExecutionOutcome::Failed {
+                        err: format!("chown {path:?}: helper refused: {reason}"),
+                    },
                     PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
                         err: format!("chown {path:?} via helper: {err}"),
                     },
@@ -245,7 +253,13 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
     }
 
     fn apply_recreate_path(&self, op: &InverseOp) -> ExecutionOutcome {
-        let InverseOp::RecreatePath { path, kind, mode } = op else {
+        let InverseOp::RecreatePath {
+            path,
+            kind,
+            mode,
+            device,
+        } = op
+        else {
             return ExecutionOutcome::Failed {
                 err: "apply_recreate_path: wrong variant".into(),
             };
@@ -253,10 +267,32 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         use crate::metadata::FileKind;
         // AU22 — Fifo/Socket need mknod(2); dispatch through the
         // privileged-op router (the helper has CAP_MKNOD). The
-        // local recreate_path_inner handles Regular/Directory only;
-        // BlockDevice/CharDevice still require CAP_SYS_ADMIN and
-        // stay refused at the helper.
-        if matches!(kind, FileKind::Fifo | FileKind::Socket) {
+        // local recreate_path_inner handles Regular/Directory only.
+        // L4 - BlockDevice/CharDevice take the same route with the
+        // journaled capture (rdev, mode, owner, and the helper's capture
+        // token, L4b). Without a journaled device number they are
+        // refused rather than guessed.
+        let is_device = matches!(kind, FileKind::BlockDevice | FileKind::CharDevice);
+        if is_device && device.is_none() {
+            return ExecutionOutcome::Failed {
+                err: format!(
+                    "mknod {path:?} kind={kind:?}: no device number was captured \
+                     for this node, so it is not recreated"
+                ),
+            };
+        }
+        if let Some(d) = device
+            && d.token.is_none()
+        {
+            let why = d
+                .untrusted
+                .map(|u| u.reason())
+                .unwrap_or("the helper issued no capture token");
+            return ExecutionOutcome::Failed {
+                err: format!("mknod {path:?} kind={kind:?}: refused: {why}"),
+            };
+        }
+        if is_device || matches!(kind, FileKind::Fifo | FileKind::Socket) {
             // G01.5 — same parent-tree guarantee as the regular path
             // (recreate_path_inner does this for us; we mirror it
             // here for the mknod branch).
@@ -270,8 +306,16 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             }
             // mode wire carries perm bits + S_IF* kind. The router
             // dispatches into the helper which calls libc::mknod
-            // with S_IFIFO/S_IFSOCK | perm_bits.
-            return match self.privileged_router.mknod(path, *mode, 0) {
+            // with S_IFIFO/S_IFSOCK | perm_bits. A device sends the
+            // captured mode, which is what its token covers.
+            let (send_mode, rdev) = match device {
+                Some(d) => (d.mode, d.rdev),
+                None => (*mode, 0),
+            };
+            let made = self
+                .privileged_router
+                .mknod(path, send_mode, rdev, device.as_ref());
+            return match made {
                 PrivilegedOpOutcome::Applied => ExecutionOutcome::Applied,
                 PrivilegedOpOutcome::OutOfScope => ExecutionOutcome::Failed {
                     err: format!(
@@ -283,6 +327,14 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                 },
                 PrivilegedOpOutcome::NotFound => ExecutionOutcome::Failed {
                     err: format!("mknod {path:?} kind={kind:?}: parent path missing"),
+                },
+                PrivilegedOpOutcome::Conflict { detail } => ExecutionOutcome::Conflict {
+                    kind: crate::inverse::Conflict::Hard {
+                        detail: format!("mknod {path:?} kind={kind:?}: {detail}"),
+                    },
+                },
+                PrivilegedOpOutcome::Refused { reason } => ExecutionOutcome::Failed {
+                    err: format!("mknod {path:?} kind={kind:?}: refused: {reason}"),
                 },
                 PrivilegedOpOutcome::Failed { err } => ExecutionOutcome::Failed {
                     err: format!("mknod {path:?} kind={kind:?}: {err}"),
@@ -639,11 +691,10 @@ fn unlink_inner(path: &Path) -> Result<(), String> {
 }
 
 /// Recreate a path the original command unlinked. Handles regular
-/// files, directories, and (post-AU22) BlockDevice/CharDevice fail
-/// with a DR-15.2 message — those need CAP_SYS_ADMIN even with the
-/// right owner. Fifo/Socket are NOT routed here; the executor
-/// dispatches those through the PrivilegedOpRouter::mknod before
-/// reaching this function (see apply_recreate_path's AU22 branch).
+/// files and directories. Fifo, Socket, BlockDevice and CharDevice
+/// are NOT routed here; the executor dispatches those through
+/// PrivilegedOpRouter::mknod before reaching this function (see
+/// apply_recreate_path's mknod branch).
 fn recreate_path_inner(
     path: &Path,
     kind: crate::metadata::FileKind,
@@ -700,15 +751,12 @@ fn recreate_path_inner(
             "RecreatePath for symlink at {path:?} is a planner bug — \
              use InverseOp::CreateSymlink which carries the target"
         )),
-        // BlockDevice/CharDevice need mknod(2) with CAP_SYS_ADMIN
-        // even when owned by the requestor; the helper holds
-        // CAP_MKNOD but not CAP_SYS_ADMIN by default. Deferred to
-        // DR-15.2 (separate policy review for granting CAP_SYS_ADMIN
-        // to the helper). Fifo/Socket are handled upstream by
-        // apply_recreate_path's AU22 branch and never reach here.
+        // Fifo, Socket and the device kinds are handled upstream by
+        // apply_recreate_path's mknod branch (helper IPC) and never
+        // reach here.
         other => Err(format!(
             "RecreatePath for kind {other:?} at {path:?}: needs mknod(2) \
-             with CAP_SYS_ADMIN — deferred to DR-15.2"
+             through the helper"
         )),
     }
 }
@@ -991,6 +1039,7 @@ mod tests {
             path: target.clone(),
             kind: crate::metadata::FileKind::Directory,
             mode: 0o040711,
+            device: None,
         };
         assert_eq!(
             e.execute(&op, false, ConflictPolicy::default()),
@@ -1022,6 +1071,7 @@ mod tests {
                 path: path.clone(),
                 kind,
                 mode,
+                device: None,
             };
             assert_eq!(
                 e.execute(&op, false, ConflictPolicy::default()),
@@ -1047,6 +1097,7 @@ mod tests {
             path: target.clone(),
             kind: crate::metadata::FileKind::Regular,
             mode: 0o100640,
+            device: None,
         };
         assert_eq!(
             e.execute(&op, false, ConflictPolicy::default()),
@@ -1114,6 +1165,7 @@ mod tests {
             path: tmpdir.path().join("link"),
             kind: crate::metadata::FileKind::Symlink,
             mode: 0o120777,
+            device: None,
         };
         match e.execute(&op, false, ConflictPolicy::default()) {
             ExecutionOutcome::Failed { err } => {
@@ -1473,5 +1525,154 @@ mod tests {
         // created.
         let body = std::fs::read(&target).expect("read restored file");
         assert_eq!(body, b"hello");
+    }
+
+    fn device_op(
+        kind: crate::metadata::FileKind,
+        device: Option<crate::metadata::DeviceNode>,
+    ) -> InverseOp {
+        InverseOp::RecreatePath {
+            path: PathBuf::from("/tmp/l4-dev-null"),
+            kind,
+            mode: 0o020666,
+            device,
+        }
+    }
+
+    #[test]
+    fn device_recreate_without_a_journaled_rdev_is_refused() {
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::with_privileged_router(
+            &reader,
+            crate::executor::InMemoryPrivilegedOpRouter::new(),
+        );
+        for kind in [
+            crate::metadata::FileKind::CharDevice,
+            crate::metadata::FileKind::BlockDevice,
+        ] {
+            match exec.execute(&device_op(kind, None), false, ConflictPolicy::default()) {
+                ExecutionOutcome::Failed { err } => {
+                    assert!(err.contains("no device number was captured"), "got: {err}");
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+        assert!(
+            exec.privileged_router
+                .mknod_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn captured_node(uid: u32, gid: u32) -> crate::metadata::DeviceNode {
+        crate::metadata::DeviceNode {
+            rdev: 0x103,
+            mode: 0o020640,
+            uid,
+            gid,
+            inode: crate::inode::InodeRef::new(1, 5),
+            removed_by: crate::events::CommandId {
+                session: uuid::Uuid::nil(),
+                seq: 3,
+            },
+            token: Some(crate::metadata::CaptureToken {
+                helper: [1; 16],
+                mac: [2; 32],
+            }),
+            untrusted: None,
+        }
+    }
+
+    /// Review round 2, item 1: a capture from a `nodev` filesystem has
+    /// no token; undo refuses with the reason and asks nothing of the
+    /// helper.
+    #[test]
+    fn device_capture_without_a_token_is_refused_with_the_reason() {
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::with_privileged_router(
+            &reader,
+            crate::executor::InMemoryPrivilegedOpRouter::new(),
+        );
+        let mut d = captured_node(7, 9);
+        d.token = None;
+        d.untrusted = Some(crate::metadata::UntrustedSource::Nodev);
+        let op = device_op(crate::metadata::FileKind::CharDevice, Some(d));
+        match exec.execute(&op, false, ConflictPolicy::default()) {
+            ExecutionOutcome::Failed { err } => {
+                assert!(
+                    err.contains("source filesystem does not allow device nodes"),
+                    "got: {err}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            exec.privileged_router
+                .mknod_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn device_recreate_sends_the_captured_node_in_one_mknod_request() {
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::with_privileged_router(
+            &reader,
+            crate::executor::InMemoryPrivilegedOpRouter::new(),
+        );
+        let dev = captured_node(7, 9);
+        let op = device_op(crate::metadata::FileKind::CharDevice, Some(dev));
+        assert_eq!(
+            exec.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        // The captured mode (what the token covers) is sent, not the
+        // RecreatePath's own mode.
+        assert_eq!(
+            exec.privileged_router.mknod_calls.lock().unwrap().clone(),
+            vec![(
+                PathBuf::from("/tmp/l4-dev-null"),
+                0o020640,
+                0x103,
+                Some(dev)
+            )]
+        );
+        // The executor makes no chown of its own.
+        assert!(exec.privileged_router.chown_log().is_empty());
+    }
+
+    #[test]
+    fn device_recreate_surfaces_helper_refusal_and_conflict() {
+        let reader = InMemoryBlobReader::new();
+        let router = crate::executor::InMemoryPrivilegedOpRouter::new();
+        router.set_outcome(PrivilegedOpOutcome::Refused {
+            reason: "capture evidence expired: helper restarted".into(),
+        });
+        let exec = FileExecutor::with_privileged_router(&reader, router);
+        let op = device_op(
+            crate::metadata::FileKind::CharDevice,
+            Some(captured_node(0, 0)),
+        );
+        match exec.execute(&op, false, ConflictPolicy::default()) {
+            ExecutionOutcome::Failed { err } => {
+                assert!(err.contains("helper restarted"), "got: {err}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        exec.privileged_router
+            .set_outcome(PrivilegedOpOutcome::Conflict {
+                detail: "owner differs".into(),
+            });
+        assert!(matches!(
+            exec.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Conflict {
+                kind: crate::inverse::Conflict::Hard { .. }
+            }
+        ));
+        assert!(exec.privileged_router.chown_log().is_empty());
     }
 }

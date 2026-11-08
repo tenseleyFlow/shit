@@ -7,13 +7,12 @@
 //!
 //! The shim (`shit-preload-shim`) opens a short-lived connection to
 //! `$XDG_RUNTIME_DIR/shit/shim.sock`, sends a [`ShimNotification`]
-//! framed via `encode_frame` (or `encode_frame_large` when a
-//! pre-image payload is attached), waits ≤50 ms for a [`ShimAck`],
-//! and closes.
+//! framed via `encode_shim_frame` (its own wire version, the large
+//! cap), waits ≤50 ms for a [`ShimAck`], and closes.
 //!
 //! Per-connection flow:
-//! 1. Decode the notification (large-frame reader — accepts both
-//!    small and large frames).
+//! 1. Decode the notification (`decode_shim_frame`; a frame from a
+//!    shim built against another wire version is refused by name).
 //! 2. Resolve `pid → CommandId` via `ActiveCommands::resolve_by_descendant`.
 //!    If no active command owns the emitter, the event is orphan
 //!    and dropped silently (the shim still gets an Allow ack — we
@@ -184,18 +183,29 @@ async fn handle_one(
     if total == 0 {
         return Ok(());
     }
-    let mut note: ShimNotification = match decode_shim_frame(&buf[..total]) {
+    let note: ShimNotification = match decode_shim_frame(&buf[..total]) {
         Ok(n) => n,
         // L5: a shell started before an upgrade still has the old shim
         // loaded. Say so by name; its notifications cannot be read.
         Err(shit_proto::DecodeError::UnsupportedVersion(got)) => {
-            let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
+            let peer_pid = peer_pid(&stream);
             warn!(
                 got,
                 expected = shit_proto::SHIM_WIRE_VERSION,
                 peer_pid = ?peer_pid,
                 "shim notification from a different shim version; restart that shell after upgrading"
             );
+            // L5 (review of #232, item 4; #225): resolve the peer to its
+            // command before acking (the caller may exit right after),
+            // then ack Allow. Acks are version-1 frames, which every shim
+            // reads, so the old shim does not wait out its timeout.
+            let command = peer_pid.and_then(|p| active.resolve_by_descendant(p));
+            if let Ok(frame) = encode_frame(&ShimAck::Allow) {
+                let _ = stream.write_all(&frame).await;
+            }
+            if let Some(command) = command {
+                journal_version_gap(&index, command, got);
+            }
             return Ok(());
         }
         Err(e) => {
@@ -203,14 +213,6 @@ async fn handle_one(
             return Ok(());
         }
     };
-    // L5 (review round 3, item 6): one call per peer process, whatever its
-    // PID namespace.
-    let peer = stream.peer_cred().ok();
-    note.call_id = crate::shim_rename::scoped_call_id(
-        note.call_id,
-        peer.map(|c| c.uid()),
-        peer.and_then(|c| c.pid()),
-    );
     debug!(
         pid = note.pid,
         syscall = %note.syscall,
@@ -236,42 +238,16 @@ async fn handle_one(
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    // L5 (review item 9): a rename's outcome belongs to the command its
-    // pre-syscall notification resolved; match it by call id, with no
-    // second ancestor walk.
-    let resolved = if note.outcome.is_some() {
-        None
-    } else {
-        active.resolve_by_descendant(note.pid)
-    };
-
+    //
     // Reserve journal order before allowing the intercepted syscall to
     // run. Ingestion itself remains fail-open and happens after the ACK,
     // but later helper/shim events can no longer overtake this pre-
-    // mutation snapshot in the planner's logical clock.
+    // mutation snapshot in the planner's logical clock. L5 (review round
+    // 5, item 2): reserved before the pid resolution. The watch check
+    // compares it with the command's PostExec: a note stamped earlier was
+    // sent while the kernel tier watched, however late it is ingested.
     let ingest_ts = crate::server::next_ts();
-
-    // L5 (review round 2, item 1): a rename call is registered before its
-    // ack, so its outcome, which the shim sends only after the syscall,
-    // always finds it, however long this ingest then takes.
-    let rename_call = is_rename_call(&note).then_some(note.call_id);
-    let from_arg = note
-        .arg
-        .split_once('\t')
-        .map_or(note.arg.as_str(), |(f, _)| f)
-        .to_string();
-    let guard = match (rename_call, resolved) {
-        (Some(call_id), Some(command)) => {
-            crate::shim_rename::register_call(call_id, command);
-            Some(crate::shim_rename::CallGuard::new(
-                call_id,
-                command,
-                &from_arg,
-                index.clone(),
-            ))
-        }
-        _ => None,
-    };
+    let resolved = active.resolve_by_descendant(note.pid);
 
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
@@ -286,39 +262,6 @@ async fn handle_one(
     if let Err(e) = stream.write_all(&frame).await {
         debug!(err = %e, pid = note.pid, "shim ack write failed; ingesting anyway");
     }
-    // The outcome's call is journaled by its pre-syscall notification's
-    // own task, which may still be running.
-    let resolved = match resolved {
-        None if note.outcome.is_some() => {
-            use crate::shim_rename::CallWait;
-            let wait = crate::shim_rename::await_call(
-                note.call_id,
-                |c| active.is_active(c),
-                crate::shim_rename::PENDING_GRACE,
-            )
-            .await;
-            match wait {
-                CallWait::Ready(c) => Some(c),
-                CallWait::Unknown => {
-                    // No record of the call: keep the outcome for when it
-                    // is ingested (bounded by the registry's TTL).
-                    crate::shim_rename::park(note);
-                    return Ok(());
-                }
-                CallWait::Abandoned(c) => {
-                    crate::shim_rename::journal_gap(
-                        &index,
-                        c,
-                        &from_arg,
-                        "this rename's outcome arrived for a call whose notification was never \
-                         fully journaled",
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        r => r,
-    };
 
     ingest_notification(
         &note,
@@ -329,51 +272,22 @@ async fn handle_one(
         &blob_store,
         &live_baseline,
     );
-    if let Some(guard) = guard
-        && let Some(parked) = guard.finish()
-    {
-        apply_parked(&parked, resolved, &index, &blob_store, &live_baseline);
-    }
     Ok(())
 }
 
-/// Journal an outcome that was parked until its call's notification was
-/// ingested. Review round 3, item 1: stamped now, after the call's
-/// Rename, not when it arrived (which was before).
-pub(crate) fn apply_parked(
-    parked: &crate::shim_rename::Parked,
-    resolved: Option<shit_planner::events::CommandId>,
-    index: &Index,
-    blob_store: &BlobStore,
-    live_baseline: &LiveBaseline,
-) {
-    ingest_notification(
-        &parked.note,
-        resolved,
-        crate::server::next_ts(),
-        None,
-        index,
-        blob_store,
-        live_baseline,
-    );
-}
-
-/// A rename-family call's pre-syscall notification (not its outcome,
-/// and not a walk chunk).
-fn is_rename_call(note: &ShimNotification) -> bool {
-    note.call_id != 0
-        && note.outcome.is_none()
-        && matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
-}
-
-/// Kind and mode of an unlink target, read before the syscall runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct UnlinkStat {
+/// Kind, mode and identity of an unlink target, read before the syscall
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnlinkStat {
     kind: FileKind,
     mode: u32,
-    /// The removed entry's identity, when the shim read it before the
-    /// call (L5 review round 3, item 5).
+    /// The removed entry's identity, when it is known: the shim's
+    /// pre-call stat for a post-call removal (L5), `(st_dev, st_ino)` for
+    /// a block/char node so the shim's report pairs with the helper's
+    /// `DeviceNodeMeta` (L4b). `None` keeps the wire's `(0, 0)` sentinel.
     inode: Option<InodeRef>,
+    /// The link's target when the entry is a symlink (L4b).
+    link_target: Option<String>,
 }
 
 /// L5 — removals the shim reports after they succeeded: `rmdir` and
@@ -384,11 +298,15 @@ fn is_post_call_removal(syscall: &str) -> bool {
 }
 
 /// lstat the target of a shim `unlink`/`unlinkat` so the journaled
-/// `TreeOp::Unlink` carries the real kind and mode. Without it an
+/// event carries the real kind and mode. Without it an
 /// `unlinkat(AT_REMOVEDIR)` lands as a Regular unlink and undo's
 /// RecreatePath makes a file where a directory was, which then breaks
 /// every child restore under it (ENOTDIR). Directories, regular files,
-/// fifos and sockets are reported; anything else keeps the wire default.
+/// fifos, sockets and block/char nodes are reported (the device number
+/// comes from the helper's `DeviceNodeMeta`, not from here); a symlink
+/// is reported with its target so undo recreates the link. The shim's
+/// own pre-call lstat (`pre_stat`) is preferred; the daemon's lstat is
+/// the fallback for a shim that did not send one.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat")
@@ -400,46 +318,86 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     // stat from before the call. Never lstat it here (review round 3,
     // item 4): the directory is gone, or something new took its name.
     if is_post_call_removal(&note.syscall) {
-        return note.pre_stat.and_then(|s| {
+        return note.pre_stat.as_ref().and_then(|s| {
             FileKind::from_mode(s.mode).map(|kind| UnlinkStat {
                 kind,
                 mode: s.mode,
                 inode: Some(InodeRef::new(s.dev, s.inode)),
+                link_target: None,
             })
         });
     }
     if !Path::new(&note.arg).is_absolute() {
         return None;
     }
-    let meta = match std::fs::symlink_metadata(&note.arg) {
-        Ok(m) => m,
-        Err(e) => {
-            debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
-            return None;
-        }
+    let (dev, ino, mode, shim_target) = match &note.pre_stat {
+        Some(st) => (st.dev, st.inode, st.mode, st.link_target.clone()),
+        None => match std::fs::symlink_metadata(&note.arg) {
+            Ok(m) => (m.dev(), m.ino(), m.mode(), None),
+            Err(e) => {
+                debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
+                return None;
+            }
+        },
     };
-    let kind = FileKind::from_mode(meta.mode()).filter(|k| {
-        matches!(
-            k,
-            FileKind::Directory | FileKind::Regular | FileKind::Fifo | FileKind::Socket
-        )
-    })?;
+    let kind = FileKind::from_mode(mode)?;
+    if kind == FileKind::Symlink {
+        // The shim's target, read before the call; else the daemon's
+        // read now. An empty target means unknown (no symlink can have
+        // one): the planner then refuses rather than make a regular file.
+        let target = shim_target
+            .or_else(|| {
+                std::fs::read_link(&note.arg)
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        return Some(UnlinkStat {
+            kind,
+            mode,
+            inode: None,
+            link_target: Some(target),
+        });
+    }
+    if !matches!(
+        kind,
+        FileKind::Directory
+            | FileKind::Regular
+            | FileKind::Fifo
+            | FileKind::Socket
+            | FileKind::BlockDevice
+            | FileKind::CharDevice
+    ) {
+        return None;
+    }
+    let inode = matches!(kind, FileKind::BlockDevice | FileKind::CharDevice)
+        .then(|| InodeRef::new(dev, ino));
     Some(UnlinkStat {
         kind,
-        mode: meta.mode(),
-        inode: None,
+        mode,
+        inode,
+        link_target: None,
     })
 }
 
-/// Overlay a pre-syscall lstat onto a classified shim Unlink.
+/// Overlay a pre-syscall lstat onto a classified shim Unlink. A removed
+/// symlink becomes `SymlinkRemoved`, whose inverse recreates the link.
 fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> CaptureEventKind {
     match (kind, stat) {
+        (
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }),
+            Some(UnlinkStat {
+                link_target: Some(target),
+                ..
+            }),
+        ) => CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target, path }),
         (
             CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path, .. }),
             Some(UnlinkStat {
                 kind,
                 mode,
                 inode: shim_inode,
+                ..
             }),
         ) => CaptureEventKind::TreeOp(TreeOp::Unlink {
             inode: shim_inode.unwrap_or(inode),
@@ -451,10 +409,82 @@ fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> Captur
     }
 }
 
+/// The pid of the process on the other end of a shim connection.
+///
+/// tokio's `peer_cred` carries a pid on Linux and macOS but not on
+/// FreeBSD, where it uses `getpeereid`. FreeBSD 13 and later report the
+/// peer's pid in `LOCAL_PEERCRED`'s `xucred`, so read that there.
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    if let Some(pid) = stream.peer_cred().ok().and_then(|c| c.pid()) {
+        return u32::try_from(pid).ok().filter(|p| *p > 0);
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: xucred is plain old data; zeroed is a valid value.
+        let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+        // SAFETY: a valid socket fd and a buffer of `len` bytes. Level 0
+        // is SOL_LOCAL (sys/un.h), which libc does not export here.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && cred.cr_version == libc::XUCRED_VERSION {
+            // SAFETY: the kernel fills cr_pid for LOCAL_PEERCRED (13.0+).
+            let pid = unsafe { cred.cr_pid__c_anonymous_union.cr_pid };
+            return u32::try_from(pid).ok().filter(|p| *p > 0);
+        }
+    }
+    None
+}
+
+/// L5 (review of #232, item 4; #225): a shim built for another wire
+/// version is writing for `command`, and none of its notifications can be
+/// read. Journal one capture-gap refusal per command, so undo says the
+/// command's changes were not captured instead of passing over them.
+fn journal_version_gap(index: &Index, command: shit_planner::events::CommandId, got: u8) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<shit_planner::events::CommandId>>> =
+        OnceLock::new();
+    // Held across the write, and marked only once it succeeded (review
+    // of #232 medium review, item 5), so a failed write is retried on the
+    // old shim's next note.
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if seen.contains(&command) {
+        return;
+    }
+    match crate::helper_link::journal_refusal(
+        index,
+        command,
+        None,
+        shit_planner::COMMAND_CAPTURE_GAP,
+        format!(
+            "a shim from an older version (wire {got}, daemon expects {}) was loaded in this \
+             command's shell; none of its changes were captured. Restart the shell to load the \
+             current shim",
+            shit_proto::SHIM_WIRE_VERSION
+        ),
+    ) {
+        Ok(()) => {
+            if seen.len() >= 4096 {
+                seen.clear();
+            }
+            seen.insert(command);
+        }
+        Err(e) => warn!(err = %e, %command, "shim version-gap refusal journal failed"),
+    }
+}
+
 /// Convert a shim notification into a `CaptureEvent` and journal it,
 /// if the emitter's pid resolves to an active command. Errors are
 /// logged but never propagated — the shim path is best-effort.
-fn ingest_notification(
+pub(crate) fn ingest_notification(
     note: &ShimNotification,
     resolved: Option<shit_planner::events::CommandId>,
     ingest_ts: shit_planner::time::TimePoint,
@@ -480,21 +510,10 @@ fn ingest_notification(
     // the partial capture); the journaled refusal ensures the
     // planner surfaces the gap as an InverseOp::Refuse node at undo
     // time instead of silently mis-attributing.
-    // L5 (review round 4, item 2): inside a watched tree the kernel tier
-    // captures the file's pre-image, as it does the create the shim then
-    // defers (`open_create` below). A shim capture gap there is no gap.
-    // Watched means BSD's baseline cwds, or the root the daemon sent the
-    // helper for this command (any platform) unless the helper said it
-    // could not watch it.
-    let gap_in_watch = matches!(
-        &note.failure,
-        Some(shit_proto::ShimFailure::PreImageUncaptured { path, .. })
-            if live_baseline.path_in_watched_subtree(Path::new(path))
-                || live_baseline.command_watches(command, Path::new(path))
-    );
-    if let Some(failure) = &note.failure
-        && !gap_in_watch
-    {
+    // L5 (review of #232, item 2): the shim's gap marker is always
+    // journaled. The planner drops it when another tier journaled a
+    // pre-image of the same path in this command.
+    if let Some(failure) = &note.failure {
         let (class, primary_path, detail) = match failure {
             shit_proto::ShimFailure::CanonicalizeFailed {
                 which_arg,
@@ -528,38 +547,26 @@ fn ingest_notification(
                 detail,
             },
         };
-        match index.put_event(&event) {
-            Err(e) => warn!(
+        if let Err(e) = index.put_event(&event) {
+            warn!(
                 err = %e,
                 pid = note.pid,
                 syscall = %note.syscall,
                 "shim notify: CaptureRefused journal failed"
-            ),
-            Ok(id) => {
-                // L5: the refusal goes with its rename call's outcome.
-                if is_rename_call(note) {
-                    crate::shim_rename::record_refusal(note.call_id, id);
-                }
-                debug!(
+            );
+        } else {
+            debug!(
                 pid = note.pid,
                 syscall = %note.syscall,
                 session = %command.session,
                 seq = command.seq,
                 "shim notify: journaled CaptureRefused (AU10)"
-                );
-            }
+            );
         }
         // Fall through — the syscall may have attached a partial
         // pre_image too (e.g., `from` canonicalized but `to`
         // didn't). Ingest what we can; the Refuse marker is
         // additive.
-    }
-
-    // L5: the post-syscall notification of a rename. Its pre-syscall
-    // twin already journaled the Rename; this records what happened.
-    if let Some(outcome) = &note.outcome {
-        crate::shim_rename::ingest_outcome(note, outcome, command, ingest_ts, index);
-        return;
     }
 
     // M07.B.5: metadata-mutation syscalls (chmod / chown / utimes /
@@ -612,7 +619,7 @@ fn ingest_notification(
             let source = if matches!(note.syscall.as_str(), "chflags" | "fchflags") {
                 shit_planner::FilePreImageSource::ShimFlagsPreMutation
             } else {
-                shit_planner::FilePreImageSource::Other
+                shit_planner::FilePreImageSource::ShimPreMutation
             };
             if let Err(e) =
                 ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts)
@@ -660,6 +667,15 @@ fn ingest_notification(
         // `open_create` after a call that created its target.
         return;
     }
+    // L5 (review round 5, item 1): on Linux the kernel tier journals
+    // every create under the root the daemon asked it to watch for this
+    // command, with the real inode. A shim Create there is a second
+    // record of the same create, and undo would unlink the path twice
+    // (the second one a conflict). Outside the root the shim is the only
+    // record. The BSD baseline gate below is the same rule for kqueue.
+    let create_in_command_watch = cfg!(target_os = "linux")
+        && matches!(note.syscall.as_str(), "open_create" | "mkdir" | "mkdirat")
+        && live_baseline.defer_create_to_kernel(command, Path::new(&note.arg), ingest_ts);
     if note.syscall == "open_create" {
         // AR05.1: the shim saw the path absent before an O_CREAT open
         // that then succeeded. On in-watch paths the dir-diff Create event
@@ -678,12 +694,12 @@ fn ingest_notification(
         // LiveBaseline's cached cwds and suppress when the wire arg
         // falls inside any of them — kqueue dir-diff is
         // authoritative there.
-        if live_baseline.path_in_watched_subtree(Path::new(&note.arg)) {
+        if live_baseline.path_in_watched_subtree(Path::new(&note.arg)) || create_in_command_watch {
             debug!(
                 pid = note.pid,
                 syscall = %note.syscall,
                 arg = %note.arg,
-                "shim notify: path is in-watch; defer to kqueue dir-diff"
+                "shim notify: path is in-watch; defer to the kernel tier"
             );
             return;
         }
@@ -727,13 +743,6 @@ fn ingest_notification(
         return;
     }
 
-    // L5 (review item 7): a walk too big for one frame arrives as
-    // pre-image chunks ahead of its Rename; they journal no Rename.
-    if note.syscall == "rename_walk" {
-        crate::shim_rename::ingest_walk(note, command, ingest_ts, index, blob_store);
-        return;
-    }
-
     // W06.A.4: a rename notification with an attached pre-image is
     // an atomic-replace shape (e.g. `install` writes a tmpfile then
     // renames it over an existing dst). Journal BOTH the TreeOp::Rename
@@ -761,11 +770,62 @@ fn ingest_notification(
     // fresh content lose all pre-state and undo can only emit a
     // refusal.
     if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
-        && (!note.extra_pre_images.is_empty() || note.walk.is_some())
+        && !note.extra_pre_images.is_empty()
     {
-        // L5: the walk's pre-images, then one RenameWalk event recording
-        // its directories and whether all of it was journaled.
-        crate::shim_rename::ingest_walk(note, command, ingest_ts, index, blob_store);
+        let mut journaled = 0u64;
+        let mut failed = 0u64;
+        for pre in &note.extra_pre_images {
+            match ingest_pre_image_with_source(
+                command,
+                pre,
+                index,
+                blob_store,
+                shit_planner::FilePreImageSource::ShimRenameSubtree,
+                ingest_ts,
+            ) {
+                Ok(()) => journaled += 1,
+                Err(e) => {
+                    failed += 1;
+                    warn!(err = %e, pid = note.pid, path = %pre.path, "shim notify: recursive pre-image ingest failed");
+                }
+            }
+        }
+        debug!(
+            pid = note.pid,
+            session = %command.session,
+            seq = command.seq,
+            n = note.extra_pre_images.len(),
+            journaled,
+            failed,
+            "shim notify: recursive rename pre-images ingested (DR-CR-54)"
+        );
+    }
+    // L5 (review of #232, item 3): the rename replaced a symlink at `to`.
+    // Journal the link with its target before the Rename, so undo puts
+    // the renamed entry back at `from` and then recreates the link.
+    if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
+        && let Some(shit_proto::ShimStat {
+            mode,
+            link_target: Some(target),
+            ..
+        }) = &note.pre_stat
+        && FileKind::from_mode(*mode) == Some(FileKind::Symlink)
+        && let Some((_, to)) = note.arg.split_once('\t')
+        && Path::new(to).is_absolute()
+    {
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: ingest_ts,
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: target.clone(),
+                path: PathBuf::from(to),
+            }),
+        };
+        if let Err(e) = index.put_event(&event) {
+            warn!(err = %e, pid = note.pid, "shim notify: replaced symlink journal failed");
+        }
     }
     // Fall through to journal the TreeOp::Rename below.
 
@@ -800,17 +860,37 @@ fn ingest_notification(
         return;
     };
 
-    // Never journal a Create for a relative path: the undo executor would
-    // resolve it against the daemon's cwd and remove the wrong entry. The
-    // shim attaches a CaptureRefused marker when it could not make the
-    // path absolute (already journaled above).
-    if is_relative_create(&kind) {
+    // Never journal a tree op with a relative path: the undo executor
+    // would resolve it against the daemon's cwd and act on the wrong
+    // entry. L5 (review of #232, item 6): it is a refusal instead. The
+    // shim attaches a marker when it could not make the path absolute
+    // (journaled above); a relative path without one is refused here.
+    if let Some(rel) = relative_tree_path(&kind) {
         debug!(
             pid = note.pid,
             syscall = %note.syscall,
             arg = %note.arg,
-            "shim notify: relative Create path; dropping"
+            "shim notify: relative tree-op path; refusing"
         );
+        if note.failure.is_none() {
+            let event = CaptureEvent {
+                id: EventId(0),
+                command,
+                ts: ingest_ts,
+                partial: false,
+                kind: CaptureEventKind::CaptureRefused {
+                    class: "capture-incomplete".to_string(),
+                    path: rel,
+                    detail: format!(
+                        "shim reported {} on a path it could not make absolute",
+                        note.syscall
+                    ),
+                },
+            };
+            if let Err(e) = index.put_event(&event) {
+                warn!(err = %e, pid = note.pid, "shim notify: relative-path refusal journal failed");
+            }
+        }
         return;
     }
 
@@ -836,13 +916,13 @@ fn ingest_notification(
     if matches!(
         note.syscall.as_str(),
         "link" | "linkat" | "mkdir" | "mkdirat"
-    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    ) && (live_baseline.path_in_watched_subtree(Path::new(&note.arg)) || create_in_command_watch)
     {
         debug!(
             pid = note.pid,
             syscall = %note.syscall,
             arg = %note.arg,
-            "shim notify: Create path is in-watch; defer to kqueue dir-diff"
+            "shim notify: Create path is in-watch; defer to the kernel tier"
         );
         return;
     }
@@ -854,15 +934,9 @@ fn ingest_notification(
         partial: false,
         kind,
     };
-    let id = match index.put_event(&event) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
-            return;
-        }
-    };
-    if is_rename_call(note) {
-        crate::shim_rename::record_rename(note.call_id, id);
+    if let Err(e) = index.put_event(&event) {
+        warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
+        return;
     }
     debug!(
         pid = note.pid,
@@ -873,34 +947,24 @@ fn ingest_notification(
     );
 }
 
-/// [`ingest_notification`] without a pre-syscall stat, for other
-/// modules' tests.
-#[cfg(test)]
-pub(crate) fn ingest_notification_for_test(
-    note: &ShimNotification,
-    resolved: Option<shit_planner::events::CommandId>,
-    ingest_ts: shit_planner::time::TimePoint,
-    index: &Index,
-    blob_store: &BlobStore,
-    live_baseline: &LiveBaseline,
-) {
-    ingest_notification(
-        note,
-        resolved,
-        ingest_ts,
-        None,
-        index,
-        blob_store,
-        live_baseline,
-    );
-}
-
-/// True when `kind` is a TreeOp::Create whose path is not absolute.
-fn is_relative_create(kind: &CaptureEventKind) -> bool {
-    matches!(
-        kind,
-        CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) if !path.is_absolute()
-    )
+/// The first relative path of a tree op, if it has one.
+fn relative_tree_path(kind: &CaptureEventKind) -> Option<PathBuf> {
+    let CaptureEventKind::TreeOp(op) = kind else {
+        return None;
+    };
+    let paths: Vec<&Path> = match op {
+        TreeOp::Create { path, .. }
+        | TreeOp::Unlink { path, .. }
+        | TreeOp::Symlink { path, .. }
+        | TreeOp::SymlinkRemoved { path, .. } => vec![path],
+        TreeOp::Rename { from, to, .. } => vec![from, to],
+        TreeOp::Link { target, .. } => vec![target],
+        TreeOp::DeviceNodeMeta { path, .. } => vec![path],
+    };
+    paths
+        .into_iter()
+        .find(|p| !p.is_absolute())
+        .map(Path::to_path_buf)
 }
 
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
@@ -918,7 +982,7 @@ fn ingest_pre_image(
         pre,
         index,
         blob_store,
-        shit_planner::FilePreImageSource::Other,
+        shit_planner::FilePreImageSource::ShimPreMutation,
         ts,
     )
 }
@@ -933,21 +997,6 @@ fn ingest_pre_image_with_source(
     blob_store: &BlobStore,
     source: shit_planner::FilePreImageSource,
     ts: shit_planner::time::TimePoint,
-) -> anyhow::Result<()> {
-    ingest_pre_image_full(command, pre, index, blob_store, source, ts, None)
-}
-
-/// [`ingest_pre_image_with_source`]; `shim_xattrs` (L5) are the file's
-/// xattrs as the shim read them before the syscall, used instead of the
-/// daemon's own read after the ack.
-pub(crate) fn ingest_pre_image_full(
-    command: shit_planner::events::CommandId,
-    pre: &ShimPreImage,
-    index: &Index,
-    blob_store: &BlobStore,
-    source: shit_planner::FilePreImageSource,
-    ts: shit_planner::time::TimePoint,
-    shim_xattrs: Option<BTreeMap<String, Vec<u8>>>,
 ) -> anyhow::Result<()> {
     let (blob_hash, stat) = blob_store
         .put(&pre.bytes)
@@ -970,7 +1019,7 @@ pub(crate) fn ingest_pre_image_full(
     // multiple xattrs concurrently might lose attribution for
     // ones not the syscall's primary target. Acceptable for v1;
     // a future hardening could have the shim capture all xattrs.
-    let xattrs = shim_xattrs.unwrap_or_else(|| build_xattrs_target(&pre.path, pre.xattr.as_ref()));
+    let xattrs = build_xattrs_target(&pre.path, pre.xattr.as_ref());
     let meta = FileMetadata {
         mode: pre.mode,
         uid: pre.uid,
@@ -1286,11 +1335,49 @@ mod tests {
         for syscall in ["mkdir", "mkfifo", "link"] {
             let rel = classify_tree_op(syscall, "relative/child").expect("classifiable");
             assert!(
-                is_relative_create(&rel),
+                relative_tree_path(&rel).is_some(),
                 "{syscall} relative must be dropped"
             );
             let abs = classify_tree_op(syscall, "/tmp/shit-abs-child").expect("classifiable");
-            assert!(!is_relative_create(&abs), "{syscall} absolute must pass");
+            assert!(
+                relative_tree_path(&abs).is_none(),
+                "{syscall} absolute must pass"
+            );
+        }
+    }
+
+    /// Review of #232, item 6: an Unlink or Rename with a relative path
+    /// (macOS reports unresolved dirfd names raw) is never journaled as
+    /// a tree op. It is a refusal: the shim's marker when it sent one,
+    /// the daemon's own when it did not.
+    #[test]
+    fn relative_unlink_and_rename_are_refused_not_journaled() {
+        for (syscall, arg) in [
+            ("unlinkat", "name"),
+            ("renameat", "a\t/tmp/abs-b"),
+            ("renameat", "/tmp/abs-a\tb"),
+        ] {
+            let kinds = kinds_after(&open_note_arg(syscall, arg, None));
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-incomplete"
+                ),
+                "{syscall} {arg}: {kinds:#?}"
+            );
+            let marker = shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg: "path".into(),
+                attempted_path: arg.into(),
+                error_chain: "F_GETPATH failed".into(),
+            };
+            let kinds = kinds_after(&open_note_arg(syscall, arg, Some(marker)));
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-incomplete"
+                ),
+                "{syscall} {arg} with marker: {kinds:#?}"
+            );
         }
     }
 
@@ -1352,10 +1439,7 @@ mod tests {
                 pre_image: None,
                 extra_pre_images: Vec::new(),
                 failure: None,
-                walk: None,
-                outcome: None,
                 pre_stat: None,
-                call_id: 0,
             };
             let frame = shit_proto::encode_shim_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
@@ -1425,7 +1509,7 @@ mod tests {
         assert!(matches!(
             &events[0].kind,
             CaptureEventKind::FilePreImage {
-                source: shit_planner::FilePreImageSource::Other,
+                source: shit_planner::FilePreImageSource::ShimPreMutation,
                 ..
             }
         ));
@@ -1489,10 +1573,7 @@ mod tests {
             }),
             extra_pre_images: Vec::new(),
             failure: None,
-            walk: None,
-            outcome: None,
             pre_stat: None,
-            call_id: 0,
         };
         let reserved_ts = TimePoint::new(778, 43);
 
@@ -1588,10 +1669,7 @@ mod tests {
                 shim_pre("/tmp/shit-walk/d/sub/b", b"b"),
             ],
             failure: None,
-            walk: None,
-            outcome: None,
             pre_stat: None,
-            call_id: 0,
         };
         ingest_notification(
             &note,
@@ -1624,7 +1702,7 @@ mod tests {
                 ),
                 (
                     PathBuf::from("/tmp/shit-walk/d.bak"),
-                    FilePreImageSource::Other
+                    FilePreImageSource::ShimPreMutation
                 ),
             ]
         );
@@ -1650,10 +1728,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
-            walk: None,
-            outcome: None,
             pre_stat: None,
-            call_id: 0,
         };
         let fifo = tmp.path().join("p");
         let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -1667,7 +1742,18 @@ mod tests {
         let f = pre_syscall_unlink_stat(&note("unlink", &file)).expect("file stat");
         assert_eq!(f.kind, FileKind::Regular);
         assert_eq!(f.mode & 0o7777, 0o600);
-        assert_eq!(pre_syscall_unlink_stat(&note("unlinkat", &link)), None);
+        // A char node reports its kind (stat only; /dev/null is not
+        // touched).
+        let n = pre_syscall_unlink_stat(&note("unlink", Path::new("/dev/null")))
+            .expect("char device stat");
+        assert_eq!(n.kind, FileKind::CharDevice);
+        // L4b: a symlink reports its target, and only device nodes
+        // carry an identity.
+        let l = pre_syscall_unlink_stat(&note("unlinkat", &link)).expect("symlink stat");
+        assert_eq!(l.kind, FileKind::Symlink);
+        assert_eq!(l.link_target.as_deref(), Some(file.to_str().unwrap()));
+        assert_eq!(f.inode, None);
+        assert!(n.inode.is_some_and(|i| i != InodeRef::new(0, 0)));
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", &tmp.path().join("gone"))),
             None
@@ -1676,6 +1762,124 @@ mod tests {
         assert_eq!(
             pre_syscall_unlink_stat(&note("unlinkat", Path::new("relative"))),
             None
+        );
+    }
+
+    /// L4b: the shim's `unlink` of a symlink journals a
+    /// `SymlinkRemoved` for the link's own path with its target, so
+    /// undo recreates the link and leaves the target alone.
+    #[test]
+    fn unlink_of_a_symlink_journals_the_link_and_its_target() {
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let note = ShimNotification {
+            pid: 4242,
+            syscall: "unlinkat".into(),
+            arg: link.to_str().unwrap().into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: None,
+        };
+        let stat = pre_syscall_unlink_stat(&note);
+        let (_t, index, blob_store, command) = ingest_fixture("rm link");
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(6, 0),
+            stat,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        let events = index.events_for_command(command);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        match &events[0].kind {
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target: t, path }) => {
+                assert_eq!(path, &link);
+                assert_eq!(t, target.to_str().unwrap());
+            }
+            other => panic!("expected SymlinkRemoved, got {other:?}"),
+        }
+    }
+
+    /// Review round 3, item 2: the symlink is gone by the time the daemon
+    /// reads it. The shim's target is used; with none, the removal is
+    /// still a SymlinkRemoved (target unknown), never a Regular Unlink.
+    #[test]
+    fn symlink_removal_uses_the_shim_target_when_the_link_is_gone() {
+        let gone = "/nonexistent-shit-l4b/link";
+        let note = |target: Option<&str>| ShimNotification {
+            pid: 1,
+            syscall: "unlinkat".into(),
+            arg: gone.into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: 1,
+                inode: 2,
+                mode: 0o120777,
+                link_target: target.map(str::to_string),
+            }),
+        };
+        let kind = |n: &ShimNotification| {
+            apply_unlink_stat(
+                classify_tree_op("unlinkat", gone).unwrap(),
+                pre_syscall_unlink_stat(n),
+            )
+        };
+        assert_eq!(
+            kind(&note(Some("t"))),
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: "t".into(),
+                path: PathBuf::from(gone),
+            })
+        );
+        assert_eq!(
+            kind(&note(None)),
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: String::new(),
+                path: PathBuf::from(gone),
+            })
+        );
+    }
+
+    /// L4b: a shim `unlink` of a device node carries the shim's pre-call
+    /// identity, so it pairs with the helper's `DeviceNodeMeta`.
+    #[test]
+    fn unlink_of_a_device_node_journals_the_shim_identity() {
+        let note = ShimNotification {
+            pid: 1,
+            syscall: "unlink".into(),
+            arg: "/w/null".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: 0x803,
+                inode: 77,
+                mode: 0o020640,
+                link_target: None,
+            }),
+        };
+        let stat = pre_syscall_unlink_stat(&note).expect("stat from pre_stat");
+        let kind = apply_unlink_stat(classify_tree_op("unlink", "/w/null").unwrap(), Some(stat));
+        assert_eq!(
+            kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: InodeRef::new(0x803, 77),
+                path: PathBuf::from("/w/null"),
+                kind: FileKind::CharDevice,
+                mode: 0o020640,
+            })
         );
     }
 
@@ -1692,10 +1896,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
-            walk: None,
-            outcome: None,
             pre_stat: None,
-            call_id: 0,
         };
         let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
         ingest_notification(
@@ -1706,6 +1907,7 @@ mod tests {
                 kind: FileKind::Directory,
                 mode: 0o040750,
                 inode: None,
+                link_target: None,
             }),
             &index,
             &blob_store,
@@ -1790,6 +1992,17 @@ mod tests {
             .collect()
     }
 
+    fn open_note_arg(
+        syscall: &str,
+        arg: &str,
+        failure: Option<shit_proto::ShimFailure>,
+    ) -> ShimNotification {
+        ShimNotification {
+            arg: arg.into(),
+            ..open_note(syscall, failure)
+        }
+    }
+
     fn open_note(syscall: &str, failure: Option<shit_proto::ShimFailure>) -> ShimNotification {
         ShimNotification {
             pid: 4242,
@@ -1799,10 +2012,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure,
-            walk: None,
-            outcome: None,
             pre_stat: None,
-            call_id: 0,
         }
     }
 
@@ -1837,10 +2047,11 @@ mod tests {
         );
     }
 
-    /// Review round 4, item 2: in a watched tree the kernel tier holds the
-    /// pre-image, so the shim's gap is not journaled; outside it is.
+    /// Review of #232, item 2: the shim's gap marker is journaled in a
+    /// watched tree too (BSD baseline or the command's watch root). The
+    /// planner decides whether another tier covered it.
     #[test]
-    fn uncaptured_file_in_a_watched_tree_journals_no_refusal() {
+    fn uncaptured_file_in_a_watched_tree_still_journals_its_refusal() {
         use shit_planner::time::TimePoint;
         let failure = shit_proto::ShimFailure::PreImageUncaptured {
             path: "/tmp/shit-open/existing".into(),
@@ -1850,6 +2061,7 @@ mod tests {
         let watched = LiveBaseline::new();
         watched.entry_for_cwd(Path::new("/tmp/shit-open"));
         let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        watched.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
         ingest_notification(
             &note,
             Some(command),
@@ -1864,68 +2076,326 @@ mod tests {
             .into_iter()
             .map(|e| e.kind)
             .collect();
-        assert!(kinds.is_empty(), "{kinds:#?}");
-        // Out of watch, the same note is a refusal (as in
-        // `uncaptured_existing_file_journals_a_refusal_only`).
-        assert_eq!(kinds_after(&note).len(), 1);
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-gap"
+            ),
+            "{kinds:#?}"
+        );
     }
 
-    /// Review round 4, item 2 on Linux: the daemon records the root it
-    /// sent the helper in WatchTree for each command. A gap in that tree
-    /// journals nothing; outside it, or once the helper said it cannot
-    /// watch the command, it is a refusal.
+    /// Review round 5, item 1: `python3 -m venv` / `mkdir -p` under the
+    /// command's watch root on Linux. The kernel tier journals each
+    /// create with its inode; the shim's notes for the same paths are
+    /// deferred, so each path has one Create and undo removes each once
+    /// with no conflicts. Outside the root the shim's Create is kept.
     #[test]
-    fn uncaptured_file_in_the_commands_watch_root_journals_no_refusal() {
+    #[cfg(target_os = "linux")]
+    fn shim_creates_in_the_commands_watch_root_defer_to_the_kernel_tier() {
         use shit_planner::time::TimePoint;
-        let gap = |path: &str| {
-            open_note(
-                "open",
-                Some(shit_proto::ShimFailure::PreImageUncaptured {
-                    path: path.into(),
-                    reason: "over the shim's inline pre-image cap".into(),
-                }),
-            )
+        use std::os::unix::fs::MetadataExt;
+        let (tmp, index, blob_store, command) = ingest_fixture("python3 -m venv v");
+        let root = tmp.path().canonicalize().unwrap().join("w");
+        let out = tmp.path().canonicalize().unwrap().join("out");
+        std::fs::create_dir_all(root.join("v/bin")).unwrap();
+        std::fs::write(root.join("v/bin/activate"), b"x").unwrap();
+        std::fs::create_dir(&out).unwrap();
+        let lb = LiveBaseline::new();
+        lb.record_command_watch(command, root.clone());
+        lb.confirm_command_watch(command, TimePoint::new(1, 0));
+        let mut t = 1;
+        let mut ts = || {
+            t += 1;
+            TimePoint::new(t, 0)
         };
-        let run = |note: &ShimNotification, lb: &LiveBaseline, command, index: &Index, blobs| {
-            ingest_notification(
-                note,
-                Some(command),
-                TimePoint::new(6, 0),
-                None,
+        for (rel, kind, shim) in [
+            ("v", FileKind::Directory, "mkdir"),
+            ("v/bin", FileKind::Directory, "mkdirat"),
+            ("v/bin/activate", FileKind::Regular, "open_create"),
+        ] {
+            let p = root.join(rel);
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            index
+                .put_event(&CaptureEvent {
+                    id: EventId(0),
+                    command,
+                    ts: ts(),
+                    partial: false,
+                    kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                        inode: InodeRef::new(m.dev(), m.ino()),
+                        path: p.clone(),
+                        kind,
+                        mode: m.mode(),
+                    }),
+                })
+                .unwrap();
+            let mut note = open_note(shim, None);
+            note.arg = p.to_str().unwrap().into();
+            ingest_notification(&note, Some(command), ts(), None, &index, &blob_store, &lb);
+        }
+        let mut note = open_note("mkdir", None);
+        note.arg = out.to_str().unwrap().into();
+        ingest_notification(&note, Some(command), ts(), None, &index, &blob_store, &lb);
+        let events = index.events_for_command(command);
+        let mut creates: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        creates.sort();
+        assert_eq!(
+            creates,
+            vec![
+                out.clone(),
+                root.join("v"),
+                root.join("v/bin"),
+                root.join("v/bin/activate")
+            ]
+        );
+        let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, command).unwrap();
+        let plan = shit_planner::plan(
+            record,
+            &events,
+            &shit_planner::LiveStateProbe::new(),
+            &index,
+        );
+        assert!(
+            plan.nodes.iter().all(|n| n.conflict.is_none()),
+            "{:#?}",
+            plan.nodes
+        );
+    }
+
+    /// Review of #232, item 3: `mv new link` over a symlink. The daemon
+    /// journals the replaced link, and undo puts `new` back and recreates
+    /// the link with its target.
+    #[test]
+    fn rename_over_a_symlink_is_undone_by_recreating_the_link() {
+        use shit_planner::time::TimePoint;
+        let (tmp, index, blob_store, command) = ingest_fixture("mv new link");
+        let dir = tmp.path().canonicalize().unwrap().join("w");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("target"), b"keep").unwrap();
+        std::fs::write(dir.join("new"), b"new").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let mut note = open_note("rename", None);
+        note.arg = format!(
+            "{}\t{}",
+            dir.join("new").display(),
+            dir.join("link").display()
+        );
+        note.pre_stat = Some(shit_proto::ShimStat {
+            dev: 1,
+            inode: 2,
+            mode: 0o120777,
+            link_target: Some("target".into()),
+        });
+        let lb = LiveBaseline::new();
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(5, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        std::fs::rename(dir.join("new"), dir.join("link")).unwrap();
+
+        let events = index.events_for_command(command);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target, path })
+                    if target == "target" && *path == dir.join("link")
+            )),
+            "{events:#?}"
+        );
+        let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, command).unwrap();
+        let probe = shit_planner::LiveStateProbe::new();
+        let plan = shit_planner::plan(record, &events, &probe, &index);
+        let blobs = shit_planner::InMemoryBlobReader::new();
+        let exec = shit_planner::FileExecutor::new(&blobs);
+        let report = shit_planner::Orchestrator::new(&exec, &probe).run(
+            &plan,
+            false,
+            shit_planner::ConflictPolicy::Abort,
+        );
+        assert!(
+            report
+                .records
+                .iter()
+                .all(|r| r.outcome_kind == shit_planner::OutcomeKind::Applied),
+            "{:#?}",
+            report.records
+        );
+        assert_eq!(std::fs::read(dir.join("new")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read_link(dir.join("link")).unwrap(),
+            PathBuf::from("target")
+        );
+    }
+
+    /// Review of #232, item 4: a frame from an older shim (version 1, or
+    /// version 2 from #223's shim) from a process running under a tracked
+    /// command. The peer gets an Allow ack it can decode, and the command
+    /// gets one capture-gap refusal.
+    #[test]
+    fn old_shim_frame_is_acked_and_journals_a_version_gap() {
+        for version in [1u8, 2] {
+            old_shim_frame_case(version);
+        }
+    }
+
+    fn old_shim_frame_case(version: u8) {
+        let (_tmp, index, blob_store, fixture) = ingest_fixture("python3 save.py");
+        // One command per case: the refusal is journaled once per command.
+        let command = shit_planner::events::CommandId {
+            seq: 100 + u64::from(version),
+            ..fixture
+        };
+        let mut record =
+            <Index as shit_planner::PlannerStore>::command_by_id(&index, fixture).unwrap();
+        record.command = command;
+        index.put_command(&record).unwrap();
+        let index = Arc::new(index);
+        let active = Arc::new(ActiveCommands::default());
+        active.insert(std::process::id(), command);
+        let (ours, theirs) = StdUnixStream::pair().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let task = {
+            let (index, active) = (index.clone(), active.clone());
+            let blobs = Arc::new(blob_store);
+            theirs.set_nonblocking(true).unwrap();
+            let _guard = rt.enter();
+            let theirs = UnixStream::from_std(theirs).unwrap();
+            rt.spawn(handle_one(
+                theirs,
                 index,
                 blobs,
-                lb,
-            );
+                active,
+                Arc::new(LiveBaseline::new()),
+            ))
         };
-        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        let mut ours = ours;
+        // A frame as a shim from before the upgrade sends it: the
+        // generic version-1 frame, or a current frame stamped 2.
+        let old = if version == 1 {
+            encode_frame(&open_note("open", None)).unwrap()
+        } else {
+            let mut f = shit_proto::encode_shim_frame(&open_note("open", None)).unwrap();
+            f[4] = version;
+            f
+        };
+        std::io::Write::write_all(&mut ours, &old).unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut len = [0u8; 4];
+        std::io::Read::read_exact(&mut ours, &mut len).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        std::io::Read::read_exact(&mut ours, &mut body).unwrap();
+        let mut frame = len.to_vec();
+        frame.extend_from_slice(&body);
+        let ack: ShimAck = decode_frame(&frame).unwrap();
+        assert!(matches!(ack, ShimAck::Allow));
+        rt.block_on(task).unwrap().unwrap();
+        let kinds: Vec<_> = index
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::CaptureRefused { class, detail, .. }]
+                    if class == shit_planner::COMMAND_CAPTURE_GAP && detail.contains("Restart the shell")
+            ),
+            "{kinds:#?}"
+        );
+    }
+
+    /// Review of #232 round 2, item 2: until the helper confirms the
+    /// watch, the shim's Create is journaled; once it has, it is left to
+    /// the kernel tier.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shim_create_before_the_watch_is_ready_is_journaled() {
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("mkdir d");
         let lb = LiveBaseline::new();
         lb.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
-        run(
-            &gap("/tmp/shit-open/big.bin"),
-            &lb,
-            command,
+        let mut early = open_note("mkdir", None);
+        early.arg = "/tmp/shit-open/early".into();
+        ingest_notification(
+            &early,
+            Some(command),
+            TimePoint::new(2, 0),
+            None,
             &index,
             &blob_store,
+            &lb,
         );
+        lb.confirm_command_watch(command, TimePoint::new(3, 0));
+        let mut late = open_note("mkdir", None);
+        late.arg = "/tmp/shit-open/late".into();
+        ingest_notification(
+            &late,
+            Some(command),
+            TimePoint::new(4, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        let creates: Vec<_> = index
+            .events_for_command(command)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, vec![PathBuf::from("/tmp/shit-open/early")]);
+    }
+
+    /// Review of #232 medium review, item 5: a version-gap refusal whose
+    /// write failed (here the command row is not there yet) is written
+    /// on the next note, not skipped as already seen.
+    #[test]
+    fn failed_version_gap_write_is_retried() {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let session = uuid::Uuid::from_u128(0x5eed);
+        let command = shit_planner::events::CommandId { session, seq: 1 };
+        journal_version_gap(&index, command, 1);
         assert!(index.events_for_command(command).is_empty());
-        run(
-            &gap("/tmp/elsewhere/big.bin"),
-            &lb,
-            command,
-            &index,
-            &blob_store,
-        );
+        index
+            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("python3 x.py".into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: 1,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(0, 0),
+                ended_at: None,
+                exit_code: None,
+                event_ids: vec![],
+            })
+            .unwrap();
+        journal_version_gap(&index, command, 1);
+        journal_version_gap(&index, command, 1);
         assert_eq!(index.events_for_command(command).len(), 1);
-        // WatchTreeFailed (or the helper's no-tier observation) drops it.
-        lb.forget_command_watch(command);
-        run(
-            &gap("/tmp/shit-open/big.bin"),
-            &lb,
-            command,
-            &index,
-            &blob_store,
-        );
-        assert_eq!(index.events_for_command(command).len(), 2);
     }
 
     #[test]
@@ -1952,6 +2422,7 @@ mod tests {
             dev: 1,
             inode: 2,
             mode: 0o040750,
+            link_target: None,
         });
         let stat = pre_syscall_unlink_stat(&note);
         assert_eq!(
@@ -1960,6 +2431,7 @@ mod tests {
                 kind: FileKind::Directory,
                 mode: 0o040750,
                 inode: Some(InodeRef::new(1, 2)),
+                link_target: None,
             })
         );
     }
@@ -1976,6 +2448,7 @@ mod tests {
             dev: 9,
             inode: 4242,
             mode: 0o040711,
+            link_target: None,
         });
         let kinds = kinds_after_with_stat(&with_stat);
         assert!(
@@ -2024,10 +2497,7 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
-            walk: None,
-            outcome: None,
             pre_stat: None,
-            call_id: 0,
         };
         for (stat, want_mode) in [
             (
@@ -2035,6 +2505,7 @@ mod tests {
                     kind: FileKind::Directory,
                     mode: 0o040700,
                     inode: None,
+                    link_target: None,
                 }),
                 0o040700,
             ),

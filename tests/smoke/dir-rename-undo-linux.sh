@@ -108,15 +108,6 @@ if [ "${N_RENAME}" -lt 1 ]; then
     smoke_fail "expected the dir rename to be journaled"
 fi
 
-# L5: the walk's record and the shim's post-syscall outcome, which the
-# planner's replaced-subtree rule needs as proof.
-N_WALK="$(smoke_journal_count "discriminant = 'RenameWalk'" 2>/dev/null || echo 0)"
-N_OUTCOME="$(smoke_journal_count "discriminant = 'RenameOutcome'" 2>/dev/null || echo 0)"
-smoke_log "RenameWalk events: ${N_WALK}, RenameOutcome events: ${N_OUTCOME}"
-if [ "${N_WALK}" -lt 1 ] || [ "${N_OUTCOME}" -lt 1 ]; then
-    smoke_fail "expected the walk record and the rename outcome to be journaled"
-fi
-
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
 smoke_log "PASS: dir-rename-undo-linux (${N_PRE} per-file pre-images journaled for the renamed subtree)"

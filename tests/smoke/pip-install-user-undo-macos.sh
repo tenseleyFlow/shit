@@ -268,7 +268,7 @@ if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; the
     exit 0
 fi
 
-# L5: SHIT_REQUIRE_OUTCOME_A=1 (set on the hosted job) makes Outcome A
+# L5: SHIT_REQUIRE_OUTCOME_A=1 makes Outcome A
 # the only pass.
 if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
     smoke_log "SHIT_REQUIRE_OUTCOME_A=1: Outcome B not accepted"

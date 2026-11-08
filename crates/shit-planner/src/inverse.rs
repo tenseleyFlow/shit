@@ -15,7 +15,7 @@ use crate::events::{
     CommandRecord, NetworkTool, PackageManager, PackageOpKind, ServiceState, SystemdScope,
 };
 use crate::inode::{BlobHash, InodeRef};
-use crate::metadata::{FileKind, FileMetadata};
+use crate::metadata::{DeviceNode, FileKind, FileMetadata};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -50,6 +50,10 @@ pub enum InverseOp {
         path: PathBuf,
         kind: FileKind,
         mode: u32,
+        /// Device number and owner for `BlockDevice`/`CharDevice`,
+        /// copied from the journaled unlink. `None` for other kinds;
+        /// a device kind without it is refused, not guessed.
+        device: Option<DeviceNode>,
     },
     /// Reverse a rename: rename `from` back to `to`. The planner orders
     /// renames to avoid stomping intermediate states.

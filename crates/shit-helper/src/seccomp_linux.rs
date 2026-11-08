@@ -195,6 +195,14 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     // 0 around the mknod call so captured perm bits round-trip
     // byte-identical.
     libc::SYS_mknodat,
+    // L4b - a restored device node is widened from mode 0 to its
+    // captured mode by chmod on /proc/self/fd/N of the held O_PATH fd.
+    libc::SYS_fchmodat,
+    // L4b - device restore compares the captured owner with the
+    // helper's euid (the invoking user) before mknod.
+    libc::SYS_geteuid,
+    // L4b - nodev checks: fstatvfs (glibc fstatfs) on held fds.
+    libc::SYS_fstatfs,
     libc::SYS_umask,
     libc::SYS_fcntl,
     libc::SYS_mmap,

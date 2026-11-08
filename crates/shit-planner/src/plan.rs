@@ -50,18 +50,6 @@ pub fn plan(
     probe: &dyn StateProbe,
     store: &dyn PlannerStore,
 ) -> UndoPlan {
-    plan_with_options(command, events, probe, store, PlanOptions::default())
-}
-
-/// [`plan`] with the daemon's options. `strict_capture` turns L5's
-/// capture-gap warnings into refusals.
-pub fn plan_with_options(
-    command: CommandRecord,
-    events: &[CaptureEvent],
-    probe: &dyn StateProbe,
-    store: &dyn PlannerStore,
-    options: PlanOptions,
-) -> UndoPlan {
     // AR07.1: refuse-list short-circuit. If the original command
     // matches a refuse-list entry, the plan is a single Refuse node
     // carrying the catalog reason + remediation. We skip per-event
@@ -135,36 +123,10 @@ pub fn plan_with_options(
         crate::plan_forward::paired_flags_shim_events(&chronological)
     };
 
-    // L5 (review round 3, item 3): walk entries whose xattrs the shim
-    // could not read come back without them. Say so: a warning, or a
-    // refusal under strict capture.
-    surface_unread_walk_xattrs(
-        &live,
-        &class.fired_walks,
-        options,
-        &mut nodes,
-        &mut warnings,
-    );
+    class.dropped_events.extend(covered_capture_gaps(&live));
 
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
-        // L5: the last inverse of a replaced subtree's walk has run, so
-        // its directories can take their recorded metadata (mode, which
-        // may forbid writing into them, owner, xattrs, mtime). Deepest
-        // first, so a parent's mode cannot lock out its children.
-        if let Some(dirs) = class.rebuilt_dir_metadata.get(&ev.id) {
-            for (inode, path, target) in dirs {
-                nodes.push(PlanNode {
-                    op: InverseOp::RestoreMetadata {
-                        inode: *inode,
-                        path: path.clone(),
-                        target: target.clone(),
-                    },
-                    cohort: 0,
-                    conflict: None,
-                });
-            }
-        }
     }
 
     // DR-14: partition nodes into cohorts so the orchestrator's
@@ -180,61 +142,66 @@ pub fn plan_with_options(
     }
 }
 
-/// Only walks the replaced-subtree rule rebuilt from: a reversed rename
-/// brings back the real entries, xattrs and all (review round 4, item 1).
-/// Not on the BSDs, whose shim does not read extattrs: there the walk's
-/// xattrs are not applicable, not unread, and are documented as such.
-fn surface_unread_walk_xattrs(
-    live: &[&CaptureEvent],
-    fired_walks: &HashSet<crate::events::EventId>,
-    options: PlanOptions,
-    nodes: &mut Vec<PlanNode>,
-    warnings: &mut Vec<PlanWarning>,
-) {
-    if cfg!(any(
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly",
-    )) {
-        return;
-    }
-    let mut seen: HashSet<&Path> = HashSet::new();
-    for ev in live {
-        let CaptureEventKind::RenameWalk { entries, .. } = &ev.kind else {
-            continue;
-        };
-        if !fired_walks.contains(&ev.id) {
-            continue;
-        }
-        for e in entries.iter().filter(|e| !e.xattrs_read) {
-            if !seen.insert(e.path.as_path()) {
-                continue;
-            }
-            let reason = format!(
-                "{}: its extended attributes could not be read before it was renamed, \
-                 so it is restored without them",
-                e.path.display()
-            );
-            if options.strict_capture {
-                nodes.push(PlanNode {
-                    op: InverseOp::Refuse {
-                        class: "capture-gap".to_string(),
-                        reason,
-                        remediation: None,
-                    },
-                    cohort: 0,
-                    conflict: None,
-                });
-            } else {
-                warnings.push(PlanWarning::Informational {
-                    tier: crate::inverse::InverseTier::Files,
-                    message: reason,
-                });
-            }
+/// L5 (review of #232, item 2): a shim capture-gap marker for `P` says
+/// the shim could not read `P` before a write. Another tier may have:
+/// when the command journaled a content pre-image of `P` that the shim
+/// did not capture, undo restores the earliest pre-image of `P`
+/// whichever open it came from, so the gap is covered and its refusal
+/// is dropped. Otherwise the refusal stands.
+///
+/// Which pre-image covers which gap. Undo restores the earliest
+/// pre-image of a path, so only that one is weighed. It covers the gap
+/// when it holds the file's state from before the gapped write:
+///
+/// - it was journaled no later than the gap (an earlier open captured
+///   the pre-command bytes), or
+/// - (review of #232 medium review, item 1) its captured mtime is more
+///   than [`GAP_MTIME_MARGIN_NANOS`] older than the daemon's wall clock
+///   when it stamped the gap. The shim's note is stamped before the
+///   write runs, while a kernel tier's capture of the same open is
+///   stamped later, on receipt, so journal order cannot pair them. The
+///   gapped write sets the file's mtime to a time after the gap was
+///   stamped, so a capture taken after that write never passes. The
+///   margin absorbs coarse filesystem timestamps; a file modified
+///   within it just before the command keeps its refusal.
+fn covered_capture_gaps(live: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let mut earliest: std::collections::HashMap<&Path, (crate::time::TimePoint, i128)> =
+        std::collections::HashMap::new();
+    for e in live {
+        if let CaptureEventKind::FilePreImage {
+            path, source, meta, ..
+        } = &e.kind
+            && source.has_content()
+            && !source.is_shim()
+        {
+            let this = (e.ts, meta.mtime_unix_nanos);
+            earliest
+                .entry(path.as_path())
+                .and_modify(|cur| {
+                    if this.0 < cur.0 {
+                        *cur = this;
+                    }
+                })
+                .or_insert(this);
         }
     }
+    live.iter()
+        .filter(|e| match &e.kind {
+            CaptureEventKind::CaptureRefused { class, path, .. } if class == "capture-gap" => {
+                earliest.get(path.as_path()).is_some_and(|(ts, mtime)| {
+                    let stamped = i128::from(e.ts.wallclock_unix_nanos);
+                    *ts <= e.ts
+                        || (stamped > 0 && *mtime > 0 && *mtime + GAP_MTIME_MARGIN_NANOS < stamped)
+                })
+            }
+            _ => false,
+        })
+        .map(|e| e.id)
+        .collect()
 }
+
+/// See [`covered_capture_gaps`].
+const GAP_MTIME_MARGIN_NANOS: i128 = 1_000_000_000;
 
 fn emit_unless_skipped(
     ev: &CaptureEvent,
@@ -263,11 +230,8 @@ fn emit_unless_skipped(
     }
     // W01.B.fix-rename-coalescing: skip the entire event if the
     // path is transient (Create+PreImage+Unlink AND gone at undo).
-    // L5: a replaced subtree's walk pre-image is pre-rename data, even
-    // when a later scratch file at the same path is transient.
     if let Some(p) = event_path(ev)
         && class.transient_paths.contains(p)
-        && !class.walk_restores.contains(&ev.id)
     {
         return;
     }
@@ -336,6 +300,9 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+    /// L4b - device captures keyed by the id of the `Unlink` each one
+    /// pairs with exactly (see [`pair_device_nodes`]).
+    device_nodes: std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode>,
     /// Shim chflags snapshots already covered by a kqueue
     /// `MetadataChange` for the same inode and pre-value.
     paired_flags_shims: HashSet<crate::events::EventId>,
@@ -346,34 +313,10 @@ struct EventClassification {
     /// Unlinks of moved data that undo cannot prove it can restore;
     /// each becomes a Refuse node with this reason.
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
-    /// L5: proven directory renames whose destination the command
-    /// deleted, keyed by the Rename. See [`crate::replaced`].
-    replaced_renames:
-        std::collections::HashMap<crate::events::EventId, crate::replaced::DirRebuild>,
-    /// L5: walk pre-images that rebuild a replaced subtree in place.
-    walk_restores: HashSet<crate::events::EventId>,
-    /// L5: event -> rebuilt directories' recorded metadata, applied
-    /// after that event's inverses.
-    rebuilt_dir_metadata:
-        std::collections::HashMap<crate::events::EventId, Vec<crate::replaced::RebuiltDirMetadata>>,
-    /// L5: RenameWalk events the rule rebuilt from.
-    fired_walks: HashSet<crate::events::EventId>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
-    let mut disproved = disproved_renames(events, probe);
-    // L5: the shim's post-syscall outcomes. Only commands that have one
-    // pay for the index.
-    let outcomes = events.iter().any(|ev| {
-        matches!(
-            ev.kind,
-            CaptureEventKind::RenameOutcome { .. } | CaptureEventKind::RenameWalk { .. }
-        )
-    });
-    let rename_index = outcomes.then(|| EventPathIndex::new(events));
-    if let Some(index) = &rename_index {
-        disproved.extend(crate::replaced::failed_renames(index));
-    }
+    let disproved = disproved_renames(events, probe);
     let mut creates: HashSet<PathBuf> = HashSet::new();
     let mut unlinks: HashSet<PathBuf> = HashSet::new();
     let mut pre_images: HashSet<PathBuf> = HashSet::new();
@@ -458,7 +401,14 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             _ => {}
         }
     }
-    let provenance = Provenance::from_events(events, &disproved);
+    // L4b - one place decides which device Unlink a capture belongs to;
+    // Provenance's dedup keeps that one. Both L4b passes work in journal
+    // order (ts, id); sort once.
+    let mut chrono: Vec<&CaptureEvent> = events.to_vec();
+    chrono.sort_by_key(|e| (e.ts, e.id));
+    let (device_nodes, duplicate_device_unlinks) = device_pairing(&chrono);
+    let paired: HashSet<crate::events::EventId> = device_nodes.keys().copied().collect();
+    let provenance = Provenance::from_events(events, &disproved, &paired);
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
     for p in creates.iter().chain(rename_destinations.iter()) {
@@ -767,25 +717,10 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
-    let replaced = match &rename_index {
-        Some(index) => crate::replaced::ReplacedSubtrees::from_events(
-            index,
-            &disproved,
-            &provenance.dropped_events,
-            probe,
-        ),
-        None => crate::replaced::ReplacedSubtrees::default(),
-    };
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
-    dropped_events.extend(replaced.dropped_events);
-    for id in replaced
-        .by_rename
-        .keys()
-        .chain(replaced.walk_restores.iter())
-    {
-        dropped_events.remove(id);
-    }
+    dropped_events.extend(duplicate_device_unlinks);
+    dropped_events.extend(symlink_removal_markers(&chrono));
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -793,26 +728,23 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
+        device_nodes,
         paired_flags_shims: HashSet::new(),
         dropped_events,
         refused_unlinks: provenance.refused_unlinks,
-        replaced_renames: replaced.by_rename,
-        walk_restores: replaced.walk_restores,
-        rebuilt_dir_metadata: replaced.dir_metadata,
-        fired_walks: replaced.fired_walks,
     }
 }
 
 /// Chronological event positions by every path an event names, so a
 /// question about one subtree costs its own events, not the journal's.
-pub(crate) struct EventPathIndex<'a> {
-    pub(crate) chrono: Vec<&'a CaptureEvent>,
+struct EventPathIndex<'a> {
+    chrono: Vec<&'a CaptureEvent>,
     by_path: std::collections::BTreeMap<PathBuf, Vec<usize>>,
 }
 
 impl<'a> EventPathIndex<'a> {
     /// `events` is in reverse-chronological order (as `plan` sorts it).
-    pub(crate) fn new(events: &[&'a CaptureEvent]) -> Self {
+    fn new(events: &[&'a CaptureEvent]) -> Self {
         let chrono: Vec<&CaptureEvent> = events.iter().rev().copied().collect();
         let mut by_path: std::collections::BTreeMap<PathBuf, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -837,7 +769,7 @@ impl<'a> EventPathIndex<'a> {
 
     /// Sorted positions of events naming `root` or anything under it,
     /// and of Renames moving an ancestor of `root`.
-    pub(crate) fn touching(&self, root: &Path) -> Vec<usize> {
+    fn touching(&self, root: &Path) -> Vec<usize> {
         let mut out: Vec<usize> = btree_subtree(&self.by_path, root)
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
@@ -989,14 +921,24 @@ struct Provenance {
     dropped_events: HashSet<crate::events::EventId>,
     /// See [`EventClassification::refused_unlinks`].
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
+    /// L4b - device Unlinks a DeviceNodeMeta paired with
+    /// ([`device_pairing`]); the no-bytes dedup keeps one of these.
+    paired_device_unlinks: HashSet<crate::events::EventId>,
 }
 
 impl Provenance {
     /// `events` is in reverse-chronological order (as `plan` sorts it).
-    fn from_events(events: &[&CaptureEvent], disproved: &HashSet<crate::events::EventId>) -> Self {
+    fn from_events(
+        events: &[&CaptureEvent],
+        disproved: &HashSet<crate::events::EventId>,
+        paired_device_unlinks: &HashSet<crate::events::EventId>,
+    ) -> Self {
         let mut live: std::collections::BTreeMap<PathBuf, EntryHistory> =
             std::collections::BTreeMap::new();
-        let mut out = Self::default();
+        let mut out = Self {
+            paired_device_unlinks: paired_device_unlinks.clone(),
+            ..Self::default()
+        };
         for ev in events.iter().rev() {
             match &ev.kind {
                 CaptureEventKind::FilePreImage { path, source, .. } if source.has_content() => {
@@ -1081,6 +1023,14 @@ impl Provenance {
                         h.unlinked_at.get_or_insert_with(|| path.clone());
                     }
                 }
+                // L4b - the shim reports a removed symlink as
+                // SymlinkRemoved; for provenance it is that entry's unlink.
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => {
+                    if let Some(h) = live.get_mut(path) {
+                        h.unlinks.push((ev.id, crate::metadata::FileKind::Symlink));
+                        h.unlinked_at.get_or_insert_with(|| path.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -1121,9 +1071,25 @@ impl Provenance {
         // is its whole restore, once. A second tier's report of the same
         // unlink would hit a Phantom, and a tier that lost the race to
         // stat it reported the wire's Regular default.
-        let no_bytes =
-            |k: &FileKind| matches!(k, FileKind::Directory | FileKind::Fifo | FileKind::Socket);
-        if let Some((keep, _)) = h.unlinks.iter().find(|(_, k)| no_bytes(k)) {
+        let no_bytes = |k: &FileKind| {
+            matches!(
+                k,
+                FileKind::Directory
+                    | FileKind::Fifo
+                    | FileKind::Socket
+                    | FileKind::BlockDevice
+                    | FileKind::CharDevice
+                    | FileKind::Symlink
+            )
+        };
+        // A device Unlink that carries a capture is the one to keep; the
+        // others are its twins (device_pairing drops those too).
+        let keep = h
+            .unlinks
+            .iter()
+            .find(|(id, _)| self.paired_device_unlinks.contains(id))
+            .or_else(|| h.unlinks.iter().find(|(_, k)| no_bytes(k)));
+        if let Some((keep, _)) = keep {
             self.dropped_events
                 .extend(h.unlinks.iter().map(|(id, _)| *id).filter(|id| id != keep));
             return;
@@ -1241,12 +1207,7 @@ fn emit_for_event(
             // blob (write tmpfile + rename into place is the existing
             // executor path). Only mark Missing when the parent is
             // gone too — that's the truly unrecoverable shape.
-            // L5: a replaced subtree's walk restores into the directories
-            // the Rename's inverse just rebuilt, over whatever the
-            // command's new tree left at that name.
-            let mut conflict = if class.walk_restores.contains(&ev.id) {
-                None
-            } else if atomic_replace_paths.contains(path) {
+            let mut conflict = if atomic_replace_paths.contains(path) {
                 if probe.stat(path).is_some() {
                     None
                 } else {
@@ -1787,12 +1748,19 @@ fn emit_for_event(
                 op: InverseOp::Refuse {
                     class: class.clone(),
                     reason: format!("capture incomplete for {}: {}", path.display(), detail),
-                    remediation: Some(if class == "capture-gap" {
+                    remediation: Some(if class == crate::events::COMMAND_CAPTURE_GAP {
+                        // L5: the whole command, not one path.
+                        "shit could not capture some of this command's changes (the reason \
+                         is above), so undo cannot reverse them; check what the command \
+                         changed and undo those parts by hand."
+                            .to_string()
+                    } else if class == "capture-gap" {
                         // L5: an existing file was written without its
-                        // bytes (over the inline cap, unreadable).
-                        "shit cannot restore this file's earlier content because the shim \
-                         could not read it before the write; restore it from a backup if \
-                         you need it."
+                        // bytes (over the inline cap, unreadable), or the
+                        // shim's notes could not be read at all.
+                        "shit could not capture this path's earlier state before the command \
+                         changed it (the reason is above); restore it from a backup if you \
+                         need it."
                             .to_string()
                     } else {
                         "Re-run the command from a directory whose parent path exists; \
@@ -1805,9 +1773,6 @@ fn emit_for_event(
                 conflict: None,
             });
         }
-        // L5 — evidence for the rename rules in classify_replace_paths;
-        // their inverses come from the Rename and the walk pre-images.
-        CaptureEventKind::RenameWalk { .. } | CaptureEventKind::RenameOutcome { .. } => {}
     }
 }
 
@@ -1889,6 +1854,169 @@ fn native_delegation_for(
         | PackageManager::Brew
         | PackageManager::Pkg => None,
     }
+}
+
+/// L4b - pair each `DeviceNodeMeta` with the `Unlink` it was journaled
+/// after. A pair needs the same nonzero `(dev, ino)`, the same path, a
+/// kind that agrees with the captured mode, and a nonzero rdev; the
+/// meta takes the latest such `Unlink` before it in journal order
+/// (`(ts, id)`) that no earlier meta took. A zero inode (the shim's
+/// sentinel) never pairs: an `Unlink` with no exact pair carries no
+/// device and is refused at undo.
+#[cfg(test)]
+pub(crate) fn pair_device_nodes(
+    events: &[&CaptureEvent],
+) -> std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode> {
+    let mut chrono: Vec<&CaptureEvent> = events.to_vec();
+    chrono.sort_by_key(|e| (e.ts, e.id));
+    device_pairing(&chrono).0
+}
+
+/// [`pair_device_nodes`], plus the device `Unlink`s that are a second
+/// tier's report of a paired removal: same identity and path as a
+/// paired `Unlink`, with nothing else journaled at that path between
+/// the two. The shim (pre-call lstat) and the LSM tier both report one
+/// `rm`; only one `RecreatePath` may come of it.
+fn device_pairing(
+    events: &[&CaptureEvent],
+) -> (
+    std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode>,
+    Vec<crate::events::EventId>,
+) {
+    use crate::metadata::{DeviceNode, FileKind};
+    // `events` is in journal order (ts, id).
+    let ordered = events;
+    let none = InodeRef::new(0, 0);
+    type Open = std::collections::HashMap<(InodeRef, PathBuf), (crate::events::EventId, FileKind)>;
+    let mut open: Open = std::collections::HashMap::new();
+    let mut out = std::collections::HashMap::new();
+    let device_unlink = |ev: &CaptureEvent| match &ev.kind {
+        CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode, path, kind, ..
+        }) if *inode != none && matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) => {
+            Some((*inode, path.clone(), *kind))
+        }
+        _ => None,
+    };
+    for ev in ordered {
+        if let Some((inode, path, kind)) = device_unlink(ev) {
+            open.insert((inode, path), (ev.id, kind));
+            continue;
+        }
+        if let CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+            inode,
+            path,
+            rdev,
+            mode,
+            uid,
+            gid,
+            token,
+            untrusted,
+        }) = &ev.kind
+            && *inode != none
+            && *rdev != 0
+        {
+            let Some((unlink_id, unlink_kind)) = open.remove(&(*inode, path.clone())) else {
+                continue;
+            };
+            if FileKind::from_mode(*mode) != Some(unlink_kind) {
+                continue;
+            }
+            out.insert(
+                unlink_id,
+                DeviceNode {
+                    rdev: *rdev,
+                    mode: *mode,
+                    uid: *uid,
+                    gid: *gid,
+                    inode: *inode,
+                    removed_by: ev.command,
+                    token: *token,
+                    untrusted: *untrusted,
+                },
+            );
+        }
+    }
+    // Duplicates: walk each (identity, path) run in journal order. A run
+    // is broken by any other event at that path.
+    let mut duplicates = Vec::new();
+    let mut run: std::collections::HashMap<PathBuf, (InodeRef, Vec<crate::events::EventId>)> =
+        std::collections::HashMap::new();
+    let mut close = |r: (InodeRef, Vec<crate::events::EventId>)| {
+        if r.1.iter().any(|id| out.contains_key(id)) {
+            duplicates.extend(r.1.into_iter().filter(|id| !out.contains_key(id)));
+        }
+    };
+    for ev in ordered {
+        if let Some((inode, path, _)) = device_unlink(ev) {
+            match run.get_mut(&path) {
+                Some((i, ids)) if *i == inode => ids.push(ev.id),
+                _ => {
+                    if let Some(r) = run.insert(path, (inode, vec![ev.id])) {
+                        close(r);
+                    }
+                }
+            }
+            continue;
+        }
+        // DeviceNodeMeta has no event_path, so a meta never breaks a run.
+        if let Some(p) = event_path(ev).cloned()
+            && let Some(r) = run.remove(&p)
+        {
+            close(r);
+        }
+    }
+    for (_, r) in run {
+        close(r);
+    }
+    (out, duplicates)
+}
+
+/// L4b - the helper's marker-only `Unlink` (mode 0: it lost the race to
+/// stat the entry) that is the other tier's report of a `SymlinkRemoved`:
+/// the next event at that path in journal order (the shim's report is
+/// stamped before the syscall, the marker during it). The shim's `SymlinkRemoved` is the
+/// whole restore; the marker would recreate a regular file where the
+/// link was. A mode-0 Unlink of a later entry at the same path is kept.
+/// `events` is in journal order (ts, id).
+pub(crate) fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let ordered = events;
+    let mut by_path: std::collections::HashMap<&PathBuf, Vec<&CaptureEvent>> =
+        std::collections::HashMap::new();
+    for ev in ordered {
+        if let Some(p) = event_path(ev) {
+            by_path.entry(p).or_default().push(ev);
+        }
+    }
+    let is_marker = |e: &CaptureEvent| {
+        matches!(
+            &e.kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink { mode: 0, .. })
+        )
+    };
+    let mut out = Vec::new();
+    for seq in by_path.values() {
+        let mut taken = HashSet::new();
+        for (i, ev) in seq.iter().enumerate() {
+            if !matches!(
+                &ev.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { .. })
+            ) {
+                continue;
+            }
+            // The shim's SymlinkRemoved is stamped before the call and the
+            // kernel tier's marker during it, so the twin is the next event
+            // at the path. A marker before it belongs to an earlier entry.
+            let next = seq
+                .get(i + 1)
+                .filter(|e| is_marker(e) && !taken.contains(&e.id));
+            if let Some(m) = next {
+                taken.insert(m.id);
+                out.push(m.id);
+            }
+        }
+    }
+    out
 }
 
 fn emit_for_tree_op(
@@ -1992,32 +2120,13 @@ fn emit_for_tree_op(
                     path: path.clone(),
                     kind: *kind,
                     mode: *mode,
+                    device: class.device_nodes.get(&id).copied(),
                 },
                 cohort: 0,
                 conflict,
             });
         }
         TreeOp::Rename { from, to, .. } => {
-            // L5: the moved subtree was deleted again later in the
-            // command, so there is nothing at `to` to move back. Rebuild
-            // the directories at `from` here, after the inverses of
-            // everything the command did later have run; the walk's
-            // pre-images (journaled just before this rename) then restore
-            // the files in place.
-            if let Some(dirs) = class.replaced_renames.get(&id) {
-                for (path, mode) in dirs {
-                    nodes.push(PlanNode {
-                        op: InverseOp::RecreatePath {
-                            path: path.clone(),
-                            kind: crate::metadata::FileKind::Directory,
-                            mode: *mode,
-                        },
-                        cohort: 0,
-                        conflict: None,
-                    });
-                }
-                return;
-            }
             // AR01.1 follow-up: if the rename's destination is in
             // atomic_replace_paths (Rename + PreImage + Unlink + path
             // present at undo), the FilePreImage's RestoreContent
@@ -2056,6 +2165,24 @@ fn emit_for_tree_op(
         TreeOp::Symlink { path, .. } => {
             nodes.push(PlanNode {
                 op: InverseOp::Unlink { path: path.clone() },
+                cohort: 0,
+                conflict: None,
+            });
+        }
+        // Consumed by the path's Unlink above; no inverse of its own.
+        TreeOp::DeviceNodeMeta { .. } => {}
+        // L4b - the shim could not read the removed link's target (an
+        // empty target cannot exist): refuse rather than guess.
+        TreeOp::SymlinkRemoved { target, path } if target.is_empty() => {
+            nodes.push(PlanNode {
+                op: InverseOp::Refuse {
+                    class: "symlink-target-unknown".to_string(),
+                    reason: format!(
+                        "{} was a symlink whose target was not captured, so it is not recreated",
+                        path.display()
+                    ),
+                    remediation: None,
+                },
                 cohort: 0,
                 conflict: None,
             });
@@ -2310,6 +2437,170 @@ mod tests {
             p.warnings
                 .iter()
                 .any(|w| matches!(w, PlanWarning::PartialEvents { dropped: 1 }))
+        );
+    }
+
+    /// Review of #232, item 2: a shim gap marker and, optionally, a
+    /// pre-image of the same path from `source`. Returns the plan's
+    /// capture-gap refusals.
+    fn capture_gap_refusals(pre: Option<crate::FilePreImageSource>) -> usize {
+        capture_gap_refusals_at(pre, 1)
+    }
+
+    /// The gap is stamped 2; the pre-image `pre_ts`.
+    fn capture_gap_refusals_at(pre: Option<crate::FilePreImageSource>, pre_ts: u64) -> usize {
+        capture_gap_refusals_wall(pre, pre_ts, 0)
+    }
+
+    /// As [`capture_gap_refusals_at`], with the gap's wall clock set to
+    /// `gap_wall`. The pre-image's captured mtime is 0 (unknown).
+    fn capture_gap_refusals_wall(
+        pre: Option<crate::FilePreImageSource>,
+        pre_ts: u64,
+        gap_wall: u64,
+    ) -> usize {
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 5);
+        let blob = BlobHash::from_bytes([0xAB; 32]);
+        let path = PathBuf::from("/tmp/big.bin");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(100),
+            },
+            None,
+        );
+        store.put_blob(blob, 50);
+        let command = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let mut events = vec![CaptureEvent {
+            id: EventId(2),
+            command,
+            ts: TimePoint::new(2, gap_wall),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-gap".into(),
+                path: path.clone(),
+                detail: "the file existed before the write".into(),
+            },
+        }];
+        if let Some(source) = pre {
+            events.push(CaptureEvent {
+                id: EventId(1),
+                command,
+                ts: TimePoint::new(pre_ts, 0),
+                partial: false,
+                kind: CaptureEventKind::FilePreImage {
+                    inode,
+                    path: path.clone(),
+                    blob,
+                    meta: meta(50),
+                    post_content_hash: None,
+                    source,
+                },
+            });
+        }
+        plan(dummy_command(), &events, &probe, &store)
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, InverseOp::Refuse { class, .. } if class == "capture-gap"))
+            .count()
+    }
+
+    /// Review of #232 medium review, item 6: a command-scoped refusal reads
+    /// as one about the command, not about one path's earlier state.
+    #[test]
+    fn command_capture_gap_has_command_level_wording() {
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: crate::events::COMMAND_CAPTURE_GAP.into(),
+                path: PathBuf::from("/tmp"),
+                detail: "a shim from an older version".into(),
+            },
+        };
+        let p = plan(
+            dummy_command(),
+            &[ev],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        let [node] = p.nodes.as_slice() else {
+            panic!("{:#?}", p.nodes);
+        };
+        let InverseOp::Refuse { remediation, .. } = &node.op else {
+            panic!("{node:#?}");
+        };
+        let text = remediation.as_deref().unwrap();
+        assert!(text.contains("this command's changes"), "{text}");
+        assert!(!text.contains("this path"), "{text}");
+    }
+
+    /// Low re-review of #232: a pre-image with an unknown mtime (0) taken
+    /// after the gap cannot show it predates the gapped write, so the
+    /// refusal stands.
+    #[test]
+    fn unknown_mtime_does_not_cover_a_later_gap() {
+        assert_eq!(
+            capture_gap_refusals_wall(
+                Some(crate::FilePreImageSource::Other),
+                3,
+                1_800_000_000_000_000_000,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn kernel_tier_pre_image_covers_a_shim_capture_gap() {
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::Other)),
+            0
+        );
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::EsAuthPreMutation)),
+            0
+        );
+    }
+
+    /// Review of #232 round 2, item 3: `open(O_TRUNC)` the shim could not
+    /// capture (gap at 2), then a later rewrite the kernel tier captured
+    /// (pre-image at 5, of the already-truncated file). The later bytes
+    /// are not the pre-command state: the refusal stands.
+    #[test]
+    fn a_kernel_pre_image_after_the_gap_does_not_cover_it() {
+        assert_eq!(
+            capture_gap_refusals_at(Some(crate::FilePreImageSource::Other), 5),
+            1
+        );
+        assert_eq!(
+            capture_gap_refusals_at(Some(crate::FilePreImageSource::Other), 2),
+            0
+        );
+    }
+
+    #[test]
+    fn capture_gap_stands_when_no_other_tier_captured_the_path() {
+        assert_eq!(capture_gap_refusals(None), 1);
+        // A shim pre-image of the path (another open, or the rename walk)
+        // is no evidence the gapped write was covered.
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::ShimPreMutation)),
+            1
+        );
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::ShimRenameSubtree)),
+            1
         );
     }
 

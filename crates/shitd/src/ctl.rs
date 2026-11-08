@@ -221,7 +221,7 @@ async fn handle_client(
             let blob_store = Arc::clone(&blob_store);
             let helper_link = helper_link.as_ref().map(Arc::clone);
             match tokio::task::spawn_blocking(move || {
-                handle_undo(req, &index, &blob_store, helper_link, plan_options)
+                handle_undo(req, &index, &blob_store, helper_link)
             })
             .await
             {
@@ -1385,8 +1385,6 @@ fn capture_event_kind_label(kind: &shit_planner::events::CaptureEventKind) -> &'
         K::KubectlOp { .. } => "KubectlOp",
         K::GhOp { .. } => "GhOp",
         K::CaptureRefused { .. } => "CaptureRefused",
-        K::RenameWalk { .. } => "RenameWalk",
-        K::RenameOutcome { .. } => "RenameOutcome",
     }
 }
 
@@ -1440,10 +1438,9 @@ fn handle_undo(
     index: &Index,
     blob_store: &BlobStore,
     helper_link: Option<Arc<crate::helper_link::HelperLink>>,
-    plan_options: shit_planner::PlanOptions,
 ) -> CtlResponse {
     use shit_planner::{
-        ConflictPolicy, FileExecutor, LiveStateProbe, Orchestrator, OutcomeKind, plan_with_options,
+        ConflictPolicy, FileExecutor, LiveStateProbe, Orchestrator, OutcomeKind, plan,
     };
 
     let policy = match req.on_conflict {
@@ -1496,7 +1493,7 @@ fn handle_undo(
     for cmd in commands {
         commands_attempted += 1;
         let events = index.events_for_command(cmd.command);
-        let undo_plan = plan_with_options(cmd.clone(), &events, &probe, index, plan_options);
+        let undo_plan = plan(cmd.clone(), &events, &probe, index);
         // AR06.1: per-command executor so the shell-state runner
         // can be wired with the session-specific precmd-queue
         // path. Other tier executors are cheap stateless wrappers

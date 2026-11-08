@@ -32,13 +32,12 @@ pub mod probe;
 pub mod probe_live;
 pub mod proc;
 pub mod refuse;
-mod replaced;
 pub mod services;
 pub mod shell_state_render;
 pub mod store;
 pub mod time;
 
-pub use plan::{PlanOptions, plan, plan_with_options};
+pub use plan::{PlanOptions, plan};
 
 pub use env::{
     DEFAULT_IGNORE, DEFAULT_IGNORE_PREFIXES, DEFAULT_REDACT_SUBSTRINGS, EnvDiff, EnvFilter,
@@ -46,9 +45,9 @@ pub use env::{
     parse_block as env_parse_block, redact_value,
 };
 pub use events::{
-    CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId, FilePreImageSource,
-    NetworkTool, PackageManager, PackageOpKind, ProcessOpKind, ServiceState, SystemdScope, TreeOp,
-    WalkEntry,
+    COMMAND_CAPTURE_GAP, CaptureEvent, CaptureEventKind, CommandId, CommandRecord, EventId,
+    FilePreImageSource, NetworkTool, PackageManager, PackageOpKind, ProcessOpKind, ServiceState,
+    SystemdScope, TreeOp,
 };
 pub use exec_log::{ExecLog, ExecLogError, default_dir as exec_log_default_dir, read_all};
 pub use executor::{
@@ -62,7 +61,7 @@ pub use inverse::{
     AliasDiff, Conflict, ContainerOp, ContainerRuntime, DbEngine, FuncDiff, InverseOp, InverseTier,
     OptDiff, PlanNode, PlanWarning, RollbackHint, UndoPlan,
 };
-pub use metadata::{FileKind, FileMetadata};
+pub use metadata::{CaptureToken, DeviceNode, FileKind, FileMetadata, UntrustedSource};
 pub use network::{
     IP_MUTATING, IPTABLES_MUTATING, NFT_MUTATING, PFCTL_MUTATING, RestoreMethod, UFW_MUTATING,
     is_ip_mutating, is_iptables_mutating, is_nft_mutating, is_pfctl_mutating, is_ufw_mutating,

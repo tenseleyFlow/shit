@@ -256,9 +256,9 @@ if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; the
     exit 0
 fi
 
-# SHIT_REQUIRE_OUTCOME_A=1 makes Outcome A the only pass; the hosted job
-# sets it (L5). Without it, local runs on hosts where the shim cannot see
-# pip's writes still accept Outcome B (loud refusal).
+# SHIT_REQUIRE_OUTCOME_A=1 makes Outcome A the only pass. Without it the
+# smoke still accepts Outcome B (loud refusal) on hosts where the shim
+# cannot see pip's writes.
 if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
     smoke_log "SHIT_REQUIRE_OUTCOME_A=1: Outcome B not accepted"
     smoke_log "  undo exit:    ${UNDO_RC}"

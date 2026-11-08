@@ -35,6 +35,57 @@ pub struct FileMetadata {
     pub flags: u32,
 }
 
+/// L4b - the helper's proof that it saw a device node unlinked: the id
+/// of the helper process that issued it and an HMAC under that
+/// process's secret key. Opaque to the daemon and planner, which store
+/// it and hand it back; only the issuing helper can check it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureToken {
+    pub helper: [u8; 16],
+    pub mac: [u8; 32],
+}
+
+/// What a block or char device node needs beyond its path to be
+/// recreated, and the evidence the helper wants before it will do so.
+/// Every field comes from the helper's `fstat` of the held fd before
+/// the unlink committed; the planner copies it from the journaled
+/// `DeviceNodeMeta` and never fills any of it in itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceNode {
+    /// `st_rdev`, glibc-encoded. This is the `dev_t` `mknod(2)` takes.
+    pub rdev: u64,
+    /// Full `st_mode` (kind and permission bits) at capture.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// `(st_dev, st_ino)` of the removed node.
+    pub inode: crate::inode::InodeRef,
+    /// The command that removed the node (not the undo).
+    pub removed_by: crate::events::CommandId,
+    /// `None` when the helper would not vouch for the capture.
+    pub token: Option<CaptureToken>,
+    /// Why there is no token, when the helper said.
+    pub untrusted: Option<UntrustedSource>,
+}
+
+/// L4b - why the helper issued no token for a device-node capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UntrustedSource {
+    Nodev,
+    Unknown,
+}
+
+impl UntrustedSource {
+    pub fn reason(self) -> &'static str {
+        match self {
+            UntrustedSource::Nodev => "source filesystem does not allow device nodes",
+            UntrustedSource::Unknown => {
+                "could not determine whether the source filesystem allows device nodes"
+            }
+        }
+    }
+}
+
 impl FileMetadata {
     /// Coarse equality used for "are we still in the captured state?" probes.
     /// Excludes `mtime`, which legitimately changes for read-only opens on

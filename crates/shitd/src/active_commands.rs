@@ -109,14 +109,6 @@ impl ActiveCommands {
         None
     }
 
-    /// L5: whether `command` is still running on any shell.
-    pub fn is_active(&self, command: CommandId) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.values().any(|stack| stack.contains(&command)))
-            .unwrap_or(false)
-    }
-
     /// Number of shell pids currently with an active command. For
     /// metrics / debug only. Wired to `shit metrics` in a later DR.
     #[allow(dead_code)]

@@ -44,6 +44,7 @@
 //! practice. If a future bench shows pathological cases we revisit
 //! with a smarter pass.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::inode::InodeRef;
@@ -118,62 +119,41 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
 /// `nodes`' order. Callers that want to fold this into the existing
 /// `plan()` pipeline just append it after the per-event emission.
 pub fn assign_cohorts(nodes: &mut [PlanNode]) -> u32 {
-    use std::collections::HashMap;
-    // Highest cohort so far of a node holding each inode, of a node at
-    // each path, and of any node at or under each path. A node goes one
-    // past every earlier node it depends on: one sharing an inode or a
-    // path, one at an ancestor of its path (a directory created before
-    // its children, or its metadata restored after them, L5 review round
-    // 2 item 8), and one under its path. Plan order is kept for every
-    // dependent pair, which also fixes the old lowest-free-cohort pick
-    // that could schedule a node ahead of an earlier conflicting one.
-    let mut by_inode: HashMap<InodeRef, u32> = HashMap::new();
-    let mut at_path: HashMap<PathBuf, u32> = HashMap::new();
-    let mut under_path: HashMap<PathBuf, u32> = HashMap::new();
-    let mut count = 0u32;
-    let next = |c: Option<&u32>| c.map(|c| c + 1);
+    // Per-cohort set of touch keys held by ops already assigned to
+    // it. Stored as a Vec<BTreeSet<TouchKey>>; index = cohort id.
+    let mut cohort_touches: Vec<BTreeSet<TouchKey>> = Vec::new();
+
     for node in nodes.iter_mut() {
         let keys = touches(&node.op);
         if keys.is_empty() {
             // Informational op — always cohort 0.
             node.cohort = 0;
-            count = count.max(1);
+            if cohort_touches.is_empty() {
+                cohort_touches.push(BTreeSet::new());
+            }
             continue;
         }
-        let mut cohort = 0u32;
-        for k in &keys {
-            let dep = match k {
-                TouchKey::Inode(i) => next(by_inode.get(i)),
-                TouchKey::Path(p) => {
-                    let mut d = next(under_path.get(p));
-                    for a in p.ancestors().skip(1) {
-                        d = d.max(next(at_path.get(a)));
-                    }
-                    d
-                }
-            };
-            cohort = cohort.max(dep.unwrap_or(0));
-        }
-        for k in keys {
-            match k {
-                TouchKey::Inode(i) => {
-                    let e = by_inode.entry(i).or_insert(cohort);
-                    *e = (*e).max(cohort);
-                }
-                TouchKey::Path(p) => {
-                    for a in p.ancestors() {
-                        let e = under_path.entry(a.to_path_buf()).or_insert(cohort);
-                        *e = (*e).max(cohort);
-                    }
-                    let e = at_path.entry(p).or_insert(cohort);
-                    *e = (*e).max(cohort);
-                }
+        // Find the lowest cohort with no key overlap.
+        let mut chosen: Option<usize> = None;
+        for (i, existing) in cohort_touches.iter().enumerate() {
+            if keys.iter().all(|k| !existing.contains(k)) {
+                chosen = Some(i);
+                break;
             }
         }
-        node.cohort = cohort;
-        count = count.max(cohort + 1);
+        let cohort_idx = match chosen {
+            Some(i) => i,
+            None => {
+                cohort_touches.push(BTreeSet::new());
+                cohort_touches.len() - 1
+            }
+        };
+        for k in keys {
+            cohort_touches[cohort_idx].insert(k);
+        }
+        node.cohort = cohort_idx as u32;
     }
-    count
+    cohort_touches.len() as u32
 }
 
 #[cfg(test)]

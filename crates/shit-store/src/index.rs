@@ -567,6 +567,8 @@ fn update_path_history_with_conn(
                 ],
             )?;
         }
+        // Metadata beside an Unlink; the Unlink already closed the row.
+        T::DeviceNodeMeta { .. } => {}
         T::Unlink { path, .. } => {
             // Close the most recent active row for this path.
             conn.execute(
@@ -739,6 +741,12 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
                     Some(path.to_string_lossy().into_owned()),
                     "TreeOpSymlinkRemoved",
                 ),
+                T::DeviceNodeMeta { inode, path, .. } => (
+                    Some(inode.dev as i64),
+                    Some(inode.inode as i64),
+                    Some(path.to_string_lossy().into_owned()),
+                    "TreeOpDeviceNodeMeta",
+                ),
             };
             Denormalized {
                 discriminant: disc,
@@ -852,32 +860,6 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
-        // L5 — keyed by the rename source, like the walk's pre-images.
-        K::RenameWalk { root, entries, .. } => {
-            // Review round 2, item 9: the root directory's own entry, which
-            // an incomplete walk does not carry; never a file's.
-            let root_inode = entries
-                .iter()
-                .find(|e| e.path == *root && e.kind == shit_planner::metadata::FileKind::Directory)
-                .map(|e| e.inode);
-            Denormalized {
-                discriminant: "RenameWalk",
-                dev: root_inode.map(|i| i.dev as i64),
-                inode: root_inode.map(|i| i.inode as i64),
-                path: Some(root.to_string_lossy().into_owned()),
-                blob_hash: None,
-                post_content_hash: None,
-            }
-        }
-        // Keyed by the destination, like the Rename row.
-        K::RenameOutcome { to, dest, .. } => Denormalized {
-            discriminant: "RenameOutcome",
-            dev: Some(dest.dev as i64),
-            inode: Some(dest.inode as i64),
-            path: Some(to.to_string_lossy().into_owned()),
-            blob_hash: None,
-            post_content_hash: None,
-        },
     }
 }
 
@@ -910,6 +892,26 @@ fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<CaptureEvent> {
     // bug surfaced by the rm-undo smoke (S24.C).
     ev.id = shit_planner::events::EventId(id as u64);
     Ok(ev)
+}
+
+impl Index {
+    /// L4b - one command's events journaled at `path`, in journal order.
+    /// Lets the daemon check the latest removal at a path without
+    /// decoding the whole command.
+    pub fn events_for_command_at_path(&self, command: CommandId, path: &Path) -> Vec<CaptureEvent> {
+        let conn = self.conn.lock().unwrap();
+        collect_events(
+            &conn,
+            "SELECT id, payload FROM events
+             WHERE session = ?1 AND seq = ?2 AND path = ?3
+             ORDER BY ts_logical, id",
+            params![
+                command.session.as_bytes().as_slice(),
+                command.seq as i64,
+                path.to_string_lossy()
+            ],
+        )
+    }
 }
 
 impl PlannerStore for Index {
@@ -1092,41 +1094,6 @@ mod tests {
     use super::*;
     use shit_planner::FileMetadata;
     use std::collections::BTreeMap;
-
-    /// L5 review round 2, item 9: an incomplete walk carries only file
-    /// entries; its row is keyed by the root directory's inode or none.
-    #[test]
-    fn rename_walk_row_takes_the_root_inode_or_none() {
-        let file = shit_planner::WalkEntry {
-            path: PathBuf::from("/tmp/d/f"),
-            inode: InodeRef::new(5, 77),
-            kind: shit_planner::metadata::FileKind::Regular,
-            meta: meta(),
-            xattrs_read: true,
-        };
-        let root = shit_planner::WalkEntry {
-            path: PathBuf::from("/tmp/d"),
-            inode: InodeRef::new(5, 70),
-            kind: shit_planner::metadata::FileKind::Directory,
-            meta: FileMetadata {
-                mode: 0o040755,
-                ..meta()
-            },
-            xattrs_read: true,
-        };
-        let walk = |complete, entries| CaptureEventKind::RenameWalk {
-            root: PathBuf::from("/tmp/d"),
-            complete,
-            files: 1,
-            entries,
-        };
-        let incomplete = walk(false, vec![file.clone()]);
-        let d = denormalize(&incomplete);
-        assert_eq!((d.dev, d.inode), (None, None));
-        let complete = walk(true, vec![root, file]);
-        let d = denormalize(&complete);
-        assert_eq!((d.dev, d.inode), (Some(5), Some(70)));
-    }
 
     fn meta() -> FileMetadata {
         FileMetadata {
@@ -1568,5 +1535,92 @@ mod tests {
         idx.put_blob_record(blob, 999, false, TimePoint::new(0, 0))
             .unwrap();
         assert_eq!(idx.blob_size_hint(blob), Some(999));
+    }
+
+    /// D-13 fixture: `tests/fixtures/trunk-device-unlink.db` was written
+    /// by trunk before L4. The current build must open it and read every
+    /// row with no decode fallback: `TreeOp::Unlink` is unchanged.
+    #[test]
+    fn opens_trunk_written_database() {
+        use shit_planner::TreeOp;
+        use shit_planner::metadata::FileKind;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("trunk.db");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/trunk-device-unlink.db"
+            ),
+            &db,
+        )
+        .unwrap();
+        let idx = Index::open(&db).unwrap();
+        let session = Uuid::from_u128(0x4c34);
+        let events = idx.events_for_command(CommandId { session, seq: 1 });
+        assert_eq!(events.len(), 3, "{events:#?}");
+        let unlinks: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    path, kind, mode, ..
+                }) => Some((path.clone(), *kind, *mode)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unlinks,
+            vec![
+                (PathBuf::from("/w/dev-null"), FileKind::CharDevice, 0o020666),
+                (PathBuf::from("/w/plain"), FileKind::Regular, 0o100644),
+            ]
+        );
+    }
+
+    /// The new row lands next to an Unlink and reads back. A build
+    /// without the variant cannot decode it; every event query drops
+    /// rows that fail to decode, so such a build skips it.
+    #[test]
+    fn device_node_meta_round_trips_beside_its_unlink() {
+        use shit_planner::TreeOp;
+        use shit_planner::metadata::FileKind;
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        let command = CommandId { session, seq: 1 };
+        let inode = InodeRef::new(2, 3);
+        let mk = |t, op| CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: TimePoint::new(t, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(op),
+        };
+        let unlink = TreeOp::Unlink {
+            inode,
+            path: PathBuf::from("/w/null"),
+            kind: FileKind::CharDevice,
+            mode: 0o020666,
+        };
+        let meta = TreeOp::DeviceNodeMeta {
+            inode,
+            path: PathBuf::from("/w/null"),
+            rdev: 0x103,
+            mode: 0o020666,
+            uid: 0,
+            gid: 5,
+            token: Some(shit_planner::CaptureToken {
+                helper: [3; 16],
+                mac: [4; 32],
+            }),
+            untrusted: None,
+        };
+        idx.put_event(&mk(1, unlink.clone())).unwrap();
+        idx.put_event(&mk(2, meta.clone())).unwrap();
+        let got = idx.events_for_command(command);
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert_eq!(got[0].kind, CaptureEventKind::TreeOp(unlink));
+        assert_eq!(got[1].kind, CaptureEventKind::TreeOp(meta));
     }
 }

@@ -504,9 +504,6 @@ fn emit_forward_for_event(
                 ),
             });
         }
-        // L5 — evidence for the undo planner's rename rules; nothing to
-        // redo on their own.
-        CaptureEventKind::RenameWalk { .. } | CaptureEventKind::RenameOutcome { .. } => {}
     }
 }
 
@@ -523,6 +520,7 @@ fn emit_forward_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec
                     path: path.clone(),
                     kind: *kind,
                     mode: *mode,
+                    device: None,
                 },
                 cohort: 0,
                 conflict: phantom_if_exists(path, probe),
@@ -563,6 +561,7 @@ fn emit_forward_for_tree_op(op: &TreeOp, probe: &dyn StateProbe, nodes: &mut Vec
                 conflict: phantom_if_exists(path, probe),
             });
         }
+        TreeOp::DeviceNodeMeta { .. } => {}
         TreeOp::SymlinkRemoved { path, .. } => {
             // W09.16.1 — forward of "symlink at `path` was removed"
             // is to remove it. The paired Create event (for the new

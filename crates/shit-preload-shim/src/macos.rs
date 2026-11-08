@@ -180,7 +180,7 @@ where
 /// Same contract as `libc::unlink` — `pathname` must point to a
 /// valid NUL-terminated C string for the duration of the call.
 unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
-    policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(pathname));
+    policy::notify_unlink_entry("unlink", &cstr_to_string(pathname));
     // SAFETY: caller upholds libc::unlink's contract on pathname.
     unsafe { libc::unlink(pathname) }
 }
@@ -210,7 +210,7 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
         return rc;
     }
     match joined {
-        Ok(p) => policy::notify_pre_mutation_with_content("unlinkat", &p),
+        Ok(p) => policy::notify_unlink_entry("unlinkat", &p),
         Err((raw, failure)) => policy::notify_unresolved("unlinkat", &raw, failure),
     }
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
@@ -245,8 +245,7 @@ unsafe extern "C" fn my_rename(from: *const c_char, to: *const c_char) -> c_int 
         &cstr_to_string(to),
     );
     let rc = unsafe { libc::rename(from, to) };
-    // L5: report a directory rename's result and any failure.
-    policy::finish_rename(pending, rc);
+    policy::rename_end(pending, rc);
     rc
 }
 
@@ -270,11 +269,12 @@ unsafe extern "C" fn my_renameat(
     ) {
         (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
         (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
-            policy::notify_rename_unresolved("renameat", &format!("{f}\t{t}"), failure)
+            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure);
+            None
         }
     };
     let rc = unsafe { libc::renameat(fromfd, from, tofd, to) };
-    policy::finish_rename(pending, rc);
+    policy::rename_end(pending, rc);
     rc
 }
 
@@ -353,14 +353,12 @@ mod addr {
 unsafe extern "C" fn rust_shim_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     // L5: the shared write-open policy (Create only for a path absent
     // before a successful call; a gap marker for an uncapturable file).
-    let pending = policy::write_open_begin(
+    policy::write_open(
         "open",
-        policy::OpenTarget::Path(&cstr_to_string(path)),
         flags,
-    );
-    let rc = unsafe { libc::open(path, flags, mode as c_int) };
-    policy::write_open_end(pending, rc);
-    rc
+        || policy::OpenTarget::Path(cstr_to_string(path)),
+        |f| unsafe { libc::open(path, f, mode as c_int) },
+    )
 }
 
 /// Rust target of the C trampoline for `openat(2)`.
@@ -375,18 +373,20 @@ unsafe extern "C" fn rust_shim_openat(
     mode: c_uint,
 ) -> c_int {
     // L5: keyed to the dirfd, then the shared write-open policy.
-    let pending = match join_dirfd(dirfd, &cstr_to_string(path)) {
-        Ok(p) => policy::write_open_begin("openat", policy::OpenTarget::Path(&p), flags),
+    // (#231 tracks routing this through the dirfd target the other
+    // platforms use.)
+    let call = |f| unsafe { libc::openat(dirfd, path, f, mode as c_int) };
+    if !policy::open_may_mutate(flags) || policy::disabled() {
+        return call(flags);
+    }
+    match join_dirfd(dirfd, &cstr_to_string(path)) {
+        Ok(p) => policy::write_open("openat", flags, || policy::OpenTarget::Path(p), call),
         Err((raw, failure)) => {
-            if policy::is_write_open(flags) || flags & libc::O_CREAT != 0 {
-                policy::notify_unresolved("openat", &raw, failure);
-            }
-            None
+            let rc = call(flags);
+            policy::write_open_unresolved("openat", &raw, failure, rc);
+            rc
         }
-    };
-    let rc = unsafe { libc::openat(dirfd, path, flags, mode as c_int) };
-    policy::write_open_end(pending, rc);
-    rc
+    }
 }
 
 /// Replacement for `mkdir(2)`. Captures directory-create
@@ -1655,6 +1655,70 @@ mod rename_wire_tests {
         assert_eq!(pre.bytes, b"old");
     }
 
+    /// Review of #232, item 7: an openat whose dirfd cannot be resolved
+    /// is reported only after the call succeeded. A bad dirfd fails with
+    /// EBADF, so nothing is sent and errno is the call's.
+    #[test]
+    fn unresolved_openat_that_fails_sends_nothing() {
+        let name = CString::new("never").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let fd = unsafe {
+                rust_shim_openat(
+                    987_654,
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT,
+                    0o644,
+                )
+            };
+            assert_eq!(fd, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review of #232 round 2, item 8: a muted shim reports neither a
+    /// removal nor an unresolved unlinkat.
+    #[test]
+    fn muted_rmdir_and_unresolved_unlinkat_send_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let p = CString::new(dir.join("d").to_str().unwrap()).unwrap();
+        let name = CString::new("x").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            policy::test_mute::with_muted(|| {
+                assert_eq!(unsafe { my_rmdir(p.as_ptr()) }, 0);
+                unsafe { my_unlinkat(987_654, name.as_ptr(), 0) };
+            });
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review of #232 round 2, item 6: unlinking a symlink is keyed to the
+    /// link, never its target.
+    #[test]
+    fn unlinkat_of_a_symlink_is_keyed_to_the_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("target"), b"t").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("link").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), 0) }, 0);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "unlinkat")
+            .expect("unlinkat");
+        assert_eq!(n.arg, dir.join("link").to_str().unwrap());
+        assert!(n.pre_image.is_none(), "{n:#?}");
+        assert!(dir.join("target").exists());
+    }
+
     #[test]
     fn unlinkat_with_real_dirfd_is_keyed_to_that_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1672,28 +1736,6 @@ mod rename_wire_tests {
         let want = dir.join("f");
         assert_eq!(n.arg, want.to_str().unwrap());
         assert_eq!(n.pre_image.as_ref().unwrap().bytes, b"bytes");
-    }
-
-    /// Review round 4, item 6: an unkeyable failed renameat still reports
-    /// its outcome under its call id.
-    #[test]
-    fn unresolvable_failed_renameat_reports_its_outcome() {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (a, b) = (CString::new("a").unwrap(), CString::new("b").unwrap());
-        let notes = policy::test_capture::capture(|| {
-            let rc = unsafe { my_renameat(fds[0], a.as_ptr(), fds[0], b.as_ptr()) };
-            assert_eq!(rc, -1);
-        });
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
-        assert_eq!(notes.len(), 2, "{notes:#?}");
-        assert!(notes[0].failure.is_some());
-        assert_ne!(notes[0].call_id, 0);
-        assert_eq!(notes[0].call_id, notes[1].call_id);
-        assert_ne!(notes[1].outcome.expect("outcome").errno, 0);
     }
 
     #[test]
@@ -1722,7 +1764,11 @@ mod rename_wire_tests {
         });
         let n = notes.iter().find(|n| n.syscall == "rmdir").expect("rmdir");
         assert_eq!(n.arg, dir.join("d").to_str().unwrap());
-        assert!(n.pre_stat.is_some_and(|s| s.mode & 0o170000 == 0o040000));
+        assert!(
+            n.pre_stat
+                .as_ref()
+                .is_some_and(|s| s.mode & 0o170000 == 0o040000)
+        );
         assert!(!dir.join("d").exists());
     }
 }

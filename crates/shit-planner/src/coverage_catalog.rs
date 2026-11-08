@@ -75,6 +75,11 @@ pub const COVERAGE_CATALOG: &[CoverageClass] = &[
         since_sprint: "L02",
     },
     CoverageClass {
+        id: "fs-device-node",
+        representative_smoke: "mknod-restore-undo-linux.sh",
+        since_sprint: "L4",
+    },
+    CoverageClass {
         id: "fs-metadata",
         representative_smoke: "chmod-undo-linux.sh",
         since_sprint: "L03",
