@@ -1222,7 +1222,19 @@ impl LinuxCaptureRuntime {
         // reading only when it is a regular file (open_unlink_fallback),
         // so a device node made by the command is held without being
         // opened, and a fifo never blocks.
-        let opened = open_unlink_fallback(&path_to_string(&resolved_path)).ok();
+        // An O_PATH open succeeds on a symlink, where the old O_RDONLY
+        // open failed with ELOOP and took the marker path below; keep
+        // that: only entries this handler holds fds for are kept.
+        let opened = open_unlink_fallback(&path_to_string(&resolved_path))
+            .ok()
+            .filter(|f| {
+                fstat_dev_inode_kind(f.as_raw_fd()).is_some_and(|(_, _, k)| {
+                    matches!(
+                        k,
+                        FileType::Regular | FileType::Fifo | FileType::Socket | FileType::Device
+                    )
+                })
+            });
 
         let (dev, inode, file_type) = match opened
             .as_ref()
