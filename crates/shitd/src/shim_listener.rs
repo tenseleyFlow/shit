@@ -375,7 +375,17 @@ fn ingest_notification(
     // the partial capture); the journaled refusal ensures the
     // planner surfaces the gap as an InverseOp::Refuse node at undo
     // time instead of silently mis-attributing.
-    if let Some(failure) = &note.failure {
+    // L5 (review round 4, item 2): inside a watched tree the kernel tier
+    // captures the file's pre-image, as it does the create the shim then
+    // defers (`open_create` below). A shim capture gap there is no gap.
+    let gap_in_watch = matches!(
+        &note.failure,
+        Some(shit_proto::ShimFailure::PreImageUncaptured { path, .. })
+            if live_baseline.path_in_watched_subtree(Path::new(path))
+    );
+    if let Some(failure) = &note.failure
+        && !gap_in_watch
+    {
         let (class, primary_path, detail) = match failure {
             shit_proto::ShimFailure::CanonicalizeFailed {
                 which_arg,
@@ -1660,6 +1670,39 @@ mod tests {
                 if path == Path::new("/tmp/shit-open/existing")),
             "{kinds:#?}"
         );
+    }
+
+    /// Review round 4, item 2: in a watched tree the kernel tier holds the
+    /// pre-image, so the shim's gap is not journaled; outside it is.
+    #[test]
+    fn uncaptured_file_in_a_watched_tree_journals_no_refusal() {
+        use shit_planner::time::TimePoint;
+        let failure = shit_proto::ShimFailure::PreImageUncaptured {
+            path: "/tmp/shit-open/existing".into(),
+            reason: "over the shim's inline pre-image cap".into(),
+        };
+        let note = open_note("open", Some(failure));
+        let watched = LiveBaseline::new();
+        watched.entry_for_cwd(Path::new("/tmp/shit-open"));
+        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(6, 0),
+            None,
+            &index,
+            &blob_store,
+            &watched,
+        );
+        let kinds: Vec<_> = index
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.is_empty(), "{kinds:#?}");
+        // Out of watch, the same note is a refusal (as in
+        // `uncaptured_existing_file_journals_a_refusal_only`).
+        assert_eq!(kinds_after(&note).len(), 1);
     }
 
     #[test]
