@@ -281,7 +281,7 @@ async fn handle_one(
                 None => {
                     // No record of the call: keep the outcome for when it
                     // is ingested (bounded by the registry's TTL).
-                    crate::shim_rename::park(note, ingest_ts);
+                    crate::shim_rename::park(note);
                     return Ok(());
                 }
             }
@@ -301,17 +301,30 @@ async fn handle_one(
     if let Some(call_id) = rename_call
         && let Some(parked) = crate::shim_rename::finish_call(call_id)
     {
-        ingest_notification(
-            &parked.note,
-            resolved,
-            parked.ts,
-            None,
-            &index,
-            &blob_store,
-            &live_baseline,
-        );
+        apply_parked(&parked, resolved, &index, &blob_store, &live_baseline);
     }
     Ok(())
+}
+
+/// Journal an outcome that was parked until its call's notification was
+/// ingested. Review round 3, item 1: stamped now, after the call's
+/// Rename, not when it arrived (which was before).
+pub(crate) fn apply_parked(
+    parked: &crate::shim_rename::Parked,
+    resolved: Option<shit_planner::events::CommandId>,
+    index: &Index,
+    blob_store: &BlobStore,
+    live_baseline: &LiveBaseline,
+) {
+    ingest_notification(
+        &parked.note,
+        resolved,
+        crate::server::next_ts(),
+        None,
+        index,
+        blob_store,
+        live_baseline,
+    );
 }
 
 /// A rename-family call's pre-syscall notification (not its outcome,

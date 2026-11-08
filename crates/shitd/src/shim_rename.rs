@@ -141,7 +141,6 @@ struct Call {
 /// An outcome that arrived for a call the daemon has no record of.
 pub(crate) struct Parked {
     pub note: ShimNotification,
-    pub ts: TimePoint,
 }
 
 /// Done calls and parked outcomes older than this are dropped. A failed
@@ -293,12 +292,12 @@ pub(crate) async fn await_call(call_id: u64) -> Option<CommandId> {
 
 /// Keep an outcome whose call is not known yet; [`finish_call`] hands it
 /// back if the call's notification is ingested later.
-pub(crate) fn park(note: ShimNotification, ts: TimePoint) {
+pub(crate) fn park(note: ShimNotification) {
     let mut reg = lock();
     reg.expire();
     let id = note.call_id;
     reg.parked_order.push_back((std::time::Instant::now(), id));
-    reg.parked.insert(id, Parked { note, ts });
+    reg.parked.insert(id, Parked { note });
 }
 
 /// Journal a rename's post-syscall outcome, naming the Rename and refusal
@@ -655,12 +654,11 @@ mod tests {
         assert_eq!(rt.block_on(await_call(call_id)), None);
         let mut n = note(None, None);
         n.call_id = call_id;
-        park(n, TimePoint::new(9, 0));
+        park(n);
         let (_tmp, _index, _blobs, command) = fixture();
         register_call(call_id, command);
         let parked = finish_call(call_id).expect("parked outcome handed back");
         assert_eq!(parked.note.call_id, call_id);
-        assert_eq!(parked.ts, TimePoint::new(9, 0));
     }
 
     /// Review round 3, item 6: the same shim call id from two processes
@@ -681,5 +679,64 @@ mod tests {
         let reg = lock();
         assert_eq!(reg.calls.get(&a).and_then(|c| c.rename), Some(EventId(1)));
         assert_eq!(reg.calls.get(&b).and_then(|c| c.rename), Some(EventId(2)));
+    }
+
+    /// Review round 3, item 1: an outcome that arrived before its call was
+    /// registered is journaled after the call's Rename once applied.
+    #[test]
+    fn parked_outcome_is_stamped_after_its_rename() {
+        let (_tmp, index, blobs, command) = fixture();
+        let call_id = 0x5150_0000_0003;
+        let mut out = note(
+            None,
+            Some(ShimRenameOutcome {
+                errno: 0,
+                source_dev: 64,
+                source_inode: 10,
+                dest_dev: 64,
+                dest_inode: 10,
+            }),
+        );
+        out.call_id = call_id;
+        // Arrived first: its arrival time is the earliest of all.
+        park(out);
+        let mut pre = note(None, None);
+        pre.call_id = call_id;
+        register_call(call_id, command);
+        crate::shim_listener::ingest_notification_for_test(
+            &pre,
+            Some(command),
+            crate::server::next_ts(),
+            &index,
+            &blobs,
+            &LiveBaseline::new(),
+        );
+        let parked = finish_call(call_id).expect("parked");
+        crate::shim_listener::apply_parked(
+            &parked,
+            Some(command),
+            &index,
+            &blobs,
+            &LiveBaseline::new(),
+        );
+        let events = index.events_for_command(command);
+        let ts_of = |pred: &dyn Fn(&CaptureEventKind) -> bool| {
+            events.iter().find(|e| pred(&e.kind)).map(|e| e.ts).unwrap()
+        };
+        let rename = ts_of(&|k| {
+            matches!(
+                k,
+                CaptureEventKind::TreeOp(shit_planner::TreeOp::Rename { .. })
+            )
+        });
+        let outcome = ts_of(&|k| matches!(k, CaptureEventKind::RenameOutcome { .. }));
+        assert!(outcome > rename, "outcome {outcome:?} rename {rename:?}");
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            CaptureEventKind::RenameOutcome {
+                rename: Some(_),
+                ..
+            }
+        )));
     }
 }
