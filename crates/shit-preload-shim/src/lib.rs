@@ -1513,29 +1513,33 @@ mod policy {
         if should_skip_path(&abs) {
             return None;
         }
-        match (std::fs::symlink_metadata(&abs), std::fs::metadata(&abs)) {
+        // One lstat; the target is stat'ed only through a symlink.
+        let existing = match std::fs::symlink_metadata(&abs) {
             // A symlink under O_NOFOLLOW: the open fails with ELOOP.
-            (Ok(l), _) if nofollow && l.file_type().is_symlink() => None,
-            // Exists (or is a symlink to something that does).
-            (Ok(_), Ok(m)) => {
-                if !writes || !m.is_file() {
-                    // Fifos, sockets, devices outside /dev: no bytes to
-                    // restore and nothing created.
-                    return None;
-                }
-                notify_existing_file(syscall, &abs, &m, failure);
-                None
-            }
-            (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => {
-                creates.then_some(PendingCreate {
+            Ok(l) if l.file_type().is_symlink() && nofollow => return None,
+            Ok(l) if l.file_type().is_symlink() => std::fs::metadata(&abs).ok(),
+            Ok(l) => Some(l),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return creates.then_some(PendingCreate {
                     path: abs,
                     gap: failure,
-                })
+                });
+            }
+            Err(_) => None,
+        };
+        match existing {
+            Some(m) => {
+                if writes && m.is_file() {
+                    notify_existing_file(syscall, &abs, &m, failure);
+                }
+                // Fifos, sockets, devices outside /dev: no bytes to
+                // restore and nothing created.
+                None
             }
             // A dangling symlink (the open would create its target
             // elsewhere) or a stat that failed: the prior state is not
             // known, so a success is a gap.
-            _ => creates.then(|| PendingCreate {
+            None => creates.then(|| PendingCreate {
                 gap: Some(failure.unwrap_or_else(|| uncaptured(&abs, "prior state unknown"))),
                 path: abs,
             }),

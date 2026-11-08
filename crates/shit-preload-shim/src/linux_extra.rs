@@ -198,7 +198,9 @@ fortify_open!(__openat64_2, at);
 
 /// `creat(2)` and `creat64(2)`, which are `open(path,
 /// O_CREAT|O_WRONLY|O_TRUNC, mode)`. When the policy adds `O_EXCL` the
-/// call is made as that open.
+/// call is made as the next `open64` with those flags (review of #232
+/// round 2, item 7), so libc's own open semantics (`O_LARGEFILE`) still
+/// apply. The raw syscall runs only when dlsym found neither.
 macro_rules! creat_open {
     ($name:ident) => {
         #[doc = concat!("`", stringify!($name), "(2)`.")]
@@ -208,9 +210,21 @@ macro_rules! creat_open {
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(path: *const c_char, mode: mode_t) -> c_int {
             const FLAGS: c_int = O_CREAT | O_WRONLY | O_TRUNC;
-            path_open(path, FLAGS, |f| match real!(@ident $name, CreatFn) {
-                Some(creat) if f == FLAGS => unsafe { creat(path, mode) },
-                _ => sys::openat(libc::AT_FDCWD, path, f, mode as c_uint),
+            path_open(path, FLAGS, |f| {
+                if f == FLAGS
+                    && let Some(creat) = real!(@ident $name, CreatFn)
+                {
+                    return unsafe { creat(path, mode) };
+                }
+                match real!("open64", OpenFn) {
+                    Some(open) => unsafe { open(path, f, mode as c_uint) },
+                    None => sys::openat(
+                        libc::AT_FDCWD,
+                        path,
+                        f | libc::O_LARGEFILE,
+                        mode as c_uint,
+                    ),
+                }
             })
         }
     };
@@ -271,7 +285,8 @@ pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t
     rc
 }
 
-/// `rmdir(2)`: notify before the syscall, as an unlink of a directory.
+/// `rmdir(2)`: resolve and stat the target first, notify only after the
+/// call removed it (a refused rmdir removed nothing).
 ///
 /// # Safety
 /// libc `rmdir` contract.
