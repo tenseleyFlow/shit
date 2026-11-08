@@ -202,8 +202,8 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
     // succeeded, with the stat from before, like rmdir.
     if flags & libc::AT_REMOVEDIR != 0 {
         let pending = match joined {
-            Ok(p) => policy::removal_begin("unlinkat", &p),
-            Err((raw, failure)) => policy::removal_pending("unlinkat", raw, Some(failure)),
+            Ok(p) => policy::removal_begin("unlinkat_dir", &p),
+            Err((raw, failure)) => policy::removal_pending("unlinkat_dir", raw, Some(failure)),
         };
         let rc = unsafe { libc::unlinkat(dirfd, pathname, flags) };
         policy::removal_end(pending, rc);

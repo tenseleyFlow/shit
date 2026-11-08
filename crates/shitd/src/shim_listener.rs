@@ -266,6 +266,16 @@ async fn handle_one(
 struct UnlinkStat {
     kind: FileKind,
     mode: u32,
+    /// The removed entry's identity, when the shim read it before the
+    /// call (L5 review round 3, item 5).
+    inode: Option<InodeRef>,
+}
+
+/// L5 — removals the shim reports after they succeeded: `rmdir` and
+/// `unlinkat(AT_REMOVEDIR)`. Only ever directories, and gone by the time
+/// the daemon reads the note.
+fn is_post_call_removal(syscall: &str) -> bool {
+    matches!(syscall, "rmdir" | "unlinkat_dir")
 }
 
 /// lstat the target of a shim `unlink`/`unlinkat` so the journaled
@@ -276,13 +286,22 @@ struct UnlinkStat {
 /// fifos and sockets are reported; anything else keeps the wire default.
 fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     use std::os::unix::fs::MetadataExt;
-    if !matches!(note.syscall.as_str(), "unlink" | "unlinkat" | "rmdir") {
+    if !matches!(note.syscall.as_str(), "unlink" | "unlinkat")
+        && !is_post_call_removal(&note.syscall)
+    {
         return None;
     }
-    // L5: rmdir is reported after it succeeded, with the shim's own stat
-    // from before the call; there is nothing left here to stat.
-    if let Some(s) = note.pre_stat {
-        return FileKind::from_mode(s.mode).map(|kind| UnlinkStat { kind, mode: s.mode });
+    // L5: a removal reported after it succeeded carries the shim's own
+    // stat from before the call. Never lstat it here (review round 3,
+    // item 4): the directory is gone, or something new took its name.
+    if is_post_call_removal(&note.syscall) {
+        return note.pre_stat.and_then(|s| {
+            FileKind::from_mode(s.mode).map(|kind| UnlinkStat {
+                kind,
+                mode: s.mode,
+                inode: Some(InodeRef::new(s.dev, s.inode)),
+            })
+        });
     }
     if !Path::new(&note.arg).is_absolute() {
         return None;
@@ -303,6 +322,7 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     Some(UnlinkStat {
         kind,
         mode: meta.mode(),
+        inode: None,
     })
 }
 
@@ -311,9 +331,13 @@ fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> Captur
     match (kind, stat) {
         (
             CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path, .. }),
-            Some(UnlinkStat { kind, mode }),
+            Some(UnlinkStat {
+                kind,
+                mode,
+                inode: shim_inode,
+            }),
         ) => CaptureEventKind::TreeOp(TreeOp::Unlink {
-            inode,
+            inode: shim_inode.unwrap_or(inode),
             path,
             kind,
             mode,
@@ -837,7 +861,7 @@ fn ingest_pre_image_with_source(
 /// path.
 fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
     match syscall {
-        "unlink" | "unlinkat" | "rmdir" => {
+        "unlink" | "unlinkat" | "rmdir" | "unlinkat_dir" => {
             let path = PathBuf::from(arg);
             // G02: shim doesn't carry kind/mode in its notification
             // wire (the shim's notify happens pre-syscall and
@@ -845,8 +869,9 @@ fn classify_tree_op(syscall: &str, arg: &str) -> Option<CaptureEventKind> {
             // pre-G02 hard-coded behavior. The kernel-tier LSM
             // path (helper) DOES carry kind+mode and overrides this
             // when both tiers see the same unlink.
-            // L5: rmdir(2) only ever removes a directory.
-            let (kind, mode) = if syscall == "rmdir" {
+            // L5: rmdir(2) and unlinkat(AT_REMOVEDIR) only ever remove a
+            // directory, whether or not the shim read its mode.
+            let (kind, mode) = if is_post_call_removal(syscall) {
                 (shit_planner::metadata::FileKind::Directory, 0o040755)
             } else {
                 (shit_planner::metadata::FileKind::Regular, 0o100644)
@@ -1508,6 +1533,7 @@ mod tests {
             Some(UnlinkStat {
                 kind: FileKind::Directory,
                 mode: 0o040750,
+                inode: None,
             }),
             &index,
             &blob_store,
@@ -1560,6 +1586,27 @@ mod tests {
             Some(command),
             TimePoint::new(6, 0),
             None,
+            &index,
+            &blob_store,
+            &LiveBaseline::new(),
+        );
+        index
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    /// As `kinds_after`, with the daemon's own stat step as `handle_one`
+    /// runs it.
+    fn kinds_after_with_stat(note: &ShimNotification) -> Vec<CaptureEventKind> {
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
+        ingest_notification(
+            note,
+            Some(command),
+            TimePoint::new(6, 0),
+            pre_syscall_unlink_stat(note),
             &index,
             &blob_store,
             &LiveBaseline::new(),
@@ -1645,9 +1692,59 @@ mod tests {
             stat,
             Some(UnlinkStat {
                 kind: FileKind::Directory,
-                mode: 0o040750
+                mode: 0o040750,
+                inode: Some(InodeRef::new(1, 2)),
             })
         );
+    }
+
+    /// Review round 3, items 4 and 5: an `unlinkat(AT_REMOVEDIR)` reported
+    /// after success is a directory unlink with the shim's identity, and
+    /// without a stat it is still a directory, never an lstat of whatever
+    /// now has the name.
+    #[test]
+    fn post_call_removals_are_directories_with_the_shims_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut with_stat = open_note("unlinkat_dir", None);
+        with_stat.pre_stat = Some(shit_proto::ShimStat {
+            dev: 9,
+            inode: 4242,
+            mode: 0o040711,
+        });
+        let kinds = kinds_after_with_stat(&with_stat);
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::TreeOp(TreeOp::Unlink {
+                    kind: FileKind::Directory,
+                    mode: 0o040711,
+                    inode,
+                    ..
+                })] if *inode == InodeRef::new(9, 4242)
+            ),
+            "{kinds:#?}"
+        );
+        // Something new holds the name now; it must not be stat'ed.
+        let tmp = tempfile::tempdir().unwrap();
+        let reused = tmp.path().join("d");
+        std::fs::create_dir(&reused).unwrap();
+        std::fs::set_permissions(&reused, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for syscall in ["rmdir", "unlinkat_dir"] {
+            let mut bare = open_note(syscall, None);
+            bare.arg = reused.to_str().unwrap().into();
+            let kinds = kinds_after_with_stat(&bare);
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::TreeOp(TreeOp::Unlink {
+                        kind: FileKind::Directory,
+                        mode: 0o040755,
+                        ..
+                    })]
+                ),
+                "{syscall}: {kinds:#?}"
+            );
+        }
     }
 
     #[test]
@@ -1668,6 +1765,7 @@ mod tests {
                 Some(UnlinkStat {
                     kind: FileKind::Directory,
                     mode: 0o040700,
+                    inode: None,
                 }),
                 0o040700,
             ),
