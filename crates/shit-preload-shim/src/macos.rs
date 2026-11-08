@@ -1690,7 +1690,11 @@ mod rename_wire_tests {
         });
         let n = notes.iter().find(|n| n.syscall == "rmdir").expect("rmdir");
         assert_eq!(n.arg, dir.join("d").to_str().unwrap());
-        assert!(n.pre_stat.as_ref().is_some_and(|s| s.mode & 0o170000 == 0o040000));
+        assert!(
+            n.pre_stat
+                .as_ref()
+                .is_some_and(|s| s.mode & 0o170000 == 0o040000)
+        );
         assert!(!dir.join("d").exists());
     }
 }

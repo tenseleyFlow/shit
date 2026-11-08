@@ -130,9 +130,18 @@ pub unsafe extern "C" fn openat64(
     })
 }
 
-/// glibc's `_FORTIFY_SOURCE` entries for a two-argument open. glibc
-/// aborts in these on `O_CREAT`, so the policy never adds `O_EXCL` here;
-/// any other flags go to the raw syscall.
+/// glibc's `_FORTIFY_SOURCE` entries for a two-argument open. The
+/// caller's flags go through unchanged (review of #232, item 5). glibc
+/// aborts in these on `O_CREAT` or `O_TMPFILE`, which need a mode the
+/// two-argument form does not carry: such a call goes straight to the
+/// real function, so it aborts as it would without the shim, and the
+/// policy never sees it (so never adds `O_EXCL`). Only when no next
+/// definition exists does a call without those flags fall back to the
+/// raw syscall, where the mode is unused.
+fn fortify_needs_mode(flags: c_int) -> bool {
+    flags & O_CREAT != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE
+}
+
 macro_rules! fortify_open {
     ($name:ident) => {
         #[doc = concat!("glibc's `", stringify!($name), "`.")]
@@ -141,9 +150,19 @@ macro_rules! fortify_open {
         /// The glibc contract of the same name.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(path: *const c_char, flags: c_int) -> c_int {
-            path_open(path, flags, |f| match real!(@ident $name, Open2Fn) {
-                Some(open) if f == flags => unsafe { open(path, f) },
-                _ => sys::openat(libc::AT_FDCWD, path, f, 0),
+            let real = real!(@ident $name, Open2Fn);
+            if fortify_needs_mode(flags) {
+                return match real {
+                    Some(open) => unsafe { open(path, flags) },
+                    None => unsafe { libc::abort() },
+                };
+            }
+            path_open(path, flags, |f| {
+                debug_assert_eq!(f, flags);
+                match real {
+                    Some(open) => unsafe { open(path, flags) },
+                    None => sys::openat(libc::AT_FDCWD, path, flags, 0),
+                }
             })
         }
     };
@@ -154,10 +173,18 @@ macro_rules! fortify_open {
         /// The glibc contract of the same name.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $name(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+            let real = real!(@ident $name, OpenAt2Fn);
+            if fortify_needs_mode(flags) {
+                return match real {
+                    Some(open) => unsafe { open(dirfd, path, flags) },
+                    None => unsafe { libc::abort() },
+                };
+            }
             at_open(dirfd, path, flags, |f| {
-                match real!(@ident $name, OpenAt2Fn) {
-                    Some(open) if f == flags => unsafe { open(dirfd, path, f) },
-                    _ => sys::openat(dirfd, path, f, 0),
+                debug_assert_eq!(f, flags);
+                match real {
+                    Some(open) => unsafe { open(dirfd, path, flags) },
+                    None => sys::openat(dirfd, path, flags, 0),
                 }
             })
         }
@@ -615,5 +642,46 @@ mod tests {
         });
         assert!(notes.is_empty(), "{notes:#?}");
         assert_eq!(std::fs::read(dir.join("target")).unwrap(), b"old");
+    }
+
+    /// Review of #232, item 5: `__open_2` with `O_CREAT` aborts, as glibc
+    /// does without the shim; nothing is created.
+    #[test]
+    fn fortify_open_with_o_creat_aborts_like_glibc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("never");
+        let cp = c(&p);
+        // SAFETY: the child only calls the interposer and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let fd = unsafe { __open_2(cp.as_ptr(), O_WRONLY | O_CREAT) };
+            unsafe { libc::_exit(if fd >= 0 { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
+        assert!(!p.exists());
+    }
+
+    /// Without `O_CREAT` the fortify entry opens with the caller's flags
+    /// and the policy captures as usual.
+    #[test]
+    fn fortify_open_passes_flags_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("f"), b"old").unwrap();
+        let p = c(&dir.join("f"));
+        let missing = c(&dir.join("missing"));
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { __open_2(p.as_ptr(), O_WRONLY | O_TRUNC) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+            assert_eq!(unsafe { __open_2(missing.as_ptr(), O_WRONLY) }, -1);
+        });
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].pre_image.as_ref().unwrap().bytes, b"old");
+        assert!(!dir.join("missing").exists());
     }
 }
