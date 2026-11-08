@@ -112,8 +112,13 @@ pub struct CloseAccounting {
 
 impl CloseAccounting {
     pub fn note_baseline_entry(&mut self, id: Id, path: &std::path::Path) {
-        self.baseline.insert(id);
+        self.note_baseline_id(id);
         self.baseline_paths.insert(path.to_path_buf(), id);
+    }
+
+    /// A baseline identity whose path no rename check needs.
+    pub fn note_baseline_id(&mut self, id: Id) {
+        self.baseline.insert(id);
     }
 
     pub fn note_walked(&mut self) {
