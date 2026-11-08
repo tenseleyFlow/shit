@@ -293,3 +293,28 @@ fn muted_removal_sends_nothing() {
     });
     assert!(notes.is_empty(), "{notes:#?}");
 }
+
+/// Review of #232 medium review, item 4: a removal whose name could not
+/// be keyed carries no stat (`src` here exists relative to the test's
+/// cwd, which is not the dirfd's directory), and a muted shim records
+/// nothing for it at all.
+#[test]
+fn unkeyed_removal_carries_no_stat_and_honors_the_mute() {
+    let marker = || shit_proto::ShimFailure::CanonicalizeFailed {
+        which_arg: "path".into(),
+        attempted_path: "src".into(),
+        error_chain: "dirfd 9 could not be resolved".into(),
+    };
+    assert!(std::path::Path::new("src").exists());
+    let notes = test_capture::capture(|| {
+        let p = super::policy::removal_pending("unlinkat_dir", "src".into(), Some(marker()));
+        super::policy::removal_end(p, 0);
+    });
+    assert_eq!(notes.len(), 1, "{notes:#?}");
+    assert!(notes[0].pre_stat.is_none(), "{notes:#?}");
+    assert!(notes[0].failure.is_some());
+    let muted = super::policy::test_mute::with_muted(|| {
+        super::policy::removal_pending("unlinkat_dir", "src".into(), Some(marker()))
+    });
+    assert!(muted.is_none());
+}

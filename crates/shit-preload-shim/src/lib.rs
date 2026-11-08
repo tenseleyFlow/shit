@@ -1388,16 +1388,24 @@ mod policy {
     }
 
     /// A removal to report after the call. `failure` is set when the
-    /// path could not be keyed; it is then reported with the marker.
+    /// path could not be keyed; it is then reported with the marker and
+    /// no stat (review of #232 medium review, item 4): the raw name may
+    /// be relative to a dirfd, and an lstat of it against the cwd would
+    /// read some other entry. Muted, re-entered and skipped paths send
+    /// nothing, on every branch.
     pub(super) fn removal_pending(
         syscall: &'static str,
         abs: String,
         failure: Option<shit_proto::ShimFailure>,
     ) -> Option<PendingRemoval> {
-        if should_skip_path(&abs) {
+        if idle(&abs) {
             return None;
         }
-        let stat = lstat_identity(&abs);
+        let stat = if failure.is_none() {
+            lstat_identity(&abs)
+        } else {
+            None
+        };
         Some(PendingRemoval {
             syscall,
             path: abs,
