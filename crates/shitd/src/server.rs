@@ -614,6 +614,7 @@ fn handle(
         }
         HookMessage::SessionClose { .. } => {
             info!(%session, kind, "session close");
+            close_ctx.live_baseline.forget_session_watches(session);
             if let Err(e) = index.close_session(session, ts) {
                 warn!(err = %e, "close_session failed");
             }

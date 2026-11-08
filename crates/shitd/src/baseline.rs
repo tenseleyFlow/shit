@@ -235,6 +235,22 @@ impl BaselineCacheEntry {
     }
 }
 
+/// L5: one command's kernel-tier watch, as the daemon requested it.
+struct CommandWatch {
+    root: PathBuf,
+    /// The PostExec's timestamp, once it arrived.
+    closed_at: Option<TimePoint>,
+    /// When the daemon recorded it, for the age-out.
+    recorded: std::time::Instant,
+}
+
+/// L5 (review of #232, item 8): a watch whose PostExec never arrived (a
+/// shell killed mid-command) is dropped after this long.
+const COMMAND_WATCH_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// At most this many command watches are kept; the oldest go first.
+const COMMAND_WATCH_CAP: usize = 4096;
+
 /// Daemon-wide live baseline state. One per shitd instance. Holds
 /// per-cwd cache entries indexed by absolute path.
 ///
@@ -242,20 +258,15 @@ impl BaselineCacheEntry {
 /// payload carries the cwd path (B05.10) and the walker scans
 /// from there. Two sessions in the same cwd share the cache
 /// entry (refcount); the walk runs once for both.
-/// L5: one command's kernel-tier watch, as the daemon requested it.
-struct CommandWatch {
-    root: PathBuf,
-    /// The PostExec's timestamp, once it arrived.
-    closed_at: Option<TimePoint>,
-}
-
 #[derive(Default)]
 pub struct LiveBaseline {
     by_cwd: RwLock<HashMap<PathBuf, Arc<BaselineCacheEntry>>>,
     /// L5 (review round 4, item 2): the watch root the daemon sent the
     /// helper in `WatchTree` for each command, on every platform, and the
     /// time its PostExec closed the watch. Dropped when the helper says it
-    /// cannot watch that command, and when the session starts another.
+    /// cannot watch that command, when the session starts another or
+    /// closes, and after [`COMMAND_WATCH_TTL`] or past
+    /// [`COMMAND_WATCH_CAP`].
     command_roots: RwLock<HashMap<CommandId, CommandWatch>>,
 }
 
@@ -337,19 +348,43 @@ impl LiveBaseline {
     }
 
     /// L5: the daemon asked the helper to watch `command` under `root`.
-    /// The session's earlier, closed commands are dropped: a shim note
-    /// for one of them that is still in flight is judged unwatched,
-    /// which journals a refusal and loses nothing.
+    /// The session's earlier, closed commands are dropped, and so are
+    /// watches past the age-out or the cap. A shim note for a dropped
+    /// command that is still in flight is judged unwatched, so its Create
+    /// is journaled by the shim; nothing is lost.
     pub fn record_command_watch(&self, command: CommandId, root: PathBuf) {
+        self.record_command_watch_at(command, root, std::time::Instant::now());
+    }
+
+    fn record_command_watch_at(&self, command: CommandId, root: PathBuf, now: std::time::Instant) {
         let mut map = self.command_roots.write().unwrap();
-        map.retain(|c, w| c.session != command.session || w.closed_at.is_none());
+        map.retain(|c, w| {
+            (c.session != command.session || w.closed_at.is_none())
+                && now.saturating_duration_since(w.recorded) < COMMAND_WATCH_TTL
+        });
+        while map.len() >= COMMAND_WATCH_CAP {
+            let Some(oldest) = map.iter().min_by_key(|(_, w)| w.recorded).map(|(c, _)| *c) else {
+                break;
+            };
+            map.remove(&oldest);
+        }
         map.insert(
             command,
             CommandWatch {
                 root,
                 closed_at: None,
+                recorded: now,
             },
         );
+    }
+
+    /// L5 (review of #232, item 8): the session closed; its commands'
+    /// watches go with it.
+    pub fn forget_session_watches(&self, session: uuid::Uuid) {
+        self.command_roots
+            .write()
+            .unwrap()
+            .retain(|c, _| c.session != session);
     }
 
     /// L5 (review round 5, item 2): `command`'s PostExec at `at` closed
@@ -362,7 +397,7 @@ impl LiveBaseline {
     }
 
     /// L5: `command` is not watched after all (the helper failed to
-    /// attach, or has no capture tier).
+    /// attach, or has no capture tier, or the WatchTree send failed).
     pub fn forget_command_watch(&self, command: CommandId) {
         self.command_roots.write().unwrap().remove(&command);
     }
@@ -382,6 +417,58 @@ impl LiveBaseline {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Review of #232, item 8: a closed session drops its watches; an
+    /// unclosed watch ages out; the map never grows past its cap.
+    #[test]
+    fn command_watches_are_pruned_by_session_close_age_and_cap() {
+        use std::time::{Duration, Instant};
+        let lb = LiveBaseline::new();
+        let s1 = Uuid::from_u128(1);
+        let s2 = Uuid::from_u128(2);
+        let f = Path::new("/w/f");
+        let at = TimePoint::new(1, 0);
+        let c1 = CommandId {
+            session: s1,
+            seq: 1,
+        };
+        let c2 = CommandId {
+            session: s2,
+            seq: 1,
+        };
+        lb.record_command_watch(c1, PathBuf::from("/w"));
+        lb.record_command_watch(c2, PathBuf::from("/w"));
+        lb.forget_session_watches(s1);
+        assert!(!lb.command_watches(c1, f, at));
+        assert!(lb.command_watches(c2, f, at));
+
+        let t0 = Instant::now();
+        let old = CommandId {
+            session: s1,
+            seq: 2,
+        };
+        lb.record_command_watch_at(old, PathBuf::from("/w"), t0);
+        let later = t0 + COMMAND_WATCH_TTL + Duration::from_secs(1);
+        let fresh = CommandId {
+            session: s2,
+            seq: 2,
+        };
+        lb.record_command_watch_at(fresh, PathBuf::from("/w"), later);
+        assert!(!lb.command_watches(old, f, at), "unclosed watch aged out");
+        assert!(lb.command_watches(fresh, f, at));
+
+        for seq in 0..(COMMAND_WATCH_CAP as u64 + 10) {
+            lb.record_command_watch_at(
+                CommandId {
+                    session: Uuid::from_u128(1000 + u128::from(seq)),
+                    seq,
+                },
+                PathBuf::from("/w"),
+                later + Duration::from_millis(seq),
+            );
+        }
+        assert!(lb.command_roots.read().unwrap().len() <= COMMAND_WATCH_CAP);
+    }
 
     /// Review round 5, item 2: a closed watch still covers notes the
     /// daemon timestamped before the PostExec, and no later ones.
