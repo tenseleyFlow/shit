@@ -910,9 +910,15 @@ static RINGBUF_LOSSES_OBSERVED: AtomicU64 = AtomicU64::new(0);
 /// How often a reader polls its object's loss counter between flushes.
 const LOSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Upper bound on records drained for one flush request, so a reader
-/// under sustained load still acks.
-const FLUSH_DRAIN_MAX: u32 = 1 << 16;
+/// Time a reader may spend draining for one flush request. The drain
+/// runs until the ring is empty; this bound only matters when producers
+/// refill the ring as fast as it drains. It is half of the request
+/// loop's `LSM_FLUSH_TIMEOUT` (2 s), so a reader that hits it still acks
+/// inside the wait and the close reports a truncated tail instead of a
+/// timeout; the daemon's barrier waits 5 s on top. A 256 KiB ring holds
+/// at most about 4k records, which drain in milliseconds, so a drain
+/// that has not emptied the ring in a second is not converging.
+const FLUSH_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
 /// Ring-buffer reserve failures observed so far, summed over objects.
 pub fn ringbuf_losses_observed() -> u64 {
@@ -987,29 +993,32 @@ pub struct LsmFlushHandle {
 pub enum FlushAck {
     /// The ring was empty when the drain stopped.
     Drained,
-    /// The drain handled its cap of records and found another one
-    /// queued. Records still in the ring reach userspace after the tree
-    /// is unwatched and lose their attribution, so the close is not
-    /// clean.
+    /// The drain ran out of [`FLUSH_DRAIN_BUDGET`] with records still
+    /// queued. Those reach userspace after the tree is unwatched and lose
+    /// their attribution, so the close reports the command's tail as
+    /// possibly missing.
     Truncated { drained: u32 },
 }
 
 /// Drain for a flush request. `next` handles one record and returns
-/// false when the ring is empty. Up to `max` records are handled; one
-/// more found waiting makes the drain truncated. That extra record is
-/// handled too, so the peek loses nothing.
-fn drain_for_flush(max: u32, mut next: impl FnMut() -> bool) -> FlushAck {
+/// false when the ring is empty; `expired` reports that the time budget
+/// is spent. The drain runs until the ring is empty. When the budget is
+/// spent, one more record found waiting makes the drain truncated; that
+/// record is handled too, so the check loses nothing.
+fn drain_for_flush(mut expired: impl FnMut() -> bool, mut next: impl FnMut() -> bool) -> FlushAck {
     let mut drained = 0u32;
-    while drained < max {
+    loop {
+        if expired() {
+            return if next() {
+                FlushAck::Truncated { drained }
+            } else {
+                FlushAck::Drained
+            };
+        }
         if !next() {
             return FlushAck::Drained;
         }
-        drained += 1;
-    }
-    if next() {
-        FlushAck::Truncated { drained }
-    } else {
-        FlushAck::Drained
+        drained = drained.saturating_add(1);
     }
 }
 
@@ -1425,18 +1434,22 @@ fn reader_thread(
         // request is already in the ring, so draining until empty
         // dispatches the command's whole tail before the ack.
         while let Ok(ack) = flush_rx.try_recv() {
-            let outcome = drain_for_flush(FLUSH_DRAIN_MAX, || {
-                let Some(rec) = rb.next() else {
-                    return false;
-                };
-                handler(&rec[..], sink.as_ref());
-                true
-            });
+            let deadline = Instant::now() + FLUSH_DRAIN_BUDGET;
+            let outcome = drain_for_flush(
+                || Instant::now() >= deadline,
+                || {
+                    let Some(rec) = rb.next() else {
+                        return false;
+                    };
+                    handler(&rec[..], sink.as_ref());
+                    true
+                },
+            );
             if let FlushAck::Truncated { drained } = outcome {
                 tracing::warn!(
                     thread = thread_name,
                     drained,
-                    "eBPF flush drain hit its cap with records still queued"
+                    "eBPF flush drain ran out of time with records still queued"
                 );
             }
             loss.poll(thread_name);
@@ -1558,33 +1571,78 @@ mod tests {
         t.join().unwrap();
     }
 
+    /// A ring of `n` records; returns how many `next` handled.
+    fn ring(n: u32) -> (std::cell::Cell<u32>, std::cell::Cell<u32>) {
+        (std::cell::Cell::new(n), std::cell::Cell::new(0))
+    }
+
     #[test]
-    fn drain_reports_truncation_only_when_a_record_is_left() {
-        let mut left = 3u32;
-        let mut take = || {
-            if left == 0 {
-                return false;
-            }
-            left -= 1;
-            true
-        };
-        assert_eq!(drain_for_flush(3, &mut take), FlushAck::Drained);
+    fn drain_empties_the_ring_past_any_record_count() {
+        // More than the old FLUSH_DRAIN_MAX cap: a drain with time left
+        // keeps going until the ring is empty.
+        let (left, handled) = ring((1 << 16) + 10);
+        let outcome = drain_for_flush(
+            || false,
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                handled.set(handled.get() + 1);
+                true
+            },
+        );
+        assert_eq!(outcome, FlushAck::Drained);
+        assert_eq!(handled.get(), (1 << 16) + 10);
+    }
 
-        let mut left = 5u32;
-        let mut handled = 0u32;
-        let outcome = drain_for_flush(3, || {
-            if left == 0 {
-                return false;
-            }
-            left -= 1;
-            handled += 1;
-            true
-        });
+    #[test]
+    fn drain_is_truncated_only_when_time_runs_out_with_records_left() {
+        let (left, handled) = ring(5);
+        let checks = std::cell::Cell::new(0u32);
+        let outcome = drain_for_flush(
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                handled.set(handled.get() + 1);
+                true
+            },
+        );
         assert_eq!(outcome, FlushAck::Truncated { drained: 3 });
-        assert_eq!(handled, 4, "the peeked record is handled, not dropped");
+        assert_eq!(
+            handled.get(),
+            4,
+            "the record that proved truncation is handled"
+        );
 
-        let mut none = || false;
-        assert_eq!(drain_for_flush(3, &mut none), FlushAck::Drained);
+        // Time runs out exactly as the ring empties: not truncated.
+        let (left, _) = ring(3);
+        let checks = std::cell::Cell::new(0u32);
+        let outcome = drain_for_flush(
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                true
+            },
+        );
+        assert_eq!(outcome, FlushAck::Drained);
+    }
+
+    #[test]
+    fn drain_budget_fits_inside_the_flush_wait() {
+        assert!(FLUSH_DRAIN_BUDGET < crate::LSM_FLUSH_TIMEOUT);
     }
 
     #[test]
