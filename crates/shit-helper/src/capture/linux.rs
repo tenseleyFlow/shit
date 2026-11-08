@@ -935,7 +935,19 @@ impl LinuxCaptureRuntime {
             tracing::warn!(error = %e, "lsm send_response failed");
             ws.note_silent_send_failure();
         } else if evidence {
-            ws.acct.note_delete_captured((ev_dev_userspace, ev.inode));
+            // Bytes that hash the same as the pre-command snapshot are
+            // the pre-image whatever the command did to the file in
+            // between; otherwise they count only if it never wrote it.
+            let matches_snapshot = staging_fd.is_some()
+                && ws
+                    .pre_snapshots
+                    .get(&(ev_dev_userspace, ev.inode))
+                    .is_some_and(|snap| blake3_of(&snap.bytes) == blob_hash);
+            if matches_snapshot {
+                ws.acct.note_captured((ev_dev_userspace, ev.inode));
+            } else {
+                ws.acct.note_delete_captured((ev_dev_userspace, ev.inode));
+            }
         }
         if !evidence {
             ws.acct.note_missing(
@@ -3534,6 +3546,31 @@ mod born_set_tests {
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
         assert!(obs[0].1.contains("no pre-mutation snapshot"), "{obs:?}");
+    }
+
+    #[test]
+    fn unchanged_file_opened_for_write_then_deleted_is_not_loss() {
+        // `git branch -D`: a ref is opened for write, not changed, then
+        // removed. The unlink reader runs before the release reader, so
+        // the release finds no held fd to compare with. The unlink read
+        // the same bytes as the snapshot, so it holds the pre-image.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("ref"), b"sha\n").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("ref");
+        let id = Rig::id(&path);
+        // The open is deduped by an earlier capture in a real run; here
+        // the open is skipped and only the write intent is recorded.
+        let cmd = rig.cmd;
+        rig.rt()
+            .watches
+            .get_mut(&cmd)
+            .unwrap()
+            .acct
+            .note_written(id);
+        std::fs::remove_file(&path).unwrap();
+        rig.unlink(id, root, "ref");
+        rig.release(id);
+        assert_eq!(rig.close(None), vec![]);
     }
 
     #[test]
