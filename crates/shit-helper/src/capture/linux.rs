@@ -321,6 +321,7 @@ impl LinuxCaptureRuntime {
             return;
         };
         ws.acct.note_tree_dev(root.dev());
+        ws.acct.note_root(cwd);
         // The listing ran even if it fails, so a failure makes the walk
         // incomplete rather than absent.
         ws.acct.note_walked();
@@ -490,6 +491,7 @@ impl LinuxCaptureRuntime {
         };
         ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
         ws.acct.note_baseline_entry(root_dev_inode, cwd);
+        ws.acct.note_root(cwd);
         ws.acct.note_tree_dev(root_dev_inode.0);
         ws.acct.note_walked();
 

@@ -72,6 +72,9 @@ pub struct CloseAccounting {
     /// Filesystems the watched tree spans: the root's, plus any
     /// submount the walk skipped.
     tree_devs: BTreeSet<u64>,
+    /// The watch root. A loss whose path is known and not under it is
+    /// outside the tree.
+    root: Option<std::path::PathBuf>,
     /// The walk stopped at its file cap.
     capped: bool,
     /// Directories the walk recorded but did not list completely
@@ -130,6 +133,18 @@ impl CloseAccounting {
 
     pub fn note_walked(&mut self) {
         self.walked = true;
+    }
+
+    pub fn note_root(&mut self, root: &std::path::Path) {
+        self.root = Some(root.to_path_buf());
+    }
+
+    /// True when `path` is known and not under the watch root.
+    fn outside_root(&self, path: Option<&str>) -> bool {
+        match (path, self.root.as_deref()) {
+            (Some(p), Some(root)) => !std::path::Path::new(p).starts_with(root),
+            _ => false,
+        }
     }
 
     pub fn note_tree_dev(&mut self, dev: u64) {
@@ -342,6 +357,7 @@ impl CloseAccounting {
                 Provenance::Baseline => lost.push(obs),
                 Provenance::Born | Provenance::Outside => {}
                 Provenance::Unlocated if self.born_at(obs.path.as_deref(), order) => {}
+                Provenance::Unlocated if self.outside_root(obs.path.as_deref()) => {}
                 Provenance::Unlocated => unlocated += 1,
             }
         }
@@ -522,6 +538,29 @@ mod tests {
             a.close(0, None).is_empty(),
             "positive evidence still counts"
         );
+    }
+
+    #[test]
+    fn known_path_outside_the_watch_root_is_outside() {
+        let mut a = walked();
+        a.note_root(Path::new("/w"));
+        a.note_capped();
+        a.note_missing(
+            (1, 99),
+            false,
+            Some("/home/u/.bash_history".into()),
+            "no snapshot",
+        );
+        a.note_missing((1, 98), false, Some("/wx/f".into()), "no snapshot");
+        let obs = a.close(0, None);
+        assert!(obs.is_empty(), "{obs:?}");
+
+        let mut a = walked();
+        a.note_root(Path::new("/w"));
+        a.note_capped();
+        a.note_missing((1, 97), false, Some("/w/deep/f".into()), "no snapshot");
+        a.note_missing((1, 96), false, None, "no snapshot");
+        assert!(a.close(0, None)[0].detail.starts_with("2 changed file(s)"));
     }
 
     #[test]
