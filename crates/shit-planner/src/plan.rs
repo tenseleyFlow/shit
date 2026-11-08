@@ -1735,6 +1735,7 @@ fn native_delegation_for(
 /// (`(ts, id)`) that no earlier meta took. A zero inode (the shim's
 /// sentinel) never pairs: an `Unlink` with no exact pair carries no
 /// device and is refused at undo.
+#[cfg(test)]
 pub(crate) fn pair_device_nodes(
     events: &[&CaptureEvent],
 ) -> std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode> {
