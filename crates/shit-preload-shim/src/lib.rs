@@ -1170,9 +1170,9 @@ mod policy {
     }
 
     /// L5 — the target of a write-capable open, before resolution.
-    pub enum OpenTarget<'a> {
-        /// `open`, `open64`, `creat*`, `truncate`: a path as given.
-        Path(&'a str),
+    pub enum OpenTarget {
+        /// `open`, `open64`, `creat*`: a path as given.
+        Path(String),
         /// `openat`, `openat64`: a name relative to a dirfd.
         #[cfg(any(
             target_os = "freebsd",
@@ -1181,11 +1181,11 @@ mod policy {
             target_os = "dragonfly",
             target_os = "linux",
         ))]
-        At(libc::c_int, &'a str),
+        At(libc::c_int, String),
     }
 
     /// L5 — an open that may create its target, to settle after the call.
-    pub struct PendingCreate {
+    struct PendingCreate {
         path: String,
         /// Set when the shim could not show the path was absent before
         /// the call: then a successful open is a capture gap, not a
@@ -1203,6 +1203,13 @@ mod policy {
         flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_TRUNC) != 0
     }
 
+    /// True for opens the write-open policy looks at: they can write
+    /// bytes, or (review round 2, item 6: `O_RDONLY|O_CREAT`) create the
+    /// file.
+    fn open_may_mutate(flags: libc::c_int) -> bool {
+        is_write_open(flags) || flags & libc::O_CREAT != 0
+    }
+
     fn uncaptured(path: &str, reason: &str) -> shit_proto::ShimFailure {
         shit_proto::ShimFailure::PreImageUncaptured {
             path: path.to_string(),
@@ -1210,11 +1217,17 @@ mod policy {
         }
     }
 
+    /// The key a write-open's note uses. The open follows a final
+    /// symlink unless `O_NOFOLLOW` is set (#223, D-22), so the note and
+    /// pre-image name the target `echo > link` writes. With `O_NOFOLLOW`
+    /// the entry itself is kept.
     fn resolve_open_target(
-        target: OpenTarget<'_>,
+        target: OpenTarget,
+        nofollow: bool,
     ) -> Option<(String, Option<shit_proto::ShimFailure>)> {
         match target {
-            OpenTarget::Path(p) => Some(canonicalize_or_raw(p, "path")),
+            OpenTarget::Path(p) if nofollow => Some(entry_or_raw(&p, "path")),
+            OpenTarget::Path(p) => Some(canonicalize_or_raw(&p, "path")),
             #[cfg(any(
                 target_os = "freebsd",
                 target_os = "netbsd",
@@ -1222,41 +1235,94 @@ mod policy {
                 target_os = "dragonfly",
                 target_os = "linux",
             ))]
-            OpenTarget::At(dirfd, p) => match resolve_at_for_notify(dirfd, p, "path") {
-                AtResolution::Resolved(abs) => Some((abs, None)),
-                AtResolution::Failed(raw, f) => Some((raw, Some(f))),
-                AtResolution::Nothing => None,
-            },
+            OpenTarget::At(dirfd, p) => {
+                let r = if nofollow {
+                    resolve_entry_at(dirfd, &p, "path")
+                } else {
+                    resolve_at_for_notify(dirfd, &p, "path")
+                };
+                match r {
+                    AtResolution::Resolved(abs) => Some((abs, None)),
+                    AtResolution::Failed(raw, f) => Some((raw, Some(f))),
+                    AtResolution::Nothing => None,
+                }
+            }
         }
     }
 
     /// L5 — the one policy for write-capable opens (`open`, `openat`,
     /// `open64`, `openat64`, the fortify entries, `creat*`, macOS `open`
-    /// and `openat`), run before the call.
+    /// and `openat`). `call(flags)` makes the real call; `target` is only
+    /// built when the flags and the mute switch say there is work
+    /// (review round 5, item 7).
     ///
     /// An existing regular file is captured and sent with its bytes. One
     /// the shim cannot capture (over the inline cap, unreadable) is sent
     /// with a capture-gap marker and no bytes, so undo refuses it instead
-    /// of unlinking the user's file. A path that is absent before an
-    /// `O_CREAT` open comes back as a [`PendingCreate`]: the Create is
-    /// journaled by [`write_open_end`] only if the call succeeded.
-    pub fn write_open_begin(
+    /// of unlinking the user's file. A Create is sent only for a path
+    /// this call created. Review round 5, item 5: for a path absent
+    /// before an `O_CREAT` open without `O_EXCL`, the call is first made
+    /// with `O_EXCL`. If it succeeds this call created the file. If it
+    /// fails with EEXIST another process created the path in between; it
+    /// is handled as an existing file and the call is made again as
+    /// asked.
+    pub fn write_open(
         syscall: &'static str,
-        target: OpenTarget<'_>,
+        flags: libc::c_int,
+        target: impl FnOnce() -> OpenTarget,
+        call: impl Fn(libc::c_int) -> libc::c_int,
+    ) -> libc::c_int {
+        if !open_may_mutate(flags) || disabled() || IN_NOTIFY.with(|f| f.get()) {
+            return call(flags);
+        }
+        let Some(pending) = write_open_begin(syscall, target(), flags) else {
+            return call(flags);
+        };
+        if pending.gap.is_some() || flags & libc::O_EXCL != 0 {
+            let rc = call(flags);
+            write_open_end(Some(pending), rc);
+            return rc;
+        }
+        #[cfg(test)]
+        test_capture::run_before_create();
+        let rc = call(flags | libc::O_EXCL);
+        if rc >= 0 {
+            write_open_end(Some(pending), rc);
+            return rc;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+            return rc;
+        }
+        // Someone else's file now. Capture it as existing; if it is
+        // gone again its prior state is unknown, and a success is a gap.
+        let again =
+            write_open_begin(syscall, OpenTarget::Path(pending.path), flags).map(|mut p| {
+                p.gap
+                    .get_or_insert_with(|| uncaptured(&p.path, "prior state unknown"));
+                p
+            });
+        let rc = call(flags);
+        write_open_end(again, rc);
+        rc
+    }
+
+    /// Before a write-capable open: capture an existing file, or return
+    /// a [`PendingCreate`] for a path that may be created.
+    fn write_open_begin(
+        syscall: &'static str,
+        target: OpenTarget,
         flags: libc::c_int,
     ) -> Option<PendingCreate> {
-        // Review round 2, item 6: `O_RDONLY|O_CREAT` writes no bytes but can
-        // still create the file.
         let writes = is_write_open(flags);
         let creates = flags & libc::O_CREAT != 0;
-        if disabled() || !(writes || creates) || IN_NOTIFY.with(|f| f.get()) {
-            return None;
-        }
-        let (abs, failure) = resolve_open_target(target)?;
+        let nofollow = flags & libc::O_NOFOLLOW != 0;
+        let (abs, failure) = resolve_open_target(target, nofollow)?;
         if should_skip_path(&abs) {
             return None;
         }
         match (std::fs::symlink_metadata(&abs), std::fs::metadata(&abs)) {
+            // A symlink under O_NOFOLLOW: the open fails with ELOOP.
+            (Ok(l), _) if nofollow && l.file_type().is_symlink() => None,
             // Exists (or is a symlink to something that does).
             (Ok(_), Ok(m)) => {
                 if !writes || !m.is_file() {
@@ -1283,10 +1349,10 @@ mod policy {
         }
     }
 
-    /// L5 — after a write-capable open: a Create for a target that was
-    /// absent before and now exists because the call succeeded. Leaves
-    /// errno as the call set it.
-    pub fn write_open_end(pending: Option<PendingCreate>, rc: libc::c_int) {
+    /// After a write-capable open: a Create for a target that was absent
+    /// before and now exists because the call succeeded. Leaves errno as
+    /// the call set it.
+    fn write_open_end(pending: Option<PendingCreate>, rc: libc::c_int) {
         let Some(p) = pending else {
             return;
         };
@@ -1942,6 +2008,22 @@ mod policy {
                 }
             });
         }
+        thread_local! {
+            static BEFORE_CREATE: RefCell<Option<Box<dyn FnOnce()>>> =
+                const { RefCell::new(None) };
+        }
+        /// Run `f` once, the next time a write-open on this thread is
+        /// about to create a path it found absent: a racing creator.
+        /// (Its test uses the Linux raw-syscall fallback as the racer.)
+        #[cfg(target_os = "linux")]
+        pub fn before_create(f: impl FnOnce() + 'static) {
+            BEFORE_CREATE.with(|b| *b.borrow_mut() = Some(Box::new(f)));
+        }
+        pub(in crate::policy) fn run_before_create() {
+            if let Some(f) = BEFORE_CREATE.with(|b| b.borrow_mut().take()) {
+                f();
+            }
+        }
         /// Run `f` with capture on and return what it would have sent.
         pub fn capture(f: impl FnOnce()) -> Vec<shit_proto::ShimNotification> {
             NOTES.with(|n| *n.borrow_mut() = Some(Vec::new()));
@@ -2015,20 +2097,20 @@ mod interposers {
         // file is the canonical content-overwrite shape (e.g.
         // `install -m … src dst` where dst already exists). L5: one
         // policy for every write-capable open; see
-        // `policy::write_open_begin`.
-        let pending = policy::write_open_begin(
+        // `policy::write_open`.
+        policy::write_open(
             "open",
-            policy::OpenTarget::Path(&cstr_to_string(path)),
             flags,
-        );
-        let real = next::real_open();
-        let rc = if next::is_zero(next::as_usize(real)) {
-            unsafe { libc::open(path, flags, mode as c_uint) }
-        } else {
-            unsafe { real(path, flags, mode) }
-        };
-        policy::write_open_end(pending, rc);
-        rc
+            || policy::OpenTarget::Path(cstr_to_string(path)),
+            |f| {
+                let real = next::real_open();
+                if next::is_zero(next::as_usize(real)) {
+                    unsafe { libc::open(path, f, mode as c_uint) }
+                } else {
+                    unsafe { real(path, f, mode) }
+                }
+            },
+        )
     }
 
     /// `unlinkat(2)` interposer. W06.A.1 — modern FreeBSD `rm` /
@@ -2083,19 +2165,19 @@ mod interposers {
     ) -> c_int {
         // W06.A.4 / DR-CR-54.B / L5: same policy as `open`, with the
         // dirfd resolved to an absolute key up front.
-        let pending = policy::write_open_begin(
+        policy::write_open(
             "openat",
-            policy::OpenTarget::At(dirfd, &cstr_to_string(path)),
             flags,
-        );
-        let real = next::real_openat();
-        let rc = if next::is_zero(next::as_usize(real)) {
-            unsafe { libc::openat(dirfd, path, flags, mode as c_uint) }
-        } else {
-            unsafe { real(dirfd, path, flags, mode) }
-        };
-        policy::write_open_end(pending, rc);
-        rc
+            || policy::OpenTarget::At(dirfd, cstr_to_string(path)),
+            |f| {
+                let real = next::real_openat();
+                if next::is_zero(next::as_usize(real)) {
+                    unsafe { libc::openat(dirfd, path, f, mode as c_uint) }
+                } else {
+                    unsafe { real(dirfd, path, f, mode) }
+                }
+            },
+        )
     }
 
     /// `rename(2)` interposer. W06.A.1 — `install`'s atomic move

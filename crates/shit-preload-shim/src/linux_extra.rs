@@ -11,7 +11,7 @@
 //! of its stash were unjournaled.
 //!
 //! The open family uses the same policy as `open`/`openat`
-//! ([`policy::write_open_begin`]): a Create only for a path that was
+//! ([`policy::write_open`]): a Create only for a path that was
 //! absent before a call that succeeded, the bytes of an existing file,
 //! or a capture-gap marker when they could not be read. `mkdir`/`mkdirat`
 //! resolve their target before the syscall and notify only after it
@@ -24,9 +24,15 @@ use std::sync::OnceLock;
 
 /// The next definition of `$name`, typed `$ty`, or `None`.
 macro_rules! real {
-    ($name:literal, $ty:ty) => {{
+    (@ident $name:ident, $ty:ty) => {
+        real!(@sym concat!(stringify!($name), "\0"), $ty)
+    };
+    ($name:literal, $ty:ty) => {
+        real!(@sym concat!($name, "\0"), $ty)
+    };
+    (@sym $sym:expr, $ty:ty) => {{
         static SYM: OnceLock<usize> = OnceLock::new();
-        match next::lookup(&SYM, concat!($name, "\0").as_bytes()) {
+        match next::lookup(&SYM, $sym.as_bytes()) {
             0 => None,
             // SAFETY: dlsym returned the next definition of this libc
             // symbol, whose C signature is `$ty`.
@@ -69,28 +75,30 @@ mod sys {
     }
 }
 
-/// Run a path open under the shared write-open policy.
-fn path_open(path: *const c_char, flags: c_int, call: impl FnOnce() -> c_int) -> c_int {
-    let pending = policy::write_open_begin(
+/// Run a path open under the shared write-open policy. `call` gets the
+/// flags to use (the policy may add `O_EXCL`; see [`policy::write_open`]).
+fn path_open(path: *const c_char, flags: c_int, call: impl Fn(c_int) -> c_int) -> c_int {
+    policy::write_open(
         "open",
-        policy::OpenTarget::Path(&cstr_to_string(path)),
         flags,
-    );
-    let rc = call();
-    policy::write_open_end(pending, rc);
-    rc
+        || policy::OpenTarget::Path(cstr_to_string(path)),
+        call,
+    )
 }
 
 /// Run a dirfd-relative open under the shared write-open policy.
-fn at_open(dirfd: c_int, path: *const c_char, flags: c_int, call: impl FnOnce() -> c_int) -> c_int {
-    let pending = policy::write_open_begin(
+fn at_open(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    call: impl Fn(c_int) -> c_int,
+) -> c_int {
+    policy::write_open(
         "openat",
-        policy::OpenTarget::At(dirfd, &cstr_to_string(path)),
         flags,
-    );
-    let rc = call();
-    policy::write_open_end(pending, rc);
-    rc
+        || policy::OpenTarget::At(dirfd, cstr_to_string(path)),
+        call,
+    )
 }
 
 /// `open64(2)`.
@@ -99,9 +107,9 @@ fn at_open(dirfd: c_int, path: *const c_char, flags: c_int, call: impl FnOnce() 
 /// libc `open64` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
-    path_open(path, flags, || match real!("open64", OpenFn) {
-        Some(f) => unsafe { f(path, flags, mode) },
-        None => sys::openat(libc::AT_FDCWD, path, flags, mode),
+    path_open(path, flags, |f| match real!("open64", OpenFn) {
+        Some(open) => unsafe { open(path, f, mode) },
+        None => sys::openat(libc::AT_FDCWD, path, f, mode),
     })
 }
 
@@ -116,101 +124,74 @@ pub unsafe extern "C" fn openat64(
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
-    at_open(dirfd, path, flags, || match real!("openat64", OpenAtFn) {
-        Some(f) => unsafe { f(dirfd, path, flags, mode) },
-        None => sys::openat(dirfd, path, flags, mode),
+    at_open(dirfd, path, flags, |f| match real!("openat64", OpenAtFn) {
+        Some(open) => unsafe { open(dirfd, path, f, mode) },
+        None => sys::openat(dirfd, path, f, mode),
     })
 }
 
-/// glibc's `_FORTIFY_SOURCE` entry for a two-argument `open`.
-///
-/// # Safety
-/// glibc `__open_2` contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
-    path_open(path, flags, || match real!("__open_2", Open2Fn) {
-        Some(f) => unsafe { f(path, flags) },
-        None => sys::openat(libc::AT_FDCWD, path, flags, 0),
-    })
-}
-
-/// glibc's `_FORTIFY_SOURCE` entry for a two-argument `open64`.
-///
-/// # Safety
-/// glibc `__open64_2` contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __open64_2(path: *const c_char, flags: c_int) -> c_int {
-    path_open(path, flags, || match real!("__open64_2", Open2Fn) {
-        Some(f) => unsafe { f(path, flags) },
-        None => sys::openat(libc::AT_FDCWD, path, flags, 0),
-    })
-}
-
-/// glibc's `_FORTIFY_SOURCE` entry for a two-argument `openat`.
-///
-/// # Safety
-/// glibc `__openat_2` contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
-    at_open(dirfd, path, flags, || {
-        match real!("__openat_2", OpenAt2Fn) {
-            Some(f) => unsafe { f(dirfd, path, flags) },
-            None => sys::openat(dirfd, path, flags, 0),
+/// glibc's `_FORTIFY_SOURCE` entries for a two-argument open. glibc
+/// aborts in these on `O_CREAT`, so the policy never adds `O_EXCL` here;
+/// any other flags go to the raw syscall.
+macro_rules! fortify_open {
+    ($name:ident) => {
+        #[doc = concat!("glibc's `", stringify!($name), "`.")]
+        ///
+        /// # Safety
+        /// The glibc contract of the same name.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(path: *const c_char, flags: c_int) -> c_int {
+            path_open(path, flags, |f| match real!(@ident $name, Open2Fn) {
+                Some(open) if f == flags => unsafe { open(path, f) },
+                _ => sys::openat(libc::AT_FDCWD, path, f, 0),
+            })
         }
-    })
+    };
+    ($name:ident, at) => {
+        #[doc = concat!("glibc's `", stringify!($name), "`.")]
+        ///
+        /// # Safety
+        /// The glibc contract of the same name.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+            at_open(dirfd, path, flags, |f| {
+                match real!(@ident $name, OpenAt2Fn) {
+                    Some(open) if f == flags => unsafe { open(dirfd, path, f) },
+                    _ => sys::openat(dirfd, path, f, 0),
+                }
+            })
+        }
+    };
 }
 
-/// glibc's `_FORTIFY_SOURCE` entry for a two-argument `openat64`.
-///
-/// # Safety
-/// glibc `__openat64_2` contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __openat64_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
-    at_open(dirfd, path, flags, || {
-        match real!("__openat64_2", OpenAt2Fn) {
-            Some(f) => unsafe { f(dirfd, path, flags) },
-            None => sys::openat(dirfd, path, flags, 0),
+fortify_open!(__open_2);
+fortify_open!(__open64_2);
+fortify_open!(__openat_2, at);
+fortify_open!(__openat64_2, at);
+
+/// `creat(2)` and `creat64(2)`, which are `open(path,
+/// O_CREAT|O_WRONLY|O_TRUNC, mode)`. When the policy adds `O_EXCL` the
+/// call is made as that open.
+macro_rules! creat_open {
+    ($name:ident) => {
+        #[doc = concat!("`", stringify!($name), "(2)`.")]
+        ///
+        /// # Safety
+        /// The libc contract of the same name.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(path: *const c_char, mode: mode_t) -> c_int {
+            const FLAGS: c_int = O_CREAT | O_WRONLY | O_TRUNC;
+            path_open(path, FLAGS, |f| match real!(@ident $name, CreatFn) {
+                Some(creat) if f == FLAGS => unsafe { creat(path, mode) },
+                _ => sys::openat(libc::AT_FDCWD, path, f, mode as c_uint),
+            })
         }
-    })
+    };
 }
 
-/// `creat(2)`, which is `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`.
-///
-/// # Safety
-/// libc `creat` contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn creat(path: *const c_char, mode: mode_t) -> c_int {
-    path_open(path, O_CREAT | O_WRONLY | O_TRUNC, || {
-        match real!("creat", CreatFn) {
-            Some(f) => unsafe { f(path, mode) },
-            None => sys::openat(
-                libc::AT_FDCWD,
-                path,
-                O_CREAT | O_WRONLY | O_TRUNC,
-                mode as c_uint,
-            ),
-        }
-    })
-}
+creat_open!(creat);
+creat_open!(creat64);
 
-/// `creat64(2)`.
-///
-/// # Safety
-/// libc `creat64` contract.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
-    path_open(path, O_CREAT | O_WRONLY | O_TRUNC, || {
-        match real!("creat64", CreatFn) {
-            Some(f) => unsafe { f(path, mode) },
-            None => sys::openat(
-                libc::AT_FDCWD,
-                path,
-                O_CREAT | O_WRONLY | O_TRUNC,
-                mode as c_uint,
-            ),
-        }
-    })
-}
 /// `mkdir(2)`: resolve first, notify after success only.
 ///
 /// # Safety
@@ -547,5 +528,92 @@ mod tests {
         });
         assert_eq!(notes.len(), 1, "{notes:#?}");
         assert_eq!(notes[0].pre_image.as_ref().unwrap().bytes, b"old");
+    }
+
+    /// Review round 5, item 5: another process creates the path between
+    /// the shim's lstat and the open. This call did not create it: no
+    /// Create (undo would unlink the other process's file); its bytes are
+    /// captured as an existing file's.
+    #[test]
+    fn racing_creator_is_not_journaled_as_this_calls_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let p = dir.join("raced");
+        let cp = c(&p);
+        let theirs = cp.clone();
+        let notes = test_capture::capture(|| {
+            // The other process: the raw syscall, which the shim does
+            // not see.
+            test_capture::before_create(move || {
+                let fd = sys::openat(libc::AT_FDCWD, theirs.as_ptr(), O_WRONLY | O_CREAT, 0o644);
+                assert!(fd >= 0);
+                assert_eq!(unsafe { libc::write(fd, b"theirs".as_ptr().cast(), 6) }, 6);
+                unsafe { libc::close(fd) };
+            });
+            let fd = unsafe { open64(cp.as_ptr(), O_WRONLY | O_CREAT, 0o644) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        assert!(
+            notes.iter().all(|n| n.syscall != "open_create"),
+            "{notes:#?}"
+        );
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].pre_image.as_ref().unwrap().bytes, b"theirs");
+    }
+
+    /// The `O_EXCL` first attempt is invisible to a caller that creates
+    /// the file, and creat's own flags still apply.
+    #[test]
+    fn creat_of_a_new_path_is_one_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let p = c(&dir.join("n"));
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { creat(p.as_ptr(), 0o600) };
+            assert!(fd >= 0);
+            assert_eq!(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) }, 1);
+            unsafe { libc::close(fd) };
+        });
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].syscall, "open_create");
+        assert_eq!(std::fs::read(dir.join("n")).unwrap(), b"x");
+    }
+
+    /// #223 / D-22: a write-open follows the final symlink, so the note
+    /// and its pre-image name the target `echo > link` writes.
+    #[test]
+    fn write_open_through_a_symlink_captures_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("target"), b"old").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let p = c(&dir.join("link"));
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(p.as_ptr(), O_WRONLY | O_TRUNC, 0) };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        let pre = notes[0].pre_image.as_ref().expect("pre-image");
+        assert_eq!(pre.path, dir.join("target").to_str().unwrap());
+        assert_eq!(pre.bytes, b"old");
+    }
+
+    /// With `O_NOFOLLOW` the open of a symlink fails (ELOOP) and writes
+    /// nothing: no note, and the target's bytes are not claimed.
+    #[test]
+    fn nofollow_write_open_of_a_symlink_sends_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("target"), b"old").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let p = c(&dir.join("link"));
+        let notes = test_capture::capture(|| {
+            let fd = unsafe { open64(p.as_ptr(), O_WRONLY | O_TRUNC | libc::O_NOFOLLOW, 0) };
+            assert_eq!(fd, -1);
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+        assert_eq!(std::fs::read(dir.join("target")).unwrap(), b"old");
     }
 }

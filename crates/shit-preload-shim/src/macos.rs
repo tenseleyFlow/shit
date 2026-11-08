@@ -344,14 +344,12 @@ mod addr {
 unsafe extern "C" fn rust_shim_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     // L5: the shared write-open policy (Create only for a path absent
     // before a successful call; a gap marker for an uncapturable file).
-    let pending = policy::write_open_begin(
+    policy::write_open(
         "open",
-        policy::OpenTarget::Path(&cstr_to_string(path)),
         flags,
-    );
-    let rc = unsafe { libc::open(path, flags, mode as c_int) };
-    policy::write_open_end(pending, rc);
-    rc
+        || policy::OpenTarget::Path(cstr_to_string(path)),
+        |f| unsafe { libc::open(path, f, mode as c_int) },
+    )
 }
 
 /// Rust target of the C trampoline for `openat(2)`.
@@ -366,18 +364,19 @@ unsafe extern "C" fn rust_shim_openat(
     mode: c_uint,
 ) -> c_int {
     // L5: keyed to the dirfd, then the shared write-open policy.
-    let pending = match join_dirfd(dirfd, &cstr_to_string(path)) {
-        Ok(p) => policy::write_open_begin("openat", policy::OpenTarget::Path(&p), flags),
+    // (#231 tracks routing this through the dirfd target the other
+    // platforms use.)
+    let call = |f| unsafe { libc::openat(dirfd, path, f, mode as c_int) };
+    if !(policy::is_write_open(flags) || flags & libc::O_CREAT != 0) || policy::disabled() {
+        return call(flags);
+    }
+    match join_dirfd(dirfd, &cstr_to_string(path)) {
+        Ok(p) => policy::write_open("openat", flags, || policy::OpenTarget::Path(p), call),
         Err((raw, failure)) => {
-            if policy::is_write_open(flags) || flags & libc::O_CREAT != 0 {
-                policy::notify_unresolved("openat", &raw, failure);
-            }
-            None
+            policy::notify_unresolved("openat", &raw, failure);
+            call(flags)
         }
-    };
-    let rc = unsafe { libc::openat(dirfd, path, flags, mode as c_int) };
-    policy::write_open_end(pending, rc);
-    rc
+    }
 }
 
 /// Replacement for `mkdir(2)`. Captures directory-create
