@@ -89,8 +89,14 @@ pub struct CloseAccounting {
     /// Identities this command opened for write, wrote, or changed the
     /// attributes of.
     written: BTreeSet<Id>,
-    lost: BTreeMap<Id, Observation>,
-    unlocated: BTreeSet<Id>,
+    /// Mutations whose evidence was not captured, keyed by identity:
+    /// the first observation, and whether any event placed the identity
+    /// in a parent the walk listed completely. Classified at close.
+    missing: BTreeMap<Id, (Observation, bool)>,
+    /// Renames dropped because a source or destination parent could not
+    /// be resolved. Each could have moved a pre-existing file into a
+    /// walked directory, so absence from a listing stops proving birth.
+    renames_unresolved: u32,
     /// Losses with no identity (an fstat that failed).
     unkeyed: Vec<String>,
     /// `(label, value)` of a tier-wide loss counter when the watch began.
@@ -169,21 +175,34 @@ impl CloseAccounting {
         self.kernel_mark = Some((label, value));
     }
 
-    /// Classify `id`. `parent_walked` is the caller's proof that the
-    /// entry's parent directory was listed completely by the walk, or
-    /// was itself created inside the command; an identity absent from
-    /// such a directory's listing was born. Baseline wins over born, so
-    /// a reused inode number never hides the loss of the file that
-    /// first had it.
-    pub fn classify(&mut self, id: Id, parent_walked: bool) -> Provenance {
+    /// A rename was dropped because a parent could not be resolved.
+    pub fn note_unresolved_rename(&mut self) {
+        self.renames_unresolved = self.renames_unresolved.saturating_add(1);
+    }
+
+    /// Absence from a walked parent's listing proves birth only when the
+    /// whole walk completed and no rename went unresolved: otherwise a
+    /// pre-existing file can arrive in a walked directory from a part of
+    /// the tree, or a place outside it, that the walk never listed.
+    fn absence_proves_birth(&self) -> bool {
+        self.listing_complete() && self.renames_unresolved == 0
+    }
+
+    /// Classify `id` at close. `absent_from_walked_parent` means some
+    /// event placed `id` in a directory the walk listed completely (or
+    /// one created in the command) and the listing did not contain it.
+    /// Positive evidence of creation (FMODE_CREATED, a create stat) is
+    /// in `born`; absence counts only under [`Self::absence_proves_birth`].
+    /// Baseline wins over born, so a reused inode number never hides the
+    /// loss of the file that first had it.
+    pub fn classify(&self, id: Id, absent_from_walked_parent: bool) -> Provenance {
         if self.baseline.contains(&id) {
             return Provenance::Baseline;
         }
         if self.born.contains(&id) {
             return Provenance::Born;
         }
-        if parent_walked && id != (0, 0) {
-            self.born.insert(id);
+        if absent_from_walked_parent && id != (0, 0) && self.absence_proves_birth() {
             return Provenance::Born;
         }
         if id != (0, 0) && !self.tree_devs.is_empty() && !self.tree_devs.contains(&id.0) {
@@ -193,7 +212,8 @@ impl CloseAccounting {
     }
 
     /// Record that a mutation of `id` reached the producer and its
-    /// evidence could not be captured. Born identities are exempt.
+    /// evidence could not be captured. Whether that is loss is decided
+    /// at close, once every event for the command has been seen.
     pub fn note_missing(
         &mut self,
         id: Id,
@@ -201,18 +221,16 @@ impl CloseAccounting {
         path: Option<String>,
         detail: impl Into<String>,
     ) {
-        match self.classify(id, parent_walked) {
-            Provenance::Born | Provenance::Outside => {}
-            Provenance::Baseline => {
-                self.lost.entry(id).or_insert(Observation {
+        self.missing
+            .entry(id)
+            .and_modify(|(_, absent)| *absent |= parent_walked)
+            .or_insert((
+                Observation {
                     path,
                     detail: detail.into(),
-                });
-            }
-            Provenance::Unlocated => {
-                self.unlocated.insert(id);
-            }
-        }
+                },
+                parent_walked,
+            ));
     }
 
     /// A loss with no identity to classify.
@@ -239,6 +257,12 @@ impl CloseAccounting {
                 }
             ));
         }
+        if self.renames_unresolved > 0 {
+            parts.push(format!(
+                "{} rename(s) had a source or destination outside the walked tree",
+                self.renames_unresolved
+            ));
+        }
         (!parts.is_empty()).then(|| parts.join("; "))
     }
 
@@ -250,11 +274,18 @@ impl CloseAccounting {
     pub fn close(mut self, send_failures: u32, kernel_now: Option<u64>) -> Vec<Observation> {
         let mut out = Vec::new();
         let reason = self.incomplete_reason();
-        let mut lost: Vec<Observation> = std::mem::take(&mut self.lost)
-            .into_iter()
-            .filter(|(id, _)| !self.has_evidence(id))
-            .map(|(_, obs)| obs)
-            .collect();
+        let mut lost = Vec::new();
+        let mut unlocated = 0usize;
+        for (id, (obs, absent)) in std::mem::take(&mut self.missing) {
+            if self.has_evidence(&id) {
+                continue;
+            }
+            match self.classify(id, absent) {
+                Provenance::Baseline => lost.push(obs),
+                Provenance::Born | Provenance::Outside => {}
+                Provenance::Unlocated => unlocated += 1,
+            }
+        }
         let hidden = lost.len().saturating_sub(MAX_PATH_OBSERVATIONS);
         lost.truncate(MAX_PATH_OBSERVATIONS);
         out.extend(lost);
@@ -266,11 +297,6 @@ impl CloseAccounting {
                 ),
             });
         }
-        let unlocated = self
-            .unlocated
-            .iter()
-            .filter(|id| !self.born.contains(id) && !self.has_evidence(id))
-            .count();
         if unlocated > 0
             && let Some(reason) = reason
         {
@@ -421,12 +447,39 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_rename_stops_absence_proving_birth() {
+        let mut a = walked();
+        a.note_unresolved_rename();
+        a.note_missing((1, 21), true, None, "unlink race lost");
+        let obs = a.close(0, None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].detail.contains("rename"), "{obs:?}");
+
+        let mut a = walked();
+        a.note_unresolved_rename();
+        a.note_born((1, 21));
+        a.note_missing((1, 21), true, None, "unlink race lost");
+        assert!(
+            a.close(0, None).is_empty(),
+            "positive evidence still counts"
+        );
+    }
+
+    #[test]
+    fn incomplete_walk_stops_absence_proving_birth() {
+        let mut a = walked();
+        a.note_unwalked_dir((1, 2));
+        a.note_missing((1, 21), true, None, "unlink race lost");
+        assert_eq!(a.close(0, None).len(), 1);
+    }
+
+    #[test]
     fn unwalked_parent_does_not_prove_birth() {
         let mut a = walked();
         a.note_unwalked_dir((1, 2));
         assert!(!a.dir_walked((1, 2)));
         assert!(a.dir_walked((1, 3)));
-        let mut b = CloseAccounting::default();
+        let b = CloseAccounting::default();
         assert!(!b.dir_walked((1, 3)), "no walk proves nothing");
         assert_eq!(b.classify((1, 9), false), Provenance::Unlocated);
     }
@@ -493,7 +546,7 @@ mod tests {
 
     #[test]
     fn unknown_identity_marker_is_never_born() {
-        let mut a = walked();
+        let a = walked();
         assert_eq!(a.classify((0, 0), true), Provenance::Unlocated);
     }
 }

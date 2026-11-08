@@ -1875,7 +1875,9 @@ impl LinuxCaptureRuntime {
                 "lsm rename: old_parent_inode not in dir_paths; dropping event"
             );
             // R3 slice B — the event is dropped, so a pre-existing
-            // destination it replaced has no pre-image either.
+            // destination it replaced has no pre-image either, and the
+            // moved entry may be a pre-existing file the walk never saw.
+            ws.acct.note_unresolved_rename();
             if let Some(to) = to_resolved.as_deref() {
                 note_replaced_without_capture(ws, Path::new(to), moved);
             }
@@ -1888,6 +1890,7 @@ impl LinuxCaptureRuntime {
                 basename = ev.new_basename,
                 "lsm rename: new_parent_inode not in dir_paths; dropping event"
             );
+            ws.acct.note_unresolved_rename();
             ws.acct.note_missing(
                 moved,
                 false,
@@ -3590,6 +3593,60 @@ mod born_set_tests {
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
         assert!(obs[0].1.contains("not listed completely"), "{obs:?}");
+    }
+
+    /// A tree with a directory past the depth limit, plus `deep/x` inside
+    /// it. Returns the rig and the unwalked directory.
+    fn rig_with_unwalked_file() -> (Rig, PathBuf) {
+        let rig = Rig::new(|d| {
+            let mut p = d.to_path_buf();
+            for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+                p = p.join(format!("d{i}"));
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("x"), b"pre-existing, never walked").unwrap();
+        });
+        let mut deep = rig.dir.path().to_path_buf();
+        for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+            deep = deep.join(format!("d{i}"));
+        }
+        (rig, deep)
+    }
+
+    #[test]
+    fn file_moved_from_an_unwalked_directory_then_removed_is_not_born() {
+        // `mv deep/x x; rm x`: x existed, but the walk never reached it.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        std::fs::rename(deep.join("x"), rig.dir.path().join("x")).unwrap();
+        rig.rename(id, (deep_id, "x"), (root, "x"));
+        std::fs::remove_file(rig.dir.path().join("x")).unwrap();
+        rig.unlink(id, root, "x");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("could not be placed"), "{obs:?}");
+    }
+
+    #[test]
+    fn file_moved_in_by_an_unresolved_rename_then_removed_is_not_born() {
+        // Complete walk, but the rename's source is outside the tree, so
+        // absence from the walked root proves nothing.
+        let mut rig = Rig::new(|_| {});
+        let root = rig.root();
+        let outside = tempfile::tempdir_in(rig.dir.path().parent().unwrap()).unwrap();
+        let src = outside.path().join("x");
+        std::fs::write(&src, b"from elsewhere").unwrap();
+        let id = Rig::id(&src);
+        let src_parent = Rig::id(outside.path());
+        std::fs::rename(&src, rig.dir.path().join("x")).unwrap();
+        rig.rename(id, (src_parent, "x"), (root, "x"));
+        std::fs::remove_file(rig.dir.path().join("x")).unwrap();
+        rig.unlink(id, root, "x");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("rename"), "{obs:?}");
     }
 
     #[test]
