@@ -197,7 +197,19 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
 unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
     // L5: `shutil.rmtree` passes names relative to a real dirfd. Keyed
     // against the cwd they named the wrong files.
-    match join_dirfd(dirfd, &cstr_to_string(pathname)) {
+    let joined = join_dirfd(dirfd, &cstr_to_string(pathname));
+    // Review round 2, item 2: a directory removal is reported after it
+    // succeeded, with the stat from before, like rmdir.
+    if flags & libc::AT_REMOVEDIR != 0 {
+        let pending = match joined {
+            Ok(p) => policy::removal_begin("unlinkat", &p),
+            Err((raw, failure)) => policy::removal_pending("unlinkat", raw, Some(failure)),
+        };
+        let rc = unsafe { libc::unlinkat(dirfd, pathname, flags) };
+        policy::removal_end(pending, rc);
+        return rc;
+    }
+    match joined {
         Ok(p) => policy::notify_pre_mutation_with_content("unlinkat", &p),
         Err((raw, failure)) => policy::notify_unresolved("unlinkat", &raw, failure),
     }
@@ -1650,6 +1662,21 @@ mod rename_wire_tests {
         let want = dir.join("f");
         assert_eq!(n.arg, want.to_str().unwrap());
         assert_eq!(n.pre_image.as_ref().unwrap().bytes, b"bytes");
+    }
+
+    #[test]
+    fn unlinkat_removedir_of_a_non_empty_dir_sends_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("full")).unwrap();
+        std::fs::write(dir.join("full/f"), b"f").unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("full").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let rc = unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            assert_eq!(rc, -1);
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
     }
 
     #[test]

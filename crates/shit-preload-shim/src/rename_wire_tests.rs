@@ -66,3 +66,44 @@ fn rename_with_absolute_paths_over_existing_file_keeps_from_and_to() {
     assert_eq!(n.arg, format!("{}\t{}", a.display(), b.display()));
     assert_eq!(n.pre_image.as_ref().unwrap().path, b.to_str().unwrap());
 }
+
+/// Review round 2, item 2: `unlinkat(dirfd, name, AT_REMOVEDIR)` is a
+/// removal like `rmdir`: reported after it succeeds, with the pre-call
+/// stat, and not at all when it fails.
+#[test]
+fn unlinkat_removedir_of_a_non_empty_dir_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(dir.join("full")).unwrap();
+    std::fs::write(dir.join("full/f"), b"f").unwrap();
+    let dfd = std::fs::File::open(&dir).unwrap();
+    let name = CString::new("full").unwrap();
+    let notes = test_capture::capture(|| {
+        let rc = unsafe {
+            super::interposers::unlinkat(dfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+        };
+        assert_eq!(rc, -1);
+    });
+    assert!(notes.is_empty(), "{notes:#?}");
+}
+
+#[test]
+fn unlinkat_removedir_reports_after_success_with_the_pre_call_stat() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(dir.join("e")).unwrap();
+    std::fs::set_permissions(dir.join("e"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    let dfd = std::fs::File::open(&dir).unwrap();
+    let name = CString::new("e").unwrap();
+    let notes = test_capture::capture(|| {
+        let rc = unsafe {
+            super::interposers::unlinkat(dfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+        };
+        assert_eq!(rc, 0);
+    });
+    assert_eq!(notes.len(), 1, "{notes:#?}");
+    assert_eq!(notes[0].syscall, "unlinkat");
+    assert_eq!(notes[0].arg, dir.join("e").to_str().unwrap());
+    assert_eq!(notes[0].pre_stat.map(|s| s.mode), Some(0o040750));
+}
