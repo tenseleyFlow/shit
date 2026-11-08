@@ -451,21 +451,25 @@ pub struct LinuxCaptureSink {
 
 #[cfg(target_os = "linux")]
 impl LinuxCaptureSink {
-    /// Returns true if the event's process should be filtered out
-    /// before tree lookup. Matched on the tgid: `hdr.pid` is the
+    /// Returns true if the event comes from an excluded process or
+    /// from anything it spawned. Matched on the tgid (`hdr.pid` is the
     /// thread id, so a worker thread of the helper or daemon would
-    /// otherwise pass, and its parent (the shell that started shitd)
+    /// otherwise pass) and on every recorded ancestor: a `dpkg-query`
+    /// or `systemctl` the helper or daemon runs has them in its
+    /// ancestry, and above them the shell that started shitd, which
     /// can be a tracked root.
     fn is_excluded(&self, hdr: &EventHeader) -> bool {
-        excluded_by_tgid(&self.excluded_pids, hdr)
+        excluded_by_lineage(&self.excluded_pids, hdr)
     }
 }
 
-/// True when the event's process (its tgid, not its thread id) is in
-/// `excluded`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn excluded_by_tgid(excluded: &[u32], hdr: &EventHeader) -> bool {
-    excluded.contains(&hdr.tgid)
+/// True when the event's process (its tgid, not its thread id) or any
+/// recorded ancestor is in `excluded`. Ancestry ends at the first 0.
+fn excluded_by_lineage(excluded: &[u32], hdr: &EventHeader) -> bool {
+    std::iter::once(hdr.tgid)
+        .chain(hdr.ancestry().into_iter().map(|a| a as u32))
+        .take_while(|&p| p != 0)
+        .any(|p| excluded.contains(&p))
 }
 
 /// Start-up tap for the `FMODE_CREATED` probe. While active, open events
@@ -517,7 +521,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm unlink event");
             return;
@@ -548,7 +552,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm rmdir event");
             return;
@@ -577,7 +581,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm release event");
             return;
@@ -602,7 +606,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm setattr event");
             return;
@@ -634,7 +638,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm mkdir event");
             return;
@@ -660,7 +664,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm create event");
             return;
@@ -687,7 +691,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm open event");
             return;
@@ -712,7 +716,7 @@ impl LsmEventSink for LinuxCaptureSink {
             .tree
             .lock()
             .unwrap()
-            .is_tracked_with_ancestry(pid, &ev.hdr.ancestry())
+            .is_tracked_with_ancestry(ev.hdr.tgid as i32, &ev.hdr.ancestry())
         else {
             tracing::trace!(pid, "untracked pid; dropping lsm rename event");
             return;
@@ -1825,8 +1829,41 @@ mod tests {
             tgid: 500,
             ..EventHeader::default()
         };
-        assert!(excluded_by_tgid(&[500], &worker));
-        assert!(!excluded_by_tgid(&[501], &worker));
+        assert!(excluded_by_lineage(&[500], &worker));
+        assert!(!excluded_by_lineage(&[501], &worker));
+    }
+
+    #[test]
+    fn exclusion_covers_processes_the_helper_or_daemon_spawned() {
+        // dpkg-query (700) run by the helper (500), under shitd (400),
+        // under the shell that started it (300), which is the tracked
+        // root. The tgid is not excluded; its ancestry is.
+        let mut ancestors = [0u32; ANCESTRY_DEPTH];
+        ancestors[..2].copy_from_slice(&[400, 300]);
+        let child = EventHeader {
+            pid: 700,
+            tgid: 700,
+            parent_pid: 500,
+            ancestors,
+            ..EventHeader::default()
+        };
+        assert!(excluded_by_lineage(&[500], &child));
+        assert!(excluded_by_lineage(&[400], &child));
+        assert!(!excluded_by_lineage(&[301], &child));
+    }
+
+    #[test]
+    fn exclusion_ignores_slots_past_the_first_zero() {
+        let mut ancestors = [0u32; ANCESTRY_DEPTH];
+        ancestors[2] = 500;
+        let ev = EventHeader {
+            pid: 700,
+            tgid: 700,
+            parent_pid: 600,
+            ancestors,
+            ..EventHeader::default()
+        };
+        assert!(!excluded_by_lineage(&[500], &ev));
     }
 
     #[test]

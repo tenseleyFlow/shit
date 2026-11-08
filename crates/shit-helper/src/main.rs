@@ -1524,7 +1524,9 @@ fn boot_ebpf_lsm(
         None
     };
 
-    let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
+    let mut tree_map = fanotify::tree::TreeMap::new();
+    tree_map.set_excluded(excluded_pids.iter().map(|&p| p as i32).collect());
+    let tree = Arc::new(std::sync::Mutex::new(tree_map));
 
     let sink: Arc<dyn ebpf::LsmEventSink> = match runtime.clone() {
         Some(rt) => Arc::new(ebpf::ringbuf_reader::LinuxCaptureSink {
