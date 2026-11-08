@@ -191,7 +191,9 @@ if [ "${PIP_RC}" -ne 0 ]; then
     smoke_fail "pip install --force-reinstall (v2) exited rc=${PIP_RC}"
 fi
 
-V2_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
+# No bytecode writes from the check itself: they are outside the
+# command and would sit in ~/.local beside what undo restores.
+V2_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
 if [ "${V2_OUTPUT}" != "hello pip v2" ]; then
     smoke_log "pip-v2.log (last 50 lines):"
     tail -50 "${SHIT_SMOKE_TMP}/pip-v2.log" | sed 's/^/    /' >&2
@@ -241,12 +243,14 @@ if [ ! -f "${INSTALLED_MOD}" ]; then
     smoke_fail "${INSTALLED_MOD} missing post-undo — undo unlinked instead of restoring"
 fi
 
-POST_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
+# Snapshot before running the script: running it could write
+# __pycache__ entries undo never saw.
+tree_snapshot > "${SHIT_SMOKE_TMP}/tree-after.txt"
+POST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
 POST_SHA="$(sha256_of "${INSTALLED_MOD}")"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 
-tree_snapshot > "${SHIT_SMOKE_TMP}/tree-after.txt"
 TREE_SAME=1
 if ! diff "${SHIT_SMOKE_TMP}/tree-before.txt" "${SHIT_SMOKE_TMP}/tree-after.txt" > "${SHIT_SMOKE_TMP}/tree.diff"; then
     TREE_SAME=0
