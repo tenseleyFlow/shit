@@ -2077,6 +2077,22 @@ fn emit_for_tree_op(
         }
         // Consumed by the path's Unlink above; no inverse of its own.
         TreeOp::DeviceNodeMeta { .. } => {}
+        // L4b - the shim could not read the removed link's target (an
+        // empty target cannot exist): refuse rather than guess.
+        TreeOp::SymlinkRemoved { target, path } if target.is_empty() => {
+            nodes.push(PlanNode {
+                op: InverseOp::Refuse {
+                    class: "symlink-target-unknown".to_string(),
+                    reason: format!(
+                        "{} was a symlink whose target was not captured, so it is not recreated",
+                        path.display()
+                    ),
+                    remediation: None,
+                },
+                cohort: 0,
+                conflict: None,
+            });
+        }
         TreeOp::SymlinkRemoved { target, path } => {
             // W09.16.1 — the OLD symlink at `path` was removed
             // (by `ln -sf` or `rm + ln -s`); recreate it. The

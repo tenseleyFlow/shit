@@ -1777,6 +1777,27 @@ fn device_made_and_removed_in_the_command_is_scratch() {
     assert!(std::fs::symlink_metadata(&p).is_err());
 }
 
+/// Review round 3, item 2: a removed symlink whose target is unknown
+/// (empty) is refused; undo makes neither a link nor a regular file.
+#[test]
+fn symlink_removal_with_unknown_target_is_refused() {
+    use crate::inverse::InverseOp;
+    let mut sim = Sim::new();
+    let l = sim.p("l");
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: String::new(),
+        path: l.clone(),
+    }));
+    let nodes = sim.plan_nodes();
+    assert_eq!(nodes.len(), 1, "{nodes:#?}");
+    assert!(
+        matches!(&nodes[0].op, InverseOp::Refuse { class, .. } if class == "symlink-target-unknown"),
+        "{nodes:#?}"
+    );
+    sim.undo();
+    assert!(std::fs::symlink_metadata(&l).is_err());
+}
+
 fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
     let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
     let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)

@@ -1440,7 +1440,7 @@ mod policy {
         target_os = "dragonfly",
         target_os = "linux",
     ))]
-    fn lstat_identity(path: &str) -> Option<shit_proto::ShimStat> {
+    pub(super) fn lstat_identity(path: &str) -> Option<shit_proto::ShimStat> {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path)
             .ok()
@@ -1448,6 +1448,12 @@ mod policy {
                 dev: m.dev(),
                 inode: m.ino(),
                 mode: m.mode(),
+                link_target: m
+                    .file_type()
+                    .is_symlink()
+                    .then(|| std::fs::read_link(path).ok())
+                    .flatten()
+                    .map(|t| t.to_string_lossy().into_owned()),
             })
     }
 
@@ -2467,6 +2473,21 @@ mod tests {
     )
 ))]
 mod canonical_tests {
+    /// Review round 3, item 2: the shim's pre-call lstat carries a
+    /// symlink's target, so the daemon does not have to read it later.
+    #[test]
+    fn pre_stat_carries_a_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink("some/target", &link).unwrap();
+        let st = super::policy::lstat_identity(link.to_str().unwrap()).unwrap();
+        assert_eq!(st.link_target.as_deref(), Some("some/target"));
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let st = super::policy::lstat_identity(file.to_str().unwrap()).unwrap();
+        assert_eq!(st.link_target, None);
+    }
+
     /// D-22: a write-open through a symlink follows it. The notification
     /// is keyed by the target and carries the target's pre-image, so
     /// undo restores the target's bytes. `O_NOFOLLOW` keeps the link.

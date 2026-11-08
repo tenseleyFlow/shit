@@ -294,10 +294,10 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     if !Path::new(&note.arg).is_absolute() {
         return None;
     }
-    let (dev, ino, mode) = match note.pre_stat {
-        Some(st) => (st.dev, st.inode, st.mode),
+    let (dev, ino, mode, shim_target) = match &note.pre_stat {
+        Some(st) => (st.dev, st.inode, st.mode, st.link_target.clone()),
         None => match std::fs::symlink_metadata(&note.arg) {
-            Ok(m) => (m.dev(), m.ino(), m.mode()),
+            Ok(m) => (m.dev(), m.ino(), m.mode(), None),
             Err(e) => {
                 debug!(err = %e, pid = note.pid, arg = %note.arg, "shim unlink: pre-syscall lstat failed; keeping default kind");
                 return None;
@@ -306,12 +306,21 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     };
     let kind = FileKind::from_mode(mode)?;
     if kind == FileKind::Symlink {
-        let target = std::fs::read_link(&note.arg).ok()?;
+        // The shim's target, read before the call; else the daemon's
+        // read now. An empty target means unknown (no symlink can have
+        // one): the planner then refuses rather than make a regular file.
+        let target = shim_target
+            .or_else(|| {
+                std::fs::read_link(&note.arg)
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
         return Some(UnlinkStat {
             kind,
             mode,
             inode: InodeRef::new(0, 0),
-            link_target: Some(target.to_string_lossy().into_owned()),
+            link_target: Some(target),
         });
     }
     if !matches!(
@@ -1563,6 +1572,49 @@ mod tests {
         }
     }
 
+    /// Review round 3, item 2: the symlink is gone by the time the daemon
+    /// reads it. The shim's target is used; with none, the removal is
+    /// still a SymlinkRemoved (target unknown), never a Regular Unlink.
+    #[test]
+    fn symlink_removal_uses_the_shim_target_when_the_link_is_gone() {
+        let gone = "/nonexistent-shit-l4b/link";
+        let note = |target: Option<&str>| ShimNotification {
+            pid: 1,
+            syscall: "unlinkat".into(),
+            arg: gone.into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: 1,
+                inode: 2,
+                mode: 0o120777,
+                link_target: target.map(str::to_string),
+            }),
+        };
+        let kind = |n: &ShimNotification| {
+            apply_unlink_stat(
+                classify_tree_op("unlinkat", gone).unwrap(),
+                pre_syscall_unlink_stat(n),
+            )
+        };
+        assert_eq!(
+            kind(&note(Some("t"))),
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: "t".into(),
+                path: PathBuf::from(gone),
+            })
+        );
+        assert_eq!(
+            kind(&note(None)),
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: String::new(),
+                path: PathBuf::from(gone),
+            })
+        );
+    }
+
     /// L4b: a shim `unlink` of a device node carries the shim's pre-call
     /// identity, so it pairs with the helper's `DeviceNodeMeta`.
     #[test]
@@ -1579,6 +1631,7 @@ mod tests {
                 dev: 0x803,
                 inode: 77,
                 mode: 0o020640,
+                link_target: None,
             }),
         };
         let stat = pre_syscall_unlink_stat(&note).expect("stat from pre_stat");

@@ -182,11 +182,14 @@ pub struct ShimNotification {
 }
 
 /// Identity and mode of a path, as the shim read it (lstat).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShimStat {
     pub dev: u64,
     pub inode: u64,
     pub mode: u32,
+    /// L4b - the link's target, read before the call, when the entry is
+    /// a symlink. `None` for other kinds, or when readlink failed.
+    pub link_target: Option<String>,
 }
 
 /// AU10 — structured failure reported by the shim when capture
@@ -457,6 +460,7 @@ mod tests {
                 dev: 1,
                 inode: 2,
                 mode: 0o020640,
+                link_target: None,
             }),
         };
         let frame = encode_shim_frame(&n).unwrap();
