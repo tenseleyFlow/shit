@@ -1649,9 +1649,7 @@ mod policy {
         failure: Option<shit_proto::ShimFailure>,
         pre_stat: Option<shit_proto::ShimStat>,
     ) -> std::io::Result<()> {
-        use shit_proto::{
-            ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
-        };
+        use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_shim_frame};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, SystemTime};
@@ -1691,8 +1689,6 @@ mod policy {
         // SAFETY: shim runs in arbitrary user processes; getpid is a
         // syscall, not an interposer target, so this is safe.
         let pid = unsafe { libc::getpid() } as u32;
-        let has_pre = pre_image.is_some();
-        let has_extras = !extra_pre_images.is_empty();
         let note = ShimNotification {
             pid,
             syscall: syscall.to_string(),
@@ -1714,11 +1710,10 @@ mod policy {
         // DR-CR-54: a recursive batch can blow well past the small-
         // frame cap even with `pre_image=None`; pick large-frame
         // whenever extras are present too.
-        let frame = if has_pre || has_extras {
-            encode_frame_large(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
-        } else {
-            encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
-        };
+        // Shim frames carry their own version byte; the large cap covers
+        // pre-image payloads.
+        let frame =
+            encode_shim_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
         stream.write_all(&frame)?;
 
         // Best-effort ack read. We don't actually act on the ack today

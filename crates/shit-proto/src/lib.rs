@@ -41,7 +41,8 @@ pub use ctl::{
 };
 pub use frame::{
     DecodeError, EncodeError, HOOK_DGRAM_MAX_FRAME, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE,
-    WIRE_VERSION, decode_frame, decode_frame_large, encode_frame, encode_frame_large,
+    SHIM_WIRE_VERSION, WIRE_VERSION, decode_frame, decode_frame_large, decode_shim_frame,
+    encode_frame, encode_frame_large, encode_shim_frame,
 };
 
 /// AU26: maximum bytes for `HookMessage::PreExec.cmd_string`. The shell
