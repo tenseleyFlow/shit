@@ -906,6 +906,7 @@ impl PumpState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let mut failed = 0u32;
         for op in events {
             let resp = shit_proto::HelperResponse::TreeMutation {
                 session: command.session,
@@ -915,7 +916,13 @@ impl PumpState {
             };
             if let Err(e) = self.conn.send_response(&resp) {
                 tracing::warn!(error = %e, "send TreeMutation failed");
+                failed = failed.saturating_add(1);
             }
+        }
+        if failed > 0
+            && let Some(ws) = self.watches.get_mut(&command)
+        {
+            ws.send_failures = ws.send_failures.saturating_add(failed);
         }
     }
 
@@ -1200,11 +1207,26 @@ fn baseline_walk_and_emit(
         file_count: count,
         partial,
     };
-    if let Err(e) = conn.send_response(&complete) {
-        tracing::warn!(error = %e, "baseline: BaselineWalkComplete send failed");
-    }
+    let complete_sent = match conn.send_response(&complete) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "baseline: BaselineWalkComplete send failed");
+            false
+        }
+    };
 
-    (count, partial, shipped)
+    (count, partial, baseline_shipped(shipped, complete_sent))
+}
+
+/// The files whose baseline pre-image the daemon can use. Without the
+/// completion marker the daemon's cache for the cwd is never marked
+/// ready, so none of them counts.
+fn baseline_shipped(shipped: HashSet<(u64, u64)>, complete_sent: bool) -> HashSet<(u64, u64)> {
+    if complete_sent {
+        shipped
+    } else {
+        HashSet::new()
+    }
 }
 
 fn path_to_string(p: &Path) -> String {
@@ -1960,7 +1982,7 @@ mod tests {
             assert!(raw >= 0);
             Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
         };
-        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), kq, None);
+        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), Arc::clone(&kq), None);
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,
@@ -1969,5 +1991,50 @@ mod tests {
         // Must not panic; must not send.
         state.handle_vnode(999, VnodeEventKind::Write);
         assert!(state.watches.is_empty(), "watches must still be empty");
+        drop(kq);
+    }
+
+    /// R3 slice B review round 2, item 3: a dir-diff TreeMutation that
+    /// never reaches the daemon is a send failure for the command.
+    #[test]
+    fn failed_tree_mutation_send_is_counted() {
+        let (conn_a, conn_b) = crate::ipc::socketpair().expect("socketpair");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
+        let staging_fd = {
+            use std::os::fd::FromRawFd;
+            let cpath = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(raw >= 0);
+            Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), Arc::clone(&kq), None);
+        let cmd = CommandId {
+            session: Uuid::from_u128(79),
+            seq: 1,
+        };
+        state.attach(&kq, cmd, &root).unwrap();
+        drop(conn_b);
+        std::fs::write(root.join("new"), b"").unwrap();
+        let root_fd = *state.watches[&cmd].dir_baselines.keys().next().unwrap();
+        state.handle_dir_change(cmd, root_fd);
+        assert!(
+            state.watches[&cmd].send_failures > 0,
+            "the lost Create was not counted"
+        );
+    }
+
+    #[test]
+    fn baseline_counts_nothing_when_its_completion_marker_is_lost() {
+        let shipped: HashSet<(u64, u64)> = [(1, 2), (1, 3)].into_iter().collect();
+        assert_eq!(baseline_shipped(shipped.clone(), true), shipped);
+        assert!(baseline_shipped(shipped, false).is_empty());
     }
 }
