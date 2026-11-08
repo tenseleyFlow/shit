@@ -236,7 +236,11 @@ sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 # that touched it (outside ~/.local these are pip's scratch paths).
 grep -oE '"/[^"]+"' "${SHIT_SMOKE_TMP}/undo.log" | tr -d '"' | sort -u | while read -r p; do
     smoke_log "journal rows for conflicted path ${p}:"
-    smoke_journal_query "SELECT id, ts_logical, discriminant, dev, inode, path FROM events WHERE path = '${p}' OR path LIKE '%$(basename "${p}")' ORDER BY id;" 2>/dev/null \
+    # SQL string literals: double any single quote.
+    q="${p//\'/\'\'}"
+    b="$(basename "${p}")"
+    b="${b//\'/\'\'}"
+    smoke_journal_query "SELECT id, ts_logical, discriminant, dev, inode, path FROM events WHERE path = '${q}' OR path LIKE '%/${b}' ORDER BY id;" 2>/dev/null \
         | sed 's/^/    /' >&2 || true
 done
 
