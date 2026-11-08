@@ -1248,7 +1248,7 @@ impl LinuxCaptureRuntime {
         // succeeds on a symlink, where the old O_RDONLY open failed with
         // ELOOP; a symlink, any other unheld kind, and a failed open all
         // take the marker branch, as before.
-        let held = open_held_nofollow(&path_to_string(&resolved_path)).ok();
+        let held = open_held_nofollow(&resolved_path).ok();
         let held_stat = held
             .as_ref()
             .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()));
@@ -1966,8 +1966,11 @@ fn kernel_dev_to_userspace(kdev: u64) -> u64 {
 /// reading, through `/proc/self/fd/N` so it is the same inode, with
 /// `O_NONBLOCK|O_NOCTTY`. A fifo, socket or device node keeps the
 /// `O_PATH` fd, so the helper never blocks on a fifo or opens a device.
-fn open_held_nofollow(path: &str) -> std::io::Result<OwnedFd> {
-    let c = std::ffi::CString::new(path).map_err(std::io::Error::other)?;
+fn open_held_nofollow(path: impl AsRef<Path>) -> std::io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    // By the path's bytes (OsStr), so a non-UTF-8 name is held as is.
+    let c = std::ffi::CString::new(path.as_ref().as_os_str().as_bytes())
+        .map_err(std::io::Error::other)?;
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
@@ -2766,6 +2769,30 @@ mod tests {
             }
             other => panic!("expected a Create, got {other:?}"),
         }
+    }
+
+    /// Review round 3, item 3: the create path holds a non-UTF-8 name by
+    /// its bytes, as on trunk, rather than a lossy string that names
+    /// nothing.
+    #[test]
+    fn create_path_holds_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let staging = tempfile::tempdir().unwrap();
+        let (a, _b) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        let file = dir.path().join(name);
+        std::fs::write(&file, b"x").unwrap();
+        let m = std::fs::metadata(&file).unwrap();
+        rt.process_lsm_create_resolved(cmd, 1, file, 0o100644);
+        let ws = rt.watches.get(&cmd).unwrap();
+        assert!(
+            ws.pre_opens.contains_key(&(m.dev(), m.ino())),
+            "non-UTF-8 name not held"
+        );
     }
 
     /// Review round 2, item 2: a directory reaching the create path is
