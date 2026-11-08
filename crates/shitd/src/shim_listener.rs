@@ -570,10 +570,6 @@ fn journal_rename_outcome(
     ts: shit_planner::time::TimePoint,
     index: &Index,
 ) {
-    let Some((from, to)) = note.arg.split_once('\t') else {
-        debug!(pid = note.pid, arg = %note.arg, "shim notify: rename outcome without from\\tto");
-        return;
-    };
     let event = CaptureEvent {
         id: EventId(0),
         command,
@@ -582,11 +578,8 @@ fn journal_rename_outcome(
         kind: CaptureEventKind::RenameOutcome {
             pid: note.pid,
             call_id: note.call_id,
-            from: PathBuf::from(from),
-            to: PathBuf::from(to),
             errno: out.errno,
             source: InodeRef::new(out.source_dev, out.source_inode),
-            dest: InodeRef::new(out.dest_dev, out.dest_inode),
         },
     };
     if let Err(e) = index.put_event(&event) {
@@ -2568,8 +2561,6 @@ mod tests {
             errno: 18,
             source_dev: 8,
             source_inode: 42,
-            dest_dev: 0,
-            dest_inode: 0,
         });
         ingest_notification(
             &out,

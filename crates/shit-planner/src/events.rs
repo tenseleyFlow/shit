@@ -440,16 +440,14 @@ pub enum CaptureEventKind {
     },
     /// L5 (PR B): what a rename-family call did, from the note the shim
     /// sends after it returns. `errno` is 0 on success. `source` is the
-    /// inode at `from` before the call; `dest` the inode at `to` after a
-    /// success, `(0, 0)` otherwise. No inverse of its own.
+    /// inode at `from`, read before the call (`(0, 0)` if unknown). The
+    /// call's paths are on its Rename, which its RenameCall lists. No
+    /// inverse of its own.
     RenameOutcome {
         pid: u32,
         call_id: u64,
-        from: PathBuf,
-        to: PathBuf,
         errno: i32,
         source: InodeRef,
-        dest: InodeRef,
     },
 }
 

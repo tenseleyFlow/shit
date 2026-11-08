@@ -91,12 +91,11 @@ pub fn plan(
         warnings.push(PlanWarning::UnclosedCommand);
     }
 
-    let mut live: Vec<&CaptureEvent> = events.iter().filter(|e| !e.partial).collect();
-    // L5 (PR B): a rename call that failed moved nothing, and the kernel
-    // tier's report of a call is the same rename again. Both leave the
-    // plan before anything reads the events (see `rename_calls`).
-    let by_calls = crate::rename_calls::dropped_by_rename_calls(&live);
-    live.retain(|e| !by_calls.contains(&e.id));
+    // L5 (PR B): the events with rename calls applied (a failed call's
+    // rows and kernel twins out, a surviving shim Rename with its twin's
+    // inode), the same set redo plans from (see `rename_calls`).
+    let adjusted = crate::rename_calls::live_events(events);
+    let mut live: Vec<&CaptureEvent> = adjusted.iter().collect();
     // Reverse-chronological: latest events first.
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.id)));
 

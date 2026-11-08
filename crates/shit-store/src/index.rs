@@ -870,11 +870,11 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             blob_hash: None,
             post_content_hash: None,
         },
-        K::RenameOutcome { to, source, .. } => Denormalized {
+        K::RenameOutcome { source, .. } => Denormalized {
             discriminant: "RenameOutcome",
             dev: Some(source.dev as i64),
             inode: Some(source.inode as i64),
-            path: Some(to.to_string_lossy().into_owned()),
+            path: None,
             blob_hash: None,
             post_content_hash: None,
         },
@@ -1687,11 +1687,8 @@ mod tests {
         let outcome = CaptureEventKind::RenameOutcome {
             pid: 7,
             call_id: 3,
-            from: PathBuf::from("/w/a"),
-            to: PathBuf::from("/w/b"),
             errno: 18,
             source: InodeRef::new(8, 42),
-            dest: InodeRef::new(0, 0),
         };
         idx.put_event(&mk(1, call.clone())).unwrap();
         idx.put_event(&mk(2, outcome.clone())).unwrap();

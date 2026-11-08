@@ -198,12 +198,10 @@ pub struct ShimNotification {
 pub struct ShimRenameOutcome {
     /// 0 when the call returned 0, else its errno.
     pub errno: i32,
-    /// lstat of `from` before the call; `(0, 0)` when it failed.
+    /// lstat of `from`, read before the call whether or not the call
+    /// then succeeded; `(0, 0)` when that lstat failed.
     pub source_dev: u64,
     pub source_inode: u64,
-    /// lstat of `to` after a successful call; `(0, 0)` otherwise.
-    pub dest_dev: u64,
-    pub dest_inode: u64,
 }
 
 /// Identity and mode of a path, as the shim read it (lstat).

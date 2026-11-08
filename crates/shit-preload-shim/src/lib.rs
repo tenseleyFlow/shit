@@ -1019,7 +1019,6 @@ mod policy {
         let mut pending = PendingRename {
             syscall,
             arg: arg.to_string(),
-            to_abs: capture_path.to_string(),
             call_id,
             source,
             held: None,
@@ -1077,7 +1076,6 @@ mod policy {
     pub struct PendingRename {
         syscall: &'static str,
         arg: String,
-        to_abs: String,
         call_id: u64,
         /// `(dev, inode)` of `from` before the call; `(0, 0)` if unknown.
         source: (u64, u64),
@@ -1094,8 +1092,9 @@ mod policy {
 
     /// After a rename-family call. A held rename (one over a symlink) is
     /// sent only if the call succeeded. Then, for every call, the outcome:
-    /// the errno, the source's inode before the call and the destination's
-    /// after a success, under the call's id. Nothing waits on its ack.
+    /// the errno and the source's inode read before the call, under the
+    /// call's id. Nothing waits on its ack, and nothing is stat'ed after
+    /// the call.
     /// Leaves errno as it was.
     pub fn rename_end(pending: Option<PendingRename>, rc: libc::c_int) {
         let Some(p) = pending else {
@@ -1128,11 +1127,6 @@ mod policy {
                     },
                 );
             }
-            let dest = if errno == 0 {
-                lstat_identity(&p.to_abs).map_or((0, 0), |st| (st.dev, st.inode))
-            } else {
-                (0, 0)
-            };
             let _ = try_notify_full(
                 p.syscall,
                 &p.arg,
@@ -1145,8 +1139,6 @@ mod policy {
                         errno,
                         source_dev: p.source.0,
                         source_inode: p.source.1,
-                        dest_dev: dest.0,
-                        dest_inode: dest.1,
                     }),
                     no_ack: true,
                     ..NoteExtra::default()

@@ -24,8 +24,8 @@ fn rename_abs(from: &std::path::Path, to: &std::path::Path) -> i32 {
 }
 
 /// L5 PR B: every rename-family call sends its outcome under the same
-/// call id as its pre-call note, with the source's inode before the call
-/// and the destination's after it. Two calls get two ids.
+/// call id as its pre-call note, with the source's inode read before the
+/// call. Two calls get two ids.
 #[test]
 fn each_rename_call_reports_its_outcome_under_its_own_id() {
     use std::os::unix::fs::MetadataExt;
@@ -42,7 +42,7 @@ fn each_rename_call_reports_its_outcome_under_its_own_id() {
     assert!(notes[0].outcome.is_none() && notes[2].outcome.is_none());
     let out = notes[1].outcome.expect("outcome");
     assert_eq!(out.errno, 0);
-    assert_eq!((out.source_inode, out.dest_inode), (a_ino, a_ino));
+    assert_eq!(out.source_inode, a_ino);
     assert_ne!(notes[0].call_id, 0);
     assert_eq!(notes[0].call_id, notes[1].call_id);
     assert_eq!(notes[2].call_id, notes[3].call_id);
@@ -50,8 +50,8 @@ fn each_rename_call_reports_its_outcome_under_its_own_id() {
     assert_eq!(notes[1].arg, notes[0].arg);
 }
 
-/// A failed rename reports its errno, keeps it for the caller, and names
-/// no destination.
+/// A failed rename reports its errno, keeps it for the caller, and still
+/// carries the source's pre-call inode.
 #[test]
 fn failed_rename_reports_its_errno() {
     let tmp = tempfile::tempdir().unwrap();
@@ -67,7 +67,10 @@ fn failed_rename_reports_its_errno() {
     let out = notes.last().unwrap().outcome.expect("outcome");
     assert_eq!(Some(out.errno), errno);
     assert_eq!(out.errno, libc::EISDIR);
-    assert_eq!((out.dest_dev, out.dest_inode), (0, 0));
+    assert_ne!(
+        out.source_inode, 0,
+        "the source is read before the call, which then fails"
+    );
 }
 
 #[test]
