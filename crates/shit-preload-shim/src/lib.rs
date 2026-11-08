@@ -873,33 +873,29 @@ mod policy {
             call_id,
             ..Extra::default()
         };
-        if walk.is_none() {
-            // A file rename: nothing to fall back to, so no copies.
-            let _ = try_notify_full(syscall, arg, pre_image, extras, failure, extra(None));
-        } else {
-            let sent = try_notify_full(
+        let note = make_note(syscall, arg, pre_image, extras, failure, extra(walk));
+        // Finding 6, review item 7: a frame too big with the walk must
+        // lose neither the Rename nor the files' bytes. Send the pre-images
+        // on their own in chunks (`rename_walk`, which journals no Rename),
+        // then the Rename without them; without the walk record the
+        // planner treats the walk as incomplete. Only for a frame too big
+        // to encode (`InvalidData`, review round 2 item 7): a daemon that
+        // is down gets nothing more from a resend. The unsent note comes
+        // back whole, so nothing is copied for this (round 3 item 8).
+        if let Err((e, Some(unsent))) = send_note(note, false)
+            && e.kind() == std::io::ErrorKind::InvalidData
+            && unsent.walk.is_some()
+        {
+            let unsent = *unsent;
+            send_walk_chunks(arg, unsent.extra_pre_images, call_id);
+            let _ = try_notify_full(
                 syscall,
                 arg,
-                pre_image.clone(),
-                extras.clone(),
-                failure.clone(),
-                extra(walk),
+                unsent.pre_image,
+                Vec::new(),
+                unsent.failure,
+                extra(None),
             );
-            // Finding 6, review item 7: a frame too big with the walk must
-            // lose neither the Rename nor the files' bytes. Send the
-            // pre-images on their own in chunks (`rename_walk`, which
-            // journals no Rename), then the Rename without them. Without
-            // the walk record the planner treats the walk as incomplete.
-            // Review round 2, item 7: only for a frame too big to encode
-            // (`InvalidData`); a daemon that is down or slow gets nothing
-            // more from a resend.
-            if sent
-                .as_ref()
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidData)
-            {
-                send_walk_chunks(arg, extras, call_id);
-                let _ = try_notify_full(syscall, arg, pre_image, Vec::new(), failure, extra(None));
-            }
         }
         IN_NOTIFY.with(|f| f.set(false));
         Some(RenamePending {
@@ -2119,52 +2115,106 @@ mod policy {
         failure: Option<shit_proto::ShimFailure>,
         extra: Extra,
     ) -> std::io::Result<()> {
+        let no_ack = extra.no_ack;
+        let note = make_note(syscall, arg, pre_image, extra_pre_images, failure, extra);
+        send_note(note, no_ack).map_err(|(e, _)| e)
+    }
+
+    /// One notification, stamped with this process's pid and the time.
+    fn make_note(
+        syscall: &'static str,
+        arg: &str,
+        pre_image: Option<shit_proto::ShimPreImage>,
+        extra_pre_images: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
+        extra: Extra,
+    ) -> shit_proto::ShimNotification {
+        use std::time::SystemTime;
         let Extra {
             walk,
             outcome,
             pre_stat,
             call_id,
-            no_ack,
+            no_ack: _,
         } = extra;
-        use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_shim_frame};
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // SAFETY: shim runs in arbitrary user processes; getpid is a
+        // syscall, not an interposer target, so this is safe.
+        let pid = unsafe { libc::getpid() } as u32;
+        shit_proto::ShimNotification {
+            pid,
+            syscall: syscall.to_string(),
+            arg: arg.to_string(),
+            ts_unix_nanos: now,
+            pre_image,
+            extra_pre_images,
+            // AU10 — populated when an upstream resolution step
+            // (canonicalize, primarily) tripped the previously-
+            // silent fallback. The daemon's shim_listener journals
+            // a Refuse marker keyed by this field.
+            failure,
+            walk,
+            outcome,
+            pre_stat,
+            call_id,
+        }
+    }
+
+    /// Encode and send one notification. Encoding comes first and borrows
+    /// the note, so a frame too big to encode (`InvalidData`) hands the
+    /// note back unsent and the rename path can move its contents into
+    /// the fallback instead of copying them up front (review round 3,
+    /// item 8). Any other failure is a send failure, and the note is gone.
+    fn send_note(
+        note: shit_proto::ShimNotification,
+        no_ack: bool,
+    ) -> Result<(), (std::io::Error, Option<Box<shit_proto::ShimNotification>>)> {
+        use shit_proto::{ShimAck, decode_frame, encode_shim_frame};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
-        use std::time::{Duration, SystemTime};
+        use std::time::Duration;
 
         #[cfg(test)]
         if test_capture::active() {
-            let note = ShimNotification {
-                pid: 0,
-                syscall: syscall.to_string(),
-                arg: arg.to_string(),
-                ts_unix_nanos: 0,
-                pre_image,
-                extra_pre_images,
-                failure,
-                walk,
-                outcome,
-                pre_stat,
-                call_id,
-            };
+            let mut note = note;
+            note.pid = 0;
+            note.ts_unix_nanos = 0;
             if let Some(limit) = test_capture::frame_limit()
                 && encode_shim_frame(&note).map_or(true, |f| f.len() > limit)
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "frame over the test limit",
+                return Err((
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "frame over the test limit",
+                    ),
+                    Some(Box::new(note)),
                 ));
             }
             let fail = test_capture::fail_with();
             test_capture::push(note);
             if let Some(kind) = fail {
-                return Err(std::io::Error::new(kind, "test send failure"));
+                return Err((std::io::Error::new(kind, "test send failure"), None));
             }
             return Ok(());
         }
+        // L5: shim frames carry their own version byte
+        // (`SHIM_WIRE_VERSION`) and the large cap. An encode failure is
+        // `InvalidData`, which the rename path takes to mean "too big"
+        // (review round 2, item 7); anything else is a send failure.
+        let frame = match encode_shim_frame(&note) {
+            Ok(f) => f,
+            Err(e) => return Err((frame_error(e), Some(Box::new(note)))),
+        };
+        let heavy =
+            note.pre_image.is_some() || !note.extra_pre_images.is_empty() || note.walk.is_some();
+        drop(note);
         let path = socket_path();
         // Best-effort `connect(2)` — if the socket doesn't exist (no
         // daemon, daemon down, wrong $XDG_RUNTIME_DIR), bail silently.
-        let mut stream = UnixStream::connect(path)?;
+        let mut stream = UnixStream::connect(path).map_err(|e| (e, None))?;
         // W06.A.4.1: the write timeout must scale with payload size.
         // The default 50 ms was sized for sub-MAX_FRAME_SIZE (256 KiB)
         // notifications and would time out partway through a multi-MiB
@@ -2181,45 +2231,17 @@ mod policy {
         // immediately scheduled). For notifications without
         // pre-image, the original 50 ms stays — those are tiny and a
         // hung daemon shouldn't pause a user's `unlink` for 5s.
-        let write_timeout = if pre_image.is_some() || !extra_pre_images.is_empty() || walk.is_some()
-        {
+        let write_timeout = if heavy {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(50)
         };
-        stream.set_write_timeout(Some(write_timeout))?;
-        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        // SAFETY: shim runs in arbitrary user processes; getpid is a
-        // syscall, not an interposer target, so this is safe.
-        let pid = unsafe { libc::getpid() } as u32;
-        let note = ShimNotification {
-            pid,
-            syscall: syscall.to_string(),
-            arg: arg.to_string(),
-            ts_unix_nanos: now,
-            pre_image,
-            extra_pre_images,
-            // AU10 — populated when an upstream resolution step
-            // (canonicalize, primarily) tripped the previously-
-            // silent fallback. The daemon's shim_listener journals
-            // a Refuse marker keyed by this field.
-            failure,
-            walk,
-            outcome,
-            pre_stat,
-            call_id,
-        };
-        // L5: shim frames carry their own version byte
-        // (`SHIM_WIRE_VERSION`) and the large cap. An encode failure is
-        // `InvalidData`, which the rename path takes to mean "too big"
-        // (review round 2, item 7); anything else is a send failure.
-        let frame = encode_shim_frame(&note).map_err(frame_error)?;
-        stream.write_all(&frame)?;
+        let io = |e: std::io::Error| (e, None);
+        stream.set_write_timeout(Some(write_timeout)).map_err(io)?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .map_err(io)?;
+        stream.write_all(&frame).map_err(io)?;
 
         // Best-effort ack read. We don't actually act on the ack today
         // (Allow-always), but draining it lets the listener's per-conn
