@@ -405,3 +405,28 @@ fn walk_resend_only_for_an_oversized_frame() {
         .count();
     assert_eq!(pre_calls, 1, "{notes:#?}");
 }
+
+/// Review round 4, item 6: a rename whose names cannot be keyed still
+/// gets a call id, and its failure an outcome, so the daemon can retract
+/// the capture-incomplete refusal of a rename that never happened.
+#[test]
+fn unresolvable_failed_renameat_reports_its_outcome() {
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (a, b) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+    let notes = test_capture::capture(|| {
+        let rc = unsafe { super::interposers::renameat(fds[0], a.as_ptr(), fds[0], b.as_ptr()) };
+        assert_eq!(rc, -1);
+    });
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    assert_eq!(notes.len(), 2, "{notes:#?}");
+    assert!(notes[0].failure.is_some() && notes[0].outcome.is_none());
+    let out = notes[1].outcome.expect("outcome");
+    assert_ne!(out.errno, 0);
+    assert_ne!(notes[0].call_id, 0);
+    assert_eq!(notes[0].call_id, notes[1].call_id);
+    assert_eq!(notes[0].arg, notes[1].arg);
+}

@@ -269,8 +269,7 @@ unsafe extern "C" fn my_renameat(
     ) {
         (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
         (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
-            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure);
-            None
+            policy::notify_rename_unresolved("renameat", &format!("{f}\t{t}"), failure)
         }
     };
     let rc = unsafe { libc::renameat(fromfd, from, tofd, to) };
@@ -1672,6 +1671,28 @@ mod rename_wire_tests {
         let want = dir.join("f");
         assert_eq!(n.arg, want.to_str().unwrap());
         assert_eq!(n.pre_image.as_ref().unwrap().bytes, b"bytes");
+    }
+
+    /// Review round 4, item 6: an unkeyable failed renameat still reports
+    /// its outcome under its call id.
+    #[test]
+    fn unresolvable_failed_renameat_reports_its_outcome() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (a, b) = (CString::new("a").unwrap(), CString::new("b").unwrap());
+        let notes = policy::test_capture::capture(|| {
+            let rc = unsafe { my_renameat(fds[0], a.as_ptr(), fds[0], b.as_ptr()) };
+            assert_eq!(rc, -1);
+        });
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert_eq!(notes.len(), 2, "{notes:#?}");
+        assert!(notes[0].failure.is_some());
+        assert_ne!(notes[0].call_id, 0);
+        assert_eq!(notes[0].call_id, notes[1].call_id);
+        assert_ne!(notes[1].outcome.expect("outcome").errno, 0);
     }
 
     #[test]

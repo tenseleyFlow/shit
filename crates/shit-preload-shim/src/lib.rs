@@ -700,9 +700,7 @@ mod policy {
             (AtResolution::Failed(fa, fe), AtResolution::Failed(ta, _))
             | (AtResolution::Failed(fa, fe), AtResolution::Resolved(ta))
             | (AtResolution::Resolved(fa), AtResolution::Failed(ta, fe)) => {
-                let arg = format!("{fa}\t{ta}");
-                notify_inner_with_failure(syscall, &arg, None, Some(fe), false);
-                None
+                notify_rename_unresolved(syscall, &format!("{fa}\t{ta}"), fe)
             }
         }
     }
@@ -815,6 +813,41 @@ mod policy {
     const RECURSIVE_FRAME_BUDGET: u64 = 60 * 1024 * 1024;
     /// Rough postcard cost of one record beyond its path, bytes and xattrs.
     const RECORD_OVERHEAD: u64 = 128;
+
+    /// L5 (review round 4, item 6) — a rename whose arguments could not be
+    /// keyed: send `from\tto` as given with the AU10 marker, under a call id,
+    /// and keep it pending so a failure still sends its outcome (which
+    /// retracts the marker of a rename that never happened).
+    pub fn notify_rename_unresolved(
+        syscall: &'static str,
+        arg: &str,
+        failure: shit_proto::ShimFailure,
+    ) -> Option<RenamePending> {
+        if disabled() || IN_NOTIFY.with(|f| f.replace(true)) {
+            return None;
+        }
+        let call_id = next_call_id();
+        let _ = try_notify_full(
+            syscall,
+            arg,
+            None,
+            Vec::new(),
+            Some(failure),
+            Extra {
+                call_id,
+                ..Extra::default()
+            },
+        );
+        IN_NOTIFY.with(|f| f.set(false));
+        Some(RenamePending {
+            syscall,
+            arg: arg.to_string(),
+            to_abs: String::new(),
+            source: (0, 0),
+            source_is_dir: false,
+            call_id,
+        })
+    }
 
     /// L5 — a rename the shim notified, for the post-syscall outcome.
     pub struct RenamePending {
