@@ -28,7 +28,11 @@
 # no cap_chown, so undo must refuse before mknod with the "not the
 # invoking user" reason, and no node may appear.
 #
-# Phase 3, helper restart. A user-owned node is `rm`'d, then shitd and
+# Phase 3, both tiers. A user-owned node is `rm`'d with the preload
+# shim loaded, so the shim and the LSM tier both report the removal.
+# Undo must restore it once (one apply_mknod Applied for this phase).
+#
+# Phase 4, helper restart. A user-owned node is `rm`'d, then shitd and
 # its helper are restarted. The new helper has a new key, so undo must
 # refuse with "capture evidence expired: helper restarted" and create
 # nothing.
@@ -173,20 +177,62 @@ smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 2 10
 undo_expect_refusal "${SHIT_SMOKE_TMP}/undo-root.log" "not the invoking user" "${ROOT_NODE}"
 smoke_log "phase 2: foreign owner refused, no node created"
 
-# ---- phase 3: a restarted helper refuses old capture evidence ----
+# ---- phase 3: shim and LSM both report one rm ----
+SHIM_LIB="${SHIT_SMOKE_BIN_DIR}/libshit_preload_shim.so"
+[ -f "${SHIM_LIB}" ] || smoke_fail "shim missing at ${SHIM_LIB}"
+DUAL_NODE="${SCRATCH}/l4_null_dual"
+seed "${DUAL_NODE}" "${ME}" 0640
+"${SHIT_BIN}" hook-send pre-exec \
+    --session "${SESSION}" --seq 3 --pid "${PID}" \
+    --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
+sleep 0.5
+LD_PRELOAD="${SHIM_LIB}" rm -f "${DUAL_NODE}"
+[ ! -e "${DUAL_NODE}" ] || smoke_fail "rm did not remove ${DUAL_NODE}"
+sleep 0.5
+"${SHIT_BIN}" hook-send post-exec \
+    --session "${SESSION}" --seq 3 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 3 10
+# The shim must really have reported this rm, or the phase proves nothing.
+# The daemon's JSON log is written asynchronously; give it a moment.
+shim_seen=0
+for _ in $(seq 1 50); do
+    if [ "$(cat "${XDG_STATE_HOME}"/shit/log/daemon.jsonl* 2>/dev/null | grep -a 'shim pre-mutation' | grep -c 'l4_null_dual' || true)" -gt 0 ]; then
+        shim_seen=1
+        break
+    fi
+    sleep 0.1
+done
+[ "${shim_seen}" = 1 ] || smoke_fail "phase 3: no shim notification for ${DUAL_NODE}; LD_PRELOAD shim did not report"
+SHIM_UNLINKS="$(smoke_journal_count "discriminant = 'TreeOpUnlink' AND path = '${DUAL_NODE}'")"
+smoke_log "phase 3: ${SHIM_UNLINKS} Unlink row(s) journaled for the dual-tier rm"
+APPLIED_BEFORE="$(sed 's/\x1b\[[0-9;]*m//g' "${SHIT_SMOKE_TMP}/shitd.log" | grep 'apply_mknod' | grep -Ec 'outcome[=:]+ *Applied' || true)"
+"${SHIT_BIN}" undo --yes >"${SHIT_SMOKE_TMP}/undo-dual.log" 2>&1 || {
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo-dual.log" >&2
+    smoke_fail "dual-tier undo exited non-zero"
+}
+[ "$(stat -c '%t:%T %a %u:%g' "${DUAL_NODE}" 2>/dev/null)" = "1:3 640 ${ME}" ] || {
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo-dual.log" >&2
+    smoke_fail "dual-tier node not restored as captured"
+}
+APPLIED_AFTER="$(sed 's/\x1b\[[0-9;]*m//g' "${SHIT_SMOKE_TMP}/shitd.log" | grep 'apply_mknod' | grep -Ec 'outcome[=:]+ *Applied' || true)"
+[ $((APPLIED_AFTER - APPLIED_BEFORE)) -eq 1 ] || smoke_fail "dual-tier undo ran apply_mknod $((APPLIED_AFTER - APPLIED_BEFORE)) times, want 1"
+smoke_log "phase 3: dual-tier rm restored once"
+rm -f "${DUAL_NODE}"
+
+# ---- phase 4: a restarted helper refuses old capture evidence ----
 OLD_NODE="${SCRATCH}/l4_null_before_restart"
 seed "${OLD_NODE}" "${ME}" 0600
-rm_in_command 3 "${OLD_NODE}"
-smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 3 10
+rm_in_command 4 "${OLD_NODE}"
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 4 10
 cp "${SHIT_SMOKE_TMP}/shitd.log" "${SHIT_SMOKE_TMP}/shitd-before-restart.log"
 smoke_stop_shitd || true
 smoke_start_shitd
 undo_expect_refusal "${SHIT_SMOKE_TMP}/undo-restart.log" "capture evidence expired: helper restarted" "${OLD_NODE}"
-smoke_log "phase 3: token from the previous helper refused"
+smoke_log "phase 4: token from the previous helper refused"
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}" || true
 
-sudo -n rm -f "${NODE}" "${ROOT_NODE}" "${OLD_NODE}" || true
+sudo -n rm -f "${NODE}" "${ROOT_NODE}" "${OLD_NODE}" "${DUAL_NODE}" || true
 
-smoke_log "PASS: mknod-restore-undo-linux (restore via capture token; foreign owner and restarted helper refused)"
+smoke_log "PASS: mknod-restore-undo-linux (restore via capture token, once under both tiers; foreign owner and restarted helper refused)"
