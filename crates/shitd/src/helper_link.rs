@@ -1602,27 +1602,16 @@ fn journal_unlink_with_device(
                 if *inode == inode_ref && existing_path == &path
         )
     });
-    if already {
+    // L4b - the shim may already have journaled this removal with the
+    // same identity (its pre-call lstat). The Unlink is then not repeated,
+    // but the device capture is still journaled, after it, so the two
+    // pair.
+    if already && device.is_none() {
         return Ok(());
     }
-    let unlink_ev = CaptureEvent {
-        id: EventId(0),
-        command,
-        ts,
-        partial: false,
-        kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
-            inode: inode_ref,
-            path: path.clone(),
-            kind,
-            mode,
-        }),
-    };
-    index.put_event(&unlink_ev).map_err(|e| {
-        HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
-    })?;
-    // L4 - the device number, mode, owner and the helper's token ride in
-    // their own event, so the Unlink row keeps its stored shape. The
-    // planner pairs them by (dev, ino) and journal order.
+    if !already {
+        put_unlink(index, command, ts, inode_ref, path.clone(), kind, mode)?;
+    }
     if let Some(d) = device {
         let meta_ev = CaptureEvent {
             id: EventId(0),
@@ -1645,6 +1634,33 @@ fn journal_unlink_with_device(
             )))
         })?;
     }
+    Ok(())
+}
+
+fn put_unlink(
+    index: &Index,
+    command: CommandId,
+    ts: shit_planner::TimePoint,
+    inode_ref: InodeRef,
+    path: std::path::PathBuf,
+    kind: shit_planner::metadata::FileKind,
+    mode: u32,
+) -> Result<(), HelperLinkError> {
+    let unlink_ev = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts,
+        partial: false,
+        kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode: inode_ref,
+            path,
+            kind,
+            mode,
+        }),
+    };
+    index.put_event(&unlink_ev).map_err(|e| {
+        HelperLinkError::Io(std::io::Error::other(format!("put_event (unlink): {e}")))
+    })?;
     Ok(())
 }
 
@@ -1952,6 +1968,64 @@ mod tests_dispatch {
             Err(UnwatchError::LinkClosed)
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// L4b: when the shim journaled the removal first with the same
+    /// identity, the helper's capture adds the DeviceNodeMeta after it and
+    /// no second Unlink.
+    #[test]
+    fn device_meta_follows_a_shim_unlink_of_the_same_node() {
+        use shit_planner::PlannerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(5),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let inode = InodeRef::new(0x803, 77);
+        let path = PathBuf::from("/w/null");
+        let kind = shit_planner::metadata::FileKind::CharDevice;
+        put_unlink(
+            &index,
+            cmd,
+            shit_planner::TimePoint::new(2, 0),
+            inode,
+            path.clone(),
+            kind,
+            0o020640,
+        )
+        .unwrap();
+        let device = DeviceCapture {
+            rdev: 0x103,
+            mode: 0o020640,
+            uid: 1,
+            gid: 1,
+            token: shit_planner::CaptureToken {
+                helper: [1; 16],
+                mac: [2; 32],
+            },
+        };
+        journal_unlink_with_device(
+            &index,
+            cmd,
+            shit_planner::TimePoint::new(3, 0),
+            inode,
+            path,
+            kind,
+            0o020640,
+            Some(device),
+        )
+        .unwrap();
+        let events = index.events_for_command(cmd);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) => "unlink",
+                CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { .. }) => "meta",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["unlink", "meta"], "{events:#?}");
     }
 
     fn index_with_command(dir: &Path, cmd: CommandId) -> Index {

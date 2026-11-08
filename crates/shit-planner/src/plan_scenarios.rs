@@ -1550,6 +1550,85 @@ fn rm_mknod_rm_pairs_each_unlink_with_its_own_capture() {
     );
 }
 
+/// L4b: the normal Linux setup reports one `rm` of a device twice: the
+/// shim (pre-call lstat identity) and the LSM tier (Unlink and
+/// DeviceNodeMeta). Whatever order the reports land in, undo makes one
+/// RecreatePath with the capture, and it applies.
+#[test]
+fn dual_tier_rm_of_a_device_node_restores_it_once() {
+    use crate::inverse::InverseOp;
+    let node = InodeRef::new(1, 5);
+    // 0: shim first, helper saw the shim's Unlink and wrote only the
+    //    meta; 1: both Unlinks, then the meta; 2: helper first.
+    for order in 0..3 {
+        let mut sim = Sim::new();
+        let p = sim.p("null");
+        let shim = device_unlink(p.clone(), node);
+        let helper = device_unlink(p.clone(), node);
+        match order {
+            0 => {
+                sim.emit(shim);
+                sim.emit(device_meta(p.clone(), node, 0x103));
+            }
+            1 => {
+                sim.emit(shim);
+                sim.emit(helper);
+                sim.emit(device_meta(p.clone(), node, 0x103));
+            }
+            _ => {
+                sim.emit(helper);
+                sim.emit(device_meta(p.clone(), node, 0x103));
+                sim.emit(shim);
+            }
+        }
+        let nodes = sim.plan_nodes();
+        let recreates: Vec<_> = nodes
+            .iter()
+            .filter(|n| matches!(n.op, InverseOp::RecreatePath { .. }))
+            .collect();
+        assert_eq!(recreates.len(), 1, "order {order}: {nodes:#?}");
+        assert!(
+            matches!(
+                &recreates[0].op,
+                InverseOp::RecreatePath { device: Some(d), .. } if d.rdev == 0x103
+            ),
+            "order {order}: {nodes:#?}"
+        );
+        let log = sim.undo_with_mknod();
+        assert_eq!(log.len(), 1, "order {order}: {log:#?}");
+        assert!(log[0].starts_with("ok "), "order {order}: {log:#?}");
+    }
+}
+
+/// L4b: `rm link` reported by the shim as SymlinkRemoved (the link's
+/// own path and target) and by the LSM tier as a marker-only Unlink
+/// (mode 0, it could not stat a symlink). Undo recreates the link and
+/// leaves the target untouched.
+#[test]
+fn rm_of_a_symlink_recreates_the_link_and_leaves_the_target() {
+    let mut sim = Sim::new();
+    sim.seed_file("target", b"keep", 0o644);
+    let target = sim.p("target");
+    let link = sim.p("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let m = std::fs::symlink_metadata(&link).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: target.to_str().unwrap().to_string(),
+        path: link.clone(),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(m.dev(), m.ino()),
+        path: link.clone(),
+        kind: FileKind::Regular,
+        mode: 0,
+    }));
+    std::fs::remove_file(&link).unwrap();
+    let log = sim.undo();
+    assert!(log.iter().all(|l| l.starts_with("ok ")), "{log:#?}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+}
+
 fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
     let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
     let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)

@@ -647,9 +647,11 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
-    let device_nodes = pair_device_nodes(events);
+    let (device_nodes, duplicate_device_unlinks) = device_pairing(events);
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
+    dropped_events.extend(duplicate_device_unlinks);
+    dropped_events.extend(symlink_removal_markers(events));
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -1729,61 +1731,140 @@ fn native_delegation_for(
 /// L4b - pair each `DeviceNodeMeta` with the `Unlink` it was journaled
 /// after. A pair needs the same nonzero `(dev, ino)`, the same path, a
 /// kind that agrees with the captured mode, and a nonzero rdev; the
-/// meta takes the latest such `Unlink` before it in journal order that
-/// no earlier meta took. A zero inode (the shim's sentinel) never pairs:
-/// an `Unlink` with no exact pair carries no device and is refused at
-/// undo.
+/// meta takes the latest such `Unlink` before it in journal order
+/// (`(ts, id)`) that no earlier meta took. A zero inode (the shim's
+/// sentinel) never pairs: an `Unlink` with no exact pair carries no
+/// device and is refused at undo.
 pub(crate) fn pair_device_nodes(
     events: &[&CaptureEvent],
 ) -> std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode> {
+    device_pairing(events).0
+}
+
+/// [`pair_device_nodes`], plus the device `Unlink`s that are a second
+/// tier's report of a paired removal: same identity and path as a
+/// paired `Unlink`, with nothing else journaled at that path between
+/// the two. The shim (pre-call lstat) and the LSM tier both report one
+/// `rm`; only one `RecreatePath` may come of it.
+fn device_pairing(
+    events: &[&CaptureEvent],
+) -> (
+    std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode>,
+    Vec<crate::events::EventId>,
+) {
     use crate::metadata::{DeviceNode, FileKind};
     let mut ordered: Vec<&CaptureEvent> = events.to_vec();
-    ordered.sort_by_key(|e| e.id);
+    ordered.sort_by_key(|e| (e.ts, e.id));
     let none = InodeRef::new(0, 0);
     type Open = std::collections::HashMap<(InodeRef, PathBuf), (crate::events::EventId, FileKind)>;
     let mut open: Open = std::collections::HashMap::new();
     let mut out = std::collections::HashMap::new();
-    for ev in ordered {
-        match &ev.kind {
-            CaptureEventKind::TreeOp(TreeOp::Unlink {
-                inode, path, kind, ..
-            }) if *inode != none
-                && matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) =>
-            {
-                open.insert((*inode, path.clone()), (ev.id, *kind));
+    let device_unlink = |ev: &CaptureEvent| match &ev.kind {
+        CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode, path, kind, ..
+        }) if *inode != none && matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) => {
+            Some((*inode, path.clone(), *kind))
+        }
+        _ => None,
+    };
+    for ev in &ordered {
+        if let Some((inode, path, kind)) = device_unlink(ev) {
+            open.insert((inode, path), (ev.id, kind));
+            continue;
+        }
+        if let CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+            inode,
+            path,
+            rdev,
+            mode,
+            uid,
+            gid,
+            token,
+        }) = &ev.kind
+            && *inode != none
+            && *rdev != 0
+        {
+            let Some((unlink_id, unlink_kind)) = open.remove(&(*inode, path.clone())) else {
+                continue;
+            };
+            if FileKind::from_mode(*mode) != Some(unlink_kind) {
+                continue;
             }
-            CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
-                inode,
-                path,
-                rdev,
-                mode,
-                uid,
-                gid,
-                token,
-            }) if *inode != none && *rdev != 0 => {
-                let Some((unlink_id, unlink_kind)) = open.remove(&(*inode, path.clone())) else {
-                    continue;
-                };
-                if FileKind::from_mode(*mode) != Some(unlink_kind) {
-                    continue;
-                }
-                out.insert(
-                    unlink_id,
-                    DeviceNode {
-                        rdev: *rdev,
-                        mode: *mode,
-                        uid: *uid,
-                        gid: *gid,
-                        inode: *inode,
-                        removed_by: ev.command,
-                        token: *token,
-                    },
-                );
-            }
-            _ => {}
+            out.insert(
+                unlink_id,
+                DeviceNode {
+                    rdev: *rdev,
+                    mode: *mode,
+                    uid: *uid,
+                    gid: *gid,
+                    inode: *inode,
+                    removed_by: ev.command,
+                    token: *token,
+                },
+            );
         }
     }
-    out
+    // Duplicates: walk each (identity, path) run in journal order. A run
+    // is broken by any other event at that path.
+    let mut duplicates = Vec::new();
+    let mut run: std::collections::HashMap<PathBuf, (InodeRef, Vec<crate::events::EventId>)> =
+        std::collections::HashMap::new();
+    let mut close = |r: (InodeRef, Vec<crate::events::EventId>)| {
+        if r.1.iter().any(|id| out.contains_key(id)) {
+            duplicates.extend(r.1.into_iter().filter(|id| !out.contains_key(id)));
+        }
+    };
+    for ev in &ordered {
+        if let Some((inode, path, _)) = device_unlink(ev) {
+            match run.get_mut(&path) {
+                Some((i, ids)) if *i == inode => ids.push(ev.id),
+                _ => {
+                    if let Some(r) = run.insert(path, (inode, vec![ev.id])) {
+                        close(r);
+                    }
+                }
+            }
+            continue;
+        }
+        let same_node_meta = |p: &PathBuf| match (&ev.kind, run.get(p)) {
+            (CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { inode, .. }), Some((i, _))) => {
+                inode == i
+            }
+            _ => false,
+        };
+        if let Some(p) = event_path(ev).cloned()
+            && !same_node_meta(&p)
+            && let Some(r) = run.remove(&p)
+        {
+            close(r);
+        }
+    }
+    for (_, r) in run {
+        close(r);
+    }
+    (out, duplicates)
+}
+
+/// L4b - the helper's marker-only `Unlink` (mode 0: it lost the race to
+/// stat the entry) for a path the shim journaled as a removed symlink.
+/// The shim's `SymlinkRemoved` is the whole restore; the marker would
+/// recreate a regular file where the link was.
+fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let links: HashSet<&PathBuf> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => Some(path),
+            _ => None,
+        })
+        .collect();
+    events
+        .iter()
+        .filter(|e| {
+            matches!(&e.kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink { path, mode: 0, .. }) if links.contains(path))
+        })
+        .map(|e| e.id)
+        .collect()
 }
 
 fn emit_for_tree_op(
