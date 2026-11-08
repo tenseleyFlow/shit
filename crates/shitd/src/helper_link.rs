@@ -2431,6 +2431,54 @@ mod tests_dispatch {
         }
     }
 
+    /// Review of #232 medium review, item 3: the helper's failure for N
+    /// arrives after the session moved on to N+1. N's watch is still
+    /// known, so the deferred Creates are reported, not lost silently.
+    #[test]
+    fn late_watch_failure_after_the_next_command_still_journals_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = CommandId {
+            session: Uuid::from_u128(12),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), n);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let waiters = PrivOpWaiters::default();
+        let lb = crate::baseline::LiveBaseline::new();
+        lb.record_command_watch(n, PathBuf::from("/tmp/watched"));
+        lb.confirm_command_watch(n, shit_planner::time::TimePoint::new(1, 0));
+        assert!(lb.defer_create_to_kernel(
+            n,
+            std::path::Path::new("/tmp/watched/new"),
+            shit_planner::time::TimePoint::new(2, 0)
+        ));
+        lb.close_command_watch(n, shit_planner::time::TimePoint::new(3, 0));
+        lb.record_command_watch(CommandId { seq: 2, ..n }, PathBuf::from("/tmp/watched"));
+        dispatch_response(
+            HelperResponse::WatchTreeFailed {
+                session: n.session,
+                command_seq: n.seq,
+                reason: "late".into(),
+            },
+            None,
+            &index,
+            &blobs,
+            &map,
+            &lb,
+            "bpf-lsm",
+            &waiters,
+            false,
+        );
+        assert!(
+            index
+                .events_for_command(n)
+                .iter()
+                .any(|e| matches!(&e.kind, CaptureEventKind::CaptureRefused { .. })),
+            "deferred Creates must be reported"
+        );
+    }
+
     #[tokio::test]
     async fn capture_refused_does_not_change_readiness() {
         let dir = tempfile::tempdir().unwrap();

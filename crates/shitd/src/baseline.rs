@@ -246,7 +246,17 @@ struct CommandWatch {
     deferred: bool,
     /// When the daemon recorded it, for the age-out.
     recorded: std::time::Instant,
+    /// When its PostExec (or the session's close) arrived, for the
+    /// grace period below.
+    closed_instant: Option<std::time::Instant>,
 }
+
+/// L5 (review of #232 medium review, items 2 and 3): a closed watch is
+/// kept this long after its close. Shim notes stamped during the command
+/// can be ingested late (the next PreExec may already have been
+/// handled); they are judged by this watch, and a helper failure that
+/// arrives late still finds the deferred-Create flag.
+const CLOSED_WATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// L5 (review of #232, item 8): a watch whose PostExec never arrived (a
 /// shell killed mid-command) is dropped after this long.
@@ -268,9 +278,9 @@ pub struct LiveBaseline {
     /// L5 (review round 4, item 2): the watch root the daemon sent the
     /// helper in `WatchTree` for each command, on every platform, and the
     /// time its PostExec closed the watch. Dropped when the helper says it
-    /// cannot watch that command, when the session starts another or
-    /// closes, and after [`COMMAND_WATCH_TTL`] or past
-    /// [`COMMAND_WATCH_CAP`].
+    /// cannot watch that command, [`CLOSED_WATCH_GRACE`] after it closed
+    /// (PostExec or session close), after [`COMMAND_WATCH_TTL`] unclosed,
+    /// or past [`COMMAND_WATCH_CAP`].
     command_roots: RwLock<HashMap<CommandId, CommandWatch>>,
     /// R3 slice B — inodes whose BaselineCaptured the daemon could not
     /// ingest, per `(session, cwd)` of the walk that sent them. The
@@ -430,10 +440,11 @@ impl LiveBaseline {
     }
 
     /// L5: the daemon asked the helper to watch `command` under `root`.
-    /// The session's earlier, closed commands are dropped, and so are
-    /// watches past the age-out or the cap. A shim note for a dropped
-    /// command that is still in flight is judged unwatched, so its Create
-    /// is journaled by the shim; nothing is lost.
+    /// Watches closed more than [`CLOSED_WATCH_GRACE`] ago, unclosed ones
+    /// past [`COMMAND_WATCH_TTL`], and the oldest past the cap are
+    /// dropped. A closed watch is kept through the grace period even when
+    /// the session has moved on, so a late note of the closed command is
+    /// still judged by it.
     ///
     /// L5 (review of #232 round 2, item 1): the root is stored canonical.
     /// The hook sends the shell's logical `$PWD`, which may run through a
@@ -445,9 +456,9 @@ impl LiveBaseline {
 
     fn record_command_watch_at(&self, command: CommandId, root: PathBuf, now: std::time::Instant) {
         let mut map = self.command_roots.write().unwrap();
-        map.retain(|c, w| {
-            (c.session != command.session || w.closed_at.is_none())
-                && now.saturating_duration_since(w.recorded) < COMMAND_WATCH_TTL
+        map.retain(|_, w| match w.closed_instant {
+            Some(closed) => now.saturating_duration_since(closed) < CLOSED_WATCH_GRACE,
+            None => now.saturating_duration_since(w.recorded) < COMMAND_WATCH_TTL,
         });
         while map.len() >= COMMAND_WATCH_CAP {
             let Some(oldest) = map.iter().min_by_key(|(_, w)| w.recorded).map(|(c, _)| *c) else {
@@ -463,17 +474,22 @@ impl LiveBaseline {
                 ready_at: None,
                 deferred: false,
                 recorded: now,
+                closed_instant: None,
             },
         );
     }
 
-    /// L5 (review of #232, item 8): the session closed; its commands'
-    /// watches go with it.
-    pub fn forget_session_watches(&self, session: uuid::Uuid) {
-        self.command_roots
-            .write()
-            .unwrap()
-            .retain(|c, _| c.session != session);
+    /// L5 (review of #232, item 8): the session closed at `at`. Its
+    /// commands' watches close too and are dropped after the grace
+    /// period, like any closed watch.
+    pub fn close_session_watches(&self, session: uuid::Uuid, at: TimePoint) {
+        let now = std::time::Instant::now();
+        for (c, w) in self.command_roots.write().unwrap().iter_mut() {
+            if c.session == session {
+                w.closed_at.get_or_insert(at);
+                w.closed_instant.get_or_insert(now);
+            }
+        }
     }
 
     /// L5 (review round 5, item 2): `command`'s PostExec at `at` closed
@@ -482,6 +498,7 @@ impl LiveBaseline {
     pub fn close_command_watch(&self, command: CommandId, at: TimePoint) {
         if let Some(w) = self.command_roots.write().unwrap().get_mut(&command) {
             w.closed_at.get_or_insert(at);
+            w.closed_instant.get_or_insert_with(std::time::Instant::now);
         }
     }
 
@@ -568,6 +585,25 @@ mod tests {
         assert!(!lb.forget_command_watch(c), "nothing deferred");
     }
 
+    /// Review of #232 medium review, item 2: PreExec N+1 is handled
+    /// before N's open_create is ingested. The note was stamped during N,
+    /// so it is still left to N's confirmed watch, not journaled.
+    #[test]
+    fn late_create_of_a_closed_command_still_defers() {
+        let lb = LiveBaseline::new();
+        let n = CommandId {
+            session: Uuid::from_u128(8),
+            seq: 1,
+        };
+        let f = Path::new("/w/venv/bin/python");
+        lb.record_command_watch(n, PathBuf::from("/w"));
+        lb.confirm_command_watch(n, TimePoint::new(2, 0));
+        lb.close_command_watch(n, TimePoint::new(10, 0));
+        lb.record_command_watch(CommandId { seq: 2, ..n }, PathBuf::from("/w"));
+        assert!(lb.defer_create_to_kernel(n, f, TimePoint::new(9, 0)));
+        assert!(lb.forget_command_watch(n), "the deferral is still known");
+    }
+
     /// Review of #232 round 2, item 1: a shell whose `$PWD` runs through
     /// a symlink. The shim's canonical paths are under the recorded root.
     #[test]
@@ -606,9 +642,21 @@ mod tests {
         };
         lb.record_command_watch(c1, PathBuf::from("/w"));
         lb.record_command_watch(c2, PathBuf::from("/w"));
-        lb.forget_session_watches(s1);
-        assert!(!lb.command_watches(c1, f, at));
+        lb.close_session_watches(s1, TimePoint::new(5, 0));
+        // Closed at 5: a note stamped before still counts, a later one not.
+        assert!(lb.command_watches(c1, f, at));
+        assert!(!lb.command_watches(c1, f, TimePoint::new(6, 0)));
         assert!(lb.command_watches(c2, f, at));
+        // Past the grace period the closed watch is dropped.
+        lb.record_command_watch_at(
+            CommandId {
+                session: s2,
+                seq: 9,
+            },
+            PathBuf::from("/w"),
+            Instant::now() + CLOSED_WATCH_GRACE + Duration::from_secs(1),
+        );
+        assert!(!lb.command_watches(c1, f, at));
 
         let t0 = Instant::now();
         let old = CommandId {
@@ -653,10 +701,11 @@ mod tests {
         assert!(lb.command_watches(c, f, TimePoint::new(9, 0)));
         assert!(!lb.command_watches(c, f, TimePoint::new(11, 0)));
         assert!(!lb.command_watches(c, Path::new("/x/f"), TimePoint::new(9, 0)));
-        // The session's next command drops the closed one.
+        // Review of #232 medium review, item 2: the session's next command
+        // does not drop the closed one; a late note of `c` still counts.
         let next = CommandId { seq: 2, ..c };
         lb.record_command_watch(next, PathBuf::from("/w"));
-        assert!(!lb.command_watches(c, f, TimePoint::new(9, 0)));
+        assert!(lb.command_watches(c, f, TimePoint::new(9, 0)));
         assert!(lb.command_watches(next, f, TimePoint::new(12, 0)));
     }
 
