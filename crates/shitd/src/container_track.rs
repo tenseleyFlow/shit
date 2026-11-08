@@ -35,6 +35,8 @@ pub enum HandleError {
         verb: ContainerVerbWire,
         key: &'static str,
     },
+    #[error("strict capture refused the container event: {0}")]
+    CaptureRefused(String),
     #[error("journal write failed: {0}")]
     JournalWrite(String),
     #[error("stash hash mismatch: helper claimed {claimed}, daemon computed {computed}")]
@@ -48,11 +50,18 @@ pub enum HandleError {
 /// Handle one container-event request: resolve command window,
 /// translate wire → planner types, journal the event. Returns the
 /// journaled [`EventId`] on success.
+///
+/// With `strict` set (`SHIT_STRICT_CAPTURE`), an event the helper marked
+/// as degraded (`capture_failed` extra) or whose evidence has the wrong
+/// shape is replaced by a command-scoped `CaptureRefused` row. The event
+/// is not journaled (its inverse would fail halfway and hide the refusal)
+/// and the runtime command is never blocked.
 pub fn handle(
     req: ContainerEventReq,
     active: &crate::active_commands::ActiveCommands,
     index: &Index,
     blob_store: &BlobStore,
+    strict: bool,
 ) -> Result<EventId, HandleError> {
     let Some(command) = active.resolve_by_descendant(req.pid) else {
         tracing::warn!(
@@ -64,6 +73,32 @@ pub fn handle(
         return Err(HandleError::NoActiveCommand(req.pid));
     };
 
+    if strict && let Some(detail) = capture_gap(&req) {
+        crate::helper_link::journal_capture_refused_or_log(index, command, None, detail.clone());
+        return Err(HandleError::CaptureRefused(detail));
+    }
+
+    let result = journal_event(req, command, index, blob_store);
+    // In strict mode a failure after the gap check (blob write, hash
+    // mismatch, stash registration, missing extras, journal write) means
+    // the undo evidence is incomplete; make that durable too.
+    if strict && let Err(e) = &result {
+        crate::helper_link::journal_capture_refused_or_log(
+            index,
+            command,
+            None,
+            format!("container event could not be journaled: {e}"),
+        );
+    }
+    result
+}
+
+fn journal_event(
+    req: ContainerEventReq,
+    command: shit_planner::CommandId,
+    index: &Index,
+    blob_store: &BlobStore,
+) -> Result<EventId, HandleError> {
     let runtime = wire_to_planner_runtime(req.runtime);
     let op = build_container_op(req.verb, &req.extras)?;
     let stash_tarball = req.stash_tarball.map(BlobHash::from_bytes);
@@ -156,6 +191,43 @@ pub fn handle(
             tracing::error!(error = %e, pid = req.pid, "container-event journal write failed");
             Err(HandleError::JournalWrite(e.to_string()))
         }
+    }
+}
+
+/// Why this request cannot support a faithful undo, if it cannot.
+/// Request-shape checks stay narrow: each one is a state no healthy
+/// helper produces, so flagging it never refuses a good capture.
+fn capture_gap(req: &ContainerEventReq) -> Option<String> {
+    let verb = format!("{:?}", req.verb);
+    if let Some(cause) = req.extras.get(shit_proto::CONTAINER_CAPTURE_FAILED_EXTRA) {
+        return Some(format!("container {verb} pre-capture failed: {cause}"));
+    }
+    let has_hash = req.stash_tarball.is_some();
+    let has_bytes = req.stash_tarball_bytes.is_some();
+    if has_hash != has_bytes {
+        return Some(format!(
+            "container {verb} stash hash and bytes are not both present"
+        ));
+    }
+    if req.stash_tarball_bytes.as_ref().is_some_and(Vec::is_empty) {
+        return Some(format!("container {verb} stash tarball is empty"));
+    }
+    let config_is_object = || {
+        serde_json::from_slice::<serde_json::Value>(&req.captured_config)
+            .map(|v| match v {
+                serde_json::Value::Array(items) => items.len() == 1 && items[0].is_object(),
+                other => other.is_object(),
+            })
+            .unwrap_or(false)
+    };
+    match req.verb {
+        ContainerVerbWire::Rm | ContainerVerbWire::NetworkRm if !config_is_object() => Some(
+            format!("container {verb} captured configuration is missing or not one JSON object"),
+        ),
+        ContainerVerbWire::Rmi | ContainerVerbWire::VolumeRm if !has_hash => {
+            Some(format!("container {verb} has no stash tarball"))
+        }
+        _ => None,
     }
 }
 
@@ -385,5 +457,67 @@ mod tests {
                 key: "image"
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod capture_gap_tests {
+    use super::*;
+
+    fn req(verb: ContainerVerbWire) -> ContainerEventReq {
+        ContainerEventReq {
+            runtime: ContainerRuntimeWire::Docker,
+            verb,
+            captured_config: Vec::new(),
+            stash_image: None,
+            stash_tarball: None,
+            stash_tarball_bytes: None,
+            extras: BTreeMap::new(),
+            pid: 1,
+            uid: 0,
+        }
+    }
+
+    #[test]
+    fn helper_marked_failure_is_a_gap() {
+        let mut r = req(ContainerVerbWire::Pull);
+        r.extras.insert(
+            shit_proto::CONTAINER_CAPTURE_FAILED_EXTRA.into(),
+            "docker inspect failed".into(),
+        );
+        let gap = capture_gap(&r).expect("gap");
+        assert!(gap.contains("docker inspect failed"), "{gap}");
+    }
+
+    #[test]
+    fn complete_rm_and_rmi_are_not_gaps() {
+        let mut rm = req(ContainerVerbWire::Rm);
+        rm.captured_config = br#"[{"Id":"abc"}]"#.to_vec();
+        assert!(capture_gap(&rm).is_none());
+        let mut rmi = req(ContainerVerbWire::Rmi);
+        rmi.stash_tarball = Some([1; 32]);
+        rmi.stash_tarball_bytes = Some(vec![1, 2, 3]);
+        assert!(capture_gap(&rmi).is_none());
+    }
+
+    #[test]
+    fn missing_evidence_is_a_gap() {
+        assert!(capture_gap(&req(ContainerVerbWire::Rm)).is_some());
+        assert!(capture_gap(&req(ContainerVerbWire::NetworkRm)).is_some());
+        assert!(capture_gap(&req(ContainerVerbWire::Rmi)).is_some());
+        assert!(capture_gap(&req(ContainerVerbWire::VolumeRm)).is_some());
+        let mut half = req(ContainerVerbWire::Rmi);
+        half.stash_tarball = Some([1; 32]);
+        assert!(capture_gap(&half).is_some());
+        let mut empty = req(ContainerVerbWire::Rmi);
+        empty.stash_tarball = Some([1; 32]);
+        empty.stash_tarball_bytes = Some(Vec::new());
+        assert!(capture_gap(&empty).is_some());
+    }
+
+    #[test]
+    fn compose_down_and_pull_have_no_shape_rule() {
+        assert!(capture_gap(&req(ContainerVerbWire::ComposeDown)).is_none());
+        assert!(capture_gap(&req(ContainerVerbWire::Pull)).is_none());
     }
 }

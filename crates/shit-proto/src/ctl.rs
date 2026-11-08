@@ -735,6 +735,11 @@ pub struct PkgEventReq {
 /// `stash_tarball` is the blake3-keyed tarball blob hash for Rmi /
 /// VolumeRm. Both `None` for ops that don't need a content stash
 /// (network-rm relies on inspect JSON alone).
+/// `ContainerEventReq::extras` key the helper sets when its pre-event
+/// capture could not gather the evidence the inverse needs. The value is
+/// the human-readable cause. The daemon refuses the command in strict mode.
+pub const CONTAINER_CAPTURE_FAILED_EXTRA: &str = "capture_failed";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerEventReq {
     pub runtime: ContainerRuntimeWire,

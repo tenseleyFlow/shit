@@ -2,11 +2,12 @@
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use shit_preload_shim::install_config::expand_tilde;
 use shit_proto::{
     CtlRequest, CtlResponse, HOOK_DGRAM_MAX_FRAME, HookMessage, RedirectOpWire, RedirectTargetWire,
     ShellKind, decode_frame, encode_frame, encode_frame_large,
 };
-use shit_shell::redirect::{RedirectOp, parse_redirects};
+use shit_shell::redirect::{Quote, RedirectOp, RedirectTarget, parse_redirects};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -452,14 +453,11 @@ fn run_pre_exec_redirects(
     if analysis.is_empty() {
         return Ok(());
     }
-    let targets: Vec<RedirectTargetWire> = analysis
-        .targets
-        .into_iter()
-        .map(|t| RedirectTargetWire {
-            op: to_op_wire(t.op),
-            path: t.path,
-        })
-        .collect();
+    // This process runs in the shell's working directory, so relative
+    // targets resolve here and not against the daemon's cwd.
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let targets = resolve_targets(analysis.targets, cwd.as_deref(), home.as_deref());
     let ctl_path = ctl_sock
         .or_else(|| {
             sock.as_ref()
@@ -489,6 +487,112 @@ fn run_pre_exec_redirects(
             Ok(())
         }
     }
+}
+
+/// Resolve every parsed target and drop repeats. Identity is the operator
+/// plus the resolved path: `> f` and `> "f"` name one file, while
+/// `> ~/x` and `> '~/x'` resolve to different ones and stay separate.
+fn resolve_targets(
+    targets: Vec<RedirectTarget>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<RedirectTargetWire> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in targets {
+        let path = resolve_redirect_target(&t, cwd, home);
+        if seen.insert((t.op, path.clone())) {
+            out.push(RedirectTargetWire {
+                op: to_op_wire(t.op),
+                path,
+            });
+        }
+    }
+    out
+}
+
+/// Resolve a redirect target to the path the kernel tiers will record.
+///
+/// Expansion follows the quoting the parser recorded. Only an unquoted
+/// leading `~`, `~/`, `$HOME` or `${HOME}` expands to `home`; a quoted
+/// `'~/x'` names a file called `~` in the cwd. Single-quoted text is
+/// literal. In double-quoted or mixed text `$` and backticks still expand
+/// in the shell, so those targets cannot be resolved here; `(`, `*`, `{`
+/// and the like are literal there. Unquoted text with any of them is
+/// unresolvable.
+///
+/// A relative path becomes absolute by joining it onto `cwd`, but only
+/// when `t.cwd_stable` says nothing earlier on the line can change the
+/// directory (`cd build && make > log` writes under `build`, not here).
+/// The result keeps its final component as written, so a symlink there
+/// keeps its own identity, but the parent directory is canonicalized: the
+/// kernel reports `/work/out` for `sub/../out`, and a pre-image keyed to
+/// `/work/sub/../out` would never match it in the planner.
+///
+/// An unresolvable target is sent as written; the daemon skips it in
+/// default mode and refuses the command in strict mode.
+fn resolve_redirect_target(t: &RedirectTarget, cwd: Option<&Path>, home: Option<&Path>) -> String {
+    let raw = t.path.as_str();
+    if raw.is_empty() {
+        return raw.to_owned();
+    }
+    let expanded_home = match (t.quote, home) {
+        (Quote::None, Some(home)) => {
+            let e = expand_tilde(raw, home);
+            (e != raw).then_some(e)
+        }
+        _ => None,
+    };
+    let resolvable = match (&expanded_home, t.quote) {
+        // The tail after the home prefix is plain text; check it.
+        (Some(_), _) => {
+            let tail = ["~", "${HOME}", "$HOME"]
+                .iter()
+                .find_map(|p| raw.strip_prefix(p))
+                .unwrap_or(raw);
+            !has_unexpanded_syntax(tail)
+        }
+        (None, Quote::None) => !has_unexpanded_syntax(raw),
+        (None, Quote::Single) => true,
+        (None, Quote::Double | Quote::Mixed) => !raw.contains(['$', '`']),
+    };
+    if !resolvable {
+        return raw.to_owned();
+    }
+    let path = expanded_home.as_deref().unwrap_or(raw);
+    let joined: PathBuf = if path.starts_with('/') {
+        PathBuf::from(path)
+    } else {
+        match cwd {
+            Some(dir) if t.cwd_stable && dir.is_absolute() => dir.join(path),
+            _ => return raw.to_owned(),
+        }
+    };
+    let resolved = canonical_parent(&joined).unwrap_or(joined);
+    match resolved.to_str() {
+        Some(text) => text.to_owned(),
+        None => raw.to_owned(),
+    }
+}
+
+/// `parent.canonicalize()` joined with the final component. `None` when
+/// there is no usable final component or the parent does not resolve.
+fn canonical_parent(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = path.parent()?.canonicalize().ok()?;
+    Some(parent.join(name))
+}
+
+/// Unquoted text the shell would expand: parameters, command
+/// substitution, globs, braces, escapes, and a leading `~`.
+fn has_unexpanded_syntax(raw: &str) -> bool {
+    raw.starts_with('~')
+        || raw.chars().any(|ch| {
+            matches!(
+                ch,
+                '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '\\' | '(' | ')'
+            )
+        })
 }
 
 fn to_op_wire(op: RedirectOp) -> RedirectOpWire {
@@ -677,4 +781,186 @@ fn send_over_ctl(sock_path: &Path, msg: &HookMessage) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod redirect_resolve_tests {
+    use super::*;
+
+    fn tmp() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        (dir, root)
+    }
+
+    fn tgt(path: &str, quote: Quote, cwd_stable: bool) -> RedirectTarget {
+        RedirectTarget {
+            op: RedirectOp::Truncate,
+            path: path.to_string(),
+            quote,
+            cwd_stable,
+        }
+    }
+
+    /// Unquoted, cwd-stable target with no home directory.
+    fn resolve(raw: &str, cwd: Option<&Path>) -> String {
+        resolve_redirect_target(&tgt(raw, Quote::None, true), cwd, None)
+    }
+
+    fn resolve_q(raw: &str, quote: Quote, cwd: &Path, home: &Path) -> String {
+        resolve_redirect_target(&tgt(raw, quote, true), Some(cwd), Some(home))
+    }
+
+    #[test]
+    fn dedup_is_by_resolved_path_not_quoting() {
+        let (_d, root) = tmp();
+        let go = |line: &str, home: Option<&Path>| {
+            resolve_targets(parse_redirects(line).targets, Some(&root), home)
+        };
+        // Same file written two ways: one target.
+        assert_eq!(go("echo a > f > \"f\"", None).len(), 1);
+        assert_eq!(go("echo a > f > ./f", None).len(), 1);
+        // Same text, different files: `~/x` is $HOME/x, `'~/x'` is ./~/x.
+        assert_eq!(go("echo a > ~/x > '~/x'", Some(&root)).len(), 2);
+        // Different operators on one path stay separate.
+        assert_eq!(go("echo a > f >> f", None).len(), 2);
+    }
+
+    #[test]
+    fn relative_target_joins_shell_cwd() {
+        let (_d, root) = tmp();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let cwd = root.join("sub");
+        assert_eq!(
+            resolve("out", Some(&cwd)),
+            root.join("sub/out").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn dotdot_is_normalized_through_the_parent() {
+        let (_d, root) = tmp();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let cwd = root.join("sub");
+        assert_eq!(
+            resolve("../out", Some(&cwd)),
+            root.join("out").to_str().unwrap()
+        );
+        let abs = format!("{}/sub/../out", root.display());
+        assert_eq!(resolve(&abs, None), root.join("out").to_str().unwrap());
+    }
+
+    #[test]
+    fn symlinked_parent_resolves_physically_final_symlink_is_kept() {
+        let (_d, root) = tmp();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.join("real/final")).unwrap();
+        assert_eq!(
+            resolve("link/f", Some(&root)),
+            root.join("real/f").to_str().unwrap()
+        );
+        assert_eq!(
+            resolve("link/final", Some(&root)),
+            root.join("real/final").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_parent_falls_back_to_the_plain_join() {
+        let cwd = Path::new("/nonexistent-shit-root");
+        assert_eq!(resolve("a/b", Some(cwd)), "/nonexistent-shit-root/a/b");
+    }
+
+    #[test]
+    fn unquoted_home_forms_expand_only_when_unquoted() {
+        let (_d, home) = tmp();
+        let cwd = home.join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let want = home.join("new.log");
+        for raw in ["~/new.log", "$HOME/new.log", "${HOME}/new.log"] {
+            assert_eq!(
+                resolve_q(raw, Quote::None, &cwd, &home),
+                want.to_str().unwrap(),
+                "{raw}"
+            );
+        }
+        // Single quotes: a literal file named `~` (or `$HOME`) in the cwd.
+        assert_eq!(
+            resolve_q("~/x", Quote::Single, &cwd, &home),
+            cwd.join("~/x").to_str().unwrap()
+        );
+        assert_eq!(
+            resolve_q("$HOME/x", Quote::Single, &cwd, &home),
+            cwd.join("$HOME/x").to_str().unwrap()
+        );
+        // Double quotes: tilde is literal, `$HOME` would expand, so it is
+        // left for the daemon to skip or refuse.
+        assert_eq!(
+            resolve_q("~/x", Quote::Double, &cwd, &home),
+            cwd.join("~/x").to_str().unwrap()
+        );
+        assert_eq!(resolve_q("$HOME/x", Quote::Double, &cwd, &home), "$HOME/x");
+        // `~user` and `$HOMEFOO` are not the home directory.
+        assert_eq!(resolve_q("~other/x", Quote::None, &cwd, &home), "~other/x");
+        assert_eq!(
+            resolve_q("$HOMEFOO/x", Quote::None, &cwd, &home),
+            "$HOMEFOO/x"
+        );
+    }
+
+    #[test]
+    fn quoted_names_with_shell_punctuation_are_literal() {
+        let (_d, root) = tmp();
+        let want = root.join("notes (draft).txt");
+        assert_eq!(
+            resolve_q("notes (draft).txt", Quote::Single, &root, &root),
+            want.to_str().unwrap()
+        );
+        assert_eq!(
+            resolve_q("notes (draft).txt", Quote::Double, &root, &root),
+            want.to_str().unwrap()
+        );
+        // The same text unquoted is a syntax error or a subshell.
+        assert_eq!(
+            resolve_q("notes (draft).txt", Quote::None, &root, &root),
+            "notes (draft).txt"
+        );
+    }
+
+    #[test]
+    fn other_unexpanded_syntax_is_sent_verbatim() {
+        let cwd = Path::new("/work");
+        for raw in ["$NOPE/out", "a*b", "`pwd`/x", "{a,b}", "a\\ b"] {
+            assert_eq!(resolve(raw, Some(cwd)), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn relative_target_after_a_possible_cd_is_not_resolved() {
+        let (_d, root) = tmp();
+        let t = parse_redirects("cd sub && echo x > out").targets;
+        assert_eq!(t.len(), 1);
+        assert!(!t[0].cwd_stable);
+        assert_eq!(resolve_redirect_target(&t[0], Some(&root), None), "out");
+        // Absolute targets do not depend on the cwd.
+        let abs = format!("cd sub && echo x > {}/out", root.display());
+        let t = parse_redirects(&abs).targets;
+        assert_eq!(
+            resolve_redirect_target(&t[0], Some(&root), None),
+            root.join("out").to_str().unwrap()
+        );
+        // Without a cd the same relative target resolves.
+        let t = parse_redirects("echo x > out").targets;
+        assert_eq!(
+            resolve_redirect_target(&t[0], Some(&root), None),
+            root.join("out").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_or_relative_cwd_leaves_target_alone() {
+        assert_eq!(resolve("out", None), "out");
+        assert_eq!(resolve("out", Some(Path::new("rel"))), "out");
+    }
 }

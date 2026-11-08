@@ -1270,7 +1270,7 @@ fn note_ingest_failure(strict_capture: bool, index: &Index, command: CommandId, 
     }
 }
 
-fn journal_capture_refused_or_log(
+pub(crate) fn journal_capture_refused_or_log(
     index: &Index,
     command: CommandId,
     path: Option<PathBuf>,
