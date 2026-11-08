@@ -188,7 +188,7 @@ async fn handle_one(
         // L5: a shell started before an upgrade still has the old shim
         // loaded. Say so by name; its notifications cannot be read.
         Err(shit_proto::DecodeError::UnsupportedVersion(got)) => {
-            let peer_pid = stream.peer_cred().ok().and_then(|c| c.pid());
+            let peer_pid = peer_pid(&stream);
             warn!(
                 got,
                 expected = shit_proto::SHIM_WIRE_VERSION,
@@ -199,9 +199,7 @@ async fn handle_one(
             // command before acking (the caller may exit right after),
             // then ack Allow. Acks are version-1 frames, which every shim
             // reads, so the old shim does not wait out its timeout.
-            let command = peer_pid
-                .and_then(|p| u32::try_from(p).ok())
-                .and_then(|p| active.resolve_by_descendant(p));
+            let command = peer_pid.and_then(|p| active.resolve_by_descendant(p));
             let ts = crate::server::next_ts();
             if let Ok(frame) = encode_frame(&ShimAck::Allow) {
                 let _ = stream.write_all(&frame).await;
@@ -361,6 +359,41 @@ fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> Captur
         }),
         (k, _) => k,
     }
+}
+
+/// The pid of the process on the other end of a shim connection.
+///
+/// tokio's `peer_cred` carries a pid on Linux and macOS but not on
+/// FreeBSD, where it uses `getpeereid`. FreeBSD 13 and later report the
+/// peer's pid in `LOCAL_PEERCRED`'s `xucred`, so read that there.
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    if let Some(pid) = stream.peer_cred().ok().and_then(|c| c.pid()) {
+        return u32::try_from(pid).ok().filter(|p| *p > 0);
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: xucred is plain old data; zeroed is a valid value.
+        let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+        // SAFETY: a valid socket fd and a buffer of `len` bytes. Level 0
+        // is SOL_LOCAL (sys/un.h), which libc does not export here.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 && cred.cr_version == libc::XUCRED_VERSION {
+            // SAFETY: the kernel fills cr_pid for LOCAL_PEERCRED (13.0+).
+            let pid = unsafe { cred.cr_pid__c_anonymous_union.cr_pid };
+            return u32::try_from(pid).ok().filter(|p| *p > 0);
+        }
+    }
+    None
 }
 
 /// L5 (review of #232, item 4; #225): a shim built for another wire
