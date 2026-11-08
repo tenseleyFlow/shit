@@ -29,6 +29,10 @@ pub mod bsd;
 ))]
 pub mod cwd;
 
+// Every producer sends its observations through `accounting`; only the
+// Linux and BSD producers keep its close-time ledger.
+pub mod accounting;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 

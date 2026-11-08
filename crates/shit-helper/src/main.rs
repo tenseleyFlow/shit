@@ -1626,7 +1626,18 @@ fn boot_ebpf_lsm(
     if let Some(r) = release_reader {
         readers.push(r);
     }
-    let flush = readers.iter().map(ebpf::LsmReader::flush_handle).collect();
+    let flush: Vec<ebpf::LsmFlushHandle> =
+        readers.iter().map(ebpf::LsmReader::flush_handle).collect();
+    if let Some(rt) = &runtime {
+        let staging = rt
+            .lock()
+            .map(|g| g.staging_dir().to_path_buf())
+            .unwrap_or_else(|e| e.into_inner().staging_dir().to_path_buf());
+        let trusted = probe_fmode_created(&staging, &flush);
+        if let Ok(mut g) = rt.lock() {
+            g.set_fmode_created_trusted(trusted);
+        }
+    }
     Ok(LsmCaptureState {
         _readers: readers,
         _loader: loader,
@@ -1636,6 +1647,49 @@ fn boot_ebpf_lsm(
             flush,
         },
     })
+}
+
+/// Check that `file_open` reports `FMODE_CREATED` the way the born set
+/// assumes (R3 slice B, D-11). The bit is a kernel macro, not BTF, so
+/// the helper creates a file in its staging dir, reopens it, and looks
+/// at its own two open events. Any failure leaves the bit untrusted;
+/// birth is then proven only by create stats and walked parents.
+#[cfg(target_os = "linux")]
+fn probe_fmode_created(staging: &std::path::Path, flush: &[ebpf::LsmFlushHandle]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path = staging.join(format!(".fmode-created-probe-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    ebpf::ringbuf_reader::fmode_probe_begin(std::process::id());
+    let target = (|| {
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()?;
+        let meta = created.metadata().ok()?;
+        drop(created);
+        let reopened = std::fs::OpenOptions::new().write(true).open(&path).ok()?;
+        drop(reopened);
+        Some((meta.dev(), meta.ino()))
+    })();
+    let flushed = ebpf::flush_all_readers(flush, LSM_FLUSH_TIMEOUT);
+    let seen = ebpf::ringbuf_reader::fmode_probe_finish();
+    let _ = std::fs::remove_file(&path);
+    let passed = match (target, &flushed) {
+        (Some(target), Ok(())) => capture::linux::fmode_created_probe_passed(&seen, target),
+        _ => false,
+    };
+    if passed {
+        tracing::info!("FMODE_CREATED probe passed; creating opens prove birth");
+    } else {
+        tracing::warn!(
+            ?target,
+            flush = ?flushed,
+            events = seen.len(),
+            "FMODE_CREATED probe failed; birth falls back to create stats and walked parents"
+        );
+    }
+    passed
 }
 
 /// Decide which kernel-tier the helper *should* use based on the
@@ -2339,25 +2393,6 @@ fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<PathBuf, String> 
     })
 }
 
-/// Send a `CaptureRefused` observation. The daemon decides whether it
-/// becomes a journal row (strict mode) or a log line.
-fn send_capture_observation(
-    conn: &ipc::Conn,
-    command: shit_planner::events::CommandId,
-    path: Option<String>,
-    detail: String,
-) {
-    let resp = shit_proto::HelperResponse::CaptureRefused {
-        session: command.session,
-        seq: command.seq,
-        path,
-        detail,
-    };
-    if let Err(e) = conn.send_response(&resp) {
-        tracing::warn!(err = %e, %command, "CaptureRefused observation send failed");
-    }
-}
-
 /// Close-barrier marker for `UnwatchTree`. Sent on every path, degraded
 /// included: it means "nothing more will arrive for this command".
 /// macOS sends it through `capture::UnwatchFlushMarker` instead.
@@ -2384,7 +2419,7 @@ fn begin_watch(
         return true;
     }
     tracing::warn!(%command, "duplicate WatchTree ignored");
-    send_capture_observation(
+    capture::accounting::send_capture_observation(
         conn,
         command,
         None,
@@ -2419,12 +2454,21 @@ fn linux_watch_tree(
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
         // L01: explicit dedupe-state init for the command.
+        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
         if let Some(rt) = &state.capture_runtime
             && let Ok(mut g) = rt.lock()
         {
             g.on_watch_tree(command);
+            g.mark_kernel_losses(
+                command,
+                "the fanotify queue",
+                state.overflows.load(std::sync::atomic::Ordering::Acquire),
+            );
+            if let Ok(cwd) = &cwd {
+                g.note_direct_children_baseline(command, cwd);
+            }
         }
-        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid)?;
+        let cwd = cwd?;
         // L01: narrow-scope fanotify mark on the watch cwd
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
@@ -2467,6 +2511,11 @@ fn linux_watch_tree(
             && let Ok(mut g) = rt.lock()
         {
             g.on_watch_tree(command);
+            g.mark_kernel_losses(
+                command,
+                "the eBPF ring buffers",
+                ebpf::ringbuf_losses_observed(),
+            );
             if let Ok(cwd) = &cwd {
                 g.pre_open_tree(command, cwd);
             }
@@ -2489,7 +2538,7 @@ fn linux_watch_tree(
                     tier = "ebpf-lsm",
                     "watch_tree registered without pre-opens (LSM tier)"
                 );
-                send_capture_observation(
+                capture::accounting::send_capture_observation(
                     conn,
                     command,
                     None,
@@ -2504,7 +2553,7 @@ fn linux_watch_tree(
             command_seq,
             "watch_tree with no fanotify or lsm tier (degraded)"
         );
-        send_capture_observation(
+        capture::accounting::send_capture_observation(
             conn,
             command,
             None,
@@ -2862,7 +2911,7 @@ fn request_loop(
                         "watch_tree ignored — no macos capture (degraded)"
                     );
                     if macos_es_capture.is_none() {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
@@ -2980,7 +3029,10 @@ fn request_loop(
                     let runtime = state.capture_runtime.as_ref().and_then(|rt| rt.lock().ok());
                     state.tree.lock().unwrap().unwatch(session, command_seq);
                     if let Some(mut g) = runtime {
-                        g.on_unwatch_tree(cmd);
+                        g.on_unwatch_tree_counting(
+                            cmd,
+                            Some(state.overflows.load(std::sync::atomic::Ordering::Acquire)),
+                        );
                     }
                     if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd)
                         && let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path)
@@ -2998,7 +3050,7 @@ fn request_loop(
                     // to this command, then stop watching.
                     if let Err(detail) = ebpf::flush_all_readers(&state.flush, LSM_FLUSH_TIMEOUT) {
                         tracing::warn!(%session, command_seq, %detail, "eBPF reader flush incomplete");
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
@@ -3010,7 +3062,7 @@ fn request_loop(
                     if let Some(rt) = &state.runtime
                         && let Ok(mut g) = rt.lock()
                     {
-                        g.on_unwatch_tree(cmd);
+                        g.on_unwatch_tree_counting(cmd, Some(ebpf::ringbuf_losses_observed()));
                     }
                     tracing::info!(%session, command_seq, tier = "ebpf-lsm", "unwatch_tree");
                 }
@@ -3033,7 +3085,7 @@ fn request_loop(
                             tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
                         }
                         Some(DetachOutcome::Deferred) => {
-                            send_capture_observation(
+                            capture::accounting::send_capture_observation(
                                 &conn,
                                 command,
                                 None,
@@ -3041,7 +3093,7 @@ fn request_loop(
                             );
                         }
                         Some(DetachOutcome::PumpGone) => {
-                            send_capture_observation(
+                            capture::accounting::send_capture_observation(
                                 &conn,
                                 command,
                                 None,
@@ -3079,14 +3131,14 @@ fn request_loop(
                     // `flush` is still held here, so these go out ahead of
                     // the marker however fast the pumps are.
                     if outcomes.contains(&DetachOutcome::PumpGone) {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
                             capture::DETACH_PUMP_GONE_DETAIL.to_string(),
                         );
                     } else if outcomes.contains(&DetachOutcome::Deferred) {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
@@ -3096,7 +3148,7 @@ fn request_loop(
                     // FSEvents delivers with latency and has no way to ask
                     // for what the kernel still holds. ES has no such gap.
                     if macos_capture.is_some() && macos_es_capture.is_none() {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,

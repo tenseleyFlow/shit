@@ -272,11 +272,89 @@ pub struct LiveBaseline {
     /// closes, and after [`COMMAND_WATCH_TTL`] or past
     /// [`COMMAND_WATCH_CAP`].
     command_roots: RwLock<HashMap<CommandId, CommandWatch>>,
+    /// R3 slice B — inodes whose BaselineCaptured the daemon could not
+    /// ingest, per `(session, cwd)` of the walk that sent them. The
+    /// helper already counts them as baselined, so a later write in that
+    /// session has no pre-write content anywhere. Cleared when a command
+    /// in that session and cwd closes; at most [`MAX_FAILED_INGESTS`]
+    /// inodes are kept in all.
+    ingest_failed: std::sync::Mutex<FailedIngests>,
+}
+
+/// Bound on inodes kept across every scope of [`LiveBaseline`]'s failed
+/// ingests. Past it a scope is marked saturated instead of growing, and
+/// every inode in it counts as failed until it is cleared.
+pub const MAX_FAILED_INGESTS: usize = 4096;
+
+#[derive(Default)]
+pub struct FailedIngests {
+    by_scope: HashMap<(uuid::Uuid, PathBuf), FailedScope>,
+    total: usize,
+}
+
+#[derive(Default)]
+struct FailedScope {
+    inodes: std::collections::HashSet<(u64, u64)>,
+    saturated: bool,
 }
 
 impl LiveBaseline {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that the baseline for `(dev, inode)`, walked for
+    /// `session` in `cwd`, was not ingested.
+    pub fn mark_ingest_failed(&self, session: uuid::Uuid, cwd: &Path, dev: u64, inode: u64) {
+        let mut f = self.ingest_failed.lock().unwrap_or_else(|e| e.into_inner());
+        let full = f.total >= MAX_FAILED_INGESTS;
+        let scope = f.by_scope.entry((session, cwd.to_path_buf())).or_default();
+        if scope.saturated || scope.inodes.contains(&(dev, inode)) {
+            return;
+        }
+        if full {
+            scope.saturated = true;
+            return;
+        }
+        scope.inodes.insert((dev, inode));
+        f.total += 1;
+    }
+
+    /// A later baseline for `(dev, inode)` in this scope was ingested.
+    pub fn clear_ingest_inode(&self, session: uuid::Uuid, cwd: &Path, dev: u64, inode: u64) {
+        let mut f = self.ingest_failed.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = f
+            .by_scope
+            .get_mut(&(session, cwd.to_path_buf()))
+            .is_some_and(|scope| scope.inodes.remove(&(dev, inode)));
+        if removed {
+            f.total -= 1;
+        }
+    }
+
+    /// A command in `session` and `cwd` closed: its walk's failures are
+    /// no longer anyone's pre-image.
+    pub fn clear_ingest_failed_for(&self, session: uuid::Uuid, cwd: &Path) {
+        let mut f = self.ingest_failed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(scope) = f.by_scope.remove(&(session, cwd.to_path_buf())) {
+            f.total -= scope.inodes.len();
+        }
+    }
+
+    /// True when a walk for `session` failed to ingest `(dev, inode)`.
+    pub fn ingest_failed(&self, session: uuid::Uuid, dev: u64, inode: u64) -> bool {
+        let f = self.ingest_failed.lock().unwrap_or_else(|e| e.into_inner());
+        f.by_scope.iter().any(|((s, _), scope)| {
+            *s == session && (scope.saturated || scope.inodes.contains(&(dev, inode)))
+        })
+    }
+
+    /// Inodes kept across every scope.
+    pub fn failed_ingest_entries(&self) -> usize {
+        self.ingest_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .total
     }
 
     /// Get or create the cache entry for `cwd`. Newly-created
@@ -580,6 +658,39 @@ mod tests {
         lb.record_command_watch(next, PathBuf::from("/w"));
         assert!(!lb.command_watches(c, f, TimePoint::new(9, 0)));
         assert!(lb.command_watches(next, f, TimePoint::new(12, 0)));
+    }
+
+    #[test]
+    fn failed_ingests_are_scoped_to_session_and_cleared_at_close() {
+        let lb = LiveBaseline::new();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let cwd = Path::new("/w");
+        lb.mark_ingest_failed(a, cwd, 1, 7);
+        assert!(lb.ingest_failed(a, 1, 7));
+        assert!(!lb.ingest_failed(b, 1, 7), "another session");
+        lb.clear_ingest_failed_for(b, cwd);
+        assert!(lb.ingest_failed(a, 1, 7), "another session's close");
+        lb.clear_ingest_failed_for(a, Path::new("/other"));
+        assert!(lb.ingest_failed(a, 1, 7), "another cwd's close");
+        lb.clear_ingest_failed_for(a, cwd);
+        assert!(!lb.ingest_failed(a, 1, 7), "cleared at its command's close");
+    }
+
+    #[test]
+    fn failed_ingests_past_the_cap_count_every_inode() {
+        let lb = LiveBaseline::new();
+        let a = Uuid::from_u128(3);
+        let cwd = Path::new("/w");
+        for i in 0..(MAX_FAILED_INGESTS as u64 + 1) {
+            lb.mark_ingest_failed(a, cwd, 1, i);
+        }
+        assert!(
+            lb.ingest_failed(a, 9, 999_999),
+            "a saturated scope covers every inode"
+        );
+        assert!(lb.failed_ingest_entries() <= MAX_FAILED_INGESTS);
+        lb.clear_ingest_failed_for(a, cwd);
+        assert!(!lb.ingest_failed(a, 9, 999_999));
     }
 
     fn cmd(seq: u64) -> CommandId {
