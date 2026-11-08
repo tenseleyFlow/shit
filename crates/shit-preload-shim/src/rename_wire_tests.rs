@@ -263,3 +263,33 @@ fn canonicalize_marker_and_destination_gap_are_both_sent() {
         "{notes:#?}"
     );
 }
+
+/// Review of #232 round 2, item 6: the entry resolver used for unlink on
+/// macOS (and renames everywhere) keeps a symlink as the link.
+#[test]
+fn entry_resolution_keys_a_symlink_to_the_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::write(dir.join("target"), b"t").unwrap();
+    std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+    let (abs, failure) =
+        super::policy::entry_or_raw(tmp.path().join("link").to_str().unwrap(), "path");
+    assert!(failure.is_none());
+    assert_eq!(abs, dir.join("link").to_str().unwrap());
+}
+
+/// Review of #232 round 2, item 8: a muted shim (`SHIT_SHIM_DISABLE`, as
+/// `shit undo` runs) reports no removal after the call.
+#[test]
+fn muted_removal_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(dir.join("d")).unwrap();
+    let pending =
+        super::policy::removal_pending("rmdir", dir.join("d").to_str().unwrap().to_string(), None);
+    std::fs::remove_dir(dir.join("d")).unwrap();
+    let notes = test_capture::capture(|| {
+        super::policy::test_mute::with_muted(|| super::policy::removal_end(pending, 0));
+    });
+    assert!(notes.is_empty(), "{notes:#?}");
+}

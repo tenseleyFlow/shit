@@ -511,8 +511,31 @@ mod policy {
     /// True when the shim is muted via `SHIT_SHIM_DISABLE=1`. Cached
     /// after the first call so the env probe happens once per process.
     pub fn disabled() -> bool {
+        #[cfg(test)]
+        if test_mute::muted() {
+            return true;
+        }
         static D: OnceLock<bool> = OnceLock::new();
         *D.get_or_init(|| std::env::var_os("SHIT_SHIM_DISABLE").as_deref() == Some("1".as_ref()))
+    }
+
+    /// Unit-test hook: mute the shim on this thread, as
+    /// `SHIT_SHIM_DISABLE=1` does for a whole process.
+    #[cfg(test)]
+    pub mod test_mute {
+        use std::cell::Cell;
+        thread_local! {
+            static MUTED: Cell<bool> = const { Cell::new(false) };
+        }
+        pub fn muted() -> bool {
+            MUTED.with(|m| m.get())
+        }
+        pub fn with_muted<T>(f: impl FnOnce() -> T) -> T {
+            MUTED.with(|m| m.set(true));
+            let out = f();
+            MUTED.with(|m| m.set(false));
+            out
+        }
     }
 
     /// Notification stub. The full version sends a pre-mutation frame
@@ -572,6 +595,24 @@ mod policy {
             return;
         }
         notify_inner(syscall, path, Some(path));
+    }
+
+    /// Review of #232 round 2, item 6: `unlink` acts on the entry itself,
+    /// so the key is the canonical parent plus the final name, and a
+    /// symlink's removal is keyed to the link, never its target. A
+    /// regular file is captured as usual. (#223 gives Linux the same rule
+    /// as `resolve_leaf_at_for_notify`; the names are reconciled when it
+    /// lands.)
+    #[cfg(target_os = "macos")]
+    pub fn notify_unlink_entry(syscall: &'static str, path: &str) {
+        if idle(path) {
+            return;
+        }
+        let (abs, failure) = entry_or_raw(path, "path");
+        if should_skip_path(&abs) {
+            return;
+        }
+        notify_inner_with_failure(syscall, &abs, Some(&abs), failure, true);
     }
 
     /// Outcome of resolving an `*at` syscall's `(dirfd, path)` pair for
@@ -741,6 +782,11 @@ mod policy {
     /// rename, `from\tto`) with the AU10 marker and no capture.
     #[cfg(target_os = "macos")]
     pub fn notify_unresolved(syscall: &'static str, arg: &str, failure: shit_proto::ShimFailure) {
+        // Review of #232 round 2, item 8: muted, re-entered or skipped
+        // paths send nothing here either.
+        if idle(arg) {
+            return;
+        }
         notify_inner_with_failure(syscall, arg, None, Some(failure), false);
     }
 
@@ -1285,7 +1331,10 @@ mod policy {
         let Some(p) = pending else {
             return;
         };
-        if rc != 0 || IN_NOTIFY.with(|f| f.replace(true)) {
+        // Review of #232 round 2, item 8: the same gate as the begin
+        // side, so a muted process (shit's own undo) journals nothing.
+        if rc != 0 || disabled() || should_skip_path(&p.path) || IN_NOTIFY.with(|f| f.replace(true))
+        {
             return;
         }
         with_saved_errno(|| {
@@ -1799,7 +1848,10 @@ mod policy {
     }
 
     /// [`canonicalize_or_raw`] with [`canonical_entry_path`].
-    fn entry_or_raw(path: &str, which_arg: &str) -> (String, Option<shit_proto::ShimFailure>) {
+    pub(super) fn entry_or_raw(
+        path: &str,
+        which_arg: &str,
+    ) -> (String, Option<shit_proto::ShimFailure>) {
         match canonical_entry_path(path) {
             Ok(abs) => (abs, None),
             Err(e) => (

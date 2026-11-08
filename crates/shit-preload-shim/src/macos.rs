@@ -180,7 +180,7 @@ where
 /// Same contract as `libc::unlink` — `pathname` must point to a
 /// valid NUL-terminated C string for the duration of the call.
 unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
-    policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(pathname));
+    policy::notify_unlink_entry("unlink", &cstr_to_string(pathname));
     // SAFETY: caller upholds libc::unlink's contract on pathname.
     unsafe { libc::unlink(pathname) }
 }
@@ -210,7 +210,7 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
         return rc;
     }
     match joined {
-        Ok(p) => policy::notify_pre_mutation_with_content("unlinkat", &p),
+        Ok(p) => policy::notify_unlink_entry("unlinkat", &p),
         Err((raw, failure)) => policy::notify_unresolved("unlinkat", &raw, failure),
     }
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
@@ -1677,6 +1677,46 @@ mod rename_wire_tests {
             );
         });
         assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review of #232 round 2, item 8: a muted shim reports neither a
+    /// removal nor an unresolved unlinkat.
+    #[test]
+    fn muted_rmdir_and_unresolved_unlinkat_send_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let p = CString::new(dir.join("d").to_str().unwrap()).unwrap();
+        let name = CString::new("x").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            policy::test_mute::with_muted(|| {
+                assert_eq!(unsafe { my_rmdir(p.as_ptr()) }, 0);
+                unsafe { my_unlinkat(987_654, name.as_ptr(), 0) };
+            });
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review of #232 round 2, item 6: unlinking a symlink is keyed to the
+    /// link, never its target.
+    #[test]
+    fn unlinkat_of_a_symlink_is_keyed_to_the_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("target"), b"t").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("link").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), 0) }, 0);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "unlinkat")
+            .expect("unlinkat");
+        assert_eq!(n.arg, dir.join("link").to_str().unwrap());
+        assert!(n.pre_image.is_none(), "{n:#?}");
+        assert!(dir.join("target").exists());
     }
 
     #[test]
