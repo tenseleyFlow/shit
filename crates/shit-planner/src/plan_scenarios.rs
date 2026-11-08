@@ -1754,6 +1754,28 @@ fn only_the_marker_beside_a_symlink_removal_is_dropped() {
     );
 }
 
+/// Review item 2: `mknod n c 1 3 && rm n` in one command. The helper
+/// journals the node's Create, so the node is scratch: undo makes
+/// nothing, even with the removal's capture journaled.
+#[test]
+fn device_made_and_removed_in_the_command_is_scratch() {
+    let mut sim = Sim::new();
+    let p = sim.p("n");
+    let node = InodeRef::new(1, 5);
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: node,
+        path: p.clone(),
+        kind: FileKind::CharDevice,
+        mode: 0o020666,
+    }));
+    sim.emit(device_unlink(p.clone(), node));
+    sim.emit(device_meta(p.clone(), node, 0x103));
+    let nodes = sim.plan_nodes();
+    assert!(nodes.is_empty(), "{nodes:#?}");
+    assert!(sim.undo_with_mknod().is_empty());
+    assert!(std::fs::symlink_metadata(&p).is_err());
+}
+
 fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
     let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
     let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)

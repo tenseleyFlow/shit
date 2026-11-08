@@ -1217,11 +1217,12 @@ impl LinuxCaptureRuntime {
         // can be fstat'd. Sockets return ENXIO and fall to the
         // marker-only path (which still journals the TreeOpCreate
         // wire above).
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&resolved_path)
-            .ok();
+        //
+        // Review item 2 (L4b) - opened O_PATH first and reopened for
+        // reading only when it is a regular file (open_unlink_fallback),
+        // so a device node made by the command is held without being
+        // opened, and a fifo never blocks.
+        let opened = open_unlink_fallback(&path_to_string(&resolved_path)).ok();
 
         let (dev, inode, file_type) = match opened
             .as_ref()
@@ -1245,6 +1246,20 @@ impl LinuxCaptureRuntime {
             FileType::Regular => shit_proto::FileKindWire::Regular,
             FileType::Fifo => shit_proto::FileKindWire::Fifo,
             FileType::Socket => shit_proto::FileKindWire::Socket,
+            // Review item 2 (L4b) - a block/char node born in the command
+            // is journaled, so create-then-rm is scratch and undo never
+            // makes a node that was not there before.
+            FileType::Device => {
+                let fd = opened.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd, &mut st) } == 0
+                    && st.st_mode & libc::S_IFMT == libc::S_IFBLK
+                {
+                    shit_proto::FileKindWire::BlockDevice
+                } else {
+                    shit_proto::FileKindWire::CharDevice
+                }
+            }
             _ => {
                 // O_NOFOLLOW caught a symlink, dir (impossible here
                 // since process_lsm_mkdir handles that), or Other
@@ -1301,7 +1316,7 @@ impl LinuxCaptureRuntime {
                 ws.pre_snapshots
                     .insert((dev, inode), PreSnapshot { meta, bytes });
             }
-            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+            ws.pre_opens.insert((dev, inode), f);
             // AR01.1.fix-rename-target-preimage — reverse-index so a
             // later rename-over-this-path resolves the (dev, inode).
             ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
@@ -2677,6 +2692,38 @@ mod tests {
     /// the correct nested-dir absolute path, where the prior
     /// flat-join resolver would have produced `repo/index.lock` for
     /// git's actual `repo/.git/index.lock`.
+    /// Review item 2: a block/char node made inside the command is
+    /// journaled as a Create (so create-then-rm is scratch), and the
+    /// helper holds it as O_PATH without opening the device. /dev/null
+    /// stands in for a node the command made.
+    #[test]
+    fn device_node_made_in_the_command_journals_a_create() {
+        let staging = tempfile::tempdir().unwrap();
+        let (a, b) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        rt.process_lsm_create_resolved(cmd, 1, PathBuf::from("/dev/null"), 0o020666);
+        let m = std::fs::metadata("/dev/null").unwrap();
+        let ws = rt.watches.get(&cmd).unwrap();
+        let fd = ws
+            .pre_opens
+            .get(&(m.dev(), m.ino()))
+            .expect("device node held for the unlink path");
+        let fl = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(fl & libc::O_PATH, 0, "device must be held O_PATH");
+        match b.recv_response().unwrap() {
+            HelperResponse::TreeMutation {
+                op: shit_proto::TreeOpWire::Create { kind, path, .. },
+                ..
+            } => {
+                assert_eq!(kind, shit_proto::FileKindWire::CharDevice);
+                assert_eq!(path, "/dev/null");
+            }
+            other => panic!("expected a Create, got {other:?}"),
+        }
+    }
+
     /// Review item 6: the fallback must not block on a fifo with no
     /// writer (a plain O_RDONLY open would), must not open a device for
     /// reading, and still gives a readable fd for a regular file.
