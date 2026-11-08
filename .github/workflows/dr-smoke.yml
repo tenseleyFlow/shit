@@ -2356,8 +2356,11 @@ jobs:
           # AU22 adds cap_mknod to the capset so mkfifo-restore-undo-linux
           # (and any future Fifo/Socket restore path) can dispatch
           # libc::mknod via helper-IPC. cap_mknod is the standard
-          # POSIX-capability gate for mknod(2) with FIFO/SOCK kinds;
-          # block/char devices still need CAP_SYS_ADMIN (DR-15.2).
+          # POSIX-capability gate for mknod(2). L4 restores block/char
+          # nodes through the same call (CAP_MKNOD is enough in the
+          # init user namespace), only with the helper's capture token
+          # and only for nodes the invoking user owned. No cap_chown:
+          # other owners wait on #226/#227 (mknod-restore-undo-linux).
           sudo setcap cap_mknod,cap_sys_admin,cap_bpf,cap_perfmon+ep \
             target/release/shit-helper
           getcap target/release/shit-helper

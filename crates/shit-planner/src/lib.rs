@@ -60,7 +60,7 @@ pub use inverse::{
     AliasDiff, Conflict, ContainerOp, ContainerRuntime, DbEngine, FuncDiff, InverseOp, InverseTier,
     OptDiff, PlanNode, PlanWarning, RollbackHint, UndoPlan,
 };
-pub use metadata::{FileKind, FileMetadata};
+pub use metadata::{CaptureToken, DeviceNode, FileKind, FileMetadata, UntrustedSource};
 pub use network::{
     IP_MUTATING, IPTABLES_MUTATING, NFT_MUTATING, PFCTL_MUTATING, RestoreMethod, UFW_MUTATING,
     is_ip_mutating, is_iptables_mutating, is_nft_mutating, is_pfctl_mutating, is_ufw_mutating,

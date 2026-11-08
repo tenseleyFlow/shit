@@ -884,6 +884,9 @@ fn dispatch_response(
             is_delete,
             fd_sent_via_scm: _,
             flags,
+            rdev,
+            device_token,
+            device_untrusted,
         } => {
             let Some(staging) = fd else {
                 // AR01.1.fix-marker-only — when the helper lost the
@@ -910,14 +913,11 @@ fn dispatch_response(
                     // the planner emits RecreatePath{Directory} so
                     // `git clean -fd` undo restores the dir as a
                     // dir, not a regular file.
-                    if let Err(e) = journal_unlink_idempotent(
-                        index,
-                        command,
-                        ts,
-                        inode_ref,
-                        path_buf,
-                        kind_from_mode_bits(mode),
-                        mode,
+                    let kind = kind_from_mode_bits(mode);
+                    let device =
+                        device_capture(kind, rdev, mode, uid, gid, device_token, device_untrusted);
+                    if let Err(e) = journal_unlink_with_device(
+                        index, command, ts, inode_ref, path_buf, kind, mode, device,
                     ) {
                         tracing::error!(error = %e, %session, seq, "marker-only Unlink journal failed");
                         note_ingest_failure(
@@ -1586,10 +1586,9 @@ fn kind_from_mode_bits(mode: u32) -> shit_planner::metadata::FileKind {
         // Regular-file inverse, which silently lost the kind.
         0o010000 => FileKind::Fifo,
         0o140000 => FileKind::Socket,
-        // BlockDevice + CharDevice need CAP_SYS_ADMIN at the
-        // helper (deferred to DR-15.2); recording the kind is
-        // correct, the executor's recreate_path_inner returns the
-        // DR-15.2 deferral message when it sees these.
+        // BlockDevice + CharDevice restore through the helper's
+        // mknod once the journal row also carries the captured rdev
+        // (L4); a row without one is refused at undo.
         0o060000 => FileKind::BlockDevice,
         0o020000 => FileKind::CharDevice,
         // Unknown / no S_IF bits set — fall through to Regular as
@@ -1609,17 +1608,150 @@ fn journal_unlink_idempotent(
     kind: shit_planner::metadata::FileKind,
     mode: u32,
 ) -> Result<(), HelperLinkError> {
-    use shit_planner::PlannerStore;
-    let already = index.events_for_command(command).into_iter().any(|e| {
-        matches!(
-            &e.kind,
-            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path, .. })
-                if *inode == inode_ref && existing_path == &path
-        )
-    });
-    if already {
+    journal_unlink_with_device(index, command, ts, inode_ref, path, kind, mode, None)
+}
+
+/// L4b - what the daemon journals beside a device `Unlink`: a device
+/// number with the helper's token, or with none when the source
+/// filesystem was `nodev` (undo then refuses with that reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceCapture {
+    rdev: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    token: Option<shit_planner::CaptureToken>,
+    untrusted: Option<shit_planner::UntrustedSource>,
+}
+
+/// L4 / L4b ruling 6 - a `DeviceNodeMeta` is journaled only for a node
+/// the mode bits say is a device, with a nonzero rdev, and either the
+/// helper's token or the helper's word that the source was `nodev`.
+/// Anything less is no capture at all: the `Unlink` alone is journaled,
+/// and undo gives the "no device number captured" refusal.
+fn device_capture(
+    kind: shit_planner::metadata::FileKind,
+    rdev: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    token: Option<shit_proto::CaptureToken>,
+    untrusted: Option<shit_proto::UntrustedSource>,
+) -> Option<DeviceCapture> {
+    use shit_planner::metadata::FileKind;
+    if !matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) || rdev == 0 {
+        return None;
+    }
+    if token.is_none() && untrusted.is_none() {
+        return None;
+    }
+    Some(DeviceCapture {
+        rdev,
+        mode,
+        uid,
+        gid,
+        token: token.map(|t| shit_planner::CaptureToken {
+            helper: t.helper,
+            mac: t.mac,
+        }),
+        untrusted: untrusted.map(|u| match u {
+            shit_proto::UntrustedSource::Nodev => shit_planner::UntrustedSource::Nodev,
+            shit_proto::UntrustedSource::Unknown => shit_planner::UntrustedSource::Unknown,
+        }),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn journal_unlink_with_device(
+    index: &Index,
+    command: CommandId,
+    ts: shit_planner::TimePoint,
+    inode_ref: InodeRef,
+    path: std::path::PathBuf,
+    kind: shit_planner::metadata::FileKind,
+    mode: u32,
+    device: Option<DeviceCapture>,
+) -> Result<(), HelperLinkError> {
+    let events = index.events_for_command_at_path(command, &path);
+    let already = if device.is_some() {
+        // L4b - only the latest Unlink at this path counts, and only if
+        // no DeviceNodeMeta follows it yet: after inode reuse an earlier
+        // removal's Unlink is not this one.
+        latest_unclaimed_unlink(&events, &path) == Some(inode_ref)
+    } else {
+        events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path, .. })
+                    if *inode == inode_ref && existing_path == &path
+            )
+        })
+    };
+    // L4b - the shim may already have journaled this removal with the
+    // same identity (its pre-call lstat). The Unlink is then not repeated,
+    // but the device capture is still journaled, after it, so the two
+    // pair.
+    if already && device.is_none() {
         return Ok(());
     }
+    if !already {
+        put_unlink(index, command, ts, inode_ref, path.clone(), kind, mode)?;
+    }
+    if let Some(d) = device {
+        let meta_ev = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts,
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+                inode: inode_ref,
+                path,
+                rdev: d.rdev,
+                mode: d.mode,
+                uid: d.uid,
+                gid: d.gid,
+                token: d.token,
+                untrusted: d.untrusted,
+            }),
+        };
+        index.put_event(&meta_ev).map_err(|e| {
+            HelperLinkError::Io(std::io::Error::other(format!(
+                "put_event (device meta): {e}"
+            )))
+        })?;
+    }
+    Ok(())
+}
+
+/// The inode of the latest `Unlink` at `path` in journal order, when no
+/// `DeviceNodeMeta` for that path follows it.
+fn latest_unclaimed_unlink(events: &[CaptureEvent], path: &std::path::Path) -> Option<InodeRef> {
+    let mut ordered: Vec<&CaptureEvent> = events.iter().collect();
+    ordered.sort_by_key(|e| (e.ts, e.id));
+    let mut latest = None;
+    for e in ordered {
+        match &e.kind {
+            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: p, .. }) if p == path => {
+                latest = Some(*inode);
+            }
+            CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { path: p, .. }) if p == path => {
+                latest = None;
+            }
+            _ => {}
+        }
+    }
+    latest
+}
+
+fn put_unlink(
+    index: &Index,
+    command: CommandId,
+    ts: shit_planner::TimePoint,
+    inode_ref: InodeRef,
+    path: std::path::PathBuf,
+    kind: shit_planner::metadata::FileKind,
+    mode: u32,
+) -> Result<(), HelperLinkError> {
     let unlink_ev = CaptureEvent {
         id: EventId(0),
         command,
@@ -1871,6 +2003,43 @@ mod tests_kind_from_mode_bits {
         // mode=0 (helper lost race to stat the unlinked inode).
         assert_eq!(kind_from_mode_bits(0), FileKind::Regular);
     }
+
+    /// L4b ruling 6: no meta row without a device kind, a nonzero rdev
+    /// and the helper's token.
+    #[test]
+    fn device_capture_needs_kind_rdev_and_token() {
+        let t = Some(shit_proto::CaptureToken {
+            helper: [1; 16],
+            mac: [2; 32],
+        });
+        let chr = FileKind::CharDevice;
+        assert_eq!(device_capture(chr, 0, 0o020600, 1, 1, t, None), None);
+        assert_eq!(device_capture(chr, 0x103, 0o020600, 1, 1, None, None), None);
+        // Review round 2, item 1: a nodev source journals the meta with
+        // no token, so undo can say why it refuses.
+        let nodev = device_capture(
+            chr,
+            0x103,
+            0o020600,
+            1,
+            1,
+            None,
+            Some(shit_proto::UntrustedSource::Nodev),
+        )
+        .unwrap();
+        assert!(nodev.token.is_none());
+        assert_eq!(nodev.untrusted, Some(shit_planner::UntrustedSource::Nodev));
+        assert_eq!(
+            device_capture(FileKind::Fifo, 0x103, 0o010600, 1, 1, t, None),
+            None
+        );
+        let got = device_capture(FileKind::BlockDevice, 0x803, 0o060600, 1, 2, t, None).unwrap();
+        assert_eq!(
+            (got.rdev, got.mode, got.uid, got.gid),
+            (0x803, 0o060600, 1, 2)
+        );
+        assert_eq!(got.token.unwrap().mac, [2; 32]);
+    }
 }
 
 #[cfg(test)]
@@ -1919,6 +2088,116 @@ mod tests_dispatch {
             Err(UnwatchError::LinkClosed)
         ));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// L4b: when the shim journaled the removal first with the same
+    /// identity, the helper's capture adds the DeviceNodeMeta after it and
+    /// no second Unlink.
+    #[test]
+    fn device_meta_follows_a_shim_unlink_of_the_same_node() {
+        use shit_planner::PlannerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(5),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let inode = InodeRef::new(0x803, 77);
+        let path = PathBuf::from("/w/null");
+        let kind = shit_planner::metadata::FileKind::CharDevice;
+        put_unlink(
+            &index,
+            cmd,
+            shit_planner::TimePoint::new(2, 0),
+            inode,
+            path.clone(),
+            kind,
+            0o020640,
+        )
+        .unwrap();
+        let device = DeviceCapture {
+            rdev: 0x103,
+            mode: 0o020640,
+            uid: 1,
+            gid: 1,
+            token: Some(shit_planner::CaptureToken {
+                helper: [1; 16],
+                mac: [2; 32],
+            }),
+            untrusted: None,
+        };
+        journal_unlink_with_device(
+            &index,
+            cmd,
+            shit_planner::TimePoint::new(3, 0),
+            inode,
+            path,
+            kind,
+            0o020640,
+            Some(device),
+        )
+        .unwrap();
+        let events = index.events_for_command(cmd);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) => "unlink",
+                CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { .. }) => "meta",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["unlink", "meta"], "{events:#?}");
+    }
+
+    /// Review item 5: the node is removed, a new one gets the same inode
+    /// number, and it is removed too. The second removal's Unlink must be
+    /// journaled before its meta, not skipped because of the first.
+    #[test]
+    fn second_removal_after_inode_reuse_journals_its_own_unlink() {
+        use shit_planner::PlannerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(6),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let inode = InodeRef::new(0x803, 77);
+        let path = PathBuf::from("/w/null");
+        let kind = shit_planner::metadata::FileKind::CharDevice;
+        let device = |rdev| DeviceCapture {
+            rdev,
+            mode: 0o020640,
+            uid: 1,
+            gid: 1,
+            token: Some(shit_planner::CaptureToken {
+                helper: [1; 16],
+                mac: [2; 32],
+            }),
+            untrusted: None,
+        };
+        for (t, rdev) in [(2, 0x103), (3, 0x105)] {
+            journal_unlink_with_device(
+                &index,
+                cmd,
+                shit_planner::TimePoint::new(t, 0),
+                inode,
+                path.clone(),
+                kind,
+                0o020640,
+                Some(device(rdev)),
+            )
+            .unwrap();
+        }
+        let kinds: Vec<&str> = index
+            .events_for_command(cmd)
+            .iter()
+            .map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) => "unlink",
+                CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { .. }) => "meta",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["unlink", "meta", "unlink", "meta"]);
     }
 
     fn index_with_command(dir: &Path, cmd: CommandId) -> Index {
@@ -2083,6 +2362,9 @@ mod tests_dispatch {
             mtime_unix_nanos: 0,
             xattrs: Default::default(),
             flags: 0,
+            rdev: 0,
+            device_token: None,
+            device_untrusted: None,
             is_delete: false,
             fd_sent_via_scm: true,
         };
@@ -2155,6 +2437,9 @@ mod tests_dispatch {
                     mtime_unix_nanos: 0,
                     xattrs: Default::default(),
                     flags: 0,
+                    rdev: 0,
+                    device_token: None,
+                    device_untrusted: None,
                     is_delete: false,
                     fd_sent_via_scm: true,
                 },
@@ -2226,6 +2511,9 @@ mod tests_dispatch {
                 mtime_unix_nanos: 0,
                 xattrs: Default::default(),
                 flags: 0,
+                rdev: 0,
+                device_token: None,
+                device_untrusted: None,
                 is_delete: false,
                 fd_sent_via_scm: true,
             },

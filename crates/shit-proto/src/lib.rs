@@ -41,7 +41,8 @@ pub use ctl::{
 };
 pub use frame::{
     DecodeError, EncodeError, HOOK_DGRAM_MAX_FRAME, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE,
-    WIRE_VERSION, decode_frame, decode_frame_large, encode_frame, encode_frame_large,
+    SHIM_WIRE_VERSION, WIRE_VERSION, decode_frame, decode_frame_large, decode_shim_frame,
+    encode_frame, encode_frame_large, encode_shim_frame,
 };
 
 /// AU26: maximum bytes for `HookMessage::PreExec.cmd_string`. The shell
@@ -112,13 +113,14 @@ mod tests {
     }
 }
 pub use helper::{
-    AuthDecision, AuthEventKind, FileKindWire, FileMetadataWire, HELPER_PATH_HINT_MAX,
-    HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest, HelperResponse,
-    MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, SelfVerifyReport, SignatureKind, TreeOpWire,
-    validate_outgoing,
+    AuthDecision, AuthEventKind, CaptureToken, DeviceEvidence, FileKindWire, FileMetadataWire,
+    HELPER_PATH_HINT_MAX, HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest,
+    HelperResponse, MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, SelfVerifyReport, SignatureKind,
+    TreeOpWire, UntrustedSource, validate_outgoing,
 };
 pub use shim::{
-    SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage, XattrPreImage,
+    SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage, ShimStat,
+    XattrPreImage,
 };
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.

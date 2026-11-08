@@ -40,6 +40,9 @@ blake3 = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# L4b - capture tokens (HMAC-SHA256); device restore is Linux-only.
+hmac = { workspace = true }
+sha2 = { workspace = true }
 seccompiler = "0.5"
 bitflags = { workspace = true }
 crossbeam-channel = "0.5"

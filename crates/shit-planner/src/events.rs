@@ -489,6 +489,27 @@ pub enum TreeOp {
         target: String, // the OLD symlink's target
         path: PathBuf,  // path of the symlink that was replaced
     },
+    /// L4 - device number, mode and owner of a block/char node that
+    /// was unlinked, journaled right after its `Unlink`, with the
+    /// helper's capture token (L4b). The planner pairs it with that
+    /// `Unlink` by `(dev, ino)` in journal order and puts the result on
+    /// `RecreatePath`. It is a separate event so `Unlink` keeps its
+    /// stored shape; this variant sits last in the enum, so older rows
+    /// decode as before. A build that predates it fails to decode the
+    /// row, and the store skips undecodable rows, so such a build never
+    /// sees it and cannot restore the node (it refuses).
+    DeviceNodeMeta {
+        inode: InodeRef,
+        path: PathBuf,
+        rdev: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        /// `None` when the helper issued none; `untrusted` says why, and
+        /// undo refuses with that reason.
+        token: Option<crate::metadata::CaptureToken>,
+        untrusted: Option<crate::metadata::UntrustedSource>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

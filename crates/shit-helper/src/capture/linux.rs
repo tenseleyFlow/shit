@@ -645,6 +645,9 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete,
             fd_sent_via_scm: true,
+            rdev: 0,
+            device_token: None,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -783,12 +786,10 @@ impl LinuxCaptureRuntime {
                 // the mutating pid has exited between hook fire and
                 // handler dispatch -- same fix scope as the resolved
                 // path used for the journal entry (Issue #22).
-                let opened = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&resolved_path);
-                match opened {
-                    Ok(f) => (Some(OwnedFd::from(f)), "race"),
+                // Review item 6 (L4b): the race-to-open fallback holds
+                // the entry without opening a fifo or device for reading.
+                match open_held_nofollow(&resolved_path) {
+                    Ok(fd) => (Some(fd), "race"),
                     Err(_) => (None, "miss"),
                 }
             };
@@ -834,7 +835,11 @@ impl LinuxCaptureRuntime {
             } else {
                 matches!(
                     file_type,
-                    FileType::Regular | FileType::Fifo | FileType::Socket
+                    FileType::Regular
+                        | FileType::Fifo
+                        | FileType::Socket
+                        | FileType::BlockDevice
+                        | FileType::CharDevice
                 )
             });
         let race_fd = capture_fd_owned;
@@ -846,7 +851,12 @@ impl LinuxCaptureRuntime {
             let fd = race_fd.as_ref().unwrap().as_raw_fd();
             let meta = fstat_meta(fd);
             (0, [0u8; 32], None, meta)
-        } else if race_won && matches!(file_type, FileType::Fifo | FileType::Socket) {
+        } else if race_won
+            && matches!(
+                file_type,
+                FileType::Fifo | FileType::Socket | FileType::BlockDevice | FileType::CharDevice
+            )
+        {
             // AU29 follow-up — Fifo/Socket capture: O_PATH fd held
             // by pre_open can be fstat'd for mode/uid/gid but can't
             // be read from (O_PATH semantics). Without this branch
@@ -902,6 +912,41 @@ impl LinuxCaptureRuntime {
             (0, [0u8; 32], None, None)
         };
 
+        // L4b - a device node seen through a held fd whose (dev, ino)
+        // matched the event gets a capture token over what fstat said.
+        // That token is the only thing that lets a later ApplyMknod
+        // recreate it.
+        //
+        // Review round 2, item 1: a node on a `nodev` filesystem (FUSE
+        // always is) gets no token; such a filesystem can report any rdev.
+        let device_untrusted = if race_won && file_type.is_device() {
+            race_fd
+                .as_ref()
+                .and_then(|fd| crate::capture_token::untrusted_source(fd.as_raw_fd()))
+        } else {
+            None
+        };
+        let device_token = match (&meta_wire, race_won && file_type.is_device()) {
+            (Some(m), true) if m.rdev != 0 => crate::capture_token::process_key().and_then(|k| {
+                crate::capture_token::device_token(
+                    k,
+                    &crate::capture_token::DeviceFacts {
+                        mode: m.mode,
+                        rdev: m.rdev,
+                        uid: m.uid,
+                        gid: m.gid,
+                        dev: ev_dev_userspace,
+                        ino: ev.inode,
+                        path: &resolved_path,
+                        session: ev.command.session,
+                        seq: ev.command.seq,
+                    },
+                    device_untrusted.is_some(),
+                )
+            }),
+            _ => None,
+        };
+
         // Build wire. If we lost the race, `meta_wire` is None — set
         // mode/uid/gid/mtime to 0; the daemon's Delete-restore path
         // does not rely on these for marker-only events.
@@ -930,6 +975,13 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: true,
             fd_sent_via_scm: staging_fd.is_some(),
+            rdev: if file_type.is_device() {
+                meta_wire.as_ref().map(|m| m.rdev).unwrap_or(0)
+            } else {
+                0
+            },
+            device_token,
+            device_untrusted,
         };
 
         let send_result = if let Some(ref fd) = staging_fd {
@@ -1144,6 +1196,9 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
+            device_token: None,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -1414,11 +1469,17 @@ impl LinuxCaptureRuntime {
         // can be fstat'd. Sockets return ENXIO and fall to the
         // marker-only path (which still journals the TreeOpCreate
         // wire above).
-        let opened = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&resolved_path)
-        {
+        //
+        // Review item 2 (L4b) - opened O_PATH first and reopened for
+        // reading only when it is a regular file (open_held_nofollow),
+        // so a device node made by the command is held without being
+        // opened, and a fifo never blocks.
+        // Kinds this handler holds: as on trunk, a directory is not
+        // journaled here (process_lsm_mkdir owns it). An O_PATH open also
+        // succeeds on a symlink, where the old O_RDONLY open failed with
+        // ELOOP; a symlink, any other unheld kind, and a failed open all
+        // take the marker branch, as before.
+        let held = match open_held_nofollow(&resolved_path) {
             Ok(f) => Some(f),
             Err(e) => {
                 // R3 slice B — the create hook fired and the entry is
@@ -1434,18 +1495,34 @@ impl LinuxCaptureRuntime {
                 None
             }
         };
-
-        let (dev, inode, file_type) = match opened
+        let held_stat = held
             .as_ref()
-            .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()))
-        {
-            Some(t) => t,
-            None => {
+            .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()));
+        let (opened, (dev, inode, file_type)) = match held_stat {
+            Some((_, _, FileType::Directory)) => {
+                tracing::trace!(
+                    path = %resolved_path.display(),
+                    "lsm create: directory; left to the mkdir handler"
+                );
+                return;
+            }
+            Some(
+                t @ (
+                    _,
+                    _,
+                    FileType::Regular
+                    | FileType::Fifo
+                    | FileType::Socket
+                    | FileType::BlockDevice
+                    | FileType::CharDevice,
+                ),
+            ) => (held, t),
+            _ => {
                 tracing::warn!(
                     path = %resolved_path.display(),
                     "lsm create: post-open/fstat race lost; emitting marker TreeOpCreate (dev=0, inode=0)"
                 );
-                (0, 0, FileType::Regular)
+                (None, (0, 0, FileType::Regular))
             }
         };
         // AU29 — accept Fifo / Socket here (mknod routes through
@@ -1457,6 +1534,11 @@ impl LinuxCaptureRuntime {
             FileType::Regular => shit_proto::FileKindWire::Regular,
             FileType::Fifo => shit_proto::FileKindWire::Fifo,
             FileType::Socket => shit_proto::FileKindWire::Socket,
+            // Review item 2 (L4b) - a block/char node born in the command
+            // is journaled, so create-then-rm is scratch and undo never
+            // makes a node that was not there before.
+            FileType::BlockDevice => shit_proto::FileKindWire::BlockDevice,
+            FileType::CharDevice => shit_proto::FileKindWire::CharDevice,
             _ => {
                 // O_NOFOLLOW caught a symlink, dir (impossible here
                 // since process_lsm_mkdir handles that), or Other
@@ -1516,7 +1598,7 @@ impl LinuxCaptureRuntime {
                 ws.pre_snapshots
                     .insert((dev, inode), PreSnapshot::new(meta, bytes));
             }
-            ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
+            ws.pre_opens.insert((dev, inode), f);
             // AR01.1.fix-rename-target-preimage — reverse-index so a
             // later rename-over-this-path resolves the (dev, inode).
             ws.path_to_inode.insert(resolved_path.clone(), (dev, inode));
@@ -1671,6 +1753,9 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
+            device_token: None,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -1859,6 +1944,9 @@ impl LinuxCaptureRuntime {
             flags: 0,
             is_delete: false,
             fd_sent_via_scm: true,
+            rdev: 0,
+            device_token: None,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -1987,6 +2075,9 @@ impl LinuxCaptureRuntime {
                         flags: 0,
                         is_delete: true,
                         fd_sent_via_scm: true,
+                        rdev: 0,
+                        device_token: None,
+                        device_untrusted: None,
                     };
                     if let Err(e) = self
                         .conn
@@ -2214,7 +2305,9 @@ fn pre_open_recurse(
         // shape as the dir branch above; fstat returns the right
         // mode bits via the held fd.
         use std::os::unix::fs::FileTypeExt;
-        if ft.is_fifo() || ft.is_socket() {
+        // L4 - block/char nodes get the same O_PATH hold so the
+        // unlink can fstat st_rdev; O_PATH never opens the device.
+        if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
             if let Ok(f) = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
@@ -2292,6 +2385,48 @@ pub(crate) fn kernel_dev_to_userspace(kdev: u64) -> u64 {
 /// encoding `pre_open_tree` keyed dir_paths with. BPF callers must
 /// pass `kernel_dev_to_userspace(ev.parent_dev)` (or use the file's
 /// own dev for unlink/rename, since those can't cross filesystems).
+/// Open `path` for holding without following a symlink and without
+/// opening it for I/O unless it is a regular file. `O_PATH|O_NOFOLLOW`
+/// first (fstat works on it); only a regular file is then reopened for
+/// reading, through `/proc/self/fd/N` so it is the same inode, with
+/// `O_NONBLOCK|O_NOCTTY`. A fifo, socket or device node keeps the
+/// `O_PATH` fd, so the helper never blocks on a fifo or opens a device.
+fn open_held_nofollow(path: impl AsRef<Path>) -> std::io::Result<OwnedFd> {
+    use std::os::unix::ffi::OsStrExt;
+    // By the path's bytes (OsStr), so a non-UTF-8 name is held as is.
+    let c = std::ffi::CString::new(path.as_ref().as_os_str().as_bytes())
+        .map_err(std::io::Error::other)?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let opath = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(opath.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Ok(opath);
+    }
+    let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", opath.as_raw_fd()))
+        .map_err(std::io::Error::other)?;
+    let rd = unsafe {
+        libc::open(
+            proc.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if rd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(rd) })
+}
+
 fn resolve_via_parent(
     ws_dir_paths: &BTreeMap<(u64, u64), PathBuf>,
     parent_dev: u64,
@@ -2443,9 +2578,17 @@ fn fstat_dev_inode_kind(fd: RawFd) -> Option<(u64, u64, FileType)> {
         libc::S_IFDIR => FileType::Directory,
         libc::S_IFIFO => FileType::Fifo,
         libc::S_IFSOCK => FileType::Socket,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFCHR => FileType::CharDevice,
         _ => FileType::Other,
     };
     Some((st.st_dev, st.st_ino, kind))
+}
+
+impl FileType {
+    fn is_device(self) -> bool {
+        matches!(self, FileType::BlockDevice | FileType::CharDevice)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2454,6 +2597,10 @@ enum FileType {
     Directory,
     Fifo,
     Socket,
+    /// L4 - block device node.
+    BlockDevice,
+    /// L4 - char device node.
+    CharDevice,
     Other,
 }
 
@@ -2465,6 +2612,8 @@ struct StatMeta {
     size: u64,
     mtime_unix_nanos: i128,
     xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// `st_rdev`; nonzero only for device nodes.
+    rdev: u64,
 }
 
 impl StatMeta {
@@ -2500,6 +2649,7 @@ fn fstat_meta(fd: RawFd) -> Option<StatMeta> {
         size: st.st_size as u64,
         mtime_unix_nanos: mtime,
         xattrs: crate::capture::xattr::read_user_xattrs(fd),
+        rdev: st.st_rdev,
     })
 }
 
@@ -3022,6 +3172,121 @@ mod tests {
     /// the correct nested-dir absolute path, where the prior
     /// flat-join resolver would have produced `repo/index.lock` for
     /// git's actual `repo/.git/index.lock`.
+    /// Review item 2: a block/char node made inside the command is
+    /// journaled as a Create (so create-then-rm is scratch), and the
+    /// helper holds it as O_PATH without opening the device. /dev/null
+    /// stands in for a node the command made.
+    #[test]
+    fn device_node_made_in_the_command_journals_a_create() {
+        let staging = tempfile::tempdir().unwrap();
+        let (a, b) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        rt.process_lsm_create_resolved(cmd, 1, PathBuf::from("/dev/null"), 0o020666);
+        let m = std::fs::metadata("/dev/null").unwrap();
+        let ws = rt.watches.get(&cmd).unwrap();
+        let fd = ws
+            .pre_opens
+            .get(&(m.dev(), m.ino()))
+            .expect("device node held for the unlink path");
+        let fl = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(fl & libc::O_PATH, 0, "device must be held O_PATH");
+        match b.recv_response().unwrap() {
+            HelperResponse::TreeMutation {
+                op: shit_proto::TreeOpWire::Create { kind, path, .. },
+                ..
+            } => {
+                assert_eq!(kind, shit_proto::FileKindWire::CharDevice);
+                assert_eq!(path, "/dev/null");
+            }
+            other => panic!("expected a Create, got {other:?}"),
+        }
+    }
+
+    /// Review round 3, item 3: the create path holds a non-UTF-8 name by
+    /// its bytes, as on trunk, rather than a lossy string that names
+    /// nothing.
+    #[test]
+    fn create_path_holds_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let staging = tempfile::tempdir().unwrap();
+        let (a, _b) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        let file = dir.path().join(name);
+        std::fs::write(&file, b"x").unwrap();
+        let m = std::fs::metadata(&file).unwrap();
+        rt.process_lsm_create_resolved(cmd, 1, file, 0o100644);
+        let ws = rt.watches.get(&cmd).unwrap();
+        assert!(
+            ws.pre_opens.contains_key(&(m.dev(), m.ino())),
+            "non-UTF-8 name not held"
+        );
+    }
+
+    /// Review round 2, item 2: a directory reaching the create path is
+    /// left to the mkdir handler, as on trunk, not journaled as a
+    /// marker Regular Create.
+    #[test]
+    fn create_path_journals_nothing_for_a_directory() {
+        let staging = tempfile::tempdir().unwrap();
+        let (a, b) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("d");
+        std::fs::create_dir(&sub).unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        rt.process_lsm_create_resolved(cmd, 1, sub, 0o040755);
+        rt.process_lsm_create_resolved(cmd, 1, file.clone(), 0o100644);
+        // The first (and only) message is the file's Create.
+        match b.recv_response().unwrap() {
+            HelperResponse::TreeMutation {
+                op: shit_proto::TreeOpWire::Create { path, .. },
+                ..
+            } => assert_eq!(path, file.to_str().unwrap()),
+            other => panic!("expected the file's Create, got {other:?}"),
+        }
+    }
+
+    /// Review item 6: the fallback must not block on a fifo with no
+    /// writer (a plain O_RDONLY open would), must not open a device for
+    /// reading, and still gives a readable fd for a regular file.
+    #[test]
+    fn unlink_fallback_never_opens_a_fifo_or_device_for_reading() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let r = open_held_nofollow(&path);
+            let _ = tx.send(r.map(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }));
+        });
+        let flags = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("fallback blocked on a fifo")
+            .unwrap();
+        assert_ne!(flags & libc::O_PATH, 0, "fifo must stay O_PATH");
+        let dev = open_held_nofollow("/dev/null").unwrap();
+        let fl = unsafe { libc::fcntl(dev.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(fl & libc::O_PATH, 0, "device must stay O_PATH");
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"bytes").unwrap();
+        let fd = open_held_nofollow(file.to_str().unwrap()).unwrap();
+        let mut got = String::new();
+        std::fs::File::from(fd).read_to_string(&mut got).unwrap();
+        assert_eq!(got, "bytes");
+    }
+
     #[test]
     fn resolve_via_parent_uses_dir_map() {
         let mut dir_paths: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();

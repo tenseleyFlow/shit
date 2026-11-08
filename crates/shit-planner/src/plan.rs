@@ -237,6 +237,9 @@ struct EventClassification {
     /// path's normal RecreatePath/RestoreContent inverses; emits a
     /// single CreateHardlink instead.
     hardlink_dead_to_source: std::collections::HashMap<PathBuf, PathBuf>,
+    /// L4b - device captures keyed by the id of the `Unlink` each one
+    /// pairs with exactly (see [`pair_device_nodes`]).
+    device_nodes: std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode>,
     /// Shim chflags snapshots already covered by a kqueue
     /// `MetadataChange` for the same inode and pre-value.
     paired_flags_shims: HashSet<crate::events::EventId>,
@@ -335,7 +338,14 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             _ => {}
         }
     }
-    let provenance = Provenance::from_events(events, &disproved);
+    // L4b - one place decides which device Unlink a capture belongs to;
+    // Provenance's dedup keeps that one. Both L4b passes work in journal
+    // order (ts, id); sort once.
+    let mut chrono: Vec<&CaptureEvent> = events.to_vec();
+    chrono.sort_by_key(|e| (e.ts, e.id));
+    let (device_nodes, duplicate_device_unlinks) = device_pairing(&chrono);
+    let paired: HashSet<crate::events::EventId> = device_nodes.keys().copied().collect();
+    let provenance = Provenance::from_events(events, &disproved, &paired);
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
     for p in creates.iter().chain(rename_destinations.iter()) {
@@ -646,6 +656,8 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     }
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
+    dropped_events.extend(duplicate_device_unlinks);
+    dropped_events.extend(symlink_removal_markers(&chrono));
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -653,6 +665,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         spurious_creates_with_preimage,
         hardlink_live_paths,
         hardlink_dead_to_source,
+        device_nodes,
         paired_flags_shims: HashSet::new(),
         dropped_events,
         refused_unlinks: provenance.refused_unlinks,
@@ -839,14 +852,24 @@ struct Provenance {
     dropped_events: HashSet<crate::events::EventId>,
     /// See [`EventClassification::refused_unlinks`].
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
+    /// L4b - device Unlinks a DeviceNodeMeta paired with
+    /// ([`device_pairing`]); the no-bytes dedup keeps one of these.
+    paired_device_unlinks: HashSet<crate::events::EventId>,
 }
 
 impl Provenance {
     /// `events` is in reverse-chronological order (as `plan` sorts it).
-    fn from_events(events: &[&CaptureEvent], disproved: &HashSet<crate::events::EventId>) -> Self {
+    fn from_events(
+        events: &[&CaptureEvent],
+        disproved: &HashSet<crate::events::EventId>,
+        paired_device_unlinks: &HashSet<crate::events::EventId>,
+    ) -> Self {
         let mut live: std::collections::BTreeMap<PathBuf, EntryHistory> =
             std::collections::BTreeMap::new();
-        let mut out = Self::default();
+        let mut out = Self {
+            paired_device_unlinks: paired_device_unlinks.clone(),
+            ..Self::default()
+        };
         for ev in events.iter().rev() {
             match &ev.kind {
                 CaptureEventKind::FilePreImage { path, source, .. } if source.has_content() => {
@@ -929,6 +952,14 @@ impl Provenance {
                         h.unlinked_at.get_or_insert_with(|| path.clone());
                     }
                 }
+                // L4b - the shim reports a removed symlink as
+                // SymlinkRemoved; for provenance it is that entry's unlink.
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => {
+                    if let Some(h) = live.get_mut(path) {
+                        h.unlinks.push((ev.id, crate::metadata::FileKind::Symlink));
+                        h.unlinked_at.get_or_insert_with(|| path.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -958,9 +989,25 @@ impl Provenance {
         // is its whole restore, once. A second tier's report of the same
         // unlink would hit a Phantom, and a tier that lost the race to
         // stat it reported the wire's Regular default.
-        let no_bytes =
-            |k: &FileKind| matches!(k, FileKind::Directory | FileKind::Fifo | FileKind::Socket);
-        if let Some((keep, _)) = h.unlinks.iter().find(|(_, k)| no_bytes(k)) {
+        let no_bytes = |k: &FileKind| {
+            matches!(
+                k,
+                FileKind::Directory
+                    | FileKind::Fifo
+                    | FileKind::Socket
+                    | FileKind::BlockDevice
+                    | FileKind::CharDevice
+                    | FileKind::Symlink
+            )
+        };
+        // A device Unlink that carries a capture is the one to keep; the
+        // others are its twins (device_pairing drops those too).
+        let keep = h
+            .unlinks
+            .iter()
+            .find(|(id, _)| self.paired_device_unlinks.contains(id))
+            .or_else(|| h.unlinks.iter().find(|(_, k)| no_bytes(k)));
+        if let Some((keep, _)) = keep {
             self.dropped_events
                 .extend(h.unlinks.iter().map(|(id, _)| *id).filter(|id| id != keep));
             return;
@@ -1198,7 +1245,7 @@ fn emit_for_event(
                 conflict,
             });
         }
-        CaptureEventKind::TreeOp(op) => emit_for_tree_op(op, probe, class, nodes),
+        CaptureEventKind::TreeOp(op) => emit_for_tree_op(ev.id, op, probe, class, nodes),
         CaptureEventKind::ShellStateDiff {
             pwd_before,
             pwd_after,
@@ -1713,7 +1760,171 @@ fn native_delegation_for(
     }
 }
 
+/// L4b - pair each `DeviceNodeMeta` with the `Unlink` it was journaled
+/// after. A pair needs the same nonzero `(dev, ino)`, the same path, a
+/// kind that agrees with the captured mode, and a nonzero rdev; the
+/// meta takes the latest such `Unlink` before it in journal order
+/// (`(ts, id)`) that no earlier meta took. A zero inode (the shim's
+/// sentinel) never pairs: an `Unlink` with no exact pair carries no
+/// device and is refused at undo.
+#[cfg(test)]
+pub(crate) fn pair_device_nodes(
+    events: &[&CaptureEvent],
+) -> std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode> {
+    let mut chrono: Vec<&CaptureEvent> = events.to_vec();
+    chrono.sort_by_key(|e| (e.ts, e.id));
+    device_pairing(&chrono).0
+}
+
+/// [`pair_device_nodes`], plus the device `Unlink`s that are a second
+/// tier's report of a paired removal: same identity and path as a
+/// paired `Unlink`, with nothing else journaled at that path between
+/// the two. The shim (pre-call lstat) and the LSM tier both report one
+/// `rm`; only one `RecreatePath` may come of it.
+fn device_pairing(
+    events: &[&CaptureEvent],
+) -> (
+    std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode>,
+    Vec<crate::events::EventId>,
+) {
+    use crate::metadata::{DeviceNode, FileKind};
+    // `events` is in journal order (ts, id).
+    let ordered = events;
+    let none = InodeRef::new(0, 0);
+    type Open = std::collections::HashMap<(InodeRef, PathBuf), (crate::events::EventId, FileKind)>;
+    let mut open: Open = std::collections::HashMap::new();
+    let mut out = std::collections::HashMap::new();
+    let device_unlink = |ev: &CaptureEvent| match &ev.kind {
+        CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode, path, kind, ..
+        }) if *inode != none && matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) => {
+            Some((*inode, path.clone(), *kind))
+        }
+        _ => None,
+    };
+    for ev in ordered {
+        if let Some((inode, path, kind)) = device_unlink(ev) {
+            open.insert((inode, path), (ev.id, kind));
+            continue;
+        }
+        if let CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta {
+            inode,
+            path,
+            rdev,
+            mode,
+            uid,
+            gid,
+            token,
+            untrusted,
+        }) = &ev.kind
+            && *inode != none
+            && *rdev != 0
+        {
+            let Some((unlink_id, unlink_kind)) = open.remove(&(*inode, path.clone())) else {
+                continue;
+            };
+            if FileKind::from_mode(*mode) != Some(unlink_kind) {
+                continue;
+            }
+            out.insert(
+                unlink_id,
+                DeviceNode {
+                    rdev: *rdev,
+                    mode: *mode,
+                    uid: *uid,
+                    gid: *gid,
+                    inode: *inode,
+                    removed_by: ev.command,
+                    token: *token,
+                    untrusted: *untrusted,
+                },
+            );
+        }
+    }
+    // Duplicates: walk each (identity, path) run in journal order. A run
+    // is broken by any other event at that path.
+    let mut duplicates = Vec::new();
+    let mut run: std::collections::HashMap<PathBuf, (InodeRef, Vec<crate::events::EventId>)> =
+        std::collections::HashMap::new();
+    let mut close = |r: (InodeRef, Vec<crate::events::EventId>)| {
+        if r.1.iter().any(|id| out.contains_key(id)) {
+            duplicates.extend(r.1.into_iter().filter(|id| !out.contains_key(id)));
+        }
+    };
+    for ev in ordered {
+        if let Some((inode, path, _)) = device_unlink(ev) {
+            match run.get_mut(&path) {
+                Some((i, ids)) if *i == inode => ids.push(ev.id),
+                _ => {
+                    if let Some(r) = run.insert(path, (inode, vec![ev.id])) {
+                        close(r);
+                    }
+                }
+            }
+            continue;
+        }
+        // DeviceNodeMeta has no event_path, so a meta never breaks a run.
+        if let Some(p) = event_path(ev).cloned()
+            && let Some(r) = run.remove(&p)
+        {
+            close(r);
+        }
+    }
+    for (_, r) in run {
+        close(r);
+    }
+    (out, duplicates)
+}
+
+/// L4b - the helper's marker-only `Unlink` (mode 0: it lost the race to
+/// stat the entry) that is the other tier's report of a `SymlinkRemoved`:
+/// the next event at that path in journal order (the shim's report is
+/// stamped before the syscall, the marker during it). The shim's `SymlinkRemoved` is the
+/// whole restore; the marker would recreate a regular file where the
+/// link was. A mode-0 Unlink of a later entry at the same path is kept.
+/// `events` is in journal order (ts, id).
+pub(crate) fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let ordered = events;
+    let mut by_path: std::collections::HashMap<&PathBuf, Vec<&CaptureEvent>> =
+        std::collections::HashMap::new();
+    for ev in ordered {
+        if let Some(p) = event_path(ev) {
+            by_path.entry(p).or_default().push(ev);
+        }
+    }
+    let is_marker = |e: &CaptureEvent| {
+        matches!(
+            &e.kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink { mode: 0, .. })
+        )
+    };
+    let mut out = Vec::new();
+    for seq in by_path.values() {
+        let mut taken = HashSet::new();
+        for (i, ev) in seq.iter().enumerate() {
+            if !matches!(
+                &ev.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { .. })
+            ) {
+                continue;
+            }
+            // The shim's SymlinkRemoved is stamped before the call and the
+            // kernel tier's marker during it, so the twin is the next event
+            // at the path. A marker before it belongs to an earlier entry.
+            let next = seq
+                .get(i + 1)
+                .filter(|e| is_marker(e) && !taken.contains(&e.id));
+            if let Some(m) = next {
+                taken.insert(m.id);
+                out.push(m.id);
+            }
+        }
+    }
+    out
+}
+
 fn emit_for_tree_op(
+    id: crate::events::EventId,
     op: &TreeOp,
     probe: &dyn StateProbe,
     class: &EventClassification,
@@ -1813,6 +2024,7 @@ fn emit_for_tree_op(
                     path: path.clone(),
                     kind: *kind,
                     mode: *mode,
+                    device: class.device_nodes.get(&id).copied(),
                 },
                 cohort: 0,
                 conflict,
@@ -1857,6 +2069,24 @@ fn emit_for_tree_op(
         TreeOp::Symlink { path, .. } => {
             nodes.push(PlanNode {
                 op: InverseOp::Unlink { path: path.clone() },
+                cohort: 0,
+                conflict: None,
+            });
+        }
+        // Consumed by the path's Unlink above; no inverse of its own.
+        TreeOp::DeviceNodeMeta { .. } => {}
+        // L4b - the shim could not read the removed link's target (an
+        // empty target cannot exist): refuse rather than guess.
+        TreeOp::SymlinkRemoved { target, path } if target.is_empty() => {
+            nodes.push(PlanNode {
+                op: InverseOp::Refuse {
+                    class: "symlink-target-unknown".to_string(),
+                    reason: format!(
+                        "{} was a symlink whose target was not captured, so it is not recreated",
+                        path.display()
+                    ),
+                    remediation: None,
+                },
                 cohort: 0,
                 conflict: None,
             });

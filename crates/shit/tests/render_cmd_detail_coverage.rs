@@ -73,8 +73,12 @@ const JSON_ONLY_CAPTURE_EVENT_KINDS: &[&str] = &[
 
 /// Subvariants of `TreeOp` that intentionally render via the JSON
 /// fallback in `render_tree_op`. Empty at HD-01 land time — every
-/// TreeOp shape today has an explicit human-readable arm.
-const JSON_ONLY_TREE_OPS: &[&str] = &[];
+/// TreeOp shape today has an explicit human-readable arm, except:
+const JSON_ONLY_TREE_OPS: &[&str] = &[
+    // rationale: L4 DeviceNodeMeta is bookkeeping beside an Unlink
+    // (rdev, owner); the Unlink line already names the path.
+    "DeviceNodeMeta",
+];
 
 /// Names of `CaptureEventKind` variants that `render_event` has a
 /// dedicated arm for. Source of truth: the `match ev.kind_label`

@@ -563,6 +563,109 @@ mod policy {
         notify_inner(syscall, path, Some(path));
     }
 
+    /// Plain-path (`unlink`, `open`) counterpart of
+    /// [`notify_pre_mutation_with_content_at`]: the same resolver with
+    /// `AT_FDCWD`, and the resolved path is what gets sent and captured
+    /// (one realpath per call). A path that cannot be keyed ships the
+    /// AU10 marker instead of a silent raw-path fallback; one whose
+    /// parent is missing sends nothing.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn notify_plain_pre_mutation_with_content(syscall: &'static str, path: &str) {
+        if let Some(r) = plain_resolution(path) {
+            notify_resolved(syscall, r);
+        }
+    }
+
+    /// Write-capable `open`/`openat`. An open acts on what the path
+    /// names after symlinks, so the final component is followed (full
+    /// resolve) unless `O_NOFOLLOW` is set, and the pre-image is keyed
+    /// by the resolved target: a write through a symlink restores the
+    /// target's bytes and leaves the link alone. Removals keep the
+    /// parent-only form ([`notify_plain_pre_mutation_with_content`],
+    /// [`notify_pre_mutation_with_content_at`]).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn notify_open_pre_mutation(
+        syscall: &'static str,
+        dirfd: libc::c_int,
+        path: &str,
+        flags: libc::c_int,
+    ) {
+        if let Some(r) = open_resolution(dirfd, path, flags) {
+            notify_resolved(syscall, r);
+        }
+    }
+
+    /// The resolution [`notify_open_pre_mutation`] sends; `None` when
+    /// muted or re-entrant (checked before any canonicalize).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn open_resolution(
+        dirfd: libc::c_int,
+        path: &str,
+        flags: libc::c_int,
+    ) -> Option<AtResolution> {
+        if disabled() || should_skip_path(path) || IN_NOTIFY.with(|f| f.get()) {
+            return None;
+        }
+        Some(if flags & libc::O_NOFOLLOW != 0 {
+            resolve_leaf_at_for_notify(dirfd, path, "path")
+        } else {
+            resolve_at_for_notify(dirfd, path, "path")
+        })
+    }
+
+    /// L4b ruling 7 - the muted and re-entrant cases return before any
+    /// canonicalize, so a disabled shim or a nested call (the
+    /// pre-image read's own `open`) costs no realpath.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn plain_resolution(path: &str) -> Option<AtResolution> {
+        if disabled() || should_skip_path(path) || IN_NOTIFY.with(|f| f.get()) {
+            return None;
+        }
+        Some(resolve_leaf_at_for_notify(libc::AT_FDCWD, path, "path"))
+    }
+
+    /// Test hook: run `f` as if inside a notification on this thread.
+    #[cfg(all(
+        test,
+        any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "linux",
+        )
+    ))]
+    pub(super) fn with_in_notify<R>(f: impl FnOnce() -> R) -> R {
+        let prev = IN_NOTIFY.with(|c| c.replace(true));
+        let out = f();
+        IN_NOTIFY.with(|c| c.set(prev));
+        out
+    }
+
     /// Outcome of resolving an `*at` syscall's `(dirfd, path)` pair for
     /// the journal.
     #[cfg(any(
@@ -599,6 +702,42 @@ mod policy {
         target_os = "linux",
     ))]
     pub fn resolve_at_for_notify(dirfd: libc::c_int, path: &str, which_arg: &str) -> AtResolution {
+        resolve_at_with(dirfd, path, which_arg, canonical_path)
+    }
+
+    /// L4b - variant for calls that act on the final component itself
+    /// (`unlink`, `unlinkat`, and an `O_NOFOLLOW` open): canonicalizes
+    /// only the parent directory and
+    /// joins the final component unresolved, so a symlink is journaled
+    /// as the link, never as its target.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn resolve_leaf_at_for_notify(
+        dirfd: libc::c_int,
+        path: &str,
+        which_arg: &str,
+    ) -> AtResolution {
+        resolve_at_with(dirfd, path, which_arg, canonical_parent_join)
+    }
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn resolve_at_with(
+        dirfd: libc::c_int,
+        path: &str,
+        which_arg: &str,
+        canon: fn(&str) -> Result<String, CanonicalizeError>,
+    ) -> AtResolution {
         let joined = join_at_path(dirfd, path);
         if !joined.starts_with('/') && dirfd != libc::AT_FDCWD {
             return AtResolution::Failed(
@@ -610,7 +749,7 @@ mod policy {
                 },
             );
         }
-        match canonical_path(&joined) {
+        match canon(&joined) {
             Ok(abs) => AtResolution::Resolved(abs),
             Err(CanonicalizeError::PathAndParentBothFailed { parent_err, .. })
                 if matches!(
@@ -645,12 +784,32 @@ mod policy {
         dirfd: libc::c_int,
         path: &str,
     ) {
-        match resolve_at_for_notify(dirfd, path, "path") {
+        notify_resolved(syscall, resolve_leaf_at_for_notify(dirfd, path, "path"));
+    }
+
+    /// Send one resolved single-path notification: a keyed path is the
+    /// wire arg and the capture path, already resolved; a marker ships
+    /// the raw path; `Nothing` sends nothing.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    fn notify_resolved(syscall: &'static str, resolution: AtResolution) {
+        match resolution {
             AtResolution::Resolved(abs) => {
                 if should_skip_path(&abs) {
                     return;
                 }
-                notify_inner_with_failure(syscall, &abs, Some(&abs), None, true);
+                // L4b - the removed entry's identity, read before the
+                // call, so the daemon can pair this report with the
+                // kernel tier's report of the same removal.
+                let pre_stat = matches!(syscall, "unlink" | "unlinkat")
+                    .then(|| lstat_identity(&abs))
+                    .flatten();
+                notify_inner_stat(syscall, &abs, Some(&abs), None, true, pre_stat);
             }
             AtResolution::Failed(raw, failure) => {
                 if should_skip_path(&raw) {
@@ -1178,6 +1337,37 @@ mod policy {
         }
     }
 
+    /// L4b - `canonicalize(parent).join(name)`, never resolving the
+    /// final component (it may be a symlink the call acts on).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn canonical_parent_join(path: &str) -> Result<String, CanonicalizeError> {
+        use std::path::{Path, PathBuf};
+        let p = Path::new(path);
+        let Some(name) = p.file_name() else {
+            return Err(CanonicalizeError::NoFileName(path.to_string()));
+        };
+        let parent_in = match p.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+            Some(parent) => parent.to_path_buf(),
+            None => return Err(CanonicalizeError::NoParent(path.to_string())),
+        };
+        match std::fs::canonicalize(&parent_in) {
+            Ok(parent_abs) => Ok(parent_abs.join(name).to_string_lossy().into_owned()),
+            Err(parent_err) => Err(CanonicalizeError::PathAndParentBothFailed {
+                path: path.to_string(),
+                path_err: std::io::Error::new(parent_err.kind(), "final component not resolved"),
+                parent: parent_in.to_string_lossy().into_owned(),
+                parent_err,
+            }),
+        }
+    }
+
     /// AU10 — Convenience for callers that need to keep the syscall
     /// flowing even when canonicalize fails: returns
     /// `(best_effort_path, Option<ShimFailure>)`. The path is the
@@ -1239,6 +1429,43 @@ mod policy {
         failure: Option<shit_proto::ShimFailure>,
         path_resolved: bool,
     ) {
+        notify_inner_stat(syscall, arg, capture_path, failure, path_resolved, None);
+    }
+
+    /// lstat `path` into the wire's identity triple.
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn lstat_identity(path: &str) -> Option<shit_proto::ShimStat> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| shit_proto::ShimStat {
+                dev: m.dev(),
+                inode: m.ino(),
+                mode: m.mode(),
+                link_target: m
+                    .file_type()
+                    .is_symlink()
+                    .then(|| std::fs::read_link(path).ok())
+                    .flatten()
+                    .map(|t| t.to_string_lossy().into_owned()),
+            })
+    }
+
+    /// [`notify_inner_with_failure`] plus the target's pre-call lstat.
+    fn notify_inner_stat(
+        syscall: &'static str,
+        arg: &str,
+        capture_path: Option<&str>,
+        failure: Option<shit_proto::ShimFailure>,
+        path_resolved: bool,
+        pre_stat: Option<shit_proto::ShimStat>,
+    ) {
         if disabled() {
             return;
         }
@@ -1265,7 +1492,7 @@ mod policy {
             (Some(pre), Some(cap)) if cap == arg => pre.path.clone(),
             _ => arg.to_string(),
         };
-        let _ = try_notify(syscall, &wire_arg, pre_image, Vec::new(), failure);
+        let _ = try_notify_stat(syscall, &wire_arg, pre_image, Vec::new(), failure, pre_stat);
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -1280,7 +1507,7 @@ mod policy {
 
     /// [`capture_pre_image`]; `path_resolved` skips the second
     /// canonicalize when the caller already produced a canonical key.
-    fn capture_pre_image_resolved(
+    pub(super) fn capture_pre_image_resolved(
         path: &str,
         path_resolved: bool,
     ) -> Option<shit_proto::ShimPreImage> {
@@ -1417,9 +1644,18 @@ mod policy {
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
     ) -> std::io::Result<()> {
-        use shit_proto::{
-            ShimAck, ShimNotification, decode_frame, encode_frame, encode_frame_large,
-        };
+        try_notify_stat(syscall, arg, pre_image, extra_pre_images, failure, None)
+    }
+
+    fn try_notify_stat(
+        syscall: &'static str,
+        arg: &str,
+        pre_image: Option<shit_proto::ShimPreImage>,
+        extra_pre_images: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
+        pre_stat: Option<shit_proto::ShimStat>,
+    ) -> std::io::Result<()> {
+        use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_shim_frame};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, SystemTime};
@@ -1459,8 +1695,6 @@ mod policy {
         // SAFETY: shim runs in arbitrary user processes; getpid is a
         // syscall, not an interposer target, so this is safe.
         let pid = unsafe { libc::getpid() } as u32;
-        let has_pre = pre_image.is_some();
-        let has_extras = !extra_pre_images.is_empty();
         let note = ShimNotification {
             pid,
             syscall: syscall.to_string(),
@@ -1473,6 +1707,7 @@ mod policy {
             // silent fallback. The daemon's shim_listener journals
             // a Refuse marker keyed by this field.
             failure,
+            pre_stat,
         };
         // Pre-image notifications can carry up to ~256 KiB of bytes;
         // small notifications fit MAX_FRAME_SIZE comfortably. Use the
@@ -1481,11 +1716,10 @@ mod policy {
         // DR-CR-54: a recursive batch can blow well past the small-
         // frame cap even with `pre_image=None`; pick large-frame
         // whenever extras are present too.
-        let frame = if has_pre || has_extras {
-            encode_frame_large(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
-        } else {
-            encode_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?
-        };
+        // Shim frames carry their own version byte; the large cap covers
+        // pre-image payloads.
+        let frame =
+            encode_shim_frame(&note).map_err(|e| std::io::Error::other(format!("encode: {e}")))?;
         stream.write_all(&frame)?;
 
         // Best-effort ack read. We don't actually act on the ack today
@@ -1540,7 +1774,7 @@ mod interposers {
         // Unlink + PreImage shape and emits RestoreContent for the
         // path's old bytes; the Unlink's RecreatePath inverse is
         // suppressed in that case.
-        policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(path));
+        policy::notify_plain_pre_mutation_with_content("unlink", &cstr_to_string(path));
         let real = next::real_unlink();
         if next::is_zero(next::as_usize(real)) {
             // dlsym failed; fall through to libc's wrapper. The libc
@@ -1568,7 +1802,7 @@ mod interposers {
             // file is the canonical content-overwrite shape (e.g.
             // `install -m … src dst` where dst already exists). Capture
             // the pre-image so undo can restore.
-            policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
+            policy::notify_open_pre_mutation("open", libc::AT_FDCWD, &cstr_to_string(path), flags);
         }
         let real = next::real_open();
         if next::is_zero(next::as_usize(real)) {
@@ -1620,7 +1854,7 @@ mod interposers {
             // capture pre-image bytes when the target exists.
             // DR-CR-54.B: resolve dirfd → absolute up front.
             let path_str = cstr_to_string(path);
-            policy::notify_pre_mutation_with_content_at("openat", dirfd, &path_str);
+            policy::notify_open_pre_mutation("openat", dirfd, &path_str, flags);
         }
         let real = next::real_openat();
         if next::is_zero(next::as_usize(real)) {
@@ -2239,6 +2473,135 @@ mod tests {
     )
 ))]
 mod canonical_tests {
+    /// Review round 3, item 2: the shim's pre-call lstat carries a
+    /// symlink's target, so the daemon does not have to read it later.
+    #[test]
+    fn pre_stat_carries_a_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink("some/target", &link).unwrap();
+        let st = super::policy::lstat_identity(link.to_str().unwrap()).unwrap();
+        assert_eq!(st.link_target.as_deref(), Some("some/target"));
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let st = super::policy::lstat_identity(file.to_str().unwrap()).unwrap();
+        assert_eq!(st.link_target, None);
+    }
+
+    /// D-22: a write-open through a symlink follows it. The notification
+    /// is keyed by the target and carries the target's pre-image, so
+    /// undo restores the target's bytes. `O_NOFOLLOW` keeps the link.
+    #[test]
+    fn write_open_through_a_symlink_captures_the_target() {
+        use super::policy::{AtResolution, capture_pre_image_resolved, open_resolution};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"old bytes").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let want = std::fs::canonicalize(&target).unwrap();
+        let want = want.to_str().unwrap();
+        let flags = libc::O_WRONLY | libc::O_TRUNC;
+        let d = std::fs::File::open(dir.path()).unwrap();
+        for r in [
+            open_resolution(libc::AT_FDCWD, link.to_str().unwrap(), flags),
+            open_resolution(d.as_raw_fd(), "link", flags),
+        ] {
+            let Some(AtResolution::Resolved(abs)) = r else {
+                panic!("expected a resolved target, got {r:?}");
+            };
+            assert_eq!(abs, want);
+            let pre = capture_pre_image_resolved(&abs, true).expect("target pre-image");
+            assert_eq!(pre.path, want);
+            assert_eq!(pre.bytes, b"old bytes");
+        }
+        match open_resolution(
+            libc::AT_FDCWD,
+            link.to_str().unwrap(),
+            flags | libc::O_NOFOLLOW,
+        ) {
+            Some(AtResolution::Resolved(abs)) => assert!(abs.ends_with("/link"), "{abs}"),
+            other => panic!("O_NOFOLLOW: expected the link path, got {other:?}"),
+        }
+    }
+
+    /// L4b: `unlink`/`unlinkat` of a symlink are keyed by the link's own
+    /// path (parent canonicalized, final component as given), never by
+    /// the link's target.
+    #[test]
+    fn single_path_calls_key_a_symlink_by_the_link_not_its_target() {
+        use super::policy::{AtResolution, plain_resolution, resolve_leaf_at_for_notify};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let want = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("link")
+            .to_str()
+            .unwrap()
+            .to_string();
+        match plain_resolution(link.to_str().unwrap()) {
+            Some(AtResolution::Resolved(abs)) => assert_eq!(abs, want),
+            other => panic!("plain: expected the link path, got {other:?}"),
+        }
+        let d = std::fs::File::open(dir.path()).unwrap();
+        match resolve_leaf_at_for_notify(d.as_raw_fd(), "link", "path") {
+            AtResolution::Resolved(abs) => assert_eq!(abs, want),
+            other => panic!("at: expected the link path, got {other:?}"),
+        }
+    }
+
+    /// L4b ruling 7: a re-entrant plain-path notification returns
+    /// before canonicalizing; a normal one resolves once and that
+    /// resolved path is what is sent.
+    #[test]
+    fn plain_path_skips_canonicalize_when_reentrant_and_resolves_once_otherwise() {
+        use super::policy::{AtResolution, plain_resolution, with_in_notify};
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("via")).unwrap();
+        let path = format!("{}/via/f", dir.path().display());
+        assert!(with_in_notify(|| plain_resolution(&path)).is_none());
+        match plain_resolution(&path) {
+            Some(AtResolution::Resolved(abs)) => {
+                let want = std::fs::canonicalize(&real).unwrap().join("f");
+                assert_eq!(abs, want.to_str().unwrap());
+            }
+            other => panic!("expected a resolved path, got {other:?}"),
+        }
+    }
+
+    /// The plain `unlink`/`open` interposers use the same resolver with
+    /// `AT_FDCWD`: an unresolvable parent that is not ENOENT/ENOTDIR
+    /// (here a 300-byte component, ENAMETOOLONG) ships the marker
+    /// naming the path, rather than falling back silently.
+    #[test]
+    fn plain_path_with_unresolvable_parent_carries_the_marker() {
+        use super::policy::{AtResolution, resolve_at_for_notify};
+        let long = "x".repeat(300);
+        let path = format!("/tmp/{long}/leaf");
+        match resolve_at_for_notify(libc::AT_FDCWD, &path, "path") {
+            AtResolution::Failed(
+                raw,
+                shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg,
+                    attempted_path,
+                    ..
+                },
+            ) => {
+                assert_eq!(raw, path);
+                assert_eq!(which_arg, "path");
+                assert_eq!(attempted_path, path);
+            }
+            other => panic!("expected the AU10 marker, got {other:?}"),
+        }
+    }
+
     /// `AT_FDCWD` and absolute paths join to themselves; canonicalizing
     /// the join absolutizes a relative path.
     #[test]
