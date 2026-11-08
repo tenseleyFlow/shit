@@ -2275,3 +2275,39 @@ fn rebuilt_subtree_ops_are_ordered_across_cohorts_by_ancestry() {
     assert!(mkdir_d < write_f, "{nodes:#?}");
     assert!(write_f < meta_d, "{nodes:#?}");
 }
+
+#[test]
+fn different_dir_recreated_under_the_stash_keeps_the_ordinary_inverses() {
+    // Review round 3, item 5: `mv d t; rmdir t/empty; mkdir t/empty`
+    // (unseen); `rm -rf t`. The second rmdir of t/empty carries the new
+    // directory's inode now that removals journal the shim's identity, so
+    // the walk cannot account for it.
+    //
+    // ext4 hands a freed inode straight to the next mkdir, which would
+    // give the new directory the old one's inode and nothing to tell them
+    // apart by; an unjournaled `spare` takes it first. (With the inode
+    // reused, the second directory was necessarily empty, so the rule
+    // dropping its unlink loses nothing.)
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    let old = Sim::inode_of(&sim.p("d/empty"));
+    sim.mv("d", "t");
+    sim.rm_rf("t/empty");
+    sim.mkdir_unseen("spare");
+    sim.mkdir_unseen("t/empty");
+    assert_ne!(Sim::inode_of(&sim.p("t/empty")), old, "inode reused");
+    sim.rm_rf("t");
+    assert_not_rebuilt(&sim, "d");
+    let log = sim.undo();
+    assert_no_failures(&log);
+    let after = sim.snapshot();
+    for rel in ["d/f", "d/sub/g"] {
+        assert_eq!(
+            after.get(Path::new(rel)),
+            before.get(Path::new(rel)),
+            "{rel}\n{}",
+            log.join("\n")
+        );
+    }
+}

@@ -2384,7 +2384,7 @@ mod interposers {
         // L5 (review round 2, item 2): a directory removal is reported
         // after it succeeded, with the stat from before, like rmdir.
         if flag & libc::AT_REMOVEDIR != 0 {
-            let pending = policy::removal_begin_at("unlinkat", dirfd, &path_str);
+            let pending = policy::removal_begin_at("unlinkat_dir", dirfd, &path_str);
             let real = next::real_unlinkat();
             let rc = if next::is_zero(next::as_usize(real)) {
                 unsafe { libc::unlinkat(dirfd, path, flag) }

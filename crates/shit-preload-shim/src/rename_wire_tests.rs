@@ -378,7 +378,7 @@ fn unlinkat_removedir_reports_after_success_with_the_pre_call_stat() {
         assert_eq!(rc, 0);
     });
     assert_eq!(notes.len(), 1, "{notes:#?}");
-    assert_eq!(notes[0].syscall, "unlinkat");
+    assert_eq!(notes[0].syscall, "unlinkat_dir");
     assert_eq!(notes[0].arg, dir.join("e").to_str().unwrap());
     assert_eq!(notes[0].pre_stat.map(|s| s.mode), Some(0o040750));
 }
