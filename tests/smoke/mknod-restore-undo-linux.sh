@@ -35,7 +35,11 @@
 # Phase 4, born in the command. A node made (sudo mknod) and removed
 # inside one command is scratch: undo must create nothing.
 #
-# Phase 5, helper restart. A user-owned node is `rm`'d, then shitd and
+# Phase 5, nodev source. A node on a nodev filesystem (/dev/shm here;
+# FUSE always is) gets no token: undo refuses with "source filesystem
+# does not allow device nodes".
+#
+# Phase 6, helper restart. A user-owned node is `rm`'d, then shitd and
 # its helper are restarted. The new helper has a new key, so undo must
 # refuse with "capture evidence expired: helper restarted" and create
 # nothing.
@@ -100,11 +104,12 @@ seed() {
     [ -c "$1" ] || smoke_fail "seed $1 is not a char device"
 }
 
-# rm_in_command <seq> <path>: one journaled command that removes <path>.
+# rm_in_command <seq> <path> [cwd]: one journaled command that removes
+# <path>, watching [cwd] (default the scratch dir).
 rm_in_command() {
     "${SHIT_BIN}" hook-send pre-exec \
         --session "${SESSION}" --seq "$1" --pid "${PID}" \
-        --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
+        --cwd "${3:-${SCRATCH}}" --shell bash --sock "${SHIT_HOOK_SOCK}"
     # pre_open_tree must have stashed the node's O_PATH fd before the rm.
     sleep 0.5
     rm -f "$2" 2>/dev/null || sudo -n rm -f "$2"
@@ -142,7 +147,7 @@ smoke_log "seeded ${NODE}: major:minor(hex) mode owner = ${PRE}"
 [ "${PRE}" = "1:3 640 ${ME}" ] || smoke_fail "seed node is not as made: ${PRE}"
 
 rm_in_command 1 "${NODE}"
-smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 1 10
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta' AND path = '${NODE}'" 1 10
 
 "${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
@@ -176,7 +181,7 @@ rm -f "${NODE}"
 ROOT_NODE="${SCRATCH}/l4_null_root"
 seed "${ROOT_NODE}" 0:0 0666
 rm_in_command 2 "${ROOT_NODE}"
-smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 2 10
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta' AND path = '${ROOT_NODE}'" 1 10
 undo_expect_refusal "${SHIT_SMOKE_TMP}/undo-root.log" "not the invoking user" "${ROOT_NODE}"
 smoke_log "phase 2: foreign owner refused, no node created"
 
@@ -194,7 +199,7 @@ LD_PRELOAD="${SHIM_LIB}" rm -f "${DUAL_NODE}"
 sleep 0.5
 "${SHIT_BIN}" hook-send post-exec \
     --session "${SESSION}" --seq 3 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
-smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 3 10
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta' AND path = '${DUAL_NODE}'" 1 10
 # The shim must really have reported this rm, or the phase proves nothing.
 # The daemon's JSON log is written asynchronously; give it a moment.
 shim_seen=0
@@ -208,6 +213,7 @@ done
 [ "${shim_seen}" = 1 ] || smoke_fail "phase 3: no shim notification for ${DUAL_NODE}; LD_PRELOAD shim did not report"
 SHIM_UNLINKS="$(smoke_journal_count "discriminant = 'TreeOpUnlink' AND path = '${DUAL_NODE}'")"
 smoke_log "phase 3: ${SHIM_UNLINKS} Unlink row(s) journaled for the dual-tier rm"
+[ "${SHIM_UNLINKS}" -ge 1 ] || smoke_fail "phase 3: no Unlink journaled for ${DUAL_NODE}"
 APPLIED_BEFORE="$(sed 's/\x1b\[[0-9;]*m//g' "${SHIT_SMOKE_TMP}/shitd.log" | grep 'apply_mknod' | grep -Ec 'outcome[=:]+ *Applied' || true)"
 "${SHIT_BIN}" undo --yes >"${SHIT_SMOKE_TMP}/undo-dual.log" 2>&1 || {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo-dual.log" >&2
@@ -219,6 +225,11 @@ APPLIED_BEFORE="$(sed 's/\x1b\[[0-9;]*m//g' "${SHIT_SMOKE_TMP}/shitd.log" | grep
 }
 APPLIED_AFTER="$(sed 's/\x1b\[[0-9;]*m//g' "${SHIT_SMOKE_TMP}/shitd.log" | grep 'apply_mknod' | grep -Ec 'outcome[=:]+ *Applied' || true)"
 [ $((APPLIED_AFTER - APPLIED_BEFORE)) -eq 1 ] || smoke_fail "dual-tier undo ran apply_mknod $((APPLIED_AFTER - APPLIED_BEFORE)) times, want 1"
+# One op applied, none failed or conflicted: the twin report planned nothing.
+grep -q 'applied=1 skipped=0 refused=0 failed=0 conflicts=0' "${SHIT_SMOKE_TMP}/undo-dual.log" || {
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo-dual.log" >&2
+    smoke_fail "dual-tier undo report is not exactly one applied op"
+}
 smoke_log "phase 3: dual-tier rm restored once"
 rm -f "${DUAL_NODE}"
 
@@ -243,20 +254,38 @@ if [ -e "${BORN_NODE}" ]; then
 fi
 smoke_log "phase 4: node made and removed in the command; undo created nothing"
 
-# ---- phase 5: a restarted helper refuses old capture evidence ----
+# ---- phase 5: a node on a nodev filesystem gets no token ----
+# /dev/shm is mounted nodev on the usual Linux setups (FUSE always is).
+NODEV_DIR=""
+if grep -Eq '^[^ ]+ /dev/shm [^ ]+ [^ ]*\bnodev\b' /proc/mounts; then
+    NODEV_DIR="$(mktemp -d /dev/shm/shit-l4b.XXXXXX)"
+fi
+if [ -n "${NODEV_DIR}" ]; then
+    NODEV_NODE="${NODEV_DIR}/l4_null_nodev"
+    seed "${NODEV_NODE}" "${ME}" 0640
+    rm_in_command 5 "${NODEV_NODE}" "${NODEV_DIR}"
+    smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta' AND path = '${NODEV_NODE}'" 1 10
+    undo_expect_refusal "${SHIT_SMOKE_TMP}/undo-nodev.log" "source filesystem does not allow device nodes" "${NODEV_NODE}"
+    smoke_log "phase 5: nodev source refused"
+    rm -rf "${NODEV_DIR}"
+else
+    smoke_log "phase 5: SKIP (no nodev /dev/shm)"
+fi
+
+# ---- phase 6: a restarted helper refuses old capture evidence ----
 OLD_NODE="${SCRATCH}/l4_null_before_restart"
 seed "${OLD_NODE}" "${ME}" 0600
-rm_in_command 5 "${OLD_NODE}"
-smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 5 10
+rm_in_command 6 "${OLD_NODE}"
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta' AND path = '${OLD_NODE}'" 1 10
 cp "${SHIT_SMOKE_TMP}/shitd.log" "${SHIT_SMOKE_TMP}/shitd-before-restart.log"
 smoke_stop_shitd || true
 smoke_start_shitd
 undo_expect_refusal "${SHIT_SMOKE_TMP}/undo-restart.log" "capture evidence expired: helper restarted" "${OLD_NODE}"
-smoke_log "phase 5: token from the previous helper refused"
+smoke_log "phase 6: token from the previous helper refused"
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}" || true
 
 sudo -n rm -f "${NODE}" "${ROOT_NODE}" "${OLD_NODE}" "${DUAL_NODE}" "${BORN_NODE}" || true
 
-smoke_log "PASS: mknod-restore-undo-linux (restore via capture token, once under both tiers; foreign owner and restarted helper refused)"
+smoke_log "PASS: mknod-restore-undo-linux (restore via capture token, once under both tiers; foreign owner, nodev source and restarted helper refused)"
