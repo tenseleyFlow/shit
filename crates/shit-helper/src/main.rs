@@ -26,6 +26,7 @@ mod capsicum_bsd;
     target_os = "macos",
 ))]
 mod capture;
+#[cfg(target_os = "linux")]
 mod capture_token;
 mod cloud;
 #[cfg(target_os = "macos")]
@@ -548,15 +549,16 @@ fn main() -> anyhow::Result<()> {
     // never leaves this process. Non-dumpable keeps same-user ptrace and
     // /proc/<pid>/mem off it (a setcap exec already clears the flag;
     // this covers other starts and checks it stayed clear).
+    // Device-node restore, the only user of the key, is Linux-only.
     #[cfg(target_os = "linux")]
-    let dumpable = capture_token::ensure_non_dumpable();
-    #[cfg(not(target_os = "linux"))]
-    let dumpable = -1;
-    tracing::info!(
-        token_key = capture_token::process_key().is_some(),
-        dumpable,
-        "capture-token key ready"
-    );
+    {
+        let dumpable = capture_token::ensure_non_dumpable();
+        tracing::info!(
+            token_key = capture_token::process_key().is_some(),
+            dumpable,
+            "capture-token key ready"
+        );
+    }
 
     // ---- privileged phase ----
     // Open any fd that requires `CAP_SYS_ADMIN` while we still have it,
@@ -3284,7 +3286,10 @@ fn apply_mknod(
     let mode_native: libc::mode_t = mode as libc::mode_t;
     let ifmt = mode_native & libc::S_IFMT;
     if ifmt == libc::S_IFBLK || ifmt == libc::S_IFCHR {
+        #[cfg(target_os = "linux")]
         return apply_device_mknod(path, mode, dev, device, capture_token::process_key());
+        #[cfg(not(target_os = "linux"))]
+        return apply_device_mknod(path, mode, dev, device);
     }
     if ifmt != libc::S_IFIFO && ifmt != libc::S_IFSOCK {
         // Regular (S_IFREG — planner shouldn't route Regular here),
@@ -3405,7 +3410,6 @@ fn apply_device_mknod(
     _mode: u32,
     _rdev: u64,
     _evidence: Option<&shit_proto::DeviceEvidence>,
-    _key: Option<&capture_token::TokenKey>,
 ) -> shit_proto::PrivilegedOpOutcome {
     shit_proto::PrivilegedOpOutcome::Refused {
         reason: "block/char node restore is Linux-only".to_string(),
@@ -3723,241 +3727,246 @@ mod apply_mknod_tests {
         );
     }
 
-    // ---- L4b: block/char nodes need this helper's capture token ----
+    /// L4b: block/char nodes need this helper's capture token
+    /// (Linux-only, like the restore itself).
+    #[cfg(target_os = "linux")]
+    mod device {
+        use super::*;
 
-    const CHR: u32 = 0o020000;
-    /// 1:3, the number /dev/null has. Never a real disk.
-    const NULL_DEV: u64 = (1 << 8) | 3;
+        const CHR: u32 = 0o020000;
+        /// 1:3, the number /dev/null has. Never a real disk.
+        const NULL_DEV: u64 = (1 << 8) | 3;
 
-    fn me() -> (u32, u32) {
-        unsafe { (libc::geteuid(), libc::getegid()) }
-    }
-
-    /// Evidence as the daemon would send it back for a capture of
-    /// `path` with these fields, signed by `key`.
-    fn evidence(
-        key: &capture_token::TokenKey,
-        path: &str,
-        mode: u32,
-        rdev: u64,
-        owner: (u32, u32),
-    ) -> shit_proto::DeviceEvidence {
-        let session = uuid::Uuid::from_u128(0x004c_3462);
-        let facts = capture_token::DeviceFacts {
-            mode,
-            rdev,
-            uid: owner.0,
-            gid: owner.1,
-            dev: 0x803,
-            ino: 77,
-            path,
-            session,
-            seq: 9,
-        };
-        shit_proto::DeviceEvidence {
-            uid: owner.0,
-            gid: owner.1,
-            dev: 0x803,
-            inode: 77,
-            session,
-            command_seq: 9,
-            token: key.issue(&facts),
+        fn me() -> (u32, u32) {
+            unsafe { (libc::geteuid(), libc::getegid()) }
         }
-    }
 
-    fn this_helper() -> &'static capture_token::TokenKey {
-        capture_token::process_key().expect("kernel RNG")
-    }
-
-    fn refused(o: &PrivilegedOpOutcome, needle: &str) -> bool {
-        matches!(o, PrivilegedOpOutcome::Refused { reason } if reason.contains(needle))
-    }
-
-    #[test]
-    fn device_mknod_without_a_captured_number_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("blk");
-        let ps = p.to_str().unwrap();
-        let ev = evidence(this_helper(), ps, 0o060644, 0, me());
-        let outcome = apply_mknod(ps, 0o060644, 0, Some(&ev));
-        assert!(refused(&outcome, "no device number"), "{outcome:?}");
-        assert!(!p.exists());
-    }
-
-    #[test]
-    fn forged_device_mknod_without_a_token_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let outcome = apply_mknod(p.to_str().unwrap(), CHR | 0o666, NULL_DEV, None);
-        assert!(refused(&outcome, "no capture evidence"), "{outcome:?}");
-        assert!(std::fs::symlink_metadata(&p).is_err());
-    }
-
-    #[test]
-    fn forged_device_mknod_with_a_bad_token_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let ps = p.to_str().unwrap();
-        let mut ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
-        ev.token.mac[5] ^= 0x40;
-        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
-        assert!(refused(&outcome, "does not match"), "{outcome:?}");
-        assert!(std::fs::symlink_metadata(&p).is_err());
-    }
-
-    #[test]
-    fn token_for_other_fields_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let q = dir.path().join("elsewhere");
-        let (ps, qs) = (p.to_str().unwrap(), q.to_str().unwrap());
-        let (u, g) = me();
-        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (u, g));
-        // Another rdev, another kind, wider mode, another path.
-        for (path, mode, rdev) in [
-            (ps, CHR | 0o640, (1u64 << 8) | 5),
-            (ps, 0o060640, NULL_DEV),
-            (ps, CHR | 0o666, NULL_DEV),
-            (qs, CHR | 0o640, NULL_DEV),
-        ] {
-            let outcome = apply_mknod(path, mode, rdev, Some(&ev));
-            assert!(
-                refused(&outcome, "does not match"),
-                "{path} {mode:o} {rdev:#x}: {outcome:?}"
-            );
-        }
-        // Another owner or another removed inode than the token covers.
-        for forged in [
-            shit_proto::DeviceEvidence { uid: 0, ..ev },
-            shit_proto::DeviceEvidence { gid: 0, ..ev },
-            shit_proto::DeviceEvidence { inode: 78, ..ev },
+        /// Evidence as the daemon would send it back for a capture of
+        /// `path` with these fields, signed by `key`.
+        fn evidence(
+            key: &capture_token::TokenKey,
+            path: &str,
+            mode: u32,
+            rdev: u64,
+            owner: (u32, u32),
+        ) -> shit_proto::DeviceEvidence {
+            let session = uuid::Uuid::from_u128(0x004c_3462);
+            let facts = capture_token::DeviceFacts {
+                mode,
+                rdev,
+                uid: owner.0,
+                gid: owner.1,
+                dev: 0x803,
+                ino: 77,
+                path,
+                session,
+                seq: 9,
+            };
             shit_proto::DeviceEvidence {
-                command_seq: 10,
-                ..ev
-            },
-        ] {
-            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&forged));
-            assert!(
-                refused(&outcome, "does not match"),
-                "{forged:?}: {outcome:?}"
-            );
-        }
-        assert!(std::fs::symlink_metadata(&p).is_err());
-        assert!(std::fs::symlink_metadata(&q).is_err());
-    }
-
-    #[test]
-    fn token_from_a_previous_helper_process_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let ps = p.to_str().unwrap();
-        // A key this process never held stands in for the helper that
-        // ran before a restart.
-        let previous = capture_token::TokenKey::generate().unwrap();
-        let ev = evidence(&previous, ps, CHR | 0o640, NULL_DEV, me());
-        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
-        assert_eq!(
-            outcome,
-            PrivilegedOpOutcome::Refused {
-                reason: "capture evidence expired: helper restarted".to_string()
+                uid: owner.0,
+                gid: owner.1,
+                dev: 0x803,
+                inode: 77,
+                session,
+                command_seq: 9,
+                token: key.issue(&facts),
             }
-        );
-        assert!(std::fs::symlink_metadata(&p).is_err());
-    }
+        }
 
-    #[test]
-    fn owner_other_than_the_invoking_user_is_refused_before_mknod() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let ps = p.to_str().unwrap();
-        let (u, g) = me();
-        let other = if u == 0 { 1 } else { 0 };
-        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (other, g));
-        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
-        assert!(refused(&outcome, "not the invoking user"), "{outcome:?}");
-        assert!(std::fs::symlink_metadata(&p).is_err());
-    }
+        fn this_helper() -> &'static capture_token::TokenKey {
+            capture_token::process_key().expect("kernel RNG")
+        }
 
-    #[test]
-    fn parent_swapped_to_a_symlink_is_refused() {
-        // The token is for <dir>/sub/chr. Before the apply, `sub` is
-        // replaced by a symlink to another directory; the helper must
-        // not follow it.
-        let dir = tempfile::tempdir().unwrap();
-        let elsewhere = dir.path().join("elsewhere");
-        std::fs::create_dir(&elsewhere).unwrap();
-        let sub = dir.path().join("sub");
-        std::os::unix::fs::symlink(&elsewhere, &sub).unwrap();
-        let p = sub.join("chr");
-        let ps = p.to_str().unwrap();
-        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
-        let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
-        assert!(refused(&outcome, "symlink"), "{outcome:?}");
-        assert!(std::fs::symlink_metadata(elsewhere.join("chr")).is_err());
-        // A `..` in a token-backed path is refused too.
-        let dotdot = format!("{}/sub/../chr", dir.path().display());
-        let ev = evidence(this_helper(), &dotdot, CHR | 0o640, NULL_DEV, me());
-        let outcome = apply_mknod(&dotdot, CHR | 0o640, NULL_DEV, Some(&ev));
-        assert!(refused(&outcome, ".."), "{outcome:?}");
-    }
+        fn refused(o: &PrivilegedOpOutcome, needle: &str) -> bool {
+            matches!(o, PrivilegedOpOutcome::Refused { reason } if reason.contains(needle))
+        }
 
-    #[test]
-    fn valid_token_and_own_owner_reach_mknod_with_the_captured_mode() {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let ps = p.to_str().unwrap();
-        let (u, g) = me();
-        let mode = CHR | 0o640;
-        let ev = evidence(this_helper(), ps, mode, NULL_DEV, (u, g));
-        let outcome = apply_mknod(ps, mode, NULL_DEV, Some(&ev));
-        if outcome == PrivilegedOpOutcome::PermissionDenied {
-            // No CAP_MKNOD in this test process: every check passed and
-            // the kernel refused mknodat. Nothing was created. Set
-            // SHIT_TEST_REQUIRE_MKNOD=1 when the binary has cap_mknod.
-            assert!(
-                std::env::var_os("SHIT_TEST_REQUIRE_MKNOD").is_none(),
-                "mknodat refused although SHIT_TEST_REQUIRE_MKNOD is set"
+        #[test]
+        fn device_mknod_without_a_captured_number_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("blk");
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, 0o060644, 0, me());
+            let outcome = apply_mknod(ps, 0o060644, 0, Some(&ev));
+            assert!(refused(&outcome, "no device number"), "{outcome:?}");
+            assert!(!p.exists());
+        }
+
+        #[test]
+        fn forged_device_mknod_without_a_token_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let outcome = apply_mknod(p.to_str().unwrap(), CHR | 0o666, NULL_DEV, None);
+            assert!(refused(&outcome, "no capture evidence"), "{outcome:?}");
+            assert!(std::fs::symlink_metadata(&p).is_err());
+        }
+
+        #[test]
+        fn forged_device_mknod_with_a_bad_token_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let ps = p.to_str().unwrap();
+            let mut ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+            ev.token.mac[5] ^= 0x40;
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert!(refused(&outcome, "does not match"), "{outcome:?}");
+            assert!(std::fs::symlink_metadata(&p).is_err());
+        }
+
+        #[test]
+        fn token_for_other_fields_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let q = dir.path().join("elsewhere");
+            let (ps, qs) = (p.to_str().unwrap(), q.to_str().unwrap());
+            let (u, g) = me();
+            let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (u, g));
+            // Another rdev, another kind, wider mode, another path.
+            for (path, mode, rdev) in [
+                (ps, CHR | 0o640, (1u64 << 8) | 5),
+                (ps, 0o060640, NULL_DEV),
+                (ps, CHR | 0o666, NULL_DEV),
+                (qs, CHR | 0o640, NULL_DEV),
+            ] {
+                let outcome = apply_mknod(path, mode, rdev, Some(&ev));
+                assert!(
+                    refused(&outcome, "does not match"),
+                    "{path} {mode:o} {rdev:#x}: {outcome:?}"
+                );
+            }
+            // Another owner or another removed inode than the token covers.
+            for forged in [
+                shit_proto::DeviceEvidence { uid: 0, ..ev },
+                shit_proto::DeviceEvidence { gid: 0, ..ev },
+                shit_proto::DeviceEvidence { inode: 78, ..ev },
+                shit_proto::DeviceEvidence {
+                    command_seq: 10,
+                    ..ev
+                },
+            ] {
+                let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&forged));
+                assert!(
+                    refused(&outcome, "does not match"),
+                    "{forged:?}: {outcome:?}"
+                );
+            }
+            assert!(std::fs::symlink_metadata(&p).is_err());
+            assert!(std::fs::symlink_metadata(&q).is_err());
+        }
+
+        #[test]
+        fn token_from_a_previous_helper_process_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let ps = p.to_str().unwrap();
+            // A key this process never held stands in for the helper that
+            // ran before a restart.
+            let previous = capture_token::TokenKey::generate().unwrap();
+            let ev = evidence(&previous, ps, CHR | 0o640, NULL_DEV, me());
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert_eq!(
+                outcome,
+                PrivilegedOpOutcome::Refused {
+                    reason: "capture evidence expired: helper restarted".to_string()
+                }
             );
             assert!(std::fs::symlink_metadata(&p).is_err());
-            return;
         }
-        assert_eq!(outcome, PrivilegedOpOutcome::Applied);
-        let m = std::fs::symlink_metadata(&p).unwrap();
-        assert!(m.file_type().is_char_device());
-        assert_eq!(m.rdev(), NULL_DEV);
-        assert_eq!(m.mode() & 0o7777, 0o640);
-        assert_eq!((m.uid(), m.gid()), (u, g));
-        // Replaying the same restore is idempotent.
-        assert_eq!(
-            apply_mknod(ps, mode, NULL_DEV, Some(&ev)),
-            PrivilegedOpOutcome::Applied
-        );
-        // A node whose mode now differs is a conflict and is left alone.
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(
-            apply_mknod(ps, mode, NULL_DEV, Some(&ev)),
-            PrivilegedOpOutcome::Conflict { .. }
-        ));
-        assert_eq!(
-            std::fs::symlink_metadata(&p).unwrap().mode() & 0o7777,
-            0o600
-        );
-    }
 
-    #[test]
-    fn existing_node_with_another_number_is_a_conflict() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("chr");
-        let ps = p.to_str().unwrap();
-        // A fifo where the char node should go: kind differs.
-        let c = std::ffi::CString::new(ps).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
-        let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
-        assert!(matches!(
-            apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev)),
-            PrivilegedOpOutcome::Conflict { .. }
-        ));
+        #[test]
+        fn owner_other_than_the_invoking_user_is_refused_before_mknod() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let ps = p.to_str().unwrap();
+            let (u, g) = me();
+            let other = if u == 0 { 1 } else { 0 };
+            let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (other, g));
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert!(refused(&outcome, "not the invoking user"), "{outcome:?}");
+            assert!(std::fs::symlink_metadata(&p).is_err());
+        }
+
+        #[test]
+        fn parent_swapped_to_a_symlink_is_refused() {
+            // The token is for <dir>/sub/chr. Before the apply, `sub` is
+            // replaced by a symlink to another directory; the helper must
+            // not follow it.
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let sub = dir.path().join("sub");
+            std::os::unix::fs::symlink(&elsewhere, &sub).unwrap();
+            let p = sub.join("chr");
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert!(refused(&outcome, "symlink"), "{outcome:?}");
+            assert!(std::fs::symlink_metadata(elsewhere.join("chr")).is_err());
+            // A `..` in a token-backed path is refused too.
+            let dotdot = format!("{}/sub/../chr", dir.path().display());
+            let ev = evidence(this_helper(), &dotdot, CHR | 0o640, NULL_DEV, me());
+            let outcome = apply_mknod(&dotdot, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert!(refused(&outcome, ".."), "{outcome:?}");
+        }
+
+        #[test]
+        fn valid_token_and_own_owner_reach_mknod_with_the_captured_mode() {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let ps = p.to_str().unwrap();
+            let (u, g) = me();
+            let mode = CHR | 0o640;
+            let ev = evidence(this_helper(), ps, mode, NULL_DEV, (u, g));
+            let outcome = apply_mknod(ps, mode, NULL_DEV, Some(&ev));
+            if outcome == PrivilegedOpOutcome::PermissionDenied {
+                // No CAP_MKNOD in this test process: every check passed and
+                // the kernel refused mknodat. Nothing was created. Set
+                // SHIT_TEST_REQUIRE_MKNOD=1 when the binary has cap_mknod.
+                assert!(
+                    std::env::var_os("SHIT_TEST_REQUIRE_MKNOD").is_none(),
+                    "mknodat refused although SHIT_TEST_REQUIRE_MKNOD is set"
+                );
+                assert!(std::fs::symlink_metadata(&p).is_err());
+                return;
+            }
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert!(m.file_type().is_char_device());
+            assert_eq!(m.rdev(), NULL_DEV);
+            assert_eq!(m.mode() & 0o7777, 0o640);
+            assert_eq!((m.uid(), m.gid()), (u, g));
+            // Replaying the same restore is idempotent.
+            assert_eq!(
+                apply_mknod(ps, mode, NULL_DEV, Some(&ev)),
+                PrivilegedOpOutcome::Applied
+            );
+            // A node whose mode now differs is a conflict and is left alone.
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(
+                apply_mknod(ps, mode, NULL_DEV, Some(&ev)),
+                PrivilegedOpOutcome::Conflict { .. }
+            ));
+            assert_eq!(
+                std::fs::symlink_metadata(&p).unwrap().mode() & 0o7777,
+                0o600
+            );
+        }
+
+        #[test]
+        fn existing_node_with_another_number_is_a_conflict() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let ps = p.to_str().unwrap();
+            // A fifo where the char node should go: kind differs.
+            let c = std::ffi::CString::new(ps).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+            let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+            assert!(matches!(
+                apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev)),
+                PrivilegedOpOutcome::Conflict { .. }
+            ));
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! L4b - capture tokens: the helper's own evidence for a privileged
-//! apply.
+//! apply. Linux-only, like the device-node restore that uses them.
 //!
 //! Any local user can run the helper, and its peer (shitd) runs as that
 //! user, so every field of an apply request is attacker-controlled. The
@@ -131,7 +131,6 @@ pub fn process_key() -> Option<&'static TokenKey> {
     PROCESS_KEY.get_or_init(TokenKey::generate).as_ref()
 }
 
-#[cfg(target_os = "linux")]
 fn fill_random(buf: &mut [u8]) -> Option<()> {
     let mut done = 0;
     while done < buf.len() {
@@ -147,23 +146,11 @@ fn fill_random(buf: &mut [u8]) -> Option<()> {
     Some(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn fill_random(buf: &mut [u8]) -> Option<()> {
-    // getentropy(2) caps one call at 256 bytes; callers ask for 48.
-    for chunk in buf.chunks_mut(256) {
-        if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
-            return None;
-        }
-    }
-    Some(())
-}
-
 /// Make sure the helper is not dumpable, and report what the kernel
 /// says. The kernel already clears the flag when it execs a binary with
 /// file capabilities; this covers a helper started some other way
 /// (root, tests) and checks nothing in the process turned it back on.
 /// Returns the value read back with `PR_GET_DUMPABLE` (0 is the goal).
-#[cfg(target_os = "linux")]
 pub fn ensure_non_dumpable() -> i32 {
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
