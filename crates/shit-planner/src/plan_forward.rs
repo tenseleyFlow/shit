@@ -59,7 +59,9 @@ pub fn plan_forward(
     // (latest last) — mirror of `plan()`'s reverse-chronological
     // walk. This lets tree-creates land before content writes when
     // a redo touches the same path twice.
-    let mut live: Vec<&CaptureEvent> = events.iter().filter(|e| !e.partial).collect();
+    // L5 (PR B): the same events undo plans from, rename calls applied.
+    let adjusted = crate::rename_calls::live_events(events);
+    let mut live: Vec<&CaptureEvent> = adjusted.iter().collect();
     live.sort_by_key(|e| (e.ts, e.id));
 
     // FreeBSD observes chflags twice: synchronously through the shim
@@ -490,6 +492,8 @@ fn emit_forward_for_event(
                 ),
             });
         }
+        // L5 (PR B): records about rename calls; nothing to redo.
+        CaptureEventKind::RenameCall { .. } | CaptureEventKind::RenameOutcome { .. } => {}
         CaptureEventKind::CaptureRefused { path, detail, .. } => {
             // AU10 — the original capture was incomplete; redo
             // (forward) has nothing to apply either. Surface the
@@ -689,6 +693,80 @@ mod tests {
             partial: false,
             kind,
         }
+    }
+
+    /// Review of #224, item 2: redo reads the same events as undo. A
+    /// failed rename call and the kernel tier's twin of a successful one
+    /// are not replayed; the successful call is replayed once.
+    #[test]
+    fn redo_skips_failed_rename_calls_and_kernel_twins() {
+        let rename = |from: &str, to: &str, inode| {
+            CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: PathBuf::from(from),
+                to: PathBuf::from(to),
+                inode,
+            })
+        };
+        let real = InodeRef::new(8, 42);
+        let events = vec![
+            // A failed call (EXDEV).
+            ev(rename("/w/a", "/w/b", InodeRef::new(0, 0)), 1),
+            ev(
+                CaptureEventKind::RenameCall {
+                    pid: 7,
+                    call_id: 1,
+                    events: vec![EventId(1)],
+                },
+                2,
+            ),
+            ev(
+                CaptureEventKind::RenameOutcome {
+                    pid: 7,
+                    call_id: 1,
+                    errno: 18,
+                    source: InodeRef::new(8, 41),
+                },
+                3,
+            ),
+            // A successful call and the kernel tier's report of it.
+            ev(rename("/w/c", "/w/d", InodeRef::new(0, 0)), 4),
+            ev(
+                CaptureEventKind::RenameCall {
+                    pid: 7,
+                    call_id: 2,
+                    events: vec![EventId(4)],
+                },
+                5,
+            ),
+            ev(rename("/w/c", "/w/d", real), 6),
+            ev(
+                CaptureEventKind::RenameOutcome {
+                    pid: 7,
+                    call_id: 2,
+                    errno: 0,
+                    source: real,
+                },
+                7,
+            ),
+        ];
+        let p = plan_forward(
+            command(1),
+            &events,
+            &probe_with(&["/w/a", "/w/c"]),
+            &InMemoryStore::new(),
+        );
+        let renames: Vec<_> = p
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                InverseOp::Rename { from, to } => Some((from.clone(), to.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            renames,
+            vec![(PathBuf::from("/w/c"), PathBuf::from("/w/d"))]
+        );
     }
 
     #[test]

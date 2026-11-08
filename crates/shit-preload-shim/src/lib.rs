@@ -1012,18 +1012,28 @@ mod policy {
         }
         let (pre_image, pre_stat, gap) = rename_destination(capture_path);
         let extras = collect_recursive_pre_images(from_abs);
+        // L5 (PR B): one id per call, on the pre-call note and on the
+        // outcome sent after the call, with the source's inode before it.
+        let call_id = next_call_id();
+        let source = lstat_identity(from_abs).map_or((0, 0), |st| (st.dev, st.inode));
+        let mut pending = PendingRename {
+            syscall,
+            arg: arg.to_string(),
+            call_id,
+            source,
+            held: None,
+        };
         // Review of #232 round 2, item 5: a rename over a symlink is
         // reported after it succeeded, carrying the link's lstat, so the
         // daemon never journals a replaced link for a rename that failed.
         if pre_stat.is_some() {
             IN_NOTIFY.with(|f| f.set(false));
-            return Some(PendingRename {
-                syscall,
-                arg: arg.to_string(),
+            pending.held = Some(HeldRename {
                 extras,
                 failure,
                 pre_stat,
             });
+            return Some(pending);
         }
         // #222: the wire arg stays `from\tto` for the whole rename
         // family, overwrite or not. The pre-image carries the
@@ -1035,34 +1045,105 @@ mod policy {
             (Some(f), Some(g)) => (Some(f), Some(g)),
             (f, g) => (f.or(g), None),
         };
-        let _ = try_notify(syscall, arg, pre_image, extras, failure);
+        let with_id = || NoteExtra {
+            call_id,
+            ..NoteExtra::default()
+        };
+        let _ = try_notify_full(syscall, arg, pre_image, extras, failure, with_id());
         if let Some(g) = second_gap {
-            let _ = try_notify("capture_gap", capture_path, None, Vec::new(), Some(g));
+            let _ = try_notify_full(
+                "capture_gap",
+                capture_path,
+                None,
+                Vec::new(),
+                Some(g),
+                with_id(),
+            );
         }
         IN_NOTIFY.with(|f| f.set(false));
-        None
+        Some(pending)
     }
 
-    /// A rename over a symlink, reported once the call returns.
+    /// L5 (PR B): a per-process id for one rename-family call. With the
+    /// pid it names the call; it never repeats within a process.
+    fn next_call_id() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A rename-family call in flight: what [`rename_end`] reports once it
+    /// returns.
     pub struct PendingRename {
         syscall: &'static str,
         arg: String,
+        call_id: u64,
+        /// `(dev, inode)` of `from` before the call; `(0, 0)` if unknown.
+        source: (u64, u64),
+        /// A rename over a symlink, whose note waits for the call's
+        /// success.
+        held: Option<HeldRename>,
+    }
+
+    struct HeldRename {
         extras: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
         pre_stat: Option<shit_proto::ShimStat>,
     }
 
-    /// After a rename-family call: send a held rename (one over a
-    /// symlink) only if the call succeeded. Leaves errno as it was.
+    /// After a rename-family call. A held rename (one over a symlink) is
+    /// sent only if the call succeeded. Then, for every call, the outcome:
+    /// the errno and the source's inode read before the call, under the
+    /// call's id. Nothing waits on its ack, and nothing is stat'ed after
+    /// the call.
+    /// Leaves errno as it was.
     pub fn rename_end(pending: Option<PendingRename>, rc: libc::c_int) {
         let Some(p) = pending else {
             return;
         };
-        if rc != 0 || IN_NOTIFY.with(|f| f.replace(true)) {
+        if disabled() || IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }
+        let errno = if rc == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
         with_saved_errno(|| {
-            let _ = try_notify_full(p.syscall, &p.arg, None, p.extras, p.failure, p.pre_stat);
+            if errno == 0
+                && let Some(h) = p.held
+            {
+                let _ = try_notify_full(
+                    p.syscall,
+                    &p.arg,
+                    None,
+                    h.extras,
+                    h.failure,
+                    NoteExtra {
+                        pre_stat: h.pre_stat,
+                        call_id: p.call_id,
+                        ..NoteExtra::default()
+                    },
+                );
+            }
+            let _ = try_notify_full(
+                p.syscall,
+                &p.arg,
+                None,
+                Vec::new(),
+                None,
+                NoteExtra {
+                    call_id: p.call_id,
+                    outcome: Some(shit_proto::ShimRenameOutcome {
+                        errno,
+                        source_dev: p.source.0,
+                        source_inode: p.source.1,
+                    }),
+                    no_ack: true,
+                    ..NoteExtra::default()
+                },
+            );
         });
         IN_NOTIFY.with(|f| f.set(false));
     }
@@ -1429,7 +1510,17 @@ mod policy {
             return;
         }
         with_saved_errno(|| {
-            let _ = try_notify_full(p.syscall, &p.path, None, Vec::new(), p.failure, p.stat);
+            let _ = try_notify_full(
+                p.syscall,
+                &p.path,
+                None,
+                Vec::new(),
+                p.failure,
+                NoteExtra {
+                    pre_stat: p.stat,
+                    ..NoteExtra::default()
+                },
+            );
         });
         IN_NOTIFY.with(|f| f.set(false));
     }
@@ -2032,7 +2123,17 @@ mod policy {
             (Some(pre), Some(cap)) if cap == arg => pre.path.clone(),
             _ => arg.to_string(),
         };
-        let _ = try_notify_full(syscall, &wire_arg, pre_image, Vec::new(), failure, pre_stat);
+        let _ = try_notify_full(
+            syscall,
+            &wire_arg,
+            pre_image,
+            Vec::new(),
+            failure,
+            NoteExtra {
+                pre_stat,
+                ..NoteExtra::default()
+            },
+        );
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -2184,7 +2285,25 @@ mod policy {
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
     ) -> std::io::Result<()> {
-        try_notify_full(syscall, arg, pre_image, extra_pre_images, failure, None)
+        try_notify_full(
+            syscall,
+            arg,
+            pre_image,
+            extra_pre_images,
+            failure,
+            NoteExtra::default(),
+        )
+    }
+
+    /// The fields of a notification most notes leave at their defaults.
+    #[derive(Default)]
+    struct NoteExtra {
+        pre_stat: Option<shit_proto::ShimStat>,
+        /// L5 (PR B): the rename call's id; 0 for other notes.
+        call_id: u64,
+        outcome: Option<shit_proto::ShimRenameOutcome>,
+        /// Nothing acts on this note's ack, so do not wait for it.
+        no_ack: bool,
     }
 
     fn frame_error(e: shit_proto::EncodeError) -> std::io::Error {
@@ -2199,8 +2318,14 @@ mod policy {
         pre_image: Option<shit_proto::ShimPreImage>,
         extra_pre_images: Vec<shit_proto::ShimPreImage>,
         failure: Option<shit_proto::ShimFailure>,
-        pre_stat: Option<shit_proto::ShimStat>,
+        extra: NoteExtra,
     ) -> std::io::Result<()> {
+        let NoteExtra {
+            pre_stat,
+            call_id,
+            outcome,
+            no_ack,
+        } = extra;
         use shit_proto::{ShimAck, ShimNotification, decode_frame, encode_shim_frame};
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
@@ -2217,6 +2342,8 @@ mod policy {
                 extra_pre_images,
                 failure,
                 pre_stat,
+                call_id,
+                outcome,
             });
             return Ok(());
         }
@@ -2268,6 +2395,8 @@ mod policy {
             // a Refuse marker keyed by this field.
             failure,
             pre_stat,
+            call_id,
+            outcome,
         };
         // L5: shim frames carry their own version byte
         // (`SHIM_WIRE_VERSION`) and the large cap. An encode failure is
@@ -2275,6 +2404,9 @@ mod policy {
         // (review round 2, item 7); anything else is a send failure.
         let frame = encode_shim_frame(&note).map_err(frame_error)?;
         stream.write_all(&frame)?;
+        if no_ack {
+            return Ok(());
+        }
 
         // Best-effort ack read. We don't actually act on the ack today
         // (Allow-always), but draining it lets the listener's per-conn

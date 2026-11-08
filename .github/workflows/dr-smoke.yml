@@ -1938,6 +1938,33 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  renameat-overwrite-undo:
+    # #222 and L5 PR B -- renameat with a real dirfd over an existing
+    # file (from\tto, the destination's pre-image, one call id across
+    # the call's rows and outcome), and a failed renameat that must
+    # leave no reverse rename.
+    name: renameat-overwrite-undo smoke (L5 PR B)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install python3 + sqlite
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        run: bash tests/smoke/renameat-overwrite-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renameat-overwrite-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   set-e-undo:
     # AR06.2 -- set -o errexit / set +o errexit toggling. Captures
     # the opts-only diff path through the ShellStateDiff event and

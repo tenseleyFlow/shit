@@ -493,6 +493,143 @@ pub(crate) fn ingest_notification(
     blob_store: &BlobStore,
     live_baseline: &LiveBaseline,
 ) {
+    // L5 (PR B): the note a rename-family call sends after it returns.
+    // Its command is the one the call's pre-call note was journaled for:
+    // the outcome is not acked, and its sender may already have exited
+    // (an EXDEV fallback copy, then exit), so a live pid lookup is only
+    // the fallback.
+    if let Some(out) = note.outcome {
+        let command = rename_call_command(note.pid, note.call_id).or(resolved);
+        match command {
+            Some(command) => journal_rename_outcome(note, out, command, ingest_ts, index),
+            None => debug!(
+                pid = note.pid,
+                call_id = note.call_id,
+                "shim notify: rename outcome for an unknown call; dropping"
+            ),
+        }
+        return;
+    }
+    let mut ids = Vec::new();
+    ingest_note(
+        note,
+        resolved,
+        ingest_ts,
+        unlink_stat,
+        index,
+        blob_store,
+        live_baseline,
+        &mut ids,
+    );
+    // A pre-call note of a rename-family call: journal the rows it wrote
+    // under the call's id.
+    if note.call_id != 0
+        && let Some(command) = resolved
+        && !ids.is_empty()
+    {
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: ingest_ts,
+            partial: false,
+            kind: CaptureEventKind::RenameCall {
+                pid: note.pid,
+                call_id: note.call_id,
+                events: ids,
+            },
+        };
+        match index.put_event(&event) {
+            Ok(_) => remember_rename_call(note.pid, note.call_id, command),
+            Err(e) => warn!(err = %e, pid = note.pid, "shim notify: RenameCall journal failed"),
+        }
+    }
+}
+
+/// L5 (PR B): the command each recent rename call's RenameCall was
+/// journaled for, by `(pid, call_id)`, until its outcome arrives. Bounded:
+/// past the cap the oldest go (their outcomes then fall back to a live
+/// pid lookup).
+fn rename_calls() -> &'static std::sync::Mutex<RenameCallMap> {
+    static CALLS: std::sync::OnceLock<std::sync::Mutex<RenameCallMap>> = std::sync::OnceLock::new();
+    CALLS.get_or_init(Default::default)
+}
+
+#[derive(Default)]
+struct RenameCallMap {
+    by_call: std::collections::HashMap<(u32, u64), shit_planner::events::CommandId>,
+    order: std::collections::VecDeque<(u32, u64)>,
+}
+
+const RENAME_CALL_CAP: usize = 16_384;
+
+fn remember_rename_call(pid: u32, call_id: u64, command: shit_planner::events::CommandId) {
+    let mut m = rename_calls().lock().unwrap();
+    if m.by_call.insert((pid, call_id), command).is_none() {
+        m.order.push_back((pid, call_id));
+    }
+    while m.order.len() > RENAME_CALL_CAP {
+        if let Some(old) = m.order.pop_front() {
+            m.by_call.remove(&old);
+        }
+    }
+}
+
+fn rename_call_command(pid: u32, call_id: u64) -> Option<shit_planner::events::CommandId> {
+    let mut m = rename_calls().lock().unwrap();
+    let c = m.by_call.remove(&(pid, call_id))?;
+    m.order.retain(|k| *k != (pid, call_id));
+    Some(c)
+}
+
+/// Journal `event` and note its id among the rows this note wrote.
+fn put(
+    index: &Index,
+    ids: &mut Vec<EventId>,
+    event: &CaptureEvent,
+) -> Result<EventId, shit_store::IndexError> {
+    let id = index.put_event(event)?;
+    ids.push(id);
+    Ok(id)
+}
+
+/// L5 (PR B): journal what a rename-family call did.
+fn journal_rename_outcome(
+    note: &ShimNotification,
+    out: shit_proto::ShimRenameOutcome,
+    command: shit_planner::events::CommandId,
+    ts: shit_planner::time::TimePoint,
+    index: &Index,
+) {
+    let event = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts,
+        partial: false,
+        kind: CaptureEventKind::RenameOutcome {
+            pid: note.pid,
+            call_id: note.call_id,
+            errno: out.errno,
+            source: InodeRef::new(out.source_dev, out.source_inode),
+        },
+    };
+    if let Err(e) = index.put_event(&event) {
+        warn!(err = %e, pid = note.pid, "shim notify: RenameOutcome journal failed");
+    }
+}
+
+/// [`ingest_notification`] for one note's own rows; `ids` collects the
+/// id of every row it journals.
+#[allow(clippy::too_many_arguments)]
+fn ingest_note(
+    note: &ShimNotification,
+    resolved: Option<shit_planner::events::CommandId>,
+    ingest_ts: shit_planner::time::TimePoint,
+    unlink_stat: Option<UnlinkStat>,
+    index: &Index,
+    blob_store: &BlobStore,
+    live_baseline: &LiveBaseline,
+    ids: &mut Vec<EventId>,
+) {
     let Some(command) = resolved else {
         // The shim is loaded into a process whose ancestor isn't a
         // tracked shell. Likely a background daemon / system service
@@ -547,7 +684,7 @@ pub(crate) fn ingest_notification(
                 detail,
             },
         };
-        if let Err(e) = index.put_event(&event) {
+        if let Err(e) = put(index, ids, &event) {
             warn!(
                 err = %e,
                 pid = note.pid,
@@ -621,9 +758,9 @@ pub(crate) fn ingest_notification(
             } else {
                 shit_planner::FilePreImageSource::ShimPreMutation
             };
-            if let Err(e) =
-                ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts)
-            {
+            if let Err(e) = ingest_pre_image_with_source(
+                command, pre, index, blob_store, source, ingest_ts, ids,
+            ) {
                 warn!(
                     err = %e,
                     pid = note.pid,
@@ -657,7 +794,7 @@ pub(crate) fn ingest_notification(
     // FilePreImage path.
     if matches!(note.syscall.as_str(), "open" | "openat" | "truncate") {
         if let Some(pre) = &note.pre_image {
-            if let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts) {
+            if let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts, ids) {
                 warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: pre-image ingest failed");
             }
         }
@@ -730,7 +867,7 @@ pub(crate) fn ingest_notification(
                 mode: 0o644,
             }),
         };
-        if let Err(e) = index.put_event(&event) {
+        if let Err(e) = put(index, ids, &event) {
             warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: TreeOp::Create journal failed");
         } else {
             debug!(
@@ -755,7 +892,7 @@ pub(crate) fn ingest_notification(
     // empty and the bytes stuck at the source tmpfile path.
     if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
+        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts, ids)
     {
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: rename pre-image ingest failed");
     }
@@ -782,6 +919,7 @@ pub(crate) fn ingest_notification(
                 blob_store,
                 shit_planner::FilePreImageSource::ShimRenameSubtree,
                 ingest_ts,
+                ids,
             ) {
                 Ok(()) => journaled += 1,
                 Err(e) => {
@@ -823,7 +961,7 @@ pub(crate) fn ingest_notification(
                 path: PathBuf::from(to),
             }),
         };
-        if let Err(e) = index.put_event(&event) {
+        if let Err(e) = put(index, ids, &event) {
             warn!(err = %e, pid = note.pid, "shim notify: replaced symlink journal failed");
         }
     }
@@ -839,7 +977,7 @@ pub(crate) fn ingest_notification(
     // planner picks the right shape.
     if matches!(note.syscall.as_str(), "unlink" | "unlinkat")
         && let Some(pre) = &note.pre_image
-        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts)
+        && let Err(e) = ingest_pre_image(command, pre, index, blob_store, ingest_ts, ids)
     {
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: unlink pre-image ingest failed");
     }
@@ -887,7 +1025,7 @@ pub(crate) fn ingest_notification(
                     ),
                 },
             };
-            if let Err(e) = index.put_event(&event) {
+            if let Err(e) = put(index, ids, &event) {
                 warn!(err = %e, pid = note.pid, "shim notify: relative-path refusal journal failed");
             }
         }
@@ -934,7 +1072,7 @@ pub(crate) fn ingest_notification(
         partial: false,
         kind,
     };
-    if let Err(e) = index.put_event(&event) {
+    if let Err(e) = put(index, ids, &event) {
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: put_event failed");
         return;
     }
@@ -976,6 +1114,7 @@ fn ingest_pre_image(
     index: &Index,
     blob_store: &BlobStore,
     ts: shit_planner::time::TimePoint,
+    ids: &mut Vec<EventId>,
 ) -> anyhow::Result<()> {
     ingest_pre_image_with_source(
         command,
@@ -984,6 +1123,7 @@ fn ingest_pre_image(
         blob_store,
         shit_planner::FilePreImageSource::ShimPreMutation,
         ts,
+        ids,
     )
 }
 
@@ -997,6 +1137,7 @@ fn ingest_pre_image_with_source(
     blob_store: &BlobStore,
     source: shit_planner::FilePreImageSource,
     ts: shit_planner::time::TimePoint,
+    ids: &mut Vec<EventId>,
 ) -> anyhow::Result<()> {
     let (blob_hash, stat) = blob_store
         .put(&pre.bytes)
@@ -1049,9 +1190,7 @@ fn ingest_pre_image_with_source(
             source,
         },
     };
-    index
-        .put_event(&event)
-        .map_err(|e| anyhow::anyhow!("put_event: {e}"))?;
+    put(index, ids, &event).map_err(|e| anyhow::anyhow!("put_event: {e}"))?;
     Ok(())
 }
 
@@ -1440,6 +1579,8 @@ mod tests {
                 extra_pre_images: Vec::new(),
                 failure: None,
                 pre_stat: None,
+                call_id: 0,
+                outcome: None,
             };
             let frame = shit_proto::encode_shim_frame(&note).unwrap();
             s.write_all(&frame).unwrap();
@@ -1501,7 +1642,15 @@ mod tests {
             flags: 0,
         };
         let reserved_ts = TimePoint::new(777, 42);
-        ingest_pre_image(command, &pre, &index, &blob_store, reserved_ts).expect("ingest");
+        ingest_pre_image(
+            command,
+            &pre,
+            &index,
+            &blob_store,
+            reserved_ts,
+            &mut Vec::new(),
+        )
+        .expect("ingest");
 
         let events = index.events_for_command(command);
         assert_eq!(events.len(), 1);
@@ -1574,6 +1723,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let reserved_ts = TimePoint::new(778, 43);
 
@@ -1670,6 +1821,8 @@ mod tests {
             ],
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         ingest_notification(
             &note,
@@ -1729,6 +1882,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let fifo = tmp.path().join("p");
         let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -1785,6 +1940,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let stat = pre_syscall_unlink_stat(&note);
         let (_t, index, blob_store, command) = ingest_fixture("rm link");
@@ -1822,6 +1979,8 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            call_id: 0,
+            outcome: None,
             pre_stat: Some(shit_proto::ShimStat {
                 dev: 1,
                 inode: 2,
@@ -1863,6 +2022,8 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
+            call_id: 0,
+            outcome: None,
             pre_stat: Some(shit_proto::ShimStat {
                 dev: 0x803,
                 inode: 77,
@@ -1897,6 +2058,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let (_tmp, index, blob_store, command) = ingest_fixture("rm -rf d");
         ingest_notification(
@@ -2013,6 +2176,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         }
     }
 
@@ -2398,6 +2563,107 @@ mod tests {
         assert_eq!(index.events_for_command(command).len(), 1);
     }
 
+    /// L5 PR B, through the ingest path: a rename call's pre-call note
+    /// journals its Rename and a RenameCall listing it under the call id;
+    /// the outcome note journals a RenameOutcome under the same id. A
+    /// failed call (ENOTEMPTY, after the LSM hook fired) leaves no reverse rename in the plan, and the
+    /// kernel tier's report of the same call (another path spelling, the
+    /// source's inode) goes with it. The outcome is ingested after its
+    /// sender exited (no live pid): its command comes from the call.
+    #[test]
+    fn a_failed_rename_call_is_joined_by_its_id_and_planned_away() {
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("pip install");
+        let lb = LiveBaseline::new();
+        let mut pre = open_note_arg("rename", "/private/var/t/a\t/private/var/t/b", None);
+        pre.call_id = 9;
+        ingest_notification(
+            &pre,
+            Some(command),
+            TimePoint::new(2, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        // The kernel tier's report: same inode, other spelling.
+        index
+            .put_event(&CaptureEvent {
+                id: EventId(0),
+                command,
+                ts: TimePoint::new(3, 0),
+                partial: false,
+                kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                    from: PathBuf::from("/var/t/a"),
+                    to: PathBuf::from("/var/t/b"),
+                    inode: InodeRef::new(8, 42),
+                }),
+            })
+            .unwrap();
+        let mut out = open_note_arg("rename", "/private/var/t/a\t/private/var/t/b", None);
+        out.call_id = 9;
+        out.outcome = Some(shit_proto::ShimRenameOutcome {
+            errno: 39,
+            source_dev: 8,
+            source_inode: 42,
+        });
+        ingest_notification(
+            &out,
+            None, // Review item 1: the sender exited before its outcome was ingested.
+            TimePoint::new(4, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+
+        let events = index.events_for_command(command);
+        let rename_id = events
+            .iter()
+            .find(|e| {
+                matches!(&e.kind, CaptureEventKind::TreeOp(TreeOp::Rename { from, .. })
+                    if from == Path::new("/private/var/t/a"))
+            })
+            .map(|e| e.id)
+            .expect("the shim's Rename");
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            CaptureEventKind::RenameCall { pid: 4242, call_id: 9, events } if events == &vec![rename_id]
+        )), "{events:#?}");
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                CaptureEventKind::RenameOutcome {
+                    call_id: 9,
+                    errno: 39,
+                    ..
+                }
+            )),
+            "{events:#?}"
+        );
+        // The outcome note is not a second Rename.
+        let renames = events
+            .iter()
+            .filter(|e| matches!(&e.kind, CaptureEventKind::TreeOp(TreeOp::Rename { .. })))
+            .count();
+        assert_eq!(renames, 2, "the shim's and the kernel's");
+        let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, command).unwrap();
+        let plan = shit_planner::plan(
+            record,
+            &events,
+            &shit_planner::probe::mock::InMemoryProbe::new(),
+            &index,
+        );
+        assert!(
+            !plan
+                .nodes
+                .iter()
+                .any(|n| matches!(n.op, shit_planner::InverseOp::Rename { .. })),
+            "{:#?}",
+            plan.nodes
+        );
+    }
+
     #[test]
     fn open_create_journals_a_create() {
         let kinds = kinds_after(&open_note("open_create", None));
@@ -2498,6 +2764,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         for (stat, want_mode) in [
             (

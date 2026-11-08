@@ -8,6 +8,71 @@ use super::policy::test_capture;
 use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
 
+/// The notes `f` sends before its calls run: every note but the
+/// outcomes the shim sends after a rename-family call returns.
+fn capture_pre(f: impl FnOnce()) -> Vec<shit_proto::ShimNotification> {
+    test_capture::capture(f)
+        .into_iter()
+        .filter(|n| n.outcome.is_none())
+        .collect()
+}
+
+fn rename_abs(from: &std::path::Path, to: &std::path::Path) -> i32 {
+    let cf = CString::new(from.to_str().unwrap()).unwrap();
+    let ct = CString::new(to.to_str().unwrap()).unwrap();
+    unsafe { super::interposers::rename(cf.as_ptr(), ct.as_ptr()) }
+}
+
+/// L5 PR B: every rename-family call sends its outcome under the same
+/// call id as its pre-call note, with the source's inode read before the
+/// call. Two calls get two ids.
+#[test]
+fn each_rename_call_reports_its_outcome_under_its_own_id() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::write(dir.join("a"), b"a").unwrap();
+    std::fs::write(dir.join("c"), b"c").unwrap();
+    let a_ino = std::fs::metadata(dir.join("a")).unwrap().ino();
+    let notes = test_capture::capture(|| {
+        assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")), 0);
+        assert_eq!(rename_abs(&dir.join("c"), &dir.join("d")), 0);
+    });
+    assert_eq!(notes.len(), 4, "{notes:#?}");
+    assert!(notes[0].outcome.is_none() && notes[2].outcome.is_none());
+    let out = notes[1].outcome.expect("outcome");
+    assert_eq!(out.errno, 0);
+    assert_eq!(out.source_inode, a_ino);
+    assert_ne!(notes[0].call_id, 0);
+    assert_eq!(notes[0].call_id, notes[1].call_id);
+    assert_eq!(notes[2].call_id, notes[3].call_id);
+    assert_ne!(notes[0].call_id, notes[2].call_id);
+    assert_eq!(notes[1].arg, notes[0].arg);
+}
+
+/// A failed rename reports its errno, keeps it for the caller, and still
+/// carries the source's pre-call inode.
+#[test]
+fn failed_rename_reports_its_errno() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::write(dir.join("a"), b"a").unwrap();
+    std::fs::create_dir(dir.join("b")).unwrap();
+    std::fs::write(dir.join("b/x"), b"x").unwrap();
+    let mut errno = None;
+    let notes = test_capture::capture(|| {
+        assert_eq!(rename_abs(&dir.join("a"), &dir.join("b")), -1);
+        errno = std::io::Error::last_os_error().raw_os_error();
+    });
+    let out = notes.last().unwrap().outcome.expect("outcome");
+    assert_eq!(Some(out.errno), errno);
+    assert_eq!(out.errno, libc::EISDIR);
+    assert_ne!(
+        out.source_inode, 0,
+        "the source is read before the call, which then fails"
+    );
+}
+
 #[test]
 fn renameat_with_real_dirfd_over_existing_file_keeps_from_and_to() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -18,7 +83,7 @@ fn renameat_with_real_dirfd_over_existing_file_keeps_from_and_to() {
     let from = CString::new(".alpha.txt.X").unwrap();
     let to = CString::new("alpha.txt").unwrap();
     let mut rc = -1;
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         rc = unsafe {
             super::interposers::renameat(
                 dfd.as_raw_fd(),
@@ -56,7 +121,7 @@ fn rename_with_absolute_paths_over_existing_file_keeps_from_and_to() {
     std::fs::write(&b, b"old").unwrap();
     let ca = CString::new(a.to_str().unwrap()).unwrap();
     let cb = CString::new(b.to_str().unwrap()).unwrap();
-    let notes = test_capture::capture(|| unsafe {
+    let notes = capture_pre(|| unsafe {
         assert_eq!(super::interposers::rename(ca.as_ptr(), cb.as_ptr()), 0);
     });
     let n = notes
@@ -78,7 +143,7 @@ fn unlinkat_removedir_of_a_non_empty_dir_sends_nothing() {
     std::fs::write(dir.join("full/f"), b"f").unwrap();
     let dfd = std::fs::File::open(&dir).unwrap();
     let name = CString::new("full").unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         let rc = unsafe {
             super::interposers::unlinkat(dfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
         };
@@ -96,7 +161,7 @@ fn unlinkat_removedir_reports_after_success_with_the_pre_call_stat() {
     std::fs::set_permissions(dir.join("e"), std::fs::Permissions::from_mode(0o750)).unwrap();
     let dfd = std::fs::File::open(&dir).unwrap();
     let name = CString::new("e").unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         let rc = unsafe {
             super::interposers::unlinkat(dfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
         };
@@ -120,7 +185,7 @@ fn rename_of_a_symlink_to_a_dir_names_the_link() {
     std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
     let from = CString::new(dir.join("link").to_str().unwrap()).unwrap();
     let to = CString::new(dir.join("moved").to_str().unwrap()).unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         assert_eq!(
             unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) },
             0
@@ -153,7 +218,7 @@ fn renameat_over_a_symlink_names_the_link_and_sends_its_target() {
     let dfd = std::fs::File::open(&dir).unwrap();
     let from = CString::new("new").unwrap();
     let to = CString::new("link").unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         let rc = unsafe {
             super::interposers::renameat(
                 dfd.as_raw_fd(),
@@ -191,7 +256,7 @@ fn rename_over_an_uncapturable_file_sends_a_gap_marker() {
     std::fs::write(dir.join("new"), b"new").unwrap();
     let from = CString::new(dir.join("new").to_str().unwrap()).unwrap();
     let to = CString::new(dir.join("big").to_str().unwrap()).unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         assert_eq!(
             unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) },
             0
@@ -221,7 +286,7 @@ fn failed_rename_over_a_symlink_sends_nothing() {
     std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
     let from = CString::new(dir.join("d").to_str().unwrap()).unwrap();
     let to = CString::new(dir.join("link").to_str().unwrap()).unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         assert_eq!(
             unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) },
             -1
@@ -244,7 +309,7 @@ fn canonicalize_marker_and_destination_gap_are_both_sent() {
     std::fs::write(dir.join("big"), &big).unwrap();
     let from = CString::new("/no-such-dir-l5/missing/x").unwrap();
     let to = CString::new(dir.join("big").to_str().unwrap()).unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) };
     });
     let failures: Vec<_> = notes.iter().filter_map(|n| n.failure.as_ref()).collect();
@@ -288,7 +353,7 @@ fn muted_removal_sends_nothing() {
     let pending =
         super::policy::removal_pending("rmdir", dir.join("d").to_str().unwrap().to_string(), None);
     std::fs::remove_dir(dir.join("d")).unwrap();
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         super::policy::test_mute::with_muted(|| super::policy::removal_end(pending, 0));
     });
     assert!(notes.is_empty(), "{notes:#?}");
@@ -306,7 +371,7 @@ fn unkeyed_removal_carries_no_stat_and_honors_the_mute() {
         error_chain: "dirfd 9 could not be resolved".into(),
     };
     assert!(std::path::Path::new("src").exists());
-    let notes = test_capture::capture(|| {
+    let notes = capture_pre(|| {
         let p = super::policy::removal_pending("unlinkat_dir", "src".into(), Some(marker()));
         super::policy::removal_end(p, 0);
     });

@@ -180,6 +180,28 @@ pub struct ShimNotification {
     /// frame shape; [`crate::SHIM_WIRE_VERSION`] says so.
     #[serde(default)]
     pub pre_stat: Option<ShimStat>,
+    /// L5 (PR B): the shim's id for one rename-family call, unique per
+    /// process (with `pid`, per call). The call's pre-syscall note and its
+    /// outcome carry the same id, and the daemon journals it on the rows
+    /// each produces, so the planner joins them by id. 0 for every other
+    /// note.
+    #[serde(default)]
+    pub call_id: u64,
+    /// L5 (PR B): set on the note the shim sends after a rename-family
+    /// call returns.
+    #[serde(default)]
+    pub outcome: Option<ShimRenameOutcome>,
+}
+
+/// L5 (PR B): what a rename-family call did, as the shim saw it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShimRenameOutcome {
+    /// 0 when the call returned 0, else its errno.
+    pub errno: i32,
+    /// lstat of `from`, read before the call whether or not the call
+    /// then succeeded; `(0, 0)` when that lstat failed.
+    pub source_dev: u64,
+    pub source_inode: u64,
 }
 
 /// Identity and mode of a path, as the shim read it (lstat).
@@ -255,6 +277,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -284,6 +308,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -309,6 +335,8 @@ mod tests {
                 error_chain: "ENOENT (path), ENOENT (parent)".into(),
             }),
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -338,6 +366,8 @@ mod tests {
                 mode: 0o040700,
                 link_target: None,
             }),
+            call_id: 0,
+            outcome: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -374,6 +404,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -409,6 +441,8 @@ mod tests {
             extra_pre_images: Vec::new(),
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -457,6 +491,8 @@ mod tests {
             ],
             failure: None,
             pre_stat: None,
+            call_id: 0,
+            outcome: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -491,6 +527,8 @@ mod tests {
                 mode: 0o020640,
                 link_target: None,
             }),
+            call_id: 0,
+            outcome: None,
         };
         let frame = encode_shim_frame(&n).unwrap();
         assert_eq!(frame[4], SHIM_WIRE_VERSION);
@@ -500,14 +538,16 @@ mod tests {
             decode_shim_frame::<ShimNotification>(&old),
             Err(DecodeError::UnsupportedVersion(1))
         ));
-        // A version-2 frame (#223's shim, before PreImageUncaptured) is
-        // refused by name too.
-        let mut v2 = frame.clone();
-        v2[4] = 2;
-        assert!(matches!(
-            decode_shim_frame::<ShimNotification>(&v2),
-            Err(DecodeError::UnsupportedVersion(2))
-        ));
-        assert_eq!(SHIM_WIRE_VERSION, 3);
+        // Version-2 and -3 frames (#223's and #232's shims) are refused
+        // by name too.
+        for v in [2u8, 3] {
+            let mut old = frame.clone();
+            old[4] = v;
+            assert!(matches!(
+                decode_shim_frame::<ShimNotification>(&old),
+                Err(DecodeError::UnsupportedVersion(got)) if got == v
+            ));
+        }
+        assert_eq!(SHIM_WIRE_VERSION, 4);
     }
 }

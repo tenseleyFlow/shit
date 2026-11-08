@@ -91,7 +91,11 @@ pub fn plan(
         warnings.push(PlanWarning::UnclosedCommand);
     }
 
-    let mut live: Vec<&CaptureEvent> = events.iter().filter(|e| !e.partial).collect();
+    // L5 (PR B): the events with rename calls applied (a failed call's
+    // rows and kernel twins out, a surviving shim Rename with its twin's
+    // inode), the same set redo plans from (see `rename_calls`).
+    let adjusted = crate::rename_calls::live_events(events);
+    let mut live: Vec<&CaptureEvent> = adjusted.iter().collect();
     // Reverse-chronological: latest events first.
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.id)));
 
@@ -1727,6 +1731,8 @@ fn emit_for_event(
                 conflict: None,
             });
         }
+        // L5 (PR B): read by `rename_calls`; no inverse of their own.
+        CaptureEventKind::RenameCall { .. } | CaptureEventKind::RenameOutcome { .. } => {}
         CaptureEventKind::CaptureRefused {
             class,
             path,

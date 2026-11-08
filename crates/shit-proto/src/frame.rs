@@ -10,12 +10,13 @@ pub const WIRE_VERSION: u8 = 1;
 /// every change a decoder cannot read gets a new version:
 /// 2 added `pre_stat` with `link_target` (L4b, #223);
 /// 3 added the `ShimFailure::PreImageUncaptured` variant (L5, #232), which
-/// a version-2 daemon cannot decode.
+/// a version-2 daemon cannot decode;
+/// 4 added `call_id` and `outcome` (L5 PR B, rename calls).
 /// A daemon acks a frame of another version, journals a capture-gap
 /// refusal for the sender's command and drops it; shells started before
 /// an upgrade keep the old shim loaded until they restart. Full version
 /// negotiation is #225.
-pub const SHIM_WIRE_VERSION: u8 = 3;
+pub const SHIM_WIRE_VERSION: u8 = 4;
 
 /// Maximum frame size (including length prefix). Frames over this are
 /// rejected on the decode side and never produced on the encode side.
