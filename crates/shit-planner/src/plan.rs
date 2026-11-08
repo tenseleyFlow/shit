@@ -190,7 +190,8 @@ fn covered_capture_gaps(live: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
             CaptureEventKind::CaptureRefused { class, path, .. } if class == "capture-gap" => {
                 earliest.get(path.as_path()).is_some_and(|(ts, mtime)| {
                     let stamped = i128::from(e.ts.wallclock_unix_nanos);
-                    *ts <= e.ts || (stamped > 0 && *mtime + GAP_MTIME_MARGIN_NANOS < stamped)
+                    *ts <= e.ts
+                        || (stamped > 0 && *mtime > 0 && *mtime + GAP_MTIME_MARGIN_NANOS < stamped)
                 })
             }
             _ => false,
@@ -2448,6 +2449,16 @@ mod tests {
 
     /// The gap is stamped 2; the pre-image `pre_ts`.
     fn capture_gap_refusals_at(pre: Option<crate::FilePreImageSource>, pre_ts: u64) -> usize {
+        capture_gap_refusals_wall(pre, pre_ts, 0)
+    }
+
+    /// As [`capture_gap_refusals_at`], with the gap's wall clock set to
+    /// `gap_wall`. The pre-image's captured mtime is 0 (unknown).
+    fn capture_gap_refusals_wall(
+        pre: Option<crate::FilePreImageSource>,
+        pre_ts: u64,
+        gap_wall: u64,
+    ) -> usize {
         let mut probe = InMemoryProbe::new();
         let mut store = InMemoryStore::new();
         let inode = InodeRef::new(1, 5);
@@ -2469,7 +2480,7 @@ mod tests {
         let mut events = vec![CaptureEvent {
             id: EventId(2),
             command,
-            ts: TimePoint::new(2, 0),
+            ts: TimePoint::new(2, gap_wall),
             partial: false,
             kind: CaptureEventKind::CaptureRefused {
                 class: "capture-gap".into(),
@@ -2533,6 +2544,21 @@ mod tests {
         let text = remediation.as_deref().unwrap();
         assert!(text.contains("this command's changes"), "{text}");
         assert!(!text.contains("this path"), "{text}");
+    }
+
+    /// Low re-review of #232: a pre-image with an unknown mtime (0) taken
+    /// after the gap cannot show it predates the gapped write, so the
+    /// refusal stands.
+    #[test]
+    fn unknown_mtime_does_not_cover_a_later_gap() {
+        assert_eq!(
+            capture_gap_refusals_wall(
+                Some(crate::FilePreImageSource::Other),
+                3,
+                1_800_000_000_000_000_000,
+            ),
+            1
+        );
     }
 
     #[test]
