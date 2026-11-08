@@ -3946,88 +3946,102 @@ mod born_set_tests {
         let _ = f;
     }
 
-    /// Every capture handler and the ledger calls its drop sites rely
-    /// on. Coverage is per site, so a new handler, or one whose ledger
-    /// calls disappear, fails here until its sites are accounted for
-    /// and listed in the R3B report.
+    /// Every handler that can lose evidence, driven into a forced
+    /// failure on a pre-existing file. Each must leave exactly one loss
+    /// at close. Births (mkdir, create) are covered by the born-set tests
+    /// above; a handler added later is not found automatically and has to
+    /// be added here.
     #[test]
-    fn every_capture_handler_feeds_the_ledger() {
-        const SITES: &[(&str, &[&str])] = &[
+    fn every_loss_reporting_handler_records_its_forced_failure() {
+        type Drive = fn(&mut Rig, Id, Id);
+        let cases: &[(&str, Drive)] = &[
+            ("handle_lsm_open: no snapshot", |rig, id, _| {
+                rig.drop_snapshot(id);
+                rig.open(id, false);
+            }),
+            ("handle_lsm_release: no snapshot", |rig, id, _| {
+                rig.drop_snapshot(id);
+                rig.release(id);
+            }),
+            ("handle_lsm_setattr: no snapshot", |rig, id, _| {
+                rig.drop_snapshot(id);
+                rig.setattr(id);
+            }),
+            ("handle_lsm_unlink: race lost", |rig, id, root| {
+                let cmd = rig.cmd;
+                rig.rt()
+                    .watches
+                    .get_mut(&cmd)
+                    .unwrap()
+                    .pre_opens
+                    .remove(&id);
+                std::fs::remove_file(rig.dir.path().join("f")).unwrap();
+                rig.unlink(id, root, "f");
+            }),
+            ("handle_lsm_unlink: parent unresolved", |rig, id, root| {
+                rig.unlink(id, (root.0, 999_999_999), "f");
+            }),
             (
-                "handle_event",
-                &["note_unkeyed", "note_missing", "note_captured"],
+                "handle_lsm_rename: replaced without snapshot",
+                |rig, id, root| {
+                    rig.drop_snapshot(id);
+                    let new = rig.dir.path().join("new");
+                    std::fs::write(&new, b"x").unwrap();
+                    let new_id = Rig::id(&new);
+                    std::fs::rename(&new, rig.dir.path().join("f")).unwrap();
+                    rig.rename(new_id, (root, "new"), (root, "f"));
+                },
             ),
             (
-                "handle_lsm_unlink",
-                &["note_missing", "note_delete_captured"],
-            ),
-            (
-                "handle_lsm_setattr",
-                &["note_written", "note_missing", "note_captured"],
-            ),
-            // Creates need no pre-image; mkdir only records births.
-            ("handle_lsm_mkdir", &["note_born"]),
-            // Resolution only; the body is process_lsm_create_resolved.
-            ("handle_lsm_create", &["process_lsm_create_resolved"]),
-            (
-                "process_lsm_create_resolved",
-                &["note_born_path", "note_born"],
-            ),
-            (
-                "handle_lsm_open",
-                &["note_born", "note_written", "note_missing", "note_captured"],
-            ),
-            (
-                "handle_lsm_release",
-                &["note_written", "note_missing", "note_captured"],
-            ),
-            (
-                "handle_lsm_rename",
-                &[
-                    "note_unresolved_rename",
-                    "note_rename_target",
-                    "note_replaced_without_capture",
-                    "note_missing",
-                    "note_captured",
-                ],
+                "handle_lsm_rename: moved out of the tree",
+                |rig, id, root| {
+                    rig.rename(id, (root, "f"), ((root.0, 999_999_999), "f"));
+                },
             ),
         ];
-        let src = include_str!("linux.rs");
-        let body_of = |name: &str| -> &str {
-            let start = src
-                .find(&format!("pub fn {name}("))
-                .or_else(|| src.find(&format!("    fn {name}(")))
-                .unwrap_or_else(|| panic!("{name} not found"));
-            let rest = &src[start..];
-            let end = rest[1..]
-                .find("\n    pub fn ")
-                .into_iter()
-                .chain(rest[1..].find("\n    fn "))
-                .chain(rest[1..].find("\n}\n"))
-                .min()
-                .unwrap();
-            &rest[..end + 1]
-        };
-        let impl_src = &src[..src.find("\n#[cfg(test)]").unwrap()];
-        let handlers: Vec<&str> = impl_src
-            .match_indices("    pub fn handle_")
-            .map(|(i, _)| {
-                let name = &impl_src[i + "    pub fn ".len()..];
-                &name[..name.find('(').unwrap()]
-            })
-            .collect();
-        for h in &handlers {
-            assert!(
-                SITES.iter().any(|(n, _)| n == h),
-                "{h} is not in SITES; account for its drop sites"
-            );
+        for (name, drive) in cases {
+            let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"pre-existing").unwrap());
+            let root = rig.root();
+            let id = Rig::id(&rig.dir.path().join("f"));
+            drive(&mut rig, id, root);
+            let obs = rig.close(None);
+            assert_eq!(obs.len(), 1, "{name}: {obs:?}");
         }
-        for (name, calls) in SITES {
-            let body = body_of(name);
-            for call in *calls {
-                assert!(body.contains(call), "{name} no longer calls {call}");
+
+        // fanotify reads the pre-image from the event fd; a file over the
+        // cap cannot be read, and it was in the cwd listing.
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_PRE_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (helper, daemon) = crate::ipc::socketpair().unwrap();
+        let mut rt =
+            LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(0xfa),
+            seq: 1,
+        };
+        rt.note_direct_children_baseline(cmd, dir.path());
+        let f = std::fs::File::open(&big).unwrap();
+        rt.handle_event(&FanotifyEventView {
+            command: cmd,
+            fd: f.as_raw_fd(),
+            pid: 1,
+            kind: FanotifyCaptureKind::OpenWrite,
+            _life: std::marker::PhantomData,
+        });
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        let mut losses = 0;
+        while let Ok((resp, _)) = daemon.recv_response_with_fd() {
+            if let HelperResponse::CaptureRefused { .. } = resp {
+                losses += 1;
             }
         }
+        assert_eq!(losses, 1, "handle_event: pre-image read failed");
     }
 
     #[test]
