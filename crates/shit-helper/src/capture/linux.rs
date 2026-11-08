@@ -3794,6 +3794,90 @@ mod born_set_tests {
         let _ = f;
     }
 
+    /// Every capture handler and the ledger calls its drop sites rely
+    /// on. Coverage is per site, so a new handler, or one whose ledger
+    /// calls disappear, fails here until its sites are accounted for
+    /// and listed in the R3B report.
+    #[test]
+    fn every_capture_handler_feeds_the_ledger() {
+        const SITES: &[(&str, &[&str])] = &[
+            (
+                "handle_event",
+                &["note_unkeyed", "note_missing", "note_captured"],
+            ),
+            (
+                "handle_lsm_unlink",
+                &["note_missing", "note_delete_captured"],
+            ),
+            (
+                "handle_lsm_setattr",
+                &["note_written", "note_missing", "note_captured"],
+            ),
+            // Creates need no pre-image; mkdir only records births.
+            ("handle_lsm_mkdir", &["note_born"]),
+            // Resolution only; the body is process_lsm_create_resolved.
+            ("handle_lsm_create", &["process_lsm_create_resolved"]),
+            (
+                "process_lsm_create_resolved",
+                &["note_born_path", "note_born"],
+            ),
+            (
+                "handle_lsm_open",
+                &["note_born", "note_written", "note_missing", "note_captured"],
+            ),
+            (
+                "handle_lsm_release",
+                &["note_written", "note_missing", "note_captured"],
+            ),
+            (
+                "handle_lsm_rename",
+                &[
+                    "note_unresolved_rename",
+                    "note_rename_target",
+                    "note_replaced_without_capture",
+                    "note_missing",
+                    "note_captured",
+                ],
+            ),
+        ];
+        let src = include_str!("linux.rs");
+        let body_of = |name: &str| -> &str {
+            let start = src
+                .find(&format!("pub fn {name}("))
+                .or_else(|| src.find(&format!("    fn {name}(")))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &src[start..];
+            let end = rest[1..]
+                .find("\n    pub fn ")
+                .into_iter()
+                .chain(rest[1..].find("\n    fn "))
+                .chain(rest[1..].find("\n}\n"))
+                .min()
+                .unwrap();
+            &rest[..end + 1]
+        };
+        let impl_src = &src[..src.find("\n#[cfg(test)]").unwrap()];
+        let handlers: Vec<&str> = impl_src
+            .match_indices("    pub fn handle_")
+            .map(|(i, _)| {
+                let name = &impl_src[i + "    pub fn ".len()..];
+                &name[..name.find('(').unwrap()]
+            })
+            .collect();
+        for h in &handlers {
+            assert!(
+                SITES.iter().any(|(n, _)| n == h),
+                "{h} is not in SITES; account for its drop sites"
+            );
+        }
+        for (name, calls) in SITES {
+            let body = body_of(name);
+            for call in *calls {
+                assert!(body.contains(call), "{name} no longer calls {call}");
+            }
+        }
+    }
+
     #[test]
     fn fmode_probe_needs_the_bit_on_create_and_not_on_reopen() {
         let k = userspace_to_kernel_dev(0x803);
