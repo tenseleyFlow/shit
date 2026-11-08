@@ -1003,7 +1003,7 @@ fn dispatch_response(
             // R3 slice B — kqueue captures after the write, and the
             // baseline that held the pre-write bytes never made it into
             // the store. The journaled bytes below are post-write.
-            if !is_delete && live_baseline.ingest_failed(dev, inode) {
+            if !is_delete && live_baseline.ingest_failed(session, dev, inode) {
                 note_ingest_failure(
                     strict_capture,
                     index,
@@ -1063,7 +1063,7 @@ fn dispatch_response(
         } => {
             let Some(staging) = fd else {
                 tracing::error!(%session, dev, inode, "BaselineCaptured missing SCM_RIGHTS fd");
-                live_baseline.mark_ingest_failed(dev, inode);
+                live_baseline.mark_ingest_failed(session, Path::new(&cwd), dev, inode);
                 return;
             };
             let ingested = handle_baseline_captured(
@@ -1080,10 +1080,10 @@ fn dispatch_response(
                 live_baseline,
             );
             match ingested {
-                Ok(_) => live_baseline.clear_ingest_failed(dev, inode),
+                Ok(_) => live_baseline.clear_ingest_inode(session, Path::new(&cwd), dev, inode),
                 Err(e) => {
                     tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
-                    live_baseline.mark_ingest_failed(dev, inode);
+                    live_baseline.mark_ingest_failed(session, Path::new(&cwd), dev, inode);
                 }
             }
         }
@@ -2168,6 +2168,70 @@ mod tests_dispatch {
                 assert!(rows.is_empty(), "{rows:?}");
             }
         }
+    }
+
+    /// Review round 3, item 2: a failed baseline in one session says
+    /// nothing about the same inode number written in another session.
+    #[test]
+    fn failed_baseline_ingest_in_another_session_refuses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = Uuid::from_u128(6);
+        let cmd = CommandId {
+            session: Uuid::from_u128(7),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let baseline = crate::baseline::LiveBaseline::new();
+        let waiters = PrivOpWaiters::default();
+        let send = |resp: HelperResponse, fd: Option<OwnedFd>| {
+            dispatch_response(
+                resp, fd, &index, &blobs, &map, &baseline, "kqueue", &waiters, true,
+            );
+        };
+        send(
+            HelperResponse::BaselineCaptured {
+                session: other,
+                cwd: "/tmp/elsewhere".into(),
+                dev: 1,
+                inode: 7,
+                path: "/tmp/elsewhere/g".into(),
+                blob_hash: [0u8; 32],
+                stored_bytes: 3,
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                mtime_unix_nanos: 0,
+                xattrs: Default::default(),
+                fd_sent_via_scm: true,
+            },
+            None,
+        );
+        let post = b"new";
+        let claimed: [u8; 32] = *blobs.put(post).unwrap().0.as_bytes();
+        send(
+            HelperResponse::CapturedPreImage {
+                session: cmd.session,
+                seq: cmd.seq,
+                dev: 1,
+                inode: 7,
+                path: Some("/tmp/watched/f".into()),
+                blob_hash: claimed,
+                stored_bytes: post.len() as u64,
+                post_content_hash: Some(claimed),
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                mtime_unix_nanos: 0,
+                xattrs: Default::default(),
+                flags: 0,
+                is_delete: false,
+                fd_sent_via_scm: true,
+            },
+            Some(tmp_staging_fd(post)),
+        );
+        assert!(refusal_details(&index, cmd).is_empty());
     }
 
     fn tmp_staging_fd(content: &[u8]) -> OwnedFd {
