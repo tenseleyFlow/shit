@@ -184,7 +184,7 @@ async fn handle_one(
     if total == 0 {
         return Ok(());
     }
-    let note: ShimNotification = match decode_shim_frame(&buf[..total]) {
+    let mut note: ShimNotification = match decode_shim_frame(&buf[..total]) {
         Ok(n) => n,
         // L5: a shell started before an upgrade still has the old shim
         // loaded. Say so by name; its notifications cannot be read.
@@ -203,6 +203,14 @@ async fn handle_one(
             return Ok(());
         }
     };
+    // L5 (review round 3, item 6): one call per peer process, whatever its
+    // PID namespace.
+    let peer = stream.peer_cred().ok();
+    note.call_id = crate::shim_rename::scoped_call_id(
+        note.call_id,
+        peer.map(|c| c.uid()),
+        peer.and_then(|c| c.pid()),
+    );
     debug!(
         pid = note.pid,
         syscall = %note.syscall,

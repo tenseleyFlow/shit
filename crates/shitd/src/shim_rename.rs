@@ -200,6 +200,24 @@ fn changed() -> &'static tokio::sync::Notify {
     N.get_or_init(tokio::sync::Notify::new)
 }
 
+/// Review round 3, item 6: the shim's call id is unique only within its
+/// process, and its pid only within its PID namespace. Scope it by the
+/// connection's peer credentials as the daemon sees them (`SO_PEERCRED`:
+/// uid and the pid in the daemon's namespace), so two processes in
+/// different namespaces with the same pid and counter never share a call.
+/// 0 stays 0 (not a rename call).
+pub(crate) fn scoped_call_id(call_id: u64, peer_uid: Option<u32>, peer_pid: Option<i32>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if call_id == 0 {
+        return 0;
+    }
+    // DefaultHasher::new() is SipHash with fixed keys: stable within the
+    // daemon's lifetime, which is all the registry needs.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (call_id, peer_uid, peer_pid).hash(&mut h);
+    h.finish().max(1)
+}
+
 /// Review round 2, item 1: register a rename-family call before its
 /// pre-syscall notification is acked, so its outcome (sent only after the
 /// syscall, so after the ack) always finds it.
@@ -643,5 +661,25 @@ mod tests {
         let parked = finish_call(call_id).expect("parked outcome handed back");
         assert_eq!(parked.note.call_id, call_id);
         assert_eq!(parked.ts, TimePoint::new(9, 0));
+    }
+
+    /// Review round 3, item 6: the same shim call id from two processes
+    /// (different PID namespaces, same pid and counter) is two calls.
+    #[test]
+    fn same_call_id_from_two_peers_is_two_calls() {
+        let (_tmp, _index, _blobs, command) = fixture();
+        let shim_id = 0x0000_0007_0000_0001;
+        let a = scoped_call_id(shim_id, Some(1000), Some(4001));
+        let b = scoped_call_id(shim_id, Some(1000), Some(4002));
+        assert_ne!(a, b);
+        assert_eq!(a, scoped_call_id(shim_id, Some(1000), Some(4001)));
+        assert_eq!(scoped_call_id(0, Some(1000), Some(4001)), 0);
+        register_call(a, command);
+        register_call(b, command);
+        record_rename(a, EventId(1));
+        record_rename(b, EventId(2));
+        let reg = lock();
+        assert_eq!(reg.calls.get(&a).and_then(|c| c.rename), Some(EventId(1)));
+        assert_eq!(reg.calls.get(&b).and_then(|c| c.rename), Some(EventId(2)));
     }
 }
