@@ -262,7 +262,8 @@ impl ReplacedSubtrees {
         // Inode proof: what is at `to` after the call is what was at
         // `from` before it.
         // The outcome must be this call's own, named by the daemon.
-        let proven = chrono[r + 1..].iter().find_map(|e| match &e.kind {
+        // Review round 3, item 1: by id, wherever it sits in the journal.
+        let proven = chrono.iter().find_map(|e| match &e.kind {
             CaptureEventKind::RenameOutcome {
                 from: of,
                 to: ot,

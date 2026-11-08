@@ -2311,3 +2311,27 @@ fn different_dir_recreated_under_the_stash_keeps_the_ordinary_inverses() {
         );
     }
 }
+
+#[test]
+fn outcome_journaled_before_its_rename_still_proves_it() {
+    // Review round 3, item 1: an outcome parked by the daemon and applied
+    // late, or one whose timestamp landed early, is the call's own by id,
+    // wherever it sits in the journal.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    let before = sim.snapshot();
+    sim.mv("d", "d.old");
+    let pos = sim
+        .events
+        .iter()
+        .position(|e| matches!(e.kind, CaptureEventKind::RenameOutcome { .. }))
+        .unwrap();
+    let mut outcome = sim.events.remove(pos);
+    outcome.ts = TimePoint::new(0, 1);
+    sim.events.insert(0, outcome);
+    sim.mkdir("d");
+    sim.write("d/f", b"new\n");
+    sim.rm_rf("d.old");
+    assert_rebuilt(&sim, "d");
+    assert_restored(&sim, &before);
+}
