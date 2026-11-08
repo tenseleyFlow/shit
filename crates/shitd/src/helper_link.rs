@@ -886,7 +886,7 @@ fn dispatch_response(
             flags,
             rdev,
             device_token,
-            device_source_nodev,
+            device_untrusted,
         } => {
             let Some(staging) = fd else {
                 // AR01.1.fix-marker-only — when the helper lost the
@@ -914,15 +914,8 @@ fn dispatch_response(
                     // `git clean -fd` undo restores the dir as a
                     // dir, not a regular file.
                     let kind = kind_from_mode_bits(mode);
-                    let device = device_capture(
-                        kind,
-                        rdev,
-                        mode,
-                        uid,
-                        gid,
-                        device_token,
-                        device_source_nodev,
-                    );
+                    let device =
+                        device_capture(kind, rdev, mode, uid, gid, device_token, device_untrusted);
                     if let Err(e) = journal_unlink_with_device(
                         index, command, ts, inode_ref, path_buf, kind, mode, device,
                     ) {
@@ -1562,7 +1555,7 @@ struct DeviceCapture {
     uid: u32,
     gid: u32,
     token: Option<shit_planner::CaptureToken>,
-    source_nodev: bool,
+    untrusted: Option<shit_planner::UntrustedSource>,
 }
 
 /// L4 / L4b ruling 6 - a `DeviceNodeMeta` is journaled only for a node
@@ -1577,13 +1570,13 @@ fn device_capture(
     uid: u32,
     gid: u32,
     token: Option<shit_proto::CaptureToken>,
-    source_nodev: bool,
+    untrusted: Option<shit_proto::UntrustedSource>,
 ) -> Option<DeviceCapture> {
     use shit_planner::metadata::FileKind;
     if !matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) || rdev == 0 {
         return None;
     }
-    if token.is_none() && !source_nodev {
+    if token.is_none() && untrusted.is_none() {
         return None;
     }
     Some(DeviceCapture {
@@ -1595,7 +1588,10 @@ fn device_capture(
             helper: t.helper,
             mac: t.mac,
         }),
-        source_nodev,
+        untrusted: untrusted.map(|u| match u {
+            shit_proto::UntrustedSource::Nodev => shit_planner::UntrustedSource::Nodev,
+            shit_proto::UntrustedSource::Unknown => shit_planner::UntrustedSource::Unknown,
+        }),
     })
 }
 
@@ -1650,7 +1646,7 @@ fn journal_unlink_with_device(
                 uid: d.uid,
                 gid: d.gid,
                 token: d.token,
-                source_nodev: d.source_nodev,
+                untrusted: d.untrusted,
             }),
         };
         index.put_event(&meta_ev).map_err(|e| {
@@ -1952,20 +1948,27 @@ mod tests_kind_from_mode_bits {
             mac: [2; 32],
         });
         let chr = FileKind::CharDevice;
-        assert_eq!(device_capture(chr, 0, 0o020600, 1, 1, t, false), None);
-        assert_eq!(
-            device_capture(chr, 0x103, 0o020600, 1, 1, None, false),
-            None
-        );
+        assert_eq!(device_capture(chr, 0, 0o020600, 1, 1, t, None), None);
+        assert_eq!(device_capture(chr, 0x103, 0o020600, 1, 1, None, None), None);
         // Review round 2, item 1: a nodev source journals the meta with
         // no token, so undo can say why it refuses.
-        let nodev = device_capture(chr, 0x103, 0o020600, 1, 1, None, true).unwrap();
-        assert!(nodev.token.is_none() && nodev.source_nodev);
+        let nodev = device_capture(
+            chr,
+            0x103,
+            0o020600,
+            1,
+            1,
+            None,
+            Some(shit_proto::UntrustedSource::Nodev),
+        )
+        .unwrap();
+        assert!(nodev.token.is_none());
+        assert_eq!(nodev.untrusted, Some(shit_planner::UntrustedSource::Nodev));
         assert_eq!(
-            device_capture(FileKind::Fifo, 0x103, 0o010600, 1, 1, t, false),
+            device_capture(FileKind::Fifo, 0x103, 0o010600, 1, 1, t, None),
             None
         );
-        let got = device_capture(FileKind::BlockDevice, 0x803, 0o060600, 1, 2, t, false).unwrap();
+        let got = device_capture(FileKind::BlockDevice, 0x803, 0o060600, 1, 2, t, None).unwrap();
         assert_eq!(
             (got.rdev, got.mode, got.uid, got.gid),
             (0x803, 0o060600, 1, 2)
@@ -2056,7 +2059,7 @@ mod tests_dispatch {
                 helper: [1; 16],
                 mac: [2; 32],
             }),
-            source_nodev: false,
+            untrusted: None,
         };
         journal_unlink_with_device(
             &index,
@@ -2105,7 +2108,7 @@ mod tests_dispatch {
                 helper: [1; 16],
                 mac: [2; 32],
             }),
-            source_nodev: false,
+            untrusted: None,
         };
         for (t, rdev) in [(2, 0x103), (3, 0x105)] {
             journal_unlink_with_device(

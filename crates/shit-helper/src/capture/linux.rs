@@ -482,7 +482,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -742,11 +742,13 @@ impl LinuxCaptureRuntime {
         //
         // Review round 2, item 1: a node on a `nodev` filesystem (FUSE
         // always is) gets no token; such a filesystem can report any rdev.
-        let device_source_nodev = race_won
-            && file_type.is_device()
-            && race_fd.as_ref().is_some_and(|fd| {
-                crate::capture_token::fs_is_nodev(fd.as_raw_fd()).unwrap_or(true)
-            });
+        let device_untrusted = if race_won && file_type.is_device() {
+            race_fd
+                .as_ref()
+                .and_then(|fd| crate::capture_token::untrusted_source(fd.as_raw_fd()))
+        } else {
+            None
+        };
         let device_token = match (&meta_wire, race_won && file_type.is_device()) {
             (Some(m), true) if m.rdev != 0 => crate::capture_token::process_key().and_then(|k| {
                 crate::capture_token::device_token(
@@ -762,7 +764,7 @@ impl LinuxCaptureRuntime {
                         session: ev.command.session,
                         seq: ev.command.seq,
                     },
-                    device_source_nodev,
+                    device_untrusted.is_some(),
                 )
             }),
             _ => None,
@@ -802,7 +804,7 @@ impl LinuxCaptureRuntime {
                 0
             },
             device_token,
-            device_source_nodev,
+            device_untrusted,
         };
 
         let send_result = if let Some(ref fd) = staging_fd {
@@ -970,7 +972,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -1471,7 +1473,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -1628,7 +1630,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
         };
         if let Err(e) = self
             .conn
@@ -1738,7 +1740,7 @@ impl LinuxCaptureRuntime {
                         fd_sent_via_scm: true,
                         rdev: 0,
                         device_token: None,
-                        device_source_nodev: false,
+                        device_untrusted: None,
                     };
                     if let Err(e) = self
                         .conn

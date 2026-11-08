@@ -1407,7 +1407,7 @@ fn device_meta(path: std::path::PathBuf, inode: InodeRef, rdev: u64) -> CaptureE
             helper: [7; 16],
             mac: [rdev as u8; 32],
         }),
-        source_nodev: false,
+        untrusted: None,
     })
 }
 

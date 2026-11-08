@@ -489,7 +489,7 @@ impl PumpState {
             flags: meta.flags,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
             is_delete,
             fd_sent_via_scm: true,
         };

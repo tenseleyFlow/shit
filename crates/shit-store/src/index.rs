@@ -1594,7 +1594,7 @@ mod tests {
                 helper: [3; 16],
                 mac: [4; 32],
             }),
-            source_nodev: false,
+            untrusted: None,
         };
         idx.put_event(&mk(1, unlink.clone())).unwrap();
         idx.put_event(&mk(2, meta.clone())).unwrap();

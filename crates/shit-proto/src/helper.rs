@@ -266,6 +266,15 @@ pub struct CaptureToken {
     pub mac: [u8; 32],
 }
 
+/// L4b - why the helper would not vouch for a device-node capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UntrustedSource {
+    /// The source filesystem is mounted `nodev`.
+    Nodev,
+    /// `fstatvfs` on the held node failed, so the helper does not know.
+    Unknown,
+}
+
 /// L4b - the captured identity of a device node, sent back with an
 /// `ApplyMknod` so the helper can check its token. `session` and
 /// `command_seq` are those of the command that removed the node, not of
@@ -414,12 +423,12 @@ pub enum HelperResponse {
         /// a later `ApplyMknod` must present. See [`CaptureToken`].
         #[serde(default)]
         device_token: Option<CaptureToken>,
-        /// L4b - the held node sits on a filesystem mounted `nodev`
-        /// (FUSE always is): the helper issues no token, since such a
-        /// filesystem can report any rdev, and undo refuses with a
-        /// reason.
+        /// L4b - set when the helper issued no token because it could not
+        /// trust the source filesystem: mounted `nodev` (FUSE always is;
+        /// such a filesystem can report any rdev), or its flags could not
+        /// be read. Undo refuses with the matching reason.
         #[serde(default)]
-        device_source_nodev: bool,
+        device_untrusted: Option<UntrustedSource>,
     },
     /// W02.B.live-baseline — one regular file's content snapshot,
     /// captured at session-open by the helper-side baseline walker
@@ -1095,7 +1104,7 @@ mod tests {
             flags: 0,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
         };
         let bytes = encode_frame(&ev).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
@@ -1124,7 +1133,7 @@ mod tests {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
-            device_source_nodev: false,
+            device_untrusted: None,
         };
         let err = validate_outgoing(&ev).unwrap_err();
         assert!(matches!(err, HelperProtoError::PathHintTooLong { .. }));

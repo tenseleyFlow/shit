@@ -64,8 +64,26 @@ pub struct DeviceNode {
     pub removed_by: crate::events::CommandId,
     /// `None` when the helper would not vouch for the capture.
     pub token: Option<CaptureToken>,
-    /// The node sat on a `nodev` filesystem: no token was issued.
-    pub source_nodev: bool,
+    /// Why there is no token, when the helper said.
+    pub untrusted: Option<UntrustedSource>,
+}
+
+/// L4b - why the helper issued no token for a device-node capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UntrustedSource {
+    Nodev,
+    Unknown,
+}
+
+impl UntrustedSource {
+    pub fn reason(self) -> &'static str {
+        match self {
+            UntrustedSource::Nodev => "source filesystem does not allow device nodes",
+            UntrustedSource::Unknown => {
+                "could not determine whether the source filesystem allows device nodes"
+            }
+        }
+    }
 }
 
 impl FileMetadata {

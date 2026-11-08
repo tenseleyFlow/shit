@@ -284,11 +284,10 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         if let Some(d) = device
             && d.token.is_none()
         {
-            let why = if d.source_nodev {
-                "source filesystem does not allow device nodes"
-            } else {
-                "the helper issued no capture token"
-            };
+            let why = d
+                .untrusted
+                .map(|u| u.reason())
+                .unwrap_or("the helper issued no capture token");
             return ExecutionOutcome::Failed {
                 err: format!("mknod {path:?} kind={kind:?}: refused: {why}"),
             };
@@ -1582,7 +1581,7 @@ mod tests {
                 helper: [1; 16],
                 mac: [2; 32],
             }),
-            source_nodev: false,
+            untrusted: None,
         }
     }
 
@@ -1598,7 +1597,7 @@ mod tests {
         );
         let mut d = captured_node(7, 9);
         d.token = None;
-        d.source_nodev = true;
+        d.untrusted = Some(crate::metadata::UntrustedSource::Nodev);
         let op = device_op(crate::metadata::FileKind::CharDevice, Some(d));
         match exec.execute(&op, false, ConflictPolicy::default()) {
             ExecutionOutcome::Failed { err } => {

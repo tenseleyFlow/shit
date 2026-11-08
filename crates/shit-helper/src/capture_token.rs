@@ -135,15 +135,32 @@ pub fn fs_is_nodev(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
     Ok(sv.f_flag & libc::ST_NODEV != 0)
 }
 
+/// Why the helper will not vouch for a device node held by `fd`: its
+/// filesystem is `nodev`, or `fstatvfs` failed so the helper cannot
+/// tell. `None` when the filesystem honors device nodes.
+pub fn untrusted_source(fd: std::os::fd::RawFd) -> Option<shit_proto::UntrustedSource> {
+    classify_source(fs_is_nodev(fd))
+}
+
+/// [`untrusted_source`] on a `fs_is_nodev` result (split out so the
+/// error case can be tested).
+pub fn classify_source(nodev: std::io::Result<bool>) -> Option<shit_proto::UntrustedSource> {
+    match nodev {
+        Ok(false) => None,
+        Ok(true) => Some(shit_proto::UntrustedSource::Nodev),
+        Err(_) => Some(shit_proto::UntrustedSource::Unknown),
+    }
+}
+
 /// The token for a device-node capture, or none when the source
-/// filesystem is `nodev`: the helper does not vouch for what such a
-/// filesystem reports.
+/// filesystem is untrusted (`nodev`, or its flags unknown): the helper
+/// does not vouch for what such a filesystem reports.
 pub fn device_token(
     key: &TokenKey,
     facts: &DeviceFacts<'_>,
-    source_nodev: bool,
+    untrusted: bool,
 ) -> Option<CaptureToken> {
-    (!source_nodev).then(|| key.issue(facts))
+    (!untrusted).then(|| key.issue(facts))
 }
 
 static PROCESS_KEY: OnceLock<Option<TokenKey>> = OnceLock::new();
@@ -277,6 +294,20 @@ mod tests {
             let fd = std::fs::File::open("/dev/shm").unwrap();
             assert!(fs_is_nodev(fd.as_raw_fd()).unwrap());
         }
+    }
+
+    /// Review round 3, item 4: an fstatvfs error is its own reason, not
+    /// "nodev".
+    #[test]
+    fn statvfs_error_is_unknown_not_nodev() {
+        use shit_proto::UntrustedSource;
+        assert_eq!(classify_source(Ok(false)), None);
+        assert_eq!(classify_source(Ok(true)), Some(UntrustedSource::Nodev));
+        assert_eq!(
+            classify_source(Err(std::io::Error::from_raw_os_error(libc::EBADF))),
+            Some(UntrustedSource::Unknown)
+        );
+        assert_eq!(untrusted_source(-1), Some(UntrustedSource::Unknown));
     }
 
     #[test]
