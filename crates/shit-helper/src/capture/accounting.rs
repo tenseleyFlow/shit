@@ -228,6 +228,12 @@ impl CloseAccounting {
         self.baseline_paths.insert(to.to_path_buf(), moved);
     }
 
+    /// A directory moved from `from` to `to`: every baseline path
+    /// strictly under `from` now lives under `to`.
+    pub fn note_dir_renamed(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        rekey_under(&mut self.baseline_paths, from, to);
+    }
+
     /// A rename moved an entry onto `path`.
     pub fn note_rename_target(&mut self, path: String) {
         self.rename_targets.insert(path);
@@ -416,6 +422,26 @@ impl CloseAccounting {
             }
         }
         out
+    }
+}
+
+/// Move every key strictly under `from` to the same place under `to`.
+/// The key equal to `from` is left alone: after `mv d e; mkdir d` it may
+/// already name the new directory.
+pub fn rekey_under<V>(
+    map: &mut BTreeMap<std::path::PathBuf, V>,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) {
+    let moved: Vec<std::path::PathBuf> = map
+        .keys()
+        .filter(|k| k.as_path() != from && k.starts_with(from))
+        .cloned()
+        .collect();
+    for old in moved {
+        if let (Some(v), Ok(rest)) = (map.remove(&old), old.strip_prefix(from)) {
+            map.insert(to.join(rest), v);
+        }
     }
 }
 

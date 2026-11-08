@@ -2020,6 +2020,26 @@ impl LinuxCaptureRuntime {
         ws.path_to_inode.remove(&from_path_buf);
         ws.path_to_inode.insert(to_path_buf.clone(), moved);
         ws.acct.note_renamed(&from_path_buf, &to_path_buf, moved);
+        // A directory takes its subtree with it: re-key everything under
+        // the old path, or later events resolve children to where they
+        // were and `mv d e; mkdir d; mv tmp d/f` takes old f for the
+        // file being replaced at d/f.
+        if let Some(dir) = ws.dir_paths.get_mut(&moved) {
+            *dir = to_path_buf.clone();
+            for path in ws.dir_paths.values_mut() {
+                if path.as_path() != from_path_buf.as_path()
+                    && let Ok(rest) = path.strip_prefix(&from_path_buf)
+                {
+                    *path = to_path_buf.join(rest);
+                }
+            }
+            crate::capture::accounting::rekey_under(
+                &mut ws.path_to_inode,
+                &from_path_buf,
+                &to_path_buf,
+            );
+            ws.acct.note_dir_renamed(&from_path_buf, &to_path_buf);
+        }
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
@@ -3586,6 +3606,68 @@ mod born_set_tests {
         rig.unlink(id, root, "f");
         rig.open(id, false);
         assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn directory_rename_moves_its_children_in_every_map() {
+        // `mv d e; mkdir d; mv tmp d/f`. Old f now lives at e/f. The last
+        // rename creates d/f; it replaces nothing, so no pre-image of old
+        // f may be sent as deleted at d/f, and old f keeps its own state.
+        let mut rig = Rig::new(|d| {
+            std::fs::create_dir(d.join("d")).unwrap();
+            std::fs::write(d.join("d/f"), b"old f").unwrap();
+        });
+        let root = rig.root();
+        let d_old = Rig::id(&rig.dir.path().join("d"));
+        let f_id = Rig::id(&rig.dir.path().join("d/f"));
+        std::fs::rename(rig.dir.path().join("d"), rig.dir.path().join("e")).unwrap();
+        rig.rename(d_old, (root, "d"), (root, "e"));
+        std::fs::create_dir(rig.dir.path().join("d")).unwrap();
+        let cmd = rig.cmd;
+        let mkdir = LsmMkdirView {
+            command: cmd,
+            pid: 1,
+            parent_dev: userspace_to_kernel_dev(root.0),
+            parent_inode: root.1,
+            mode: 0o40755,
+            basename: "d",
+        };
+        rig.rt().handle_lsm_mkdir(&mkdir);
+        let d_new = Rig::id(&rig.dir.path().join("d"));
+        let tmp = rig.dir.path().join("tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let tmp_id = Rig::id(&tmp);
+        rig.create(root, "tmp");
+        std::fs::rename(&tmp, rig.dir.path().join("d/f")).unwrap();
+        rig.rename(tmp_id, (root, "tmp"), (d_new, "f"));
+        {
+            let e = rig.dir.path().join("e");
+            let ws = rig.rt.as_ref().unwrap().watches.get(&cmd).unwrap();
+            assert_eq!(
+                ws.path_to_inode.get(&e.join("f")),
+                Some(&f_id),
+                "old f must be indexed at its new path"
+            );
+            assert_eq!(
+                ws.dir_paths.get(&d_old),
+                Some(&e),
+                "the moved directory must resolve to its new path"
+            );
+        }
+        let mut rt = rig.rt.take().unwrap();
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        while let Ok((resp, _fd)) = rig.daemon.recv_response_with_fd() {
+            if let HelperResponse::CapturedPreImage {
+                is_delete: true,
+                inode,
+                path,
+                ..
+            } = resp
+            {
+                assert_ne!(inode, f_id.1, "old f was sent as replaced at {path:?}");
+            }
+        }
     }
 
     #[test]
