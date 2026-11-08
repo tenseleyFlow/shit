@@ -339,6 +339,24 @@ fn finalize_post_exec(
     ctx.closing.finish(command);
 }
 
+/// L5 (review of #232, item 1): record the root a kernel tier will watch
+/// for `command`, then send the WatchTree request. Recording first means
+/// a failure reply (WatchTreeFailed, or the no-tier observation) that the
+/// helper link dispatches before `send` returns always finds the record
+/// and drops it. A send that fails drops it too.
+fn request_watch<E: std::fmt::Display>(
+    live_baseline: &crate::baseline::LiveBaseline,
+    command: CommandId,
+    root: PathBuf,
+    send: impl FnOnce() -> Result<(), E>,
+) {
+    live_baseline.record_command_watch(command, root);
+    if let Err(e) = send() {
+        live_baseline.forget_command_watch(command);
+        warn!(err = %e, "WatchTree dispatch to helper failed");
+    }
+}
+
 /// Frames whose handler journals an event against `(session, seq)`.
 fn needs_command_row(msg: &HookMessage) -> Option<CommandId> {
     match msg {
@@ -451,13 +469,12 @@ fn handle(
                     shell_kind: *shell_kind,
                     cwd_path: cwd_path.clone(),
                 };
-                match link.send_request(&req) {
-                    // L5: the root a kernel tier will watch for this command.
-                    Ok(_) => close_ctx
-                        .live_baseline
-                        .record_command_watch(command, PathBuf::from(cwd_path)),
-                    Err(e) => warn!(err = %e, "WatchTree dispatch to helper failed"),
-                }
+                request_watch(
+                    &close_ctx.live_baseline,
+                    command,
+                    PathBuf::from(cwd_path),
+                    || link.send_request(&req),
+                );
             }
         }
         HookMessage::PostExec { seq, exit_code, .. } => {
@@ -610,6 +627,32 @@ mod close_barrier_tests {
     use super::*;
     use crate::watch_ready::WatchReadyMap;
     use uuid::Uuid;
+
+    /// Review of #232, item 1: the helper answers WatchTree with a
+    /// failure before `send_request` returns. The command must not stay
+    /// watched; nor when the send itself fails.
+    #[test]
+    fn immediate_watch_failure_leaves_the_command_unwatched() {
+        use shit_planner::time::TimePoint;
+        let lb = crate::baseline::LiveBaseline::new();
+        let command = CommandId {
+            session: uuid::Uuid::from_u128(3),
+            seq: 1,
+        };
+        let f = std::path::Path::new("/w/f");
+        // The failure reply is dispatched (forget) inside the send.
+        super::request_watch(&lb, command, PathBuf::from("/w"), || {
+            lb.forget_command_watch(command);
+            Ok::<(), String>(())
+        });
+        assert!(!lb.command_watches(command, f, TimePoint::new(1, 0)));
+        super::request_watch(&lb, command, PathBuf::from("/w"), || {
+            Err::<(), _>("helper gone".to_string())
+        });
+        assert!(!lb.command_watches(command, f, TimePoint::new(1, 0)));
+        super::request_watch(&lb, command, PathBuf::from("/w"), || Ok::<(), String>(()));
+        assert!(lb.command_watches(command, f, TimePoint::new(1, 0)));
+    }
 
     fn refusal_details(index: &Index, command: CommandId) -> Vec<String> {
         <Index as shit_planner::PlannerStore>::events_for_command(index, command)
