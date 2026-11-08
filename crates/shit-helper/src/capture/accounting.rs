@@ -59,12 +59,6 @@ pub struct Observation {
     pub detail: String,
 }
 
-#[derive(Debug, Clone)]
-struct Loss {
-    path: Option<String>,
-    detail: String,
-}
-
 #[derive(Debug, Default)]
 pub struct CloseAccounting {
     /// Every identity the baseline walk saw, whatever its kind and
@@ -88,7 +82,7 @@ pub struct CloseAccounting {
     born: BTreeSet<Id>,
     /// Identities with a pre-image or metadata capture on the wire.
     captured: BTreeSet<Id>,
-    lost: BTreeMap<Id, Loss>,
+    lost: BTreeMap<Id, Observation>,
     unlocated: BTreeSet<Id>,
     /// Losses with no identity (an fstat that failed).
     unkeyed: Vec<String>,
@@ -180,7 +174,7 @@ impl CloseAccounting {
         match self.classify(id, parent_walked) {
             Provenance::Born | Provenance::Outside => {}
             Provenance::Baseline => {
-                self.lost.entry(id).or_insert(Loss {
+                self.lost.entry(id).or_insert(Observation {
                     path,
                     detail: detail.into(),
                 });
@@ -226,25 +220,20 @@ impl CloseAccounting {
     pub fn close(self, send_failures: u32, kernel_now: Option<u64>) -> Vec<Observation> {
         let mut out = Vec::new();
         let reason = self.incomplete_reason();
-        let lost: Vec<Loss> = self
+        let mut lost: Vec<Observation> = self
             .lost
             .into_iter()
             .filter(|(id, _)| !self.captured.contains(id))
-            .map(|(_, loss)| loss)
+            .map(|(_, obs)| obs)
             .collect();
-        let shown = lost.len().min(MAX_PATH_OBSERVATIONS);
-        for loss in &lost[..shown] {
-            out.push(Observation {
-                path: loss.path.clone(),
-                detail: loss.detail.clone(),
-            });
-        }
-        if lost.len() > shown {
+        let hidden = lost.len().saturating_sub(MAX_PATH_OBSERVATIONS);
+        lost.truncate(MAX_PATH_OBSERVATIONS);
+        out.extend(lost);
+        if hidden > 0 {
             out.push(Observation {
                 path: None,
                 detail: format!(
-                    "{} more pre-existing file(s) changed without captured evidence",
-                    lost.len() - shown
+                    "{hidden} more pre-existing file(s) changed without captured evidence"
                 ),
             });
         }
