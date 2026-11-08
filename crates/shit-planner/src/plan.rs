@@ -965,6 +965,9 @@ struct EntryHistory {
     /// One of them is a trusted pre-mutation snapshot: the entry existed
     /// before the command whatever the Create says.
     trusted_pre_image: bool,
+    /// L5: an ancestor directory's journaled rename carried it to its
+    /// current path (it has no rename of its own for that move).
+    carried: bool,
     /// Its unlinks, with the kind each reports. More than one tier can
     /// report the same unlink: the shim's with the (0, 0) inode sentinel
     /// is not merged with the helper's by `journal_unlink_idempotent`.
@@ -1050,10 +1053,11 @@ impl Provenance {
                         .filter(|k| k != from)
                         .collect();
                     for k in under {
-                        if let (Some(h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from))
-                            && let Some(old) = live.insert(to.join(rel), h)
-                        {
-                            out.finish(old);
+                        if let (Some(mut h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from)) {
+                            h.carried = true;
+                            if let Some(old) = live.insert(to.join(rel), h) {
+                                out.finish(old);
+                            }
                         }
                     }
                     let moved = match live.remove(from) {
@@ -1098,7 +1102,12 @@ impl Provenance {
             // pre-images are of bytes this command wrote. The transient
             // rule covers that shape at one path, but not the reverse
             // rename, which would hit a missing source.
-            if h.pre_images.is_empty() || (!h.renames.is_empty() && !h.trusted_pre_image) {
+            // Review round 4, item 4: moved by its directory's rename
+            // counts as moved (`mkdir w; echo x > w/t; mv w w2; rm -rf
+            // w2`). Only its own events go; the directory's Rename is the
+            // directory's to decide.
+            let moved = !h.renames.is_empty() || h.carried;
+            if h.pre_images.is_empty() || (moved && !h.trusted_pre_image) {
                 self.dropped_events.extend(h.pre_images);
                 self.dropped_events.extend(h.creates);
                 self.dropped_events.extend(h.renames);

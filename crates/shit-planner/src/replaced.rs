@@ -289,13 +289,17 @@ impl ReplacedSubtrees {
         // One generation of each: nothing earlier names either side,
         // except a scratch entry at `to` that was already gone again.
         let start = first;
-        let earlier = |p: &Path| {
+        // The scratch exemption is for `to` only (pip claims the stash
+        // name with `mkdir; rmdir` first). Anything earlier at `from`, even
+        // scratch, means the source was made in this command, so there is
+        // nothing from before it to rebuild (review round 4, item 4).
+        let earlier = |p: &Path, allow_scratch: bool| {
             index
                 .touching(p)
                 .into_iter()
-                .any(|j| j < start && !scratch.contains(&chrono[j].id))
+                .any(|j| j < start && !(allow_scratch && scratch.contains(&chrono[j].id)))
         };
-        if earlier(from) || earlier(to) {
+        if earlier(from, false) || earlier(to, true) {
             return None;
         }
         let mut dropped = HashSet::new();
