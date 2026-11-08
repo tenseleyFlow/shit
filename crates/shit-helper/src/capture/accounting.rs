@@ -90,16 +90,23 @@ pub struct CloseAccounting {
     /// attributes of.
     written: BTreeSet<Id>,
     /// Mutations whose evidence was not captured, keyed by identity:
-    /// the first observation, and whether any event placed the identity
-    /// in a parent the walk listed completely. Classified at close.
-    missing: BTreeMap<Id, (Observation, bool)>,
+    /// the first observation, whether any event placed the identity in
+    /// a parent the walk listed completely, and the order in which the
+    /// first record arrived. Classified at close.
+    missing: BTreeMap<Id, (Observation, bool, u64)>,
+    /// The same for mutations whose identity is unknown, `(0, 0)`. Each
+    /// is its own loss; they never share an entry.
+    missing_unknown: Vec<(Observation, bool, u64)>,
+    /// Arrival counter for `missing` and `born_paths`.
+    order: u64,
     /// Renames dropped because a source or destination parent could not
     /// be resolved. Each could have moved a pre-existing file into a
     /// walked directory, so absence from a listing stops proving birth.
     renames_unresolved: u32,
     /// Paths a create hook fired for whose entry was already gone when
     /// the handler opened it: created and removed inside the command.
-    born_paths: BTreeSet<String>,
+    /// The value is the arrival order of the first such create.
+    born_paths: BTreeMap<String, u64>,
     /// Paths some rename in the command moved an entry onto. A born
     /// path that is also a rename target proves nothing about whatever
     /// was removed there later.
@@ -190,7 +197,13 @@ impl CloseAccounting {
     /// A create fired for `path` and the entry was gone (ENOENT) by the
     /// time the handler opened it.
     pub fn note_born_path(&mut self, path: String) {
-        self.born_paths.insert(path);
+        let order = self.next_order();
+        self.born_paths.entry(path).or_insert(order);
+    }
+
+    fn next_order(&mut self) -> u64 {
+        self.order += 1;
+        self.order
     }
 
     /// A rename moved an entry onto `path`.
@@ -198,8 +211,17 @@ impl CloseAccounting {
         self.rename_targets.insert(path);
     }
 
-    fn born_at(&self, path: Option<&str>) -> bool {
-        path.is_some_and(|p| self.born_paths.contains(p) && !self.rename_targets.contains(p))
+    /// True when a loss first recorded at `order` for `path` is the file
+    /// an ENOENT create proved born. Only a loss recorded after that
+    /// create qualifies: one recorded before it may be the entry that was
+    /// at the path before the command created its own.
+    fn born_at(&self, path: Option<&str>, order: u64) -> bool {
+        path.is_some_and(|p| {
+            self.born_paths
+                .get(p)
+                .is_some_and(|&created| created < order)
+                && !self.rename_targets.contains(p)
+        })
     }
 
     /// A rename was dropped because a parent could not be resolved.
@@ -248,16 +270,19 @@ impl CloseAccounting {
         path: Option<String>,
         detail: impl Into<String>,
     ) {
+        let order = self.next_order();
+        let obs = Observation {
+            path,
+            detail: detail.into(),
+        };
+        if id == (0, 0) {
+            self.missing_unknown.push((obs, parent_walked, order));
+            return;
+        }
         self.missing
             .entry(id)
-            .and_modify(|(_, absent)| *absent |= parent_walked)
-            .or_insert((
-                Observation {
-                    path,
-                    detail: detail.into(),
-                },
-                parent_walked,
-            ));
+            .and_modify(|(_, absent, _)| *absent |= parent_walked)
+            .or_insert((obs, parent_walked, order));
     }
 
     /// A loss with no identity to classify.
@@ -303,14 +328,20 @@ impl CloseAccounting {
         let reason = self.incomplete_reason();
         let mut lost = Vec::new();
         let mut unlocated = 0usize;
-        for (id, (obs, absent)) in std::mem::take(&mut self.missing) {
-            if self.has_evidence(&id) {
+        let keyed = std::mem::take(&mut self.missing)
+            .into_iter()
+            .map(|(id, (obs, absent, order))| (id, obs, absent, order));
+        let unknown = std::mem::take(&mut self.missing_unknown)
+            .into_iter()
+            .map(|(obs, absent, order)| ((0, 0), obs, absent, order));
+        for (id, obs, absent, order) in keyed.chain(unknown) {
+            if id != (0, 0) && self.has_evidence(&id) {
                 continue;
             }
             match self.classify(id, absent) {
                 Provenance::Baseline => lost.push(obs),
                 Provenance::Born | Provenance::Outside => {}
-                Provenance::Unlocated if self.born_at(obs.path.as_deref()) => {}
+                Provenance::Unlocated if self.born_at(obs.path.as_deref(), order) => {}
                 Provenance::Unlocated => unlocated += 1,
             }
         }
@@ -491,6 +522,29 @@ mod tests {
             a.close(0, None).is_empty(),
             "positive evidence still counts"
         );
+    }
+
+    #[test]
+    fn unknown_identity_losses_are_counted_one_by_one() {
+        let mut a = walked();
+        a.note_capped();
+        a.note_missing((0, 0), false, Some("/w/a".into()), "no identity");
+        a.note_missing((0, 0), false, Some("/w/b".into()), "no identity");
+        let obs = a.close(0, None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].detail.starts_with("2 changed file(s)"), "{obs:?}");
+    }
+
+    #[test]
+    fn born_path_excuses_only_losses_recorded_after_its_create() {
+        let mut a = walked();
+        a.note_capped();
+        a.note_missing((1, 50), false, Some("/w/p".into()), "unlink race lost");
+        a.note_born_path("/w/p".into());
+        a.note_missing((1, 51), false, Some("/w/p".into()), "unlink race lost");
+        let obs = a.close(0, None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].detail.starts_with("1 changed file(s)"), "{obs:?}");
     }
 
     #[test]

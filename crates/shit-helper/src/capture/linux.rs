@@ -3657,9 +3657,58 @@ mod born_set_tests {
         std::fs::write(&t, b"").unwrap();
         let id = Rig::id(&t);
         std::fs::remove_file(&t).unwrap();
+        rig.create(root, "t");
+        rig.unlink(id, root, "t");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn unlink_handled_before_its_enoent_create_is_not_excused() {
+        // The narrow side of the ordering rule: a loss recorded before the
+        // create at its path may be the file that was there before it.
+        let (mut rig, _deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let t = rig.dir.path().join("t");
+        std::fs::write(&t, b"").unwrap();
+        let id = Rig::id(&t);
+        std::fs::remove_file(&t).unwrap();
         rig.unlink(id, root, "t");
         rig.create(root, "t");
-        assert_eq!(rig.close(None), vec![]);
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn create_enoent_does_not_hide_the_earlier_file_at_that_path() {
+        // `rm x; touch x; rm x` where the first x existed but was never
+        // walked. The create proves the second x was born, not the first.
+        // `last` is recorded in dir_paths (so events under it resolve) but
+        // past the depth limit, so its contents were never listed.
+        let mut rig = Rig::new(|d| {
+            let mut p = d.to_path_buf();
+            for i in 0..PRE_OPEN_TREE_DEPTH_LIMIT {
+                p = p.join(format!("d{i}"));
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("x"), b"pre-existing, never walked").unwrap();
+        });
+        let mut last = rig.dir.path().to_path_buf();
+        for i in 0..PRE_OPEN_TREE_DEPTH_LIMIT {
+            last = last.join(format!("d{i}"));
+        }
+        let last_id = Rig::id(&last);
+        let old = Rig::id(&last.join("x"));
+        std::fs::remove_file(last.join("x")).unwrap();
+        std::fs::write(last.join("x"), b"").unwrap();
+        let new = Rig::id(&last.join("x"));
+        std::fs::remove_file(last.join("x")).unwrap();
+        rig.unlink(old, last_id, "x");
+        rig.create(last_id, "x");
+        // If the inode number was reused, old == new: one identity, first
+        // recorded before the create, so the expectation is the same.
+        rig.unlink(new, last_id, "x");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.starts_with("1 changed file(s)"), "{obs:?}");
     }
 
     #[test]
