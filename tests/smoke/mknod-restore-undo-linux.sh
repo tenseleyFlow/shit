@@ -32,7 +32,10 @@
 # shim loaded, so the shim and the LSM tier both report the removal.
 # Undo must restore it once (one apply_mknod Applied for this phase).
 #
-# Phase 4, helper restart. A user-owned node is `rm`'d, then shitd and
+# Phase 4, born in the command. A node made (sudo mknod) and removed
+# inside one command is scratch: undo must create nothing.
+#
+# Phase 5, helper restart. A user-owned node is `rm`'d, then shitd and
 # its helper are restarted. The new helper has a new key, so undo must
 # refuse with "capture evidence expired: helper restarted" and create
 # nothing.
@@ -219,20 +222,41 @@ APPLIED_AFTER="$(sed 's/\x1b\[[0-9;]*m//g' "${SHIT_SMOKE_TMP}/shitd.log" | grep 
 smoke_log "phase 3: dual-tier rm restored once"
 rm -f "${DUAL_NODE}"
 
-# ---- phase 4: a restarted helper refuses old capture evidence ----
+# ---- phase 4: a node made and removed in one command is scratch ----
+BORN_NODE="${SCRATCH}/l4_null_born"
+"${SHIT_BIN}" hook-send pre-exec \
+    --session "${SESSION}" --seq 4 --pid "${PID}" \
+    --cwd "${SCRATCH}" --shell bash --sock "${SHIT_HOOK_SOCK}"
+sleep 0.5
+sudo -n mknod -m 0640 "${BORN_NODE}" c 1 3
+sudo -n chown "${ME}" "${BORN_NODE}"
+sleep 0.3
+rm -f "${BORN_NODE}"
+sleep 0.5
+"${SHIT_BIN}" hook-send post-exec \
+    --session "${SESSION}" --seq 4 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
+smoke_wait_for_event "discriminant = 'TreeOpCreate' AND path = '${BORN_NODE}'" 1 10
+"${SHIT_BIN}" undo --yes >"${SHIT_SMOKE_TMP}/undo-born.log" 2>&1 || true
+if [ -e "${BORN_NODE}" ]; then
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo-born.log" >&2
+    smoke_fail "undo created ${BORN_NODE}, which did not exist before the command"
+fi
+smoke_log "phase 4: node made and removed in the command; undo created nothing"
+
+# ---- phase 5: a restarted helper refuses old capture evidence ----
 OLD_NODE="${SCRATCH}/l4_null_before_restart"
 seed "${OLD_NODE}" "${ME}" 0600
-rm_in_command 4 "${OLD_NODE}"
-smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 4 10
+rm_in_command 5 "${OLD_NODE}"
+smoke_wait_for_event "discriminant = 'TreeOpDeviceNodeMeta'" 5 10
 cp "${SHIT_SMOKE_TMP}/shitd.log" "${SHIT_SMOKE_TMP}/shitd-before-restart.log"
 smoke_stop_shitd || true
 smoke_start_shitd
 undo_expect_refusal "${SHIT_SMOKE_TMP}/undo-restart.log" "capture evidence expired: helper restarted" "${OLD_NODE}"
-smoke_log "phase 4: token from the previous helper refused"
+smoke_log "phase 5: token from the previous helper refused"
 
 "${SHIT_BIN}" hook-send session-close \
     --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}" || true
 
-sudo -n rm -f "${NODE}" "${ROOT_NODE}" "${OLD_NODE}" "${DUAL_NODE}" || true
+sudo -n rm -f "${NODE}" "${ROOT_NODE}" "${OLD_NODE}" "${DUAL_NODE}" "${BORN_NODE}" || true
 
 smoke_log "PASS: mknod-restore-undo-linux (restore via capture token, once under both tiers; foreign owner and restarted helper refused)"
