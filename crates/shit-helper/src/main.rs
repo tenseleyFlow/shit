@@ -3320,16 +3320,22 @@ fn apply_mknod(
             err: format!("path exists with wrong kind: {ft:?}"),
         };
     }
-    // `mode` includes both file-type and perm bits; libc::mknod
-    // expects exactly that composite. Perm bits are masked by
-    // umask; set umask(0) for the syscall so the captured mode
-    // round-trips byte-identical. The helper's IPC arm is
-    // single-threaded so the umask restore-before-yield is safe.
-    let prev_umask = unsafe { libc::umask(0) };
-    let rc = unsafe { libc::mknod(c_path.as_ptr(), mode_native, 0) };
-    unsafe { libc::umask(prev_umask) };
+    // Create with permission bits 0, then set the captured bits on the
+    // new node itself. No umask change: a process-wide umask(0) would
+    // race with capture threads creating staging files, and the umask
+    // can only clear bits, so 0 needs none.
+    let rc = unsafe { libc::mknod(c_path.as_ptr(), ifmt, 0) };
     if rc == 0 {
-        return PrivilegedOpOutcome::Applied;
+        let perms = mode_native & 0o7777;
+        return match set_new_node_mode(&c_path, ifmt, perms) {
+            Ok(()) => PrivilegedOpOutcome::Applied,
+            Err(e) => {
+                unsafe { libc::unlink(c_path.as_ptr()) };
+                PrivilegedOpOutcome::Failed {
+                    err: format!("chmod {perms:o}: {e}; node removed"),
+                }
+            }
+        };
     }
     let errno = std::io::Error::last_os_error();
     match errno.raw_os_error() {
@@ -3339,6 +3345,64 @@ fn apply_mknod(
             err: format!("mknod: {errno}"),
         },
     }
+}
+
+/// Give a just-made fifo/socket its captured permission bits without
+/// following a symlink. On Linux through an O_PATH fd of the node
+/// (`/proc/self/fd/N`), checked to be of the expected kind; elsewhere
+/// `fchmodat(AT_SYMLINK_NOFOLLOW)`.
+#[cfg(target_os = "linux")]
+fn set_new_node_mode(
+    c_path: &std::ffi::CStr,
+    ifmt: libc::mode_t,
+    perms: libc::mode_t,
+) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let node = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(node.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != ifmt {
+        return Err(std::io::Error::other(
+            "node at path is not the one just created",
+        ));
+    }
+    let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", node.as_raw_fd()))
+        .map_err(std::io::Error::other)?;
+    if unsafe { libc::fchmodat(libc::AT_FDCWD, proc.as_ptr(), perms, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_new_node_mode(
+    c_path: &std::ffi::CStr,
+    _ifmt: libc::mode_t,
+    perms: libc::mode_t,
+) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            perms,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// L4b - block/char node restore. Every field of the request is
@@ -3708,6 +3772,26 @@ mod apply_mknod_tests {
         assert_eq!(outcome, PrivilegedOpOutcome::Applied);
         let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
         assert!(ft.is_fifo(), "expected fifo, got {ft:?}");
+    }
+
+    /// Fifo and socket restores get exactly the captured permission bits
+    /// (here bits a usual umask would clear) with no umask change: made
+    /// with bits 0, then chmod'ed on the node.
+    #[test]
+    fn fifo_and_socket_get_the_captured_mode_without_a_umask_change() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let dir = tempfile::tempdir().unwrap();
+        for (name, ifmt) in [("f", 0o010000u32), ("s", 0o140000u32)] {
+            let p = dir.path().join(name);
+            let outcome = apply_mknod(p.to_str().unwrap(), ifmt | 0o666, 0, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied, "{name}");
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            assert!(
+                m.file_type().is_fifo() || m.file_type().is_socket(),
+                "{name}"
+            );
+            assert_eq!(m.mode() & 0o7777, 0o666, "{name}");
+        }
     }
 
     #[test]
