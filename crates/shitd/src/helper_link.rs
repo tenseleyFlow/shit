@@ -1130,6 +1130,8 @@ fn dispatch_response(
                 seq: command_seq,
             };
             watch_ready.mark_failed(cmd, reason.clone());
+            // L5: not watched, so a shim capture gap there stays a refusal.
+            live_baseline.forget_command_watch(cmd);
             tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
             if strict_capture {
                 journal_capture_refused_or_log(
@@ -1150,6 +1152,12 @@ fn dispatch_response(
             // the WatchReadyMap. Default mode logs it; strict mode journals
             // it so the planner refuses the command's undo.
             let cmd = CommandId { session, seq };
+            // L5: a whole-command observation (no capture tier, or the
+            // attach failed) means nothing watches it: a shim capture gap
+            // there stays a refusal.
+            if path.is_none() {
+                live_baseline.forget_command_watch(cmd);
+            }
             if strict_capture {
                 tracing::warn!(%session, seq, ?path, %detail, "helper capture refusal (strict; journaling)");
                 journal_capture_refused_or_log(index, cmd, path.map(PathBuf::from), detail);
@@ -1934,6 +1942,51 @@ mod tests_dispatch {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, PathBuf::from("/tmp/watched"));
         assert!(rows[0].1.contains("no Linux capture tier"));
+    }
+
+    /// L5 (review round 4, item 2): a command the helper cannot watch
+    /// (attach failed, or no capture tier) is not watched for the shim's
+    /// capture-gap check; a per-path observation changes nothing.
+    #[test]
+    fn unwatchable_command_drops_its_watch_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(5),
+            seq: 2,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let waiters = PrivOpWaiters::default();
+        let lb = crate::baseline::LiveBaseline::new();
+        let f = std::path::Path::new("/tmp/watched/f");
+        let send = |resp| {
+            dispatch_response(
+                resp, None, &index, &blobs, &map, &lb, "bpf-lsm", &waiters, false,
+            )
+        };
+        lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
+        send(HelperResponse::CaptureRefused {
+            session: cmd.session,
+            seq: cmd.seq,
+            path: Some("/tmp/watched/f".into()),
+            detail: "one path".into(),
+        });
+        assert!(lb.command_watches(cmd, f));
+        send(HelperResponse::WatchTreeFailed {
+            session: cmd.session,
+            command_seq: cmd.seq,
+            reason: "attach failed".into(),
+        });
+        assert!(!lb.command_watches(cmd, f));
+        lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
+        send(HelperResponse::CaptureRefused {
+            session: cmd.session,
+            seq: cmd.seq,
+            path: None,
+            detail: "no Linux capture tier is active".into(),
+        });
+        assert!(!lb.command_watches(cmd, f));
     }
 
     #[tokio::test]
