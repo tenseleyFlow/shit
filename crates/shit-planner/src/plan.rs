@@ -1879,8 +1879,8 @@ fn device_pairing(
 
 /// L4b - the helper's marker-only `Unlink` (mode 0: it lost the race to
 /// stat the entry) that is the other tier's report of a `SymlinkRemoved`:
-/// the next or previous event at that path in journal order, with no
-/// other event at the path between. The shim's `SymlinkRemoved` is the
+/// the next event at that path in journal order (the shim's report is
+/// stamped before the syscall, the marker during it). The shim's `SymlinkRemoved` is the
 /// whole restore; the marker would recreate a regular file where the
 /// link was. A mode-0 Unlink of a later entry at the same path is kept.
 pub(crate) fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
@@ -1909,14 +1909,13 @@ pub(crate) fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::ev
             ) {
                 continue;
             }
+            // The shim's SymlinkRemoved is stamped before the call and the
+            // kernel tier's marker during it, so the twin is the next event
+            // at the path. A marker before it belongs to an earlier entry.
             let next = seq
                 .get(i + 1)
                 .filter(|e| is_marker(e) && !taken.contains(&e.id));
-            let prev = i
-                .checked_sub(1)
-                .and_then(|j| seq.get(j))
-                .filter(|e| is_marker(e) && !taken.contains(&e.id));
-            if let Some(m) = next.or(prev) {
+            if let Some(m) = next {
                 taken.insert(m.id);
                 out.push(m.id);
             }

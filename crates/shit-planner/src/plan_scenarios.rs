@@ -1777,6 +1777,27 @@ fn device_made_and_removed_in_the_command_is_scratch() {
     assert!(std::fs::symlink_metadata(&p).is_err());
 }
 
+/// Review round 3, item 5: a mode-0 marker journaled before the
+/// SymlinkRemoved belongs to an earlier entry at the path (here a file
+/// whose removal the kernel tier could not stat) and is kept.
+#[test]
+fn marker_before_a_symlink_removal_is_kept() {
+    let mut sim = Sim::new();
+    let l = sim.p("l");
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(1, 7),
+        path: l.clone(),
+        kind: FileKind::Regular,
+        mode: 0,
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: "/elsewhere".into(),
+        path: l.clone(),
+    }));
+    let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
+    assert!(crate::plan::symlink_removal_markers(&refs).is_empty());
+}
+
 /// Review round 3, item 2: a removed symlink whose target is unknown
 /// (empty) is refused; undo makes neither a link nor a regular file.
 #[test]
