@@ -136,6 +136,7 @@ struct Call {
     rename: Option<EventId>,
     refusal: Option<EventId>,
     done: bool,
+    registered: std::time::Instant,
 }
 
 /// An outcome that arrived for a call the daemon has no record of.
@@ -233,6 +234,7 @@ pub(crate) fn register_call(call_id: u64, command: CommandId) {
             rename: None,
             refusal: None,
             done: false,
+            registered: std::time::Instant::now(),
         },
     );
 }
@@ -270,23 +272,127 @@ pub(crate) fn finish_call(call_id: u64) -> Option<Parked> {
     parked
 }
 
+/// What waiting on an outcome's call came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CallWait {
+    /// The call's notification was ingested; the outcome belongs to this
+    /// command.
+    Ready(CommandId),
+    /// No record of the call: the caller parks the outcome.
+    Unknown,
+    /// The call's command closed and its ingest never finished within
+    /// `grace` of registering: the caller journals a capture gap.
+    Abandoned(CommandId),
+}
+
+/// How long after its command closes a call may still be ingesting. A
+/// 50 MiB walk ingests in seconds; pip can exit before its stash's walk
+/// is journaled, so closing alone is not a reason to give up.
+pub(crate) const PENDING_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The command an outcome belongs to, once its call's pre-syscall ingest
 /// is done (review item 9: no second ancestor walk). Waits as long as
-/// that ingest runs. `None` when the daemon has no record of the call:
-/// the caller parks the outcome.
-pub(crate) async fn await_call(call_id: u64) -> Option<CommandId> {
+/// that ingest runs, with no timeout of its own (review round 2, item 1),
+/// until the call's command has closed and `grace` has passed since the
+/// call was registered (review round 3, item 2).
+pub(crate) async fn await_call(
+    call_id: u64,
+    is_open: impl Fn(CommandId) -> bool,
+    grace: std::time::Duration,
+) -> CallWait {
     loop {
         let wake = changed().notified();
         tokio::pin!(wake);
         // Arm before checking, so a finish between the check and the
         // wait is not missed.
         wake.as_mut().enable();
-        match lock().calls.get(&call_id) {
-            None => return None,
-            Some(c) if c.done => return Some(c.command),
-            Some(_) => {}
+        {
+            let mut reg = lock();
+            match reg.calls.get(&call_id) {
+                None => return CallWait::Unknown,
+                Some(c) if c.done => return CallWait::Ready(c.command),
+                Some(c) if !is_open(c.command) && c.registered.elapsed() >= grace => {
+                    let command = c.command;
+                    reg.calls.remove(&call_id);
+                    return CallWait::Abandoned(command);
+                }
+                Some(_) => {}
+            }
         }
-        wake.await;
+        // Re-check now and then for the command closing; a finish wakes
+        // this sooner.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), wake).await;
+    }
+}
+
+/// Journal a capture gap for a rename call: what its notifications said
+/// could not all be journaled.
+pub(crate) fn journal_gap(index: &Index, command: CommandId, path: &str, detail: &str) {
+    let event = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts: crate::server::next_ts(),
+        partial: false,
+        kind: CaptureEventKind::CaptureRefused {
+            class: "capture-gap".to_string(),
+            path: PathBuf::from(path),
+            detail: detail.to_string(),
+        },
+    };
+    if let Err(e) = index.put_event(&event) {
+        warn!(err = %e, path, "shim notify: rename capture-gap journal failed");
+    }
+}
+
+/// Review round 3, item 2: finishes a registered call on every way out of
+/// its ingest. Dropped without [`CallGuard::finish`] (the ingest
+/// panicked, or the task was cancelled), it still wakes the waiting
+/// outcome and journals a capture gap for the rename's source.
+pub(crate) struct CallGuard {
+    call_id: u64,
+    command: CommandId,
+    from: String,
+    index: std::sync::Arc<Index>,
+    armed: bool,
+}
+
+impl CallGuard {
+    pub(crate) fn new(
+        call_id: u64,
+        command: CommandId,
+        from: &str,
+        index: std::sync::Arc<Index>,
+    ) -> Self {
+        Self {
+            call_id,
+            command,
+            from: from.to_string(),
+            index,
+            armed: true,
+        }
+    }
+
+    /// The ingest returned: mark the call done and take any outcome
+    /// parked for it.
+    pub(crate) fn finish(mut self) -> Option<Parked> {
+        self.armed = false;
+        finish_call(self.call_id)
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = finish_call(self.call_id);
+        journal_gap(
+            &self.index,
+            self.command,
+            &self.from,
+            "the daemon failed partway through journaling this rename's notification; \
+             its walk and outcome may be incomplete",
+        );
     }
 }
 
@@ -537,8 +643,9 @@ mod tests {
             .enable_time()
             .build()
             .unwrap()
-            .block_on(await_call(post.call_id));
-        assert_eq!(resolved, Some(command));
+            .block_on(await_call(post.call_id, |_| true, PENDING_GRACE));
+        assert_eq!(resolved, CallWait::Ready(command));
+        let resolved = Some(command);
         crate::shim_listener::ingest_notification_for_test(
             &post,
             resolved,
@@ -631,11 +738,11 @@ mod tests {
                 record_rename(call_id, EventId(9));
                 finish_call(call_id);
             });
-            let got = await_call(call_id).await;
+            let got = await_call(call_id, |_| true, PENDING_GRACE).await;
             slow.await.unwrap();
             got
         });
-        assert_eq!(got, Some(command));
+        assert_eq!(got, CallWait::Ready(command));
         assert_eq!(
             lock().calls.get(&call_id).and_then(|c| c.rename),
             Some(EventId(9))
@@ -651,7 +758,10 @@ mod tests {
             .enable_time()
             .build()
             .unwrap();
-        assert_eq!(rt.block_on(await_call(call_id)), None);
+        assert_eq!(
+            rt.block_on(await_call(call_id, |_| true, PENDING_GRACE)),
+            CallWait::Unknown
+        );
         let mut n = note(None, None);
         n.call_id = call_id;
         park(n);
@@ -738,5 +848,49 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// Review round 3, item 2: an ingest that panics still finishes its
+    /// call and leaves a capture gap; an outcome waiting on a call whose
+    /// command closed without the ingest finishing gives up.
+    #[test]
+    fn panicked_ingest_finishes_its_call_and_journals_a_gap() {
+        let (_tmp, index, _blobs, command) = fixture();
+        let index = std::sync::Arc::new(index);
+        let call_id = 0x5150_0000_0004;
+        register_call(call_id, command);
+        let idx = index.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = CallGuard::new(call_id, command, "/tmp/l5/d", idx);
+            panic!("ingest blew up");
+        }));
+        assert!(r.is_err());
+        assert!(lock().calls.get(&call_id).is_some_and(|c| c.done));
+        let gaps: Vec<_> = index
+            .events_for_command(command)
+            .into_iter()
+            .filter(|e| matches!(&e.kind, CaptureEventKind::CaptureRefused { class, .. } if class == "capture-gap"))
+            .collect();
+        assert_eq!(gaps.len(), 1, "{gaps:#?}");
+    }
+
+    #[test]
+    fn outcome_for_a_call_whose_command_closed_is_abandoned() {
+        let (_tmp, _index, _blobs, command) = fixture();
+        let call_id = 0x5150_0000_0005;
+        register_call(call_id, command);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                await_call(call_id, |_| false, std::time::Duration::ZERO),
+            )
+            .await
+        });
+        assert_eq!(got.expect("gave up in time"), CallWait::Abandoned(command));
+        assert!(!lock().calls.contains_key(&call_id));
     }
 }

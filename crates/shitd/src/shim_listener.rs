@@ -255,9 +255,23 @@ async fn handle_one(
     // ack, so its outcome, which the shim sends only after the syscall,
     // always finds it, however long this ingest then takes.
     let rename_call = is_rename_call(&note).then_some(note.call_id);
-    if let (Some(call_id), Some(command)) = (rename_call, resolved) {
-        crate::shim_rename::register_call(call_id, command);
-    }
+    let from_arg = note
+        .arg
+        .split_once('\t')
+        .map_or(note.arg.as_str(), |(f, _)| f)
+        .to_string();
+    let guard = match (rename_call, resolved) {
+        (Some(call_id), Some(command)) => {
+            crate::shim_rename::register_call(call_id, command);
+            Some(crate::shim_rename::CallGuard::new(
+                call_id,
+                command,
+                &from_arg,
+                index.clone(),
+            ))
+        }
+        _ => None,
+    };
 
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
@@ -276,12 +290,29 @@ async fn handle_one(
     // own task, which may still be running.
     let resolved = match resolved {
         None if note.outcome.is_some() => {
-            match crate::shim_rename::await_call(note.call_id).await {
-                Some(c) => Some(c),
-                None => {
+            use crate::shim_rename::CallWait;
+            let wait = crate::shim_rename::await_call(
+                note.call_id,
+                |c| active.is_active(c),
+                crate::shim_rename::PENDING_GRACE,
+            )
+            .await;
+            match wait {
+                CallWait::Ready(c) => Some(c),
+                CallWait::Unknown => {
                     // No record of the call: keep the outcome for when it
                     // is ingested (bounded by the registry's TTL).
                     crate::shim_rename::park(note);
+                    return Ok(());
+                }
+                CallWait::Abandoned(c) => {
+                    crate::shim_rename::journal_gap(
+                        &index,
+                        c,
+                        &from_arg,
+                        "this rename's outcome arrived for a call whose notification was never \
+                         fully journaled",
+                    );
                     return Ok(());
                 }
             }
@@ -298,8 +329,8 @@ async fn handle_one(
         &blob_store,
         &live_baseline,
     );
-    if let Some(call_id) = rename_call
-        && let Some(parked) = crate::shim_rename::finish_call(call_id)
+    if let Some(guard) = guard
+        && let Some(parked) = guard.finish()
     {
         apply_parked(&parked, resolved, &index, &blob_store, &live_baseline);
     }
