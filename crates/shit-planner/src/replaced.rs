@@ -78,6 +78,8 @@ pub(crate) struct ReplacedSubtrees {
     /// pre-images) or its earliest pre-image -> directory metadata to
     /// apply after the files, deepest first.
     pub dir_metadata: HashMap<EventId, Vec<RebuiltDirMetadata>>,
+    /// The RenameWalk events the rule rebuilt from.
+    pub fired_walks: HashSet<EventId>,
 }
 
 struct Walked<'a> {
@@ -118,6 +120,7 @@ impl ReplacedSubtrees {
         self.dropped_events.extend(f.dropped);
         self.walk_restores.extend(f.restores.iter().copied());
         self.by_rename.insert(f.rename, f.dirs);
+        self.fired_walks.insert(f.walk);
         let key = f.restores.first().copied().unwrap_or(f.walk);
         self.dir_metadata.insert(key, f.metadata);
     }

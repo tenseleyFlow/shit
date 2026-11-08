@@ -138,7 +138,13 @@ pub fn plan_with_options(
     // L5 (review round 3, item 3): walk entries whose xattrs the shim
     // could not read come back without them. Say so: a warning, or a
     // refusal under strict capture.
-    surface_unread_walk_xattrs(&live, options, &mut nodes, &mut warnings);
+    surface_unread_walk_xattrs(
+        &live,
+        &class.fired_walks,
+        options,
+        &mut nodes,
+        &mut warnings,
+    );
 
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
@@ -174,17 +180,33 @@ pub fn plan_with_options(
     }
 }
 
+/// Only walks the replaced-subtree rule rebuilt from: a reversed rename
+/// brings back the real entries, xattrs and all (review round 4, item 1).
+/// Not on the BSDs, whose shim does not read extattrs: there the walk's
+/// xattrs are not applicable, not unread, and are documented as such.
 fn surface_unread_walk_xattrs(
     live: &[&CaptureEvent],
+    fired_walks: &HashSet<crate::events::EventId>,
     options: PlanOptions,
     nodes: &mut Vec<PlanNode>,
     warnings: &mut Vec<PlanWarning>,
 ) {
+    if cfg!(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )) {
+        return;
+    }
     let mut seen: HashSet<&Path> = HashSet::new();
     for ev in live {
         let CaptureEventKind::RenameWalk { entries, .. } = &ev.kind else {
             continue;
         };
+        if !fired_walks.contains(&ev.id) {
+            continue;
+        }
         for e in entries.iter().filter(|e| !e.xattrs_read) {
             if !seen.insert(e.path.as_path()) {
                 continue;
@@ -334,6 +356,8 @@ struct EventClassification {
     /// after that event's inverses.
     rebuilt_dir_metadata:
         std::collections::HashMap<crate::events::EventId, Vec<crate::replaced::RebuiltDirMetadata>>,
+    /// L5: RenameWalk events the rule rebuilt from.
+    fired_walks: HashSet<crate::events::EventId>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
@@ -775,6 +799,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         replaced_renames: replaced.by_rename,
         walk_restores: replaced.walk_restores,
         rebuilt_dir_metadata: replaced.dir_metadata,
+        fired_walks: replaced.fired_walks,
     }
 }
 

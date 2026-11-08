@@ -2393,3 +2393,38 @@ fn unread_walk_xattrs_warn_by_default_and_refuse_under_strict() {
         strict.nodes
     );
 }
+
+#[test]
+fn unread_walk_xattrs_are_silent_when_the_rename_is_reversed() {
+    // Review round 4, item 1: `mv d t` alone is undone by the reverse
+    // rename, which brings back the real files with their real xattrs.
+    // Nothing is restored from the walk, so nothing to warn about.
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    sim.mv("d", "t");
+    for e in &mut sim.events {
+        if let CaptureEventKind::RenameWalk { entries, .. } = &mut e.kind {
+            for w in entries.iter_mut() {
+                w.xattrs_read = false;
+            }
+        }
+    }
+    let probe = LiveStateProbe::new();
+    let p = crate::plan::plan_with_options(
+        command_record(),
+        &sim.events,
+        &probe,
+        &sim.store,
+        crate::plan::PlanOptions {
+            strict_capture: true,
+        },
+    );
+    assert!(p.warnings.is_empty(), "{:#?}", p.warnings);
+    assert!(
+        !p.nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::inverse::InverseOp::Refuse { .. })),
+        "{:#?}",
+        p.nodes
+    );
+}
