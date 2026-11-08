@@ -1653,6 +1653,9 @@ jobs:
       - name: build binaries + shim
         run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
       - name: run smoke
+        # L5: Outcome A (v1 restored at its path) is required on Linux.
+        env:
+          SHIT_REQUIRE_OUTCOME_A: "1"
         run: bash tests/smoke/pip-install-user-undo-linux.sh
       - name: upload artifacts on failure
         if: failure()
