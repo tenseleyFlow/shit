@@ -3279,6 +3279,7 @@ fn apply_mknod(
     device: Option<&shit_proto::DeviceEvidence>,
 ) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
+    #[cfg(not(target_os = "linux"))]
     use std::os::unix::fs::FileTypeExt;
     // libc::mode_t is u32 on Linux, u16 on macOS — cast at the
     // boundary so bitops + comparisons against libc constants
@@ -3296,6 +3297,19 @@ fn apply_mknod(
         // or 0 (caller forgot to set the kind). Refused.
         return PrivilegedOpOutcome::PermissionDenied;
     }
+    // Linux: through the parent dirfd, like device restores. Making a
+    // fifo or socket needs no privilege, so the parent may be reached
+    // through symlinks; the node itself is never re-resolved by name.
+    #[cfg(target_os = "linux")]
+    {
+        match dirfd::open_parent(path) {
+            Ok((parent, name)) => {
+                dirfd::special_node_at(&parent, &name, ifmt, mode_native & 0o7777)
+            }
+            Err(o) => o,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     let c_path = match std::ffi::CString::new(path) {
         Ok(s) => s,
         Err(e) => {
@@ -3309,6 +3323,7 @@ fn apply_mknod(
     // planner might have already replayed the op, or a parallel
     // command recreated the same path). Anything else is a real
     // conflict and bubbles up as Failed.
+    #[cfg(not(target_os = "linux"))]
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         let ft = meta.file_type();
         let already_right =
@@ -3324,67 +3339,44 @@ fn apply_mknod(
     // new node itself. No umask change: a process-wide umask(0) would
     // race with capture threads creating staging files, and the umask
     // can only clear bits, so 0 needs none.
-    let rc = unsafe { libc::mknod(c_path.as_ptr(), ifmt, 0) };
-    if rc == 0 {
-        let perms = mode_native & 0o7777;
-        return match set_new_node_mode(&c_path, ifmt, perms) {
-            Ok(()) => PrivilegedOpOutcome::Applied,
-            Err(e) => {
-                unsafe { libc::unlink(c_path.as_ptr()) };
-                PrivilegedOpOutcome::Failed {
-                    err: format!("chmod {perms:o}: {e}; node removed"),
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let rc = unsafe { libc::mknod(c_path.as_ptr(), ifmt, 0) };
+        if rc == 0 {
+            let ours = std::fs::symlink_metadata(path)
+                .map(|m| (m.dev(), m.ino()))
+                .ok();
+            let perms = mode_native & 0o7777;
+            return match set_new_node_mode(&c_path, ifmt, perms) {
+                Ok(()) => PrivilegedOpOutcome::Applied,
+                Err(e) => {
+                    // Remove only the node just made, not a swapped-in entry.
+                    let still = std::fs::symlink_metadata(path)
+                        .map(|m| (m.dev(), m.ino()))
+                        .ok();
+                    if ours.is_some() && still == ours {
+                        unsafe { libc::unlink(c_path.as_ptr()) };
+                    }
+                    PrivilegedOpOutcome::Failed {
+                        err: format!("chmod {perms:o}: {e}; node removed"),
+                    }
                 }
-            }
-        };
-    }
-    let errno = std::io::Error::last_os_error();
-    match errno.raw_os_error() {
-        Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
-        Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
-        _ => PrivilegedOpOutcome::Failed {
-            err: format!("mknod: {errno}"),
-        },
+            };
+        }
+        let errno = std::io::Error::last_os_error();
+        match errno.raw_os_error() {
+            Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+            Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
+            _ => PrivilegedOpOutcome::Failed {
+                err: format!("mknod: {errno}"),
+            },
+        }
     }
 }
 
-/// Give a just-made fifo/socket its captured permission bits without
-/// following a symlink. On Linux through an O_PATH fd of the node
-/// (`/proc/self/fd/N`), checked to be of the expected kind; elsewhere
-/// `fchmodat(AT_SYMLINK_NOFOLLOW)`.
-#[cfg(target_os = "linux")]
-fn set_new_node_mode(
-    c_path: &std::ffi::CStr,
-    ifmt: libc::mode_t,
-    perms: libc::mode_t,
-) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let node = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(node.as_raw_fd(), &mut st) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if st.st_mode & libc::S_IFMT != ifmt {
-        return Err(std::io::Error::other(
-            "node at path is not the one just created",
-        ));
-    }
-    let proc = std::ffi::CString::new(format!("/proc/self/fd/{}", node.as_raw_fd()))
-        .map_err(std::io::Error::other)?;
-    if unsafe { libc::fchmodat(libc::AT_FDCWD, proc.as_ptr(), perms, 0) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
+/// Non-Linux: give a just-made fifo/socket its captured permission
+/// bits without following a symlink.
 #[cfg(not(target_os = "linux"))]
 fn set_new_node_mode(
     c_path: &std::ffi::CStr,
@@ -3616,6 +3608,114 @@ mod dirfd {
         Ok((dir, to_c(name)?))
     }
 
+    /// Open the parent of `path` (`O_PATH|O_DIRECTORY`, symlinks in the
+    /// parent chain followed) for a fifo/socket restore, which needs no
+    /// privilege. Returns it with the final name.
+    pub(super) fn open_parent(path: &str) -> Result<(OwnedFd, CString), PrivilegedOpOutcome> {
+        let p = std::path::Path::new(path);
+        let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+            return Err(PrivilegedOpOutcome::Failed {
+                err: format!("path {path:?} has no parent or file name"),
+            });
+        };
+        use std::os::unix::ffi::OsStrExt;
+        let to_c = |b: &[u8]| {
+            CString::new(b).map_err(|e| PrivilegedOpOutcome::Failed {
+                err: format!("path contains NUL: {e}"),
+            })
+        };
+        let parent_c = to_c(parent.as_os_str().as_bytes())?;
+        let name_c = to_c(name.as_bytes())?;
+        match open_at(libc::AT_FDCWD, &parent_c, libc::O_PATH | libc::O_DIRECTORY) {
+            Ok(fd) => Ok((fd, name_c)),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Err(PrivilegedOpOutcome::NotFound),
+            Err(e) => Err(PrivilegedOpOutcome::Failed {
+                err: format!("open parent: {e}"),
+            }),
+        }
+    }
+
+    /// Remove `name` under `parent` only if it is still the entry
+    /// `(st_dev, st_ino)`; a swapped-in entry is left alone.
+    pub(super) fn unlink_if_same(parent: &OwnedFd, name: &CStr, ours: (u64, u64)) {
+        if let Ok(st) = fstatat_nofollow(parent, name)
+            && (st.st_dev, st.st_ino) == ours
+        {
+            unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+
+    /// Set `perms` on the node held by `node` (O_PATH) through
+    /// `/proc/self/fd/N`, which names that inode, not what is at a path.
+    fn chmod_held(node: &OwnedFd, perms: libc::mode_t) -> std::io::Result<()> {
+        let proc = CString::new(format!("/proc/self/fd/{}", node.as_raw_fd()))
+            .map_err(std::io::Error::other)?;
+        if unsafe { libc::fchmodat(libc::AT_FDCWD, proc.as_ptr(), perms, 0) } != 0 {
+            return Err(errno());
+        }
+        Ok(())
+    }
+
+    /// Fifo/socket restore under `parent`: an entry of the same kind
+    /// already there is Applied; anything else there is refused. The
+    /// node is made with bits 0 and given `perms` through its own fd;
+    /// on failure it is removed only if the entry is still that node.
+    pub(super) fn special_node_at(
+        parent: &OwnedFd,
+        name: &CStr,
+        ifmt: libc::mode_t,
+        perms: libc::mode_t,
+    ) -> PrivilegedOpOutcome {
+        match fstatat_nofollow(parent, name) {
+            Ok(st) if st.st_mode & libc::S_IFMT == ifmt => return PrivilegedOpOutcome::Applied,
+            Ok(st) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("path exists with wrong kind: mode {:o}", st.st_mode),
+                };
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("fstatat: {e}"),
+                };
+            }
+        }
+        if unsafe { libc::mknodat(parent.as_raw_fd(), name.as_ptr(), ifmt, 0) } != 0 {
+            let e = errno();
+            return match e.raw_os_error() {
+                Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+                Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
+                _ => PrivilegedOpOutcome::Failed {
+                    err: format!("mknod: {e}"),
+                },
+            };
+        }
+        let ours = match fstatat_nofollow(parent, name) {
+            Ok(st) if st.st_mode & libc::S_IFMT == ifmt => (st.st_dev, st.st_ino),
+            _ => {
+                return PrivilegedOpOutcome::Failed {
+                    err: "node at path is not the one just created".to_string(),
+                };
+            }
+        };
+        let held = open_at(parent.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW)
+            .and_then(|fd| match fstat_fd(&fd) {
+                Ok(st) if (st.st_dev, st.st_ino) == ours => Ok(fd),
+                Ok(_) => Err(std::io::Error::other("node changed during restore")),
+                Err(e) => Err(e),
+            })
+            .and_then(|fd| chmod_held(&fd, perms));
+        match held {
+            Ok(()) => PrivilegedOpOutcome::Applied,
+            Err(e) => {
+                unlink_if_same(parent, name, ours);
+                PrivilegedOpOutcome::Failed {
+                    err: format!("chmod {perms:o}: {e}; node removed"),
+                }
+            }
+        }
+    }
+
     fn describe(st: &libc::stat) -> String {
         format!(
             "mode {:o}, rdev {:#x}, owner {}:{}",
@@ -3697,13 +3797,7 @@ mod dirfd {
             }
         };
         let ours = (made.st_dev, made.st_ino);
-        let remove = || {
-            if let Ok(st) = fstatat_nofollow(parent, name)
-                && (st.st_dev, st.st_ino) == ours
-            {
-                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
-            }
-        };
+        let remove = || unlink_if_same(parent, name, ours);
         let node = match open_at(parent.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW) {
             Ok(fd) => fd,
             Err(e) => {
@@ -3751,17 +3845,7 @@ mod dirfd {
         }
         // chmod through the held O_PATH fd: /proc/self/fd/N names this
         // inode, not whatever is at `name` now.
-        let proc_path = match CString::new(format!("/proc/self/fd/{}", node.as_raw_fd())) {
-            Ok(p) => p,
-            Err(e) => {
-                remove();
-                return PrivilegedOpOutcome::Failed {
-                    err: format!("proc path: {e}"),
-                };
-            }
-        };
-        if unsafe { libc::fchmodat(libc::AT_FDCWD, proc_path.as_ptr(), perms, 0) } != 0 {
-            let e = errno();
+        if let Err(e) = chmod_held(&node, perms) {
             remove();
             return PrivilegedOpOutcome::Failed {
                 err: format!("chmod {perms:o}: {e}; node removed"),
@@ -4014,6 +4098,27 @@ mod apply_mknod_tests {
             let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
             assert!(refused(&outcome, "not the invoking user"), "{outcome:?}");
             assert!(std::fs::symlink_metadata(&p).is_err());
+        }
+
+        /// Review round 3, item 1: cleanup after a failed restore removes
+        /// only the node it made; an entry swapped in at the name stays.
+        #[test]
+        fn cleanup_leaves_a_swapped_in_entry_alone() {
+            use std::os::unix::fs::MetadataExt;
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a");
+            std::fs::write(&a, b"ours").unwrap();
+            let m = std::fs::metadata(&a).unwrap();
+            let ours = (m.dev(), m.ino());
+            let b = dir.path().join("b");
+            std::fs::write(&b, b"theirs").unwrap();
+            std::fs::rename(&b, &a).unwrap();
+            let (parent, name) = dirfd::open_parent(a.to_str().unwrap()).unwrap();
+            dirfd::unlink_if_same(&parent, &name, ours);
+            assert_eq!(std::fs::read(&a).unwrap(), b"theirs");
+            let now = std::fs::metadata(&a).unwrap();
+            dirfd::unlink_if_same(&parent, &name, (now.dev(), now.ino()));
+            assert!(std::fs::symlink_metadata(&a).is_err());
         }
 
         /// Review round 2, item 1: a token signed for one filesystem is not
