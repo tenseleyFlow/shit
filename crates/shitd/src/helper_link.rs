@@ -1595,13 +1595,21 @@ fn journal_unlink_with_device(
     device: Option<DeviceCapture>,
 ) -> Result<(), HelperLinkError> {
     use shit_planner::PlannerStore;
-    let already = index.events_for_command(command).into_iter().any(|e| {
-        matches!(
-            &e.kind,
-            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path, .. })
-                if *inode == inode_ref && existing_path == &path
-        )
-    });
+    let events = index.events_for_command(command);
+    let already = if device.is_some() {
+        // L4b - only the latest Unlink at this path counts, and only if
+        // no DeviceNodeMeta follows it yet: after inode reuse an earlier
+        // removal's Unlink is not this one.
+        latest_unclaimed_unlink(&events, &path) == Some(inode_ref)
+    } else {
+        events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: existing_path, .. })
+                    if *inode == inode_ref && existing_path == &path
+            )
+        })
+    };
     // L4b - the shim may already have journaled this removal with the
     // same identity (its pre-call lstat). The Unlink is then not repeated,
     // but the device capture is still journaled, after it, so the two
@@ -1635,6 +1643,26 @@ fn journal_unlink_with_device(
         })?;
     }
     Ok(())
+}
+
+/// The inode of the latest `Unlink` at `path` in journal order, when no
+/// `DeviceNodeMeta` for that path follows it.
+fn latest_unclaimed_unlink(events: &[CaptureEvent], path: &std::path::Path) -> Option<InodeRef> {
+    let mut ordered: Vec<&CaptureEvent> = events.iter().collect();
+    ordered.sort_by_key(|e| (e.ts, e.id));
+    let mut latest = None;
+    for e in ordered {
+        match &e.kind {
+            CaptureEventKind::TreeOp(TreeOp::Unlink { inode, path: p, .. }) if p == path => {
+                latest = Some(*inode);
+            }
+            CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { path: p, .. }) if p == path => {
+                latest = None;
+            }
+            _ => {}
+        }
+    }
+    latest
 }
 
 fn put_unlink(
@@ -2026,6 +2054,56 @@ mod tests_dispatch {
             })
             .collect();
         assert_eq!(kinds, vec!["unlink", "meta"], "{events:#?}");
+    }
+
+    /// Review item 5: the node is removed, a new one gets the same inode
+    /// number, and it is removed too. The second removal's Unlink must be
+    /// journaled before its meta, not skipped because of the first.
+    #[test]
+    fn second_removal_after_inode_reuse_journals_its_own_unlink() {
+        use shit_planner::PlannerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(6),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let inode = InodeRef::new(0x803, 77);
+        let path = PathBuf::from("/w/null");
+        let kind = shit_planner::metadata::FileKind::CharDevice;
+        let device = |rdev| DeviceCapture {
+            rdev,
+            mode: 0o020640,
+            uid: 1,
+            gid: 1,
+            token: shit_planner::CaptureToken {
+                helper: [1; 16],
+                mac: [2; 32],
+            },
+        };
+        for (t, rdev) in [(2, 0x103), (3, 0x105)] {
+            journal_unlink_with_device(
+                &index,
+                cmd,
+                shit_planner::TimePoint::new(t, 0),
+                inode,
+                path.clone(),
+                kind,
+                0o020640,
+                Some(device(rdev)),
+            )
+            .unwrap();
+        }
+        let kinds: Vec<&str> = index
+            .events_for_command(cmd)
+            .iter()
+            .map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Unlink { .. }) => "unlink",
+                CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { .. }) => "meta",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["unlink", "meta", "unlink", "meta"]);
     }
 
     fn index_with_command(dir: &Path, cmd: CommandId) -> Index {
