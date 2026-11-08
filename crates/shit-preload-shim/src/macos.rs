@@ -217,7 +217,8 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
 }
 
 /// Replacement for `rmdir(2)` (L5). `shutil.rmtree` removes its top
-/// directory this way; notify while the directory still exists.
+/// directory this way. Notified only after it succeeded, with the stat
+/// taken before the call (a refused rmdir removed nothing).
 ///
 /// # Safety
 /// Same contract as `libc::rmdir`.
@@ -1680,7 +1681,7 @@ mod rename_wire_tests {
     }
 
     #[test]
-    fn rmdir_notifies_before_the_directory_goes() {
+    fn rmdir_notifies_after_it_succeeds_with_its_pre_call_stat() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().canonicalize().unwrap();
         std::fs::create_dir(dir.join("d")).unwrap();
@@ -1690,6 +1691,7 @@ mod rename_wire_tests {
         });
         let n = notes.iter().find(|n| n.syscall == "rmdir").expect("rmdir");
         assert_eq!(n.arg, dir.join("d").to_str().unwrap());
+        assert!(n.pre_stat.is_some_and(|s| s.mode & 0o170000 == 0o040000));
         assert!(!dir.join("d").exists());
     }
 }
