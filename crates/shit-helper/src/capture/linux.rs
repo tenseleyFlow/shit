@@ -51,8 +51,30 @@ use std::sync::Arc;
 use shit_planner::events::CommandId;
 use shit_proto::HelperResponse;
 
+use crate::capture::accounting::{CloseAccounting, Id, send_observations};
 use crate::capture::streaming::{STREAM_COPY_CAP, StreamError, stream_copy_to_staging_path};
 use crate::ipc::Conn;
+
+/// `FMODE_CREATED` from `include/linux/fs.h` (`1 << 20` since 4.19). A
+/// macro, so not in BTF. The helper checks it with a probe at start
+/// (`main.rs`) and ignores the bit if the probe fails.
+pub const FMODE_CREATED: u32 = 1 << 20;
+
+/// Judge the `FMODE_CREATED` probe. `seen` holds the helper's own open
+/// events in ring order as `(kernel dev, inode, f_mode)`; `target` is the
+/// probe file's userspace identity. The probe creates the file with one
+/// open and reopens it with another, so the bit must be set on the first
+/// and clear on every later one.
+pub fn fmode_created_probe_passed(seen: &[(u64, u64, u32)], target: Id) -> bool {
+    let modes: Vec<u32> = seen
+        .iter()
+        .filter(|(dev, ino, _)| (kernel_dev_to_userspace(*dev), *ino) == target)
+        .map(|&(_, _, mode)| mode)
+        .collect();
+    modes.len() >= 2
+        && modes[0] & FMODE_CREATED != 0
+        && modes[1..].iter().all(|m| m & FMODE_CREATED == 0)
+}
 
 /// Bounded pre-image read size. Larger files ALLOW without capture
 /// and log `partial=true` on the event.
@@ -159,6 +181,9 @@ struct WatchState {
     /// write returned Err) — NOT dedupe-skips or other intentional
     /// short-circuits.
     silent_send_failures: u32,
+    /// R3 slice B — baseline, born set and uncaptured mutations. Read
+    /// at `on_unwatch_tree`, which sends one observation per loss.
+    acct: CloseAccounting,
 }
 
 impl WatchState {
@@ -195,6 +220,15 @@ const PRE_OPEN_TREE_MAX_FILES: usize = 512;
 struct PreSnapshot {
     meta: StatMeta,
     bytes: Vec<u8>,
+    /// blake3 of `bytes`, computed once when the snapshot is taken.
+    hash: [u8; 32],
+}
+
+impl PreSnapshot {
+    fn new(meta: StatMeta, bytes: Vec<u8>) -> Self {
+        let hash = blake3_of(&bytes);
+        Self { meta, bytes, hash }
+    }
 }
 
 /// AR01.3 follow-up: queued create event waiting for its parent dir
@@ -250,6 +284,10 @@ pub struct LinuxCaptureRuntime {
     watches: BTreeMap<CommandId, WatchState>,
     conn: Arc<Conn>,
     staging_dir: PathBuf,
+    /// The start-up probe saw `FMODE_CREATED` set on a creating open
+    /// and clear on a plain one. Until then the bit is ignored and
+    /// birth is proven only by a create stat or a walked parent.
+    fmode_created_trusted: bool,
 }
 
 impl LinuxCaptureRuntime {
@@ -259,7 +297,90 @@ impl LinuxCaptureRuntime {
             watches: BTreeMap::new(),
             conn,
             staging_dir,
+            fmode_created_trusted: false,
         })
+    }
+
+    /// Record the `FMODE_CREATED` probe result.
+    pub fn set_fmode_created_trusted(&mut self, trusted: bool) {
+        self.fmode_created_trusted = trusted;
+    }
+
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging_dir
+    }
+
+    /// Remember a tier-wide loss counter's value at watch start, so the
+    /// close can report drops that happened while the command ran.
+    pub fn mark_kernel_losses(&mut self, command: CommandId, label: &'static str, value: u64) {
+        self.watches
+            .entry(command)
+            .or_default()
+            .acct
+            .mark_kernel_losses(label, value);
+    }
+
+    /// Fanotify baseline: the cwd's direct children, which is all the
+    /// per-command mark covers. Subdirectories are reported as not
+    /// covered, since writes inside them never reach the helper.
+    pub fn note_direct_children_baseline(&mut self, command: CommandId, cwd: &Path) {
+        let ws = self.watches.entry(command).or_default();
+        ws.cwd = Some(cwd.to_path_buf());
+        let Ok(root) = std::fs::metadata(cwd) else {
+            return;
+        };
+        ws.acct.note_tree_dev(root.dev());
+        ws.acct.note_root(cwd);
+        // The listing ran even if it fails, so a failure makes the walk
+        // incomplete rather than absent.
+        ws.acct.note_walked();
+        let root_id = (root.dev(), root.ino());
+        let Ok(read) = std::fs::read_dir(cwd) else {
+            ws.acct.note_unwalked_dir(root_id);
+            return;
+        };
+        let mut subdirs = 0usize;
+        let mut complete = true;
+        for ent in read {
+            let Ok(ent) = ent else {
+                complete = false;
+                continue;
+            };
+            let path = ent.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                complete = false;
+                continue;
+            };
+            ws.acct.note_baseline_entry((meta.dev(), meta.ino()), &path);
+            if meta.is_dir() {
+                subdirs += 1;
+            }
+        }
+        if !complete {
+            ws.acct.note_unwalked_dir(root_id);
+        }
+        if subdirs > 0 {
+            ws.acct.note_uncovered(format!(
+                "fanotify marks cover only direct children of {}; {subdirs} subdirector{} not watched",
+                cwd.display(),
+                if subdirs == 1 { "y is" } else { "ies are" }
+            ));
+        }
+    }
+
+    /// True when `path` is a direct child of the cwd and the cwd listing
+    /// taken at WatchTree stat'd every entry.
+    fn fanotify_parent_walked(ws: &WatchState, path: Option<&Path>) -> bool {
+        match (path.and_then(Path::parent), ws.cwd.as_deref()) {
+            (Some(parent), Some(cwd)) => parent == cwd && ws.acct.listing_complete(),
+            _ => false,
+        }
+    }
+
+    /// True when `parent` was listed completely by the walk or was
+    /// created inside the command.
+    fn lsm_parent_walked(ws: &WatchState, parent: Id) -> bool {
+        ws.dir_paths.contains_key(&parent) && ws.acct.dir_walked(parent)
     }
 
     /// Begin watching for events from descendants of a command's
@@ -281,6 +402,13 @@ impl LinuxCaptureRuntime {
     /// investigate the lost mkdir) and drop them with the rest of
     /// the WatchState.
     pub fn on_unwatch_tree(&mut self, command: CommandId) {
+        self.on_unwatch_tree_counting(command, None);
+    }
+
+    /// [`Self::on_unwatch_tree`], given the current value of the counter
+    /// passed to [`Self::mark_kernel_losses`]. Loss observations go out
+    /// here, before the caller sends `UnwatchTreeFlushed`.
+    pub fn on_unwatch_tree_counting(&mut self, command: CommandId, kernel_losses_now: Option<u64>) {
         if let Some(ws) = self.watches.get(&command) {
             let pending = ws.pending_creates.values().map(|v| v.len()).sum::<usize>();
             if pending > 0 {
@@ -310,7 +438,10 @@ impl LinuxCaptureRuntime {
                 );
             }
         }
-        self.watches.remove(&command);
+        if let Some(ws) = self.watches.remove(&command) {
+            let observations = ws.acct.close(ws.silent_send_failures, kernel_losses_now);
+            send_observations(&self.conn, command, observations);
+        }
     }
 
     /// L04 — open every regular file under `cwd` and stash the
@@ -368,10 +499,25 @@ impl LinuxCaptureRuntime {
             }
         };
         ws.dir_paths.insert(root_dev_inode, cwd.to_path_buf());
+        ws.acct.note_baseline_entry(root_dev_inode, cwd);
+        ws.acct.note_root(cwd);
+        ws.acct.note_tree_dev(root_dev_inode.0);
+        ws.acct.note_walked();
 
         let mut opened = 0usize;
         let mut hit_cap = false;
-        pre_open_recurse(ws, cwd, root_dev_inode.0, 0, &mut opened, &mut hit_cap);
+        pre_open_recurse(
+            ws,
+            cwd,
+            root_dev_inode,
+            root_dev_inode.0,
+            0,
+            &mut opened,
+            &mut hit_cap,
+        );
+        if hit_cap {
+            ws.acct.note_capped();
+        }
 
         tracing::info!(
             session = %command.session,
@@ -415,6 +561,8 @@ impl LinuxCaptureRuntime {
             Some(t) => t,
             None => {
                 tracing::warn!(fd = ev.fd, "fstat failed; skipping capture");
+                ws.acct
+                    .note_unkeyed("fanotify event fd could not be identified (fstat failed)");
                 return;
             }
         };
@@ -433,10 +581,25 @@ impl LinuxCaptureRuntime {
             return;
         }
 
+        // R3 slice B — a capture failure is loss unless the file was
+        // born in the command. fanotify has no create event; a file
+        // absent from the cwd listing taken at WatchTree was born.
+        let note_missing = |ws: &mut WatchState, detail: String| {
+            let path = path_for_kernel_fd(ev.fd);
+            let parent_walked = Self::fanotify_parent_walked(ws, path.as_deref());
+            ws.acct.note_missing(
+                (dev, inode),
+                parent_walked,
+                path.as_deref().map(path_to_string),
+                detail,
+            );
+        };
+
         let bytes = match read_pre_image(ev.fd) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(fd = ev.fd, error = %e, "pre-image read failed");
+                note_missing(ws, format!("pre-image read failed: {e}"));
                 return;
             }
         };
@@ -444,6 +607,7 @@ impl LinuxCaptureRuntime {
             Some(m) => m,
             None => {
                 tracing::warn!(fd = ev.fd, "fstat_meta failed");
+                note_missing(ws, "pre-image metadata could not be read".to_string());
                 return;
             }
         };
@@ -452,6 +616,7 @@ impl LinuxCaptureRuntime {
             Ok(fd) => fd,
             Err(e) => {
                 tracing::warn!(error = %e, "staging write failed");
+                note_missing(ws, format!("pre-image staging failed: {e}"));
                 return;
             }
         };
@@ -490,6 +655,8 @@ impl LinuxCaptureRuntime {
         {
             tracing::warn!(error = %e, "send_response_with_fd failed");
             ws.note_silent_send_failure();
+        } else {
+            ws.acct.note_captured((dev, inode));
         }
 
         ws.dedupe.insert(
@@ -587,8 +754,18 @@ impl LinuxCaptureRuntime {
                 basename = ev.basename,
                 "lsm unlink: parent_inode not in dir_paths; dropping event"
             );
+            ws.acct.note_missing(
+                (ev_dev_userspace, ev.inode),
+                false,
+                None,
+                format!(
+                    "unlink of {:?} was dropped: its parent directory could not be resolved",
+                    ev.basename
+                ),
+            );
             return;
         };
+        let parent_walked = Self::lsm_parent_walked(ws, (ev_dev_userspace, ev.parent_inode));
 
         // Look up pre-opened fd for this (dev, inode). The fd was
         // grabbed at WatchTree time by `pre_open_tree`. Even after
@@ -812,9 +989,38 @@ impl LinuxCaptureRuntime {
         } else {
             self.conn.send_response(&resp)
         };
+        // Bytes for a regular file, metadata for a directory, FIFO or
+        // socket. A marker carries neither.
+        let evidence = staging_fd.is_some() || meta_wire.is_some();
         if let Err(e) = send_result {
             tracing::warn!(error = %e, "lsm send_response failed");
             ws.note_silent_send_failure();
+        } else if evidence {
+            // Bytes that hash the same as the pre-command snapshot are
+            // the pre-image whatever the command did to the file in
+            // between; otherwise they count only if it never wrote it.
+            let matches_snapshot = staging_fd.is_some()
+                && ws
+                    .pre_snapshots
+                    .get(&(ev_dev_userspace, ev.inode))
+                    .is_some_and(|snap| snap.hash == blob_hash);
+            if matches_snapshot {
+                ws.acct.note_captured((ev_dev_userspace, ev.inode));
+            } else {
+                ws.acct.note_delete_captured((ev_dev_userspace, ev.inode));
+            }
+        }
+        if !evidence {
+            ws.acct.note_missing(
+                (ev_dev_userspace, ev.inode),
+                parent_walked,
+                Some(resolved_path.clone()),
+                if race_won {
+                    "deleted entry's pre-image could not be read".to_string()
+                } else {
+                    "deleted entry was gone before its pre-image could be read".to_string()
+                },
+            );
         }
 
         // (Dedupe already invalidated up-front at handler entry, so
@@ -854,6 +1060,7 @@ impl LinuxCaptureRuntime {
         let ws = self.watches.entry(ev.command).or_default();
 
         let ev_dev_userspace = kernel_dev_to_userspace(ev.dev);
+        ws.acct.note_written((ev_dev_userspace, ev.inode));
 
         // Dedupe — first capture per (dev, inode) wins. Important
         // for the open(O_WRONLY|O_TRUNC) path: file_open LSM fires
@@ -902,14 +1109,27 @@ impl LinuxCaptureRuntime {
                 (ev_dev_userspace, ev.inode),
                 DedupeEntry { invalidated: false },
             );
+            let path = resolve_inode_to_path(ws, ev_dev_userspace, ev.inode);
+            ws.acct.note_missing(
+                (ev_dev_userspace, ev.inode),
+                false,
+                path.as_deref().map(path_to_string),
+                "attribute change had no pre-change snapshot",
+            );
             return;
         };
+        let blob_hash = snap.hash;
         let bytes = snap.bytes;
-        let blob_hash = blake3_of(&bytes);
         let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "lsm setattr staging write failed");
+                ws.acct.note_missing(
+                    (ev_dev_userspace, ev.inode),
+                    false,
+                    None,
+                    format!("attribute change pre-image staging failed: {e}"),
+                );
                 return;
             }
         };
@@ -934,6 +1154,12 @@ impl LinuxCaptureRuntime {
                     dev = ev_dev_userspace,
                     inode = ev.inode,
                     "lsm setattr: path resolution failed (pre_opens fd + path_to_inode reverse both miss); dropping event"
+                );
+                ws.acct.note_missing(
+                    (ev_dev_userspace, ev.inode),
+                    false,
+                    None,
+                    "attribute change was dropped: path could not be resolved",
                 );
                 return;
             }
@@ -980,6 +1206,8 @@ impl LinuxCaptureRuntime {
         {
             tracing::warn!(error = %e, "lsm setattr send_response_with_fd failed");
             ws.note_silent_send_failure();
+        } else {
+            ws.acct.note_captured((ev_dev_userspace, ev.inode));
         }
 
         ws.dedupe.insert(
@@ -1095,6 +1323,7 @@ impl LinuxCaptureRuntime {
         // drain here ensures every create still gets a TreeOpCreate
         // journaled.
         let drained = if dev != 0 {
+            ws.acct.note_born((dev, inode));
             ws.dir_paths.insert((dev, inode), resolved_dir.clone());
             ws.pending_creates.remove(&(dev, inode)).unwrap_or_default()
         } else {
@@ -1250,7 +1479,22 @@ impl LinuxCaptureRuntime {
         // succeeds on a symlink, where the old O_RDONLY open failed with
         // ELOOP; a symlink, any other unheld kind, and a failed open all
         // take the marker branch, as before.
-        let held = open_held_nofollow(&resolved_path).ok();
+        let held = match open_held_nofollow(&resolved_path) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                // R3 slice B — the create hook fired and the entry is
+                // already gone: it was created and removed inside the
+                // command. Removing it again needs no pre-image.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    self.watches
+                        .entry(command)
+                        .or_default()
+                        .acct
+                        .note_born_path(path_to_string(&resolved_path));
+                }
+                None
+            }
+        };
         let held_stat = held
             .as_ref()
             .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()));
@@ -1339,6 +1583,9 @@ impl LinuxCaptureRuntime {
         // handlers for inode=0 won't hit the snapshot cache anyway.
         if let Some(f) = opened {
             let ws = self.watches.entry(command).or_default();
+            // R3 slice B — the create hook fired for this name, and the
+            // stat that followed found this identity there.
+            ws.acct.note_born((dev, inode));
             let fd_raw = f.as_raw_fd();
             // AU29 — only read content bytes for regular files.
             // FIFOs/Sockets have no bytes; read_pre_image would
@@ -1349,7 +1596,7 @@ impl LinuxCaptureRuntime {
                 && let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw))
             {
                 ws.pre_snapshots
-                    .insert((dev, inode), PreSnapshot { meta, bytes });
+                    .insert((dev, inode), PreSnapshot::new(meta, bytes));
             }
             ws.pre_opens.insert((dev, inode), f);
             // AR01.1.fix-rename-target-preimage — reverse-index so a
@@ -1399,6 +1646,16 @@ impl LinuxCaptureRuntime {
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
 
+        // R3 slice B — the kernel sets FMODE_CREATED when this open
+        // created the inode, so birth and identity arrive together. A
+        // file created this way needs no pre-image, whatever the order
+        // in which the other readers deliver its events.
+        let created_now = self.fmode_created_trusted && ev.f_mode & FMODE_CREATED != 0;
+        if created_now {
+            ws.acct.note_born((ev_dev, ev.inode));
+        }
+        ws.acct.note_written((ev_dev, ev.inode));
+
         // Dedupe: first write-open per (dev, inode) per watch window.
         if !should_capture_dedupe(&ws.dedupe, (ev_dev, ev.inode)) {
             tracing::trace!(
@@ -1421,15 +1678,32 @@ impl LinuxCaptureRuntime {
                 inode = ev.inode,
                 "lsm open: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
             );
+            if !created_now {
+                let path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+                ws.acct.note_missing(
+                    (ev_dev, ev.inode),
+                    false,
+                    path.as_deref().map(path_to_string),
+                    "write-open had no pre-mutation snapshot",
+                );
+            }
             return;
         };
+        let blob_hash = snap.hash;
         let bytes = snap.bytes;
         let meta = snap.meta;
-        let blob_hash = blake3_of(&bytes);
         let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "lsm open staging write failed");
+                if !created_now {
+                    ws.acct.note_missing(
+                        (ev_dev, ev.inode),
+                        false,
+                        None,
+                        format!("write-open pre-image staging failed: {e}"),
+                    );
+                }
                 return;
             }
         };
@@ -1444,6 +1718,14 @@ impl LinuxCaptureRuntime {
                     inode = ev.inode,
                     "lsm open: path resolution failed; dropping event"
                 );
+                if !created_now {
+                    ws.acct.note_missing(
+                        (ev_dev, ev.inode),
+                        false,
+                        None,
+                        "write-open was dropped: path could not be resolved",
+                    );
+                }
                 return;
             }
         };
@@ -1481,6 +1763,8 @@ impl LinuxCaptureRuntime {
         {
             tracing::warn!(error = %e, "lsm open send_response_with_fd failed");
             ws.note_silent_send_failure();
+        } else {
+            ws.acct.note_captured((ev_dev, ev.inode));
         }
 
         ws.dedupe
@@ -1523,6 +1807,7 @@ impl LinuxCaptureRuntime {
         let ws = self.watches.entry(ev.command).or_default();
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
+        ws.acct.note_written((ev_dev, ev.inode));
 
         // Dedupe: another LSM handler may have already captured
         // for this (dev, inode) in this watch window. First handler
@@ -1547,6 +1832,13 @@ impl LinuxCaptureRuntime {
                 inode = ev.inode,
                 "lsm release: no pre-snapshot; dropping"
             );
+            let path = resolve_inode_to_path(ws, ev_dev, ev.inode);
+            ws.acct.note_missing(
+                (ev_dev, ev.inode),
+                false,
+                path.as_deref().map(path_to_string),
+                "written file had no pre-mutation snapshot",
+            );
             return;
         };
 
@@ -1557,6 +1849,12 @@ impl LinuxCaptureRuntime {
                 dev = ev_dev,
                 inode = ev.inode,
                 "lsm release: pre-snapshot present but no held fd; dropping"
+            );
+            ws.acct.note_missing(
+                (ev_dev, ev.inode),
+                false,
+                None,
+                "written file's post-write content could not be compared",
             );
             return;
         };
@@ -1573,10 +1871,16 @@ impl LinuxCaptureRuntime {
                     error = %e,
                     "lsm release: read_pre_image failed; dropping"
                 );
+                ws.acct.note_missing(
+                    (ev_dev, ev.inode),
+                    false,
+                    None,
+                    format!("written file's post-write content could not be read: {e}"),
+                );
                 return;
             }
         };
-        let pre_hash = blake3_of(&snap.bytes);
+        let pre_hash = snap.hash;
         let post_hash = blake3_of(&current_bytes);
         if pre_hash == post_hash {
             tracing::trace!(
@@ -1595,6 +1899,12 @@ impl LinuxCaptureRuntime {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "lsm release staging write failed");
+                ws.acct.note_missing(
+                    (ev_dev, ev.inode),
+                    false,
+                    None,
+                    format!("written file's pre-image staging failed: {e}"),
+                );
                 return;
             }
         };
@@ -1606,6 +1916,12 @@ impl LinuxCaptureRuntime {
                     dev = ev_dev,
                     inode = ev.inode,
                     "lsm release: path resolution failed; dropping event"
+                );
+                ws.acct.note_missing(
+                    (ev_dev, ev.inode),
+                    false,
+                    None,
+                    "written file was dropped: path could not be resolved",
                 );
                 return;
             }
@@ -1638,6 +1954,8 @@ impl LinuxCaptureRuntime {
         {
             tracing::warn!(error = %e, "lsm release send_response_with_fd failed");
             ws.note_silent_send_failure();
+        } else {
+            ws.acct.note_captured((ev_dev, ev.inode));
         }
 
         ws.dedupe
@@ -1665,6 +1983,9 @@ impl LinuxCaptureRuntime {
         let ws = self.watches.entry(ev.command).or_default();
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
+        let moved = (ev_dev, ev.inode);
+        let to_resolved =
+            resolve_via_parent(&ws.dir_paths, ev_dev, ev.new_parent_inode, ev.new_basename);
 
         // AR01.1.fix-path-via-parent-inode — resolve strictly via the
         // dir map. Rename can't cross filesystems, so both parents
@@ -1679,16 +2000,29 @@ impl LinuxCaptureRuntime {
                 basename = ev.old_basename,
                 "lsm rename: old_parent_inode not in dir_paths; dropping event"
             );
+            // R3 slice B — the event is dropped, so a pre-existing
+            // destination it replaced has no pre-image either, and the
+            // moved entry may be a pre-existing file the walk never saw.
+            ws.acct.note_unresolved_rename();
+            if let Some(to) = to_resolved.as_deref() {
+                ws.acct.note_rename_target(to.to_string());
+                note_replaced_without_capture(ws, Path::new(to), moved);
+            }
             return;
         };
-        let Some(to_path) =
-            resolve_via_parent(&ws.dir_paths, ev_dev, ev.new_parent_inode, ev.new_basename)
-        else {
+        let Some(to_path) = to_resolved else {
             tracing::warn!(
                 pid = ev.pid,
                 new_parent_inode = ev.new_parent_inode,
                 basename = ev.new_basename,
                 "lsm rename: new_parent_inode not in dir_paths; dropping event"
+            );
+            ws.acct.note_unresolved_rename();
+            ws.acct.note_missing(
+                moved,
+                false,
+                Some(from_path.clone()),
+                "entry was renamed to a path outside the watched tree",
             );
             return;
         };
@@ -1708,13 +2042,16 @@ impl LinuxCaptureRuntime {
         // No-clobber renames (creating a fresh name) miss in
         // path_to_inode; that's the correct behavior -- nothing to
         // capture.
+        ws.acct.note_rename_target(to_path.clone());
         let to_path_buf = PathBuf::from(&to_path);
+        let mut dest_handled = false;
         if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path_buf)
             && let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned()
         {
+            dest_handled = true;
+            let blob_hash = snap.hash;
             let bytes = snap.bytes;
             let meta = snap.meta;
-            let blob_hash = blake3_of(&bytes);
             match write_to_staging(&self.staging_dir, &bytes) {
                 Ok(staging_fd) => {
                     let resp = HelperResponse::CapturedPreImage {
@@ -1749,6 +2086,7 @@ impl LinuxCaptureRuntime {
                         tracing::warn!(error = %e, "lsm rename target-pre-image send_response_with_fd failed");
                         ws.note_silent_send_failure();
                     } else {
+                        ws.acct.note_captured((old_dev, old_inode));
                         tracing::info!(
                             session = %ev.command.session,
                             seq = ev.command.seq,
@@ -1763,8 +2101,44 @@ impl LinuxCaptureRuntime {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "lsm rename target staging write failed");
+                    ws.acct.note_missing(
+                        (old_dev, old_inode),
+                        false,
+                        Some(to_path.clone()),
+                        format!("rename-replaced file's pre-image staging failed: {e}"),
+                    );
                 }
             }
+        }
+        if !dest_handled {
+            note_replaced_without_capture(ws, &to_path_buf, moved);
+        }
+        // R3 slice B — the name now holds the moved entry. Without this a
+        // later rename onto `from` (an editor's `mv f f~; mv tmp f`)
+        // would take the moved file for the one being replaced.
+        let from_path_buf = PathBuf::from(&from_path);
+        ws.path_to_inode.remove(&from_path_buf);
+        ws.path_to_inode.insert(to_path_buf.clone(), moved);
+        ws.acct.note_renamed(&from_path_buf, &to_path_buf, moved);
+        // A directory takes its subtree with it: re-key everything under
+        // the old path, or later events resolve children to where they
+        // were and `mv d e; mkdir d; mv tmp d/f` takes old f for the
+        // file being replaced at d/f.
+        if let Some(dir) = ws.dir_paths.get_mut(&moved) {
+            *dir = to_path_buf.clone();
+            for path in ws.dir_paths.values_mut() {
+                if path.as_path() != from_path_buf.as_path()
+                    && let Ok(rest) = path.strip_prefix(&from_path_buf)
+                {
+                    *path = to_path_buf.join(rest);
+                }
+            }
+            crate::capture::accounting::rekey_under(
+                &mut ws.path_to_inode,
+                &from_path_buf,
+                &to_path_buf,
+            );
+            ws.acct.note_dir_renamed(&from_path_buf, &to_path_buf);
         }
 
         let resp = HelperResponse::TreeMutation {
@@ -1796,6 +2170,26 @@ impl LinuxCaptureRuntime {
     }
 }
 
+/// R3 slice B — a rename onto `to` replaced whatever was there, and no
+/// snapshot of it was sent. Loss if that was a pre-existing entry.
+fn note_replaced_without_capture(ws: &mut WatchState, to: &Path, moved: Id) {
+    let old = ws
+        .path_to_inode
+        .get(to)
+        .copied()
+        .or_else(|| ws.acct.baseline_id_at(to));
+    if let Some(old) = old
+        && old != moved
+    {
+        ws.acct.note_missing(
+            old,
+            false,
+            Some(path_to_string(to)),
+            "rename replaced an entry that had no pre-image snapshot",
+        );
+    }
+}
+
 /// AR01.1.fix-pre-open-tree-recursion — recurse `pre_open_tree` into
 /// subdirectories. Caller passes the root's `dev` and we refuse to
 /// descend into entries on a different filesystem (cross-fs traversal
@@ -1803,38 +2197,56 @@ impl LinuxCaptureRuntime {
 /// repo containing a submodule's tmpfs mount). Symlinks are never
 /// followed; `O_NOFOLLOW` on the open ensures the file we snapshot
 /// is the one we statted.
+///
+/// R3 slice B: every entry's identity goes into the baseline, whether or
+/// not it can be opened, and a directory that is not listed completely
+/// (depth limit, read error, file cap) is recorded as unwalked, so an
+/// identity missing from it is not taken as proof of birth.
 fn pre_open_recurse(
     ws: &mut WatchState,
     dir: &Path,
+    dir_id: Id,
     root_dev: u64,
     depth: usize,
     opened: &mut usize,
     hit_cap: &mut bool,
 ) {
     if depth >= PRE_OPEN_TREE_DEPTH_LIMIT {
+        ws.acct.note_unwalked_dir(dir_id);
         return;
     }
     if *opened >= PRE_OPEN_TREE_MAX_FILES {
         *hit_cap = true;
+        ws.acct.note_unwalked_dir(dir_id);
         return;
     }
     let read = match std::fs::read_dir(dir) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), err = %e, "pre_open_tree: read_dir failed");
+            ws.acct.note_unwalked_dir(dir_id);
             return;
         }
     };
-    for ent in read.flatten() {
+    for ent in read {
         if *opened >= PRE_OPEN_TREE_MAX_FILES {
             *hit_cap = true;
+            ws.acct.note_unwalked_dir(dir_id);
             return;
         }
+        let Ok(ent) = ent else {
+            ws.acct.note_unwalked_dir(dir_id);
+            continue;
+        };
         let path = ent.path();
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                ws.acct.note_unwalked_dir(dir_id);
+                continue;
+            }
         };
+        ws.acct.note_baseline_entry((meta.dev(), meta.ino()), &path);
         let ft = meta.file_type();
         if ft.is_symlink() {
             continue;
@@ -1842,6 +2254,9 @@ fn pre_open_recurse(
         if ft.is_dir() {
             // Cross-fs guard: don't recurse into a submount.
             if meta.dev() != root_dev {
+                // Not walked, so nothing on that filesystem is located.
+                ws.acct.note_unwalked_dir((meta.dev(), meta.ino()));
+                ws.acct.note_tree_dev(meta.dev());
                 continue;
             }
             ws.dir_paths.insert((meta.dev(), meta.ino()), path.clone());
@@ -1865,7 +2280,15 @@ fn pre_open_recurse(
                 ws.path_to_inode
                     .insert(path.clone(), (meta.dev(), meta.ino()));
             }
-            pre_open_recurse(ws, &path, root_dev, depth + 1, opened, hit_cap);
+            pre_open_recurse(
+                ws,
+                &path,
+                (meta.dev(), meta.ino()),
+                root_dev,
+                depth + 1,
+                opened,
+                hit_cap,
+            );
             continue;
         }
         // AU29 — capture FIFOs and sockets with an O_PATH fd so
@@ -1914,7 +2337,7 @@ fn pre_open_recurse(
         };
         if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
             ws.pre_snapshots
-                .insert((dev, inode), PreSnapshot { meta, bytes });
+                .insert((dev, inode), PreSnapshot::new(meta, bytes));
         } else {
             tracing::trace!(
                 dev,
@@ -1936,7 +2359,7 @@ fn pre_open_recurse(
 /// `i_sb->s_dev` produce the former. Without the conversion, the
 /// dedupe map and pre_opens table key mismatch with values fstat
 /// returns elsewhere in the runtime.
-fn kernel_dev_to_userspace(kdev: u64) -> u64 {
+pub(crate) fn kernel_dev_to_userspace(kdev: u64) -> u64 {
     let major: u64 = kdev >> 20;
     let minor: u64 = kdev & 0xfffff;
     (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
@@ -2685,7 +3108,15 @@ mod tests {
 
         let mut opened = 0usize;
         let mut hit_cap = false;
-        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+        pre_open_recurse(
+            &mut ws,
+            root,
+            (root_dev, root_ino),
+            root_dev,
+            0,
+            &mut opened,
+            &mut hit_cap,
+        );
 
         assert!(!hit_cap, "should not have hit max-files cap");
         // 4 regular files were created; all should be snapshotted.
@@ -2907,7 +3338,16 @@ mod tests {
 
         let mut opened = 0usize;
         let mut hit_cap = false;
-        pre_open_recurse(&mut ws, root, root_dev, 0, &mut opened, &mut hit_cap);
+        let root_ino = std::fs::metadata(root).unwrap().ino();
+        pre_open_recurse(
+            &mut ws,
+            root,
+            (root_dev, root_ino),
+            root_dev,
+            0,
+            &mut opened,
+            &mut hit_cap,
+        );
 
         // Depth limit is 8; leaf.txt is at depth 10. Should not be opened.
         assert_eq!(
@@ -2966,10 +3406,7 @@ mod tests {
             .insert((root_md.dev(), root_md.ino()), dir.path().to_path_buf());
         ws.pre_snapshots.insert(
             (dev_userspace, inode),
-            PreSnapshot {
-                meta,
-                bytes: pre_bytes.to_vec(),
-            },
+            PreSnapshot::new(meta, pre_bytes.to_vec()),
         );
         ws.pre_opens
             .insert((dev_userspace, inode), OwnedFd::from(f));
@@ -3109,5 +3546,896 @@ mod tests {
             ws.dedupe.is_empty(),
             "no pre-snapshot must produce no dedupe entry"
         );
+    }
+}
+
+/// R3 slice B — the born-set rule at each loss site. Each test runs the
+/// handler against real files in a temp dir and reads what the close
+/// sends to the daemon end of a socketpair.
+#[cfg(test)]
+mod born_set_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    struct Rig {
+        rt: Option<LinuxCaptureRuntime>,
+        daemon: Conn,
+        dir: tempfile::TempDir,
+        _staging: tempfile::TempDir,
+        cmd: CommandId,
+    }
+
+    impl Rig {
+        fn new(setup: impl FnOnce(&Path)) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let staging = tempfile::tempdir().unwrap();
+            setup(dir.path());
+            let (helper, daemon) = crate::ipc::socketpair().expect("socketpair");
+            let mut rt =
+                LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+            rt.set_fmode_created_trusted(true);
+            let cmd = CommandId {
+                session: Uuid::from_u128(0xb0),
+                seq: 7,
+            };
+            rt.on_watch_tree(cmd);
+            rt.pre_open_tree(cmd, dir.path());
+            Self {
+                rt: Some(rt),
+                daemon,
+                dir,
+                _staging: staging,
+                cmd,
+            }
+        }
+
+        fn rt(&mut self) -> &mut LinuxCaptureRuntime {
+            self.rt.as_mut().unwrap()
+        }
+
+        fn root(&self) -> Id {
+            let m = std::fs::metadata(self.dir.path()).unwrap();
+            (m.dev(), m.ino())
+        }
+
+        fn id(path: &Path) -> Id {
+            let m = std::fs::symlink_metadata(path).unwrap();
+            (m.dev(), m.ino())
+        }
+
+        /// Close the watch and return every `CaptureRefused` sent.
+        fn close(mut self, kernel_now: Option<u64>) -> Vec<(Option<String>, String)> {
+            let cmd = self.cmd;
+            let mut rt = self.rt.take().unwrap();
+            rt.on_unwatch_tree_counting(cmd, kernel_now);
+            drop(rt);
+            let mut out = Vec::new();
+            while let Ok((resp, _fd)) = self.daemon.recv_response_with_fd() {
+                if let HelperResponse::CaptureRefused { path, detail, .. } = resp {
+                    out.push((path, detail));
+                }
+            }
+            out
+        }
+
+        fn open(&mut self, id: Id, created: bool) {
+            let view = LsmOpenView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                f_mode: 0x2 | if created { FMODE_CREATED } else { 0 },
+                f_flags: 0o1,
+            };
+            self.rt().handle_lsm_open(&view);
+        }
+
+        fn unlink(&mut self, id: Id, parent: Id, name: &str) {
+            let view = LsmUnlinkView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                parent_inode: parent.1,
+                basename: name,
+                is_directory: false,
+            };
+            self.rt().handle_lsm_unlink(&view);
+        }
+
+        fn create(&mut self, parent: Id, name: &str) {
+            let view = LsmCreateView {
+                command: self.cmd,
+                pid: 1,
+                parent_dev: userspace_to_kernel_dev(parent.0),
+                parent_inode: parent.1,
+                mode: 0o100644,
+                basename: name,
+            };
+            self.rt().handle_lsm_create(&view);
+        }
+
+        fn setattr(&mut self, id: Id) {
+            let view = LsmSetattrView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                attr_valid: 1,
+                old_mode: 0o100644,
+                old_uid: 0,
+                old_gid: 0,
+                old_size: 0,
+                new_mode: 0o100600,
+                new_uid: 0,
+                new_gid: 0,
+                new_size: 0,
+            };
+            self.rt().handle_lsm_setattr(&view);
+        }
+
+        fn release(&mut self, id: Id) {
+            let view = LsmReleaseView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                f_mode: 0x2,
+                f_flags: 0o1,
+            };
+            self.rt().handle_lsm_release(&view);
+        }
+
+        fn rename(&mut self, id: Id, from: (Id, &str), to: (Id, &str)) {
+            let view = LsmRenameView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                old_parent_inode: from.0.1,
+                new_parent_inode: to.0.1,
+                old_basename: from.1,
+                new_basename: to.1,
+            };
+            self.rt().handle_lsm_rename(&view);
+        }
+
+        fn drop_snapshot(&mut self, id: Id) {
+            let cmd = self.cmd;
+            self.rt()
+                .watches
+                .get_mut(&cmd)
+                .unwrap()
+                .pre_snapshots
+                .remove(&id);
+        }
+    }
+
+    fn userspace_to_kernel_dev(udev: u64) -> u64 {
+        let major = ((udev >> 8) & 0xfff) | ((udev >> 32) & !0xfff);
+        let minor = (udev & 0xff) | ((udev >> 12) & !0xff);
+        (major << 20) | minor
+    }
+
+    #[test]
+    fn git_lock_file_dance_reports_nothing() {
+        // `git config`: create config.lock, write, rename over config.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("config"), b"[core]\n").unwrap());
+        let root = rig.root();
+        let lock = rig.dir.path().join("config.lock");
+        std::fs::write(&lock, b"[core]\n\tbare = false\n").unwrap();
+        let lock_id = Rig::id(&lock);
+        // Readers deliver out of order: rename first, then open, then
+        // the create, whose stat now misses because the name is gone.
+        std::fs::rename(&lock, rig.dir.path().join("config")).unwrap();
+        rig.rename(lock_id, (root, "config.lock"), (root, "config"));
+        rig.open(lock_id, true);
+        rig.release(lock_id);
+        rig.setattr(lock_id);
+        rig.create(root, "config.lock");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn unlink_handled_before_create_is_still_born() {
+        let mut rig = Rig::new(|_| {});
+        let root = rig.root();
+        let tmp = rig.dir.path().join("tmp_obj_x");
+        std::fs::write(&tmp, b"x").unwrap();
+        let id = Rig::id(&tmp);
+        std::fs::remove_file(&tmp).unwrap();
+        rig.unlink(id, root, "tmp_obj_x");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn creating_open_without_snapshot_is_born() {
+        let mut rig = Rig::new(|_| {});
+        let f = rig.dir.path().join("new");
+        std::fs::write(&f, b"").unwrap();
+        let id = Rig::id(&f);
+        rig.open(id, true);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn baseline_write_without_snapshot_is_loss() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("big"), b"pretend large").unwrap());
+        let id = Rig::id(&rig.dir.path().join("big"));
+        rig.drop_snapshot(id);
+        rig.open(id, false);
+        rig.release(id);
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].0.as_deref().unwrap().ends_with("/big"), "{obs:?}");
+        assert!(obs[0].1.contains("no pre-mutation snapshot"), "{obs:?}");
+    }
+
+    #[test]
+    fn baseline_write_with_snapshot_is_not_loss() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("a"), b"before").unwrap());
+        let id = Rig::id(&rig.dir.path().join("a"));
+        rig.open(id, false);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn baseline_chmod_without_snapshot_is_loss() {
+        let mut rig = Rig::new(|d| std::fs::create_dir(d.join("sub")).unwrap());
+        let id = Rig::id(&rig.dir.path().join("sub"));
+        rig.setattr(id);
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("attribute change"), "{obs:?}");
+    }
+
+    #[test]
+    fn baseline_unlink_that_loses_the_race_is_loss() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("gone"), b"bytes").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("gone");
+        let id = Rig::id(&path);
+        let cmd = rig.cmd;
+        rig.rt()
+            .watches
+            .get_mut(&cmd)
+            .unwrap()
+            .pre_opens
+            .remove(&id);
+        std::fs::remove_file(&path).unwrap();
+        rig.unlink(id, root, "gone");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("gone before its pre-image"), "{obs:?}");
+    }
+
+    #[test]
+    fn baseline_unlink_with_held_fd_is_not_loss() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("kept"), b"bytes").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("kept");
+        let id = Rig::id(&path);
+        std::fs::remove_file(&path).unwrap();
+        rig.unlink(id, root, "kept");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn delete_capture_after_a_write_does_not_clear_the_write_loss() {
+        // `echo new > f; rm f` on a pre-existing file with no snapshot:
+        // the unlink reads the held fd, which now holds the new bytes.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("f");
+        let id = Rig::id(&path);
+        rig.drop_snapshot(id);
+        std::fs::write(&path, b"new").unwrap();
+        rig.open(id, false);
+        rig.release(id);
+        std::fs::remove_file(&path).unwrap();
+        rig.unlink(id, root, "f");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("no pre-mutation snapshot"), "{obs:?}");
+    }
+
+    #[test]
+    fn snapshot_hash_is_the_blake3_of_its_bytes() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"pre-existing").unwrap());
+        let id = Rig::id(&rig.dir.path().join("f"));
+        let cmd = rig.cmd;
+        let ws = rig.rt().watches.get(&cmd).unwrap();
+        let snap = &ws.pre_snapshots[&id];
+        assert_eq!(snap.hash, blake3_of(b"pre-existing"));
+    }
+
+    #[test]
+    fn unchanged_file_opened_for_write_then_deleted_is_not_loss() {
+        // `git branch -D`: a ref is opened for write, not changed, then
+        // removed. The unlink reader runs before the release reader, so
+        // the release finds no held fd to compare with. The unlink read
+        // the same bytes as the snapshot, so it holds the pre-image.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("ref"), b"sha\n").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("ref");
+        let id = Rig::id(&path);
+        // The open is deduped by an earlier capture in a real run; here
+        // the open is skipped and only the write intent is recorded.
+        let cmd = rig.cmd;
+        rig.rt()
+            .watches
+            .get_mut(&cmd)
+            .unwrap()
+            .acct
+            .note_written(id);
+        std::fs::remove_file(&path).unwrap();
+        rig.unlink(id, root, "ref");
+        rig.release(id);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn delete_capture_after_a_write_does_not_clear_the_loss_in_any_order() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let path = rig.dir.path().join("f");
+        let id = Rig::id(&path);
+        rig.drop_snapshot(id);
+        std::fs::write(&path, b"new").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // The unlink reader runs first, then the open reader.
+        rig.unlink(id, root, "f");
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn directory_rename_moves_its_children_in_every_map() {
+        // `mv d e; mkdir d; mv tmp d/f`. Old f now lives at e/f. The last
+        // rename creates d/f; it replaces nothing, so no pre-image of old
+        // f may be sent as deleted at d/f, and old f keeps its own state.
+        let mut rig = Rig::new(|d| {
+            std::fs::create_dir(d.join("d")).unwrap();
+            std::fs::write(d.join("d/f"), b"old f").unwrap();
+        });
+        let root = rig.root();
+        let d_old = Rig::id(&rig.dir.path().join("d"));
+        let f_id = Rig::id(&rig.dir.path().join("d/f"));
+        std::fs::rename(rig.dir.path().join("d"), rig.dir.path().join("e")).unwrap();
+        rig.rename(d_old, (root, "d"), (root, "e"));
+        std::fs::create_dir(rig.dir.path().join("d")).unwrap();
+        let cmd = rig.cmd;
+        let mkdir = LsmMkdirView {
+            command: cmd,
+            pid: 1,
+            parent_dev: userspace_to_kernel_dev(root.0),
+            parent_inode: root.1,
+            mode: 0o40755,
+            basename: "d",
+        };
+        rig.rt().handle_lsm_mkdir(&mkdir);
+        let d_new = Rig::id(&rig.dir.path().join("d"));
+        let tmp = rig.dir.path().join("tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let tmp_id = Rig::id(&tmp);
+        rig.create(root, "tmp");
+        std::fs::rename(&tmp, rig.dir.path().join("d/f")).unwrap();
+        rig.rename(tmp_id, (root, "tmp"), (d_new, "f"));
+        {
+            let e = rig.dir.path().join("e");
+            let ws = rig.rt.as_ref().unwrap().watches.get(&cmd).unwrap();
+            assert_eq!(
+                ws.path_to_inode.get(&e.join("f")),
+                Some(&f_id),
+                "old f must be indexed at its new path"
+            );
+            assert_eq!(
+                ws.dir_paths.get(&d_old),
+                Some(&e),
+                "the moved directory must resolve to its new path"
+            );
+        }
+        let mut rt = rig.rt.take().unwrap();
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        while let Ok((resp, _fd)) = rig.daemon.recv_response_with_fd() {
+            if let HelperResponse::CapturedPreImage {
+                is_delete: true,
+                inode,
+                path,
+                ..
+            } = resp
+            {
+                assert_ne!(inode, f_id.1, "old f was sent as replaced at {path:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn backup_then_replace_save_is_not_loss() {
+        // An editor's save: `mv f f~; mv tmp f`. f has no snapshot, but
+        // it is not replaced: it moved to f~ before tmp took its name.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let f = rig.dir.path().join("f");
+        let f_id = Rig::id(&f);
+        rig.drop_snapshot(f_id);
+        let tmp = rig.dir.path().join("tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let tmp_id = Rig::id(&tmp);
+        rig.create(root, "tmp");
+        rig.open(tmp_id, true);
+        std::fs::rename(&f, rig.dir.path().join("f~")).unwrap();
+        rig.rename(f_id, (root, "f"), (root, "f~"));
+        std::fs::rename(&tmp, &f).unwrap();
+        rig.rename(tmp_id, (root, "tmp"), (root, "f"));
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn rename_onto_a_moved_away_name_sends_no_target_pre_image() {
+        // Same save with a snapshot for f: the second rename must not
+        // send f's bytes as a pre-image deleted at f; f was not deleted.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let f = rig.dir.path().join("f");
+        let f_id = Rig::id(&f);
+        let tmp = rig.dir.path().join("tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let tmp_id = Rig::id(&tmp);
+        std::fs::rename(&f, rig.dir.path().join("f~")).unwrap();
+        rig.rename(f_id, (root, "f"), (root, "f~"));
+        std::fs::rename(&tmp, &f).unwrap();
+        rig.rename(tmp_id, (root, "tmp"), (root, "f"));
+        let cmd = rig.cmd;
+        let mut rt = rig.rt.take().unwrap();
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        let mut deleted_targets = Vec::new();
+        while let Ok((resp, _fd)) = rig.daemon.recv_response_with_fd() {
+            if let HelperResponse::CapturedPreImage {
+                is_delete: true,
+                inode,
+                ..
+            } = resp
+            {
+                deleted_targets.push(inode);
+            }
+        }
+        assert!(
+            !deleted_targets.contains(&f_id.1),
+            "f was moved, not replaced: {deleted_targets:?}"
+        );
+    }
+
+    #[test]
+    fn rename_over_unsnapshotted_baseline_entry_is_loss() {
+        let mut rig = Rig::new(|d| std::os::unix::fs::symlink("target", d.join("link")).unwrap());
+        let root = rig.root();
+        let new = rig.dir.path().join("new");
+        std::fs::write(&new, b"x").unwrap();
+        let new_id = Rig::id(&new);
+        std::fs::rename(&new, rig.dir.path().join("link")).unwrap();
+        rig.rename(new_id, (root, "new"), (root, "link"));
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].0.as_deref().unwrap().ends_with("/link"), "{obs:?}");
+    }
+
+    #[test]
+    fn rename_out_of_the_tree_loses_only_baseline_entries() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("a"), b"x").unwrap());
+        let root = rig.root();
+        let a = Rig::id(&rig.dir.path().join("a"));
+        let born = rig.dir.path().join("b");
+        std::fs::write(&born, b"y").unwrap();
+        let born_id = Rig::id(&born);
+        let elsewhere = (root.0, 999_999_999);
+        rig.open(born_id, true);
+        rig.rename(born_id, (root, "b"), (elsewhere, "b"));
+        rig.rename(a, (root, "a"), (elsewhere, "a"));
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("outside the watched tree"), "{obs:?}");
+    }
+
+    #[test]
+    fn writes_outside_a_complete_baseline_are_not_loss() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("a"), b"x").unwrap());
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let id = Rig::id(outside.path());
+        rig.open(id, false);
+        rig.setattr(id);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn unlocated_write_counts_when_a_directory_was_not_walked() {
+        // Deeper than PRE_OPEN_TREE_DEPTH_LIMIT: the deepest directory
+        // is recorded but not listed.
+        let mut rig = Rig::new(|d| {
+            let mut p = d.to_path_buf();
+            for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+                p = p.join(format!("d{i}"));
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("deep"), b"x").unwrap();
+        });
+        let mut deep = rig.dir.path().to_path_buf();
+        for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+            deep = deep.join(format!("d{i}"));
+        }
+        let id = Rig::id(&deep.join("deep"));
+        let parent = Rig::id(&deep);
+        rig.open(id, false);
+        // An unlink under the unwalked directory is not proof of birth.
+        let cmd = rig.cmd;
+        let parent_walked =
+            LinuxCaptureRuntime::lsm_parent_walked(rig.rt().watches.get(&cmd).unwrap(), parent);
+        assert!(!parent_walked);
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("not listed completely"), "{obs:?}");
+    }
+
+    /// A tree with a directory past the depth limit, plus `deep/x` inside
+    /// it. Returns the rig and the unwalked directory.
+    fn rig_with_unwalked_file() -> (Rig, PathBuf) {
+        let rig = Rig::new(|d| {
+            let mut p = d.to_path_buf();
+            for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+                p = p.join(format!("d{i}"));
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("x"), b"pre-existing, never walked").unwrap();
+        });
+        let mut deep = rig.dir.path().to_path_buf();
+        for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+            deep = deep.join(format!("d{i}"));
+        }
+        (rig, deep)
+    }
+
+    #[test]
+    fn file_moved_from_an_unwalked_directory_then_removed_is_not_born() {
+        // `mv deep/x x; rm x`: x existed, but the walk never reached it.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        std::fs::rename(deep.join("x"), rig.dir.path().join("x")).unwrap();
+        rig.rename(id, (deep_id, "x"), (root, "x"));
+        std::fs::remove_file(rig.dir.path().join("x")).unwrap();
+        rig.unlink(id, root, "x");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("could not be placed"), "{obs:?}");
+    }
+
+    #[test]
+    fn file_created_and_removed_before_the_create_handler_is_born() {
+        // `touch t; rm t` finished before the create reader ran: its stat
+        // gets ENOENT. The walk is incomplete, so absence proves nothing;
+        // the create event itself is the evidence.
+        let (mut rig, _deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let t = rig.dir.path().join("t");
+        std::fs::write(&t, b"").unwrap();
+        let id = Rig::id(&t);
+        std::fs::remove_file(&t).unwrap();
+        rig.create(root, "t");
+        rig.unlink(id, root, "t");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn unlink_handled_before_its_enoent_create_is_not_excused() {
+        // The narrow side of the ordering rule: a loss recorded before the
+        // create at its path may be the file that was there before it.
+        let (mut rig, _deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let t = rig.dir.path().join("t");
+        std::fs::write(&t, b"").unwrap();
+        let id = Rig::id(&t);
+        std::fs::remove_file(&t).unwrap();
+        rig.unlink(id, root, "t");
+        rig.create(root, "t");
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn create_enoent_does_not_hide_the_earlier_file_at_that_path() {
+        // `rm x; touch x; rm x` where the first x existed but was never
+        // walked. The create proves the second x was born, not the first.
+        // `last` is recorded in dir_paths (so events under it resolve) but
+        // past the depth limit, so its contents were never listed.
+        let mut rig = Rig::new(|d| {
+            let mut p = d.to_path_buf();
+            for i in 0..PRE_OPEN_TREE_DEPTH_LIMIT {
+                p = p.join(format!("d{i}"));
+            }
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("x"), b"pre-existing, never walked").unwrap();
+        });
+        let mut last = rig.dir.path().to_path_buf();
+        for i in 0..PRE_OPEN_TREE_DEPTH_LIMIT {
+            last = last.join(format!("d{i}"));
+        }
+        let last_id = Rig::id(&last);
+        let old = Rig::id(&last.join("x"));
+        std::fs::remove_file(last.join("x")).unwrap();
+        std::fs::write(last.join("x"), b"").unwrap();
+        let new = Rig::id(&last.join("x"));
+        std::fs::remove_file(last.join("x")).unwrap();
+        rig.unlink(old, last_id, "x");
+        rig.create(last_id, "x");
+        // If the inode number was reused, old == new: one identity, first
+        // recorded before the create, so the expectation is the same.
+        rig.unlink(new, last_id, "x");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.starts_with("1 changed file(s)"), "{obs:?}");
+    }
+
+    #[test]
+    fn create_enoent_does_not_bless_a_file_renamed_onto_the_name() {
+        let (mut rig, deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        rig.create(root, "x");
+        std::fs::rename(deep.join("x"), rig.dir.path().join("x")).unwrap();
+        rig.rename(id, (deep_id, "x"), (root, "x"));
+        std::fs::remove_file(rig.dir.path().join("x")).unwrap();
+        rig.unlink(id, root, "x");
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn file_moved_in_by_an_unresolved_rename_then_removed_is_not_born() {
+        // Complete walk, but the rename's source is outside the tree, so
+        // absence from the walked root proves nothing.
+        let mut rig = Rig::new(|_| {});
+        let root = rig.root();
+        let outside = tempfile::tempdir_in(rig.dir.path().parent().unwrap()).unwrap();
+        let src = outside.path().join("x");
+        std::fs::write(&src, b"from elsewhere").unwrap();
+        let id = Rig::id(&src);
+        let src_parent = Rig::id(outside.path());
+        std::fs::rename(&src, rig.dir.path().join("x")).unwrap();
+        rig.rename(id, (src_parent, "x"), (root, "x"));
+        std::fs::remove_file(rig.dir.path().join("x")).unwrap();
+        rig.unlink(id, root, "x");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("rename"), "{obs:?}");
+    }
+
+    #[test]
+    fn devices_and_pipes_are_never_unlocated() {
+        let mut rig = Rig::new(|d| {
+            for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+                std::fs::create_dir_all(
+                    d.join((0..=i).map(|j| format!("d{j}/")).collect::<String>()),
+                )
+                .unwrap();
+            }
+        });
+        let null = Rig::id(Path::new("/dev/null"));
+        rig.open(null, false);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn kernel_drops_during_the_command_are_reported() {
+        let mut rig = Rig::new(|_| {});
+        let cmd = rig.cmd;
+        rig.rt()
+            .mark_kernel_losses(cmd, "the eBPF ring buffers", 10);
+        let obs = rig.close(Some(12));
+        assert_eq!(
+            obs,
+            vec![(
+                None,
+                "the eBPF ring buffers dropped 2 event(s) while this command ran".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn fanotify_unlisted_cwd_proves_no_birth() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root reads a mode-000 directory; the listing cannot fail.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old"), b"x").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (helper, _daemon) = crate::ipc::socketpair().unwrap();
+        let mut rt =
+            LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(0xf1),
+            seq: 1,
+        };
+        rt.note_direct_children_baseline(cmd, dir.path());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ws = rt.watches.get(&cmd).unwrap();
+        assert!(
+            !LinuxCaptureRuntime::fanotify_parent_walked(ws, Some(&dir.path().join("old"))),
+            "a cwd whose listing failed must not prove that its children were born"
+        );
+    }
+
+    #[test]
+    fn fanotify_reports_unwatched_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (helper, daemon) = crate::ipc::socketpair().unwrap();
+        let mut rt =
+            LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(0xf0),
+            seq: 1,
+        };
+        rt.note_direct_children_baseline(cmd, dir.path());
+        let ws = rt.watches.get(&cmd).unwrap();
+        let f = Rig::id(&dir.path().join("f"));
+        assert!(LinuxCaptureRuntime::fanotify_parent_walked(
+            ws,
+            Some(&dir.path().join("born"))
+        ));
+        assert!(!LinuxCaptureRuntime::fanotify_parent_walked(
+            ws,
+            Some(&dir.path().join("sub/x"))
+        ));
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        let mut details = Vec::new();
+        while let Ok((resp, _)) = daemon.recv_response_with_fd() {
+            if let HelperResponse::CaptureRefused { detail, .. } = resp {
+                details.push(detail);
+            }
+        }
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert!(
+            details[0].contains("1 subdirectory is not watched"),
+            "{details:?}"
+        );
+        let _ = f;
+    }
+
+    /// Every handler that can lose evidence, driven into a forced
+    /// failure on a pre-existing file. Each must leave exactly one loss
+    /// at close. Births (mkdir, create) are covered by the born-set tests
+    /// above; a handler added later is not found automatically and has to
+    /// be added here.
+    #[test]
+    fn every_loss_reporting_handler_records_its_forced_failure() {
+        type Drive = fn(&mut Rig, Id, Id);
+        let cases: &[(&str, Drive)] = &[
+            ("handle_lsm_open: no snapshot", |rig, id, _| {
+                rig.drop_snapshot(id);
+                rig.open(id, false);
+            }),
+            ("handle_lsm_release: no snapshot", |rig, id, _| {
+                rig.drop_snapshot(id);
+                rig.release(id);
+            }),
+            ("handle_lsm_setattr: no snapshot", |rig, id, _| {
+                rig.drop_snapshot(id);
+                rig.setattr(id);
+            }),
+            ("handle_lsm_unlink: race lost", |rig, id, root| {
+                let cmd = rig.cmd;
+                rig.rt()
+                    .watches
+                    .get_mut(&cmd)
+                    .unwrap()
+                    .pre_opens
+                    .remove(&id);
+                std::fs::remove_file(rig.dir.path().join("f")).unwrap();
+                rig.unlink(id, root, "f");
+            }),
+            ("handle_lsm_unlink: parent unresolved", |rig, id, root| {
+                rig.unlink(id, (root.0, 999_999_999), "f");
+            }),
+            (
+                "handle_lsm_rename: replaced without snapshot",
+                |rig, id, root| {
+                    rig.drop_snapshot(id);
+                    let new = rig.dir.path().join("new");
+                    std::fs::write(&new, b"x").unwrap();
+                    let new_id = Rig::id(&new);
+                    std::fs::rename(&new, rig.dir.path().join("f")).unwrap();
+                    rig.rename(new_id, (root, "new"), (root, "f"));
+                },
+            ),
+            (
+                "handle_lsm_rename: moved out of the tree",
+                |rig, id, root| {
+                    rig.rename(id, (root, "f"), ((root.0, 999_999_999), "f"));
+                },
+            ),
+        ];
+        for (name, drive) in cases {
+            let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"pre-existing").unwrap());
+            let root = rig.root();
+            let id = Rig::id(&rig.dir.path().join("f"));
+            drive(&mut rig, id, root);
+            let obs = rig.close(None);
+            assert_eq!(obs.len(), 1, "{name}: {obs:?}");
+        }
+
+        // fanotify reads the pre-image from the event fd; a file over the
+        // cap cannot be read, and it was in the cwd listing.
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_PRE_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let (helper, daemon) = crate::ipc::socketpair().unwrap();
+        let mut rt =
+            LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(0xfa),
+            seq: 1,
+        };
+        rt.note_direct_children_baseline(cmd, dir.path());
+        let f = std::fs::File::open(&big).unwrap();
+        rt.handle_event(&FanotifyEventView {
+            command: cmd,
+            fd: f.as_raw_fd(),
+            pid: 1,
+            kind: FanotifyCaptureKind::OpenWrite,
+            _life: std::marker::PhantomData,
+        });
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        let mut losses = 0;
+        while let Ok((resp, _)) = daemon.recv_response_with_fd() {
+            if let HelperResponse::CaptureRefused { .. } = resp {
+                losses += 1;
+            }
+        }
+        assert_eq!(losses, 1, "handle_event: pre-image read failed");
+    }
+
+    #[test]
+    fn fmode_probe_needs_the_bit_on_create_and_not_on_reopen() {
+        let k = userspace_to_kernel_dev(0x803);
+        let target = (kernel_dev_to_userspace(k), 42);
+        let good = [(k, 42, 0x2 | FMODE_CREATED), (k, 7, 0x2), (k, 42, 0x2)];
+        assert!(fmode_created_probe_passed(&good, target));
+        let never = [(k, 42, 0x2), (k, 42, 0x2)];
+        assert!(!fmode_created_probe_passed(&never, target));
+        let always = [(k, 42, 0x2 | FMODE_CREATED), (k, 42, 0x2 | FMODE_CREATED)];
+        assert!(!fmode_created_probe_passed(&always, target));
+        assert!(!fmode_created_probe_passed(&good[..1], target));
+    }
+
+    #[test]
+    fn untrusted_fmode_bit_proves_nothing() {
+        let mut rig = Rig::new(|d| {
+            for i in 0..=PRE_OPEN_TREE_DEPTH_LIMIT {
+                std::fs::create_dir_all(
+                    d.join((0..=i).map(|j| format!("d{j}/")).collect::<String>()),
+                )
+                .unwrap();
+            }
+        });
+        rig.rt().set_fmode_created_trusted(false);
+        let f = rig.dir.path().join("new");
+        std::fs::write(&f, b"").unwrap();
+        let id = Rig::id(&f);
+        rig.open(id, true);
+        // Incomplete walk, untrusted bit, no create event: unlocated.
+        assert_eq!(rig.close(None).len(), 1);
     }
 }

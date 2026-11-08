@@ -435,6 +435,44 @@ impl LinuxCaptureSink {
     }
 }
 
+/// Start-up tap for the `FMODE_CREATED` probe. While active, open events
+/// from `tgid` are recorded before the exclusion filter drops them.
+static FMODE_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// `(kernel dev, inode, f_mode)` of one open event.
+type ProbedOpen = (u64, u64, u32);
+static FMODE_PROBE: std::sync::Mutex<Option<(u32, Vec<ProbedOpen>)>> = std::sync::Mutex::new(None);
+
+/// Record open events from `tgid` until [`fmode_probe_finish`].
+pub fn fmode_probe_begin(tgid: u32) {
+    *FMODE_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some((tgid, Vec::new()));
+    FMODE_PROBE_ACTIVE.store(true, Ordering::Release);
+}
+
+/// Stop recording and return `(kernel dev, inode, f_mode)` per open seen.
+pub fn fmode_probe_finish() -> Vec<(u64, u64, u32)> {
+    FMODE_PROBE_ACTIVE.store(false, Ordering::Release);
+    FMODE_PROBE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map(|(_, seen)| seen)
+        .unwrap_or_default()
+}
+
+fn fmode_probe_tap(ev: &OpenEvent) {
+    if !FMODE_PROBE_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some((tgid, seen)) = FMODE_PROBE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        && *tgid == ev.hdr.tgid
+    {
+        seen.push((ev.dev, ev.inode, ev.f_mode));
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl LsmEventSink for LinuxCaptureSink {
     fn on_unlink(&self, ev: &UnlinkEvent) {
@@ -607,6 +645,7 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_open(&self, ev: &OpenEvent) {
+        fmode_probe_tap(ev);
         if self.is_excluded(ev.hdr.pid) {
             return;
         }
@@ -871,9 +910,15 @@ static RINGBUF_LOSSES_OBSERVED: AtomicU64 = AtomicU64::new(0);
 /// How often a reader polls its object's loss counter between flushes.
 const LOSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Upper bound on records drained for one flush request, so a reader
-/// under sustained load still acks.
-const FLUSH_DRAIN_MAX: u32 = 1 << 16;
+/// Time a reader may spend draining for one flush request. The drain
+/// runs until the ring is empty; this bound only matters when producers
+/// refill the ring as fast as it drains. It is half of the request
+/// loop's `LSM_FLUSH_TIMEOUT` (2 s), so a reader that hits it still acks
+/// inside the wait and the close reports a truncated tail instead of a
+/// timeout; the daemon's barrier waits 5 s on top. A 256 KiB ring holds
+/// at most about 4k records, which drain in milliseconds, so a drain
+/// that has not emptied the ring in a second is not converging.
+const FLUSH_DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
 /// Ring-buffer reserve failures observed so far, summed over objects.
 pub fn ringbuf_losses_observed() -> u64 {
@@ -940,13 +985,47 @@ fn note_loss_value(last: &mut u64, value: u64) -> u64 {
 #[derive(Clone)]
 pub struct LsmFlushHandle {
     thread_name: &'static str,
-    tx: mpsc::Sender<mpsc::SyncSender<()>>,
+    tx: mpsc::Sender<mpsc::SyncSender<FlushAck>>,
+}
+
+/// A reader's answer to a flush request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushAck {
+    /// The ring was empty when the drain stopped.
+    Drained,
+    /// The drain ran out of [`FLUSH_DRAIN_BUDGET`] with records still
+    /// queued. Those reach userspace after the tree is unwatched and lose
+    /// their attribution, so the close reports the command's tail as
+    /// possibly missing.
+    Truncated { drained: u32 },
+}
+
+/// Drain for a flush request. `next` handles one record and returns
+/// false when the ring is empty; `expired` reports that the time budget
+/// is spent. The drain runs until the ring is empty. When the budget is
+/// spent, one more record found waiting makes the drain truncated; that
+/// record is handled too, so the check loses nothing.
+fn drain_for_flush(mut expired: impl FnMut() -> bool, mut next: impl FnMut() -> bool) -> FlushAck {
+    let mut drained = 0u32;
+    loop {
+        if expired() {
+            return if next() {
+                FlushAck::Truncated { drained }
+            } else {
+                FlushAck::Drained
+            };
+        }
+        if !next() {
+            return FlushAck::Drained;
+        }
+        drained = drained.saturating_add(1);
+    }
 }
 
 impl LsmFlushHandle {
     /// Ask the reader to dispatch every record already in its ring
     /// buffer. Returns the channel its ack arrives on.
-    fn request(&self) -> Result<mpsc::Receiver<()>, String> {
+    fn request(&self) -> Result<mpsc::Receiver<FlushAck>, String> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.tx
             .send(ack_tx)
@@ -966,11 +1045,16 @@ pub fn flush_all_readers(handles: &[LsmFlushHandle], timeout: Duration) -> Resul
         match request {
             Ok(ack) => {
                 let wait = deadline.saturating_duration_since(Instant::now());
-                if ack.recv_timeout(wait).is_err() {
-                    failures.push(format!(
+                match ack.recv_timeout(wait) {
+                    Ok(FlushAck::Drained) => {}
+                    Ok(FlushAck::Truncated { drained }) => failures.push(format!(
+                        "eBPF {} reader flush stopped after {drained} records with more queued",
+                        handle.thread_name
+                    )),
+                    Err(_) => failures.push(format!(
                         "eBPF {} reader flush timed out",
                         handle.thread_name
-                    ));
+                    )),
                 }
             }
             Err(e) => failures.push(e),
@@ -1333,7 +1417,7 @@ fn reader_thread(
     alive: Arc<AtomicBool>,
     idle_sleep: Duration,
     mut loss: LossTracker,
-    flush_rx: mpsc::Receiver<mpsc::SyncSender<()>>,
+    flush_rx: mpsc::Receiver<mpsc::SyncSender<FlushAck>>,
 ) {
     let mut last_loss_poll = Instant::now();
     while alive.load(Ordering::Acquire) {
@@ -1350,16 +1434,27 @@ fn reader_thread(
         // request is already in the ring, so draining until empty
         // dispatches the command's whole tail before the ack.
         while let Ok(ack) = flush_rx.try_recv() {
-            let mut drained = 0u32;
-            while drained < FLUSH_DRAIN_MAX {
-                let Some(rec) = rb.next() else { break };
-                let slice: &[u8] = &rec[..];
-                handler(slice, sink.as_ref());
-                drained += 1;
+            let deadline = Instant::now() + FLUSH_DRAIN_BUDGET;
+            let outcome = drain_for_flush(
+                || Instant::now() >= deadline,
+                || {
+                    let Some(rec) = rb.next() else {
+                        return false;
+                    };
+                    handler(&rec[..], sink.as_ref());
+                    true
+                },
+            );
+            if let FlushAck::Truncated { drained } = outcome {
+                tracing::warn!(
+                    thread = thread_name,
+                    drained,
+                    "eBPF flush drain ran out of time with records still queued"
+                );
             }
             loss.poll(thread_name);
             last_loss_poll = Instant::now();
-            let _ = ack.send(());
+            let _ = ack.send(outcome);
         }
         if last_loss_poll.elapsed() >= LOSS_POLL_INTERVAL {
             loss.poll(thread_name);
@@ -1399,7 +1494,7 @@ mod tests {
 
     #[test]
     fn flush_times_out_when_reader_never_acks() {
-        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
         let handle = LsmFlushHandle {
             thread_name: "test",
             tx,
@@ -1411,15 +1506,15 @@ mod tests {
 
     #[test]
     fn stuck_reader_does_not_starve_the_others() {
-        let (stuck_tx, stuck_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
-        let (slow_tx, slow_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let (stuck_tx, stuck_rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
+        let (slow_tx, slow_rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
         // Acks well inside the deadline, but only after the stuck reader's
         // whole wait would have used it up if requests went out in turn.
         let slow = std::thread::spawn(move || {
             let requested_at = Instant::now();
             let ack = slow_rx.recv().unwrap();
             let waited = requested_at.elapsed();
-            ack.send(()).unwrap();
+            ack.send(FlushAck::Drained).unwrap();
             waited
         });
         let handles = [
@@ -1444,10 +1539,10 @@ mod tests {
 
     #[test]
     fn flush_succeeds_when_reader_acks() {
-        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
         let t = std::thread::spawn(move || {
             let ack = rx.recv().unwrap();
-            ack.send(()).unwrap();
+            ack.send(FlushAck::Drained).unwrap();
         });
         let handle = LsmFlushHandle {
             thread_name: "test",
@@ -1455,6 +1550,99 @@ mod tests {
         };
         flush_all_readers(&[handle], Duration::from_secs(5)).unwrap();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn truncated_flush_is_reported_as_incomplete() {
+        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
+        let t = std::thread::spawn(move || {
+            let ack = rx.recv().unwrap();
+            ack.send(FlushAck::Truncated { drained: 7 }).unwrap();
+        });
+        let handle = LsmFlushHandle {
+            thread_name: "open",
+            tx,
+        };
+        let err = flush_all_readers(&[handle], Duration::from_secs(5)).unwrap_err();
+        assert!(
+            err.contains("eBPF open reader flush stopped after 7 records"),
+            "{err}"
+        );
+        t.join().unwrap();
+    }
+
+    /// A ring of `n` records; returns how many `next` handled.
+    fn ring(n: u32) -> (std::cell::Cell<u32>, std::cell::Cell<u32>) {
+        (std::cell::Cell::new(n), std::cell::Cell::new(0))
+    }
+
+    #[test]
+    fn drain_empties_the_ring_past_any_record_count() {
+        // More than the old FLUSH_DRAIN_MAX cap: a drain with time left
+        // keeps going until the ring is empty.
+        let (left, handled) = ring((1 << 16) + 10);
+        let outcome = drain_for_flush(
+            || false,
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                handled.set(handled.get() + 1);
+                true
+            },
+        );
+        assert_eq!(outcome, FlushAck::Drained);
+        assert_eq!(handled.get(), (1 << 16) + 10);
+    }
+
+    #[test]
+    fn drain_is_truncated_only_when_time_runs_out_with_records_left() {
+        let (left, handled) = ring(5);
+        let checks = std::cell::Cell::new(0u32);
+        let outcome = drain_for_flush(
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                handled.set(handled.get() + 1);
+                true
+            },
+        );
+        assert_eq!(outcome, FlushAck::Truncated { drained: 3 });
+        assert_eq!(
+            handled.get(),
+            4,
+            "the record that proved truncation is handled"
+        );
+
+        // Time runs out exactly as the ring empties: not truncated.
+        let (left, _) = ring(3);
+        let checks = std::cell::Cell::new(0u32);
+        let outcome = drain_for_flush(
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                true
+            },
+        );
+        assert_eq!(outcome, FlushAck::Drained);
+    }
+
+    #[test]
+    fn drain_budget_fits_inside_the_flush_wait() {
+        assert!(FLUSH_DRAIN_BUDGET < crate::LSM_FLUSH_TIMEOUT);
     }
 
     #[test]

@@ -329,6 +329,9 @@ fn finalize_post_exec(
         if let Err(e) = index.put_command(&existing) {
             warn!(err = %e, "put_command (post) failed");
         }
+        // R3 slice B — the walk's failed ingests belonged to this command.
+        ctx.live_baseline
+            .clear_ingest_failed_for(command.session, &existing.cwd);
     }
     // AR00.5 / task #105 — drop the readiness entry for this
     // CommandId. A shell hook still waiting (stale hook, racy teardown)
