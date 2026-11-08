@@ -234,7 +234,7 @@ sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 
 # L5 PR B: for each path undo reported a conflict on, the journal rows
 # that touched it (outside ~/.local these are pip's scratch paths).
-grep -oE '"/[^"]+"' "${SHIT_SMOKE_TMP}/undo.log" | tr -d '"' | sort -u | while read -r p; do
+{ grep -oE '"/[^"]+"' "${SHIT_SMOKE_TMP}/undo.log" || true; } | tr -d '"' | sort -u | while read -r p; do
     smoke_log "journal rows for conflicted path ${p}:"
     # SQL string literals: double any single quote.
     q="${p//\'/\'\'}"
