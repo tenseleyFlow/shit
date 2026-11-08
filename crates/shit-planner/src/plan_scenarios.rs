@@ -1629,6 +1629,25 @@ fn rm_of_a_symlink_recreates_the_link_and_leaves_the_target() {
     assert_eq!(std::fs::read(&target).unwrap(), b"keep");
 }
 
+/// D-22: `echo new > link` where `link` points at `target`. The shim
+/// follows the link for a write-open and captures the target's
+/// pre-image under the target's path; undo restores the target's bytes
+/// and the link is left as it was.
+#[test]
+fn write_through_a_symlink_restores_the_target_and_keeps_the_link() {
+    let mut sim = Sim::new();
+    sim.seed_file("target", b"old bytes", 0o644);
+    let target = sim.p("target");
+    let link = sim.p("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    sim.pre_image(&target, FilePreImageSource::Other);
+    std::fs::write(&link, b"new").unwrap();
+    let log = sim.undo();
+    assert!(log.iter().all(|l| l.starts_with("ok ")), "{log:#?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"old bytes");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
+}
+
 fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
     let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
     let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)

@@ -582,6 +582,55 @@ mod policy {
         }
     }
 
+    /// Write-capable `open`/`openat`. An open acts on what the path
+    /// names after symlinks, so the final component is followed (full
+    /// resolve) unless `O_NOFOLLOW` is set, and the pre-image is keyed
+    /// by the resolved target: a write through a symlink restores the
+    /// target's bytes and leaves the link alone. Removals keep the
+    /// parent-only form ([`notify_plain_pre_mutation_with_content`],
+    /// [`notify_pre_mutation_with_content_at`]).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub fn notify_open_pre_mutation(
+        syscall: &'static str,
+        dirfd: libc::c_int,
+        path: &str,
+        flags: libc::c_int,
+    ) {
+        if let Some(r) = open_resolution(dirfd, path, flags) {
+            notify_resolved(syscall, r);
+        }
+    }
+
+    /// The resolution [`notify_open_pre_mutation`] sends; `None` when
+    /// muted or re-entrant (checked before any canonicalize).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
+    pub(super) fn open_resolution(
+        dirfd: libc::c_int,
+        path: &str,
+        flags: libc::c_int,
+    ) -> Option<AtResolution> {
+        if disabled() || should_skip_path(path) || IN_NOTIFY.with(|f| f.get()) {
+            return None;
+        }
+        Some(if flags & libc::O_NOFOLLOW != 0 {
+            resolve_leaf_at_for_notify(dirfd, path, "path")
+        } else {
+            resolve_at_for_notify(dirfd, path, "path")
+        })
+    }
+
     /// L4b ruling 7 - the muted and re-entrant cases return before any
     /// canonicalize, so a disabled shim or a nested call (the
     /// pre-image read's own `open`) costs no realpath.
@@ -656,9 +705,9 @@ mod policy {
         resolve_at_with(dirfd, path, which_arg, canonical_path)
     }
 
-    /// L4b - single-path variant for calls that act on the final
-    /// component itself (`unlink`, `unlinkat`, and the `open` forms this
-    /// shim keys by name): canonicalizes only the parent directory and
+    /// L4b - variant for calls that act on the final component itself
+    /// (`unlink`, `unlinkat`, and an `O_NOFOLLOW` open): canonicalizes
+    /// only the parent directory and
     /// joins the final component unresolved, so a symlink is journaled
     /// as the link, never as its target.
     #[cfg(any(
@@ -1452,7 +1501,7 @@ mod policy {
 
     /// [`capture_pre_image`]; `path_resolved` skips the second
     /// canonicalize when the caller already produced a canonical key.
-    fn capture_pre_image_resolved(
+    pub(super) fn capture_pre_image_resolved(
         path: &str,
         path_resolved: bool,
     ) -> Option<shit_proto::ShimPreImage> {
@@ -1752,7 +1801,7 @@ mod interposers {
             // file is the canonical content-overwrite shape (e.g.
             // `install -m … src dst` where dst already exists). Capture
             // the pre-image so undo can restore.
-            policy::notify_plain_pre_mutation_with_content("open", &cstr_to_string(path));
+            policy::notify_open_pre_mutation("open", libc::AT_FDCWD, &cstr_to_string(path), flags);
         }
         let real = next::real_open();
         if next::is_zero(next::as_usize(real)) {
@@ -1804,7 +1853,7 @@ mod interposers {
             // capture pre-image bytes when the target exists.
             // DR-CR-54.B: resolve dirfd → absolute up front.
             let path_str = cstr_to_string(path);
-            policy::notify_pre_mutation_with_content_at("openat", dirfd, &path_str);
+            policy::notify_open_pre_mutation("openat", dirfd, &path_str, flags);
         }
         let real = next::real_openat();
         if next::is_zero(next::as_usize(real)) {
@@ -2423,9 +2472,47 @@ mod tests {
     )
 ))]
 mod canonical_tests {
-    /// L4b: `unlink`/`unlinkat`/`open` of a symlink are keyed by the
-    /// link's own path (parent canonicalized, final component as
-    /// given), never by the link's target.
+    /// D-22: a write-open through a symlink follows it. The notification
+    /// is keyed by the target and carries the target's pre-image, so
+    /// undo restores the target's bytes. `O_NOFOLLOW` keeps the link.
+    #[test]
+    fn write_open_through_a_symlink_captures_the_target() {
+        use super::policy::{AtResolution, capture_pre_image_resolved, open_resolution};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"old bytes").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let want = std::fs::canonicalize(&target).unwrap();
+        let want = want.to_str().unwrap();
+        let flags = libc::O_WRONLY | libc::O_TRUNC;
+        let d = std::fs::File::open(dir.path()).unwrap();
+        for r in [
+            open_resolution(libc::AT_FDCWD, link.to_str().unwrap(), flags),
+            open_resolution(d.as_raw_fd(), "link", flags),
+        ] {
+            let Some(AtResolution::Resolved(abs)) = r else {
+                panic!("expected a resolved target, got {r:?}");
+            };
+            assert_eq!(abs, want);
+            let pre = capture_pre_image_resolved(&abs, true).expect("target pre-image");
+            assert_eq!(pre.path, want);
+            assert_eq!(pre.bytes, b"old bytes");
+        }
+        match open_resolution(
+            libc::AT_FDCWD,
+            link.to_str().unwrap(),
+            flags | libc::O_NOFOLLOW,
+        ) {
+            Some(AtResolution::Resolved(abs)) => assert!(abs.ends_with("/link"), "{abs}"),
+            other => panic!("O_NOFOLLOW: expected the link path, got {other:?}"),
+        }
+    }
+
+    /// L4b: `unlink`/`unlinkat` of a symlink are keyed by the link's own
+    /// path (parent canonicalized, final component as given), never by
+    /// the link's target.
     #[test]
     fn single_path_calls_key_a_symlink_by_the_link_not_its_target() {
         use super::policy::{AtResolution, plain_resolution, resolve_leaf_at_for_notify};
