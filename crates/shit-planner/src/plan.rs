@@ -123,6 +123,8 @@ pub fn plan(
         crate::plan_forward::paired_flags_shim_events(&chronological)
     };
 
+    class.dropped_events.extend(covered_capture_gaps(&live));
+
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
     }
@@ -138,6 +140,36 @@ pub fn plan(
         nodes,
         warnings,
     }
+}
+
+/// L5 (review of #232, item 2): a shim capture-gap marker for `P` says
+/// the shim could not read `P` before a write. Another tier may have:
+/// when the command journaled a content pre-image of `P` that the shim
+/// did not capture, undo restores the earliest pre-image of `P`
+/// whichever open it came from, so the gap is covered and its refusal
+/// is dropped. Otherwise the refusal stands.
+fn covered_capture_gaps(live: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let captured: HashSet<&Path> = live
+        .iter()
+        .filter_map(|e| match &e.kind {
+            CaptureEventKind::FilePreImage { path, source, .. }
+                if source.has_content() && !source.is_shim() =>
+            {
+                Some(path.as_path())
+            }
+            _ => None,
+        })
+        .collect();
+    live.iter()
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                CaptureEventKind::CaptureRefused { class, path, .. }
+                    if class == "capture-gap" && captured.contains(path.as_path())
+            )
+        })
+        .map(|e| e.id)
+        .collect()
 }
 
 fn emit_unless_skipped(
@@ -2137,6 +2169,89 @@ mod tests {
             p.warnings
                 .iter()
                 .any(|w| matches!(w, PlanWarning::PartialEvents { dropped: 1 }))
+        );
+    }
+
+    /// Review of #232, item 2: a shim gap marker and, optionally, a
+    /// pre-image of the same path from `source`. Returns the plan's
+    /// capture-gap refusals.
+    fn capture_gap_refusals(pre: Option<crate::FilePreImageSource>) -> usize {
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 5);
+        let blob = BlobHash::from_bytes([0xAB; 32]);
+        let path = PathBuf::from("/tmp/big.bin");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(100),
+            },
+            None,
+        );
+        store.put_blob(blob, 50);
+        let command = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let mut events = vec![CaptureEvent {
+            id: EventId(2),
+            command,
+            ts: TimePoint::new(2, 0),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-gap".into(),
+                path: path.clone(),
+                detail: "the file existed before the write".into(),
+            },
+        }];
+        if let Some(source) = pre {
+            events.push(CaptureEvent {
+                id: EventId(1),
+                command,
+                ts: TimePoint::new(1, 0),
+                partial: false,
+                kind: CaptureEventKind::FilePreImage {
+                    inode,
+                    path: path.clone(),
+                    blob,
+                    meta: meta(50),
+                    post_content_hash: None,
+                    source,
+                },
+            });
+        }
+        plan(dummy_command(), &events, &probe, &store)
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, InverseOp::Refuse { class, .. } if class == "capture-gap"))
+            .count()
+    }
+
+    #[test]
+    fn kernel_tier_pre_image_covers_a_shim_capture_gap() {
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::Other)),
+            0
+        );
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::EsAuthPreMutation)),
+            0
+        );
+    }
+
+    #[test]
+    fn capture_gap_stands_when_no_other_tier_captured_the_path() {
+        assert_eq!(capture_gap_refusals(None), 1);
+        // A shim pre-image of the path (another open, or the rename walk)
+        // is no evidence the gapped write was covered.
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::ShimPreMutation)),
+            1
+        );
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::ShimRenameSubtree)),
+            1
         );
     }
 

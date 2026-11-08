@@ -378,21 +378,10 @@ fn ingest_notification(
     // the partial capture); the journaled refusal ensures the
     // planner surfaces the gap as an InverseOp::Refuse node at undo
     // time instead of silently mis-attributing.
-    // L5 (review round 4, item 2): inside a watched tree the kernel tier
-    // captures the file's pre-image, as it does the create the shim then
-    // defers (`open_create` below). A shim capture gap there is no gap.
-    // Watched means BSD's baseline cwds, or the root the daemon sent the
-    // helper for this command (any platform) unless the helper said it
-    // could not watch it.
-    let gap_in_watch = matches!(
-        &note.failure,
-        Some(shit_proto::ShimFailure::PreImageUncaptured { path, .. })
-            if live_baseline.path_in_watched_subtree(Path::new(path))
-                || live_baseline.command_watches(command, Path::new(path), ingest_ts)
-    );
-    if let Some(failure) = &note.failure
-        && !gap_in_watch
-    {
+    // L5 (review of #232, item 2): the shim's gap marker is always
+    // journaled. The planner drops it when another tier journaled a
+    // pre-image of the same path in this command.
+    if let Some(failure) = &note.failure {
         let (class, primary_path, detail) = match failure {
             shit_proto::ShimFailure::CanonicalizeFailed {
                 which_arg,
@@ -498,7 +487,7 @@ fn ingest_notification(
             let source = if matches!(note.syscall.as_str(), "chflags" | "fchflags") {
                 shit_planner::FilePreImageSource::ShimFlagsPreMutation
             } else {
-                shit_planner::FilePreImageSource::Other
+                shit_planner::FilePreImageSource::ShimPreMutation
             };
             if let Err(e) =
                 ingest_pre_image_with_source(command, pre, index, blob_store, source, ingest_ts)
@@ -802,7 +791,7 @@ fn ingest_pre_image(
         pre,
         index,
         blob_store,
-        shit_planner::FilePreImageSource::Other,
+        shit_planner::FilePreImageSource::ShimPreMutation,
         ts,
     )
 }
@@ -1291,7 +1280,7 @@ mod tests {
         assert!(matches!(
             &events[0].kind,
             CaptureEventKind::FilePreImage {
-                source: shit_planner::FilePreImageSource::Other,
+                source: shit_planner::FilePreImageSource::ShimPreMutation,
                 ..
             }
         ));
@@ -1484,7 +1473,7 @@ mod tests {
                 ),
                 (
                     PathBuf::from("/tmp/shit-walk/d.bak"),
-                    FilePreImageSource::Other
+                    FilePreImageSource::ShimPreMutation
                 ),
             ]
         );
@@ -1688,10 +1677,11 @@ mod tests {
         );
     }
 
-    /// Review round 4, item 2: in a watched tree the kernel tier holds the
-    /// pre-image, so the shim's gap is not journaled; outside it is.
+    /// Review of #232, item 2: the shim's gap marker is journaled in a
+    /// watched tree too (BSD baseline or the command's watch root). The
+    /// planner decides whether another tier covered it.
     #[test]
-    fn uncaptured_file_in_a_watched_tree_journals_no_refusal() {
+    fn uncaptured_file_in_a_watched_tree_still_journals_its_refusal() {
         use shit_planner::time::TimePoint;
         let failure = shit_proto::ShimFailure::PreImageUncaptured {
             path: "/tmp/shit-open/existing".into(),
@@ -1701,6 +1691,7 @@ mod tests {
         let watched = LiveBaseline::new();
         watched.entry_for_cwd(Path::new("/tmp/shit-open"));
         let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        watched.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
         ingest_notification(
             &note,
             Some(command),
@@ -1715,94 +1706,13 @@ mod tests {
             .into_iter()
             .map(|e| e.kind)
             .collect();
-        assert!(kinds.is_empty(), "{kinds:#?}");
-        // Out of watch, the same note is a refusal (as in
-        // `uncaptured_existing_file_journals_a_refusal_only`).
-        assert_eq!(kinds_after(&note).len(), 1);
-    }
-
-    /// Review round 4, item 2 on Linux: the daemon records the root it
-    /// sent the helper in WatchTree for each command. A gap in that tree
-    /// journals nothing; outside it, or once the helper said it cannot
-    /// watch the command, it is a refusal.
-    #[test]
-    fn uncaptured_file_in_the_commands_watch_root_journals_no_refusal() {
-        use shit_planner::time::TimePoint;
-        let gap = |path: &str| {
-            open_note(
-                "open",
-                Some(shit_proto::ShimFailure::PreImageUncaptured {
-                    path: path.into(),
-                    reason: "over the shim's inline pre-image cap".into(),
-                }),
-            )
-        };
-        let run = |note: &ShimNotification, lb: &LiveBaseline, command, index: &Index, blobs| {
-            ingest_notification(
-                note,
-                Some(command),
-                TimePoint::new(6, 0),
-                None,
-                index,
-                blobs,
-                lb,
-            );
-        };
-        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
-        let lb = LiveBaseline::new();
-        lb.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
-        run(
-            &gap("/tmp/shit-open/big.bin"),
-            &lb,
-            command,
-            &index,
-            &blob_store,
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-gap"
+            ),
+            "{kinds:#?}"
         );
-        assert!(index.events_for_command(command).is_empty());
-        run(
-            &gap("/tmp/elsewhere/big.bin"),
-            &lb,
-            command,
-            &index,
-            &blob_store,
-        );
-        assert_eq!(index.events_for_command(command).len(), 1);
-        // WatchTreeFailed (or the helper's no-tier observation) drops it.
-        lb.forget_command_watch(command);
-        run(
-            &gap("/tmp/shit-open/big.bin"),
-            &lb,
-            command,
-            &index,
-            &blob_store,
-        );
-        assert_eq!(index.events_for_command(command).len(), 2);
-    }
-
-    /// Review round 5, item 2: a gap note stamped before the command's
-    /// PostExec but ingested after it was written under the watch, and is
-    /// no refusal. One stamped after the PostExec is.
-    #[test]
-    fn late_gap_note_from_before_post_exec_journals_no_refusal() {
-        use shit_planner::time::TimePoint;
-        let note = open_note(
-            "open",
-            Some(shit_proto::ShimFailure::PreImageUncaptured {
-                path: "/tmp/shit-open/big.bin".into(),
-                reason: "over the shim's inline pre-image cap".into(),
-            }),
-        );
-        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
-        let lb = LiveBaseline::new();
-        lb.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
-        // The PostExec at 10 is handled before either note is ingested.
-        lb.close_command_watch(command, TimePoint::new(10, 0));
-        let ingest =
-            |at| ingest_notification(&note, Some(command), at, None, &index, &blob_store, &lb);
-        ingest(TimePoint::new(9, 0));
-        assert!(index.events_for_command(command).is_empty());
-        ingest(TimePoint::new(11, 0));
-        assert_eq!(index.events_for_command(command).len(), 1);
     }
 
     /// Review round 5, item 1: `python3 -m venv` / `mkdir -p` under the

@@ -1130,7 +1130,7 @@ fn dispatch_response(
                 seq: command_seq,
             };
             watch_ready.mark_failed(cmd, reason.clone());
-            // L5: not watched, so a shim capture gap there stays a refusal.
+            // L5: not watched, so the shim's Creates there are journaled.
             live_baseline.forget_command_watch(cmd);
             tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
             if strict_capture {
@@ -1153,8 +1153,8 @@ fn dispatch_response(
             // it so the planner refuses the command's undo.
             let cmd = CommandId { session, seq };
             // L5: a whole-command observation (no capture tier, or the
-            // attach failed) means nothing watches it: a shim capture gap
-            // there stays a refusal.
+            // attach failed) means nothing watches it: the shim's Creates
+            // there are journaled.
             if path.is_none() {
                 live_baseline.forget_command_watch(cmd);
             }
@@ -1945,8 +1945,9 @@ mod tests_dispatch {
     }
 
     /// L5 (review round 4, item 2): a command the helper cannot watch
-    /// (attach failed, or no capture tier) is not watched for the shim's
-    /// capture-gap check; a per-path observation changes nothing.
+    /// (attach failed, or no capture tier) is not watched, so the shim's
+    /// Creates there are journaled; a per-path observation changes
+    /// nothing.
     #[test]
     fn unwatchable_command_drops_its_watch_root() {
         let dir = tempfile::tempdir().unwrap();

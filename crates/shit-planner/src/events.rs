@@ -134,6 +134,12 @@ pub enum FilePreImageSource {
     /// this way. The planner treats it as any other content pre-image
     /// for now; sprint L5 is the intended reader of the tag.
     ShimRenameSubtree,
+    /// L5: the shim's own content capture before a write-open,
+    /// truncate, unlink or rename over the path. Treated as `Other`
+    /// everywhere except when the planner weighs a shim capture-gap
+    /// marker: a gap is covered only by a pre-image some other tier
+    /// captured.
+    ShimPreMutation,
 }
 
 impl FilePreImageSource {
@@ -141,6 +147,16 @@ impl FilePreImageSource {
     /// carrying the file's content: a chflags snapshot.
     pub fn has_content(&self) -> bool {
         !matches!(self, FilePreImageSource::ShimFlagsPreMutation)
+    }
+
+    /// True for records the LD_PRELOAD shim captured.
+    pub fn is_shim(&self) -> bool {
+        matches!(
+            self,
+            FilePreImageSource::ShimFlagsPreMutation
+                | FilePreImageSource::ShimRenameSubtree
+                | FilePreImageSource::ShimPreMutation
+        )
     }
 
     /// True for sources whose captured bytes are known to faithfully
