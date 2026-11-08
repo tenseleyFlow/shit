@@ -352,7 +352,12 @@ impl LiveBaseline {
     /// watches past the age-out or the cap. A shim note for a dropped
     /// command that is still in flight is judged unwatched, so its Create
     /// is journaled by the shim; nothing is lost.
+    ///
+    /// L5 (review of #232 round 2, item 1): the root is stored canonical.
+    /// The hook sends the shell's logical `$PWD`, which may run through a
+    /// symlink, while the shim keys every path canonically.
     pub fn record_command_watch(&self, command: CommandId, root: PathBuf) {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         self.record_command_watch_at(command, root, std::time::Instant::now());
     }
 
@@ -417,6 +422,24 @@ impl LiveBaseline {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Review of #232 round 2, item 1: a shell whose `$PWD` runs through
+    /// a symlink. The shim's canonical paths are under the recorded root.
+    #[test]
+    fn watch_root_under_a_symlinked_cwd_matches_canonical_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let lb = LiveBaseline::new();
+        let c = CommandId {
+            session: Uuid::from_u128(4),
+            seq: 1,
+        };
+        lb.record_command_watch(c, link);
+        assert!(lb.command_watches(c, &real.join("venv/bin"), TimePoint::new(1, 0)));
+    }
 
     /// Review of #232, item 8: a closed session drops its watches; an
     /// unclosed watch ages out; the map never grows past its cap.
