@@ -99,17 +99,33 @@ struct shit_event_hdr {
 };
 
 /* Fill parent_pid and ancestors from the current task's parent.
- * bpf_probe_read_kernel zero-fills on a failed read, so a NULL link
- * yields 0 for that slot and every slot above it. */
+ *
+ * The walk stops at init (tgid 1) or at a failed read (NULL link:
+ * bpf_probe_read_kernel zero-fills, so tgid reads 0). Every slot from
+ * there up is written 0 without further reads; the ringbuf reservation
+ * is not zeroed, so each slot is written either way. Userspace treats
+ * the first 0 as "the kernel saw the whole chain".
+ *
+ * Cost: two probe reads (real_parent, tgid) per level walked, plus one
+ * for parent_pid. A shell command under a desktop or CI session is
+ * typically 5 to 8 levels below init, so 11 to 17 reads per event, at
+ * most 17. Each read is a bounded copy of a few bytes, so this adds well
+ * under a microsecond to the hook. */
 static __always_inline void shit_fill_ancestry(struct shit_event_hdr *h,
                                                struct task_struct *parent)
 {
-    h->parent_pid = BPF_CORE_READ(parent, tgid);
+    __u32 tgid = BPF_CORE_READ(parent, tgid);
     struct task_struct *t = parent;
+    h->parent_pid = tgid;
 #pragma unroll
     for (int i = 0; i < SHIT_ANCESTRY_DEPTH; i++) {
-        t = BPF_CORE_READ(t, real_parent);
-        h->ancestors[i] = BPF_CORE_READ(t, tgid);
+        if (tgid > 1) {
+            t = BPF_CORE_READ(t, real_parent);
+            tgid = BPF_CORE_READ(t, tgid);
+        } else {
+            tgid = 0;
+        }
+        h->ancestors[i] = tgid;
     }
 }
 
