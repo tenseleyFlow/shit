@@ -29,13 +29,8 @@ pub mod bsd;
 ))]
 pub mod cwd;
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly",
-))]
+// Every producer sends its observations through `accounting`; only the
+// Linux and BSD producers keep its close-time ledger.
 pub mod accounting;
 
 #[cfg(target_os = "linux")]

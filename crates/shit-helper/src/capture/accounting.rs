@@ -445,7 +445,26 @@ pub fn rekey_under<V>(
     }
 }
 
-/// Send each observation as a `CaptureRefused` for `command`.
+/// Send a `CaptureRefused` observation. The daemon decides whether it
+/// becomes a journal row (strict mode) or a log line.
+pub fn send_capture_observation(
+    conn: &crate::ipc::Conn,
+    command: shit_planner::events::CommandId,
+    path: Option<String>,
+    detail: String,
+) {
+    let resp = shit_proto::HelperResponse::CaptureRefused {
+        session: command.session,
+        seq: command.seq,
+        path,
+        detail,
+    };
+    if let Err(e) = conn.send_response(&resp) {
+        tracing::warn!(err = %e, %command, "CaptureRefused observation send failed");
+    }
+}
+
+/// Send each close-time observation for `command`.
 pub fn send_observations(
     conn: &crate::ipc::Conn,
     command: shit_planner::events::CommandId,
@@ -453,15 +472,7 @@ pub fn send_observations(
 ) {
     for obs in observations {
         tracing::warn!(%command, path = ?obs.path, detail = %obs.detail, "capture loss at close");
-        let resp = shit_proto::HelperResponse::CaptureRefused {
-            session: command.session,
-            seq: command.seq,
-            path: obs.path,
-            detail: obs.detail,
-        };
-        if let Err(e) = conn.send_response(&resp) {
-            tracing::warn!(err = %e, %command, "CaptureRefused observation send failed");
-        }
+        send_capture_observation(conn, command, obs.path, obs.detail);
     }
 }
 

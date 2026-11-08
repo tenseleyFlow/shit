@@ -2393,25 +2393,6 @@ fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<PathBuf, String> 
     })
 }
 
-/// Send a `CaptureRefused` observation. The daemon decides whether it
-/// becomes a journal row (strict mode) or a log line.
-fn send_capture_observation(
-    conn: &ipc::Conn,
-    command: shit_planner::events::CommandId,
-    path: Option<String>,
-    detail: String,
-) {
-    let resp = shit_proto::HelperResponse::CaptureRefused {
-        session: command.session,
-        seq: command.seq,
-        path,
-        detail,
-    };
-    if let Err(e) = conn.send_response(&resp) {
-        tracing::warn!(err = %e, %command, "CaptureRefused observation send failed");
-    }
-}
-
 /// Close-barrier marker for `UnwatchTree`. Sent on every path, degraded
 /// included: it means "nothing more will arrive for this command".
 /// macOS sends it through `capture::UnwatchFlushMarker` instead.
@@ -2438,7 +2419,7 @@ fn begin_watch(
         return true;
     }
     tracing::warn!(%command, "duplicate WatchTree ignored");
-    send_capture_observation(
+    capture::accounting::send_capture_observation(
         conn,
         command,
         None,
@@ -2557,7 +2538,7 @@ fn linux_watch_tree(
                     tier = "ebpf-lsm",
                     "watch_tree registered without pre-opens (LSM tier)"
                 );
-                send_capture_observation(
+                capture::accounting::send_capture_observation(
                     conn,
                     command,
                     None,
@@ -2572,7 +2553,7 @@ fn linux_watch_tree(
             command_seq,
             "watch_tree with no fanotify or lsm tier (degraded)"
         );
-        send_capture_observation(
+        capture::accounting::send_capture_observation(
             conn,
             command,
             None,
@@ -2930,7 +2911,7 @@ fn request_loop(
                         "watch_tree ignored — no macos capture (degraded)"
                     );
                     if macos_es_capture.is_none() {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
@@ -3069,7 +3050,7 @@ fn request_loop(
                     // to this command, then stop watching.
                     if let Err(detail) = ebpf::flush_all_readers(&state.flush, LSM_FLUSH_TIMEOUT) {
                         tracing::warn!(%session, command_seq, %detail, "eBPF reader flush incomplete");
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
@@ -3104,7 +3085,7 @@ fn request_loop(
                             tracing::info!(%session, command_seq, "unwatch_tree dispatched to bsd capture");
                         }
                         Some(DetachOutcome::Deferred) => {
-                            send_capture_observation(
+                            capture::accounting::send_capture_observation(
                                 &conn,
                                 command,
                                 None,
@@ -3112,7 +3093,7 @@ fn request_loop(
                             );
                         }
                         Some(DetachOutcome::PumpGone) => {
-                            send_capture_observation(
+                            capture::accounting::send_capture_observation(
                                 &conn,
                                 command,
                                 None,
@@ -3150,14 +3131,14 @@ fn request_loop(
                     // `flush` is still held here, so these go out ahead of
                     // the marker however fast the pumps are.
                     if outcomes.contains(&DetachOutcome::PumpGone) {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
                             capture::DETACH_PUMP_GONE_DETAIL.to_string(),
                         );
                     } else if outcomes.contains(&DetachOutcome::Deferred) {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
@@ -3167,7 +3148,7 @@ fn request_loop(
                     // FSEvents delivers with latency and has no way to ask
                     // for what the kernel still holds. ES has no such gap.
                     if macos_capture.is_some() && macos_es_capture.is_none() {
-                        send_capture_observation(
+                        capture::accounting::send_capture_observation(
                             &conn,
                             command,
                             None,
