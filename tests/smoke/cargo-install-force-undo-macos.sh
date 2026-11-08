@@ -199,6 +199,14 @@ smoke_log "shim notifications observed by daemon: ${SHIM_HITS}"
 N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 smoke_log "journal events: ${N_EVENTS}"
 
+# #222: the rename over the existing binary is journaled as a
+# TreeOp::Rename alongside its destination pre-image.
+N_RENAME="$(smoke_journal_count "discriminant = 'TreeOpRename' AND path LIKE '%/bin/${CRATE_NAME}'" 2>/dev/null || echo 0)"
+smoke_log "TreeOp::Rename rows onto bin/${CRATE_NAME}: ${N_RENAME}"
+if [ "${N_RENAME}" -lt 1 ]; then
+    smoke_fail "rename over ${INSTALLED_BIN} not journaled as TreeOp::Rename (#222)"
+fi
+
 smoke_log "running: shit undo --yes"
 set +e
 "${SHIT_BIN}" undo --yes > "${SHIT_SMOKE_TMP}/undo.log" 2>&1

@@ -28,7 +28,7 @@
 //! libc::foo as *const c_void)`. The dynamic linker does the rest.
 
 use super::policy;
-use libc::{O_RDWR, O_TRUNC, O_WRONLY, c_char, c_int, c_uint, c_void, mode_t};
+use libc::{c_char, c_int, c_uint, c_void, mode_t};
 use std::path::{Path, PathBuf};
 
 /// Materialize a NUL-terminated C string into an owned `String` for
@@ -180,7 +180,7 @@ where
 /// Same contract as `libc::unlink` — `pathname` must point to a
 /// valid NUL-terminated C string for the duration of the call.
 unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
-    policy::notify_pre_mutation_with_content("unlink", &cstr_to_string(pathname));
+    policy::notify_unlink_entry("unlink", &cstr_to_string(pathname));
     // SAFETY: caller upholds libc::unlink's contract on pathname.
     unsafe { libc::unlink(pathname) }
 }
@@ -195,8 +195,40 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
 /// valid NUL-terminated C string; `dirfd` must be `AT_FDCWD` or
 /// an open dirfd; `flags` is `0` or `AT_REMOVEDIR`.
 unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
-    policy::notify_pre_mutation_with_content("unlinkat", &cstr_to_string(pathname));
+    // L5: `shutil.rmtree` passes names relative to a real dirfd. Keyed
+    // against the cwd they named the wrong files.
+    let joined = join_dirfd(dirfd, &cstr_to_string(pathname));
+    // Review round 2, item 2: a directory removal is reported after it
+    // succeeded, with the stat from before, like rmdir.
+    if flags & libc::AT_REMOVEDIR != 0 {
+        let pending = match joined {
+            Ok(p) => policy::removal_begin("unlinkat_dir", &p),
+            Err((raw, failure)) => policy::removal_pending("unlinkat_dir", raw, Some(failure)),
+        };
+        let rc = unsafe { libc::unlinkat(dirfd, pathname, flags) };
+        policy::removal_end(pending, rc);
+        return rc;
+    }
+    match joined {
+        Ok(p) => policy::notify_unlink_entry("unlinkat", &p),
+        Err((raw, failure)) => policy::notify_unresolved("unlinkat", &raw, failure),
+    }
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
+}
+
+/// Replacement for `rmdir(2)` (L5). `shutil.rmtree` removes its top
+/// directory this way. Notified only after it succeeded, with the stat
+/// taken before the call (a refused rmdir removed nothing).
+///
+/// # Safety
+/// Same contract as `libc::rmdir`.
+unsafe extern "C" fn my_rmdir(pathname: *const c_char) -> c_int {
+    // L5: notify only after it removed the directory, with the stat read
+    // before the call.
+    let pending = policy::removal_begin("rmdir", &cstr_to_string(pathname));
+    let rc = unsafe { libc::rmdir(pathname) };
+    policy::removal_end(pending, rc);
+    rc
 }
 
 /// Replacement for `rename(2)`. The atomic-move syscall behind
@@ -207,8 +239,14 @@ unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c
 /// Same contract as `libc::rename` — both args must be valid
 /// NUL-terminated C strings for the duration of the call.
 unsafe extern "C" fn my_rename(from: *const c_char, to: *const c_char) -> c_int {
-    policy::notify_rename_with_dst_preimage("rename", &cstr_to_string(from), &cstr_to_string(to));
-    unsafe { libc::rename(from, to) }
+    let pending = policy::notify_rename_with_dst_preimage(
+        "rename",
+        &cstr_to_string(from),
+        &cstr_to_string(to),
+    );
+    let rc = unsafe { libc::rename(from, to) };
+    policy::rename_end(pending, rc);
+    rc
 }
 
 /// Replacement for `renameat(2)`. Dirfd-relative variant; modern
@@ -223,8 +261,46 @@ unsafe extern "C" fn my_renameat(
     tofd: c_int,
     to: *const c_char,
 ) -> c_int {
-    policy::notify_rename_with_dst_preimage("renameat", &cstr_to_string(from), &cstr_to_string(to));
-    unsafe { libc::renameat(fromfd, from, tofd, to) }
+    // #222 / L5: a relative name under a real dirfd names an entry of
+    // that directory, not of the cwd. Join it with F_GETPATH first.
+    let pending = match (
+        join_dirfd(fromfd, &cstr_to_string(from)),
+        join_dirfd(tofd, &cstr_to_string(to)),
+    ) {
+        (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
+        (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
+            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure);
+            None
+        }
+    };
+    let rc = unsafe { libc::renameat(fromfd, from, tofd, to) };
+    policy::rename_end(pending, rc);
+    rc
+}
+
+/// `path` joined with `dirfd`'s directory when it is relative to a real
+/// dirfd. Absolute paths and `AT_FDCWD` pass through for the policy
+/// layer's canonicalize. When `F_GETPATH` fails the raw name comes back
+/// with an AU10 marker: resolving it against the cwd would key the event
+/// to the wrong file.
+fn join_dirfd(dirfd: c_int, path: &str) -> Result<String, (String, shit_proto::ShimFailure)> {
+    if path.starts_with('/') || dirfd == libc::AT_FDCWD {
+        return Ok(path.to_string());
+    }
+    match fd_to_path(dirfd) {
+        Some(base) => Ok(PathBuf::from(base)
+            .join(path)
+            .to_string_lossy()
+            .into_owned()),
+        None => Err((
+            path.to_string(),
+            shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg: "path".to_string(),
+                attempted_path: path.to_string(),
+                error_chain: format!("F_GETPATH failed for dirfd {dirfd}"),
+            },
+        )),
+    }
 }
 
 // Open/openat replacements live in the C trampoline (`macos_shim.c`)
@@ -275,11 +351,14 @@ mod addr {
 /// is in `flags`.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn rust_shim_open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
-    let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
-    if writes {
-        policy::notify_pre_mutation_with_content("open", &cstr_to_string(path));
-    }
-    unsafe { libc::open(path, flags, mode as c_int) }
+    // L5: the shared write-open policy (Create only for a path absent
+    // before a successful call; a gap marker for an uncapturable file).
+    policy::write_open(
+        "open",
+        flags,
+        || policy::OpenTarget::Path(cstr_to_string(path)),
+        |f| unsafe { libc::open(path, f, mode as c_int) },
+    )
 }
 
 /// Rust target of the C trampoline for `openat(2)`.
@@ -293,11 +372,21 @@ unsafe extern "C" fn rust_shim_openat(
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
-    let writes = (flags & O_WRONLY) != 0 || (flags & O_RDWR) != 0 || (flags & O_TRUNC) != 0;
-    if writes {
-        policy::notify_pre_mutation_with_content("openat", &cstr_to_string(path));
+    // L5: keyed to the dirfd, then the shared write-open policy.
+    // (#231 tracks routing this through the dirfd target the other
+    // platforms use.)
+    let call = |f| unsafe { libc::openat(dirfd, path, f, mode as c_int) };
+    if !policy::open_may_mutate(flags) || policy::disabled() {
+        return call(flags);
     }
-    unsafe { libc::openat(dirfd, path, flags, mode as c_int) }
+    match join_dirfd(dirfd, &cstr_to_string(path)) {
+        Ok(p) => policy::write_open("openat", flags, || policy::OpenTarget::Path(p), call),
+        Err((raw, failure)) => {
+            let rc = call(flags);
+            policy::write_open_unresolved("openat", &raw, failure, rc);
+            rc
+        }
+    }
 }
 
 /// Replacement for `mkdir(2)`. Captures directory-create
@@ -763,6 +852,14 @@ static INTERPOSE_UNLINK: InterposeEntry = InterposeEntry {
 static INTERPOSE_UNLINKAT: InterposeEntry = InterposeEntry {
     replacement: my_unlinkat as *const c_void,
     target: libc::unlinkat as *const c_void,
+};
+
+/// L5: `rmdir`.
+#[used]
+#[unsafe(link_section = "__DATA,__interpose")]
+static INTERPOSE_RMDIR: InterposeEntry = InterposeEntry {
+    replacement: my_rmdir as *const c_void,
+    target: libc::rmdir as *const c_void,
 };
 
 #[used]
@@ -1450,6 +1547,7 @@ mod tests {
                 assert_eq!(which_arg, "path");
                 assert_eq!(Path::new(attempted_path), candidate);
             }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -1465,6 +1563,7 @@ mod tests {
         let entries: &[&InterposeEntry] = &[
             &INTERPOSE_UNLINK,
             &INTERPOSE_UNLINKAT,
+            &INTERPOSE_RMDIR,
             &INTERPOSE_RENAME,
             &INTERPOSE_RENAMEAT,
             &INTERPOSE_OPEN,
@@ -1503,7 +1602,7 @@ mod tests {
         ];
         assert_eq!(
             entries.len(),
-            29,
+            30,
             "M07.A.2 + M07.B.1..5 + M03.x.SETATTR + M03.x.LINK + M03.x.CREATE interposer count"
         );
         for e in entries {
@@ -1511,5 +1610,165 @@ mod tests {
             assert!(!e.target.is_null());
             assert_ne!(e.replacement, e.target);
         }
+    }
+}
+
+/// #222: renameat with a real dirfd keys both names to that directory
+/// and keeps `from\tto` on the wire when the destination exists.
+#[cfg(test)]
+mod rename_wire_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn renameat_with_real_dirfd_over_existing_file_keeps_from_and_to() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join(".alpha.txt.X"), b"new").unwrap();
+        std::fs::write(dir.join("alpha.txt"), b"old").unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let from = CString::new(".alpha.txt.X").unwrap();
+        let to = CString::new("alpha.txt").unwrap();
+        let mut rc = -1;
+        let notes = policy::test_capture::capture(|| {
+            rc = unsafe {
+                my_renameat(dfd.as_raw_fd(), from.as_ptr(), dfd.as_raw_fd(), to.as_ptr())
+            };
+        });
+        assert_eq!(rc, 0);
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "renameat")
+            .expect("renameat notification");
+        let want_to = dir.join("alpha.txt");
+        assert_eq!(
+            n.arg,
+            format!(
+                "{}\t{}",
+                dir.join(".alpha.txt.X").display(),
+                want_to.display()
+            )
+        );
+        let pre = n.pre_image.as_ref().expect("destination pre-image");
+        assert_eq!(pre.path, want_to.to_str().unwrap());
+        assert_eq!(pre.bytes, b"old");
+    }
+
+    /// Review of #232, item 7: an openat whose dirfd cannot be resolved
+    /// is reported only after the call succeeded. A bad dirfd fails with
+    /// EBADF, so nothing is sent and errno is the call's.
+    #[test]
+    fn unresolved_openat_that_fails_sends_nothing() {
+        let name = CString::new("never").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let fd = unsafe {
+                rust_shim_openat(
+                    987_654,
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT,
+                    0o644,
+                )
+            };
+            assert_eq!(fd, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review of #232 round 2, item 8: a muted shim reports neither a
+    /// removal nor an unresolved unlinkat.
+    #[test]
+    fn muted_rmdir_and_unresolved_unlinkat_send_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let p = CString::new(dir.join("d").to_str().unwrap()).unwrap();
+        let name = CString::new("x").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            policy::test_mute::with_muted(|| {
+                assert_eq!(unsafe { my_rmdir(p.as_ptr()) }, 0);
+                unsafe { my_unlinkat(987_654, name.as_ptr(), 0) };
+            });
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    /// Review of #232 round 2, item 6: unlinking a symlink is keyed to the
+    /// link, never its target.
+    #[test]
+    fn unlinkat_of_a_symlink_is_keyed_to_the_link() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("target"), b"t").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("link").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), 0) }, 0);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "unlinkat")
+            .expect("unlinkat");
+        assert_eq!(n.arg, dir.join("link").to_str().unwrap());
+        assert!(n.pre_image.is_none(), "{n:#?}");
+        assert!(dir.join("target").exists());
+    }
+
+    #[test]
+    fn unlinkat_with_real_dirfd_is_keyed_to_that_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("f"), b"bytes").unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("f").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), 0) }, 0);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "unlinkat")
+            .expect("unlinkat");
+        let want = dir.join("f");
+        assert_eq!(n.arg, want.to_str().unwrap());
+        assert_eq!(n.pre_image.as_ref().unwrap().bytes, b"bytes");
+    }
+
+    #[test]
+    fn unlinkat_removedir_of_a_non_empty_dir_sends_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("full")).unwrap();
+        std::fs::write(dir.join("full/f"), b"f").unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        let name = CString::new("full").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let rc = unsafe { my_unlinkat(dfd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            assert_eq!(rc, -1);
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
+    }
+
+    #[test]
+    fn rmdir_notifies_after_it_succeeds_with_its_pre_call_stat() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(dir.join("d")).unwrap();
+        let p = CString::new(dir.join("d").to_str().unwrap()).unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(unsafe { my_rmdir(p.as_ptr()) }, 0);
+        });
+        let n = notes.iter().find(|n| n.syscall == "rmdir").expect("rmdir");
+        assert_eq!(n.arg, dir.join("d").to_str().unwrap());
+        assert!(
+            n.pre_stat
+                .as_ref()
+                .is_some_and(|s| s.mode & 0o170000 == 0o040000)
+        );
+        assert!(!dir.join("d").exists());
     }
 }

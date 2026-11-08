@@ -1174,6 +1174,8 @@ fn dispatch_response(
                 seq: command_seq,
             };
             watch_ready.mark_ready(cmd);
+            // L5: from now on the shim may leave Creates to the kernel tier.
+            live_baseline.confirm_command_watch(cmd, crate::server::next_ts());
             tracing::debug!(%session, command_seq, "WatchTreeReady routed");
         }
         HelperResponse::WatchTreeFailed {
@@ -1186,6 +1188,10 @@ fn dispatch_response(
                 seq: command_seq,
             };
             watch_ready.mark_failed(cmd, reason.clone());
+            // L5: not watched, so the shim's Creates there are journaled.
+            if live_baseline.forget_command_watch(cmd) {
+                journal_lost_deferred_creates(index, cmd);
+            }
             tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
             if strict_capture {
                 journal_capture_refused_or_log(
@@ -1206,6 +1212,12 @@ fn dispatch_response(
             // the WatchReadyMap. Default mode logs it; strict mode journals
             // it so the planner refuses the command's undo.
             let cmd = CommandId { session, seq };
+            // L5: a whole-command observation (no capture tier, or the
+            // attach failed) means nothing watches it: the shim's Creates
+            // there are journaled.
+            if path.is_none() && live_baseline.forget_command_watch(cmd) {
+                journal_lost_deferred_creates(index, cmd);
+            }
             if strict_capture {
                 tracing::warn!(%session, seq, ?path, %detail, "helper capture refusal (strict; journaling)");
                 journal_capture_refused_or_log(index, cmd, path.map(PathBuf::from), detail);
@@ -1260,6 +1272,18 @@ pub(crate) fn journal_capture_refused(
     path: Option<PathBuf>,
     detail: String,
 ) -> Result<(), shit_store::IndexError> {
+    journal_refusal(index, command, path, "capture-incomplete", detail)
+}
+
+/// [`journal_capture_refused`] with an explicit refusal class. A missing
+/// `path` (command-scoped refusal) uses the command's cwd.
+pub(crate) fn journal_refusal(
+    index: &Index,
+    command: CommandId,
+    path: Option<PathBuf>,
+    class: &str,
+    detail: String,
+) -> Result<(), shit_store::IndexError> {
     let path = path
         .or_else(|| {
             <Index as shit_planner::PlannerStore>::command_by_id(index, command)
@@ -1272,12 +1296,30 @@ pub(crate) fn journal_capture_refused(
         ts: crate::server::next_ts(),
         partial: false,
         kind: CaptureEventKind::CaptureRefused {
-            class: "capture-incomplete".to_string(),
+            class: class.to_string(),
             path,
             detail,
         },
     };
     index.put_event(&event).map(|_| ())
+}
+
+/// L5 (review of #232 round 2, item 2): the shim left Creates to the
+/// kernel tier for `command`, then the helper said it cannot watch it.
+/// Those notes are gone and the kernel tier may not have the Creates
+/// either, so the command gets a loud capture-gap refusal in every mode.
+fn journal_lost_deferred_creates(index: &Index, command: CommandId) {
+    if let Err(e) = journal_refusal(
+        index,
+        command,
+        None,
+        shit_planner::COMMAND_CAPTURE_GAP,
+        "the shim left file creations to the kernel tier, which then stopped watching this \
+         command; some files it created may not be removed by undo"
+            .to_string(),
+    ) {
+        tracing::error!(error = %e, %command, "lost-deferred-creates refusal journal failed");
+    }
 }
 
 /// R3 slice B — the daemon received a capture event and could not
@@ -2281,6 +2323,166 @@ mod tests_dispatch {
         assert!(rows[0].1.contains("no Linux capture tier"));
     }
 
+    /// L5 (review round 4, item 2): a command the helper cannot watch
+    /// (attach failed, or no capture tier) is not watched, so the shim's
+    /// Creates there are journaled; a per-path observation changes
+    /// nothing.
+    #[test]
+    fn unwatchable_command_drops_its_watch_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(5),
+            seq: 2,
+        };
+        let index = index_with_command(dir.path(), cmd);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let waiters = PrivOpWaiters::default();
+        let lb = crate::baseline::LiveBaseline::new();
+        let f = std::path::Path::new("/tmp/watched/f");
+        let send = |resp| {
+            dispatch_response(
+                resp, None, &index, &blobs, &map, &lb, "bpf-lsm", &waiters, false,
+            )
+        };
+        lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
+        send(HelperResponse::CaptureRefused {
+            session: cmd.session,
+            seq: cmd.seq,
+            path: Some("/tmp/watched/f".into()),
+            detail: "one path".into(),
+        });
+        assert!(lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
+        send(HelperResponse::WatchTreeFailed {
+            session: cmd.session,
+            command_seq: cmd.seq,
+            reason: "attach failed".into(),
+        });
+        assert!(!lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
+        lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
+        send(HelperResponse::CaptureRefused {
+            session: cmd.session,
+            seq: cmd.seq,
+            path: None,
+            detail: "no Linux capture tier is active".into(),
+        });
+        assert!(!lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
+    }
+
+    /// Review of #232 round 2, item 2: the shim left a Create to the
+    /// kernel tier, then the helper failed the watch. In default mode the
+    /// command still gets a loud capture-gap refusal.
+    #[test]
+    fn watch_failure_after_a_deferred_create_journals_a_capture_gap() {
+        for failure in [
+            HelperResponse::WatchTreeFailed {
+                session: Uuid::from_u128(6),
+                command_seq: 1,
+                reason: "lost the mark".into(),
+            },
+            HelperResponse::CaptureRefused {
+                session: Uuid::from_u128(6),
+                seq: 1,
+                path: None,
+                detail: "no Linux capture tier is active".into(),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cmd = CommandId {
+                session: Uuid::from_u128(6),
+                seq: 1,
+            };
+            let index = index_with_command(dir.path(), cmd);
+            let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+            let map = crate::watch_ready::WatchReadyMap::new();
+            let waiters = PrivOpWaiters::default();
+            let lb = crate::baseline::LiveBaseline::new();
+            lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
+            dispatch_response(
+                HelperResponse::WatchTreeReady {
+                    session: cmd.session,
+                    command_seq: cmd.seq,
+                },
+                None,
+                &index,
+                &blobs,
+                &map,
+                &lb,
+                "bpf-lsm",
+                &waiters,
+                false,
+            );
+            assert!(lb.defer_create_to_kernel(
+                cmd,
+                std::path::Path::new("/tmp/watched/new"),
+                crate::server::next_ts()
+            ));
+            dispatch_response(
+                failure, None, &index, &blobs, &map, &lb, "bpf-lsm", &waiters, false,
+            );
+            let kinds: Vec<_> = index
+                .events_for_command(cmd)
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == shit_planner::COMMAND_CAPTURE_GAP
+                ),
+                "{kinds:#?}"
+            );
+        }
+    }
+
+    /// Review of #232 medium review, item 3: the helper's failure for N
+    /// arrives after the session moved on to N+1. N's watch is still
+    /// known, so the deferred Creates are reported, not lost silently.
+    #[test]
+    fn late_watch_failure_after_the_next_command_still_journals_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = CommandId {
+            session: Uuid::from_u128(12),
+            seq: 1,
+        };
+        let index = index_with_command(dir.path(), n);
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let map = crate::watch_ready::WatchReadyMap::new();
+        let waiters = PrivOpWaiters::default();
+        let lb = crate::baseline::LiveBaseline::new();
+        lb.record_command_watch(n, PathBuf::from("/tmp/watched"));
+        lb.confirm_command_watch(n, shit_planner::time::TimePoint::new(1, 0));
+        assert!(lb.defer_create_to_kernel(
+            n,
+            std::path::Path::new("/tmp/watched/new"),
+            shit_planner::time::TimePoint::new(2, 0)
+        ));
+        lb.close_command_watch(n, shit_planner::time::TimePoint::new(3, 0));
+        lb.record_command_watch(CommandId { seq: 2, ..n }, PathBuf::from("/tmp/watched"));
+        dispatch_response(
+            HelperResponse::WatchTreeFailed {
+                session: n.session,
+                command_seq: n.seq,
+                reason: "late".into(),
+            },
+            None,
+            &index,
+            &blobs,
+            &map,
+            &lb,
+            "bpf-lsm",
+            &waiters,
+            false,
+        );
+        assert!(
+            index
+                .events_for_command(n)
+                .iter()
+                .any(|e| matches!(&e.kind, CaptureEventKind::CaptureRefused { .. })),
+            "deferred Creates must be reported"
+        );
+    }
+
     #[tokio::test]
     async fn capture_refused_does_not_change_readiness() {
         let dir = tempfile::tempdir().unwrap();
@@ -2533,6 +2735,106 @@ mod tests_dispatch {
         // lifetime. Test-only; OS reclaims on process exit.
         std::mem::forget(dir);
         f.into()
+    }
+
+    /// Review of #232 medium review, item 1, through the real ingest
+    /// paths and clock. The shim's gap note for an open is stamped first
+    /// (before the write runs); the kernel tier's capture of the same open
+    /// is stamped on receipt, after it. A capture of the file as it was
+    /// before the command (old mtime) covers the gap. A capture taken
+    /// after the gapped write (fresh mtime) does not.
+    #[test]
+    fn kernel_capture_of_the_same_open_covers_the_shims_gap() {
+        use std::os::unix::fs::MetadataExt;
+        for (age_secs, want_refusals) in [(3600u64, 0usize), (0, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let cmd = CommandId {
+                session: Uuid::from_u128(77),
+                seq: 1,
+            };
+            let index = index_with_command(dir.path(), cmd);
+            let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+            let big = dir.path().canonicalize().unwrap().join("big.bin");
+            let bytes = b"bytes the kernel tier captured";
+            std::fs::write(&big, bytes).unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&big)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            let m = std::fs::metadata(&big).unwrap();
+
+            let gap = shit_proto::ShimNotification {
+                pid: 1,
+                syscall: "open".into(),
+                arg: big.to_str().unwrap().into(),
+                ts_unix_nanos: 0,
+                pre_image: None,
+                extra_pre_images: Vec::new(),
+                failure: Some(shit_proto::ShimFailure::PreImageUncaptured {
+                    path: big.to_str().unwrap().into(),
+                    reason: "over the shim's inline pre-image cap".into(),
+                }),
+                pre_stat: None,
+            };
+            crate::shim_listener::ingest_notification(
+                &gap,
+                Some(cmd),
+                crate::server::next_ts(),
+                None,
+                &index,
+                &blobs,
+                &crate::baseline::LiveBaseline::new(),
+            );
+            let (canonical, _) = blobs.put(bytes).unwrap();
+            handle_captured_pre_image(
+                CapturedPreImageArgs {
+                    session: cmd.session,
+                    seq: cmd.seq,
+                    dev: m.dev(),
+                    inode: m.ino(),
+                    path: Some(big.to_str().unwrap().into()),
+                    blob_hash: *canonical.as_bytes(),
+                    stored_bytes: bytes.len() as u64,
+                    post_content_hash: None,
+                    mode: m.mode(),
+                    uid: m.uid(),
+                    gid: m.gid(),
+                    mtime_unix_nanos: i128::from(m.mtime()) * 1_000_000_000
+                        + i128::from(m.mtime_nsec()),
+                    xattrs: std::collections::BTreeMap::new(),
+                    flags: 0,
+                    is_delete: false,
+                    staging: tmp_staging_fd(bytes),
+                },
+                &index,
+                &blobs,
+                "bpf-lsm",
+            )
+            .unwrap();
+            let events = index.events_for_command(cmd);
+            let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, cmd).unwrap();
+            let plan = shit_planner::plan(
+                record,
+                &events,
+                &shit_planner::LiveStateProbe::new(),
+                &index,
+            );
+            let refusals = plan
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(&n.op, shit_planner::InverseOp::Refuse { class, .. } if class == "capture-gap")
+                })
+                .count();
+            assert_eq!(
+                refusals, want_refusals,
+                "age {age_secs}s: {:#?}",
+                plan.nodes
+            );
+        }
     }
 
     #[test]

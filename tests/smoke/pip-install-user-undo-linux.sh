@@ -96,7 +96,8 @@ EOF
 PIP_FLAGS="--user --no-build-isolation --quiet"
 # PEP 668 (Ubuntu 24.04): system Python is externally managed; pip
 # refuses --user without an opt-in. CI smoke uses the opt-in flag.
-if "${PIP_BIN}" install --help 2>&1 | grep -q -- "--break-system-packages"; then
+PIP_HELP="$("${PIP_BIN}" install --help 2>&1 || true)"
+if [[ "${PIP_HELP}" == *--break-system-packages* ]]; then
     PIP_FLAGS="${PIP_FLAGS} --break-system-packages"
 fi
 
@@ -129,6 +130,15 @@ INSTALLED_MOD="${PY_USER_SITE}/${MOD_NAME}.py"
 [ -f "${INSTALLED_MOD}" ] || smoke_fail "module file not found at ${INSTALLED_MOD}"
 V1_SHA="$(sha256sum "${INSTALLED_MOD}" | awk '{print $1}')"
 smoke_log "pre-state: v1 module at ${INSTALLED_MOD}, sha=${V1_SHA:0:16}..."
+
+# L5: the whole ~/.local tree (names, kinds, modes, bytes), so Outcome A
+# can also require that nothing of v2 is left beside v1.
+tree_snapshot() {
+    ( cd "${HOME}/.local" \
+        && find . -print0 | sort -z | xargs -0 stat -c '%a %F %n' \
+        && find . -type f -print0 | sort -z | xargs -0 sha256sum )
+}
+tree_snapshot > "${SHIT_SMOKE_TMP}/tree-before.txt"
 
 # v2 source + version bump.
 cat > "${PKG_DIR}/${MOD_NAME}.py" <<'EOF'
@@ -169,7 +179,9 @@ if [ "${PIP_RC}" -ne 0 ]; then
     smoke_fail "pip install --force-reinstall (v2) exited rc=${PIP_RC}"
 fi
 
-V2_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
+# No bytecode writes from the check itself: they are outside the
+# command and would sit in ~/.local beside what undo restores.
+V2_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
 if [ "${V2_OUTPUT}" != "hello pip v2" ]; then
     smoke_log "pip-v2.log (last 50 lines):"
     tail -50 "${SHIT_SMOKE_TMP}/pip-v2.log" | sed 's/^/    /' >&2
@@ -219,10 +231,23 @@ if [ ! -f "${INSTALLED_MOD}" ]; then
     smoke_fail "${INSTALLED_MOD} missing post-undo — undo unlinked instead of restoring"
 fi
 
-POST_OUTPUT="$(SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
+# Snapshot before running the script: running it could write
+# __pycache__ entries undo never saw.
+tree_snapshot > "${SHIT_SMOKE_TMP}/tree-after.txt"
+POST_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 SHIT_DURING_UNDO=1 "${INSTALLED_BIN}")"
 POST_SHA="$(sha256sum "${INSTALLED_MOD}" | awk '{print $1}')"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
+
+TREE_SAME=1
+if ! diff "${SHIT_SMOKE_TMP}/tree-before.txt" "${SHIT_SMOKE_TMP}/tree-after.txt" > "${SHIT_SMOKE_TMP}/tree.diff"; then
+    TREE_SAME=0
+    smoke_log "~/.local differs from the pre-state after undo:"
+    sed 's/^/    /' "${SHIT_SMOKE_TMP}/tree.diff" >&2
+fi
+if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ] && [ "${TREE_SAME}" != "1" ]; then
+    smoke_fail "SHIT_REQUIRE_OUTCOME_A=1: ~/.local does not match the pre-state"
+fi
 
 # Outcome A — full undo (v1 module restored byte-identical)
 if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; then
@@ -231,9 +256,9 @@ if [ "${POST_SHA}" = "${V1_SHA}" ] && [ "${POST_OUTPUT}" = "hello pip v1" ]; the
     exit 0
 fi
 
-# SHIT_REQUIRE_OUTCOME_A=1 makes Outcome A the only pass. No job sets it:
-# the rule that reached Outcome A here was taken out of PR #205 and moved
-# to sprint L5. Outcome B (loud refusal) is the accepted result for now.
+# SHIT_REQUIRE_OUTCOME_A=1 makes Outcome A the only pass. Without it the
+# smoke still accepts Outcome B (loud refusal) on hosts where the shim
+# cannot see pip's writes.
 if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
     smoke_log "SHIT_REQUIRE_OUTCOME_A=1: Outcome B not accepted"
     smoke_log "  undo exit:    ${UNDO_RC}"

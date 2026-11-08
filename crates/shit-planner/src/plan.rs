@@ -123,6 +123,8 @@ pub fn plan(
         crate::plan_forward::paired_flags_shim_events(&chronological)
     };
 
+    class.dropped_events.extend(covered_capture_gaps(&live));
+
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
     }
@@ -139,6 +141,67 @@ pub fn plan(
         warnings,
     }
 }
+
+/// L5 (review of #232, item 2): a shim capture-gap marker for `P` says
+/// the shim could not read `P` before a write. Another tier may have:
+/// when the command journaled a content pre-image of `P` that the shim
+/// did not capture, undo restores the earliest pre-image of `P`
+/// whichever open it came from, so the gap is covered and its refusal
+/// is dropped. Otherwise the refusal stands.
+///
+/// Which pre-image covers which gap. Undo restores the earliest
+/// pre-image of a path, so only that one is weighed. It covers the gap
+/// when it holds the file's state from before the gapped write:
+///
+/// - it was journaled no later than the gap (an earlier open captured
+///   the pre-command bytes), or
+/// - (review of #232 medium review, item 1) its captured mtime is more
+///   than [`GAP_MTIME_MARGIN_NANOS`] older than the daemon's wall clock
+///   when it stamped the gap. The shim's note is stamped before the
+///   write runs, while a kernel tier's capture of the same open is
+///   stamped later, on receipt, so journal order cannot pair them. The
+///   gapped write sets the file's mtime to a time after the gap was
+///   stamped, so a capture taken after that write never passes. The
+///   margin absorbs coarse filesystem timestamps; a file modified
+///   within it just before the command keeps its refusal.
+fn covered_capture_gaps(live: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let mut earliest: std::collections::HashMap<&Path, (crate::time::TimePoint, i128)> =
+        std::collections::HashMap::new();
+    for e in live {
+        if let CaptureEventKind::FilePreImage {
+            path, source, meta, ..
+        } = &e.kind
+            && source.has_content()
+            && !source.is_shim()
+        {
+            let this = (e.ts, meta.mtime_unix_nanos);
+            earliest
+                .entry(path.as_path())
+                .and_modify(|cur| {
+                    if this.0 < cur.0 {
+                        *cur = this;
+                    }
+                })
+                .or_insert(this);
+        }
+    }
+    live.iter()
+        .filter(|e| match &e.kind {
+            CaptureEventKind::CaptureRefused { class, path, .. } if class == "capture-gap" => {
+                earliest.get(path.as_path()).is_some_and(|(ts, mtime)| {
+                    let stamped = i128::from(e.ts.wallclock_unix_nanos);
+                    *ts <= e.ts
+                        || (stamped > 0 && *mtime > 0 && *mtime + GAP_MTIME_MARGIN_NANOS < stamped)
+                })
+            }
+            _ => false,
+        })
+        .map(|e| e.id)
+        .collect()
+}
+
+/// See [`covered_capture_gaps`].
+const GAP_MTIME_MARGIN_NANOS: i128 = 1_000_000_000;
 
 fn emit_unless_skipped(
     ev: &CaptureEvent,
@@ -831,6 +894,12 @@ struct EntryHistory {
     moved_from: Option<PathBuf>,
     /// Content pre-images taken at its path, once there.
     pre_images: Vec<crate::events::EventId>,
+    /// One of them is a trusted pre-mutation snapshot: the entry existed
+    /// before the command whatever the Create says.
+    trusted_pre_image: bool,
+    /// L5: an ancestor directory's journaled rename carried it to its
+    /// current path (it has no rename of its own for that move).
+    carried: bool,
     /// Its unlinks, with the kind each reports. More than one tier can
     /// report the same unlink: the shim's with the (0, 0) inode sentinel
     /// is not merged with the helper's by `journal_unlink_idempotent`.
@@ -875,6 +944,7 @@ impl Provenance {
                 CaptureEventKind::FilePreImage { path, source, .. } if source.has_content() => {
                     if let Some(h) = live.get_mut(path) {
                         h.pre_images.push(ev.id);
+                        h.trusted_pre_image |= source.is_trusted_pre_mutation();
                     }
                 }
                 CaptureEventKind::TreeOp(
@@ -925,10 +995,11 @@ impl Provenance {
                         .filter(|k| k != from)
                         .collect();
                     for k in under {
-                        if let (Some(h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from))
-                            && let Some(old) = live.insert(to.join(rel), h)
-                        {
-                            out.finish(old);
+                        if let (Some(mut h), Ok(rel)) = (live.remove(&k), k.strip_prefix(from)) {
+                            h.carried = true;
+                            if let Some(old) = live.insert(to.join(rel), h) {
+                                out.finish(old);
+                            }
                         }
                     }
                     let moved = match live.remove(from) {
@@ -976,7 +1047,18 @@ impl Provenance {
         };
         if h.born {
             // Nothing captured and nothing that was there before: scratch.
-            if h.pre_images.is_empty() {
+            // L5: so is a born entry that was renamed before its unlink
+            // (`echo > w/t; mv w/t w/x; rm -rf w`, pip's temp files): its
+            // pre-images are of bytes this command wrote. The transient
+            // rule covers that shape at one path, but not the reverse
+            // rename, which would hit a missing source.
+            // Review round 4, item 4: moved by its directory's rename
+            // counts as moved (`mkdir w; echo x > w/t; mv w w2; rm -rf
+            // w2`). Only its own events go; the directory's Rename is the
+            // directory's to decide.
+            let moved = !h.renames.is_empty() || h.carried;
+            if h.pre_images.is_empty() || (moved && !h.trusted_pre_image) {
+                self.dropped_events.extend(h.pre_images);
                 self.dropped_events.extend(h.creates);
                 self.dropped_events.extend(h.renames);
                 self.dropped_events
@@ -1666,12 +1748,26 @@ fn emit_for_event(
                 op: InverseOp::Refuse {
                     class: class.clone(),
                     reason: format!("capture incomplete for {}: {}", path.display(), detail),
-                    remediation: Some(
+                    remediation: Some(if class == crate::events::COMMAND_CAPTURE_GAP {
+                        // L5: the whole command, not one path.
+                        "shit could not capture some of this command's changes (the reason \
+                         is above), so undo cannot reverse them; check what the command \
+                         changed and undo those parts by hand."
+                            .to_string()
+                    } else if class == "capture-gap" {
+                        // L5: an existing file was written without its
+                        // bytes (over the inline cap, unreadable), or the
+                        // shim's notes could not be read at all.
+                        "shit could not capture this path's earlier state before the command \
+                         changed it (the reason is above); restore it from a backup if you \
+                         need it."
+                            .to_string()
+                    } else {
                         "Re-run the command from a directory whose parent path exists; \
                          shit cannot reverse this path because the shim could not resolve \
                          an absolute path to attribute the captured pre-image to."
-                            .to_string(),
-                    ),
+                            .to_string()
+                    }),
                 },
                 cohort: 0,
                 conflict: None,
@@ -2341,6 +2437,170 @@ mod tests {
             p.warnings
                 .iter()
                 .any(|w| matches!(w, PlanWarning::PartialEvents { dropped: 1 }))
+        );
+    }
+
+    /// Review of #232, item 2: a shim gap marker and, optionally, a
+    /// pre-image of the same path from `source`. Returns the plan's
+    /// capture-gap refusals.
+    fn capture_gap_refusals(pre: Option<crate::FilePreImageSource>) -> usize {
+        capture_gap_refusals_at(pre, 1)
+    }
+
+    /// The gap is stamped 2; the pre-image `pre_ts`.
+    fn capture_gap_refusals_at(pre: Option<crate::FilePreImageSource>, pre_ts: u64) -> usize {
+        capture_gap_refusals_wall(pre, pre_ts, 0)
+    }
+
+    /// As [`capture_gap_refusals_at`], with the gap's wall clock set to
+    /// `gap_wall`. The pre-image's captured mtime is 0 (unknown).
+    fn capture_gap_refusals_wall(
+        pre: Option<crate::FilePreImageSource>,
+        pre_ts: u64,
+        gap_wall: u64,
+    ) -> usize {
+        let mut probe = InMemoryProbe::new();
+        let mut store = InMemoryStore::new();
+        let inode = InodeRef::new(1, 5);
+        let blob = BlobHash::from_bytes([0xAB; 32]);
+        let path = PathBuf::from("/tmp/big.bin");
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(100),
+            },
+            None,
+        );
+        store.put_blob(blob, 50);
+        let command = CommandId {
+            session: Uuid::nil(),
+            seq: 1,
+        };
+        let mut events = vec![CaptureEvent {
+            id: EventId(2),
+            command,
+            ts: TimePoint::new(2, gap_wall),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-gap".into(),
+                path: path.clone(),
+                detail: "the file existed before the write".into(),
+            },
+        }];
+        if let Some(source) = pre {
+            events.push(CaptureEvent {
+                id: EventId(1),
+                command,
+                ts: TimePoint::new(pre_ts, 0),
+                partial: false,
+                kind: CaptureEventKind::FilePreImage {
+                    inode,
+                    path: path.clone(),
+                    blob,
+                    meta: meta(50),
+                    post_content_hash: None,
+                    source,
+                },
+            });
+        }
+        plan(dummy_command(), &events, &probe, &store)
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, InverseOp::Refuse { class, .. } if class == "capture-gap"))
+            .count()
+    }
+
+    /// Review of #232 medium review, item 6: a command-scoped refusal reads
+    /// as one about the command, not about one path's earlier state.
+    #[test]
+    fn command_capture_gap_has_command_level_wording() {
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: CommandId {
+                session: Uuid::nil(),
+                seq: 1,
+            },
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: crate::events::COMMAND_CAPTURE_GAP.into(),
+                path: PathBuf::from("/tmp"),
+                detail: "a shim from an older version".into(),
+            },
+        };
+        let p = plan(
+            dummy_command(),
+            &[ev],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        let [node] = p.nodes.as_slice() else {
+            panic!("{:#?}", p.nodes);
+        };
+        let InverseOp::Refuse { remediation, .. } = &node.op else {
+            panic!("{node:#?}");
+        };
+        let text = remediation.as_deref().unwrap();
+        assert!(text.contains("this command's changes"), "{text}");
+        assert!(!text.contains("this path"), "{text}");
+    }
+
+    /// Low re-review of #232: a pre-image with an unknown mtime (0) taken
+    /// after the gap cannot show it predates the gapped write, so the
+    /// refusal stands.
+    #[test]
+    fn unknown_mtime_does_not_cover_a_later_gap() {
+        assert_eq!(
+            capture_gap_refusals_wall(
+                Some(crate::FilePreImageSource::Other),
+                3,
+                1_800_000_000_000_000_000,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn kernel_tier_pre_image_covers_a_shim_capture_gap() {
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::Other)),
+            0
+        );
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::EsAuthPreMutation)),
+            0
+        );
+    }
+
+    /// Review of #232 round 2, item 3: `open(O_TRUNC)` the shim could not
+    /// capture (gap at 2), then a later rewrite the kernel tier captured
+    /// (pre-image at 5, of the already-truncated file). The later bytes
+    /// are not the pre-command state: the refusal stands.
+    #[test]
+    fn a_kernel_pre_image_after_the_gap_does_not_cover_it() {
+        assert_eq!(
+            capture_gap_refusals_at(Some(crate::FilePreImageSource::Other), 5),
+            1
+        );
+        assert_eq!(
+            capture_gap_refusals_at(Some(crate::FilePreImageSource::Other), 2),
+            0
+        );
+    }
+
+    #[test]
+    fn capture_gap_stands_when_no_other_tier_captured_the_path() {
+        assert_eq!(capture_gap_refusals(None), 1);
+        // A shim pre-image of the path (another open, or the rename walk)
+        // is no evidence the gapped write was covered.
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::ShimPreMutation)),
+            1
+        );
+        assert_eq!(
+            capture_gap_refusals(Some(crate::FilePreImageSource::ShimRenameSubtree)),
+            1
         );
     }
 

@@ -76,7 +76,8 @@ count_in_log() {
         | awk '{s+=$1} END {print s+0}'
 }
 
-opens="$(count_in_log open)"
+# L5: a create is reported after it succeeds, as `open_create`.
+opens="$(count_in_log "open(_create)?")"
 unlinks="$(count_in_log unlink)"
 smoke_log "shim notifications: open=${opens} unlink=${unlinks}"
 

@@ -171,12 +171,13 @@ pub struct ShimNotification {
     /// rejected by name.
     #[serde(default)]
     pub failure: Option<ShimFailure>,
-    /// The target's lstat before the call, for `unlink`/`unlinkat`
-    /// (L4b; the same field L5 adds for `rmdir`). Lets the daemon
-    /// journal the removed entry's identity, so the shim's report and
-    /// the kernel tier's report of one removal pair exactly. Adding it
-    /// changed the frame shape; [`crate::SHIM_WIRE_VERSION`] says so
-    /// (the serde default does not help a postcard decoder).
+    /// The target's lstat before the call. Sent for `unlink`/`unlinkat`
+    /// (L4b), so the shim's report and the kernel tier's report of one
+    /// removal pair exactly; for removals the shim reports after they
+    /// succeed (`rmdir`, `unlinkat(AT_REMOVEDIR)`), when the daemon has
+    /// nothing left to stat; and for a rename's destination when it is a
+    /// symlink, so undo can recreate the link (L5). Adding it changed the
+    /// frame shape; [`crate::SHIM_WIRE_VERSION`] says so.
     #[serde(default)]
     pub pre_stat: Option<ShimStat>,
 }
@@ -187,8 +188,8 @@ pub struct ShimStat {
     pub dev: u64,
     pub inode: u64,
     pub mode: u32,
-    /// L4b - the link's target, read before the call, when the entry is
-    /// a symlink. `None` for other kinds, or when readlink failed.
+    /// The link's target, read before the call, when the entry is a
+    /// symlink. `None` for other kinds, or when readlink failed.
     pub link_target: Option<String>,
 }
 
@@ -222,6 +223,11 @@ pub enum ShimFailure {
         attempted_path: String,
         error_chain: String,
     },
+    /// L5 — a write-capable open or truncate of a file that existed
+    /// before the call, whose bytes the shim could not capture (over the
+    /// inline cap, unreadable, or its prior state unknown). The daemon
+    /// journals a refusal and never a Create for it.
+    PreImageUncaptured { path: String, reason: String },
 }
 
 /// Ack the daemon sends back. S24.D.2 ships `Allow` only; the broader
@@ -313,6 +319,29 @@ mod tests {
             }
             _ => panic!("expected CanonicalizeFailed"),
         }
+    }
+
+    /// `pre_stat` survives the shim wire.
+    #[test]
+    fn shim_notification_with_pre_stat_round_trips() {
+        let n = ShimNotification {
+            pid: 1,
+            syscall: "rmdir".into(),
+            arg: "/tmp/d".into(),
+            ts_unix_nanos: 0,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: Some(ShimStat {
+                dev: 1,
+                inode: 2,
+                mode: 0o040700,
+                link_target: None,
+            }),
+        };
+        let frame = encode_frame(&n).expect("encode");
+        let decoded: ShimNotification = decode_frame(&frame).expect("decode");
+        assert_eq!(decoded, n);
     }
 
     /// M07.B.4.1 — pin the xattr-pre-image wire shape on the
@@ -471,5 +500,14 @@ mod tests {
             decode_shim_frame::<ShimNotification>(&old),
             Err(DecodeError::UnsupportedVersion(1))
         ));
+        // A version-2 frame (#223's shim, before PreImageUncaptured) is
+        // refused by name too.
+        let mut v2 = frame.clone();
+        v2[4] = 2;
+        assert!(matches!(
+            decode_shim_frame::<ShimNotification>(&v2),
+            Err(DecodeError::UnsupportedVersion(2))
+        ));
+        assert_eq!(SHIM_WIRE_VERSION, 3);
     }
 }

@@ -6,12 +6,16 @@ use serde::de::DeserializeOwned;
 pub const WIRE_VERSION: u8 = 1;
 
 /// Version byte of shim -> daemon notification frames
-/// ([`crate::ShimNotification`]). 2 since trailing fields were added
-/// that a version-1 decoder cannot read (postcard is not
-/// self-describing): `pre_stat` (L4b) and L5's fields. A daemon rejects
-/// any other version by name; shells started before an upgrade keep the
-/// old shim loaded until they restart. Full version negotiation is #225.
-pub const SHIM_WIRE_VERSION: u8 = 2;
+/// ([`crate::ShimNotification`]). postcard is not self-describing, so
+/// every change a decoder cannot read gets a new version:
+/// 2 added `pre_stat` with `link_target` (L4b, #223);
+/// 3 added the `ShimFailure::PreImageUncaptured` variant (L5, #232), which
+/// a version-2 daemon cannot decode.
+/// A daemon acks a frame of another version, journals a capture-gap
+/// refusal for the sender's command and drops it; shells started before
+/// an upgrade keep the old shim loaded until they restart. Full version
+/// negotiation is #225.
+pub const SHIM_WIRE_VERSION: u8 = 3;
 
 /// Maximum frame size (including length prefix). Frames over this are
 /// rejected on the decode side and never produced on the encode side.
