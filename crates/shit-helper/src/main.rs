@@ -3570,9 +3570,9 @@ mod dirfd {
                 };
             }
         }
-        // umask(0) so the 0 permission bits are exact; the IPC arm is
-        // single-threaded.
-        let prev_umask = unsafe { libc::umask(0) };
+        // Permission bits 0: the umask can only clear bits, so it needs no
+        // change (a process-wide umask(0) would race with capture threads
+        // creating staging files). The fchmod step below sets the mode.
         let rc = unsafe {
             libc::mknodat(
                 parent.as_raw_fd(),
@@ -3581,7 +3581,6 @@ mod dirfd {
                 rdev as libc::dev_t,
             )
         };
-        unsafe { libc::umask(prev_umask) };
         if rc != 0 {
             let e = errno();
             return match e.raw_os_error() {
