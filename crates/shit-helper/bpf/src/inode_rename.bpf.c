@@ -67,7 +67,7 @@ int BPF_PROG(shit_inode_rename,
     /* AR00.5 ancestry — see inode_unlink.bpf.c for rationale. */
     struct task_struct *__t = (struct task_struct *)bpf_get_current_task();
     struct task_struct *__parent = BPF_CORE_READ(__t, real_parent);
-    e->hdr.parent_pid = BPF_CORE_READ(__parent, tgid);
+    shit_fill_ancestry(&e->hdr, __parent);
 
     /* Target identity — invariant across rename. */
     struct inode *target = BPF_CORE_READ(old_dentry, d_inode);
