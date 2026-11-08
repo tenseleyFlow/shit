@@ -367,14 +367,15 @@ unsafe extern "C" fn rust_shim_openat(
     // (#231 tracks routing this through the dirfd target the other
     // platforms use.)
     let call = |f| unsafe { libc::openat(dirfd, path, f, mode as c_int) };
-    if !(policy::is_write_open(flags) || flags & libc::O_CREAT != 0) || policy::disabled() {
+    if !policy::open_may_mutate(flags) || policy::disabled() {
         return call(flags);
     }
     match join_dirfd(dirfd, &cstr_to_string(path)) {
         Ok(p) => policy::write_open("openat", flags, || policy::OpenTarget::Path(p), call),
         Err((raw, failure)) => {
-            policy::notify_unresolved("openat", &raw, failure);
-            call(flags)
+            let rc = call(flags);
+            policy::write_open_unresolved("openat", &raw, failure, rc);
+            rc
         }
     }
 }
@@ -1643,6 +1644,30 @@ mod rename_wire_tests {
         let pre = n.pre_image.as_ref().expect("destination pre-image");
         assert_eq!(pre.path, want_to.to_str().unwrap());
         assert_eq!(pre.bytes, b"old");
+    }
+
+    /// Review of #232, item 7: an openat whose dirfd cannot be resolved
+    /// is reported only after the call succeeded. A bad dirfd fails with
+    /// EBADF, so nothing is sent and errno is the call's.
+    #[test]
+    fn unresolved_openat_that_fails_sends_nothing() {
+        let name = CString::new("never").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let fd = unsafe {
+                rust_shim_openat(
+                    987_654,
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT,
+                    0o644,
+                )
+            };
+            assert_eq!(fd, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        });
+        assert!(notes.is_empty(), "{notes:#?}");
     }
 
     #[test]

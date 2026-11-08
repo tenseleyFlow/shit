@@ -743,6 +743,25 @@ mod policy {
         notify_inner_with_failure(syscall, arg, None, Some(failure), false);
     }
 
+    /// L5 (review of #232, item 7): a write-capable open whose target
+    /// could not be keyed (macOS: F_GETPATH failed on the dirfd). The
+    /// call runs first; only a successful open is reported, with the
+    /// marker and the raw name, and only when the shim is not muted,
+    /// re-entered, or looking at a skipped path. The daemon refuses the
+    /// relative name rather than journaling it.
+    #[cfg(target_os = "macos")]
+    pub fn write_open_unresolved(
+        syscall: &'static str,
+        raw: &str,
+        failure: shit_proto::ShimFailure,
+        rc: libc::c_int,
+    ) {
+        if rc < 0 || idle(raw) {
+            return;
+        }
+        with_saved_errno(|| notify_unresolved(syscall, raw, failure));
+    }
+
     /// B09 — notify a chflags-family mutation with a metadata-only
     /// pre-image. Unlike content capture this accepts directories,
     /// special files, unreadable files, and regular files above the
@@ -1217,13 +1236,22 @@ mod policy {
         if rc != 0 || IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }
-        let saved = std::io::Error::last_os_error();
-        let _ = try_notify_full(p.syscall, &p.path, None, Vec::new(), p.failure, p.stat);
+        with_saved_errno(|| {
+            let _ = try_notify_full(p.syscall, &p.path, None, Vec::new(), p.failure, p.stat);
+        });
         IN_NOTIFY.with(|f| f.set(false));
+    }
+
+    /// Run `f` (a notification after the real call) and put back the
+    /// errno the call set, so the caller sees the call's own result.
+    pub(crate) fn with_saved_errno<T>(f: impl FnOnce() -> T) -> T {
+        let saved = std::io::Error::last_os_error();
+        let out = f();
         if let Some(e) = saved.raw_os_error() {
             // SAFETY: errno is a valid thread-local lvalue.
             unsafe { set_errno(e) };
         }
+        out
     }
 
     /// L5 (review round 4, item 8) — nothing to do for `path`: the shim is
@@ -1270,7 +1298,7 @@ mod policy {
     /// True for opens the write-open policy looks at: they can write
     /// bytes, or (review round 2, item 6: `O_RDONLY|O_CREAT`) create the
     /// file.
-    fn open_may_mutate(flags: libc::c_int) -> bool {
+    pub(crate) fn open_may_mutate(flags: libc::c_int) -> bool {
         is_write_open(flags) || flags & libc::O_CREAT != 0
     }
 
@@ -1423,15 +1451,10 @@ mod policy {
         if rc < 0 {
             return;
         }
-        let saved = std::io::Error::last_os_error();
-        match p.gap {
+        with_saved_errno(|| match p.gap {
             None => notify_inner_with_failure("open_create", &p.path, None, None, false),
             Some(f) => notify_inner_with_failure("open", &p.path, None, Some(f), false),
-        }
-        if let Some(e) = saved.raw_os_error() {
-            // SAFETY: errno is a valid thread-local lvalue.
-            unsafe { set_errno(e) };
-        }
+        });
     }
 
     /// L5 — `truncate(2)` on a path: capture the existing file, or send
