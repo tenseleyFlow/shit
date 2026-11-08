@@ -195,6 +195,20 @@ async fn handle_one(
                 peer_pid = ?peer_pid,
                 "shim notification from a different shim version; restart that shell after upgrading"
             );
+            // L5 (review of #232, item 4; #225): resolve the peer to its
+            // command before acking (the caller may exit right after),
+            // then ack Allow. Acks are version-1 frames, which every shim
+            // reads, so the old shim does not wait out its timeout.
+            let command = peer_pid
+                .and_then(|p| u32::try_from(p).ok())
+                .and_then(|p| active.resolve_by_descendant(p));
+            let ts = crate::server::next_ts();
+            if let Ok(frame) = encode_frame(&ShimAck::Allow) {
+                let _ = stream.write_all(&frame).await;
+            }
+            if let Some(command) = command {
+                journal_version_gap(&index, command, got, ts);
+            }
             return Ok(());
         }
         Err(e) => {
@@ -346,6 +360,51 @@ fn apply_unlink_stat(kind: CaptureEventKind, stat: Option<UnlinkStat>) -> Captur
             mode,
         }),
         (k, _) => k,
+    }
+}
+
+/// L5 (review of #232, item 4; #225): a shim built for another wire
+/// version is writing for `command`, and none of its notifications can be
+/// read. Journal one capture-gap refusal per command, so undo says the
+/// command's changes were not captured instead of passing over them.
+fn journal_version_gap(
+    index: &Index,
+    command: shit_planner::events::CommandId,
+    got: u8,
+    ts: shit_planner::time::TimePoint,
+) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<shit_planner::events::CommandId>>> =
+        OnceLock::new();
+    {
+        let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        if !seen.insert(command) {
+            return;
+        }
+    }
+    let cwd = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+        .map(|r| r.cwd)
+        .unwrap_or_default();
+    let event = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts,
+        partial: false,
+        kind: CaptureEventKind::CaptureRefused {
+            class: "capture-gap".to_string(),
+            path: cwd,
+            detail: format!(
+                "shim from an older version (wire {got}, daemon expects {}); its changes were \
+                 not captured. Restart the shell to load the current shim",
+                shit_proto::SHIM_WIRE_VERSION
+            ),
+        },
+    };
+    if let Err(e) = index.put_event(&event) {
+        warn!(err = %e, %command, "shim version-gap refusal journal failed");
     }
 }
 
@@ -1972,6 +2031,64 @@ mod tests {
         assert_eq!(
             std::fs::read_link(dir.join("link")).unwrap(),
             PathBuf::from("target")
+        );
+    }
+
+    /// Review of #232, item 4: a version-1 frame from a process running
+    /// under a tracked command. The peer gets an Allow ack it can decode,
+    /// and the command gets one capture-gap refusal.
+    #[test]
+    fn old_shim_frame_is_acked_and_journals_a_version_gap() {
+        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        let index = Arc::new(index);
+        let active = Arc::new(ActiveCommands::default());
+        active.insert(std::process::id(), command);
+        let (ours, theirs) = StdUnixStream::pair().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let task = {
+            let (index, active) = (index.clone(), active.clone());
+            let blobs = Arc::new(blob_store);
+            theirs.set_nonblocking(true).unwrap();
+            let _guard = rt.enter();
+            let theirs = UnixStream::from_std(theirs).unwrap();
+            rt.spawn(handle_one(
+                theirs,
+                index,
+                blobs,
+                active,
+                Arc::new(LiveBaseline::new()),
+            ))
+        };
+        let mut ours = ours;
+        // A version-1 frame, as a shim from before the upgrade sends.
+        let old = encode_frame(&open_note("open", None)).unwrap();
+        std::io::Write::write_all(&mut ours, &old).unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut len = [0u8; 4];
+        std::io::Read::read_exact(&mut ours, &mut len).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        std::io::Read::read_exact(&mut ours, &mut body).unwrap();
+        let mut frame = len.to_vec();
+        frame.extend_from_slice(&body);
+        let ack: ShimAck = decode_frame(&frame).unwrap();
+        assert!(matches!(ack, ShimAck::Allow));
+        rt.block_on(task).unwrap().unwrap();
+        let kinds: Vec<_> = index
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [CaptureEventKind::CaptureRefused { class, detail, .. }]
+                    if class == "capture-gap" && detail.contains("Restart the shell")
+            ),
+            "{kinds:#?}"
         );
     }
 

@@ -1672,10 +1672,11 @@ fn emit_for_event(
                     reason: format!("capture incomplete for {}: {}", path.display(), detail),
                     remediation: Some(if class == "capture-gap" {
                         // L5: an existing file was written without its
-                        // bytes (over the inline cap, unreadable).
-                        "shit cannot restore this file's earlier content because the shim \
-                         could not read it before the write; restore it from a backup if \
-                         you need it."
+                        // bytes (over the inline cap, unreadable), or the
+                        // shim's notes could not be read at all.
+                        "shit could not capture this path's earlier state before the command \
+                         changed it (the reason is above); restore it from a backup if you \
+                         need it."
                             .to_string()
                     } else {
                         "Re-run the command from a directory whose parent path exists; \
