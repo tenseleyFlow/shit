@@ -41,7 +41,7 @@
     target_os = "dragonfly",
 ))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -54,6 +54,7 @@ use shit_planner::events::CommandId;
 use shit_proto::HelperResponse;
 use uuid::Uuid;
 
+use crate::capture::accounting::{CloseAccounting, send_observations};
 use crate::ipc::Conn;
 use crate::kqueue::{
     DrainEvent, DrainSession, KqueueError, KqueueFd, STREAM_COPY_CAP, TrackedSubtree,
@@ -130,6 +131,23 @@ struct WatchState {
     /// changed, emit `CapturedMetadataChange` with this baseline as
     /// `before`, and update the baseline.
     meta_baselines: HashMap<RawFd, StatMeta>,
+    /// R3 slice B — identities present at attach and the born set. A
+    /// tracked fd whose identity is not in the attach listing was added
+    /// by a directory diff, so it was born in the command.
+    acct: CloseAccounting,
+    /// Tracked directories whose diff baseline is a complete listing:
+    /// listed at attach, or created in the command. An entry a diff
+    /// finds in one of these was born; in any other it may be an entry
+    /// the listing missed.
+    listed_dirs: HashSet<RawFd>,
+    /// Regular files the live-baseline walk shipped a pre-image for.
+    /// kqueue reports writes after they happen, so a pre-existing file
+    /// outside this set has no pre-write content anywhere.
+    baselined: HashSet<(u64, u64)>,
+    /// False when `SHIT_BASELINE_PREEXEC=0` turned the walk off.
+    baseline_ran: bool,
+    /// Capture responses that never reached the daemon.
+    send_failures: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -248,18 +266,41 @@ impl PumpState {
         // Build per-dir-fd entry baselines so we can diff on
         // subsequent NOTE_WRITE events. Walks each tracked dir once
         // here; the cost is proportional to dir size.
+        //
+        // R3 slice B — the same pass records every tracked identity and
+        // every listed entry as the baseline. A directory whose listing
+        // fails keeps an empty diff baseline, as before, and is recorded
+        // as not listed, so nothing found in it later counts as born.
+        let mut acct = CloseAccounting::default();
+        acct.note_walked();
+        let mut listed_dirs: HashSet<RawFd> = HashSet::new();
         let mut dir_baselines: HashMap<RawFd, DirBaseline> = HashMap::new();
         for raw in tracked_fds(&subtree) {
-            let Some((_, _, ft)) = fstat_dev_inode_kind(raw) else {
+            let Some((dev, inode, ft)) = fstat_dev_inode_kind(raw) else {
                 continue;
             };
+            acct.note_baseline_id((dev, inode));
             if ft != FileType::Directory {
                 continue;
             }
             let Some(dir_path) = subtree.path_for_fd(raw).map(|p| p.to_path_buf()) else {
+                acct.note_unwalked_dir((dev, inode));
                 continue;
             };
-            let entries = read_dir_entries(raw).unwrap_or_default();
+            let entries = match attach_listing(raw, &dir_path) {
+                Ok(entries) => {
+                    listed_dirs.insert(raw);
+                    entries
+                }
+                Err(e) => {
+                    tracing::warn!(fd = raw, dir = %dir_path.display(), error = %e, "attach listing failed");
+                    acct.note_unwalked_dir((dev, inode));
+                    BTreeMap::new()
+                }
+            };
+            for e in entries.values() {
+                acct.note_baseline_id((e.dev, e.inode));
+            }
             // W09.16.1 CI diag — dump baseline dir entries with
             // their symlink_target so we know if `config` is in
             // the map at attach time.
@@ -301,14 +342,17 @@ impl PumpState {
         // Default-on after the W02.B regression sweep landed 12/12
         // BSD smokes green. Opt out with `SHIT_BASELINE_PREEXEC=0`
         // for diagnostics / emergency rollback.
-        if std::env::var("SHIT_BASELINE_PREEXEC").as_deref() != Ok("0") {
-            let (n, partial) = baseline_walk_and_emit(
+        let mut baselined = HashSet::new();
+        let baseline_ran = std::env::var("SHIT_BASELINE_PREEXEC").as_deref() != Ok("0");
+        if baseline_ran {
+            let (n, partial, shipped) = baseline_walk_and_emit(
                 &subtree,
                 &self.conn,
                 self.staging_dir_fd.as_raw_fd(),
                 command.session,
                 root_path,
             );
+            baselined = shipped;
             tracing::info!(
                 %command.session,
                 seq = command.seq,
@@ -325,6 +369,11 @@ impl PumpState {
                 dedupe: HashMap::new(),
                 dir_baselines,
                 meta_baselines,
+                acct,
+                listed_dirs,
+                baselined,
+                baseline_ran,
+                send_failures: 0,
             },
         );
         Ok(())
@@ -335,6 +384,9 @@ impl PumpState {
             for raw in tracked_fds(&ws.subtree) {
                 self.fd_to_command.remove(&raw);
             }
+            // Before the caller's UnwatchTreeFlushed, so the daemon sees
+            // every loss for the command ahead of the close barrier.
+            send_observations(&self.conn, command, ws.acct.close(ws.send_failures, None));
             tracing::info!(
                 %command.session,
                 seq = command.seq,
@@ -388,6 +440,8 @@ impl PumpState {
             Some(t) => t,
             None => {
                 tracing::warn!(fd, "fstat failed; skipping capture");
+                ws.acct
+                    .note_unkeyed("kqueue event fd could not be identified (fstat failed)");
                 return;
             }
         };
@@ -417,12 +471,36 @@ impl PumpState {
             return;
         }
         let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
+        // R3 slice B — kqueue fires after the write, so a pre-existing
+        // file's only pre-write content is its live-baseline pre-image.
+        // A tracked file absent from the attach listing was born.
+        if !is_delete {
+            ws.acct.note_written((dev, inode));
+        }
+        if !is_delete && !ws.baselined.contains(&(dev, inode)) {
+            ws.acct.note_missing(
+                (dev, inode),
+                false,
+                path.as_deref().map(path_to_string),
+                if ws.baseline_ran {
+                    "pre-existing file was written but the baseline walk captured no pre-image for it"
+                } else {
+                    "pre-existing file was written with the baseline walk turned off"
+                },
+            );
+        }
         // Stat for metadata. After Delete the fstat above already
         // returned valid (dev, inode); same call works for mode/uid/gid/mtime.
         let meta = match fstat_meta(fd) {
             Some(m) => m,
             None => {
                 tracing::warn!(fd, "fstat for meta failed; skipping capture");
+                ws.acct.note_missing(
+                    (dev, inode),
+                    false,
+                    path.as_deref().map(path_to_string),
+                    "pre-image metadata could not be read",
+                );
                 return;
             }
         };
@@ -439,6 +517,12 @@ impl PumpState {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(fd, error = %e, "stream_copy_to_staging failed");
+                    ws.acct.note_missing(
+                        (dev, inode),
+                        false,
+                        path.as_deref().map(path_to_string),
+                        format!("pre-image could not be staged: {e}"),
+                    );
                     return;
                 }
             };
@@ -495,6 +579,13 @@ impl PumpState {
             .send_response_with_fd(&resp, staging_fd.as_raw_fd())
         {
             tracing::warn!(error = %e, "send_response_with_fd failed");
+            ws.send_failures = ws.send_failures.saturating_add(1);
+        } else if is_delete {
+            // A delete's fd still holds the bytes. They are evidence
+            // only if this command did not write the file first; a
+            // write's capture is post-write content, and its evidence
+            // is the baseline pre-image checked above.
+            ws.acct.note_delete_captured((dev, inode));
         }
         // Mark as captured. Don't insert a NEW key — we used or_insert
         // above; just update the invalidated flag based on Delete.
@@ -558,6 +649,10 @@ impl PumpState {
         let Some(ws) = self.watches.get_mut(&command) else {
             return;
         };
+        // R3 slice B — an addition to a completely listed directory was
+        // born in the command; in any other it may be an entry the
+        // attach listing missed.
+        let parent_listed = ws.listed_dirs.contains(&fd);
         let Some(baseline) = ws.dir_baselines.get_mut(&fd) else {
             tracing::trace!(fd, "dir Write on dir without baseline; skipping");
             return;
@@ -664,6 +759,9 @@ impl PumpState {
             // through to Regular, and the dir-watching branch
             // below never fires for new dirs. W03.B.
             let kind = file_kind_at(fd, name);
+            if parent_listed {
+                ws.acct.note_born((cur_entry.dev, cur_entry.inode));
+            }
             events.push(shit_proto::TreeOpWire::Create {
                 dev: cur_entry.dev,
                 inode: cur_entry.inode,
@@ -771,6 +869,10 @@ impl PumpState {
         for new_path in new_dirs_to_watch {
             if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
                 self.fd_to_command.insert(new_fd, command);
+                // Born, so its seeded empty baseline is complete.
+                if parent_listed {
+                    ws.listed_dirs.insert(new_fd);
+                }
                 // S29.3 — meta baseline for the dir too (chmod on a
                 // dir fires NOTE_ATTRIB on it).
                 if let Some(m) = fstat_meta(new_fd) {
@@ -804,6 +906,7 @@ impl PumpState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let mut failed = 0u32;
         for op in events {
             let resp = shit_proto::HelperResponse::TreeMutation {
                 session: command.session,
@@ -813,7 +916,13 @@ impl PumpState {
             };
             if let Err(e) = self.conn.send_response(&resp) {
                 tracing::warn!(error = %e, "send TreeMutation failed");
+                failed = failed.saturating_add(1);
             }
+        }
+        if failed > 0
+            && let Some(ws) = self.watches.get_mut(&command)
+        {
+            ws.send_failures = ws.send_failures.saturating_add(failed);
         }
     }
 
@@ -843,8 +952,15 @@ impl PumpState {
             tracing::trace!(fd, ?ft, "attrib on non-regular; skipping");
             return;
         }
+        ws.acct.note_written((dev, inode));
         let Some(after) = fstat_meta(fd) else {
             tracing::warn!(fd, "fstat_meta failed during attrib handling");
+            ws.acct.note_missing(
+                (dev, inode),
+                false,
+                ws.subtree.path_for_fd(fd).map(path_to_string),
+                "attribute change could not be read",
+            );
             return;
         };
         let before = match ws.meta_baselines.get(&fd).cloned() {
@@ -854,6 +970,12 @@ impl PumpState {
                 // race with detach). Take the current as baseline and
                 // skip emission — we have nothing to compare to.
                 ws.meta_baselines.insert(fd, after);
+                ws.acct.note_missing(
+                    (dev, inode),
+                    false,
+                    ws.subtree.path_for_fd(fd).map(path_to_string),
+                    "attribute change had no pre-change metadata",
+                );
                 return;
             }
         };
@@ -878,6 +1000,7 @@ impl PumpState {
         };
         if let Err(e) = self.conn.send_response(&resp) {
             tracing::warn!(error = %e, "send CapturedMetadataChange failed");
+            ws.send_failures = ws.send_failures.saturating_add(1);
             return;
         }
         ws.meta_baselines.insert(fd, after);
@@ -1009,9 +1132,10 @@ fn baseline_walk_and_emit(
     staging_dir_fd: RawFd,
     session: uuid::Uuid,
     cwd_path: &Path,
-) -> (u64, bool) {
+) -> (u64, bool, HashSet<(u64, u64)>) {
     let mut count = 0u64;
     let mut partial = false;
+    let mut shipped = HashSet::new();
 
     for (fd, path) in subtree.iter_entries() {
         let Some((dev, inode, kind)) = fstat_dev_inode_kind(fd) else {
@@ -1071,6 +1195,7 @@ fn baseline_walk_and_emit(
             partial = true;
             continue;
         }
+        shipped.insert((dev, inode));
         count += 1;
     }
 
@@ -1082,15 +1207,46 @@ fn baseline_walk_and_emit(
         file_count: count,
         partial,
     };
-    if let Err(e) = conn.send_response(&complete) {
-        tracing::warn!(error = %e, "baseline: BaselineWalkComplete send failed");
-    }
+    let complete_sent = match conn.send_response(&complete) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "baseline: BaselineWalkComplete send failed");
+            false
+        }
+    };
 
-    (count, partial)
+    (count, partial, baseline_shipped(shipped, complete_sent))
+}
+
+/// The files whose baseline pre-image the daemon can use. Without the
+/// completion marker the daemon's cache for the cwd is never marked
+/// ready, so none of them counts.
+fn baseline_shipped(shipped: HashSet<(u64, u64)>, complete_sent: bool) -> HashSet<(u64, u64)> {
+    if complete_sent {
+        shipped
+    } else {
+        HashSet::new()
+    }
 }
 
 fn path_to_string(p: &Path) -> String {
     String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+}
+
+/// Test hook: make the attach-time listing of this directory fail.
+#[cfg(test)]
+static FAIL_LISTING_FOR_TEST: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// The attach-time listing of a tracked directory.
+fn attach_listing(
+    dir_fd: RawFd,
+    #[allow(unused_variables)] dir_path: &Path,
+) -> std::io::Result<BTreeMap<std::ffi::OsString, DirEntryBaseline>> {
+    #[cfg(test)]
+    if FAIL_LISTING_FOR_TEST.lock().unwrap().as_deref() == Some(dir_path) {
+        return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    }
+    read_dir_entries(dir_fd)
 }
 
 /// Read a directory's immediate child entries via a tracked dir fd,
@@ -1529,6 +1685,52 @@ fn pump(
 mod tests {
     use super::*;
 
+    /// R3 slice B review item 3. A directory whose attach-time listing
+    /// failed has an empty baseline, so a file found in it later cannot
+    /// be told apart from one the listing missed. Writing such a file
+    /// must leave strict mode a loss to report, not a birth.
+    #[test]
+    fn file_under_a_failed_listing_is_not_born() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("old"), b"pre-existing").unwrap();
+        *FAIL_LISTING_FOR_TEST.lock().unwrap() = Some(sub.clone());
+        let (helper, daemon) = crate::ipc::socketpair().unwrap();
+        let (control, _pump) = spawn(Arc::new(helper), dir.path().join("staging"), None).unwrap();
+        let session = Uuid::from_u128(78);
+        control
+            .on_watch_tree(session, 1, std::process::id(), root.to_str().unwrap())
+            .unwrap();
+        loop {
+            match daemon.recv_response_with_fd().unwrap().0 {
+                HelperResponse::WatchTreeReady { .. } => break,
+                HelperResponse::WatchTreeFailed { reason, .. } => panic!("attach: {reason}"),
+                _ => {}
+            }
+        }
+        *FAIL_LISTING_FOR_TEST.lock().unwrap() = None;
+        // The dir diff adds `new` to the watch; then it is written.
+        std::fs::write(sub.join("new"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(sub.join("new"), b"written").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        control.on_unwatch_tree(session, 1);
+        let mut details = Vec::new();
+        loop {
+            match daemon.recv_response_with_fd().unwrap().0 {
+                HelperResponse::UnwatchTreeFlushed { .. } => break,
+                HelperResponse::CaptureRefused { detail, .. } => details.push(detail),
+                _ => {}
+            }
+        }
+        assert!(
+            details.iter().any(|d| d.contains("not listed completely")),
+            "a write under a failed listing was taken as a birth: {details:?}"
+        );
+    }
+
     #[test]
     fn drain_times_out_while_events_keep_arriving() {
         let (tx, rx) = sync_channel::<DrainEvent>(16);
@@ -1780,7 +1982,7 @@ mod tests {
             assert!(raw >= 0);
             Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
         };
-        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), kq, None);
+        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), Arc::clone(&kq), None);
         let ghost = CommandId {
             session: Uuid::nil(),
             seq: 0,
@@ -1789,5 +1991,50 @@ mod tests {
         // Must not panic; must not send.
         state.handle_vnode(999, VnodeEventKind::Write);
         assert!(state.watches.is_empty(), "watches must still be empty");
+        drop(kq);
+    }
+
+    /// R3 slice B review round 2, item 3: a dir-diff TreeMutation that
+    /// never reaches the daemon is a send failure for the command.
+    #[test]
+    fn failed_tree_mutation_send_is_counted() {
+        let (conn_a, conn_b) = crate::ipc::socketpair().expect("socketpair");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
+        let staging_fd = {
+            use std::os::fd::FromRawFd;
+            let cpath = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            assert!(raw >= 0);
+            Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        let mut state = PumpState::new(staging_fd, Arc::new(conn_a), Arc::clone(&kq), None);
+        let cmd = CommandId {
+            session: Uuid::from_u128(79),
+            seq: 1,
+        };
+        state.attach(&kq, cmd, &root).unwrap();
+        drop(conn_b);
+        std::fs::write(root.join("new"), b"").unwrap();
+        let root_fd = *state.watches[&cmd].dir_baselines.keys().next().unwrap();
+        state.handle_dir_change(cmd, root_fd);
+        assert!(
+            state.watches[&cmd].send_failures > 0,
+            "the lost Create was not counted"
+        );
+    }
+
+    #[test]
+    fn baseline_counts_nothing_when_its_completion_marker_is_lost() {
+        let shipped: HashSet<(u64, u64)> = [(1, 2), (1, 3)].into_iter().collect();
+        assert_eq!(baseline_shipped(shipped.clone(), true), shipped);
+        assert!(baseline_shipped(shipped, false).is_empty());
     }
 }

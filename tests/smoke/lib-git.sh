@@ -81,3 +81,105 @@ smoke_g01_assert_helper_caps() {
     smoke_log "helper caps: ${caps}"
     return 0
 }
+
+# R3 slice B — strict git lock-file smoke, shared by the Linux (LSM) and
+# FreeBSD (kqueue) wrappers.
+#
+#   smoke_strict_git_lockfile <name> <hash-fn>
+#
+# <hash-fn> prints the sha256 of the file given as $1. The caller has
+# already passed its tier gate (kernel tier, helper caps, SHIT_FORCE_TIER)
+# and set SHIT_BIN. One session under SHIT_STRICT_CAPTURE=1 runs
+# `git config`, `git commit` and `git branch -D`, undoing each right after
+# it runs, and then requires zero CaptureRefused rows.
+smoke_strict_git_lockfile() {
+    local name="$1" hash_fn="$2"
+    local repo="${SHIT_SMOKE_TMP}/scratch/repo"
+    mkdir -p "${repo}"
+    git_invoke -C "${repo}" init -q
+    echo "initial content" > "${repo}/README.md"
+    git_invoke -C "${repo}" add README.md
+    git_invoke -C "${repo}" commit -q -m "anchor commit"
+    git_invoke -C "${repo}" branch feat
+    echo "feature line" >> "${repo}/README.md"
+    git_invoke -C "${repo}" commit -q -am "feature commit"
+    local feat_sha prior_head config_sha
+    feat_sha="$(git_invoke -C "${repo}" rev-parse HEAD)"
+    git_invoke -C "${repo}" branch -f feat "${feat_sha}"
+    git_invoke -C "${repo}" reset -q --hard HEAD~1
+    prior_head="$(git_invoke -C "${repo}" rev-parse HEAD)"
+    echo "staged line" >> "${repo}/README.md"
+    git_invoke -C "${repo}" add README.md
+    config_sha="$("${hash_fn}" "${repo}/.git/config")"
+    smoke_log "anchor=${prior_head} feat=${feat_sha} config sha256=${config_sha}"
+
+    SHIT_STRICT_CAPTURE=1 smoke_start_shitd
+    local session
+    session="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    cd "${repo}"
+    "${SHIT_BIN}" hook-send session-open \
+        --session "${session}" --pid "$$" --shell bash \
+        --tty "$(tty 2>/dev/null || echo /dev/null)" \
+        --sock "${SHIT_HOOK_SOCK}"
+
+    _lockfile_run() {
+        local seq="$1" cmdline="$2"
+        shift 2
+        "${SHIT_BIN}" hook-send pre-exec \
+            --session "${session}" --seq "${seq}" --pid "$$" \
+            --cwd "${repo}" --shell bash --cmdline "${cmdline}" \
+            --sock "${SHIT_HOOK_SOCK}"
+        smoke_log "[${seq}] ${cmdline}"
+        git_invoke -C "${repo}" "$@"
+        "${SHIT_BIN}" hook-send post-exec \
+            --session "${session}" --seq "${seq}" --exit-code 0 \
+            --sock "${SHIT_HOOK_SOCK}"
+    }
+    _lockfile_undo() {
+        local label="$1"
+        local log="${SHIT_SMOKE_TMP}/undo-${label}.log"
+        local rc
+        set +e
+        "${SHIT_BIN}" undo --yes > "${log}" 2>&1
+        rc=$?
+        set -e
+        sed 's/^/    undo: /' "${log}" >&2 || true
+        [ "${rc}" -eq 0 ] || smoke_fail "[${label}] shit undo exit=${rc}"
+        if grep -q "capture-incomplete" "${log}"; then
+            smoke_fail "[${label}] strict undo refused with capture-incomplete"
+        fi
+    }
+
+    _lockfile_run 1 "git config core.shitprobe yes" config core.shitprobe yes
+    [ "$(git_invoke -C "${repo}" config --get core.shitprobe)" = "yes" ] \
+        || smoke_fail "[config] git config did not take effect"
+    _lockfile_undo config
+    if git_invoke -C "${repo}" config --get core.shitprobe >/dev/null 2>&1; then
+        smoke_fail "[config] core.shitprobe still set after undo"
+    fi
+    [ "$("${hash_fn}" "${repo}/.git/config")" = "${config_sha}" ] \
+        || smoke_fail "[config] .git/config differs from its pre-command bytes"
+
+    _lockfile_run 2 "git commit -m staged" commit -q -m staged
+    _lockfile_undo commit
+    [ "$(git_invoke -C "${repo}" rev-parse HEAD)" = "${prior_head}" ] \
+        || smoke_fail "[commit] HEAD not restored to ${prior_head}"
+    [ "$(git_invoke -C "${repo}" status --porcelain)" = "M  README.md" ] \
+        || smoke_fail "[commit] index not restored (status: $(git_invoke -C "${repo}" status --porcelain))"
+
+    _lockfile_run 3 "git branch -D feat" branch -q -D feat
+    _lockfile_undo branch
+    [ "$(git_invoke -C "${repo}" rev-parse --verify -q feat)" = "${feat_sha}" ] \
+        || smoke_fail "[branch] refs/heads/feat not restored to ${feat_sha}"
+
+    "${SHIT_BIN}" hook-send session-close --session "${session}" --sock "${SHIT_HOOK_SOCK}"
+    cd "${SHIT_SMOKE_TMP}"
+
+    local refusals
+    refusals="$(smoke_journal_count "discriminant = 'CaptureRefused'")"
+    if [ "${refusals}" -ne 0 ]; then
+        smoke_dump_refusals
+        smoke_fail "strict capture journaled ${refusals} CaptureRefused row(s) for born lock files"
+    fi
+    smoke_log "PASS: ${name} (config, commit and branch -D undone; zero refusals)"
+}
