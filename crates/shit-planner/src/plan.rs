@@ -338,7 +338,11 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             _ => {}
         }
     }
-    let provenance = Provenance::from_events(events, &disproved);
+    // L4b - one place decides which device Unlink a capture belongs to;
+    // Provenance's dedup keeps that one.
+    let (device_nodes, duplicate_device_unlinks) = device_pairing(events);
+    let paired: HashSet<crate::events::EventId> = device_nodes.keys().copied().collect();
+    let provenance = Provenance::from_events(events, &disproved, &paired);
     let mut atomic = HashSet::new();
     let mut transient = HashSet::new();
     for p in creates.iter().chain(rename_destinations.iter()) {
@@ -647,7 +651,6 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
             hardlink_dead_to_source.insert(p.clone(), source.clone());
         }
     }
-    let (device_nodes, duplicate_device_unlinks) = device_pairing(events);
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
     dropped_events.extend(duplicate_device_unlinks);
@@ -846,14 +849,24 @@ struct Provenance {
     dropped_events: HashSet<crate::events::EventId>,
     /// See [`EventClassification::refused_unlinks`].
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
+    /// L4b - device Unlinks a DeviceNodeMeta paired with
+    /// ([`device_pairing`]); the no-bytes dedup keeps one of these.
+    paired_device_unlinks: HashSet<crate::events::EventId>,
 }
 
 impl Provenance {
     /// `events` is in reverse-chronological order (as `plan` sorts it).
-    fn from_events(events: &[&CaptureEvent], disproved: &HashSet<crate::events::EventId>) -> Self {
+    fn from_events(
+        events: &[&CaptureEvent],
+        disproved: &HashSet<crate::events::EventId>,
+        paired_device_unlinks: &HashSet<crate::events::EventId>,
+    ) -> Self {
         let mut live: std::collections::BTreeMap<PathBuf, EntryHistory> =
             std::collections::BTreeMap::new();
-        let mut out = Self::default();
+        let mut out = Self {
+            paired_device_unlinks: paired_device_unlinks.clone(),
+            ..Self::default()
+        };
         for ev in events.iter().rev() {
             match &ev.kind {
                 CaptureEventKind::FilePreImage { path, source, .. } if source.has_content() => {
@@ -936,6 +949,14 @@ impl Provenance {
                         h.unlinked_at.get_or_insert_with(|| path.clone());
                     }
                 }
+                // L4b - the shim reports a removed symlink as
+                // SymlinkRemoved; for provenance it is that entry's unlink.
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => {
+                    if let Some(h) = live.get_mut(path) {
+                        h.unlinks.push((ev.id, crate::metadata::FileKind::Symlink));
+                        h.unlinked_at.get_or_insert_with(|| path.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -973,9 +994,17 @@ impl Provenance {
                     | FileKind::Socket
                     | FileKind::BlockDevice
                     | FileKind::CharDevice
+                    | FileKind::Symlink
             )
         };
-        if let Some((keep, _)) = h.unlinks.iter().find(|(_, k)| no_bytes(k)) {
+        // A device Unlink that carries a capture is the one to keep; the
+        // others are its twins (device_pairing drops those too).
+        let keep = h
+            .unlinks
+            .iter()
+            .find(|(id, _)| self.paired_device_unlinks.contains(id))
+            .or_else(|| h.unlinks.iter().find(|(_, k)| no_bytes(k)));
+        if let Some((keep, _)) = keep {
             self.dropped_events
                 .extend(h.unlinks.iter().map(|(id, _)| *id).filter(|id| id != keep));
             return;
@@ -1847,25 +1876,51 @@ fn device_pairing(
 }
 
 /// L4b - the helper's marker-only `Unlink` (mode 0: it lost the race to
-/// stat the entry) for a path the shim journaled as a removed symlink.
-/// The shim's `SymlinkRemoved` is the whole restore; the marker would
-/// recreate a regular file where the link was.
-fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
-    let links: HashSet<&PathBuf> = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { path, .. }) => Some(path),
-            _ => None,
-        })
-        .collect();
-    events
-        .iter()
-        .filter(|e| {
-            matches!(&e.kind,
-                CaptureEventKind::TreeOp(TreeOp::Unlink { path, mode: 0, .. }) if links.contains(path))
-        })
-        .map(|e| e.id)
-        .collect()
+/// stat the entry) that is the other tier's report of a `SymlinkRemoved`:
+/// the next or previous event at that path in journal order, with no
+/// other event at the path between. The shim's `SymlinkRemoved` is the
+/// whole restore; the marker would recreate a regular file where the
+/// link was. A mode-0 Unlink of a later entry at the same path is kept.
+pub(crate) fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let mut ordered: Vec<&CaptureEvent> = events.to_vec();
+    ordered.sort_by_key(|e| (e.ts, e.id));
+    let mut by_path: std::collections::HashMap<&PathBuf, Vec<&CaptureEvent>> =
+        std::collections::HashMap::new();
+    for ev in &ordered {
+        if let Some(p) = event_path(ev) {
+            by_path.entry(p).or_default().push(ev);
+        }
+    }
+    let is_marker = |e: &CaptureEvent| {
+        matches!(
+            &e.kind,
+            CaptureEventKind::TreeOp(TreeOp::Unlink { mode: 0, .. })
+        )
+    };
+    let mut out = Vec::new();
+    for seq in by_path.values() {
+        let mut taken = HashSet::new();
+        for (i, ev) in seq.iter().enumerate() {
+            if !matches!(
+                &ev.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { .. })
+            ) {
+                continue;
+            }
+            let next = seq
+                .get(i + 1)
+                .filter(|e| is_marker(e) && !taken.contains(&e.id));
+            let prev = i
+                .checked_sub(1)
+                .and_then(|j| seq.get(j))
+                .filter(|e| is_marker(e) && !taken.contains(&e.id));
+            if let Some(m) = next.or(prev) {
+                taken.insert(m.id);
+                out.push(m.id);
+            }
+        }
+    }
+    out
 }
 
 fn emit_for_tree_op(

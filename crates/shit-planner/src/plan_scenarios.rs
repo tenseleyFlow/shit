@@ -1648,6 +1648,112 @@ fn write_through_a_symlink_restores_the_target_and_keeps_the_link() {
     assert_eq!(std::fs::read_link(&link).unwrap(), target);
 }
 
+/// Review item 1: `mv d1 d2 && rm d2` of a device, both tiers reporting
+/// the rm. Provenance's no-bytes dedup and the device pairing must agree
+/// on the Unlink to keep, in either report order: the node is recreated
+/// once, with its capture, and renamed back.
+#[test]
+fn moved_then_removed_device_dual_tier_keeps_the_paired_unlink() {
+    use crate::inverse::InverseOp;
+    let node = InodeRef::new(1, 5);
+    for helper_first in [false, true] {
+        let mut sim = Sim::new();
+        let (d1, d2) = (sim.p("d1"), sim.p("d2"));
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+            from: d1,
+            to: d2.clone(),
+            inode: node,
+        }));
+        if helper_first {
+            sim.emit(device_unlink(d2.clone(), node));
+            sim.emit(device_meta(d2.clone(), node, 0x103));
+            sim.emit(device_unlink(d2.clone(), node));
+        } else {
+            sim.emit(device_unlink(d2.clone(), node));
+            sim.emit(device_unlink(d2.clone(), node));
+            sim.emit(device_meta(d2.clone(), node, 0x103));
+        }
+        let nodes = sim.plan_nodes();
+        assert_eq!(nodes.len(), 2, "helper_first={helper_first}: {nodes:#?}");
+        assert!(
+            matches!(
+                &nodes[0].op,
+                InverseOp::RecreatePath { device: Some(d), .. } if d.rdev == 0x103
+            ),
+            "helper_first={helper_first}: {nodes:#?}"
+        );
+        assert!(
+            matches!(&nodes[1].op, InverseOp::Rename { .. }),
+            "helper_first={helper_first}: {nodes:#?}"
+        );
+    }
+}
+
+/// Review item 3: `ln -s t l && rm l` made and removed the link inside
+/// the command. The shim's SymlinkRemoved is that entry's unlink, so the
+/// whole thing is scratch: undo leaves no link behind.
+#[test]
+fn symlink_made_and_removed_in_the_command_is_scratch() {
+    let mut sim = Sim::new();
+    let link = sim.p("l");
+    let target = sim.p("t").to_str().unwrap().to_string();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Symlink {
+        target: target.clone(),
+        path: link.clone(),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target,
+        path: link.clone(),
+    }));
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(1, 9),
+        path: link.clone(),
+        kind: FileKind::Regular,
+        mode: 0,
+    }));
+    let nodes = sim.plan_nodes();
+    assert!(nodes.is_empty(), "{nodes:#?}");
+    let log = sim.undo();
+    assert!(log.is_empty(), "{log:#?}");
+    assert!(std::fs::symlink_metadata(&link).is_err());
+}
+
+/// Review item 4: `rm l` (a symlink), `echo x > l`, `rm l`. Only the
+/// LSM marker next to the SymlinkRemoved is its twin; the marker of the
+/// later regular file at the same path is kept.
+#[test]
+fn only_the_marker_beside_a_symlink_removal_is_dropped() {
+    let mut sim = Sim::new();
+    let l = sim.p("l");
+    let marker = |sim: &mut Sim, ino| {
+        sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+            inode: InodeRef::new(1, ino),
+            path: sim.p("l"),
+            kind: FileKind::Regular,
+            mode: 0,
+        }))
+    };
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+        target: "/elsewhere".into(),
+        path: l.clone(),
+    }));
+    marker(&mut sim, 7);
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Create {
+        inode: InodeRef::new(1, 8),
+        path: l.clone(),
+        kind: FileKind::Regular,
+        mode: 0o100644,
+    }));
+    marker(&mut sim, 8);
+    let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
+    assert_eq!(
+        crate::plan::symlink_removal_markers(&refs),
+        vec![EventId(2)],
+        "{:#?}",
+        sim.events
+    );
+}
+
 fn device_pairs(sim: &Sim) -> Vec<(EventId, u64)> {
     let refs: Vec<&CaptureEvent> = sim.events.iter().collect();
     let mut pairs: Vec<(EventId, u64)> = crate::plan::pair_device_nodes(&refs)
