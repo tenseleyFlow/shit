@@ -1391,11 +1391,26 @@ impl LinuxCaptureRuntime {
         // can be fstat'd. Sockets return ENXIO and fall to the
         // marker-only path (which still journals the TreeOpCreate
         // wire above).
-        let opened = std::fs::OpenOptions::new()
+        let opened = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&resolved_path)
-            .ok();
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                // R3 slice B — the create hook fired and the entry is
+                // already gone: it was created and removed inside the
+                // command. Removing it again needs no pre-image.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    self.watches
+                        .entry(command)
+                        .or_default()
+                        .acct
+                        .note_born_path(path_to_string(&resolved_path));
+                }
+                None
+            }
+        };
 
         let (dev, inode, file_type) = match opened
             .as_ref()
@@ -1879,6 +1894,7 @@ impl LinuxCaptureRuntime {
             // moved entry may be a pre-existing file the walk never saw.
             ws.acct.note_unresolved_rename();
             if let Some(to) = to_resolved.as_deref() {
+                ws.acct.note_rename_target(to.to_string());
                 note_replaced_without_capture(ws, Path::new(to), moved);
             }
             return;
@@ -1915,6 +1931,7 @@ impl LinuxCaptureRuntime {
         // No-clobber renames (creating a fresh name) miss in
         // path_to_inode; that's the correct behavior -- nothing to
         // capture.
+        ws.acct.note_rename_target(to_path.clone());
         let to_path_buf = PathBuf::from(&to_path);
         let mut dest_handled = false;
         if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path_buf)
@@ -3627,6 +3644,36 @@ mod born_set_tests {
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
         assert!(obs[0].1.contains("could not be placed"), "{obs:?}");
+    }
+
+    #[test]
+    fn file_created_and_removed_before_the_create_handler_is_born() {
+        // `touch t; rm t` finished before the create reader ran: its stat
+        // gets ENOENT. The walk is incomplete, so absence proves nothing;
+        // the create event itself is the evidence.
+        let (mut rig, _deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let t = rig.dir.path().join("t");
+        std::fs::write(&t, b"").unwrap();
+        let id = Rig::id(&t);
+        std::fs::remove_file(&t).unwrap();
+        rig.unlink(id, root, "t");
+        rig.create(root, "t");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn create_enoent_does_not_bless_a_file_renamed_onto_the_name() {
+        let (mut rig, deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        rig.create(root, "x");
+        std::fs::rename(deep.join("x"), rig.dir.path().join("x")).unwrap();
+        rig.rename(id, (deep_id, "x"), (root, "x"));
+        std::fs::remove_file(rig.dir.path().join("x")).unwrap();
+        rig.unlink(id, root, "x");
+        assert_eq!(rig.close(None).len(), 1);
     }
 
     #[test]

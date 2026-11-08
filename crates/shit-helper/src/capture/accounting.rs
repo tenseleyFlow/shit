@@ -97,6 +97,13 @@ pub struct CloseAccounting {
     /// be resolved. Each could have moved a pre-existing file into a
     /// walked directory, so absence from a listing stops proving birth.
     renames_unresolved: u32,
+    /// Paths a create hook fired for whose entry was already gone when
+    /// the handler opened it: created and removed inside the command.
+    born_paths: BTreeSet<String>,
+    /// Paths some rename in the command moved an entry onto. A born
+    /// path that is also a rename target proves nothing about whatever
+    /// was removed there later.
+    rename_targets: BTreeSet<String>,
     /// Losses with no identity (an fstat that failed).
     unkeyed: Vec<String>,
     /// `(label, value)` of a tier-wide loss counter when the watch began.
@@ -173,6 +180,21 @@ impl CloseAccounting {
 
     pub fn mark_kernel_losses(&mut self, label: &'static str, value: u64) {
         self.kernel_mark = Some((label, value));
+    }
+
+    /// A create fired for `path` and the entry was gone (ENOENT) by the
+    /// time the handler opened it.
+    pub fn note_born_path(&mut self, path: String) {
+        self.born_paths.insert(path);
+    }
+
+    /// A rename moved an entry onto `path`.
+    pub fn note_rename_target(&mut self, path: String) {
+        self.rename_targets.insert(path);
+    }
+
+    fn born_at(&self, path: Option<&str>) -> bool {
+        path.is_some_and(|p| self.born_paths.contains(p) && !self.rename_targets.contains(p))
     }
 
     /// A rename was dropped because a parent could not be resolved.
@@ -283,6 +305,7 @@ impl CloseAccounting {
             match self.classify(id, absent) {
                 Provenance::Baseline => lost.push(obs),
                 Provenance::Born | Provenance::Outside => {}
+                Provenance::Unlocated if self.born_at(obs.path.as_deref()) => {}
                 Provenance::Unlocated => unlocated += 1,
             }
         }
