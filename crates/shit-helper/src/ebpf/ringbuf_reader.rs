@@ -561,16 +561,38 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_setattr(&self, ev: &SetattrEvent) {
-        if self.is_excluded(ev.hdr.pid) {
+        let excluded = self.is_excluded(ev.hdr.pid);
+        let pid = ev.hdr.pid as i32;
+        let (cached, roots, tracked) = {
+            let mut tree = self.tree.lock().unwrap();
+            let cached = tree.diag_cached(pid);
+            let roots = tree.diag_roots();
+            let tracked = if excluded {
+                None
+            } else {
+                tree.is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
+            };
+            (cached, roots, tracked)
+        };
+        tracing::info!(
+            pid = ev.hdr.pid,
+            tgid = ev.hdr.tgid,
+            ppid = ev.hdr.parent_pid,
+            comm = %comm_to_string(&ev.hdr.comm),
+            inode = ev.inode,
+            attr_valid = ev.attr_valid,
+            ts_ns = ev.hdr.ts_ns,
+            now_ns = diag_monotonic_ns(),
+            excluded,
+            cached = ?cached,
+            roots = ?roots,
+            tracked = ?tracked,
+            "diag-209 setattr rx"
+        );
+        if excluded {
             return;
         }
-        let pid = ev.hdr.pid as i32;
-        let Some((session, seq)) = self
-            .tree
-            .lock()
-            .unwrap()
-            .is_tracked_with_parent(pid, ev.hdr.parent_pid as i32)
-        else {
+        let Some((session, seq)) = tracked else {
             tracing::trace!(pid, "untracked pid; dropping lsm setattr event");
             return;
         };
@@ -807,6 +829,17 @@ impl LsmEventSink for LoggingSink {
 
 /// Convert a `[u8; 16]` `comm` array (NUL-terminated, like
 /// `/proc/<pid>/comm`) into a Rust string. Stops at the first NUL.
+/// #209 diagnostics: CLOCK_MONOTONIC in ns, the clock `bpf_ktime_get_ns` uses.
+pub fn diag_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 fn comm_to_string(buf: &[u8; 16]) -> String {
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()

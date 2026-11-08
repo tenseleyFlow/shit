@@ -1031,6 +1031,12 @@ impl EbpfLoader {
     /// `"rmdir"`, `"release"`, `"mknod"`). Returns `None` when the object
     /// is not loaded, the map was already taken, or the object predates
     /// the counter.
+    /// #209 diagnostics: the setattr object's hook-fire counters.
+    pub fn take_setattr_diag(&mut self) -> Option<RingbufLossCounter> {
+        let map = self.setattr_bpf.as_mut()?.take_map("setattr_diag")?;
+        aya::maps::Array::try_from(map).ok()
+    }
+
     pub fn take_loss_counter(&mut self, object: &str) -> Option<RingbufLossCounter> {
         let bpf = match object {
             "unlink" => self.bpf.as_mut(),

@@ -61,6 +61,24 @@ struct {
     __uint(max_entries, 256 * 1024);
 } setattr_events SEC(".maps");
 
+/* #209 diagnostics: [0] hook fires, [1] last pid_tgid, [2] last
+ * parent tgid, [3] last inode. Written before the ringbuf reserve so
+ * userspace can tell a hook that never fired from an event lost later. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 4);
+    __type(key, __u32);
+    __type(value, __u64);
+} setattr_diag SEC(".maps");
+
+static __always_inline void diag_note(__u32 k, __u64 v)
+{
+    __u64 *slot = bpf_map_lookup_elem(&setattr_diag, &k);
+    if (slot) {
+        *slot = v;
+    }
+}
+
 /* Kernel ATTR_* bit positions in `struct iattr::ia_valid`. These are
  * stable across the 5.7+ window (linux/fs.h). Mirror only the ones
  * we re-emit on the wire in common.h's SHIT_ATTR_* set. */
@@ -96,6 +114,19 @@ static __always_inline __u32 translate_ia_valid(__u32 ia_valid)
  * load time and attaches whichever entry point matches. */
 static __always_inline void __do_setattr(struct dentry *dentry, struct iattr *attr)
 {
+    {
+        __u32 k0 = 0;
+        __u64 *fires = bpf_map_lookup_elem(&setattr_diag, &k0);
+        if (fires) {
+            __sync_fetch_and_add(fires, 1);
+        }
+        struct task_struct *dt = (struct task_struct *)bpf_get_current_task();
+        struct task_struct *dp = BPF_CORE_READ(dt, real_parent);
+        struct inode *di = BPF_CORE_READ(dentry, d_inode);
+        diag_note(1, bpf_get_current_pid_tgid());
+        diag_note(2, (__u64)BPF_CORE_READ(dp, tgid));
+        diag_note(3, BPF_CORE_READ(di, i_ino));
+    }
     struct shit_setattr_event *e =
         bpf_ringbuf_reserve(&setattr_events, sizeof(*e), 0);
     if (!e) {

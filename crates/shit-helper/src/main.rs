@@ -1414,6 +1414,32 @@ struct LsmDispatch {
     /// One flush handle per ring-buffer reader. UnwatchTree drains
     /// them all before acknowledging the close barrier.
     flush: Vec<ebpf::LsmFlushHandle>,
+    /// #209 diagnostics: setattr hook-fire counters.
+    setattr_diag: Option<Arc<std::sync::Mutex<ebpf::loader::RingbufLossCounter>>>,
+}
+
+/// #209 diagnostics: log the setattr hook counters.
+#[cfg(target_os = "linux")]
+fn diag_setattr_counters(state: &LsmDispatch, at: &str, command: shit_planner::events::CommandId) {
+    let Some(diag) = &state.setattr_diag else {
+        tracing::info!(at, "diag-209 setattr counters unavailable");
+        return;
+    };
+    let g = diag.lock().unwrap_or_else(|e| e.into_inner());
+    let read = |k: u32| g.get(&k, 0).unwrap_or(u64::MAX);
+    let last = read(1);
+    tracing::info!(
+        at,
+        session = %command.session,
+        seq = command.seq,
+        fires = read(0),
+        last_tid = last & 0xffff_ffff,
+        last_tgid = last >> 32,
+        last_ppid = read(2),
+        last_inode = read(3),
+        now_ns = ebpf::ringbuf_reader::diag_monotonic_ns(),
+        "diag-209 setattr counters"
+    );
 }
 
 /// Bound on draining every eBPF ring-buffer reader at UnwatchTree.
@@ -1525,6 +1551,9 @@ fn boot_ebpf_lsm(
     };
 
     let tree = Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new()));
+    let setattr_diag = loader
+        .take_setattr_diag()
+        .map(|m| Arc::new(std::sync::Mutex::new(m)));
 
     let sink: Arc<dyn ebpf::LsmEventSink> = match runtime.clone() {
         Some(rt) => Arc::new(ebpf::ringbuf_reader::LinuxCaptureSink {
@@ -1662,6 +1691,7 @@ fn boot_ebpf_lsm(
             tree,
             runtime,
             flush,
+            setattr_diag,
         },
     })
 }
@@ -2537,6 +2567,7 @@ fn linux_watch_tree(
                 g.pre_open_tree(command, cwd);
             }
         }
+        diag_setattr_counters(state, "watch", command);
         match &cwd {
             Ok(cwd) => tracing::info!(
                 %session,
@@ -2649,6 +2680,7 @@ mod linux_watch_tests {
             tree: Arc::new(std::sync::Mutex::new(fanotify::tree::TreeMap::new())),
             runtime: None,
             flush: Vec::new(),
+            setattr_diag: None,
         }
     }
 
@@ -3065,6 +3097,7 @@ fn request_loop(
                     // Close barrier: dispatch everything already in the
                     // ring buffers while the pid tree still attributes it
                     // to this command, then stop watching.
+                    diag_setattr_counters(state, "unwatch-before-flush", command);
                     if let Err(detail) = ebpf::flush_all_readers(&state.flush, LSM_FLUSH_TIMEOUT) {
                         tracing::warn!(%session, command_seq, %detail, "eBPF reader flush incomplete");
                         capture::accounting::send_capture_observation(
@@ -3074,6 +3107,7 @@ fn request_loop(
                             format!("capture tail may be missing: {detail}"),
                         );
                     }
+                    diag_setattr_counters(state, "unwatch-after-flush", command);
                     state.tree.lock().unwrap().unwatch(session, command_seq);
                     let cmd = command;
                     if let Some(rt) = &state.runtime

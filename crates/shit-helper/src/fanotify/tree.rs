@@ -63,6 +63,16 @@ impl TreeMap {
         self.pid_cache.clear();
     }
 
+    /// #209 diagnostics: the cached answer for `pid`, if any.
+    pub fn diag_cached(&self, pid: i32) -> Option<Option<(Uuid, u64)>> {
+        self.pid_cache.get(&pid).copied()
+    }
+
+    /// #209 diagnostics: every tracked root pid.
+    pub fn diag_roots(&self) -> Vec<i32> {
+        self.trees.values().map(|t| t.root_pid).collect()
+    }
+
     /// Stop watching a subtree. Cache is cleared because previously
     /// cached pids may now belong to no tracked tree.
     pub fn unwatch(&mut self, session: Uuid, command_seq: u64) {
