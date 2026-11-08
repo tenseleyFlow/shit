@@ -600,7 +600,16 @@ mod policy {
     }
 
     /// Test hook: run `f` as if inside a notification on this thread.
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "linux",
+        )
+    ))]
     pub(super) fn with_in_notify<R>(f: impl FnOnce() -> R) -> R {
         let prev = IN_NOTIFY.with(|c| c.replace(true));
         let out = f();
