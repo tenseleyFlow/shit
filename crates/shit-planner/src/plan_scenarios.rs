@@ -2285,18 +2285,19 @@ fn different_dir_recreated_under_the_stash_keeps_the_ordinary_inverses() {
     //
     // ext4 hands a freed inode straight to the next mkdir, which would
     // give the new directory the old one's inode and nothing to tell them
-    // apart by; an unjournaled `spare` takes it first. (With the inode
+    // apart by. So the replacement is made while the original still
+    // exists and moved into place unseen afterwards. (With the inode
     // reused, the second directory was necessarily empty, so the rule
     // dropping its unlink loses nothing.)
     let mut sim = Sim::new();
     seed_tree(&sim);
     let before = sim.snapshot();
     let old = Sim::inode_of(&sim.p("d/empty"));
+    sim.mkdir_unseen("replacement");
     sim.mv("d", "t");
     sim.rm_rf("t/empty");
-    sim.mkdir_unseen("spare");
-    sim.mkdir_unseen("t/empty");
-    assert_ne!(Sim::inode_of(&sim.p("t/empty")), old, "inode reused");
+    std::fs::rename(sim.p("replacement"), sim.p("t/empty")).unwrap();
+    assert_ne!(Sim::inode_of(&sim.p("t/empty")), old);
     sim.rm_rf("t");
     assert_not_rebuilt(&sim, "d");
     let log = sim.undo();
@@ -2449,4 +2450,64 @@ fn scratch_file_carried_by_its_dirs_rename_then_removed_leaves_nothing() {
         "{nodes:#?}"
     );
     assert_restored(&sim, &before);
+}
+
+#[test]
+fn failed_exdev_dir_rename_retracts_its_walk_too() {
+    // Review round 4, item 5: `mv d other/t` across filesystems. The walk
+    // and Rename are journaled, rename(2) fails with EXDEV, mv copies and
+    // `rm -rf d`. The failed call's walk pre-images would restore d's
+    // files a second time beside the unlink pre-images.
+    use crate::inverse::InverseOp;
+    let mut sim = Sim::new();
+    sim.seed_dir("other", 0o755);
+    sim.other_fs = Some((sim.p("other"), 4242));
+    sim.seed_dir("d/sub", 0o750);
+    sim.seed_file("d/f", b"f\n", 0o640);
+    sim.seed_file("d/sub/g", b"g\n", 0o600);
+    let before = sim.snapshot();
+    let (d, t) = (sim.p("d"), sim.p("other/t"));
+    sim.walk(&d, None);
+    let source = Sim::inode_of(&d);
+    let rename = sim.emit(CaptureEventKind::TreeOp(TreeOp::Rename {
+        from: d.clone(),
+        to: t.clone(),
+        inode: InodeRef::new(0, 0),
+    }));
+    sim.shared_ts = None;
+    sim.emit(CaptureEventKind::RenameOutcome {
+        from: d.clone(),
+        to: t.clone(),
+        errno: libc::EXDEV,
+        source,
+        dest: InodeRef::new(0, 0),
+        rename: Some(rename),
+        refusal: None,
+    });
+    let mut files = Vec::new();
+    walk_files(&d, &mut files);
+    for f in &files {
+        let dst = t.join(f.strip_prefix(&d).unwrap());
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(f, dst).unwrap();
+    }
+    sim.rm_rf("d");
+    let nodes = sim.plan_nodes();
+    let f = sim.p("d/f");
+    let restores = nodes
+        .iter()
+        .filter(|n| matches!(&n.op, InverseOp::RestoreContent { path, .. } if *path == f))
+        .count();
+    assert_eq!(restores, 1, "{nodes:#?}");
+    let log = sim.undo();
+    assert_no_failures(&log);
+    let after = sim.snapshot();
+    for rel in ["d", "d/f", "d/sub", "d/sub/g"] {
+        assert_eq!(
+            after.get(Path::new(rel)),
+            before.get(Path::new(rel)),
+            "{rel}\n{}",
+            log.join("\n")
+        );
+    }
 }

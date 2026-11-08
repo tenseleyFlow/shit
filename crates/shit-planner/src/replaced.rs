@@ -42,6 +42,9 @@ use std::path::{Path, PathBuf};
 /// Rename. Its reverse rename then fails loudly at undo; nothing is lost.
 pub(crate) fn failed_renames(index: &EventPathIndex<'_>) -> HashSet<EventId> {
     let mut out = HashSet::new();
+    let mut failed_ts = HashSet::new();
+    let ts_of: HashMap<EventId, crate::time::TimePoint> =
+        index.chrono.iter().map(|ev| (ev.id, ev.ts)).collect();
     for ev in &index.chrono {
         if let CaptureEventKind::RenameOutcome {
             errno,
@@ -53,6 +56,27 @@ pub(crate) fn failed_renames(index: &EventPathIndex<'_>) -> HashSet<EventId> {
         {
             out.extend(rename.iter().copied());
             out.extend(refusal.iter().copied());
+            failed_ts.extend(rename.and_then(|id| ts_of.get(&id)).copied());
+        }
+    }
+    // Review round 4, item 5: the walk of a call that failed (its
+    // RenameWalk and walk pre-images) came in the same notification as its
+    // Rename, so it shares the Rename's timestamp. It describes a move that
+    // did not happen; whatever the command then did to those files (an
+    // EXDEV copy and `rm -rf`) has its own events.
+    if !failed_ts.is_empty() {
+        for ev in &index.chrono {
+            let walk_record = matches!(
+                &ev.kind,
+                CaptureEventKind::RenameWalk { .. }
+                    | CaptureEventKind::FilePreImage {
+                        source: FilePreImageSource::ShimRenameSubtree,
+                        ..
+                    }
+            );
+            if walk_record && failed_ts.contains(&ev.ts) {
+                out.insert(ev.id);
+            }
         }
     }
     out
