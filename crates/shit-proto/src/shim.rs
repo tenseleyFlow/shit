@@ -298,6 +298,7 @@ mod tests {
                 attempted_path: "foo/bar/baz".into(),
                 error_chain: "ENOENT (path), ENOENT (parent)".into(),
             }),
+            pre_stat: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");

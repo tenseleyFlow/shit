@@ -1290,6 +1290,13 @@ mod policy {
 
     /// L4b - `canonicalize(parent).join(name)`, never resolving the
     /// final component (it may be a symlink the call acts on).
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+    ))]
     pub(super) fn canonical_parent_join(path: &str) -> Result<String, CanonicalizeError> {
         use std::path::{Path, PathBuf};
         let p = Path::new(path);
