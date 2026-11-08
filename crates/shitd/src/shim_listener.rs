@@ -546,6 +546,15 @@ fn ingest_notification(
         // `open_create` after a call that created its target.
         return;
     }
+    // L5 (review round 5, item 1): on Linux the kernel tier journals
+    // every create under the root the daemon asked it to watch for this
+    // command, with the real inode. A shim Create there is a second
+    // record of the same create, and undo would unlink the path twice
+    // (the second one a conflict). Outside the root the shim is the only
+    // record. The BSD baseline gate below is the same rule for kqueue.
+    let create_in_command_watch = cfg!(target_os = "linux")
+        && matches!(note.syscall.as_str(), "open_create" | "mkdir" | "mkdirat")
+        && live_baseline.command_watches(command, Path::new(&note.arg), ingest_ts);
     if note.syscall == "open_create" {
         // AR05.1: the shim saw the path absent before an O_CREAT open
         // that then succeeded. On in-watch paths the dir-diff Create event
@@ -564,12 +573,12 @@ fn ingest_notification(
         // LiveBaseline's cached cwds and suppress when the wire arg
         // falls inside any of them — kqueue dir-diff is
         // authoritative there.
-        if live_baseline.path_in_watched_subtree(Path::new(&note.arg)) {
+        if live_baseline.path_in_watched_subtree(Path::new(&note.arg)) || create_in_command_watch {
             debug!(
                 pid = note.pid,
                 syscall = %note.syscall,
                 arg = %note.arg,
-                "shim notify: path is in-watch; defer to kqueue dir-diff"
+                "shim notify: path is in-watch; defer to the kernel tier"
             );
             return;
         }
@@ -739,13 +748,13 @@ fn ingest_notification(
     if matches!(
         note.syscall.as_str(),
         "link" | "linkat" | "mkdir" | "mkdirat"
-    ) && live_baseline.path_in_watched_subtree(Path::new(&note.arg))
+    ) && (live_baseline.path_in_watched_subtree(Path::new(&note.arg)) || create_in_command_watch)
     {
         debug!(
             pid = note.pid,
             syscall = %note.syscall,
             arg = %note.arg,
-            "shim notify: Create path is in-watch; defer to kqueue dir-diff"
+            "shim notify: Create path is in-watch; defer to the kernel tier"
         );
         return;
     }
@@ -1794,6 +1803,89 @@ mod tests {
         assert!(index.events_for_command(command).is_empty());
         ingest(TimePoint::new(11, 0));
         assert_eq!(index.events_for_command(command).len(), 1);
+    }
+
+    /// Review round 5, item 1: `python3 -m venv` / `mkdir -p` under the
+    /// command's watch root on Linux. The kernel tier journals each
+    /// create with its inode; the shim's notes for the same paths are
+    /// deferred, so each path has one Create and undo removes each once
+    /// with no conflicts. Outside the root the shim's Create is kept.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shim_creates_in_the_commands_watch_root_defer_to_the_kernel_tier() {
+        use shit_planner::time::TimePoint;
+        use std::os::unix::fs::MetadataExt;
+        let (tmp, index, blob_store, command) = ingest_fixture("python3 -m venv v");
+        let root = tmp.path().canonicalize().unwrap().join("w");
+        let out = tmp.path().canonicalize().unwrap().join("out");
+        std::fs::create_dir_all(root.join("v/bin")).unwrap();
+        std::fs::write(root.join("v/bin/activate"), b"x").unwrap();
+        std::fs::create_dir(&out).unwrap();
+        let lb = LiveBaseline::new();
+        lb.record_command_watch(command, root.clone());
+        let mut t = 1;
+        let mut ts = || {
+            t += 1;
+            TimePoint::new(t, 0)
+        };
+        for (rel, kind, shim) in [
+            ("v", FileKind::Directory, "mkdir"),
+            ("v/bin", FileKind::Directory, "mkdirat"),
+            ("v/bin/activate", FileKind::Regular, "open_create"),
+        ] {
+            let p = root.join(rel);
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            index
+                .put_event(&CaptureEvent {
+                    id: EventId(0),
+                    command,
+                    ts: ts(),
+                    partial: false,
+                    kind: CaptureEventKind::TreeOp(TreeOp::Create {
+                        inode: InodeRef::new(m.dev(), m.ino()),
+                        path: p.clone(),
+                        kind,
+                        mode: m.mode(),
+                    }),
+                })
+                .unwrap();
+            let mut note = open_note(shim, None);
+            note.arg = p.to_str().unwrap().into();
+            ingest_notification(&note, Some(command), ts(), None, &index, &blob_store, &lb);
+        }
+        let mut note = open_note("mkdir", None);
+        note.arg = out.to_str().unwrap().into();
+        ingest_notification(&note, Some(command), ts(), None, &index, &blob_store, &lb);
+        let events = index.events_for_command(command);
+        let mut creates: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        creates.sort();
+        assert_eq!(
+            creates,
+            vec![
+                out.clone(),
+                root.join("v"),
+                root.join("v/bin"),
+                root.join("v/bin/activate")
+            ]
+        );
+        let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, command).unwrap();
+        let plan = shit_planner::plan(
+            record,
+            &events,
+            &shit_planner::LiveStateProbe::new(),
+            &index,
+        );
+        assert!(
+            plan.nodes.iter().all(|n| n.conflict.is_none()),
+            "{:#?}",
+            plan.nodes
+        );
     }
 
     #[test]
