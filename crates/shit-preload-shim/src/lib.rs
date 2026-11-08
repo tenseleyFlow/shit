@@ -857,14 +857,85 @@ mod policy {
         if IN_NOTIFY.with(|f| f.replace(true)) {
             return;
         }
-        let pre_image = capture_pre_image(capture_path);
+        let (pre_image, pre_stat, gap) = rename_destination(capture_path);
         let extras = collect_recursive_pre_images(from_abs);
         // #222: the wire arg stays `from\tto` for the whole rename
         // family, overwrite or not. The pre-image carries the
         // destination path on its own; replacing the arg with it left
         // the daemon nothing to journal a TreeOp::Rename from.
-        let _ = try_notify(syscall, arg, pre_image, extras, failure);
+        let _ = try_notify_full(syscall, arg, pre_image, extras, failure.or(gap), pre_stat);
         IN_NOTIFY.with(|f| f.set(false));
+    }
+
+    /// L5 (review of #232, item 3): what a rename replaces at `to`, before
+    /// the call. A regular file comes back as its pre-image, or as a
+    /// capture-gap marker when it cannot be read (over the cap,
+    /// unreadable). A symlink comes back as its lstat with the link's
+    /// target, so the daemon can journal the link for undo to recreate.
+    /// Any other kind that is not a directory (a fifo, a socket, a
+    /// device) is a gap. A missing destination, or a directory (which a
+    /// rename may replace only while it is empty), sends nothing.
+    fn rename_destination(
+        to: &str,
+    ) -> (
+        Option<shit_proto::ShimPreImage>,
+        Option<shit_proto::ShimStat>,
+        Option<shit_proto::ShimFailure>,
+    ) {
+        let Ok(m) = std::fs::symlink_metadata(to) else {
+            return (None, None, None);
+        };
+        let ft = m.file_type();
+        if ft.is_dir() {
+            return (None, None, None);
+        }
+        if ft.is_symlink() {
+            return match lstat_identity(to) {
+                Some(st) if st.link_target.is_some() => (None, Some(st), None),
+                _ => (
+                    None,
+                    None,
+                    Some(uncaptured(
+                        to,
+                        "could not be read (a symlink whose target readlink failed)",
+                    )),
+                ),
+            };
+        }
+        if !ft.is_file() {
+            return (
+                None,
+                None,
+                Some(uncaptured(to, "could not be captured (not a regular file)")),
+            );
+        }
+        match capture_pre_image_resolved(to, true) {
+            Some(pre) => (Some(pre), None, None),
+            None if m.len() > shit_proto::SHIM_INLINE_PREIMAGE_CAP => (
+                None,
+                None,
+                Some(uncaptured(to, "over the shim's inline pre-image cap")),
+            ),
+            None => (None, None, Some(uncaptured(to, "could not be read"))),
+        }
+    }
+
+    /// lstat `path` into the wire's identity, with a symlink's target.
+    pub(super) fn lstat_identity(path: &str) -> Option<shit_proto::ShimStat> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| shit_proto::ShimStat {
+                dev: m.dev(),
+                inode: m.ino(),
+                mode: m.mode(),
+                link_target: m
+                    .file_type()
+                    .is_symlink()
+                    .then(|| std::fs::read_link(path).ok())
+                    .flatten()
+                    .map(|t| t.to_string_lossy().into_owned()),
+            })
     }
 
     #[cfg(target_os = "linux")]
@@ -1123,17 +1194,10 @@ mod policy {
         abs: String,
         failure: Option<shit_proto::ShimFailure>,
     ) -> Option<PendingRemoval> {
-        use std::os::unix::fs::MetadataExt;
         if should_skip_path(&abs) {
             return None;
         }
-        let stat = std::fs::symlink_metadata(&abs)
-            .ok()
-            .map(|m| shit_proto::ShimStat {
-                dev: m.dev(),
-                inode: m.ino(),
-                mode: m.mode(),
-            });
+        let stat = lstat_identity(&abs);
         Some(PendingRemoval {
             syscall,
             path: abs,

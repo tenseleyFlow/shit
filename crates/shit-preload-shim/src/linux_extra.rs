@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(notes[0].syscall, "rmdir");
         assert_eq!(notes[0].arg, dir.join("gone").to_str().unwrap());
         assert!(notes[0].failure.is_none());
-        assert_eq!(notes[0].pre_stat.map(|s| s.mode), Some(0o040700));
+        assert_eq!(notes[0].pre_stat.as_ref().map(|s| s.mode), Some(0o040700));
         assert!(!dir.join("gone").exists());
     }
 

@@ -172,19 +172,24 @@ pub struct ShimNotification {
     /// negligible.
     #[serde(default)]
     pub failure: Option<ShimFailure>,
-    /// The target's lstat before the call, for removals the shim
-    /// reports after they succeed (`rmdir`): by then the daemon has
-    /// nothing left to stat.
+    /// The target's lstat before the call: for removals the shim reports
+    /// after they succeed (`rmdir`), when the daemon has nothing left to
+    /// stat, and for a rename's destination when it is a symlink, so
+    /// undo can recreate the link.
     #[serde(default)]
     pub pre_stat: Option<ShimStat>,
 }
 
-/// Identity and mode of a path, as the shim read it.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Identity and mode of a path, as the shim read it (lstat).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShimStat {
     pub dev: u64,
     pub inode: u64,
     pub mode: u32,
+    /// The link's target, read before the call, when the entry is a
+    /// symlink. `None` for other kinds, or when readlink failed. (The
+    /// same field #223 adds for unlink.)
+    pub link_target: Option<String>,
 }
 
 /// AU10 — structured failure reported by the shim when capture
@@ -356,6 +361,7 @@ mod tests {
                 dev: 1,
                 inode: 2,
                 mode: 0o040700,
+                link_target: None,
             }),
         };
         let frame = encode_frame(&n).expect("encode");

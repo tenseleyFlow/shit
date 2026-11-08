@@ -298,7 +298,7 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
     // stat from before the call. Never lstat it here (review round 3,
     // item 4): the directory is gone, or something new took its name.
     if is_post_call_removal(&note.syscall) {
-        return note.pre_stat.and_then(|s| {
+        return note.pre_stat.as_ref().and_then(|s| {
             FileKind::from_mode(s.mode).map(|kind| UnlinkStat {
                 kind,
                 mode: s.mode,
@@ -667,6 +667,33 @@ fn ingest_notification(
             failed,
             "shim notify: recursive rename pre-images ingested (DR-CR-54)"
         );
+    }
+    // L5 (review of #232, item 3): the rename replaced a symlink at `to`.
+    // Journal the link with its target before the Rename, so undo puts
+    // the renamed entry back at `from` and then recreates the link.
+    if matches!(note.syscall.as_str(), "rename" | "renameat" | "renameat2")
+        && let Some(shit_proto::ShimStat {
+            mode,
+            link_target: Some(target),
+            ..
+        }) = &note.pre_stat
+        && FileKind::from_mode(*mode) == Some(FileKind::Symlink)
+        && let Some((_, to)) = note.arg.split_once('\t')
+        && Path::new(to).is_absolute()
+    {
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: ingest_ts,
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved {
+                target: target.clone(),
+                path: PathBuf::from(to),
+            }),
+        };
+        if let Err(e) = index.put_event(&event) {
+            warn!(err = %e, pid = note.pid, "shim notify: replaced symlink journal failed");
+        }
     }
     // Fall through to journal the TreeOp::Rename below.
 
@@ -1798,6 +1825,76 @@ mod tests {
         );
     }
 
+    /// Review of #232, item 3: `mv new link` over a symlink. The daemon
+    /// journals the replaced link, and undo puts `new` back and recreates
+    /// the link with its target.
+    #[test]
+    fn rename_over_a_symlink_is_undone_by_recreating_the_link() {
+        use shit_planner::time::TimePoint;
+        let (tmp, index, blob_store, command) = ingest_fixture("mv new link");
+        let dir = tmp.path().canonicalize().unwrap().join("w");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("target"), b"keep").unwrap();
+        std::fs::write(dir.join("new"), b"new").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+        let mut note = open_note("rename", None);
+        note.arg = format!(
+            "{}\t{}",
+            dir.join("new").display(),
+            dir.join("link").display()
+        );
+        note.pre_stat = Some(shit_proto::ShimStat {
+            dev: 1,
+            inode: 2,
+            mode: 0o120777,
+            link_target: Some("target".into()),
+        });
+        let lb = LiveBaseline::new();
+        ingest_notification(
+            &note,
+            Some(command),
+            TimePoint::new(5, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        std::fs::rename(dir.join("new"), dir.join("link")).unwrap();
+
+        let events = index.events_for_command(command);
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                CaptureEventKind::TreeOp(TreeOp::SymlinkRemoved { target, path })
+                    if target == "target" && *path == dir.join("link")
+            )),
+            "{events:#?}"
+        );
+        let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, command).unwrap();
+        let probe = shit_planner::LiveStateProbe::new();
+        let plan = shit_planner::plan(record, &events, &probe, &index);
+        let blobs = shit_planner::InMemoryBlobReader::new();
+        let exec = shit_planner::FileExecutor::new(&blobs);
+        let report = shit_planner::Orchestrator::new(&exec, &probe).run(
+            &plan,
+            false,
+            shit_planner::ConflictPolicy::Abort,
+        );
+        assert!(
+            report
+                .records
+                .iter()
+                .all(|r| r.outcome_kind == shit_planner::OutcomeKind::Applied),
+            "{:#?}",
+            report.records
+        );
+        assert_eq!(std::fs::read(dir.join("new")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read_link(dir.join("link")).unwrap(),
+            PathBuf::from("target")
+        );
+    }
+
     #[test]
     fn open_create_journals_a_create() {
         let kinds = kinds_after(&open_note("open_create", None));
@@ -1822,6 +1919,7 @@ mod tests {
             dev: 1,
             inode: 2,
             mode: 0o040750,
+            link_target: None,
         });
         let stat = pre_syscall_unlink_stat(&note);
         assert_eq!(
@@ -1846,6 +1944,7 @@ mod tests {
             dev: 9,
             inode: 4242,
             mode: 0o040711,
+            link_target: None,
         });
         let kinds = kinds_after_with_stat(&with_stat);
         assert!(

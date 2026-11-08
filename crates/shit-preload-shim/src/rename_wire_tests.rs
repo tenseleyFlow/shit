@@ -105,7 +105,7 @@ fn unlinkat_removedir_reports_after_success_with_the_pre_call_stat() {
     assert_eq!(notes.len(), 1, "{notes:#?}");
     assert_eq!(notes[0].syscall, "unlinkat_dir");
     assert_eq!(notes[0].arg, dir.join("e").to_str().unwrap());
-    assert_eq!(notes[0].pre_stat.map(|s| s.mode), Some(0o040750));
+    assert_eq!(notes[0].pre_stat.as_ref().map(|s| s.mode), Some(0o040750));
 }
 
 /// Review round 5, item 3: renaming a symlink to a directory moves the
@@ -140,8 +140,11 @@ fn rename_of_a_symlink_to_a_dir_names_the_link() {
 }
 
 /// The same through renameat with a real dirfd, onto an existing link.
+/// Review of #232, item 3: the replaced link travels as the
+/// destination's lstat with its target, so undo can recreate it (the
+/// daemon side is `rename_over_a_symlink_is_undone_by_recreating_the_link`).
 #[test]
-fn renameat_over_a_symlink_names_the_link_and_captures_nothing() {
+fn renameat_over_a_symlink_names_the_link_and_sends_its_target() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().canonicalize().unwrap();
     std::fs::write(dir.join("target"), b"keep").unwrap();
@@ -171,4 +174,37 @@ fn renameat_over_a_symlink_names_the_link_and_captures_nothing() {
         )
     );
     assert!(notes[0].pre_image.is_none(), "{notes:#?}");
+    assert!(notes[0].failure.is_none(), "{notes:#?}");
+    let st = notes[0].pre_stat.as_ref().expect("the link's lstat");
+    assert_eq!(st.mode & 0o170000, 0o120000);
+    assert_eq!(st.link_target.as_deref(), Some("target"));
+}
+
+/// Review of #232, item 3: a destination the shim cannot read is a
+/// capture gap, never silence.
+#[test]
+fn rename_over_an_uncapturable_file_sends_a_gap_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let big = vec![b'x'; shit_proto::SHIM_INLINE_PREIMAGE_CAP as usize + 1];
+    std::fs::write(dir.join("big"), &big).unwrap();
+    std::fs::write(dir.join("new"), b"new").unwrap();
+    let from = CString::new(dir.join("new").to_str().unwrap()).unwrap();
+    let to = CString::new(dir.join("big").to_str().unwrap()).unwrap();
+    let notes = test_capture::capture(|| {
+        assert_eq!(
+            unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) },
+            0
+        );
+    });
+    assert_eq!(notes.len(), 1, "{notes:#?}");
+    assert!(notes[0].pre_image.is_none());
+    assert!(
+        matches!(
+            &notes[0].failure,
+            Some(shit_proto::ShimFailure::PreImageUncaptured { path, .. })
+                if path == dir.join("big").to_str().unwrap()
+        ),
+        "{notes:#?}"
+    );
 }
