@@ -2001,6 +2001,13 @@ impl LinuxCaptureRuntime {
         if !dest_handled {
             note_replaced_without_capture(ws, &to_path_buf, moved);
         }
+        // R3 slice B — the name now holds the moved entry. Without this a
+        // later rename onto `from` (an editor's `mv f f~; mv tmp f`)
+        // would take the moved file for the one being replaced.
+        let from_path_buf = PathBuf::from(&from_path);
+        ws.path_to_inode.remove(&from_path_buf);
+        ws.path_to_inode.insert(to_path_buf.clone(), moved);
+        ws.acct.note_renamed(&from_path_buf, &to_path_buf, moved);
 
         let resp = HelperResponse::TreeMutation {
             session: ev.command.session,
@@ -3542,6 +3549,63 @@ mod born_set_tests {
         rig.unlink(id, root, "f");
         rig.open(id, false);
         assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn backup_then_replace_save_is_not_loss() {
+        // An editor's save: `mv f f~; mv tmp f`. f has no snapshot, but
+        // it is not replaced: it moved to f~ before tmp took its name.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let f = rig.dir.path().join("f");
+        let f_id = Rig::id(&f);
+        rig.drop_snapshot(f_id);
+        let tmp = rig.dir.path().join("tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let tmp_id = Rig::id(&tmp);
+        rig.create(root, "tmp");
+        rig.open(tmp_id, true);
+        std::fs::rename(&f, rig.dir.path().join("f~")).unwrap();
+        rig.rename(f_id, (root, "f"), (root, "f~"));
+        std::fs::rename(&tmp, &f).unwrap();
+        rig.rename(tmp_id, (root, "tmp"), (root, "f"));
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn rename_onto_a_moved_away_name_sends_no_target_pre_image() {
+        // Same save with a snapshot for f: the second rename must not
+        // send f's bytes as a pre-image deleted at f; f was not deleted.
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"old").unwrap());
+        let root = rig.root();
+        let f = rig.dir.path().join("f");
+        let f_id = Rig::id(&f);
+        let tmp = rig.dir.path().join("tmp");
+        std::fs::write(&tmp, b"new").unwrap();
+        let tmp_id = Rig::id(&tmp);
+        std::fs::rename(&f, rig.dir.path().join("f~")).unwrap();
+        rig.rename(f_id, (root, "f"), (root, "f~"));
+        std::fs::rename(&tmp, &f).unwrap();
+        rig.rename(tmp_id, (root, "tmp"), (root, "f"));
+        let cmd = rig.cmd;
+        let mut rt = rig.rt.take().unwrap();
+        rt.on_unwatch_tree(cmd);
+        drop(rt);
+        let mut deleted_targets = Vec::new();
+        while let Ok((resp, _fd)) = rig.daemon.recv_response_with_fd() {
+            if let HelperResponse::CapturedPreImage {
+                is_delete: true,
+                inode,
+                ..
+            } = resp
+            {
+                deleted_targets.push(inode);
+            }
+        }
+        assert!(
+            !deleted_targets.contains(&f_id.1),
+            "f was moved, not replaced: {deleted_targets:?}"
+        );
     }
 
     #[test]

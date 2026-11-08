@@ -221,6 +221,13 @@ impl CloseAccounting {
         self.order
     }
 
+    /// A rename moved `moved` from `from` to `to`: nothing is at `from`
+    /// any more, and `to` now holds `moved`.
+    pub fn note_renamed(&mut self, from: &std::path::Path, to: &std::path::Path, moved: Id) {
+        self.baseline_paths.remove(from);
+        self.baseline_paths.insert(to.to_path_buf(), moved);
+    }
+
     /// A rename moved an entry onto `path`.
     pub fn note_rename_target(&mut self, path: String) {
         self.rename_targets.insert(path);
