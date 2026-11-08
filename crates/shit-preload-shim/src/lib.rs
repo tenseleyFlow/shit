@@ -1424,7 +1424,7 @@ mod policy {
     /// exists) and keep its lstat for the notification.
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub(super) fn removal_begin(syscall: &'static str, path: &str) -> Option<PendingRemoval> {
-        if disabled() || should_skip_path(path) {
+        if idle(path) {
             return None;
         }
         let (abs, failure) = canonicalize_or_raw(path, "path");
@@ -1445,7 +1445,7 @@ mod policy {
         dirfd: libc::c_int,
         path: &str,
     ) -> Option<PendingRemoval> {
-        if disabled() {
+        if idle(path) {
             return None;
         }
         match resolve_at_for_notify(dirfd, path, "path") {
@@ -1509,6 +1509,13 @@ mod policy {
             // SAFETY: errno is a valid thread-local lvalue.
             unsafe { set_errno(e) };
         }
+    }
+
+    /// L5 (review round 4, item 8) — nothing to do for `path`: the shim is
+    /// muted, this thread is already inside a notification, or the path is
+    /// one never journaled. Checked before any resolution work.
+    pub fn idle(path: &str) -> bool {
+        disabled() || IN_NOTIFY.with(|f| f.get()) || should_skip_path(path)
     }
 
     /// L5 — the target of a write-capable open, before resolution.

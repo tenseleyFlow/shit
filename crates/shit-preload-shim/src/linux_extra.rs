@@ -217,12 +217,15 @@ pub unsafe extern "C" fn creat64(path: *const c_char, mode: mode_t) -> c_int {
 /// libc `mkdir` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
-    let (resolved, failure) = policy::canonicalize_or_raw(&cstr_to_string(path), "path");
+    let raw = cstr_to_string(path);
+    let target = (!policy::idle(&raw)).then(|| policy::canonicalize_or_raw(&raw, "path"));
     let rc = match real!("mkdir", MkdirFn) {
         Some(f) => unsafe { f(path, mode) },
         None => sys::mkdirat(libc::AT_FDCWD, path, mode),
     };
-    if rc == 0 {
+    if rc == 0
+        && let Some((resolved, failure)) = target
+    {
         policy::notify_create_resolved("mkdir", &resolved, failure);
     }
     rc
@@ -234,7 +237,12 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
 /// libc `mkdirat` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: mode_t) -> c_int {
-    let target = policy::resolve_at_for_notify(dirfd, &cstr_to_string(path), "path");
+    let raw = cstr_to_string(path);
+    let target = if policy::idle(&raw) {
+        policy::AtResolution::Nothing
+    } else {
+        policy::resolve_at_for_notify(dirfd, &raw, "path")
+    };
     let rc = match real!("mkdirat", MkdirAtFn) {
         Some(f) => unsafe { f(dirfd, path, mode) },
         None => sys::mkdirat(dirfd, path, mode),
