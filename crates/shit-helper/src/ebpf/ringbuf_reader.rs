@@ -451,11 +451,21 @@ pub struct LinuxCaptureSink {
 
 #[cfg(target_os = "linux")]
 impl LinuxCaptureSink {
-    /// Returns true if events from `pid` should be filtered out
-    /// before tree lookup.
-    fn is_excluded(&self, pid: u32) -> bool {
-        self.excluded_pids.contains(&pid)
+    /// Returns true if the event's process should be filtered out
+    /// before tree lookup. Matched on the tgid: `hdr.pid` is the
+    /// thread id, so a worker thread of the helper or daemon would
+    /// otherwise pass, and its parent (the shell that started shitd)
+    /// can be a tracked root.
+    fn is_excluded(&self, hdr: &EventHeader) -> bool {
+        excluded_by_tgid(&self.excluded_pids, hdr)
     }
+}
+
+/// True when the event's process (its tgid, not its thread id) is in
+/// `excluded`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn excluded_by_tgid(excluded: &[u32], hdr: &EventHeader) -> bool {
+    excluded.contains(&hdr.tgid)
 }
 
 /// Start-up tap for the `FMODE_CREATED` probe. While active, open events
@@ -499,7 +509,7 @@ fn fmode_probe_tap(ev: &OpenEvent) {
 #[cfg(target_os = "linux")]
 impl LsmEventSink for LinuxCaptureSink {
     fn on_unlink(&self, ev: &UnlinkEvent) {
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -530,7 +540,7 @@ impl LsmEventSink for LinuxCaptureSink {
         // same handle_lsm_unlink path with is_directory=true so the
         // handler skips content capture (dirs have no bytes) and
         // emits a marker CapturedPreImage with the dir's mode.
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -559,7 +569,7 @@ impl LsmEventSink for LinuxCaptureSink {
     fn on_release(&self, ev: &ReleaseEvent) {
         // L04.2 — writable-fd close. Handler diffs against pre-image
         // snapshot and emits CapturedPreImage iff content changed.
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -584,7 +594,7 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_setattr(&self, ev: &SetattrEvent) {
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -616,7 +626,7 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_mkdir(&self, ev: &MkdirEvent) {
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -642,7 +652,7 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_create(&self, ev: &CreateEvent) {
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -669,7 +679,7 @@ impl LsmEventSink for LinuxCaptureSink {
 
     fn on_open(&self, ev: &OpenEvent) {
         fmode_probe_tap(ev);
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -694,7 +704,7 @@ impl LsmEventSink for LinuxCaptureSink {
     }
 
     fn on_rename(&self, ev: &RenameEvent) {
-        if self.is_excluded(ev.hdr.pid) {
+        if self.is_excluded(&ev.hdr) {
             return;
         }
         let pid = ev.hdr.pid as i32;
@@ -1804,6 +1814,19 @@ mod tests {
         let decoded = decode_setattr(&bytes).expect("decode");
         assert_eq!(decoded.hdr.ancestry(), [200, 100, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(decoded.dev, 0x802);
+    }
+
+    #[test]
+    fn exclusion_matches_the_tgid_not_the_thread_id() {
+        // A worker thread of an excluded process carries its own tid in
+        // `pid`; only `tgid` names the process.
+        let worker = EventHeader {
+            pid: 501,
+            tgid: 500,
+            ..EventHeader::default()
+        };
+        assert!(excluded_by_tgid(&[500], &worker));
+        assert!(!excluded_by_tgid(&[501], &worker));
     }
 
     #[test]
