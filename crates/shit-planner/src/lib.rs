@@ -38,7 +38,7 @@ pub mod shell_state_render;
 pub mod store;
 pub mod time;
 
-pub use plan::{PlanOptions, plan};
+pub use plan::{PlanOptions, plan, plan_with_options};
 
 pub use env::{
     DEFAULT_IGNORE, DEFAULT_IGNORE_PREFIXES, DEFAULT_REDACT_SUBSTRINGS, EnvDiff, EnvFilter,

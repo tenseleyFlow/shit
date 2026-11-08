@@ -24,6 +24,15 @@ fn entry_xattrs(e: &ShimWalkEntry) -> Option<BTreeMap<String, Vec<u8>>> {
     e.xattrs.as_ref().map(|v| v.iter().cloned().collect())
 }
 
+/// Review round 3, item 3: a walk file's xattrs come from the shim or not
+/// at all. Its path was renamed away by the time the daemon runs, so the
+/// daemon's own read would see nothing, or another file. When the shim
+/// could not read them the set is left empty, and the walk entry's
+/// `xattrs_read = false` tells the planner to say so.
+fn walk_file_xattrs(entry: Option<&&ShimWalkEntry>) -> BTreeMap<String, Vec<u8>> {
+    entry.and_then(|e| entry_xattrs(e)).unwrap_or_default()
+}
+
 fn walk_entry(e: &ShimWalkEntry, size: u64) -> Option<WalkEntry> {
     let kind = FileKind::from_mode(e.mode)?;
     Some(WalkEntry {
@@ -62,7 +71,7 @@ pub(crate) fn ingest_walk(
     let mut journaled = 0u64;
     let mut failed = 0u64;
     for pre in &note.extra_pre_images {
-        let xattrs = by_path.get(pre.path.as_str()).and_then(|e| entry_xattrs(e));
+        let xattrs = Some(walk_file_xattrs(by_path.get(pre.path.as_str())));
         match crate::shim_listener::ingest_pre_image_full(
             command,
             pre,
@@ -892,5 +901,19 @@ mod tests {
         });
         assert_eq!(got.expect("gave up in time"), CallWait::Abandoned(command));
         assert!(!lock().calls.contains_key(&call_id));
+    }
+
+    /// Review round 3, item 3: unread xattrs stay empty rather than falling
+    /// back to a read of the post-rename path.
+    #[test]
+    fn walk_file_xattrs_never_fall_back_to_the_daemons_read() {
+        let mut e = entry("/tmp/l5/d/f", 0o100640, 11);
+        assert_eq!(
+            walk_file_xattrs(Some(&&e)).get("user.k").map(Vec::as_slice),
+            Some(&b"v"[..])
+        );
+        e.xattrs = None;
+        assert!(walk_file_xattrs(Some(&&e)).is_empty());
+        assert!(walk_file_xattrs(None).is_empty());
     }
 }

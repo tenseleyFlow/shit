@@ -50,6 +50,18 @@ pub fn plan(
     probe: &dyn StateProbe,
     store: &dyn PlannerStore,
 ) -> UndoPlan {
+    plan_with_options(command, events, probe, store, PlanOptions::default())
+}
+
+/// [`plan`] with the daemon's options. `strict_capture` turns L5's
+/// capture-gap warnings into refusals.
+pub fn plan_with_options(
+    command: CommandRecord,
+    events: &[CaptureEvent],
+    probe: &dyn StateProbe,
+    store: &dyn PlannerStore,
+    options: PlanOptions,
+) -> UndoPlan {
     // AR07.1: refuse-list short-circuit. If the original command
     // matches a refuse-list entry, the plan is a single Refuse node
     // carrying the catalog reason + remediation. We skip per-event
@@ -123,6 +135,11 @@ pub fn plan(
         crate::plan_forward::paired_flags_shim_events(&chronological)
     };
 
+    // L5 (review round 3, item 3): walk entries whose xattrs the shim
+    // could not read come back without them. Say so: a warning, or a
+    // refusal under strict capture.
+    surface_unread_walk_xattrs(&live, options, &mut nodes, &mut warnings);
+
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
         // L5: the last inverse of a replaced subtree's walk has run, so
@@ -154,6 +171,46 @@ pub fn plan(
         command,
         nodes,
         warnings,
+    }
+}
+
+fn surface_unread_walk_xattrs(
+    live: &[&CaptureEvent],
+    options: PlanOptions,
+    nodes: &mut Vec<PlanNode>,
+    warnings: &mut Vec<PlanWarning>,
+) {
+    let mut seen: HashSet<&Path> = HashSet::new();
+    for ev in live {
+        let CaptureEventKind::RenameWalk { entries, .. } = &ev.kind else {
+            continue;
+        };
+        for e in entries.iter().filter(|e| !e.xattrs_read) {
+            if !seen.insert(e.path.as_path()) {
+                continue;
+            }
+            let reason = format!(
+                "{}: its extended attributes could not be read before it was renamed, \
+                 so it is restored without them",
+                e.path.display()
+            );
+            if options.strict_capture {
+                nodes.push(PlanNode {
+                    op: InverseOp::Refuse {
+                        class: "capture-gap".to_string(),
+                        reason,
+                        remediation: None,
+                    },
+                    cohort: 0,
+                    conflict: None,
+                });
+            } else {
+                warnings.push(PlanWarning::Informational {
+                    tier: crate::inverse::InverseTier::Files,
+                    message: reason,
+                });
+            }
+        }
     }
 }
 

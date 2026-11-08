@@ -2335,3 +2335,61 @@ fn outcome_journaled_before_its_rename_still_proves_it() {
     assert_rebuilt(&sim, "d");
     assert_restored(&sim, &before);
 }
+
+#[test]
+fn unread_walk_xattrs_warn_by_default_and_refuse_under_strict() {
+    // Review round 3, item 3: the shim could not read d/f's xattrs before
+    // the rename. Undo still restores the bytes, and says the xattrs are
+    // not coming back; strict capture refuses instead.
+    use crate::inverse::{InverseOp, PlanWarning};
+    let mut sim = Sim::new();
+    seed_tree(&sim);
+    sim.mv("d", "d.old");
+    sim.rm_rf("d.old");
+    let f = sim.p("d/f");
+    for e in &mut sim.events {
+        if let CaptureEventKind::RenameWalk { entries, .. } = &mut e.kind {
+            for w in entries.iter_mut().filter(|w| w.path == f) {
+                w.xattrs_read = false;
+            }
+        }
+    }
+    let probe = LiveStateProbe::new();
+    let mentions = |s: &str| s.contains(f.to_str().unwrap()) && s.contains("extended attributes");
+    let lax = crate::plan::plan_with_options(
+        command_record(),
+        &sim.events,
+        &probe,
+        &sim.store,
+        crate::plan::PlanOptions::default(),
+    );
+    assert!(
+        lax.warnings
+            .iter()
+            .any(|w| matches!(w, PlanWarning::Informational { message, .. } if mentions(message))),
+        "{:#?}",
+        lax.warnings
+    );
+    assert!(
+        !lax.nodes
+            .iter()
+            .any(|n| matches!(n.op, InverseOp::Refuse { .. }))
+    );
+    let strict = crate::plan::plan_with_options(
+        command_record(),
+        &sim.events,
+        &probe,
+        &sim.store,
+        crate::plan::PlanOptions {
+            strict_capture: true,
+        },
+    );
+    assert!(
+        strict
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.op, InverseOp::Refuse { reason, .. } if mentions(reason))),
+        "{:#?}",
+        strict.nodes
+    );
+}
