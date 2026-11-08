@@ -94,8 +94,7 @@ sed 's/^/    undo: /' "${SHIT_SMOKE_TMP}/undo.log" >&2 || true
 
 REFUSALS="$(smoke_journal_count "discriminant = 'CaptureRefused'")"
 if [ "${REFUSALS}" -ne 0 ]; then
-    smoke_journal_query "SELECT kind_json FROM events WHERE discriminant = 'CaptureRefused';" \
-        | sed 's/^/    refused: /' >&2 || true
+    smoke_dump_refusals
     smoke_fail "strict capture journaled ${REFUSALS} CaptureRefused row(s) for born files"
 fi
 [ "${UNDO_RC}" -eq 0 ] || smoke_fail "shit undo exit=${UNDO_RC}"

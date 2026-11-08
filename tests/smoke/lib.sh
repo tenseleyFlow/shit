@@ -515,3 +515,27 @@ smoke_refuse_assert() {
 
     smoke_log "refused as expected: class=${class}, exit=${rc}"
 }
+
+# Print every CaptureRefused row to stderr: seq, path, and the readable
+# strings of its postcard payload (class, path, detail). Fails the smoke
+# if the query or the decode fails, so a schema change cannot turn the
+# dump into silence.
+smoke_dump_refusals() {
+    local rows decoded
+    if ! rows="$(smoke_journal_query "SELECT seq, path, hex(payload) FROM events WHERE discriminant = 'CaptureRefused';")"; then
+        smoke_fail "CaptureRefused dump query failed against ${SHIT_INDEX_DB}"
+    fi
+    if ! decoded="$(printf '%s\n' "${rows}" | python3 -c '
+import re, sys
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    seq, path, payload = line.split("|", 2)
+    runs = [m.decode() for m in re.findall(rb"[ -~]{4,}", bytes.fromhex(payload))]
+    print(seq, path, " / ".join(runs))
+')"; then
+        smoke_fail "CaptureRefused dump could not decode the payload column"
+    fi
+    printf '%s\n' "${decoded}" | sed 's/^/    refused: /' >&2
+}

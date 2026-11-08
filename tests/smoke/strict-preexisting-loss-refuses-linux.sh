@@ -127,7 +127,7 @@ SHIT_STRICT_CAPTURE=1 smoke_start_shitd
 phase strict
 BIG_ROWS="$(smoke_journal_count "${REFUSED} AND path LIKE '%/strict/big/big'")"
 [ "${BIG_ROWS}" -ge 1 ] || {
-    smoke_journal_query "SELECT seq, path FROM events WHERE ${REFUSED};" | sed 's/^/    refused: /' >&2 || true
+    smoke_dump_refusals
     smoke_fail "strict: no CaptureRefused row for the over-cap baseline file"
 }
 grep -q "capture-incomplete" "${SHIT_SMOKE_TMP}/strict-big.undo.log" \

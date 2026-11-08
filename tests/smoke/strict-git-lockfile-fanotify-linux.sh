@@ -118,7 +118,7 @@ run_cmd 1 "${FLAT}" "sh -c '${FLAT_WORK}'" sh -c "${FLAT_WORK}"
 undo_into "${SHIT_SMOKE_TMP}/flat.undo.log"
 FLAT_ROWS="$(smoke_journal_count "${REFUSED}")"
 if [ "${FLAT_ROWS}" -ne 0 ]; then
-    smoke_journal_query "SELECT path FROM events WHERE ${REFUSED};" | sed 's/^/    refused: /' >&2 || true
+    smoke_dump_refusals
     smoke_fail "flat: strict journaled ${FLAT_ROWS} CaptureRefused row(s) for born files"
 fi
 if grep -q "capture-incomplete" "${SHIT_SMOKE_TMP}/flat.undo.log"; then
