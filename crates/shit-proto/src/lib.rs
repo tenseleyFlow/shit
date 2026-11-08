@@ -28,15 +28,16 @@ pub mod helper;
 pub mod shim;
 
 pub use ctl::{
-    BookmarkRequest, BookmarkSummary, CloudEventReq, CloudRuntimeWire, CloudVerbWire,
-    CmdDetailBody, CmdDetailEventWire, CmdDetailPlanSummary, ConflictPolicyWire, ContainerEventReq,
-    ContainerRuntimeWire, ContainerStashSummary, ContainerVerbWire, CtlRequest, CtlResponse,
-    DaemonStatus, DbConnInfo, DbEngineParseError, DbEngineWire, DbEventReq, DbTxStateWire,
-    GcReport, GcRequest, HelperLinkState, MetricsSnapshot, NetEventReq, NetToolParseError,
-    NetToolWire, PinRequest, PinSummary, PkgEventReq, PkgManagerParseError, PkgManagerWire,
-    PkgPhase, PreStashRedirectError, PreStashRedirectsResult, ProcEventReq, ProcSnapshot,
-    ProcToolParseError, ProcToolWire, RedirectOpWire, RedirectTargetWire, SvcEventReq,
-    SvcScopeWire, SvcToolParseError, SvcToolWire, UndoReportWire, UndoRequest,
+    BookmarkRequest, BookmarkSummary, CONTAINER_CAPTURE_FAILED_EXTRA, CloudEventReq,
+    CloudRuntimeWire, CloudVerbWire, CmdDetailBody, CmdDetailEventWire, CmdDetailPlanSummary,
+    ConflictPolicyWire, ContainerEventReq, ContainerRuntimeWire, ContainerStashSummary,
+    ContainerVerbWire, CtlRequest, CtlResponse, DaemonStatus, DbConnInfo, DbEngineParseError,
+    DbEngineWire, DbEventReq, DbTxStateWire, GcReport, GcRequest, HelperLinkState, MetricsSnapshot,
+    NetEventReq, NetToolParseError, NetToolWire, PinRequest, PinSummary, PkgEventReq,
+    PkgManagerParseError, PkgManagerWire, PkgPhase, PreStashRedirectError, PreStashRedirectsResult,
+    ProcEventReq, ProcSnapshot, ProcToolParseError, ProcToolWire, RedirectOpWire,
+    RedirectTargetWire, SvcEventReq, SvcScopeWire, SvcToolParseError, SvcToolWire, UndoReportWire,
+    UndoRequest,
 };
 pub use frame::{
     DecodeError, EncodeError, HOOK_DGRAM_MAX_FRAME, MAX_FRAME_SIZE, MAX_LARGE_FRAME_SIZE,
