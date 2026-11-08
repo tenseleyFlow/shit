@@ -220,6 +220,15 @@ const PRE_OPEN_TREE_MAX_FILES: usize = 512;
 struct PreSnapshot {
     meta: StatMeta,
     bytes: Vec<u8>,
+    /// blake3 of `bytes`, computed once when the snapshot is taken.
+    hash: [u8; 32],
+}
+
+impl PreSnapshot {
+    fn new(meta: StatMeta, bytes: Vec<u8>) -> Self {
+        let hash = blake3_of(&bytes);
+        Self { meta, bytes, hash }
+    }
 }
 
 /// AR01.3 follow-up: queued create event waiting for its parent dir
@@ -942,7 +951,7 @@ impl LinuxCaptureRuntime {
                 && ws
                     .pre_snapshots
                     .get(&(ev_dev_userspace, ev.inode))
-                    .is_some_and(|snap| blake3_of(&snap.bytes) == blob_hash);
+                    .is_some_and(|snap| snap.hash == blob_hash);
             if matches_snapshot {
                 ws.acct.note_captured((ev_dev_userspace, ev.inode));
             } else {
@@ -1057,8 +1066,8 @@ impl LinuxCaptureRuntime {
             );
             return;
         };
+        let blob_hash = snap.hash;
         let bytes = snap.bytes;
-        let blob_hash = blake3_of(&bytes);
         let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
             Ok(f) => f,
             Err(e) => {
@@ -1505,7 +1514,7 @@ impl LinuxCaptureRuntime {
                 && let (Ok(bytes), Some(meta)) = (read_pre_image(fd_raw), fstat_meta(fd_raw))
             {
                 ws.pre_snapshots
-                    .insert((dev, inode), PreSnapshot { meta, bytes });
+                    .insert((dev, inode), PreSnapshot::new(meta, bytes));
             }
             ws.pre_opens.insert((dev, inode), OwnedFd::from(f));
             // AR01.1.fix-rename-target-preimage — reverse-index so a
@@ -1598,9 +1607,9 @@ impl LinuxCaptureRuntime {
             }
             return;
         };
+        let blob_hash = snap.hash;
         let bytes = snap.bytes;
         let meta = snap.meta;
-        let blob_hash = blake3_of(&bytes);
         let staging_fd = match write_to_staging(&self.staging_dir, &bytes) {
             Ok(f) => f,
             Err(e) => {
@@ -1786,7 +1795,7 @@ impl LinuxCaptureRuntime {
                 return;
             }
         };
-        let pre_hash = blake3_of(&snap.bytes);
+        let pre_hash = snap.hash;
         let post_hash = blake3_of(&current_bytes);
         if pre_hash == post_hash {
             tracing::trace!(
@@ -1952,9 +1961,9 @@ impl LinuxCaptureRuntime {
             && let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned()
         {
             dest_handled = true;
+            let blob_hash = snap.hash;
             let bytes = snap.bytes;
             let meta = snap.meta;
-            let blob_hash = blake3_of(&bytes);
             match write_to_staging(&self.staging_dir, &bytes) {
                 Ok(staging_fd) => {
                     let resp = HelperResponse::CapturedPreImage {
@@ -2235,7 +2244,7 @@ fn pre_open_recurse(
         };
         if let (Ok(bytes), Some(meta)) = (read_pre_image(fd), fstat_meta(fd)) {
             ws.pre_snapshots
-                .insert((dev, inode), PreSnapshot { meta, bytes });
+                .insert((dev, inode), PreSnapshot::new(meta, bytes));
         } else {
             tracing::trace!(
                 dev,
@@ -3132,10 +3141,7 @@ mod tests {
             .insert((root_md.dev(), root_md.ino()), dir.path().to_path_buf());
         ws.pre_snapshots.insert(
             (dev_userspace, inode),
-            PreSnapshot {
-                meta,
-                bytes: pre_bytes.to_vec(),
-            },
+            PreSnapshot::new(meta, pre_bytes.to_vec()),
         );
         ws.pre_opens
             .insert((dev_userspace, inode), OwnedFd::from(f));
@@ -3566,6 +3572,16 @@ mod born_set_tests {
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
         assert!(obs[0].1.contains("no pre-mutation snapshot"), "{obs:?}");
+    }
+
+    #[test]
+    fn snapshot_hash_is_the_blake3_of_its_bytes() {
+        let mut rig = Rig::new(|d| std::fs::write(d.join("f"), b"pre-existing").unwrap());
+        let id = Rig::id(&rig.dir.path().join("f"));
+        let cmd = rig.cmd;
+        let ws = rig.rt().watches.get(&cmd).unwrap();
+        let snap = &ws.pre_snapshots[&id];
+        assert_eq!(snap.hash, blake3_of(b"pre-existing"));
     }
 
     #[test]
