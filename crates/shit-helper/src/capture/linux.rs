@@ -1228,35 +1228,41 @@ impl LinuxCaptureRuntime {
         // reading only when it is a regular file (open_held_nofollow),
         // so a device node made by the command is held without being
         // opened, and a fifo never blocks.
-        // An O_PATH open succeeds on a symlink, where the old O_RDONLY
-        // open failed with ELOOP and took the marker path below; keep
-        // that: only entries this handler holds fds for are kept.
-        let opened = open_held_nofollow(&path_to_string(&resolved_path))
-            .ok()
-            .filter(|f| {
-                fstat_dev_inode_kind(f.as_raw_fd()).is_some_and(|(_, _, k)| {
-                    matches!(
-                        k,
-                        FileType::Regular
-                            | FileType::Fifo
-                            | FileType::Socket
-                            | FileType::BlockDevice
-                            | FileType::CharDevice
-                    )
-                })
-            });
-
-        let (dev, inode, file_type) = match opened
+        // Kinds this handler holds: as on trunk, a directory is not
+        // journaled here (process_lsm_mkdir owns it). An O_PATH open also
+        // succeeds on a symlink, where the old O_RDONLY open failed with
+        // ELOOP; a symlink, any other unheld kind, and a failed open all
+        // take the marker branch, as before.
+        let held = open_held_nofollow(&path_to_string(&resolved_path)).ok();
+        let held_stat = held
             .as_ref()
-            .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()))
-        {
-            Some(t) => t,
-            None => {
+            .and_then(|f| fstat_dev_inode_kind(f.as_raw_fd()));
+        let (opened, (dev, inode, file_type)) = match held_stat {
+            Some((_, _, FileType::Directory)) => {
+                tracing::trace!(
+                    path = %resolved_path.display(),
+                    "lsm create: directory; left to the mkdir handler"
+                );
+                return;
+            }
+            Some(t @ (_, _, k))
+                if matches!(
+                    k,
+                    FileType::Regular
+                        | FileType::Fifo
+                        | FileType::Socket
+                        | FileType::BlockDevice
+                        | FileType::CharDevice
+                ) =>
+            {
+                (held, t)
+            }
+            _ => {
                 tracing::warn!(
                     path = %resolved_path.display(),
                     "lsm create: post-open/fstat race lost; emitting marker TreeOpCreate (dev=0, inode=0)"
                 );
-                (0, 0, FileType::Regular)
+                (None, (0, 0, FileType::Regular))
             }
         };
         // AU29 — accept Fifo / Socket here (mknod routes through
@@ -2742,6 +2748,33 @@ mod tests {
                 assert_eq!(path, "/dev/null");
             }
             other => panic!("expected a Create, got {other:?}"),
+        }
+    }
+
+    /// Review round 2, item 2: a directory reaching the create path is
+    /// left to the mkdir handler, as on trunk, not journaled as a
+    /// marker Regular Create.
+    #[test]
+    fn create_path_journals_nothing_for_a_directory() {
+        let staging = tempfile::tempdir().unwrap();
+        let (a, b) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt = LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(a)).unwrap();
+        let cmd = ghost_cmd();
+        rt.on_watch_tree(cmd);
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("d");
+        std::fs::create_dir(&sub).unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        rt.process_lsm_create_resolved(cmd, 1, sub, 0o040755);
+        rt.process_lsm_create_resolved(cmd, 1, file.clone(), 0o100644);
+        // The first (and only) message is the file's Create.
+        match b.recv_response().unwrap() {
+            HelperResponse::TreeMutation {
+                op: shit_proto::TreeOpWire::Create { path, .. },
+                ..
+            } => assert_eq!(path, file.to_str().unwrap()),
+            other => panic!("expected the file's Create, got {other:?}"),
         }
     }
 
