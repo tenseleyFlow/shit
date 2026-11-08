@@ -148,24 +148,31 @@ pub fn plan(
 /// did not capture, undo restores the earliest pre-image of `P`
 /// whichever open it came from, so the gap is covered and its refusal
 /// is dropped. Otherwise the refusal stands.
+///
+/// Review of #232 round 2, item 3: the covering pre-image must be stamped
+/// no later than the gap. One captured after it (a later rewrite of the
+/// same path) holds bytes the gapped write may already have changed.
 fn covered_capture_gaps(live: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
-    let captured: HashSet<&Path> = live
-        .iter()
-        .filter_map(|e| match &e.kind {
-            CaptureEventKind::FilePreImage { path, source, .. }
-                if source.has_content() && !source.is_shim() =>
-            {
-                Some(path.as_path())
-            }
-            _ => None,
-        })
-        .collect();
+    let mut earliest: std::collections::HashMap<&Path, crate::time::TimePoint> =
+        std::collections::HashMap::new();
+    for e in live {
+        if let CaptureEventKind::FilePreImage { path, source, .. } = &e.kind
+            && source.has_content()
+            && !source.is_shim()
+        {
+            earliest
+                .entry(path.as_path())
+                .and_modify(|t| *t = (*t).min(e.ts))
+                .or_insert(e.ts);
+        }
+    }
     live.iter()
         .filter(|e| {
             matches!(
                 &e.kind,
                 CaptureEventKind::CaptureRefused { class, path, .. }
-                    if class == "capture-gap" && captured.contains(path.as_path())
+                    if class == "capture-gap"
+                        && earliest.get(path.as_path()).is_some_and(|t| *t <= e.ts)
             )
         })
         .map(|e| e.id)
@@ -2177,6 +2184,11 @@ mod tests {
     /// pre-image of the same path from `source`. Returns the plan's
     /// capture-gap refusals.
     fn capture_gap_refusals(pre: Option<crate::FilePreImageSource>) -> usize {
+        capture_gap_refusals_at(pre, 1)
+    }
+
+    /// The gap is stamped 2; the pre-image `pre_ts`.
+    fn capture_gap_refusals_at(pre: Option<crate::FilePreImageSource>, pre_ts: u64) -> usize {
         let mut probe = InMemoryProbe::new();
         let mut store = InMemoryStore::new();
         let inode = InodeRef::new(1, 5);
@@ -2210,7 +2222,7 @@ mod tests {
             events.push(CaptureEvent {
                 id: EventId(1),
                 command,
-                ts: TimePoint::new(1, 0),
+                ts: TimePoint::new(pre_ts, 0),
                 partial: false,
                 kind: CaptureEventKind::FilePreImage {
                     inode,
@@ -2237,6 +2249,22 @@ mod tests {
         );
         assert_eq!(
             capture_gap_refusals(Some(crate::FilePreImageSource::EsAuthPreMutation)),
+            0
+        );
+    }
+
+    /// Review of #232 round 2, item 3: `open(O_TRUNC)` the shim could not
+    /// capture (gap at 2), then a later rewrite the kernel tier captured
+    /// (pre-image at 5, of the already-truncated file). The later bytes
+    /// are not the pre-command state: the refusal stands.
+    #[test]
+    fn a_kernel_pre_image_after_the_gap_does_not_cover_it() {
+        assert_eq!(
+            capture_gap_refusals_at(Some(crate::FilePreImageSource::Other), 5),
+            1
+        );
+        assert_eq!(
+            capture_gap_refusals_at(Some(crate::FilePreImageSource::Other), 2),
             0
         );
     }
