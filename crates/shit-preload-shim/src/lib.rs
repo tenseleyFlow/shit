@@ -718,13 +718,13 @@ mod policy {
         from: &str,
         tofd: libc::c_int,
         to: &str,
-    ) {
+    ) -> Option<PendingRename> {
         let f = resolve_entry_at(fromfd, from, "from");
         let t = resolve_entry_at(tofd, to, "to");
         match (f, t) {
-            (AtResolution::Nothing, _) | (_, AtResolution::Nothing) => {}
+            (AtResolution::Nothing, _) | (_, AtResolution::Nothing) => None,
             (AtResolution::Resolved(a), AtResolution::Resolved(b)) => {
-                notify_rename_with_dst_preimage(syscall, &a, &b);
+                notify_rename_with_dst_preimage(syscall, &a, &b)
             }
             // Prefer the `from` failure, as notify_rename does.
             (AtResolution::Failed(fa, fe), AtResolution::Failed(ta, _))
@@ -732,6 +732,7 @@ mod policy {
             | (AtResolution::Resolved(fa), AtResolution::Failed(ta, fe)) => {
                 let arg = format!("{fa}\t{ta}");
                 notify_inner_with_failure(syscall, &arg, None, Some(fe), false);
+                None
             }
         }
     }
@@ -791,7 +792,11 @@ mod policy {
     /// `None` and the planner falls back to ReverseRename. When `to`
     /// pre-exists (install over an existing file), the captured bytes
     /// drive a RestoreContent inverse instead.
-    pub fn notify_rename_with_dst_preimage(syscall: &'static str, from: &str, to: &str) {
+    pub fn notify_rename_with_dst_preimage(
+        syscall: &'static str,
+        from: &str,
+        to: &str,
+    ) -> Option<PendingRename> {
         // W09.7: canonicalize both `from` and `to` so the daemon's
         // TreeOp::Rename carries absolute paths. Otherwise tools like
         // `rsync` that call rename(2) with paths relative to their own
@@ -834,7 +839,7 @@ mod policy {
         // canonicalization above this also catches `./foo` vs
         // `foo`, symlink-equal pairs, etc.
         if from_abs == to_abs {
-            return;
+            return None;
         }
         let arg = format!("{from_abs}\t{to_abs}");
         // DR-CR-54 — when `from` is a directory, snapshot every
@@ -844,7 +849,7 @@ mod policy {
         // <staging>` before writing fresh content, and without
         // recursive pre-images the original site-packages contents
         // are unreachable by the time undo runs.
-        notify_rename_inner_with_recursive(syscall, &arg, &to_abs, &from_abs, failure);
+        notify_rename_inner_with_recursive(syscall, &arg, &to_abs, &from_abs, failure)
     }
 
     /// DR-CR-54 limits. A directory rename of an enormous tree
@@ -869,20 +874,67 @@ mod policy {
         capture_path: &str,
         from_abs: &str,
         failure: Option<shit_proto::ShimFailure>,
-    ) {
+    ) -> Option<PendingRename> {
         if disabled() {
-            return;
+            return None;
         }
         if IN_NOTIFY.with(|f| f.replace(true)) {
-            return;
+            return None;
         }
         let (pre_image, pre_stat, gap) = rename_destination(capture_path);
         let extras = collect_recursive_pre_images(from_abs);
+        // Review of #232 round 2, item 5: a rename over a symlink is
+        // reported after it succeeded, carrying the link's lstat, so the
+        // daemon never journals a replaced link for a rename that failed.
+        if pre_stat.is_some() {
+            IN_NOTIFY.with(|f| f.set(false));
+            return Some(PendingRename {
+                syscall,
+                arg: arg.to_string(),
+                extras,
+                failure,
+                pre_stat,
+            });
+        }
         // #222: the wire arg stays `from\tto` for the whole rename
         // family, overwrite or not. The pre-image carries the
         // destination path on its own; replacing the arg with it left
         // the daemon nothing to journal a TreeOp::Rename from.
-        let _ = try_notify_full(syscall, arg, pre_image, extras, failure.or(gap), pre_stat);
+        // Review of #232 round 2, item 4: a canonicalize marker and a
+        // destination gap are both sent; the gap rides a note of its own.
+        let (failure, second_gap) = match (failure, gap) {
+            (Some(f), Some(g)) => (Some(f), Some(g)),
+            (f, g) => (f.or(g), None),
+        };
+        let _ = try_notify(syscall, arg, pre_image, extras, failure);
+        if let Some(g) = second_gap {
+            let _ = try_notify("capture_gap", capture_path, None, Vec::new(), Some(g));
+        }
+        IN_NOTIFY.with(|f| f.set(false));
+        None
+    }
+
+    /// A rename over a symlink, reported once the call returns.
+    pub struct PendingRename {
+        syscall: &'static str,
+        arg: String,
+        extras: Vec<shit_proto::ShimPreImage>,
+        failure: Option<shit_proto::ShimFailure>,
+        pre_stat: Option<shit_proto::ShimStat>,
+    }
+
+    /// After a rename-family call: send a held rename (one over a
+    /// symlink) only if the call succeeded. Leaves errno as it was.
+    pub fn rename_end(pending: Option<PendingRename>, rc: libc::c_int) {
+        let Some(p) = pending else {
+            return;
+        };
+        if rc != 0 || IN_NOTIFY.with(|f| f.replace(true)) {
+            return;
+        }
+        with_saved_errno(|| {
+            let _ = try_notify_full(p.syscall, &p.arg, None, p.extras, p.failure, p.pre_stat);
+        });
         IN_NOTIFY.with(|f| f.set(false));
     }
 
@@ -2279,16 +2331,19 @@ mod interposers {
         // it exists) so the planner can RestoreContent rather than
         // ReverseRename (which would leave dst empty + content stuck
         // at the source tmpfile path).
-        policy::notify_rename_with_dst_preimage(
+        let pending = policy::notify_rename_with_dst_preimage(
             "rename",
             &cstr_to_string(from),
             &cstr_to_string(to),
         );
         let real = next::real_rename();
-        if next::is_zero(next::as_usize(real)) {
-            return unsafe { libc::rename(from, to) };
-        }
-        unsafe { real(from, to) }
+        let rc = if next::is_zero(next::as_usize(real)) {
+            unsafe { libc::rename(from, to) }
+        } else {
+            unsafe { real(from, to) }
+        };
+        policy::rename_end(pending, rc);
+        rc
     }
 
     /// `renameat(2)` interposer.
@@ -2310,12 +2365,15 @@ mod interposers {
         // and the classifier can't reach atomic-replace.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        policy::notify_rename_at("renameat", fromfd, &from_str, tofd, &to_str);
+        let pending = policy::notify_rename_at("renameat", fromfd, &from_str, tofd, &to_str);
         let real = next::real_renameat();
-        if next::is_zero(next::as_usize(real)) {
-            return unsafe { libc::renameat(fromfd, from, tofd, to) };
-        }
-        unsafe { real(fromfd, from, tofd, to) }
+        let rc = if next::is_zero(next::as_usize(real)) {
+            unsafe { libc::renameat(fromfd, from, tofd, to) }
+        } else {
+            unsafe { real(fromfd, from, tofd, to) }
+        };
+        policy::rename_end(pending, rc);
+        rc
     }
 
     /// DR-CR-54 — `renameat2(2)` interposer. Linux-only. The
@@ -2340,18 +2398,21 @@ mod interposers {
         // DR-CR-54.B: same dirfd→absolute resolution as renameat.
         let from_str = cstr_to_string(from);
         let to_str = cstr_to_string(to);
-        policy::notify_rename_at("renameat2", fromfd, &from_str, tofd, &to_str);
+        let pending = policy::notify_rename_at("renameat2", fromfd, &from_str, tofd, &to_str);
         let real = next::real_renameat2();
-        if next::is_zero(next::as_usize(real)) {
+        let rc = if next::is_zero(next::as_usize(real)) {
             // glibc < 2.28 had no `renameat2` wrapper; fall back
             // through raw syscall. This branch is unreachable on
             // any glibc shipped within the project's MSRV-era
             // distros, but defensive.
-            return unsafe {
+            unsafe {
                 libc::syscall(libc::SYS_renameat2, fromfd, from, tofd, to, flags as c_uint) as c_int
-            };
-        }
-        unsafe { real(fromfd, from, tofd, to, flags) }
+            }
+        } else {
+            unsafe { real(fromfd, from, tofd, to, flags) }
+        };
+        policy::rename_end(pending, rc);
+        rc
     }
 
     /// W09.10.1 — `mkfifo(2)` interposer. FreeBSD's kqueue

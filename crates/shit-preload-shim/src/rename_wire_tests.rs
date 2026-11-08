@@ -208,3 +208,58 @@ fn rename_over_an_uncapturable_file_sends_a_gap_marker() {
         "{notes:#?}"
     );
 }
+
+/// Review of #232 round 2, item 5: a rename over a symlink that fails
+/// (here ENOTDIR, a directory onto a link; EXDEV across filesystems is
+/// the same shape) sends nothing, so no replaced link is journaled.
+#[test]
+fn failed_rename_over_a_symlink_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::write(dir.join("target"), b"keep").unwrap();
+    std::fs::create_dir(dir.join("d")).unwrap();
+    std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+    let from = CString::new(dir.join("d").to_str().unwrap()).unwrap();
+    let to = CString::new(dir.join("link").to_str().unwrap()).unwrap();
+    let notes = test_capture::capture(|| {
+        assert_eq!(
+            unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) },
+            -1
+        );
+    });
+    assert!(notes.is_empty(), "{notes:#?}");
+    assert_eq!(
+        std::fs::read_link(dir.join("link")).unwrap().to_str(),
+        Some("target")
+    );
+}
+
+/// Review of #232 round 2, item 4: a `from` the shim could not key and
+/// a destination it could not read are both reported.
+#[test]
+fn canonicalize_marker_and_destination_gap_are_both_sent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let big = vec![b'x'; shit_proto::SHIM_INLINE_PREIMAGE_CAP as usize + 1];
+    std::fs::write(dir.join("big"), &big).unwrap();
+    let from = CString::new("/no-such-dir-l5/missing/x").unwrap();
+    let to = CString::new(dir.join("big").to_str().unwrap()).unwrap();
+    let notes = test_capture::capture(|| {
+        unsafe { super::interposers::rename(from.as_ptr(), to.as_ptr()) };
+    });
+    let failures: Vec<_> = notes.iter().filter_map(|n| n.failure.as_ref()).collect();
+    assert!(
+        failures
+            .iter()
+            .any(|f| matches!(f, shit_proto::ShimFailure::CanonicalizeFailed { .. })),
+        "{notes:#?}"
+    );
+    assert!(
+        failures.iter().any(|f| matches!(
+            f,
+            shit_proto::ShimFailure::PreImageUncaptured { path, .. }
+                if path == dir.join("big").to_str().unwrap()
+        )),
+        "{notes:#?}"
+    );
+}
