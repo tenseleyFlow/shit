@@ -463,7 +463,10 @@ fn handle(
         HookMessage::PostExec { seq, exit_code, .. } => {
             info!(%session, kind, seq, exit_code, "post-exec");
             let command = CommandId { session, seq: *seq };
-            close_ctx.live_baseline.forget_command_watch(command);
+            // L5 (review round 5, item 2): shim notes timestamped before
+            // this frame were written under the watch, however late they
+            // are ingested.
+            close_ctx.live_baseline.close_command_watch(command, ts);
             // A replayed PostExec must not rewrite a finalized command or
             // judge its capture again.
             let finalized = <Index as shit_planner::PlannerStore>::command_by_id(index, command)

@@ -227,13 +227,16 @@ async fn handle_one(
     // costs ~10ms (one ps invocation per ancestor level); we have
     // 40ms of headroom inside the shim's 50ms allow-on-timeout
     // budget.
-    let resolved = active.resolve_by_descendant(note.pid);
-
+    //
     // Reserve journal order before allowing the intercepted syscall to
     // run. Ingestion itself remains fail-open and happens after the ACK,
     // but later helper/shim events can no longer overtake this pre-
-    // mutation snapshot in the planner's logical clock.
+    // mutation snapshot in the planner's logical clock. L5 (review round
+    // 5, item 2): reserved before the pid resolution. The watch check
+    // compares it with the command's PostExec: a note stamped earlier was
+    // sent while the kernel tier watched, however late it is ingested.
     let ingest_ts = crate::server::next_ts();
+    let resolved = active.resolve_by_descendant(note.pid);
 
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
@@ -385,7 +388,7 @@ fn ingest_notification(
         &note.failure,
         Some(shit_proto::ShimFailure::PreImageUncaptured { path, .. })
             if live_baseline.path_in_watched_subtree(Path::new(path))
-                || live_baseline.command_watches(command, Path::new(path))
+                || live_baseline.command_watches(command, Path::new(path), ingest_ts)
     );
     if let Some(failure) = &note.failure
         && !gap_in_watch
@@ -1765,6 +1768,32 @@ mod tests {
             &blob_store,
         );
         assert_eq!(index.events_for_command(command).len(), 2);
+    }
+
+    /// Review round 5, item 2: a gap note stamped before the command's
+    /// PostExec but ingested after it was written under the watch, and is
+    /// no refusal. One stamped after the PostExec is.
+    #[test]
+    fn late_gap_note_from_before_post_exec_journals_no_refusal() {
+        use shit_planner::time::TimePoint;
+        let note = open_note(
+            "open",
+            Some(shit_proto::ShimFailure::PreImageUncaptured {
+                path: "/tmp/shit-open/big.bin".into(),
+                reason: "over the shim's inline pre-image cap".into(),
+            }),
+        );
+        let (_tmp, index, blob_store, command) = ingest_fixture("python3 save.py");
+        let lb = LiveBaseline::new();
+        lb.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
+        // The PostExec at 10 is handled before either note is ingested.
+        lb.close_command_watch(command, TimePoint::new(10, 0));
+        let ingest =
+            |at| ingest_notification(&note, Some(command), at, None, &index, &blob_store, &lb);
+        ingest(TimePoint::new(9, 0));
+        assert!(index.events_for_command(command).is_empty());
+        ingest(TimePoint::new(11, 0));
+        assert_eq!(index.events_for_command(command).len(), 1);
     }
 
     #[test]

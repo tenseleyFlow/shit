@@ -36,6 +36,7 @@
 
 use shit_planner::events::CommandId;
 use shit_planner::inode::{BlobHash, InodeRef};
+use shit_planner::time::TimePoint;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -241,14 +242,21 @@ impl BaselineCacheEntry {
 /// payload carries the cwd path (B05.10) and the walker scans
 /// from there. Two sessions in the same cwd share the cache
 /// entry (refcount); the walk runs once for both.
+/// L5: one command's kernel-tier watch, as the daemon requested it.
+struct CommandWatch {
+    root: PathBuf,
+    /// The PostExec's timestamp, once it arrived.
+    closed_at: Option<TimePoint>,
+}
+
 #[derive(Default)]
 pub struct LiveBaseline {
     by_cwd: RwLock<HashMap<PathBuf, Arc<BaselineCacheEntry>>>,
     /// L5 (review round 4, item 2): the watch root the daemon sent the
-    /// helper in `WatchTree` for each running command, on every platform.
-    /// Dropped when the helper says it cannot watch that command, and at
-    /// PostExec.
-    command_roots: RwLock<HashMap<CommandId, PathBuf>>,
+    /// helper in `WatchTree` for each command, on every platform, and the
+    /// time its PostExec closed the watch. Dropped when the helper says it
+    /// cannot watch that command, and when the session starts another.
+    command_roots: RwLock<HashMap<CommandId, CommandWatch>>,
 }
 
 impl LiveBaseline {
@@ -329,23 +337,44 @@ impl LiveBaseline {
     }
 
     /// L5: the daemon asked the helper to watch `command` under `root`.
+    /// The session's earlier, closed commands are dropped: a shim note
+    /// for one of them that is still in flight is judged unwatched,
+    /// which journals a refusal and loses nothing.
     pub fn record_command_watch(&self, command: CommandId, root: PathBuf) {
-        self.command_roots.write().unwrap().insert(command, root);
+        let mut map = self.command_roots.write().unwrap();
+        map.retain(|c, w| c.session != command.session || w.closed_at.is_none());
+        map.insert(
+            command,
+            CommandWatch {
+                root,
+                closed_at: None,
+            },
+        );
+    }
+
+    /// L5 (review round 5, item 2): `command`'s PostExec at `at` closed
+    /// its watch. The root is kept: a shim note the daemon timestamped
+    /// before `at` was written while the kernel tier still watched.
+    pub fn close_command_watch(&self, command: CommandId, at: TimePoint) {
+        if let Some(w) = self.command_roots.write().unwrap().get_mut(&command) {
+            w.closed_at.get_or_insert(at);
+        }
     }
 
     /// L5: `command` is not watched after all (the helper failed to
-    /// attach, or has no capture tier), or it ended.
+    /// attach, or has no capture tier).
     pub fn forget_command_watch(&self, command: CommandId) {
         self.command_roots.write().unwrap().remove(&command);
     }
 
-    /// L5: `path` is under the tree a kernel tier watches for `command`.
-    pub fn command_watches(&self, command: CommandId, path: &Path) -> bool {
+    /// L5: `path` is under the tree a kernel tier watched for `command`
+    /// when the daemon timestamped the note `at`.
+    pub fn command_watches(&self, command: CommandId, path: &Path, at: TimePoint) -> bool {
         self.command_roots
             .read()
             .unwrap()
             .get(&command)
-            .is_some_and(|root| path.starts_with(root))
+            .is_some_and(|w| path.starts_with(&w.root) && w.closed_at.is_none_or(|c| at < c))
     }
 }
 
@@ -353,6 +382,28 @@ impl LiveBaseline {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Review round 5, item 2: a closed watch still covers notes the
+    /// daemon timestamped before the PostExec, and no later ones.
+    #[test]
+    fn closed_command_watch_covers_only_notes_from_before_the_close() {
+        let lb = LiveBaseline::new();
+        let c = CommandId {
+            session: Uuid::from_u128(9),
+            seq: 1,
+        };
+        let f = Path::new("/w/f");
+        lb.record_command_watch(c, PathBuf::from("/w"));
+        lb.close_command_watch(c, TimePoint::new(10, 0));
+        assert!(lb.command_watches(c, f, TimePoint::new(9, 0)));
+        assert!(!lb.command_watches(c, f, TimePoint::new(11, 0)));
+        assert!(!lb.command_watches(c, Path::new("/x/f"), TimePoint::new(9, 0)));
+        // The session's next command drops the closed one.
+        let next = CommandId { seq: 2, ..c };
+        lb.record_command_watch(next, PathBuf::from("/w"));
+        assert!(!lb.command_watches(c, f, TimePoint::new(9, 0)));
+        assert!(lb.command_watches(next, f, TimePoint::new(12, 0)));
+    }
 
     fn cmd(seq: u64) -> CommandId {
         CommandId {

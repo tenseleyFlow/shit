@@ -1972,13 +1972,13 @@ mod tests_dispatch {
             path: Some("/tmp/watched/f".into()),
             detail: "one path".into(),
         });
-        assert!(lb.command_watches(cmd, f));
+        assert!(lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
         send(HelperResponse::WatchTreeFailed {
             session: cmd.session,
             command_seq: cmd.seq,
             reason: "attach failed".into(),
         });
-        assert!(!lb.command_watches(cmd, f));
+        assert!(!lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
         lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
         send(HelperResponse::CaptureRefused {
             session: cmd.session,
@@ -1986,7 +1986,7 @@ mod tests_dispatch {
             path: None,
             detail: "no Linux capture tier is active".into(),
         });
-        assert!(!lb.command_watches(cmd, f));
+        assert!(!lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
     }
 
     #[tokio::test]
