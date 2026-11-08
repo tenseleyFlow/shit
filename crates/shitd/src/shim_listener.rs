@@ -602,7 +602,7 @@ fn ingest_notification(
     // record. The BSD baseline gate below is the same rule for kqueue.
     let create_in_command_watch = cfg!(target_os = "linux")
         && matches!(note.syscall.as_str(), "open_create" | "mkdir" | "mkdirat")
-        && live_baseline.command_watches(command, Path::new(&note.arg), ingest_ts);
+        && live_baseline.defer_create_to_kernel(command, Path::new(&note.arg), ingest_ts);
     if note.syscall == "open_create" {
         // AR05.1: the shim saw the path absent before an O_CREAT open
         // that then succeeded. On in-watch paths the dir-diff Create event
@@ -1899,6 +1899,7 @@ mod tests {
         std::fs::create_dir(&out).unwrap();
         let lb = LiveBaseline::new();
         lb.record_command_watch(command, root.clone());
+        lb.confirm_command_watch(command, TimePoint::new(1, 0));
         let mut t = 1;
         let mut ts = || {
             t += 1;
@@ -2090,6 +2091,50 @@ mod tests {
             ),
             "{kinds:#?}"
         );
+    }
+
+    /// Review of #232 round 2, item 2: until the helper confirms the
+    /// watch, the shim's Create is journaled; once it has, it is left to
+    /// the kernel tier.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn shim_create_before_the_watch_is_ready_is_journaled() {
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("mkdir d");
+        let lb = LiveBaseline::new();
+        lb.record_command_watch(command, PathBuf::from("/tmp/shit-open"));
+        let mut early = open_note("mkdir", None);
+        early.arg = "/tmp/shit-open/early".into();
+        ingest_notification(
+            &early,
+            Some(command),
+            TimePoint::new(2, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        lb.confirm_command_watch(command, TimePoint::new(3, 0));
+        let mut late = open_note("mkdir", None);
+        late.arg = "/tmp/shit-open/late".into();
+        ingest_notification(
+            &late,
+            Some(command),
+            TimePoint::new(4, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        let creates: Vec<_> = index
+            .events_for_command(command)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, vec![PathBuf::from("/tmp/shit-open/early")]);
     }
 
     #[test]

@@ -240,6 +240,10 @@ struct CommandWatch {
     root: PathBuf,
     /// The PostExec's timestamp, once it arrived.
     closed_at: Option<TimePoint>,
+    /// When the helper confirmed the watch (WatchTreeReady routed).
+    ready_at: Option<TimePoint>,
+    /// The shim left at least one Create to the kernel tier.
+    deferred: bool,
     /// When the daemon recorded it, for the age-out.
     recorded: std::time::Instant,
 }
@@ -378,6 +382,8 @@ impl LiveBaseline {
             CommandWatch {
                 root,
                 closed_at: None,
+                ready_at: None,
+                deferred: false,
                 recorded: now,
             },
         );
@@ -403,8 +409,40 @@ impl LiveBaseline {
 
     /// L5: `command` is not watched after all (the helper failed to
     /// attach, or has no capture tier, or the WatchTree send failed).
-    pub fn forget_command_watch(&self, command: CommandId) {
-        self.command_roots.write().unwrap().remove(&command);
+    ///
+    /// Returns true when the shim had already left Creates to the kernel
+    /// tier for this command: the caller must then say they may be lost.
+    pub fn forget_command_watch(&self, command: CommandId) -> bool {
+        self.command_roots
+            .write()
+            .unwrap()
+            .remove(&command)
+            .is_some_and(|w| w.deferred)
+    }
+
+    /// L5 (review of #232 round 2, item 2): the helper confirmed it
+    /// watches `command` (WatchTreeReady routed at `at`).
+    pub fn confirm_command_watch(&self, command: CommandId, at: TimePoint) {
+        if let Some(w) = self.command_roots.write().unwrap().get_mut(&command) {
+            w.ready_at.get_or_insert(at);
+        }
+    }
+
+    /// L5 (review of #232 round 2, item 2): may the shim leave a Create at
+    /// `path`, stamped `at`, to the kernel tier? Only when the helper
+    /// confirmed the watch before `at` and the path is under its root.
+    /// A yes is remembered, so a later failure of that watch can be
+    /// reported (see [`Self::forget_command_watch`]).
+    pub fn defer_create_to_kernel(&self, command: CommandId, path: &Path, at: TimePoint) -> bool {
+        let mut map = self.command_roots.write().unwrap();
+        let Some(w) = map.get_mut(&command) else {
+            return false;
+        };
+        let ok = w.ready_at.is_some_and(|r| r <= at)
+            && path.starts_with(&w.root)
+            && w.closed_at.is_none_or(|c| at < c);
+        w.deferred |= ok;
+        ok
     }
 
     /// L5: `path` is under the tree a kernel tier watched for `command`
@@ -422,6 +460,35 @@ impl LiveBaseline {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Review of #232 round 2, item 2: a Create is left to the kernel tier
+    /// only once the helper confirmed the watch; a failure after that
+    /// reports that deferred Creates may be lost.
+    #[test]
+    fn creates_defer_only_to_a_confirmed_watch() {
+        let lb = LiveBaseline::new();
+        let c = CommandId {
+            session: Uuid::from_u128(5),
+            seq: 1,
+        };
+        let f = Path::new("/w/f");
+        lb.record_command_watch_at(c, PathBuf::from("/w"), std::time::Instant::now());
+        assert!(
+            !lb.defer_create_to_kernel(c, f, TimePoint::new(1, 0)),
+            "not ready yet"
+        );
+        lb.confirm_command_watch(c, TimePoint::new(2, 0));
+        assert!(
+            !lb.defer_create_to_kernel(c, f, TimePoint::new(1, 0)),
+            "stamped before ready"
+        );
+        assert!(lb.defer_create_to_kernel(c, f, TimePoint::new(3, 0)));
+        assert!(!lb.defer_create_to_kernel(c, Path::new("/x/f"), TimePoint::new(3, 0)));
+        assert!(lb.forget_command_watch(c), "a deferred Create is reported");
+        assert!(!lb.defer_create_to_kernel(c, f, TimePoint::new(4, 0)));
+        lb.record_command_watch_at(c, PathBuf::from("/w"), std::time::Instant::now());
+        assert!(!lb.forget_command_watch(c), "nothing deferred");
+    }
 
     /// Review of #232 round 2, item 1: a shell whose `$PWD` runs through
     /// a symlink. The shim's canonical paths are under the recorded root.

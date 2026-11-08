@@ -1118,6 +1118,8 @@ fn dispatch_response(
                 seq: command_seq,
             };
             watch_ready.mark_ready(cmd);
+            // L5: from now on the shim may leave Creates to the kernel tier.
+            live_baseline.confirm_command_watch(cmd, crate::server::next_ts());
             tracing::debug!(%session, command_seq, "WatchTreeReady routed");
         }
         HelperResponse::WatchTreeFailed {
@@ -1131,7 +1133,9 @@ fn dispatch_response(
             };
             watch_ready.mark_failed(cmd, reason.clone());
             // L5: not watched, so the shim's Creates there are journaled.
-            live_baseline.forget_command_watch(cmd);
+            if live_baseline.forget_command_watch(cmd) {
+                journal_lost_deferred_creates(index, cmd);
+            }
             tracing::warn!(%session, command_seq, %reason, "helper reported watch attach failure");
             if strict_capture {
                 journal_capture_refused_or_log(
@@ -1155,8 +1159,8 @@ fn dispatch_response(
             // L5: a whole-command observation (no capture tier, or the
             // attach failed) means nothing watches it: the shim's Creates
             // there are journaled.
-            if path.is_none() {
-                live_baseline.forget_command_watch(cmd);
+            if path.is_none() && live_baseline.forget_command_watch(cmd) {
+                journal_lost_deferred_creates(index, cmd);
             }
             if strict_capture {
                 tracing::warn!(%session, seq, ?path, %detail, "helper capture refusal (strict; journaling)");
@@ -1230,6 +1234,32 @@ pub(crate) fn journal_capture_refused(
         },
     };
     index.put_event(&event).map(|_| ())
+}
+
+/// L5 (review of #232 round 2, item 2): the shim left Creates to the
+/// kernel tier for `command`, then the helper said it cannot watch it.
+/// Those notes are gone and the kernel tier may not have the Creates
+/// either, so the command gets a loud capture-gap refusal in every mode.
+fn journal_lost_deferred_creates(index: &Index, command: CommandId) {
+    let cwd = <Index as shit_planner::PlannerStore>::command_by_id(index, command)
+        .map(|r| r.cwd)
+        .unwrap_or_default();
+    let event = CaptureEvent {
+        id: EventId(0),
+        command,
+        ts: crate::server::next_ts(),
+        partial: false,
+        kind: CaptureEventKind::CaptureRefused {
+            class: "capture-gap".to_string(),
+            path: cwd,
+            detail: "the shim left file creations to the kernel tier, which then stopped \
+                     watching this command; some created files may not be undone"
+                .to_string(),
+        },
+    };
+    if let Err(e) = index.put_event(&event) {
+        tracing::error!(error = %e, %command, "lost-deferred-creates refusal journal failed");
+    }
 }
 
 pub(crate) fn journal_capture_refused_or_log(
@@ -1988,6 +2018,72 @@ mod tests_dispatch {
             detail: "no Linux capture tier is active".into(),
         });
         assert!(!lb.command_watches(cmd, f, shit_planner::time::TimePoint::new(1, 0)));
+    }
+
+    /// Review of #232 round 2, item 2: the shim left a Create to the
+    /// kernel tier, then the helper failed the watch. In default mode the
+    /// command still gets a loud capture-gap refusal.
+    #[test]
+    fn watch_failure_after_a_deferred_create_journals_a_capture_gap() {
+        for failure in [
+            HelperResponse::WatchTreeFailed {
+                session: Uuid::from_u128(6),
+                command_seq: 1,
+                reason: "lost the mark".into(),
+            },
+            HelperResponse::CaptureRefused {
+                session: Uuid::from_u128(6),
+                seq: 1,
+                path: None,
+                detail: "no Linux capture tier is active".into(),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cmd = CommandId {
+                session: Uuid::from_u128(6),
+                seq: 1,
+            };
+            let index = index_with_command(dir.path(), cmd);
+            let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+            let map = crate::watch_ready::WatchReadyMap::new();
+            let waiters = PrivOpWaiters::default();
+            let lb = crate::baseline::LiveBaseline::new();
+            lb.record_command_watch(cmd, PathBuf::from("/tmp/watched"));
+            dispatch_response(
+                HelperResponse::WatchTreeReady {
+                    session: cmd.session,
+                    command_seq: cmd.seq,
+                },
+                None,
+                &index,
+                &blobs,
+                &map,
+                &lb,
+                "bpf-lsm",
+                &waiters,
+                false,
+            );
+            assert!(lb.defer_create_to_kernel(
+                cmd,
+                std::path::Path::new("/tmp/watched/new"),
+                crate::server::next_ts()
+            ));
+            dispatch_response(
+                failure, None, &index, &blobs, &map, &lb, "bpf-lsm", &waiters, false,
+            );
+            let kinds: Vec<_> = index
+                .events_for_command(cmd)
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-gap"
+                ),
+                "{kinds:#?}"
+            );
+        }
     }
 
     #[tokio::test]
