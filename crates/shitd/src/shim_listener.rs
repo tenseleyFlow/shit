@@ -279,7 +279,7 @@ async fn handle_one(
 /// Kind, mode and identity of an unlink target, read before the syscall
 /// runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UnlinkStat {
+pub(crate) struct UnlinkStat {
     kind: FileKind,
     mode: u32,
     /// The removed entry's identity, when it is known: the shim's
@@ -493,7 +493,7 @@ fn journal_version_gap(
 /// Convert a shim notification into a `CaptureEvent` and journal it,
 /// if the emitter's pid resolves to an active command. Errors are
 /// logged but never propagated — the shim path is best-effort.
-fn ingest_notification(
+pub(crate) fn ingest_notification(
     note: &ShimNotification,
     resolved: Option<shit_planner::events::CommandId>,
     ingest_ts: shit_planner::time::TimePoint,

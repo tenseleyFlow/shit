@@ -149,35 +149,58 @@ pub fn plan(
 /// whichever open it came from, so the gap is covered and its refusal
 /// is dropped. Otherwise the refusal stands.
 ///
-/// Review of #232 round 2, item 3: the covering pre-image must be stamped
-/// no later than the gap. One captured after it (a later rewrite of the
-/// same path) holds bytes the gapped write may already have changed.
+/// Which pre-image covers which gap. Undo restores the earliest
+/// pre-image of a path, so only that one is weighed. It covers the gap
+/// when it holds the file's state from before the gapped write:
+///
+/// - it was journaled no later than the gap (an earlier open captured
+///   the pre-command bytes), or
+/// - (review of #232 medium review, item 1) its captured mtime is more
+///   than [`GAP_MTIME_MARGIN_NANOS`] older than the daemon's wall clock
+///   when it stamped the gap. The shim's note is stamped before the
+///   write runs, while a kernel tier's capture of the same open is
+///   stamped later, on receipt, so journal order cannot pair them. The
+///   gapped write sets the file's mtime to a time after the gap was
+///   stamped, so a capture taken after that write never passes. The
+///   margin absorbs coarse filesystem timestamps; a file modified
+///   within it just before the command keeps its refusal.
 fn covered_capture_gaps(live: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
-    let mut earliest: std::collections::HashMap<&Path, crate::time::TimePoint> =
+    let mut earliest: std::collections::HashMap<&Path, (crate::time::TimePoint, i128)> =
         std::collections::HashMap::new();
     for e in live {
-        if let CaptureEventKind::FilePreImage { path, source, .. } = &e.kind
+        if let CaptureEventKind::FilePreImage {
+            path, source, meta, ..
+        } = &e.kind
             && source.has_content()
             && !source.is_shim()
         {
+            let this = (e.ts, meta.mtime_unix_nanos);
             earliest
                 .entry(path.as_path())
-                .and_modify(|t| *t = (*t).min(e.ts))
-                .or_insert(e.ts);
+                .and_modify(|cur| {
+                    if this.0 < cur.0 {
+                        *cur = this;
+                    }
+                })
+                .or_insert(this);
         }
     }
     live.iter()
-        .filter(|e| {
-            matches!(
-                &e.kind,
-                CaptureEventKind::CaptureRefused { class, path, .. }
-                    if class == "capture-gap"
-                        && earliest.get(path.as_path()).is_some_and(|t| *t <= e.ts)
-            )
+        .filter(|e| match &e.kind {
+            CaptureEventKind::CaptureRefused { class, path, .. } if class == "capture-gap" => {
+                earliest.get(path.as_path()).is_some_and(|(ts, mtime)| {
+                    let stamped = i128::from(e.ts.wallclock_unix_nanos);
+                    *ts <= e.ts || (stamped > 0 && *mtime + GAP_MTIME_MARGIN_NANOS < stamped)
+                })
+            }
+            _ => false,
         })
         .map(|e| e.id)
         .collect()
 }
+
+/// See [`covered_capture_gaps`].
+const GAP_MTIME_MARGIN_NANOS: i128 = 1_000_000_000;
 
 fn emit_unless_skipped(
     ev: &CaptureEvent,

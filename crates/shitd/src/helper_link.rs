@@ -2685,6 +2685,106 @@ mod tests_dispatch {
         f.into()
     }
 
+    /// Review of #232 medium review, item 1, through the real ingest
+    /// paths and clock. The shim's gap note for an open is stamped first
+    /// (before the write runs); the kernel tier's capture of the same open
+    /// is stamped on receipt, after it. A capture of the file as it was
+    /// before the command (old mtime) covers the gap. A capture taken
+    /// after the gapped write (fresh mtime) does not.
+    #[test]
+    fn kernel_capture_of_the_same_open_covers_the_shims_gap() {
+        use std::os::unix::fs::MetadataExt;
+        for (age_secs, want_refusals) in [(3600u64, 0usize), (0, 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let cmd = CommandId {
+                session: Uuid::from_u128(77),
+                seq: 1,
+            };
+            let index = index_with_command(dir.path(), cmd);
+            let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+            let big = dir.path().canonicalize().unwrap().join("big.bin");
+            let bytes = b"bytes the kernel tier captured";
+            std::fs::write(&big, bytes).unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&big)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            let m = std::fs::metadata(&big).unwrap();
+
+            let gap = shit_proto::ShimNotification {
+                pid: 1,
+                syscall: "open".into(),
+                arg: big.to_str().unwrap().into(),
+                ts_unix_nanos: 0,
+                pre_image: None,
+                extra_pre_images: Vec::new(),
+                failure: Some(shit_proto::ShimFailure::PreImageUncaptured {
+                    path: big.to_str().unwrap().into(),
+                    reason: "over the shim's inline pre-image cap".into(),
+                }),
+                pre_stat: None,
+            };
+            crate::shim_listener::ingest_notification(
+                &gap,
+                Some(cmd),
+                crate::server::next_ts(),
+                None,
+                &index,
+                &blobs,
+                &crate::baseline::LiveBaseline::new(),
+            );
+            let (canonical, _) = blobs.put(bytes).unwrap();
+            handle_captured_pre_image(
+                CapturedPreImageArgs {
+                    session: cmd.session,
+                    seq: cmd.seq,
+                    dev: m.dev(),
+                    inode: m.ino(),
+                    path: Some(big.to_str().unwrap().into()),
+                    blob_hash: *canonical.as_bytes(),
+                    stored_bytes: bytes.len() as u64,
+                    post_content_hash: None,
+                    mode: m.mode(),
+                    uid: m.uid(),
+                    gid: m.gid(),
+                    mtime_unix_nanos: i128::from(m.mtime()) * 1_000_000_000
+                        + i128::from(m.mtime_nsec()),
+                    xattrs: std::collections::BTreeMap::new(),
+                    flags: 0,
+                    is_delete: false,
+                    staging: tmp_staging_fd(bytes),
+                },
+                &index,
+                &blobs,
+                "bpf-lsm",
+            )
+            .unwrap();
+            let events = index.events_for_command(cmd);
+            let record = <Index as shit_planner::PlannerStore>::command_by_id(&index, cmd).unwrap();
+            let plan = shit_planner::plan(
+                record,
+                &events,
+                &shit_planner::LiveStateProbe::new(),
+                &index,
+            );
+            let refusals = plan
+                .nodes
+                .iter()
+                .filter(|n| {
+                    matches!(&n.op, shit_planner::InverseOp::Refuse { class, .. } if class == "capture-gap")
+                })
+                .count();
+            assert_eq!(
+                refusals, want_refusals,
+                "age {age_secs}s: {:#?}",
+                plan.nodes
+            );
+        }
+    }
+
     #[test]
     fn handle_captured_pre_image_journals_and_paired_unlink() {
         use shit_planner::{CommandRecord, TimePoint};
