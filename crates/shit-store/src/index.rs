@@ -894,6 +894,26 @@ fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<CaptureEvent> {
     Ok(ev)
 }
 
+impl Index {
+    /// L4b - one command's events journaled at `path`, in journal order.
+    /// Lets the daemon check the latest removal at a path without
+    /// decoding the whole command.
+    pub fn events_for_command_at_path(&self, command: CommandId, path: &Path) -> Vec<CaptureEvent> {
+        let conn = self.conn.lock().unwrap();
+        collect_events(
+            &conn,
+            "SELECT id, payload FROM events
+             WHERE session = ?1 AND seq = ?2 AND path = ?3
+             ORDER BY ts_logical, id",
+            params![
+                command.session.as_bytes().as_slice(),
+                command.seq as i64,
+                path.to_string_lossy()
+            ],
+        )
+    }
+}
+
 impl PlannerStore for Index {
     fn events_for_command(&self, command: CommandId) -> Vec<CaptureEvent> {
         let conn = self.conn.lock().unwrap();

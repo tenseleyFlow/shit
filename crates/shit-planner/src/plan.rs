@@ -339,8 +339,11 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         }
     }
     // L4b - one place decides which device Unlink a capture belongs to;
-    // Provenance's dedup keeps that one.
-    let (device_nodes, duplicate_device_unlinks) = device_pairing(events);
+    // Provenance's dedup keeps that one. Both L4b passes work in journal
+    // order (ts, id); sort once.
+    let mut chrono: Vec<&CaptureEvent> = events.to_vec();
+    chrono.sort_by_key(|e| (e.ts, e.id));
+    let (device_nodes, duplicate_device_unlinks) = device_pairing(&chrono);
     let paired: HashSet<crate::events::EventId> = device_nodes.keys().copied().collect();
     let provenance = Provenance::from_events(events, &disproved, &paired);
     let mut atomic = HashSet::new();
@@ -654,7 +657,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     let mut dropped_events = provenance.dropped_events;
     dropped_events.extend(disproved);
     dropped_events.extend(duplicate_device_unlinks);
-    dropped_events.extend(symlink_removal_markers(events));
+    dropped_events.extend(symlink_removal_markers(&chrono));
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -1768,7 +1771,9 @@ fn native_delegation_for(
 pub(crate) fn pair_device_nodes(
     events: &[&CaptureEvent],
 ) -> std::collections::HashMap<crate::events::EventId, crate::metadata::DeviceNode> {
-    device_pairing(events).0
+    let mut chrono: Vec<&CaptureEvent> = events.to_vec();
+    chrono.sort_by_key(|e| (e.ts, e.id));
+    device_pairing(&chrono).0
 }
 
 /// [`pair_device_nodes`], plus the device `Unlink`s that are a second
@@ -1783,8 +1788,8 @@ fn device_pairing(
     Vec<crate::events::EventId>,
 ) {
     use crate::metadata::{DeviceNode, FileKind};
-    let mut ordered: Vec<&CaptureEvent> = events.to_vec();
-    ordered.sort_by_key(|e| (e.ts, e.id));
+    // `events` is in journal order (ts, id).
+    let ordered = events;
     let none = InodeRef::new(0, 0);
     type Open = std::collections::HashMap<(InodeRef, PathBuf), (crate::events::EventId, FileKind)>;
     let mut open: Open = std::collections::HashMap::new();
@@ -1797,7 +1802,7 @@ fn device_pairing(
         }
         _ => None,
     };
-    for ev in &ordered {
+    for ev in ordered {
         if let Some((inode, path, kind)) = device_unlink(ev) {
             open.insert((inode, path), (ev.id, kind));
             continue;
@@ -1846,7 +1851,7 @@ fn device_pairing(
             duplicates.extend(r.1.into_iter().filter(|id| !out.contains_key(id)));
         }
     };
-    for ev in &ordered {
+    for ev in ordered {
         if let Some((inode, path, _)) = device_unlink(ev) {
             match run.get_mut(&path) {
                 Some((i, ids)) if *i == inode => ids.push(ev.id),
@@ -1858,14 +1863,8 @@ fn device_pairing(
             }
             continue;
         }
-        let same_node_meta = |p: &PathBuf| match (&ev.kind, run.get(p)) {
-            (CaptureEventKind::TreeOp(TreeOp::DeviceNodeMeta { inode, .. }), Some((i, _))) => {
-                inode == i
-            }
-            _ => false,
-        };
+        // DeviceNodeMeta has no event_path, so a meta never breaks a run.
         if let Some(p) = event_path(ev).cloned()
-            && !same_node_meta(&p)
             && let Some(r) = run.remove(&p)
         {
             close(r);
@@ -1883,12 +1882,12 @@ fn device_pairing(
 /// stamped before the syscall, the marker during it). The shim's `SymlinkRemoved` is the
 /// whole restore; the marker would recreate a regular file where the
 /// link was. A mode-0 Unlink of a later entry at the same path is kept.
+/// `events` is in journal order (ts, id).
 pub(crate) fn symlink_removal_markers(events: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
-    let mut ordered: Vec<&CaptureEvent> = events.to_vec();
-    ordered.sort_by_key(|e| (e.ts, e.id));
+    let ordered = events;
     let mut by_path: std::collections::HashMap<&PathBuf, Vec<&CaptureEvent>> =
         std::collections::HashMap::new();
-    for ev in &ordered {
+    for ev in ordered {
         if let Some(p) = event_path(ev) {
             by_path.entry(p).or_default().push(ev);
         }

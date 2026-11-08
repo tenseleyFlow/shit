@@ -1606,8 +1606,7 @@ fn journal_unlink_with_device(
     mode: u32,
     device: Option<DeviceCapture>,
 ) -> Result<(), HelperLinkError> {
-    use shit_planner::PlannerStore;
-    let events = index.events_for_command(command);
+    let events = index.events_for_command_at_path(command, &path);
     let already = if device.is_some() {
         // L4b - only the latest Unlink at this path counts, and only if
         // no DeviceNodeMeta follows it yet: after inode reuse an earlier
