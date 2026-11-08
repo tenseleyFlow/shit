@@ -115,6 +115,16 @@ phase() {
         --sock "${SHIT_HOOK_SOCK}"
     run_cmd 1 "${BIG_DIR}" "chmod 600 big"
     undo_into "${SHIT_SMOKE_TMP}/${label}-big.undo.log"
+    # Checked here, before the 600-file workload pushes the helper's
+    # lines for this command out of the log tail the failure dump shows.
+    if [ "${label}" = strict ] \
+        && [ "$(smoke_journal_count "${REFUSED} AND path LIKE '%/strict/big/big'")" -lt 1 ]; then
+        smoke_dump_refusals
+        smoke_log "helper lines for the chmod command:"
+        grep -aE 'FMODE_CREATED|pre_open_tree complete|lsm setattr|lsm-setattr|capture loss at close|unwatch_tree|flush' \
+            "${SHIT_SMOKE_TMP}/shitd.log" | sed 's/^/    helper: /' >&2 || true
+        smoke_fail "strict: no CaptureRefused row for the over-cap baseline file"
+    fi
     run_cmd 2 "${MANY_DIR}" 'for f in f*; do echo more >> "$f"; done'
     undo_into "${SHIT_SMOKE_TMP}/${label}-many.undo.log"
     "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
