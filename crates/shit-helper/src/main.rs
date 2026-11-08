@@ -3342,8 +3342,18 @@ fn apply_mknod(
     #[cfg(not(target_os = "linux"))]
     {
         use std::os::unix::fs::MetadataExt;
-        let rc = unsafe { libc::mknod(c_path.as_ptr(), ifmt, 0) };
-        if rc == 0 {
+        // mknod(2) makes neither a fifo nor a socket on the BSDs: a fifo
+        // comes from mkfifo, a socket from binding an AF_UNIX socket.
+        let made = if ifmt == libc::S_IFIFO {
+            if unsafe { libc::mkfifo(c_path.as_ptr(), 0) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        } else {
+            std::os::unix::net::UnixListener::bind(path).map(drop)
+        };
+        if made.is_ok() {
             let ours = std::fs::symlink_metadata(path)
                 .map(|m| (m.dev(), m.ino()))
                 .ok();
@@ -3364,12 +3374,12 @@ fn apply_mknod(
                 }
             };
         }
-        let errno = std::io::Error::last_os_error();
+        let errno = made.unwrap_err();
         match errno.raw_os_error() {
             Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
             Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
             _ => PrivilegedOpOutcome::Failed {
-                err: format!("mknod: {errno}"),
+                err: format!("create {ifmt:o}: {errno}"),
             },
         }
     }
