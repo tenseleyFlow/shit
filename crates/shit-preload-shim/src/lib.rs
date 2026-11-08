@@ -1065,9 +1065,26 @@ mod policy {
             uid: meta.uid(),
             gid: meta.gid(),
             mtime_unix_nanos: meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128,
-            flags: read_st_flags(path, false).unwrap_or(0),
+            // Review round 4, item 9: from the lstat the walk already took.
+            flags: meta_flags(meta),
             xattrs: read_xattrs(path),
         }
+    }
+
+    /// st_flags from metadata already read; 0 where there are none.
+    #[cfg(target_os = "macos")]
+    fn meta_flags(meta: &std::fs::Metadata) -> u32 {
+        std::os::macos::fs::MetadataExt::st_flags(meta)
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn meta_flags(meta: &std::fs::Metadata) -> u32 {
+        std::os::freebsd::fs::MetadataExt::st_flags(meta)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+    fn meta_flags(_meta: &std::fs::Metadata) -> u32 {
+        0
     }
 
     fn entry_cost(e: &shit_proto::ShimWalkEntry) -> u64 {
