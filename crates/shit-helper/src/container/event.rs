@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use shit_proto::CONTAINER_CAPTURE_FAILED_EXTRA as CAPTURE_FAILED_EXTRA;
 use shit_proto::{
     ContainerEventReq, ContainerRuntimeWire, ContainerVerbWire, CtlRequest, CtlResponse,
     decode_frame, encode_frame_large,
@@ -254,7 +255,7 @@ fn prepare(tool: &str, runtime: ContainerRuntimeWire, v: VerbPayload) -> Vec<Pre
 
     match docker_verb {
         DockerVerb::Rmi { images } => prepare_rmi(tool, runtime, images),
-        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force).into_iter().collect(),
+        DockerVerb::Rm { ids, force } => prepare_rm(tool, ids, force),
         DockerVerb::VolumeRm { names } => prepare_volume_rm(tool, names),
         DockerVerb::NetworkRm { names } => prepare_network_rm(tool, names),
         // stop/kill are restart-hint events; no destructive content
@@ -344,7 +345,7 @@ fn prepare_rmi(
 ) -> Vec<PreparedEvent> {
     images
         .into_iter()
-        .map(|image| prepare_rmi_one(tool, image))
+        .filter_map(|image| prepare_rmi_one(tool, image))
         .collect()
 }
 
@@ -352,12 +353,19 @@ fn prepare_rmi(
 /// `PreparedEvent` (degraded stash on `docker save` failure /
 /// over-cap tarball still ships the event so `shit show` records
 /// the rm attempt; undo surfaces as Skipped informational).
-fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
+///
+/// `None` when the image does not exist: there is nothing to capture, and
+/// the removal itself will fail.
+fn prepare_rmi_one(tool: &str, image: String) -> Option<PreparedEvent> {
     // Capture optional digest for the inverse-restore planner.
     let digest = inspect_image_digest(tool, &image);
 
     let bytes = match docker_save(tool, &image) {
         Ok(b) => b,
+        Err(e) if is_not_found(&e) => {
+            tracing::debug!(tool, image = %image, "image absent; nothing to capture");
+            return None;
+        }
         Err(e) => {
             tracing::warn!(
                 tool,
@@ -370,14 +378,18 @@ fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
             if let Some(d) = digest {
                 extras.insert("digest".into(), d);
             }
-            return PreparedEvent {
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("{tool} save failed: {e}"),
+            );
+            return Some(PreparedEvent {
                 verb: ContainerVerbWire::Rmi,
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
                 stash_image: None,
                 extras,
-            };
+            });
         }
     };
 
@@ -397,14 +409,18 @@ fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
         if let Some(d) = digest {
             extras.insert("digest".into(), d);
         }
-        return PreparedEvent {
+        extras.insert(
+            CAPTURE_FAILED_EXTRA.into(),
+            format!("image tarball exceeds the {INLINE_TARBALL_MAX_BYTES}-byte inline cap"),
+        );
+        return Some(PreparedEvent {
             verb: ContainerVerbWire::Rmi,
             captured_config: Vec::new(),
             stash_tarball: None,
             stash_tarball_bytes: None,
             stash_image: None,
             extras,
-        };
+        });
     }
 
     let hash = *blake3::hash(&bytes).as_bytes();
@@ -415,19 +431,54 @@ fn prepare_rmi_one(tool: &str, image: String) -> PreparedEvent {
         extras.insert("digest".into(), d);
     }
 
-    PreparedEvent {
+    Some(PreparedEvent {
         verb: ContainerVerbWire::Rmi,
         captured_config: Vec::new(),
         stash_tarball: Some(hash),
         stash_tarball_bytes: Some(bytes),
         stash_image: None,
         extras,
-    }
+    })
+}
+
+/// A runtime command for capture-time probes. These run with PATH still
+/// holding the container wrappers, so each carries `SHIT_DURING_UNDO=1`:
+/// the wrapper then passes straight through instead of capturing the
+/// helper's own `inspect`, `save` and `volume ls` calls.
+fn runtime_cmd(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("SHIT_DURING_UNDO", "1");
+    cmd
+}
+
+/// True when a runtime error message says the object does not exist.
+/// Docker says "No such container/network/volume/image/object", docker
+/// save says "reference does not exist", podman says "image not known"
+/// or "no such ...". A spawn failure ("No such file or directory") is
+/// deliberately not matched: the runtime itself is missing, which is a
+/// capture failure, not an absent object.
+fn not_found_text(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "no such container",
+        "no such network",
+        "no such volume",
+        "no such image",
+        "no such object",
+        "reference does not exist",
+        "image not known",
+    ]
+    .iter()
+    .any(|needle| t.contains(needle))
+}
+
+fn is_not_found(e: &std::io::Error) -> bool {
+    not_found_text(&e.to_string())
 }
 
 /// Run `{tool} save <image>` and return the tarball bytes.
 fn docker_save(tool: &str, image: &str) -> std::io::Result<Vec<u8>> {
-    let out = Command::new(tool).args(["save", image]).output()?;
+    let out = runtime_cmd(tool).args(["save", image]).output()?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "{tool} save {image} exited {}: {}",
@@ -449,7 +500,7 @@ fn docker_save(tool: &str, image: &str) -> std::io::Result<Vec<u8>> {
 /// `SHIT_DURING_UNDO=1` is propagated so the transient busybox `docker
 /// run` invocation doesn't re-trigger capture via the wrapper.
 fn docker_volume_tar(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
-    let out = Command::new(tool)
+    let out = runtime_cmd(tool)
         .args([
             "run", "--rm",
             "-v",
@@ -471,13 +522,23 @@ fn docker_volume_tar(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// True when `{tool} volume inspect <name>` fails because the volume does
+/// not exist. Any other failure (runtime down, permissions) is not
+/// "absent": capture proceeds and fails visibly.
+fn volume_absent(tool: &str, name: &str) -> bool {
+    match runtime_cmd(tool).args(["volume", "inspect", name]).output() {
+        Ok(out) if !out.status.success() => not_found_text(&String::from_utf8_lossy(&out.stderr)),
+        _ => false,
+    }
+}
+
 /// Best-effort `{tool} volume inspect --format='{{.Driver}}' <name>`
 /// to record the volume's driver so the inverse path can recreate it
 /// with the same backing. Returns `None` for the default `local`
 /// driver or when inspect fails (the planner treats `None` as "use
 /// the default").
 fn inspect_volume_driver(tool: &str, name: &str) -> Option<String> {
-    let out = Command::new(tool)
+    let out = runtime_cmd(tool)
         .args(["volume", "inspect", "--format", "{{.Driver}}", name])
         .output()
         .ok()?;
@@ -497,7 +558,7 @@ fn inspect_volume_driver(tool: &str, name: &str) -> Option<String> {
 /// from stdout. Docker emits an array-of-one shape — the planner's
 /// [`synthesize_network_create`] unwraps that.
 fn docker_network_inspect(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
-    let out = Command::new(tool)
+    let out = runtime_cmd(tool)
         .args(["network", "inspect", name])
         .output()?;
     if !out.status.success() {
@@ -523,23 +584,27 @@ fn docker_network_inspect(tool: &str, name: &str) -> std::io::Result<Vec<u8>> {
 fn prepare_network_rm(tool: &str, names: Vec<String>) -> Vec<PreparedEvent> {
     names
         .into_iter()
-        .map(|name| prepare_network_rm_one(tool, name))
+        .filter_map(|name| prepare_network_rm_one(tool, name))
         .collect()
 }
 
-fn prepare_network_rm_one(tool: &str, name: String) -> PreparedEvent {
+fn prepare_network_rm_one(tool: &str, name: String) -> Option<PreparedEvent> {
     let mut extras = BTreeMap::new();
     extras.insert("name".into(), name.clone());
 
     match docker_network_inspect(tool, &name) {
-        Ok(json_bytes) => PreparedEvent {
+        Err(e) if is_not_found(&e) => {
+            tracing::debug!(tool, network = %name, "network absent; nothing to capture");
+            None
+        }
+        Ok(json_bytes) => Some(PreparedEvent {
             verb: ContainerVerbWire::NetworkRm,
             captured_config: json_bytes,
             stash_tarball: None,
             stash_tarball_bytes: None,
             stash_image: None,
             extras,
-        },
+        }),
         Err(e) => {
             tracing::warn!(
                 tool,
@@ -547,14 +612,18 @@ fn prepare_network_rm_one(tool: &str, name: String) -> PreparedEvent {
                 err = %e,
                 "container-event: network inspect failed; event will ship without captured_config"
             );
-            PreparedEvent {
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("{tool} network inspect failed: {e}"),
+            );
+            Some(PreparedEvent {
                 verb: ContainerVerbWire::NetworkRm,
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
                 stash_image: None,
                 extras,
-            }
+            })
         }
     }
 }
@@ -574,16 +643,24 @@ fn prepare_network_rm_one(tool: &str, name: String) -> PreparedEvent {
 /// `force` (the `-f` flag on `docker rm`) is the wire-level proxy for
 /// "container may be running"; in reality the container's running
 /// state is whatever inspect reports. We trust inspect over the flag.
-fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEvent> {
-    // PR-B (AR10.9): one event per invocation; multi-id batching is
-    // tracked as DR-CR-52.
-    let id = ids.into_iter().next()?;
+fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Vec<PreparedEvent> {
+    // One event per id, like rmi / volume rm / network rm, so
+    // `docker rm -f a b c` restores all three.
+    ids.into_iter()
+        .filter_map(|id| prepare_rm_one(tool, id))
+        .collect()
+}
 
+fn prepare_rm_one(tool: &str, id: String) -> Option<PreparedEvent> {
     let mut extras = BTreeMap::new();
     extras.insert("id".into(), id.clone());
 
     let inspect_json = match docker_container_inspect(tool, &id) {
         Ok(bytes) => bytes,
+        Err(e) if is_not_found(&e) => {
+            tracing::debug!(tool, id = %id, "container absent; nothing to capture");
+            return None;
+        }
         Err(e) => {
             tracing::warn!(
                 tool,
@@ -592,6 +669,10 @@ fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEven
                 "container-event: docker inspect failed; event will ship without captured_config"
             );
             extras.insert("was_running".into(), "false".into());
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("{tool} inspect failed: {e}"),
+            );
             return Some(PreparedEvent {
                 verb: ContainerVerbWire::Rm,
                 captured_config: Vec::new(),
@@ -614,6 +695,10 @@ fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEven
         match docker_commit_running_container(tool, &id) {
             Ok(tag) => Some(tag),
             Err(e) => {
+                extras.insert(
+                    CAPTURE_FAILED_EXTRA.into(),
+                    format!("{tool} commit failed: {e}"),
+                );
                 tracing::warn!(
                     tool,
                     id = %id,
@@ -640,7 +725,7 @@ fn prepare_rm(tool: &str, ids: Vec<String>, _force: bool) -> Option<PreparedEven
 /// Run `{tool} inspect <id>` and return the raw JSON bytes. Docker
 /// emits an array-of-one shape — the planner's `apply_rm` unwraps it.
 fn docker_container_inspect(tool: &str, id: &str) -> std::io::Result<Vec<u8>> {
-    let out = Command::new(tool).args(["inspect", id]).output()?;
+    let out = runtime_cmd(tool).args(["inspect", id]).output()?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "{tool} inspect {id} exited {}: {}",
@@ -696,7 +781,7 @@ fn docker_commit_running_container(tool: &str, id: &str) -> std::io::Result<Stri
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let tag = format!("shit-stash-{short}-{ts}");
-    let out = Command::new(tool).args(["commit", id, &tag]).output()?;
+    let out = runtime_cmd(tool).args(["commit", id, &tag]).output()?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "{tool} commit {id} {tag} exited {}: {}",
@@ -749,36 +834,87 @@ fn prepare_compose_down(
     project_override: Option<String>,
     with_volumes: bool,
 ) -> Option<PreparedEvent> {
-    // Resolve the compose file. If the user passed -f, honour the
-    // first path (multi-file overlays use the first as the base);
-    // otherwise fall back to docker's default search of
-    // `docker-compose.yml` then `compose.yaml` in cwd.
-    let compose_file = files
-        .into_iter()
-        .next()
-        .or_else(default_compose_file_in_cwd)
-        .or_else(|| Some("docker-compose.yml".to_string()))?;
+    let _ = tool; // compose runtime always = docker engine; bin chosen daemon-side
+    prepare_compose_down_with(
+        "docker",
+        files,
+        project_override,
+        with_volumes,
+        std::env::var("COMPOSE_FILE").ok(),
+        std::env::var("COMPOSE_PROJECT_NAME").ok(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// `prepare_compose_down` with its environment passed in.
+///
+/// The capture is degraded (strict mode refuses the command) only when
+/// the down destroys something that is not captured, or when the file the
+/// restore replays cannot be found:
+///
+/// - The compose file follows compose's own lookup: `-f`, then
+///   `COMPOSE_FILE`, then `compose.y(a)ml` / `docker-compose.y(a)ml` in
+///   the cwd and each parent directory. With only `-p` and no file
+///   anywhere, the restore has nothing to replay; that case is degraded.
+///   `--project-directory` and `.env` files are not consulted, so a
+///   project that relies on them is also reported degraded.
+/// - `down -v` is degraded only if the project has named volumes, found
+///   by the `com.docker.compose.project` label. Volume contents are never
+///   stashed. If the query fails, whether volumes exist is unknown and the
+///   capture is degraded.
+fn prepare_compose_down_with(
+    engine: &str,
+    files: Vec<String>,
+    project_override: Option<String>,
+    with_volumes: bool,
+    env_compose_file: Option<String>,
+    env_project: Option<String>,
+    cwd: Option<&Path>,
+) -> Option<PreparedEvent> {
+    let compose_file = resolve_compose_file(&files, env_compose_file.as_deref(), cwd)
+        .unwrap_or_else(|| anchor("docker-compose.yml", cwd));
 
     // Resolve to absolute path so the daemon-side restore doesn't
-    // depend on cwd at undo time. Best-effort — if canonicalize fails
-    // (file doesn't exist where we think), ship the raw string and
-    // let the executor's apply_compose_down surface the error.
-    let compose_file_abs = std::path::PathBuf::from(&compose_file)
-        .canonicalize()
-        .map(|p| p.display().to_string())
-        .unwrap_or(compose_file);
+    // depend on cwd at undo time. If that fails the file does not exist
+    // where compose would look, so the restore cannot replay it.
+    let mut capture_failed: Vec<String> = Vec::new();
+    let compose_file_abs = match PathBuf::from(&compose_file).canonicalize() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => {
+            capture_failed.push(format!("compose file {compose_file} not resolvable: {e}"));
+            compose_file
+        }
+    };
 
-    // Project name: --project-name wins; otherwise docker compose
-    // defaults to the basename of the compose file's parent dir,
-    // lowercased with non-alnum stripped. Compute that here so the
-    // restore uses the same name and addresses the same network /
-    // containers.
-    let project = project_override.unwrap_or_else(|| default_project_name(&compose_file_abs));
+    // Project name: --project-name wins, then COMPOSE_PROJECT_NAME;
+    // otherwise docker compose defaults to the basename of the compose
+    // file's parent dir, lowercased with non-alnum stripped.
+    let project = project_override
+        .or(env_project)
+        .unwrap_or_else(|| default_project_name(&compose_file_abs));
 
     let mut extras = BTreeMap::new();
-    extras.insert("project".into(), project);
+    extras.insert("project".into(), project.clone());
     extras.insert("compose_file".into(), compose_file_abs);
     extras.insert("with_volumes".into(), with_volumes.to_string());
+    if with_volumes {
+        match compose_project_volumes(engine, &project) {
+            Some(vols) if vols.is_empty() => {}
+            Some(vols) => capture_failed.push(format!(
+                "`down --volumes` removes {} volume(s) that are not stashed: {}",
+                vols.len(),
+                vols.join(", ")
+            )),
+            None => capture_failed.push(
+                "`down --volumes`: the project's volumes could not be listed, so data loss \
+                 cannot be ruled out"
+                    .into(),
+            ),
+        }
+    }
+    if !capture_failed.is_empty() {
+        extras.insert(CAPTURE_FAILED_EXTRA.into(), capture_failed.join("; "));
+    }
     // Services empty → daemon restores all (compose default).
     // Capturing the resolved per-service list via `docker compose
     // config --services` would be more authoritative but adds an
@@ -787,7 +923,6 @@ fn prepare_compose_down(
     // No tarball / no stash_image — compose file is the source of
     // truth. `captured_config` left empty; the spec lives on disk
     // and the daemon re-reads it on restore.
-    let _ = tool; // compose runtime always = docker engine; bin chosen daemon-side
     Some(PreparedEvent {
         verb: ContainerVerbWire::ComposeDown,
         captured_config: Vec::new(),
@@ -798,23 +933,71 @@ fn prepare_compose_down(
     })
 }
 
-/// Search cwd for docker compose's two default file names, in the
-/// order compose itself checks (`compose.yaml` is the newer spec
-/// name; `docker-compose.yml` the legacy). Returns the first one
-/// that exists; None if neither does.
-fn default_compose_file_in_cwd() -> Option<String> {
-    for name in &[
-        "compose.yaml",
-        "compose.yml",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-    ] {
-        let p = std::path::Path::new(name);
-        if p.exists() {
-            return Some((*name).to_string());
-        }
+/// Compose's file lookup: the first `-f`, else the first `COMPOSE_FILE`
+/// entry (`:`-separated; relative entries resolve against `cwd`), else the
+/// first default name found in `cwd` or any parent. `None` when nothing
+/// is found.
+fn resolve_compose_file(
+    files: &[String],
+    env_compose_file: Option<&str>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    if let Some(first) = files.first() {
+        return Some(anchor(first, cwd));
     }
-    None
+    if let Some(first) = env_compose_file.and_then(|v| v.split(':').find(|e| !e.is_empty())) {
+        return Some(anchor(first, cwd));
+    }
+    let mut dir = cwd?;
+    loop {
+        for name in COMPOSE_DEFAULT_NAMES {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// A relative path joined onto the shell's `cwd`, never the helper
+/// process's own working directory. Absolute paths and a missing `cwd`
+/// leave the path as written.
+fn anchor(path: &str, cwd: Option<&Path>) -> String {
+    let p = Path::new(path);
+    match cwd {
+        Some(dir) if p.is_relative() => dir.join(p).display().to_string(),
+        _ => path.to_string(),
+    }
+}
+
+const COMPOSE_DEFAULT_NAMES: &[&str] = &[
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+];
+
+/// Named volumes carrying the compose project label, or `None` when the
+/// query fails.
+fn compose_project_volumes(engine: &str, project: &str) -> Option<Vec<String>> {
+    let out = runtime_cmd(engine)
+        .args(["volume", "ls", "-q", "--filter"])
+        .arg(format!("label=com.docker.compose.project={project}"))
+        .env("SHIT_DURING_UNDO", "1")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Docker compose's default project-name algorithm: take the basename
@@ -840,11 +1023,17 @@ fn default_project_name(compose_file_abs: &str) -> String {
 fn prepare_volume_rm(tool: &str, names: Vec<String>) -> Vec<PreparedEvent> {
     names
         .into_iter()
-        .map(|name| prepare_volume_rm_one(tool, name))
+        .filter_map(|name| prepare_volume_rm_one(tool, name))
         .collect()
 }
 
-fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
+fn prepare_volume_rm_one(tool: &str, name: String) -> Option<PreparedEvent> {
+    // `docker run -v name:...` would create a missing volume, so check
+    // existence first; an absent volume has nothing to capture.
+    if volume_absent(tool, &name) {
+        tracing::debug!(tool, volume = %name, "volume absent; nothing to capture");
+        return None;
+    }
     let driver = inspect_volume_driver(tool, &name);
 
     let bytes = match docker_volume_tar(tool, &name) {
@@ -861,14 +1050,18 @@ fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
             if let Some(d) = driver {
                 extras.insert("driver".into(), d);
             }
-            return PreparedEvent {
+            extras.insert(
+                CAPTURE_FAILED_EXTRA.into(),
+                format!("volume tar failed: {e}"),
+            );
+            return Some(PreparedEvent {
                 verb: ContainerVerbWire::VolumeRm,
                 captured_config: Vec::new(),
                 stash_tarball: None,
                 stash_tarball_bytes: None,
                 stash_image: None,
                 extras,
-            };
+            });
         }
     };
 
@@ -885,14 +1078,18 @@ fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
         if let Some(d) = driver {
             extras.insert("driver".into(), d);
         }
-        return PreparedEvent {
+        extras.insert(
+            CAPTURE_FAILED_EXTRA.into(),
+            format!("volume tarball exceeds the {INLINE_TARBALL_MAX_BYTES}-byte inline cap"),
+        );
+        return Some(PreparedEvent {
             verb: ContainerVerbWire::VolumeRm,
             captured_config: Vec::new(),
             stash_tarball: None,
             stash_tarball_bytes: None,
             stash_image: None,
             extras,
-        };
+        });
     }
 
     let hash = *blake3::hash(&bytes).as_bytes();
@@ -903,14 +1100,14 @@ fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
         extras.insert("driver".into(), d);
     }
 
-    PreparedEvent {
+    Some(PreparedEvent {
         verb: ContainerVerbWire::VolumeRm,
         captured_config: Vec::new(),
         stash_tarball: Some(hash),
         stash_tarball_bytes: Some(bytes),
         stash_image: None,
         extras,
-    }
+    })
 }
 
 /// Best-effort `{tool} inspect --format='{{.Id}}' <image>` to record
@@ -918,7 +1115,7 @@ fn prepare_volume_rm_one(tool: &str, name: String) -> PreparedEvent {
 /// inspect fails — the digest is a hint for the planner, not a
 /// blocker for stash capture.
 fn inspect_image_digest(tool: &str, image: &str) -> Option<String> {
-    let out = Command::new(tool)
+    let out = runtime_cmd(tool)
         .args(["inspect", "--format", "{{.Id}}", image])
         .output()
         .ok()?;
@@ -979,12 +1176,15 @@ mod tests {
         // No docker on PATH → inspect fails → event still ships with
         // id in extras (informational journal). was_running falls
         // back to "false" since we can't observe the real state.
-        let prepared = prepare_rm(
+        let all = prepare_rm(
             "shit-test-no-such-docker-binary",
             vec!["abc123".into(), "def456".into()],
             true,
-        )
-        .unwrap();
+        );
+        // Every id gets its own event.
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].extras.get("id").map(String::as_str), Some("def456"));
+        let prepared = all.into_iter().next().unwrap();
         assert!(matches!(prepared.verb, ContainerVerbWire::Rm));
         assert_eq!(
             prepared.extras.get("id").map(String::as_str),
@@ -996,6 +1196,7 @@ mod tests {
         );
         assert!(prepared.captured_config.is_empty());
         assert!(prepared.stash_image.is_none());
+        assert!(prepared.extras.contains_key(CAPTURE_FAILED_EXTRA));
     }
 
     #[test]
@@ -1065,6 +1266,214 @@ mod tests {
         );
         assert!(prepared.captured_config.is_empty());
         assert!(prepared.stash_tarball.is_none());
+    }
+
+    /// A stand-in for the docker engine that answers `volume ls` with the
+    /// given lines (or fails), so compose tests need no real docker.
+    fn fake_engine(dir: &Path, volumes: Option<&str>) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("engine.sh");
+        let body = match volumes {
+            Some(v) => format!("#!/bin/sh\nprintf '%s' '{v}'\n"),
+            None => "#!/bin/sh\necho engine down >&2\nexit 1\n".to_string(),
+        };
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    fn compose_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn compose_down_degraded_only_when_volumes_exist_or_are_unknown() {
+        let (_d, root) = compose_dir();
+        let file = root.join("compose.yaml").display().to_string();
+        let run = |engine: &str, vols: bool| {
+            prepare_compose_down_with(
+                engine,
+                vec![file.clone()],
+                Some("p".into()),
+                vols,
+                None,
+                None,
+                Some(&root),
+            )
+            .unwrap()
+        };
+        // Plain down: complete.
+        assert!(
+            !run("/nonexistent-engine", false)
+                .extras
+                .contains_key(CAPTURE_FAILED_EXTRA)
+        );
+        // `down -v`, project has no volumes: nothing is destroyed.
+        let none = fake_engine(&root, Some(""));
+        assert!(!run(&none, true).extras.contains_key(CAPTURE_FAILED_EXTRA));
+        // `down -v`, project has volumes: data loss, degraded.
+        let some = fake_engine(&root, Some("p_data\np_cache\n"));
+        let degraded = run(&some, true);
+        let why = &degraded.extras[CAPTURE_FAILED_EXTRA];
+        assert!(why.contains("p_data") && why.contains("2 volume"), "{why}");
+        // Engine cannot list: unknown, degraded.
+        let down = fake_engine(&root, None);
+        assert!(run(&down, true).extras[CAPTURE_FAILED_EXTRA].contains("could not be listed"));
+    }
+
+    #[test]
+    fn compose_file_follows_compose_lookup_before_degrading() {
+        let (_d, root) = compose_dir();
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let want = root.join("compose.yaml").display().to_string();
+        // -f wins; COMPOSE_FILE next (first entry, relative to cwd); then
+        // the cwd and parent directories.
+        assert_eq!(
+            resolve_compose_file(&["x.yml".into()], Some("y.yml"), Some(&sub)).as_deref(),
+            Some(sub.join("x.yml").to_str().unwrap())
+        );
+        assert_eq!(
+            resolve_compose_file(&[], Some("y.yml:z.yml"), Some(&sub)).as_deref(),
+            Some(sub.join("y.yml").to_str().unwrap())
+        );
+        assert_eq!(
+            resolve_compose_file(&[], None, Some(&sub)).as_deref(),
+            Some(want.as_str())
+        );
+        // Found in a parent directory: capture is complete.
+        let ok = prepare_compose_down_with(
+            "/nonexistent-engine",
+            vec![],
+            None,
+            false,
+            None,
+            None,
+            Some(&sub),
+        )
+        .unwrap();
+        assert!(!ok.extras.contains_key(CAPTURE_FAILED_EXTRA));
+        assert_eq!(ok.extras["compose_file"], want);
+        // Nothing anywhere (and only a project name): degraded.
+        let empty = tempfile::tempdir().unwrap();
+        let bare = prepare_compose_down_with(
+            "/nonexistent-engine",
+            vec![],
+            Some("p".into()),
+            false,
+            None,
+            None,
+            Some(empty.path()),
+        )
+        .unwrap();
+        assert!(bare.extras[CAPTURE_FAILED_EXTRA].contains("not resolvable"));
+        // COMPOSE_PROJECT_NAME names the project when -p is absent.
+        let named = prepare_compose_down_with(
+            "/nonexistent-engine",
+            vec![],
+            None,
+            false,
+            None,
+            Some("envproj".into()),
+            Some(&sub),
+        )
+        .unwrap();
+        assert_eq!(named.extras["project"], "envproj");
+    }
+
+    #[test]
+    fn relative_compose_candidates_resolve_against_the_given_cwd() {
+        // The test process's cwd is the crate directory, which holds no
+        // compose file; only the passed cwd does.
+        let (_d, root) = compose_dir();
+        let via_flag = prepare_compose_down_with(
+            "/nonexistent-engine",
+            vec!["compose.yaml".into()],
+            Some("p".into()),
+            false,
+            None,
+            None,
+            Some(&root),
+        )
+        .unwrap();
+        assert!(!via_flag.extras.contains_key(CAPTURE_FAILED_EXTRA));
+        assert_eq!(
+            via_flag.extras["compose_file"],
+            root.join("compose.yaml").display().to_string()
+        );
+        let via_env = prepare_compose_down_with(
+            "/nonexistent-engine",
+            vec![],
+            Some("p".into()),
+            false,
+            Some("compose.yaml".into()),
+            None,
+            Some(&root),
+        )
+        .unwrap();
+        assert!(!via_env.extras.contains_key(CAPTURE_FAILED_EXTRA));
+        // The literal fallback is anchored too, and degraded when absent.
+        let empty = tempfile::tempdir().unwrap();
+        let none = prepare_compose_down_with(
+            "/nonexistent-engine",
+            vec![],
+            Some("p".into()),
+            false,
+            None,
+            None,
+            Some(empty.path()),
+        )
+        .unwrap();
+        assert!(none.extras[CAPTURE_FAILED_EXTRA].contains("not resolvable"));
+        assert!(none.extras[CAPTURE_FAILED_EXTRA].contains(&empty.path().display().to_string()));
+    }
+
+    #[test]
+    fn runtime_probes_carry_the_undo_guard() {
+        let cmd = runtime_cmd("docker");
+        let guard = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "SHIT_DURING_UNDO")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(guard.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn not_found_is_nothing_to_capture_other_failures_are_degraded() {
+        // The runtime binary is missing: a capture failure, not "absent".
+        let missing = "shit-test-no-such-docker-binary";
+        let rm = prepare_rm(missing, vec!["c1".into()], false);
+        assert_eq!(rm.len(), 1);
+        assert!(rm[0].extras.contains_key(CAPTURE_FAILED_EXTRA));
+
+        // A runtime that reports the object as absent yields no event.
+        let dir = tempfile::tempdir().unwrap();
+        let absent = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join("absent.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho 'Error: No such container: x' >&2\nexit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        assert!(prepare_rm(&absent, vec!["c1".into(), "c2".into()], false).is_empty());
+        assert!(prepare_network_rm(&absent, vec!["n".into()]).is_empty());
+        assert!(prepare_rmi(&absent, ContainerRuntimeWire::Docker, vec!["i".into()]).is_empty());
+        assert!(prepare_volume_rm(&absent, vec!["v".into()]).is_empty());
+
+        assert!(not_found_text(
+            "Error response from daemon: No such network: n"
+        ));
+        assert!(not_found_text("Error: reference does not exist"));
+        assert!(!not_found_text("No such file or directory (os error 2)"));
+        assert!(!not_found_text("Cannot connect to the Docker daemon"));
     }
 
     #[test]
@@ -1179,7 +1588,12 @@ mod tests {
             ids: vec!["c1".into()],
             force: false,
         });
-        let prepared = prepare("podman", ContainerRuntimeWire::Podman, v);
+        // A missing binary keeps the test independent of any podman on the host.
+        let prepared = prepare(
+            "shit-test-no-such-podman-binary",
+            ContainerRuntimeWire::Podman,
+            v,
+        );
         assert_eq!(prepared.len(), 1);
         let p = &prepared[0];
         assert!(matches!(p.verb, ContainerVerbWire::Rm));

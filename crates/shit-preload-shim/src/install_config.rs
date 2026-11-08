@@ -159,24 +159,28 @@ pub fn resolve_with_fs(cfg: &Config, home: &Path) -> Result<Vec<String>, ConfigE
     resolve(cfg, home, |p| p.exists())
 }
 
-/// Expand a leading `~/` to `$HOME/`. Other `~` forms pass through
-/// unchanged — we intentionally don't support `~user/` because it
-/// requires a `getpwnam(3)` syscall and the install-prefix list is
-/// resolved at daemon startup, not in the shim hot path. If a user
-/// genuinely needs `~someone-else/`, they can spell out the absolute
-/// path.
+/// Expand a leading `~`, `~/`, `$HOME` or `${HOME}` to `home`. Other `~`
+/// forms pass through unchanged: `~user/` needs `getpwnam(3)`, which the
+/// shim hot path avoids, and `$HOMEFOO` is a different variable. A `home`
+/// that is not an absolute path is never substituted, so an unset or
+/// relative `$HOME` cannot turn into a surprising location.
 pub fn expand_tilde(raw: &str, home: &Path) -> String {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        let home_str = home.to_string_lossy();
-        format!(
-            "{}/{}",
-            home_str.trim_end_matches('/'),
-            rest.trim_start_matches('/')
-        )
-    } else if raw == "~" {
-        home.to_string_lossy().into_owned()
+    let Some(rest) = ["~", "${HOME}", "$HOME"]
+        .iter()
+        .find_map(|p| raw.strip_prefix(p))
+    else {
+        return raw.to_string();
+    };
+    let home_str = home.to_string_lossy();
+    let home_trimmed = home_str.trim_end_matches('/');
+    if !home.is_absolute() || home_trimmed.is_empty() || !(rest.is_empty() || rest.starts_with('/'))
+    {
+        return raw.to_string();
+    }
+    if rest.is_empty() {
+        home_trimmed.to_string()
     } else {
-        raw.to_string()
+        format!("{home_trimmed}/{}", rest.trim_start_matches('/'))
     }
 }
 
@@ -189,6 +193,15 @@ mod tests {
     }
 
     // ----- expand_tilde -----
+
+    #[test]
+    fn expand_dollar_home_forms_and_rejects_relative_home() {
+        assert_eq!(expand_tilde("$HOME/a", &home()), "/home/u/a");
+        assert_eq!(expand_tilde("${HOME}", &home()), "/home/u");
+        assert_eq!(expand_tilde("$HOMEFOO/a", &home()), "$HOMEFOO/a");
+        assert_eq!(expand_tilde("~/a", Path::new("rel")), "~/a");
+        assert_eq!(expand_tilde("~/a", Path::new("")), "~/a");
+    }
 
     #[test]
     fn tilde_slash_expands() {
