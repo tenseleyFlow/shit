@@ -728,17 +728,37 @@ fn ingest_notification(
         return;
     };
 
-    // Never journal a Create for a relative path: the undo executor would
-    // resolve it against the daemon's cwd and remove the wrong entry. The
-    // shim attaches a CaptureRefused marker when it could not make the
-    // path absolute (already journaled above).
-    if is_relative_create(&kind) {
+    // Never journal a tree op with a relative path: the undo executor
+    // would resolve it against the daemon's cwd and act on the wrong
+    // entry. L5 (review of #232, item 6): it is a refusal instead. The
+    // shim attaches a marker when it could not make the path absolute
+    // (journaled above); a relative path without one is refused here.
+    if let Some(rel) = relative_tree_path(&kind) {
         debug!(
             pid = note.pid,
             syscall = %note.syscall,
             arg = %note.arg,
-            "shim notify: relative Create path; dropping"
+            "shim notify: relative tree-op path; refusing"
         );
+        if note.failure.is_none() {
+            let event = CaptureEvent {
+                id: EventId(0),
+                command,
+                ts: ingest_ts,
+                partial: false,
+                kind: CaptureEventKind::CaptureRefused {
+                    class: "capture-incomplete".to_string(),
+                    path: rel,
+                    detail: format!(
+                        "shim reported {} on a path it could not make absolute",
+                        note.syscall
+                    ),
+                },
+            };
+            if let Err(e) = index.put_event(&event) {
+                warn!(err = %e, pid = note.pid, "shim notify: relative-path refusal journal failed");
+            }
+        }
         return;
     }
 
@@ -795,12 +815,23 @@ fn ingest_notification(
     );
 }
 
-/// True when `kind` is a TreeOp::Create whose path is not absolute.
-fn is_relative_create(kind: &CaptureEventKind) -> bool {
-    matches!(
-        kind,
-        CaptureEventKind::TreeOp(TreeOp::Create { path, .. }) if !path.is_absolute()
-    )
+/// The first relative path of a tree op, if it has one.
+fn relative_tree_path(kind: &CaptureEventKind) -> Option<PathBuf> {
+    let CaptureEventKind::TreeOp(op) = kind else {
+        return None;
+    };
+    let paths: Vec<&Path> = match op {
+        TreeOp::Create { path, .. }
+        | TreeOp::Unlink { path, .. }
+        | TreeOp::Symlink { path, .. }
+        | TreeOp::SymlinkRemoved { path, .. } => vec![path],
+        TreeOp::Rename { from, to, .. } => vec![from, to],
+        TreeOp::Link { target, .. } => vec![target],
+    };
+    paths
+        .into_iter()
+        .find(|p| !p.is_absolute())
+        .map(Path::to_path_buf)
 }
 
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
@@ -1171,11 +1202,49 @@ mod tests {
         for syscall in ["mkdir", "mkfifo", "link"] {
             let rel = classify_tree_op(syscall, "relative/child").expect("classifiable");
             assert!(
-                is_relative_create(&rel),
+                relative_tree_path(&rel).is_some(),
                 "{syscall} relative must be dropped"
             );
             let abs = classify_tree_op(syscall, "/tmp/shit-abs-child").expect("classifiable");
-            assert!(!is_relative_create(&abs), "{syscall} absolute must pass");
+            assert!(
+                relative_tree_path(&abs).is_none(),
+                "{syscall} absolute must pass"
+            );
+        }
+    }
+
+    /// Review of #232, item 6: an Unlink or Rename with a relative path
+    /// (macOS reports unresolved dirfd names raw) is never journaled as
+    /// a tree op. It is a refusal: the shim's marker when it sent one,
+    /// the daemon's own when it did not.
+    #[test]
+    fn relative_unlink_and_rename_are_refused_not_journaled() {
+        for (syscall, arg) in [
+            ("unlinkat", "name"),
+            ("renameat", "a\t/tmp/abs-b"),
+            ("renameat", "/tmp/abs-a\tb"),
+        ] {
+            let kinds = kinds_after(&open_note_arg(syscall, arg, None));
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-incomplete"
+                ),
+                "{syscall} {arg}: {kinds:#?}"
+            );
+            let marker = shit_proto::ShimFailure::CanonicalizeFailed {
+                which_arg: "path".into(),
+                attempted_path: arg.into(),
+                error_chain: "F_GETPATH failed".into(),
+            };
+            let kinds = kinds_after(&open_note_arg(syscall, arg, Some(marker)));
+            assert!(
+                matches!(
+                    kinds.as_slice(),
+                    [CaptureEventKind::CaptureRefused { class, .. }] if class == "capture-incomplete"
+                ),
+                "{syscall} {arg} with marker: {kinds:#?}"
+            );
         }
     }
 
@@ -1658,6 +1727,17 @@ mod tests {
             .into_iter()
             .map(|e| e.kind)
             .collect()
+    }
+
+    fn open_note_arg(
+        syscall: &str,
+        arg: &str,
+        failure: Option<shit_proto::ShimFailure>,
+    ) -> ShimNotification {
+        ShimNotification {
+            arg: arg.into(),
+            ..open_note(syscall, failure)
+        }
     }
 
     fn open_note(syscall: &str, failure: Option<shit_proto::ShimFailure>) -> ShimNotification {
