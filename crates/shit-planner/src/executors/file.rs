@@ -281,6 +281,18 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
                 ),
             };
         }
+        if let Some(d) = device
+            && d.token.is_none()
+        {
+            let why = if d.source_nodev {
+                "source filesystem does not allow device nodes"
+            } else {
+                "the helper issued no capture token"
+            };
+            return ExecutionOutcome::Failed {
+                err: format!("mknod {path:?} kind={kind:?}: refused: {why}"),
+            };
+        }
         if is_device || matches!(kind, FileKind::Fifo | FileKind::Socket) {
             // G01.5 — same parent-tree guarantee as the regular path
             // (recreate_path_inner does this for us; we mirror it
@@ -1566,11 +1578,44 @@ mod tests {
                 session: uuid::Uuid::nil(),
                 seq: 3,
             },
-            token: crate::metadata::CaptureToken {
+            token: Some(crate::metadata::CaptureToken {
                 helper: [1; 16],
                 mac: [2; 32],
-            },
+            }),
+            source_nodev: false,
         }
+    }
+
+    /// Review round 2, item 1: a capture from a `nodev` filesystem has
+    /// no token; undo refuses with the reason and asks nothing of the
+    /// helper.
+    #[test]
+    fn device_capture_without_a_token_is_refused_with_the_reason() {
+        let reader = InMemoryBlobReader::new();
+        let exec = FileExecutor::with_privileged_router(
+            &reader,
+            crate::executor::InMemoryPrivilegedOpRouter::new(),
+        );
+        let mut d = captured_node(7, 9);
+        d.token = None;
+        d.source_nodev = true;
+        let op = device_op(crate::metadata::FileKind::CharDevice, Some(d));
+        match exec.execute(&op, false, ConflictPolicy::default()) {
+            ExecutionOutcome::Failed { err } => {
+                assert!(
+                    err.contains("source filesystem does not allow device nodes"),
+                    "got: {err}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            exec.privileged_router
+                .mknod_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

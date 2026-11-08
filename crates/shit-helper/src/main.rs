@@ -3465,6 +3465,34 @@ fn apply_device_mknod(
         Ok(v) => v,
         Err(o) => return o,
     };
+    // Review round 2, item 1: the node is made only on the filesystem the
+    // token was issued for (its signed st_dev), and only where device
+    // nodes are honored.
+    match dirfd::fstat_fd(&parent) {
+        Ok(st) if st.st_dev == ev.dev => {}
+        Ok(_) => {
+            return refuse(
+                "the parent directory is on a different filesystem than the captured node"
+                    .to_string(),
+            );
+        }
+        Err(e) => {
+            return PrivilegedOpOutcome::Failed {
+                err: format!("fstat parent: {e}"),
+            };
+        }
+    }
+    match capture_token::fs_is_nodev(std::os::fd::AsRawFd::as_raw_fd(&parent)) {
+        Ok(false) => {}
+        Ok(true) => {
+            return refuse("target filesystem does not allow device nodes (nodev)".to_string());
+        }
+        Err(e) => {
+            return PrivilegedOpOutcome::Failed {
+                err: format!("statvfs parent: {e}"),
+            };
+        }
+    }
     dirfd::device_node_at(&parent, &name, mode, rdev, ev.uid, ev.gid)
 }
 
@@ -3501,7 +3529,7 @@ mod dirfd {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    fn fstat_fd(fd: &OwnedFd) -> std::io::Result<libc::stat> {
+    pub(super) fn fstat_fd(fd: &OwnedFd) -> std::io::Result<libc::stat> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(errno());
@@ -3833,13 +3861,32 @@ mod apply_mknod_tests {
             rdev: u64,
             owner: (u32, u32),
         ) -> shit_proto::DeviceEvidence {
+            use std::os::unix::fs::MetadataExt;
+            // The node's filesystem: the parent's st_dev, as a capture on
+            // this filesystem would have signed.
+            let dev = std::path::Path::new(path)
+                .parent()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.dev())
+                .unwrap_or(0x803);
+            evidence_on(key, path, mode, rdev, owner, dev)
+        }
+
+        fn evidence_on(
+            key: &capture_token::TokenKey,
+            path: &str,
+            mode: u32,
+            rdev: u64,
+            owner: (u32, u32),
+            dev: u64,
+        ) -> shit_proto::DeviceEvidence {
             let session = uuid::Uuid::from_u128(0x004c_3462);
             let facts = capture_token::DeviceFacts {
                 mode,
                 rdev,
                 uid: owner.0,
                 gid: owner.1,
-                dev: 0x803,
+                dev,
                 ino: 77,
                 path,
                 session,
@@ -3848,7 +3895,7 @@ mod apply_mknod_tests {
             shit_proto::DeviceEvidence {
                 uid: owner.0,
                 gid: owner.1,
-                dev: 0x803,
+                dev,
                 inode: 77,
                 session,
                 command_seq: 9,
@@ -3966,6 +4013,43 @@ mod apply_mknod_tests {
             let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, (other, g));
             let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
             assert!(refused(&outcome, "not the invoking user"), "{outcome:?}");
+            assert!(std::fs::symlink_metadata(&p).is_err());
+        }
+
+        /// Review round 2, item 1: a token signed for one filesystem is not
+        /// honored on another.
+        #[test]
+        fn parent_on_another_filesystem_than_the_signed_dev_is_refused() {
+            use std::os::unix::fs::MetadataExt;
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("chr");
+            let ps = p.to_str().unwrap();
+            let real = std::fs::metadata(dir.path()).unwrap().dev();
+            let ev = evidence_on(this_helper(), ps, CHR | 0o640, NULL_DEV, me(), real ^ 1);
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert!(refused(&outcome, "different filesystem"), "{outcome:?}");
+            assert!(std::fs::symlink_metadata(&p).is_err());
+        }
+
+        /// Review round 2, item 1: never made on a `nodev` filesystem.
+        /// /dev/shm is nodev on the usual Linux setups; skipped otherwise.
+        #[test]
+        fn nodev_target_filesystem_is_refused() {
+            let Ok(shm) = tempfile::tempdir_in("/dev/shm") else {
+                return;
+            };
+            let fd = std::fs::File::open(shm.path()).unwrap();
+            if !capture_token::fs_is_nodev(std::os::fd::AsRawFd::as_raw_fd(&fd)).unwrap() {
+                return;
+            }
+            let p = shm.path().join("chr");
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, CHR | 0o640, NULL_DEV, me());
+            let outcome = apply_mknod(ps, CHR | 0o640, NULL_DEV, Some(&ev));
+            assert!(
+                refused(&outcome, "does not allow device nodes"),
+                "{outcome:?}"
+            );
             assert!(std::fs::symlink_metadata(&p).is_err());
         }
 

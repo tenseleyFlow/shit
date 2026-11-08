@@ -201,6 +201,8 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     // L4b - device restore compares the captured owner with the
     // helper's euid (the invoking user) before mknod.
     libc::SYS_geteuid,
+    // L4b - nodev checks: fstatvfs (glibc fstatfs) on held fds.
+    libc::SYS_fstatfs,
     libc::SYS_umask,
     libc::SYS_fcntl,
     libc::SYS_mmap,

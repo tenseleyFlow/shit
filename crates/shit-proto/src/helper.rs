@@ -414,6 +414,12 @@ pub enum HelperResponse {
         /// a later `ApplyMknod` must present. See [`CaptureToken`].
         #[serde(default)]
         device_token: Option<CaptureToken>,
+        /// L4b - the held node sits on a filesystem mounted `nodev`
+        /// (FUSE always is): the helper issues no token, since such a
+        /// filesystem can report any rdev, and undo refuses with a
+        /// reason.
+        #[serde(default)]
+        device_source_nodev: bool,
     },
     /// W02.B.live-baseline — one regular file's content snapshot,
     /// captured at session-open by the helper-side baseline walker
@@ -1089,6 +1095,7 @@ mod tests {
             flags: 0,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
         let bytes = encode_frame(&ev).unwrap();
         let decoded: HelperResponse = decode_frame(&bytes).unwrap();
@@ -1117,6 +1124,7 @@ mod tests {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
         let err = validate_outgoing(&ev).unwrap_err();
         assert!(matches!(err, HelperProtoError::PathHintTooLong { .. }));

@@ -1810,6 +1810,7 @@ fn device_pairing(
             uid,
             gid,
             token,
+            source_nodev,
         }) = &ev.kind
             && *inode != none
             && *rdev != 0
@@ -1830,6 +1831,7 @@ fn device_pairing(
                     inode: *inode,
                     removed_by: ev.command,
                     token: *token,
+                    source_nodev: *source_nodev,
                 },
             );
         }

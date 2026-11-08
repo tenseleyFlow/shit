@@ -123,6 +123,29 @@ impl TokenKey {
     }
 }
 
+/// True when the filesystem holding `fd` is mounted `nodev` (FUSE
+/// always is). Such a filesystem can report any rdev and owner, so a
+/// device node seen there proves nothing about what may be made on a
+/// filesystem that honors device nodes. Works on an O_PATH fd.
+pub fn fs_is_nodev(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    let mut sv: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(fd, &mut sv) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(sv.f_flag & libc::ST_NODEV != 0)
+}
+
+/// The token for a device-node capture, or none when the source
+/// filesystem is `nodev`: the helper does not vouch for what such a
+/// filesystem reports.
+pub fn device_token(
+    key: &TokenKey,
+    facts: &DeviceFacts<'_>,
+    source_nodev: bool,
+) -> Option<CaptureToken> {
+    (!source_nodev).then(|| key.issue(facts))
+}
+
 static PROCESS_KEY: OnceLock<Option<TokenKey>> = OnceLock::new();
 
 /// This process's key, generated on first use. `main` calls it before
@@ -231,6 +254,29 @@ mod tests {
             mac: t.mac,
         };
         assert_eq!(new.verify(&f, &forged), Err(TokenError::Mismatch));
+    }
+
+    /// Review round 2, item 1: no token for a node on a `nodev`
+    /// filesystem. /dev/shm is mounted nodev on the usual Linux setups;
+    /// the test skips the real-mount half where it is not.
+    #[test]
+    fn no_token_for_a_nodev_source() {
+        let k = TokenKey::generate().unwrap();
+        let f = facts("/w/null");
+        assert!(device_token(&k, &f, true).is_none());
+        assert_eq!(device_token(&k, &f, false), Some(k.issue(&f)));
+        // A real nodev mount, where /proc/mounts lists one at /dev/shm.
+        use std::os::fd::AsRawFd;
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        let shm_nodev = mounts.lines().any(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.get(1) == Some(&"/dev/shm")
+                && f.get(3).is_some_and(|o| o.split(',').any(|x| x == "nodev"))
+        });
+        if shm_nodev {
+            let fd = std::fs::File::open("/dev/shm").unwrap();
+            assert!(fs_is_nodev(fd.as_raw_fd()).unwrap());
+        }
     }
 
     #[test]

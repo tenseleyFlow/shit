@@ -886,6 +886,7 @@ fn dispatch_response(
             flags,
             rdev,
             device_token,
+            device_source_nodev,
         } => {
             let Some(staging) = fd else {
                 // AR01.1.fix-marker-only — when the helper lost the
@@ -913,7 +914,15 @@ fn dispatch_response(
                     // `git clean -fd` undo restores the dir as a
                     // dir, not a regular file.
                     let kind = kind_from_mode_bits(mode);
-                    let device = device_capture(kind, rdev, mode, uid, gid, device_token);
+                    let device = device_capture(
+                        kind,
+                        rdev,
+                        mode,
+                        uid,
+                        gid,
+                        device_token,
+                        device_source_nodev,
+                    );
                     if let Err(e) = journal_unlink_with_device(
                         index, command, ts, inode_ref, path_buf, kind, mode, device,
                     ) {
@@ -1543,21 +1552,24 @@ fn journal_unlink_idempotent(
     journal_unlink_with_device(index, command, ts, inode_ref, path, kind, mode, None)
 }
 
-/// L4b - what the daemon journals beside a device `Unlink`. Only built
-/// from a helper capture that carries both a device number and a token.
+/// L4b - what the daemon journals beside a device `Unlink`: a device
+/// number with the helper's token, or with none when the source
+/// filesystem was `nodev` (undo then refuses with that reason).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeviceCapture {
     rdev: u64,
     mode: u32,
     uid: u32,
     gid: u32,
-    token: shit_planner::CaptureToken,
+    token: Option<shit_planner::CaptureToken>,
+    source_nodev: bool,
 }
 
 /// L4 / L4b ruling 6 - a `DeviceNodeMeta` is journaled only for a node
-/// the mode bits say is a device, with a nonzero rdev and the helper's
-/// token. Anything less is no capture at all: the `Unlink` alone is
-/// journaled, and undo gives the "no device number captured" refusal.
+/// the mode bits say is a device, with a nonzero rdev, and either the
+/// helper's token or the helper's word that the source was `nodev`.
+/// Anything less is no capture at all: the `Unlink` alone is journaled,
+/// and undo gives the "no device number captured" refusal.
 fn device_capture(
     kind: shit_planner::metadata::FileKind,
     rdev: u64,
@@ -1565,21 +1577,25 @@ fn device_capture(
     uid: u32,
     gid: u32,
     token: Option<shit_proto::CaptureToken>,
+    source_nodev: bool,
 ) -> Option<DeviceCapture> {
     use shit_planner::metadata::FileKind;
     if !matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) || rdev == 0 {
         return None;
     }
-    let token = token?;
+    if token.is_none() && !source_nodev {
+        return None;
+    }
     Some(DeviceCapture {
         rdev,
         mode,
         uid,
         gid,
-        token: shit_planner::CaptureToken {
-            helper: token.helper,
-            mac: token.mac,
-        },
+        token: token.map(|t| shit_planner::CaptureToken {
+            helper: t.helper,
+            mac: t.mac,
+        }),
+        source_nodev,
     })
 }
 
@@ -1634,6 +1650,7 @@ fn journal_unlink_with_device(
                 uid: d.uid,
                 gid: d.gid,
                 token: d.token,
+                source_nodev: d.source_nodev,
             }),
         };
         index.put_event(&meta_ev).map_err(|e| {
@@ -1935,18 +1952,25 @@ mod tests_kind_from_mode_bits {
             mac: [2; 32],
         });
         let chr = FileKind::CharDevice;
-        assert_eq!(device_capture(chr, 0, 0o020600, 1, 1, t), None);
-        assert_eq!(device_capture(chr, 0x103, 0o020600, 1, 1, None), None);
+        assert_eq!(device_capture(chr, 0, 0o020600, 1, 1, t, false), None);
         assert_eq!(
-            device_capture(FileKind::Fifo, 0x103, 0o010600, 1, 1, t),
+            device_capture(chr, 0x103, 0o020600, 1, 1, None, false),
             None
         );
-        let got = device_capture(FileKind::BlockDevice, 0x803, 0o060600, 1, 2, t).unwrap();
+        // Review round 2, item 1: a nodev source journals the meta with
+        // no token, so undo can say why it refuses.
+        let nodev = device_capture(chr, 0x103, 0o020600, 1, 1, None, true).unwrap();
+        assert!(nodev.token.is_none() && nodev.source_nodev);
+        assert_eq!(
+            device_capture(FileKind::Fifo, 0x103, 0o010600, 1, 1, t, false),
+            None
+        );
+        let got = device_capture(FileKind::BlockDevice, 0x803, 0o060600, 1, 2, t, false).unwrap();
         assert_eq!(
             (got.rdev, got.mode, got.uid, got.gid),
             (0x803, 0o060600, 1, 2)
         );
-        assert_eq!(got.token.mac, [2; 32]);
+        assert_eq!(got.token.unwrap().mac, [2; 32]);
     }
 }
 
@@ -2028,10 +2052,11 @@ mod tests_dispatch {
             mode: 0o020640,
             uid: 1,
             gid: 1,
-            token: shit_planner::CaptureToken {
+            token: Some(shit_planner::CaptureToken {
                 helper: [1; 16],
                 mac: [2; 32],
-            },
+            }),
+            source_nodev: false,
         };
         journal_unlink_with_device(
             &index,
@@ -2076,10 +2101,11 @@ mod tests_dispatch {
             mode: 0o020640,
             uid: 1,
             gid: 1,
-            token: shit_planner::CaptureToken {
+            token: Some(shit_planner::CaptureToken {
                 helper: [1; 16],
                 mac: [2; 32],
-            },
+            }),
+            source_nodev: false,
         };
         for (t, rdev) in [(2, 0x103), (3, 0x105)] {
             journal_unlink_with_device(

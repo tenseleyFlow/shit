@@ -62,7 +62,10 @@ pub struct DeviceNode {
     pub inode: crate::inode::InodeRef,
     /// The command that removed the node (not the undo).
     pub removed_by: crate::events::CommandId,
-    pub token: CaptureToken,
+    /// `None` when the helper would not vouch for the capture.
+    pub token: Option<CaptureToken>,
+    /// The node sat on a `nodev` filesystem: no token was issued.
+    pub source_nodev: bool,
 }
 
 impl FileMetadata {

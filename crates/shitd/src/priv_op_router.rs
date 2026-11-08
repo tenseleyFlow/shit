@@ -100,17 +100,21 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
         // perm_bits composite). L4b - BlockDevice/CharDevice carry the
         // journaled capture and the helper's token back; the helper
         // checks the token against every field before it acts.
-        let device = device.map(|d| shit_proto::DeviceEvidence {
-            uid: d.uid,
-            gid: d.gid,
-            dev: d.inode.dev,
-            inode: d.inode.inode,
-            session: d.removed_by.session,
-            command_seq: d.removed_by.seq,
-            token: shit_proto::CaptureToken {
-                helper: d.token.helper,
-                mac: d.token.mac,
-            },
+        // A capture without a token is refused by the executor before
+        // it gets here; none is sent if one slips through.
+        let device = device.and_then(|d| {
+            d.token.map(|t| shit_proto::DeviceEvidence {
+                uid: d.uid,
+                gid: d.gid,
+                dev: d.inode.dev,
+                inode: d.inode.inode,
+                session: d.removed_by.session,
+                command_seq: d.removed_by.seq,
+                token: shit_proto::CaptureToken {
+                    helper: t.helper,
+                    mac: t.mac,
+                },
+            })
         });
         let seq = self.next_seq();
         let req = HelperRequest::ApplyMknod {

@@ -505,7 +505,10 @@ pub enum TreeOp {
         mode: u32,
         uid: u32,
         gid: u32,
-        token: crate::metadata::CaptureToken,
+        /// `None` when the helper issued none: the source filesystem
+        /// was `nodev` (`source_nodev`), so undo refuses.
+        token: Option<crate::metadata::CaptureToken>,
+        source_nodev: bool,
     },
 }
 

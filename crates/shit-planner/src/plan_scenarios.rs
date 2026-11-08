@@ -1403,10 +1403,11 @@ fn device_meta(path: std::path::PathBuf, inode: InodeRef, rdev: u64) -> CaptureE
         mode: 0o020666,
         uid: 0,
         gid: 0,
-        token: crate::metadata::CaptureToken {
+        token: Some(crate::metadata::CaptureToken {
             helper: [7; 16],
             mac: [rdev as u8; 32],
-        },
+        }),
+        source_nodev: false,
     })
 }
 
@@ -1456,7 +1457,7 @@ fn removed_char_device_is_recreated_with_its_journaled_capture() {
                 && d.uid == 0
                 && d.inode == i
                 && d.removed_by == command_id()
-                && d.token.helper == [7; 16]
+                && d.token.is_some_and(|t| t.helper == [7; 16])
         ),
         "{nodes:#?}"
     );

@@ -1599,6 +1599,7 @@ impl PumpState {
             flags: rec.flags,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
 
         if let Err(e) = self

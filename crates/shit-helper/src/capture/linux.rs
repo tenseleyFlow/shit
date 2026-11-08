@@ -482,6 +482,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
         if let Err(e) = self
             .conn
@@ -738,19 +739,31 @@ impl LinuxCaptureRuntime {
         // matched the event gets a capture token over what fstat said.
         // That token is the only thing that lets a later ApplyMknod
         // recreate it.
+        //
+        // Review round 2, item 1: a node on a `nodev` filesystem (FUSE
+        // always is) gets no token; such a filesystem can report any rdev.
+        let device_source_nodev = race_won
+            && file_type.is_device()
+            && race_fd.as_ref().is_some_and(|fd| {
+                crate::capture_token::fs_is_nodev(fd.as_raw_fd()).unwrap_or(true)
+            });
         let device_token = match (&meta_wire, race_won && file_type.is_device()) {
-            (Some(m), true) if m.rdev != 0 => crate::capture_token::process_key().map(|k| {
-                k.issue(&crate::capture_token::DeviceFacts {
-                    mode: m.mode,
-                    rdev: m.rdev,
-                    uid: m.uid,
-                    gid: m.gid,
-                    dev: ev_dev_userspace,
-                    ino: ev.inode,
-                    path: &resolved_path,
-                    session: ev.command.session,
-                    seq: ev.command.seq,
-                })
+            (Some(m), true) if m.rdev != 0 => crate::capture_token::process_key().and_then(|k| {
+                crate::capture_token::device_token(
+                    k,
+                    &crate::capture_token::DeviceFacts {
+                        mode: m.mode,
+                        rdev: m.rdev,
+                        uid: m.uid,
+                        gid: m.gid,
+                        dev: ev_dev_userspace,
+                        ino: ev.inode,
+                        path: &resolved_path,
+                        session: ev.command.session,
+                        seq: ev.command.seq,
+                    },
+                    device_source_nodev,
+                )
             }),
             _ => None,
         };
@@ -789,6 +802,7 @@ impl LinuxCaptureRuntime {
                 0
             },
             device_token,
+            device_source_nodev,
         };
 
         let send_result = if let Some(ref fd) = staging_fd {
@@ -956,6 +970,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
         if let Err(e) = self
             .conn
@@ -1245,18 +1260,17 @@ impl LinuxCaptureRuntime {
                 );
                 return;
             }
-            Some(t @ (_, _, k))
-                if matches!(
-                    k,
+            Some(
+                t @ (
+                    _,
+                    _,
                     FileType::Regular
-                        | FileType::Fifo
-                        | FileType::Socket
-                        | FileType::BlockDevice
-                        | FileType::CharDevice
-                ) =>
-            {
-                (held, t)
-            }
+                    | FileType::Fifo
+                    | FileType::Socket
+                    | FileType::BlockDevice
+                    | FileType::CharDevice,
+                ),
+            ) => (held, t),
             _ => {
                 tracing::warn!(
                     path = %resolved_path.display(),
@@ -1457,6 +1471,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
         if let Err(e) = self
             .conn
@@ -1613,6 +1628,7 @@ impl LinuxCaptureRuntime {
             fd_sent_via_scm: true,
             rdev: 0,
             device_token: None,
+            device_source_nodev: false,
         };
         if let Err(e) = self
             .conn
@@ -1722,6 +1738,7 @@ impl LinuxCaptureRuntime {
                         fd_sent_via_scm: true,
                         rdev: 0,
                         device_token: None,
+                        device_source_nodev: false,
                     };
                     if let Err(e) = self
                         .conn
