@@ -3742,7 +3742,7 @@ mod apply_mknod_tests {
         rdev: u64,
         owner: (u32, u32),
     ) -> shit_proto::DeviceEvidence {
-        let session = uuid::Uuid::from_u128(0x4c34_62);
+        let session = uuid::Uuid::from_u128(0x004c_3462);
         let facts = capture_token::DeviceFacts {
             mode,
             rdev,
