@@ -60,8 +60,7 @@ pub const SHIT_SEQ_ENV: &str = "_SHIT_SEQ";
 /// once per process. `None` when either variable is missing or
 /// malformed; the daemon then attributes by pid ancestry.
 pub fn command_key() -> Option<shit_proto::ShimCommandKey> {
-    static K: std::sync::OnceLock<Option<shit_proto::ShimCommandKey>> =
-        std::sync::OnceLock::new();
+    static K: std::sync::OnceLock<Option<shit_proto::ShimCommandKey>> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
         parse_command_key(
             std::env::var(SHIT_SESSION_ENV).ok().as_deref(),

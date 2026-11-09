@@ -1690,9 +1690,15 @@ mod tests {
         let blob_store = fresh_blob_store(dir);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_one(stream, index, blob_store, active, Arc::new(LiveBaseline::new()))
-                .await
-                .unwrap();
+            handle_one(
+                stream,
+                index,
+                blob_store,
+                active,
+                Arc::new(LiveBaseline::new()),
+            )
+            .await
+            .unwrap();
         });
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
