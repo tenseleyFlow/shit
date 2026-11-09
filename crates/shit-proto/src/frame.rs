@@ -11,12 +11,15 @@ pub const WIRE_VERSION: u8 = 1;
 /// 2 added `pre_stat` with `link_target` (L4b, #223);
 /// 3 added the `ShimFailure::PreImageUncaptured` variant (L5, #232), which
 /// a version-2 daemon cannot decode;
-/// 4 added `call_id` and `outcome` (L5 PR B, rename calls).
-/// A daemon acks a frame of another version, journals a capture-gap
+/// 4 added `call_id` and `outcome` (L5 PR B, rename calls);
+/// 5 added `command_key` (R8, #210), which attributes a note without a
+/// live pid walk. A daemon still reads version 4 frames
+/// (`decode_shim_notification`) and attributes them by pid.
+/// A daemon acks a frame of any other version, journals a capture-gap
 /// refusal for the sender's command and drops it; shells started before
 /// an upgrade keep the old shim loaded until they restart. Full version
 /// negotiation is #225.
-pub const SHIM_WIRE_VERSION: u8 = 4;
+pub const SHIM_WIRE_VERSION: u8 = 5;
 
 /// Maximum frame size (including length prefix). Frames over this are
 /// rejected on the decode side and never produced on the encode side.
@@ -103,6 +106,22 @@ pub fn encode_shim_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, EncodeError> 
 /// [`SHIM_WIRE_VERSION`] is [`DecodeError::UnsupportedVersion`].
 pub fn decode_shim_frame<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeError> {
     decode_versioned(buf, MAX_LARGE_FRAME_SIZE, SHIM_WIRE_VERSION)
+}
+
+/// Decode a large-cap frame stamped `version`; for reading an older
+/// shim wire shape.
+pub(crate) fn decode_versioned_large<T: DeserializeOwned>(
+    buf: &[u8],
+    version: u8,
+) -> Result<T, DecodeError> {
+    decode_versioned(buf, MAX_LARGE_FRAME_SIZE, version)
+}
+
+/// Encode `msg` stamped with an arbitrary shim wire `version`, for
+/// tests of older shims.
+#[cfg(test)]
+pub(crate) fn encode_versioned_for_test<T: Serialize>(msg: &T, version: u8) -> Vec<u8> {
+    encode_versioned(msg, MAX_LARGE_FRAME_SIZE, version).unwrap()
 }
 
 fn encode_frame_with_cap<T: Serialize>(msg: &T, cap: usize) -> Result<Vec<u8>, EncodeError> {

@@ -191,6 +191,73 @@ pub struct ShimNotification {
     /// call returns.
     #[serde(default)]
     pub outcome: Option<ShimRenameOutcome>,
+    /// R8 (#210): the command the sender belongs to, read by the shim
+    /// from the environment the shell hook exports
+    /// ([`ShimCommandKey`]). The daemon attributes the note by this key,
+    /// so a sender that exits before the daemon reads the note is still
+    /// joined to its command. `None` when the sender's environment had
+    /// no key (not started from a hooked shell); the daemon then walks
+    /// the sender's pid ancestry. Added in shim wire version 5.
+    #[serde(default)]
+    pub command_key: Option<ShimCommandKey>,
+}
+
+/// R8 (#210): the shell session and command sequence number a shim
+/// note belongs to. The shell hooks export them as `_SHIT_SESSION` and
+/// `_SHIT_SEQ` before each command runs, so every process the command
+/// starts inherits them. The daemon accepts a key only from a peer with
+/// its own uid, and only for a command it knows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ShimCommandKey {
+    pub session: uuid::Uuid,
+    pub seq: u64,
+}
+
+/// The version-4 shape of [`ShimNotification`], before `command_key`.
+/// A daemon still reads these (from shells started before an upgrade)
+/// and attributes them by pid ancestry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ShimNotificationV4 {
+    pid: u32,
+    syscall: String,
+    arg: String,
+    ts_unix_nanos: u64,
+    pre_image: Option<ShimPreImage>,
+    extra_pre_images: Vec<ShimPreImage>,
+    failure: Option<ShimFailure>,
+    pre_stat: Option<ShimStat>,
+    call_id: u64,
+    outcome: Option<ShimRenameOutcome>,
+}
+
+impl From<ShimNotificationV4> for ShimNotification {
+    fn from(n: ShimNotificationV4) -> Self {
+        ShimNotification {
+            pid: n.pid,
+            syscall: n.syscall,
+            arg: n.arg,
+            ts_unix_nanos: n.ts_unix_nanos,
+            pre_image: n.pre_image,
+            extra_pre_images: n.extra_pre_images,
+            failure: n.failure,
+            pre_stat: n.pre_stat,
+            call_id: n.call_id,
+            outcome: n.outcome,
+            command_key: None,
+        }
+    }
+}
+
+/// Decode a shim notification frame of the current
+/// [`crate::SHIM_WIRE_VERSION`] or of version 4 (no `command_key`).
+/// Any other version is [`crate::DecodeError::UnsupportedVersion`].
+pub fn decode_shim_notification(buf: &[u8]) -> Result<ShimNotification, crate::DecodeError> {
+    match crate::frame::decode_shim_frame::<ShimNotification>(buf) {
+        Err(crate::DecodeError::UnsupportedVersion(4)) => {
+            crate::frame::decode_versioned_large::<ShimNotificationV4>(buf, 4).map(Into::into)
+        }
+        other => other,
+    }
 }
 
 /// L5 (PR B): what a rename-family call did, as the shim saw it.
@@ -279,6 +346,7 @@ mod tests {
             pre_stat: None,
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -310,6 +378,7 @@ mod tests {
             pre_stat: None,
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -337,6 +406,7 @@ mod tests {
             pre_stat: None,
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -368,6 +438,7 @@ mod tests {
             }),
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = encode_frame(&n).expect("encode");
         let decoded: ShimNotification = decode_frame(&frame).expect("decode");
@@ -406,6 +477,7 @@ mod tests {
             pre_stat: None,
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -443,6 +515,7 @@ mod tests {
             pre_stat: None,
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -493,6 +566,7 @@ mod tests {
             pre_stat: None,
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = crate::frame::encode_shim_frame(&n).expect("encode");
         let decoded: ShimNotification = crate::frame::decode_shim_frame(&frame).expect("decode");
@@ -529,6 +603,7 @@ mod tests {
             }),
             call_id: 0,
             outcome: None,
+            command_key: None,
         };
         let frame = encode_shim_frame(&n).unwrap();
         assert_eq!(frame[4], SHIM_WIRE_VERSION);
@@ -538,9 +613,9 @@ mod tests {
             decode_shim_frame::<ShimNotification>(&old),
             Err(DecodeError::UnsupportedVersion(1))
         ));
-        // Version-2 and -3 frames (#223's and #232's shims) are refused
-        // by name too.
-        for v in [2u8, 3] {
+        // Version-2, -3 and -4 frames (#223's, #232's and #224's shims)
+        // are refused by name too by the strict decoder.
+        for v in [2u8, 3, 4] {
             let mut old = frame.clone();
             old[4] = v;
             assert!(matches!(
@@ -548,6 +623,47 @@ mod tests {
                 Err(DecodeError::UnsupportedVersion(got)) if got == v
             ));
         }
-        assert_eq!(SHIM_WIRE_VERSION, 4);
+        assert_eq!(SHIM_WIRE_VERSION, 5);
+    }
+
+    /// R8 (#210): the key round-trips, and a version-4 frame (a shell
+    /// started before the upgrade) still decodes, with no key, through
+    /// `decode_shim_notification`. Versions 1-3 stay refused.
+    #[test]
+    fn version_4_frames_decode_without_a_key() {
+        use crate::frame::{DecodeError, encode_shim_frame, encode_versioned_for_test};
+        let v4 = ShimNotificationV4 {
+            pid: 7,
+            syscall: "mkfifo".into(),
+            arg: "/w/fifo".into(),
+            ts_unix_nanos: 9,
+            pre_image: None,
+            extra_pre_images: Vec::new(),
+            failure: None,
+            pre_stat: None,
+            call_id: 3,
+            outcome: None,
+        };
+        let frame = encode_versioned_for_test(&v4, 4);
+        let got = decode_shim_notification(&frame).unwrap();
+        assert_eq!(got, ShimNotification::from(v4.clone()));
+        assert_eq!(got.command_key, None);
+        assert_eq!(got.call_id, 3);
+
+        let mut keyed = got.clone();
+        keyed.command_key = Some(ShimCommandKey {
+            session: uuid::Uuid::from_u128(0xabc),
+            seq: 12,
+        });
+        let frame = encode_shim_frame(&keyed).unwrap();
+        assert_eq!(decode_shim_notification(&frame).unwrap(), keyed);
+
+        for v in [1u8, 2, 3] {
+            let old = encode_versioned_for_test(&v4, v);
+            assert!(matches!(
+                decode_shim_notification(&old),
+                Err(DecodeError::UnsupportedVersion(got)) if got == v
+            ));
+        }
     }
 }
