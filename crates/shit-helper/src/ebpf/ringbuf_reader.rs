@@ -1022,7 +1022,38 @@ fn note_loss_value(last: &mut u64, value: u64) -> u64 {
 #[derive(Clone)]
 pub struct LsmFlushHandle {
     thread_name: &'static str,
-    tx: mpsc::Sender<mpsc::SyncSender<FlushAck>>,
+    tx: mpsc::Sender<FlushRequest>,
+}
+
+/// One flush request: where the ack goes, and when the drain must stop.
+/// The deadline is fixed when the request is sent, so time the reader
+/// spends on records it was already handling counts against the budget.
+pub struct FlushRequest {
+    ack: mpsc::SyncSender<FlushAck>,
+    deadline: Instant,
+}
+
+/// Records a reader dispatches between flush and loss-counter checks.
+const READ_BATCH: u32 = 1024;
+
+/// Dispatch up to [`READ_BATCH`] records. `next` handles one record and
+/// returns false when the ring is empty; `poll` returns a flush request
+/// if one is waiting. A request ends the batch at once and goes into
+/// `pending`, so it does not wait behind the rest of the batch.
+fn dispatch_batch(
+    mut next: impl FnMut() -> bool,
+    mut poll: impl FnMut() -> Option<FlushRequest>,
+    pending: &mut Vec<FlushRequest>,
+) {
+    for _ in 0..READ_BATCH {
+        if let Some(req) = poll() {
+            pending.push(req);
+            return;
+        }
+        if !next() {
+            return;
+        }
+    }
 }
 
 /// A reader's answer to a flush request.
@@ -1065,7 +1096,10 @@ impl LsmFlushHandle {
     fn request(&self) -> Result<mpsc::Receiver<FlushAck>, String> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         self.tx
-            .send(ack_tx)
+            .send(FlushRequest {
+                ack: ack_tx,
+                deadline: Instant::now() + FLUSH_DRAIN_BUDGET,
+            })
             .map_err(|_| format!("eBPF {} reader is not running", self.thread_name))?;
         Ok(ack_rx)
     }
@@ -1454,24 +1488,31 @@ fn reader_thread(
     alive: Arc<AtomicBool>,
     idle_sleep: Duration,
     mut loss: LossTracker,
-    flush_rx: mpsc::Receiver<mpsc::SyncSender<FlushAck>>,
+    flush_rx: mpsc::Receiver<FlushRequest>,
 ) {
     let mut last_loss_poll = Instant::now();
+    let mut pending: Vec<FlushRequest> = Vec::new();
     while alive.load(Ordering::Acquire) {
-        let mut drained_this_pass = 0u32;
-        while let Some(rec) = rb.next() {
-            let slice: &[u8] = &rec[..];
-            handler(slice, sink.as_ref());
-            drained_this_pass += 1;
-            if drained_this_pass >= 1024 {
-                break;
-            }
-        }
+        dispatch_batch(
+            || {
+                let Some(rec) = rb.next() else {
+                    return false;
+                };
+                handler(&rec[..], sink.as_ref());
+                true
+            },
+            || flush_rx.try_recv().ok(),
+            &mut pending,
+        );
+        pending.extend(flush_rx.try_iter());
         // Close barrier: every record the kernel wrote before the
         // request is already in the ring, so draining until empty
-        // dispatches the command's whole tail before the ack.
-        while let Ok(ack) = flush_rx.try_recv() {
-            let deadline = Instant::now() + FLUSH_DRAIN_BUDGET;
+        // dispatches the command's whole tail before the ack. The
+        // budget runs from when the request was sent. A single handler
+        // still runs to completion, so one that outlasts the requester's
+        // wait shows up there as a timeout, which the close reports the
+        // same way.
+        for FlushRequest { ack, deadline } in pending.drain(..) {
             let outcome = drain_for_flush(
                 || Instant::now() >= deadline,
                 || {
@@ -1531,7 +1572,7 @@ mod tests {
 
     #[test]
     fn flush_times_out_when_reader_never_acks() {
-        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
         let handle = LsmFlushHandle {
             thread_name: "test",
             tx,
@@ -1543,13 +1584,13 @@ mod tests {
 
     #[test]
     fn stuck_reader_does_not_starve_the_others() {
-        let (stuck_tx, stuck_rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
-        let (slow_tx, slow_rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
+        let (stuck_tx, stuck_rx) = mpsc::channel::<FlushRequest>();
+        let (slow_tx, slow_rx) = mpsc::channel::<FlushRequest>();
         // Acks well inside the deadline, but only after the stuck reader's
         // whole wait would have used it up if requests went out in turn.
         let slow = std::thread::spawn(move || {
             let requested_at = Instant::now();
-            let ack = slow_rx.recv().unwrap();
+            let ack = slow_rx.recv().unwrap().ack;
             let waited = requested_at.elapsed();
             ack.send(FlushAck::Drained).unwrap();
             waited
@@ -1576,9 +1617,9 @@ mod tests {
 
     #[test]
     fn flush_succeeds_when_reader_acks() {
-        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
         let t = std::thread::spawn(move || {
-            let ack = rx.recv().unwrap();
+            let ack = rx.recv().unwrap().ack;
             ack.send(FlushAck::Drained).unwrap();
         });
         let handle = LsmFlushHandle {
@@ -1591,9 +1632,9 @@ mod tests {
 
     #[test]
     fn truncated_flush_is_reported_as_incomplete() {
-        let (tx, rx) = mpsc::channel::<mpsc::SyncSender<FlushAck>>();
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
         let t = std::thread::spawn(move || {
-            let ack = rx.recv().unwrap();
+            let ack = rx.recv().unwrap().ack;
             ack.send(FlushAck::Truncated { drained: 7 }).unwrap();
         });
         let handle = LsmFlushHandle {
@@ -1680,6 +1721,83 @@ mod tests {
     #[test]
     fn drain_budget_fits_inside_the_flush_wait() {
         assert!(FLUSH_DRAIN_BUDGET < crate::LSM_FLUSH_TIMEOUT);
+    }
+
+    /// #234 item 5: the budget runs from when the request is sent, not
+    /// from when the reader gets to it.
+    #[test]
+    fn flush_deadline_is_fixed_when_the_request_is_sent() {
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handle = LsmFlushHandle {
+            thread_name: "test",
+            tx,
+        };
+        let sent = Instant::now();
+        let _ack = handle.request().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let req = rx.recv().unwrap();
+        assert!(req.deadline <= sent + FLUSH_DRAIN_BUDGET + Duration::from_millis(5));
+        assert!(req.deadline > sent);
+    }
+
+    /// #234 item 5: a request that arrives mid-batch ends the batch, so
+    /// it does not wait behind up to [`READ_BATCH`] more records.
+    #[test]
+    fn flush_request_ends_the_batch_it_arrives_in() {
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handled = std::cell::Cell::new(0u32);
+        let mut pending = Vec::new();
+        dispatch_batch(
+            || {
+                handled.set(handled.get() + 1);
+                if handled.get() == 3 {
+                    let (ack, _) = mpsc::sync_channel(1);
+                    tx.send(FlushRequest {
+                        ack,
+                        deadline: Instant::now(),
+                    })
+                    .unwrap();
+                }
+                true
+            },
+            || rx.try_recv().ok(),
+            &mut pending,
+        );
+        assert_eq!(handled.get(), 3);
+        assert_eq!(pending.len(), 1);
+
+        // Without a request the batch stops at its size.
+        let handled = std::cell::Cell::new(0u32);
+        let mut pending = Vec::new();
+        dispatch_batch(
+            || {
+                handled.set(handled.get() + 1);
+                true
+            },
+            || None,
+            &mut pending,
+        );
+        assert_eq!(handled.get(), READ_BATCH);
+        assert!(pending.is_empty());
+    }
+
+    /// A request whose budget ran out before the reader reached it still
+    /// gets a truncation answer, inside the requester's wait.
+    #[test]
+    fn late_picked_up_request_acks_truncated() {
+        let deadline = Instant::now();
+        let (left, _) = ring(5);
+        let outcome = drain_for_flush(
+            || Instant::now() >= deadline,
+            || {
+                if left.get() == 0 {
+                    return false;
+                }
+                left.set(left.get() - 1);
+                true
+            },
+        );
+        assert_eq!(outcome, FlushAck::Truncated { drained: 0 });
     }
 
     #[test]
