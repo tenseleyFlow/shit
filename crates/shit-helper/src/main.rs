@@ -64,6 +64,8 @@ mod sandbox;
 mod seccomp_linux;
 mod self_verify;
 mod svc;
+#[cfg(target_os = "linux")]
+mod watch_scope;
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
@@ -911,7 +913,10 @@ fn run_probe_fanotify() -> anyhow::Result<()> {
     }
     let _guard = DirGuard(dir_path.clone());
 
-    fanotify::mark::mark_dir_for_capture(&fd, &dir_path)
+    let dir_fd: std::os::fd::OwnedFd = std::fs::File::open(&dir_path)
+        .map_err(|e| anyhow::anyhow!("open tempdir: {e}"))?
+        .into();
+    fanotify::mark::mark_dir_for_capture(&fd, std::os::fd::AsFd::as_fd(&dir_fd))
         .map_err(|e| anyhow::anyhow!("mark_dir_for_capture: {e}"))?;
 
     // Spawn a child that opens a probe file inside the marked dir.
@@ -2290,9 +2295,13 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_macos_capture = macos_capture.clone();
     #[cfg(target_os = "macos")]
     let request_macos_es_capture = macos_es_capture.clone();
+    #[cfg(target_os = "linux")]
+    let peer_uid = outcome.daemon_uid;
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
+            #[cfg(target_os = "linux")]
+            peer_uid,
             #[cfg(target_os = "linux")]
             request_state,
             #[cfg(target_os = "linux")]
@@ -2387,17 +2396,51 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 /// what `/proc/<pid>/cwd` would report. `/proc/<pid>/cwd` alone is racy
 /// for a short-lived root process (issue #22 family).
 #[cfg(target_os = "linux")]
-fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(raw);
-    if !path.is_absolute() {
+fn validated_linux_watch_cwd(raw: &str) -> Result<WatchCwd, String> {
+    if !std::path::Path::new(raw).is_absolute() {
         return Err(format!("watch cwd {raw:?} is not absolute"));
     }
-    let canonical = std::fs::canonicalize(&path)
-        .map_err(|e| format!("watch cwd {raw:?} is unavailable: {e}"))?;
-    if !canonical.is_dir() {
-        return Err(format!("watch cwd {raw:?} is not a directory"));
+    open_watch_dir(raw).map_err(|e| format!("watch cwd {raw:?} is unavailable: {e}"))
+}
+
+/// #230 - a Linux watch root, held open. `path` is what the held fd
+/// names (for pre-opens and logs); the fanotify mark is made on `fd`.
+#[cfg(target_os = "linux")]
+struct WatchCwd {
+    fd: std::os::fd::OwnedFd,
+    path: PathBuf,
+}
+
+/// Open `path` as a directory for reading with the helper's own
+/// credentials. After startup the helper has no effective capability
+/// (#226) and its euid is the peer's uid (checked by
+/// [`watch_scope::WatchScope`]), so this open succeeds only for a
+/// directory the peer could open itself. A deleted directory (no links
+/// left) is refused.
+#[cfg(target_os = "linux")]
+fn open_watch_dir(path: &str) -> Result<WatchCwd, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c = std::ffi::CString::new(path).map_err(|e| format!("path contains NUL: {e}"))?;
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
-    Ok(canonical)
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if st.st_nlink == 0 {
+        return Err("the directory was deleted".to_string());
+    }
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|e| format!("cannot name the opened directory: {e}"))?;
+    Ok(WatchCwd { fd, path })
 }
 
 /// Resolve the Linux watch root: the hook-reported cwd, or the root
@@ -2409,18 +2452,13 @@ fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
 /// directory was renamed, does not resolve either. Canonicalizing the
 /// magic link gives real bytes, and fails for a deleted cwd.
 #[cfg(target_os = "linux")]
-fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<PathBuf, String> {
+fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<WatchCwd, String> {
     let reported = if raw.contains(char::REPLACEMENT_CHARACTER) {
         Err(format!("watch cwd {raw:?} is not valid UTF-8"))
     } else {
         validated_linux_watch_cwd(raw)
     };
-    reported.or_else(|reason| {
-        std::fs::canonicalize(format!("/proc/{root_pid}/cwd"))
-            .ok()
-            .filter(|cwd| cwd.is_dir())
-            .ok_or(reason)
-    })
+    reported.or_else(|reason| open_watch_dir(&format!("/proc/{root_pid}/cwd")).map_err(|_| reason))
 }
 
 /// Close-barrier marker for `UnwatchTree`. Sent on every path, degraded
@@ -2456,6 +2494,23 @@ fn begin_watch(
         "duplicate WatchTree for an active command was ignored".to_string(),
     );
     false
+}
+
+/// #230 - a WatchTree the peer may not make: nothing is tracked or
+/// marked. The refusal is logged, reported as a capture observation
+/// (journaled in strict mode), and returned as the WatchTreeFailed
+/// reason.
+#[cfg(target_os = "linux")]
+fn refuse_watch(
+    conn: &ipc::Conn,
+    command: shit_planner::events::CommandId,
+    root_pid: u32,
+    reason: &str,
+) -> String {
+    tracing::warn!(%command, root_pid, %reason, "WatchTree refused");
+    let detail = format!("watch refused: {reason}");
+    capture::accounting::send_capture_observation(conn, command, None, detail.clone());
+    detail
 }
 
 /// Linux WatchTree attach. `Ok` means the tier is set up for this
@@ -2495,21 +2550,26 @@ fn linux_watch_tree(
                 state.overflows.load(std::sync::atomic::Ordering::Acquire),
             );
             if let Ok(cwd) = &cwd {
-                g.note_direct_children_baseline(command, cwd);
+                g.note_direct_children_baseline(command, &cwd.path);
             }
         }
-        let cwd = cwd?;
+        let WatchCwd {
+            fd: cwd_fd,
+            path: cwd,
+        } = cwd?;
         // L01: narrow-scope fanotify mark on the watch cwd
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
         // the box). Stash the path so UnwatchTree can unmark it.
-        match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
+        match fanotify::mark::mark_dir_for_capture(&state.fd, std::os::fd::AsFd::as_fd(&cwd_fd)) {
             Ok(()) => {
-                state
-                    .marked_paths
-                    .lock()
-                    .unwrap()
-                    .insert(command, cwd.clone());
+                state.marked_paths.lock().unwrap().insert(
+                    command,
+                    fanotify::runtime::MarkedDir {
+                        path: cwd.clone(),
+                        fd: cwd_fd,
+                    },
+                );
                 tracing::info!(
                     %session,
                     command_seq,
@@ -2547,7 +2607,7 @@ fn linux_watch_tree(
                 ebpf::ringbuf_losses_observed(),
             );
             if let Ok(cwd) = &cwd {
-                g.pre_open_tree(command, cwd);
+                g.pre_open_tree(command, &cwd.path);
             }
         }
         match &cwd {
@@ -2555,7 +2615,7 @@ fn linux_watch_tree(
                 %session,
                 command_seq,
                 root_pid,
-                cwd = %cwd.display(),
+                cwd = %cwd.path.display(),
                 tier = "ebpf-lsm",
                 "watch_tree registered + cwd pre-opened (LSM tier)"
             ),
@@ -2609,7 +2669,9 @@ mod linux_watch_tests {
     fn watch_root_prefers_the_reported_cwd() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_linux_watch_cwd(dir.path().to_str().unwrap(), std::process::id()).unwrap(),
+            resolve_linux_watch_cwd(dir.path().to_str().unwrap(), std::process::id())
+                .unwrap()
+                .path,
             std::fs::canonicalize(dir.path()).unwrap()
         );
     }
@@ -2618,7 +2680,9 @@ mod linux_watch_tests {
     fn watch_root_falls_back_when_the_report_does_not_resolve() {
         let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(
-            resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", std::process::id()).unwrap(),
+            resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", std::process::id())
+                .unwrap()
+                .path,
             own
         );
     }
@@ -2631,14 +2695,18 @@ mod linux_watch_tests {
         std::fs::create_dir(&lossy).unwrap();
         let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(
-            resolve_linux_watch_cwd(lossy.to_str().unwrap(), std::process::id()).unwrap(),
+            resolve_linux_watch_cwd(lossy.to_str().unwrap(), std::process::id())
+                .unwrap()
+                .path,
             own
         );
     }
 
     #[test]
     fn watch_root_reports_the_reason_when_neither_resolves() {
-        let err = resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", dead_pid()).unwrap_err();
+        let err = resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", dead_pid())
+            .err()
+            .unwrap();
         assert!(err.contains("shit-r3a-cwd"), "{err}");
     }
 
@@ -2652,9 +2720,58 @@ mod linux_watch_tests {
         assert!(validated_linux_watch_cwd(file.to_str().unwrap()).is_err());
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
         assert_eq!(
-            validated_linux_watch_cwd(dir.path().to_str().unwrap()).unwrap(),
+            validated_linux_watch_cwd(dir.path().to_str().unwrap())
+                .unwrap()
+                .path,
             canonical
         );
+    }
+
+    /// #230: a directory the peer cannot open (no read permission) is
+    /// not watched, though it exists and is reachable.
+    #[test]
+    fn watch_cwd_the_peer_cannot_open_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let err = validated_linux_watch_cwd(locked.to_str().unwrap())
+            .err()
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err.contains("Permission denied"), "{err}");
+    }
+
+    /// #230: the process fallback does not reach a cwd the peer may not
+    /// inspect (pid 1's cwd belongs to root).
+    #[test]
+    fn fallback_to_another_users_cwd_is_refused() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert!(resolve_linux_watch_cwd("/nonexistent/shit-230", 1).is_err());
+    }
+
+    /// A deleted directory is not a watch root.
+    #[test]
+    fn deleted_watch_cwd_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&gone)
+            .spawn()
+            .unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        let r = resolve_linux_watch_cwd("/nonexistent/shit-230", child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(r.is_err());
     }
 
     fn lsm_dispatch() -> LsmDispatch {
@@ -2803,6 +2920,7 @@ mod linux_watch_tests {
 /// disconnects or sends `Shutdown`.
 fn request_loop(
     conn: Arc<ipc::Conn>,
+    #[cfg(target_os = "linux")] peer_uid: u32,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
     #[cfg(target_os = "linux")] lsm_state: Option<LsmDispatch>,
     #[cfg(any(
@@ -2820,6 +2938,9 @@ fn request_loop(
     // Commands with a WatchTree and no UnwatchTree yet. A duplicate
     // WatchTree must not reset an active capture window.
     let mut active_watches = std::collections::BTreeSet::new();
+    // #230: which processes this peer may watch.
+    #[cfg(target_os = "linux")]
+    let mut watch_scope = watch_scope::WatchScope::new(peer_uid);
 
     loop {
         let req = match conn.recv_request() {
@@ -2859,14 +2980,17 @@ fn request_loop(
                     continue;
                 }
                 #[cfg(target_os = "linux")]
-                let attach = linux_watch_tree(
-                    &conn,
-                    fanotify_state.as_ref(),
-                    lsm_state.as_ref(),
-                    command,
-                    root_pid,
-                    &cwd_path,
-                );
+                let attach = match watch_scope.authorize(session, root_pid) {
+                    Ok(()) => linux_watch_tree(
+                        &conn,
+                        fanotify_state.as_ref(),
+                        lsm_state.as_ref(),
+                        command,
+                        root_pid,
+                        &cwd_path,
+                    ),
+                    Err(reason) => Err(refuse_watch(&conn, command, root_pid, &reason)),
+                };
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
@@ -3064,12 +3188,15 @@ fn request_loop(
                             Some(state.overflows.load(std::sync::atomic::Ordering::Acquire)),
                         );
                     }
-                    if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd)
-                        && let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path)
+                    if let Some(dir) = state.marked_paths.lock().unwrap().remove(&cmd)
+                        && let Err(e) = fanotify::mark::unmark_dir_for_capture(
+                            &state.fd,
+                            std::os::fd::AsFd::as_fd(&dir.fd),
+                        )
                     {
                         tracing::warn!(
                             err = %e,
-                            path = %path.display(),
+                            path = %dir.path.display(),
                             "unmark_dir_for_capture failed (continuing)"
                         );
                     }

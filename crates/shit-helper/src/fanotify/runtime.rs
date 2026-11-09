@@ -61,11 +61,19 @@ pub struct FanotifyState {
     /// degraded paths), in which case the reader still ALLOWs every
     /// perm event but doesn't capture.
     pub capture_runtime: Option<Arc<Mutex<LinuxCaptureRuntime>>>,
-    /// L01 — per-CommandId path that was marked at WatchTree time.
-    /// Looked up at UnwatchTree to know which path to unmark.
+    /// L01 — per-CommandId directory that was marked at WatchTree time.
+    /// Looked up at UnwatchTree to know which directory to unmark.
     /// Without this map the helper would leak marks across commands
-    /// (slowly accumulating fanotify watches over time).
-    pub marked_paths: Arc<Mutex<HashMap<CommandId, PathBuf>>>,
+    /// (slowly accumulating fanotify watches over time). #230: the
+    /// directory is held open, so the unmark hits the marked inode.
+    pub marked_paths: Arc<Mutex<HashMap<CommandId, MarkedDir>>>,
+}
+
+/// A directory marked for one command: its path for logs, and the fd
+/// the mark was made on.
+pub struct MarkedDir {
+    pub path: PathBuf,
+    pub fd: std::os::fd::OwnedFd,
 }
 
 impl FanotifyState {
