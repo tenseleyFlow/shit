@@ -31,6 +31,9 @@
 //! - **system-identity** — `useradd`, `userdel`, `groupadd`,
 //!   `passwd` — PAM and shadow-file touching; reversal needs root
 //!   semantics we don't trust ourselves with.
+//! - **cluster-release** — `helm install`, `helm upgrade`,
+//!   `helm uninstall`, `helm rollback` — no release state is captured.
+//! - **firewalld** — `firewall-cmd` — zone state is not captured.
 //!
 //! ## Matching strategy
 //!
@@ -187,6 +190,34 @@ pub static CATALOG: &[RefuseEntry] = &[
              special handling",
         ),
     },
+    RefuseEntry {
+        class: "cluster-release",
+        patterns: &[
+            RefusePattern::WordPrefix(&["helm", "install"]),
+            RefusePattern::WordPrefix(&["helm", "upgrade"]),
+            RefusePattern::WordPrefix(&["helm", "uninstall"]),
+            RefusePattern::WordPrefix(&["helm", "delete"]),
+            RefusePattern::WordPrefix(&["helm", "rollback"]),
+        ],
+        reason: "helm releases live in the cluster and shit captures no \
+                 release state, so an undo would report success while \
+                 changing nothing",
+        remediation: Some(
+            "use `helm rollback <release> <revision>` or `helm uninstall \
+             <release>` once you have checked `helm history <release>`",
+        ),
+    },
+    RefuseEntry {
+        class: "firewalld",
+        patterns: &[RefusePattern::WordPrefix(&["firewall-cmd"])],
+        reason: "firewalld keeps runtime and permanent zone state that \
+                 shit does not capture, so an undo would report success \
+                 while changing nothing",
+        remediation: Some(
+            "use the matching `firewall-cmd --remove-*` option, or \
+             `firewall-cmd --reload` to drop runtime-only changes",
+        ),
+    },
 ];
 
 /// Tokenize a shell command line for pattern matching. Whitespace-
@@ -304,6 +335,33 @@ mod tests {
     fn useradd_matches_system_identity() {
         let e = match_command("useradd -m alice").unwrap();
         assert_eq!(e.class, "system-identity");
+    }
+
+    #[test]
+    fn helm_release_verbs_match_cluster_release() {
+        for cmd in [
+            "helm install rel ./chart",
+            "helm upgrade --install rel ./chart",
+            "helm uninstall rel",
+            "helm delete rel",
+            "helm rollback rel 1",
+        ] {
+            let e = match_command(cmd).unwrap_or_else(|| panic!("{cmd} not refused"));
+            assert_eq!(e.class, "cluster-release", "{cmd}");
+        }
+    }
+
+    #[test]
+    fn helm_read_only_verbs_do_not_match() {
+        assert!(match_command("helm list").is_none());
+        assert!(match_command("helm status rel").is_none());
+        assert!(match_command("helm template rel ./chart").is_none());
+    }
+
+    #[test]
+    fn firewall_cmd_matches_firewalld() {
+        let e = match_command("firewall-cmd --add-port=8080/tcp").unwrap();
+        assert_eq!(e.class, "firewalld");
     }
 
     #[test]
