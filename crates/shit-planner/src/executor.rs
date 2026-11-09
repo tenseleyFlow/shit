@@ -169,6 +169,7 @@ impl ExecutionReport {
 pub struct PlanSummary {
     pub command_id: crate::events::CommandId,
     pub cmd_string: Option<String>,
+    #[serde(with = "crate::path_bytes")]
     pub cwd: PathBuf,
     pub node_count: usize,
 }

@@ -29,6 +29,7 @@ pub enum InverseOp {
     /// pre-validated to exist before the plan is emitted.
     RestoreContent {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         blob: BlobHash,
     },
@@ -37,16 +38,21 @@ pub enum InverseOp {
     /// (the executor applies metadata after content).
     RestoreMetadata {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         target: FileMetadata,
     },
     /// Remove a file the original command created. No content is recovered;
     /// the inverse of "create" is "unlink".
-    Unlink { path: PathBuf },
+    Unlink {
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf,
+    },
     /// Re-create a path the original command unlinked. For directories we
     /// only know the mode; for special files we know the kind. Used together
     /// with `RestoreContent` for regular files.
     RecreatePath {
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         kind: FileKind,
         mode: u32,
@@ -57,11 +63,20 @@ pub enum InverseOp {
     },
     /// Reverse a rename: rename `from` back to `to`. The planner orders
     /// renames to avoid stomping intermediate states.
-    Rename { from: PathBuf, to: PathBuf },
+    Rename {
+        #[serde(with = "crate::path_bytes")]
+        from: PathBuf,
+        #[serde(with = "crate::path_bytes")]
+        to: PathBuf,
+    },
     /// Create a symlink. Used to undo `unlink` of a symlink, or directly
     /// from a `TreeOp::Symlink` capture (rare; usually the original creation
     /// is undone via `Unlink`).
-    CreateSymlink { target: String, path: PathBuf },
+    CreateSymlink {
+        target: String,
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf,
+    },
     /// W09.20 — create a hardlink. Used to undo an `unlink` of a file
     /// when another live path still aliases the same inode at undo
     /// time. `source` is the surviving alias (must exist); `target`
@@ -71,7 +86,12 @@ pub enum InverseOp {
     /// in a `foo↔bar` pair would undo as a fresh-inode copy of foo,
     /// silently de-aliasing the workspace (breaking `cp -al`,
     /// `git worktree`-style aliasing, `--link-dest` rsync backups).
-    CreateHardlink { source: PathBuf, target: PathBuf },
+    CreateHardlink {
+        #[serde(with = "crate::path_bytes")]
+        source: PathBuf,
+        #[serde(with = "crate::path_bytes")]
+        target: PathBuf,
+    },
     /// Set an environment variable. Note: applied by emitting a shell-side
     /// snippet, not by mutating the live shell process — see S15.
     SetEnv { name: String, value: String },
@@ -119,6 +139,7 @@ pub enum InverseOp {
     /// know what they killed and how to restart it.
     ProcessNote {
         argv: Vec<String>,
+        #[serde(with = "crate::path_bytes")]
         cwd: PathBuf,
         env_summary: BTreeMap<String, String>,
         message: String,
@@ -190,6 +211,7 @@ pub enum InverseOp {
     /// `terraform apply -refresh-only` to reconcile.
     TerraformReverse {
         /// Working directory the original `terraform` command ran in.
+        #[serde(with = "crate::path_bytes")]
         workdir: PathBuf,
         op: TerraformOp,
         /// Captured `terraform state pull` output, zstd-compressed.
@@ -215,7 +237,11 @@ pub enum InverseOp {
     /// the full pre-content blob — just the pre-existing length.
     /// `pre_size` was captured by the shell redirect pre-stash before
     /// `>>` opened the file; reverse is `truncate(path, pre_size)`.
-    FileExtend { path: PathBuf, truncate_to: u64 },
+    FileExtend {
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf,
+        truncate_to: u64,
+    },
     /// C06: shell-state diff between pre-exec and post-exec snapshots.
     /// Reverse is an informational snippet the user sources (or, with
     /// `shit undo --apply-shell-state`, queued via the bash/zsh
@@ -223,6 +249,7 @@ pub enum InverseOp {
     /// Restores `cd`, `set -o` / `setopt`, alias defs, and function
     /// bodies.
     ShellStateRestore {
+        #[serde(with = "crate::path_bytes::option")]
         pwd_before: Option<PathBuf>,
         opts_diff: Vec<OptDiff>,
         aliases_diff: Vec<AliasDiff>,
@@ -281,6 +308,7 @@ pub enum InverseOp {
     /// positionally and persisted plans may contain older values.
     RestoreFlags {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         flags: u32,
     },
@@ -291,12 +319,19 @@ pub enum InverseOp {
     /// shape. An existing directory is left as it is; anything else at
     /// the path is a failure. A directory the command created is paired
     /// with a [`InverseOp::RemoveBornDir`] that takes it away again.
-    EnsureDir { path: PathBuf, mode: u32 },
+    EnsureDir {
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf,
+        mode: u32,
+    },
     /// #215: remove a directory the command created, once the undo has
     /// moved everything back out of it. Runs after every op under the
     /// path, deepest first. Gone already is fine; a directory that still
     /// holds something is left in place and reported.
-    RemoveBornDir { path: PathBuf },
+    RemoveBornDir {
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf,
+    },
 }
 
 /// C03: kubectl verb captured against a single resource (or a
@@ -457,6 +492,7 @@ pub enum ContainerOp {
     ComposeDown {
         project: String,
         services: Vec<String>,
+        #[serde(with = "crate::path_bytes")]
         compose_file: PathBuf,
         /// `docker compose down -v` was used (volumes were removed).
         with_volumes: bool,
@@ -539,6 +575,7 @@ pub enum RollbackHint {
     /// snapshotted it; restoring is the file-tier inverse op
     /// against `path` and `file_blob`.
     Sqlite {
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         file_blob: Option<BlobHash>,
     },
