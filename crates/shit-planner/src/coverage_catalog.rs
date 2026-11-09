@@ -249,29 +249,49 @@ mod tests {
         }
     }
 
-    /// Every covered class must point at a smoke that exists in
-    /// `tests/smoke/` and is not excluded from CI. A class whose
-    /// representative smoke is missing or excluded is a claim with no
-    /// evidence behind it.
+    /// Read one `# KEY:` header value from the first 30 lines of a
+    /// smoke, the same window `tools/audit/smoke-driver.sh` uses.
+    fn header(body: &str, key: &str) -> String {
+        let prefix = format!("# {key}:");
+        body.lines()
+            .take(30)
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Every covered class must point at a smoke that (1) exists in
+    /// `tests/smoke/`, (2) has an empty `EXCLUDED_BY` in its first 30
+    /// header lines, and (3) is wired into CI: its `SMOKE_RUNNER_HINT`
+    /// is a bucket runner (`self-hosted-lsm` or `freebsd-vm`, run by
+    /// the bucket-driven aggregate jobs), or `dr-smoke.yml` names
+    /// `tests/smoke/<smoke>`. It does not check that the smoke passes.
     #[test]
-    fn every_covered_smoke_exists_and_is_not_excluded() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/smoke");
+    fn every_covered_smoke_exists_is_not_excluded_and_is_wired() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/dr-smoke.yml"))
+            .expect("dr-smoke.yml readable");
         for cls in COVERAGE_CATALOG {
-            let path = dir.join(cls.representative_smoke);
+            let path = root.join("tests/smoke").join(cls.representative_smoke);
             let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 panic!(
                     "{}: representative smoke {} unreadable: {e}",
                     cls.id, cls.representative_smoke
                 )
             });
-            let excluded = body
-                .lines()
-                .find_map(|l| l.strip_prefix("# EXCLUDED_BY:"))
-                .map(str::trim)
-                .unwrap_or("");
+            let excluded = header(&body, "EXCLUDED_BY");
             assert!(
                 excluded.is_empty(),
                 "{}: representative smoke {} is excluded from CI ({excluded})",
+                cls.id,
+                cls.representative_smoke
+            );
+            let runner = header(&body, "SMOKE_RUNNER_HINT");
+            let bucketed = runner == "self-hosted-lsm" || runner == "freebsd-vm";
+            let needle = format!("tests/smoke/{}", cls.representative_smoke);
+            assert!(
+                bucketed || workflow.contains(&needle),
+                "{}: representative smoke {} (runner {runner:?}) is not wired into dr-smoke.yml",
                 cls.id,
                 cls.representative_smoke
             );
