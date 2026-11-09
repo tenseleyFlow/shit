@@ -1,4 +1,4 @@
-.PHONY: dev build test lint fmt fmt-fix tidy clean ci doc license-check tracing-leak-check post-build install uninstall
+.PHONY: readme-coverage-check dev build test lint fmt fmt-fix tidy clean ci doc license-check tracing-leak-check post-build install uninstall
 
 dev:
 	cargo build --workspace
@@ -57,7 +57,10 @@ doc:
 clean:
 	cargo clean
 
-ci: fmt license-check tracing-leak-check lint test build
+readme-coverage-check:
+	python3 tools/audit/readme-coverage.py --check
+
+ci: fmt license-check tracing-leak-check readme-coverage-check lint test build
 
 # ---------------------------------------------------------------------
 # AU07.A — system-prefix install layout.

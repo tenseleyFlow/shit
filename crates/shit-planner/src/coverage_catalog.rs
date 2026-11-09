@@ -151,7 +151,7 @@ pub const COVERAGE_CATALOG: &[CoverageClass] = &[
     },
     CoverageClass {
         id: "tool-network",
-        representative_smoke: "iptables-net.sh",
+        representative_smoke: "iptables-net-linux.sh",
         since_sprint: "AR08.2",
     },
     CoverageClass {
@@ -243,6 +243,35 @@ mod tests {
             assert!(
                 cls.representative_smoke.ends_with(".sh"),
                 "{} representative_smoke must be a .sh file (got {:?})",
+                cls.id,
+                cls.representative_smoke
+            );
+        }
+    }
+
+    /// Every covered class must point at a smoke that exists in
+    /// `tests/smoke/` and is not excluded from CI. A class whose
+    /// representative smoke is missing or excluded is a claim with no
+    /// evidence behind it.
+    #[test]
+    fn every_covered_smoke_exists_and_is_not_excluded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/smoke");
+        for cls in COVERAGE_CATALOG {
+            let path = dir.join(cls.representative_smoke);
+            let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{}: representative smoke {} unreadable: {e}",
+                    cls.id, cls.representative_smoke
+                )
+            });
+            let excluded = body
+                .lines()
+                .find_map(|l| l.strip_prefix("# EXCLUDED_BY:"))
+                .map(str::trim)
+                .unwrap_or("");
+            assert!(
+                excluded.is_empty(),
+                "{}: representative smoke {} is excluded from CI ({excluded})",
                 cls.id,
                 cls.representative_smoke
             );
