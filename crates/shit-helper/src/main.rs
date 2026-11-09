@@ -2743,15 +2743,18 @@ fn linux_watch_tree(
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
         // the box). Stash the path so UnwatchTree can unmark it.
-        match fanotify::mark::mark_dir_for_capture(&state.fd, std::os::fd::AsFd::as_fd(&cwd_fd)) {
+        //
+        // #254: the table lock is held across mark and insert so a
+        // concurrent UnwatchTree of another command in the same cwd
+        // sees this command as a sharer before it decides to unmark.
+        let marked = fanotify::runtime::MarkedDir::new(cwd.clone(), cwd_fd)
+            .map_err(|e| format!("fstat {} failed: {e}", cwd.display()))?;
+        let mut marks = state.marked_paths.lock().unwrap();
+        match fanotify::mark::mark_dir_for_capture(&state.fd, std::os::fd::AsFd::as_fd(&marked.fd))
+        {
             Ok(()) => {
-                state.marked_paths.lock().unwrap().insert(
-                    command,
-                    fanotify::runtime::MarkedDir {
-                        path: cwd.clone(),
-                        fd: cwd_fd,
-                    },
-                );
+                marks.insert(command, marked);
+                drop(marks);
                 tracing::info!(
                     %session,
                     command_seq,
@@ -3392,7 +3395,11 @@ fn request_loop(
                             Some(state.overflows.load(std::sync::atomic::Ordering::Acquire)),
                         );
                     }
-                    if let Some(dir) = state.marked_paths.lock().unwrap().remove(&cmd)
+                    // #254: another active command may share this cwd's
+                    // mark; only the last one removes it. The lock is held
+                    // through the unmark (see linux_watch_tree).
+                    let mut marks = state.marked_paths.lock().unwrap();
+                    if let Some(dir) = fanotify::runtime::release_marked_dir(&mut marks, cmd)
                         && let Err(e) = fanotify::mark::unmark_dir_for_capture(
                             &state.fd,
                             std::os::fd::AsFd::as_fd(&dir.fd),
