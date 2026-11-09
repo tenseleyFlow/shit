@@ -81,12 +81,13 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
             uid,
             gid,
             no_dereference,
-            // #227: the helper refuses a chown without a token it issued
-            // for the file. Capture does not issue ownership tokens yet,
-            // nor does the journal carry them, so every routed chown is
-            // refused with a reason. That loses nothing: the helper holds
-            // no CAP_CHOWN (D-28), so it could not do more than the
-            // daemon's own failed chown.
+            // #227: the Linux helper refuses a chown without a token it
+            // issued for the file. Capture does not issue ownership tokens
+            // yet, nor does the journal carry them, so on Linux every
+            // routed chown is refused with a reason. That loses nothing:
+            // the helper holds no CAP_CHOWN (D-28), so it could not do
+            // more than the daemon's own failed chown. The macOS and
+            // FreeBSD helpers ignore this field.
             owner: None,
         };
         let outcome = self

@@ -46,7 +46,7 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// `PrivilegedOpOutcome` gained `Conflict` and `Refused`.
 ///
 /// **Version 7 (L6, #227):** `ApplyChown` carries `OwnerEvidence`; the
-/// helper refuses a chown without a token it issued for that file.
+/// Linux helper refuses a chown without a token it issued for that file.
 pub const HELPER_PROTOCOL_VERSION: u16 = 7;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
@@ -226,12 +226,14 @@ pub enum HelperRequest {
     /// uid/gid differs from the daemon's effective uid, kernel
     /// returned EPERM).
     ///
-    /// #227 / D-28: the helper acts only with `owner` evidence, a token
-    /// this helper process issued for the file at `path` with this
+    /// #227 / D-28: the Linux helper acts only with `owner` evidence, a
+    /// token this helper process issued for the file at `path` with this
     /// `(dev, inode)` and this `uid`/`gid` as its owner. It opens the
     /// parent without following symlinks, requires the entry to still
     /// be that inode on that device, and changes it through the held
-    /// fd. Anything else is refused.
+    /// fd. Anything else is refused. The macOS and FreeBSD helpers issue
+    /// no capture tokens yet; they ignore `owner` and chown the path as
+    /// before.
     ApplyChown {
         session: Uuid,
         command_seq: u64,
@@ -239,7 +241,7 @@ pub enum HelperRequest {
         uid: u32,
         gid: u32,
         /// `true` = change the entry itself, not a symlink's target.
-        /// The helper never follows a symlink: with `false` and a
+        /// The Linux helper never follows a symlink: with `false` and a
         /// symlink at `path`, it refuses.
         no_dereference: bool,
         /// #227 - the capture evidence for this ownership change.

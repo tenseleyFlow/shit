@@ -3528,20 +3528,47 @@ fn apply_chown(
     )
 }
 
-/// Non-Linux helpers issue no capture tokens, so they have no evidence
-/// to act on and refuse every ownership change (#227).
+/// AU28 - non-Linux ApplyChown, unchanged by #227: chown(2), or
+/// lchown(2) for `no_dereference`, on the path. The owner-evidence gate
+/// is Linux-only until the macOS and FreeBSD helpers issue capture
+/// tokens of their own; `owner` is ignored here.
 #[cfg(not(target_os = "linux"))]
 fn apply_chown(
-    _path: &str,
-    _uid: u32,
-    _gid: u32,
-    _no_dereference: bool,
+    path: &str,
+    uid: u32,
+    gid: u32,
+    no_dereference: bool,
     _owner: Option<&shit_proto::OwnerEvidence>,
 ) -> shit_proto::PrivilegedOpOutcome {
-    shit_proto::PrivilegedOpOutcome::Refused {
-        reason: "ownership restore through the helper needs capture evidence, which only \
-                 the Linux helper issues"
-            .to_string(),
+    use shit_proto::PrivilegedOpOutcome;
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(s) => s,
+        Err(e) => {
+            return PrivilegedOpOutcome::Failed {
+                err: format!("path contains NUL: {e}"),
+            };
+        }
+    };
+    let rc = unsafe {
+        if no_dereference {
+            libc::lchown(c_path.as_ptr(), uid, gid)
+        } else {
+            libc::chown(c_path.as_ptr(), uid, gid)
+        }
+    };
+    if rc == 0 {
+        return PrivilegedOpOutcome::Applied;
+    }
+    let errno = std::io::Error::last_os_error();
+    match errno.raw_os_error() {
+        Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+        Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
+        _ => PrivilegedOpOutcome::Failed {
+            err: format!(
+                "{}: {errno}",
+                if no_dereference { "lchown" } else { "chown" }
+            ),
+        },
     }
 }
 
@@ -4647,8 +4674,9 @@ mod apply_chown_tests {
     use super::*;
     use shit_proto::PrivilegedOpOutcome;
 
-    /// #227: a chown with no capture evidence is refused on every
-    /// platform, before anything is touched.
+    /// #227: on Linux a chown with no capture evidence is refused,
+    /// before anything is touched.
+    #[cfg(target_os = "linux")]
     #[test]
     fn chown_without_evidence_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -4656,31 +4684,53 @@ mod apply_chown_tests {
         std::fs::write(&p, b"x").unwrap();
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
-        #[cfg(target_os = "linux")]
-        let o = apply_chown(
-            p.to_str().unwrap(),
-            uid,
-            gid,
-            true,
-            None,
-            capture_token::process_key(),
-        );
-        #[cfg(not(target_os = "linux"))]
-        let o = apply_chown(p.to_str().unwrap(), uid, gid, true, None);
+        let key = capture_token::process_key();
+        let o = apply_chown(p.to_str().unwrap(), uid, gid, true, None, key);
         assert!(matches!(o, PrivilegedOpOutcome::Refused { .. }), "{o:?}");
         // Not even an arbitrary root path gets past the evidence check.
-        #[cfg(target_os = "linux")]
-        let o = apply_chown(
-            "/etc/shadow",
-            uid,
-            gid,
-            false,
-            None,
-            capture_token::process_key(),
-        );
-        #[cfg(not(target_os = "linux"))]
-        let o = apply_chown("/etc/shadow", uid, gid, false, None);
+        let o = apply_chown("/etc/shadow", uid, gid, false, None, key);
         assert!(matches!(o, PrivilegedOpOutcome::Refused { .. }), "{o:?}");
+    }
+
+    /// Off Linux the pre-#227 path-based chown is kept until those
+    /// helpers issue capture tokens.
+    #[cfg(not(target_os = "linux"))]
+    mod non_linux {
+        use super::*;
+
+        #[test]
+        fn chown_to_self_uid_is_applied() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("self_chown");
+            std::fs::write(&p, b"x").unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let outcome = apply_chown(p.to_str().unwrap(), uid, gid, false, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        }
+
+        #[test]
+        fn chown_nonexistent_path_is_not_found() {
+            let outcome = apply_chown("/nonexistent/au28/does/not/exist", 0, 0, false, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
+        }
+
+        #[test]
+        fn chown_path_with_nul_byte_fails() {
+            let outcome = apply_chown("/tmp/has\0nul", 0, 0, false, None);
+            assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
+        }
+
+        #[test]
+        fn lchown_branch_is_reachable() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("au28_link");
+            std::os::unix::fs::symlink("/nonexistent-target", &link).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let outcome = apply_chown(link.to_str().unwrap(), uid, gid, true, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        }
     }
 
     #[cfg(target_os = "linux")]
