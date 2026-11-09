@@ -94,7 +94,8 @@ pub fn plan(
     // L5 (PR B): the events with rename calls applied (a failed call's
     // rows and kernel twins out, a surviving shim Rename with its twin's
     // inode), the same set redo plans from (see `rename_calls`).
-    let adjusted = crate::rename_calls::live_events(events);
+    let mut adjusted = crate::rename_calls::live_events(events);
+    adjusted.iter_mut().for_each(upgrade_legacy_xattr_record);
     let mut live: Vec<&CaptureEvent> = adjusted.iter().collect();
     // Reverse-chronological: latest events first.
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.id)));
@@ -256,6 +257,23 @@ fn emit_unless_skipped(
     emit_for_event(ev, probe, store, class, nodes, warnings);
 }
 
+/// M3 (#216): rows journaled before `ShimXattrPreMutation` existed hold an
+/// xattr snapshot as a `ShimPreMutation` record whose blob is the empty
+/// placeholder while the file it names has bytes. Planned as content they
+/// truncate the file. A real content capture of a non-empty file never has
+/// the empty blob, so such a row is re-tagged as the xattr record it is.
+fn upgrade_legacy_xattr_record(ev: &mut CaptureEvent) {
+    if let CaptureEventKind::FilePreImage {
+        blob, meta, source, ..
+    } = &mut ev.kind
+        && matches!(source, FilePreImageSource::ShimPreMutation)
+        && meta.size > 0
+        && blob.as_bytes() == blake3::hash(b"").as_bytes()
+    {
+        *source = FilePreImageSource::ShimXattrPreMutation;
+    }
+}
+
 /// Flags mutations apply to an inode, not one directory entry. A kqueue
 /// unlink can mark a surviving hardlink alias as noise, but an explicit
 /// chflags snapshot on that alias remains a real mutation and must survive
@@ -263,7 +281,12 @@ fn emit_unless_skipped(
 fn is_flags_only_event(ev: &CaptureEvent) -> bool {
     match &ev.kind {
         CaptureEventKind::FilePreImage { source, .. } => {
-            matches!(source, FilePreImageSource::ShimFlagsPreMutation)
+            // xattrs live on the inode too (#216).
+            matches!(
+                source,
+                FilePreImageSource::ShimFlagsPreMutation
+                    | FilePreImageSource::ShimXattrPreMutation
+            )
         }
         CaptureEventKind::MetadataChange { before, after, .. } => before.only_flags_changed(after),
         _ => false,
@@ -1197,7 +1220,40 @@ fn emit_for_event(
             // is an empty placeholder). Restore the metadata, which holds
             // the xattr's old value, and never the bytes.
             if matches!(source, FilePreImageSource::ShimXattrPreMutation) {
+                // The shim could not stat the file before the call, so the
+                // record has no identity to check. Refuse this one xattr
+                // restore; the rest of the plan is unaffected.
+                if *inode == InodeRef::new(0, 0) {
+                    nodes.push(PlanNode {
+                        op: InverseOp::Refuse {
+                            class: "xattr-unknown-inode".to_string(),
+                            reason: format!(
+                                "{}: the shim could not stat the file before the xattr change, \
+                                 so the file cannot be identified and its xattrs are not restored",
+                                path.display()
+                            ),
+                            remediation: None,
+                        },
+                        cohort: 0,
+                        conflict: None,
+                    });
+                    return;
+                }
                 let restore_path = class.hardlink_dead_to_source.get(path).unwrap_or(path);
+                // An atomic replace gives the path a new inode by design:
+                // only existence matters, as for content records.
+                let conflict = if atomic_replace_paths.contains(path) {
+                    probe.stat(restore_path).map_or_else(
+                        || {
+                            Some(Conflict::Missing {
+                                detail: format!("{} no longer exists", restore_path.display()),
+                            })
+                        },
+                        |_| None,
+                    )
+                } else {
+                    file_path_conflict(restore_path, *inode, probe)
+                };
                 nodes.push(PlanNode {
                     op: InverseOp::RestoreMetadata {
                         inode: *inode,
@@ -1205,7 +1261,7 @@ fn emit_for_event(
                         target: meta.clone(),
                     },
                     cohort: 0,
-                    conflict: file_path_conflict(restore_path, *inode, probe),
+                    conflict,
                 });
                 return;
             }
@@ -2896,6 +2952,200 @@ mod tests {
             !p.nodes
                 .iter()
                 .any(|n| matches!(n.op, InverseOp::RestoreContent { .. }))
+        );
+    }
+
+    #[test]
+    fn shim_xattr_restore_keeps_the_recorded_st_flags() {
+        let inode = InodeRef::new(1, 22);
+        let path = PathBuf::from("/tmp/xattr-hidden");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let mut ev = xattr_pre_image(inode, path.to_str().unwrap(), 1);
+        if let CaptureEventKind::FilePreImage { meta, .. } = &mut ev.kind {
+            meta.flags = 0x8000; // UF_HIDDEN
+        }
+        let p = plan(dummy_command(), &[ev], &probe, &InMemoryStore::new());
+        assert!(matches!(
+            &p.nodes[0].op,
+            InverseOp::RestoreMetadata { target, .. } if target.flags == 0x8000
+        ));
+    }
+
+    #[test]
+    fn shim_xattr_record_survives_atomic_replace_without_blocking() {
+        // setxattr, then `sed -i` style: a content pre-image of the old
+        // inode and an unlink, with a new inode at the path at undo.
+        let old = InodeRef::new(1, 23);
+        let new = InodeRef::new(1, 24);
+        let path = PathBuf::from("/tmp/xattr-replaced");
+        let blob = BlobHash::from_bytes([0xCD; 32]);
+        let mut store = InMemoryStore::new();
+        store.put_blob(blob, 5);
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: new,
+                meta: meta(3),
+            },
+            None,
+        );
+        let content = CaptureEvent {
+            id: EventId(2),
+            command: dummy_command().command,
+            ts: TimePoint::new(2, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: old,
+                path: path.clone(),
+                blob,
+                meta: meta(5),
+                post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
+            },
+        };
+        let unlink = CaptureEvent {
+            id: EventId(3),
+            command: dummy_command().command,
+            ts: TimePoint::new(3, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode: old,
+                path: path.clone(),
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let events = vec![
+            xattr_pre_image(old, path.to_str().unwrap(), 1),
+            content,
+            unlink,
+        ];
+        let p = plan(dummy_command(), &events, &probe, &store);
+        assert!(!p.has_blocking_conflicts(), "{:#?}", p.nodes);
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. })),
+            "{:#?}",
+            p.nodes
+        );
+    }
+
+    #[test]
+    fn shim_xattr_record_with_unknown_inode_refuses_only_itself() {
+        let known = InodeRef::new(1, 25);
+        let other = PathBuf::from("/tmp/xattr-other-flags");
+        let unknown_path = PathBuf::from("/tmp/xattr-unknown");
+        let mut probe = InMemoryProbe::new();
+        for (p, i) in [(&other, known), (&unknown_path, InodeRef::new(1, 26))] {
+            probe.insert(
+                p.clone(),
+                ProbeStat {
+                    inode: i,
+                    meta: meta(0),
+                },
+                None,
+            );
+        }
+        let events = vec![
+            flags_pre_image(known, other.to_str().unwrap(), 0, 1),
+            xattr_pre_image(InodeRef::new(0, 0), unknown_path.to_str().unwrap(), 2),
+        ];
+        let p = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        assert!(!p.has_blocking_conflicts(), "{:#?}", p.nodes);
+        assert!(p.nodes.iter().any(|n| matches!(
+            &n.op,
+            InverseOp::Refuse { class, reason, .. }
+                if class == "xattr-unknown-inode" && reason.contains("xattr-unknown")
+        )));
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreFlags { .. }))
+        );
+    }
+
+    #[test]
+    fn xattr_restore_survives_hardlink_live_alias_filter() {
+        // ln a b; setxattr b; rm a; rm b
+        let inode = InodeRef::new(1, 27);
+        let dead = PathBuf::from("/tmp/xattr-hardlink-dead");
+        let live = PathBuf::from("/tmp/xattr-hardlink-live");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            live.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let unlink = |id: u64, path: PathBuf| CaptureEvent {
+            id: EventId(id),
+            command: dummy_command().command,
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
+                inode,
+                path,
+                kind: crate::metadata::FileKind::Regular,
+                mode: 0o100644,
+            }),
+        };
+        let events = vec![
+            xattr_pre_image(inode, live.to_str().unwrap(), 1),
+            unlink(2, dead.clone()),
+            unlink(3, live.clone()),
+        ];
+        let p = plan(dummy_command(), &events, &probe, &InMemoryStore::new());
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. })),
+            "{:#?}",
+            p.nodes
+        );
+    }
+
+    #[test]
+    fn legacy_xattr_row_with_empty_blob_never_restores_content() {
+        // Journaled before ShimXattrPreMutation: ShimPreMutation, the
+        // empty blob, and a file that has bytes.
+        let inode = InodeRef::new(1, 28);
+        let path = PathBuf::from("/tmp/xattr-legacy");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(9),
+            },
+            None,
+        );
+        let mut ev = xattr_pre_image(inode, path.to_str().unwrap(), 1);
+        if let CaptureEventKind::FilePreImage {
+            blob, meta, source, ..
+        } = &mut ev.kind
+        {
+            *blob = BlobHash::from_bytes(*blake3::hash(b"").as_bytes());
+            meta.size = 9;
+            *source = crate::FilePreImageSource::ShimPreMutation;
+        }
+        let p = plan(dummy_command(), &[ev], &probe, &InMemoryStore::new());
+        assert_eq!(p.content_restore_count(), 0, "{:#?}", p.nodes);
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreMetadata { .. }))
         );
     }
 
