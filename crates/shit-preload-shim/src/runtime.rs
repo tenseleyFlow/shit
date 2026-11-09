@@ -50,6 +50,41 @@ pub const LD_PRELOAD_ENV: &str = "LD_PRELOAD";
 /// children.)
 pub const DYLD_INSERT_LIBRARIES_ENV: &str = "DYLD_INSERT_LIBRARIES";
 
+/// `_SHIT_SESSION`: the shell session id the hooks export (R8, #210).
+pub const SHIT_SESSION_ENV: &str = "_SHIT_SESSION";
+/// `_SHIT_SEQ`: the sequence number of the command the hook announced
+/// last in that session; exported, so the command's processes carry it.
+pub const SHIT_SEQ_ENV: &str = "_SHIT_SEQ";
+
+/// The command key this process inherited from its shell hook, read
+/// once per process. `None` when either variable is missing or
+/// malformed; the daemon then attributes by pid ancestry.
+pub fn command_key() -> Option<shit_proto::ShimCommandKey> {
+    static K: std::sync::OnceLock<Option<shit_proto::ShimCommandKey>> =
+        std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        parse_command_key(
+            std::env::var(SHIT_SESSION_ENV).ok().as_deref(),
+            std::env::var(SHIT_SEQ_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// Parse `_SHIT_SESSION` / `_SHIT_SEQ`. The nil session (a hook that
+/// could not make a uuid) and seq 0 (no command announced yet) name no
+/// command, so they are no key.
+pub fn parse_command_key(
+    session: Option<&str>,
+    seq: Option<&str>,
+) -> Option<shit_proto::ShimCommandKey> {
+    let session = uuid::Uuid::parse_str(session?.trim()).ok()?;
+    let seq: u64 = seq?.trim().parse().ok()?;
+    if session.is_nil() || seq == 0 {
+        return None;
+    }
+    Some(shit_proto::ShimCommandKey { session, seq })
+}
+
 /// Returns `true` iff the env claims the shim is active. The cdylib
 /// calls this at every interposed syscall entry; the rlib consumers
 /// call it during pure-logic decisions (tests, mocks).
@@ -141,6 +176,23 @@ mod tests {
 
     /// Local alias to keep the test bodies readable.
     static ENV_LOCK: &std::sync::Mutex<()> = &TEST_ENV_LOCK;
+
+    #[test]
+    fn command_key_parses_the_hook_exports() {
+        let id = "6f1c2a3e-8a7b-4c2d-9e10-112233445566";
+        let key = parse_command_key(Some(id), Some("17")).unwrap();
+        assert_eq!(key.session.to_string(), id);
+        assert_eq!(key.seq, 17);
+        assert_eq!(parse_command_key(Some(id), None), None);
+        assert_eq!(parse_command_key(None, Some("17")), None);
+        assert_eq!(parse_command_key(Some("not-a-uuid"), Some("17")), None);
+        assert_eq!(parse_command_key(Some(id), Some("x")), None);
+        assert_eq!(parse_command_key(Some(id), Some("0")), None);
+        assert_eq!(
+            parse_command_key(Some("00000000-0000-0000-0000-000000000000"), Some("3")),
+            None
+        );
+    }
 
     #[test]
     fn is_active_returns_true_only_when_env_equals_one() {

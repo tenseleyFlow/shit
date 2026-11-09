@@ -19,7 +19,8 @@ if test -r /proc/sys/kernel/random/uuid
 else
     set -gx _SHIT_SESSION ($_SHIT_BIN internal new-uuid 2>/dev/null; or echo 00000000-0000-0000-0000-000000000000)
 end
-set -g _SHIT_SEQ 0
+# Exported so the preload shim can name the running command (#210).
+set -gx _SHIT_SEQ 0
 
 # S15: emit the env block as NUL-separated KEY=VALUE pairs. fish has
 # no `env -0` equivalent across platforms; this loop is the portable
@@ -33,7 +34,7 @@ end
 
 function __shit_pre --on-event fish_preexec
     set -q SHIT_DISABLE; and return
-    set _SHIT_SEQ (math $_SHIT_SEQ + 1)
+    set -gx _SHIT_SEQ (math $_SHIT_SEQ + 1)
     $_SHIT_BIN hook-send pre-exec \
         --session $_SHIT_SESSION \
         --seq $_SHIT_SEQ \
