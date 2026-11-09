@@ -31,9 +31,11 @@ __shit_send_open() {
 
 __shit_pre() {
     [[ -n "${SHIT_DISABLE:-}" ]] && return
-    # ZSH_EVAL_CONTEXT contains "file" for sourced scripts, "loadautofunc" etc.
+    # zsh runs preexec hooks with ZSH_EVAL_CONTEXT=shfunc (5.9 on Linux
+    # and FreeBSD, tty or not). A nested context ("file" for a sourced
+    # script, "loadautofunc", ...) is not a command line the user typed.
     case "$ZSH_EVAL_CONTEXT" in
-        toplevel*) ;;
+        shfunc|toplevel*) ;;
         *) return ;;
     esac
     _SHIT_SEQ=$(( _SHIT_SEQ + 1 ))
