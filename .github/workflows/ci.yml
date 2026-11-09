@@ -42,6 +42,17 @@ jobs:
       - name: build (release)
         run: cargo build --workspace --release
 
+  readme-coverage:
+    # The README coverage tables are generated from the SMOKE_* headers
+    # of tests/smoke/*.sh. Fails when the committed block is stale; fix
+    # with `python3 tools/audit/readme-coverage.py`.
+    name: README coverage tables
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: check generated block
+        run: python3 tools/audit/readme-coverage.py --check
+
   helper-lib-bsd-cross-check:
     # HD-02 — fast pre-screen for the B07.6 lib facade's
     # self-containment contract. Cross-compiles just the

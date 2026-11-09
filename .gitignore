@@ -44,3 +44,4 @@ Thumbs.db
 tools/freebsd-vm/work/
 tools/linux-bpf-vm/work/
 tools/macos-tart-vm/work/
+__pycache__/
