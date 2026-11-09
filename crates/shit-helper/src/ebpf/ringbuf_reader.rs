@@ -1023,6 +1023,9 @@ fn note_loss_value(last: &mut u64, value: u64) -> u64 {
 pub struct LsmFlushHandle {
     thread_name: &'static str,
     tx: mpsc::Sender<FlushRequest>,
+    /// Set after a request is sent. The reader checks this flag between
+    /// records instead of polling the channel.
+    waiting: Arc<AtomicBool>,
 }
 
 /// One flush request: where the ack goes, and when the drain must stop.
@@ -1091,6 +1094,14 @@ fn drain_for_flush(mut expired: impl FnMut() -> bool, mut next: impl FnMut() -> 
 }
 
 impl LsmFlushHandle {
+    fn new(thread_name: &'static str, tx: mpsc::Sender<FlushRequest>) -> Self {
+        Self {
+            thread_name,
+            tx,
+            waiting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Ask the reader to dispatch every record already in its ring
     /// buffer. Returns the channel its ack arrives on.
     fn request(&self) -> Result<mpsc::Receiver<FlushAck>, String> {
@@ -1101,6 +1112,7 @@ impl LsmFlushHandle {
                 deadline: Instant::now() + FLUSH_DRAIN_BUDGET,
             })
             .map_err(|_| format!("eBPF {} reader is not running", self.thread_name))?;
+        self.waiting.store(true, Ordering::Release);
         Ok(ack_rx)
     }
 }
@@ -1424,6 +1436,8 @@ impl LsmReader {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_t = Arc::clone(&alive);
         let (flush_tx, flush_rx) = mpsc::channel();
+        let flush = LsmFlushHandle::new(thread_name, flush_tx);
+        let waiting = Arc::clone(&flush.waiting);
         let handle = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
@@ -1436,16 +1450,14 @@ impl LsmReader {
                     idle_sleep,
                     LossTracker::new(loss_counter),
                     flush_rx,
+                    waiting,
                 );
             })
             .expect("spawn lsm reader");
         LsmReader {
             alive,
             handle: Some(handle),
-            flush: LsmFlushHandle {
-                thread_name,
-                tx: flush_tx,
-            },
+            flush,
         }
     }
 
@@ -1489,6 +1501,7 @@ fn reader_thread(
     idle_sleep: Duration,
     mut loss: LossTracker,
     flush_rx: mpsc::Receiver<FlushRequest>,
+    waiting: Arc<AtomicBool>,
 ) {
     let mut last_loss_poll = Instant::now();
     let mut pending: Vec<FlushRequest> = Vec::new();
@@ -1501,7 +1514,15 @@ fn reader_thread(
                 handler(&rec[..], sink.as_ref());
                 true
             },
-            || flush_rx.try_recv().ok(),
+            // One atomic load per record. The flag is set after the
+            // send, so a set flag always finds the request queued.
+            || {
+                if waiting.swap(false, Ordering::Acquire) {
+                    flush_rx.try_recv().ok()
+                } else {
+                    None
+                }
+            },
             &mut pending,
         );
         pending.extend(flush_rx.try_iter());
@@ -1562,10 +1583,7 @@ mod tests {
     fn flush_reports_stopped_reader() {
         let (tx, rx) = mpsc::channel();
         drop(rx);
-        let handle = LsmFlushHandle {
-            thread_name: "test",
-            tx,
-        };
+        let handle = LsmFlushHandle::new("test", tx);
         let err = flush_all_readers(&[handle], Duration::from_millis(10)).unwrap_err();
         assert!(err.contains("not running"), "{err}");
     }
@@ -1573,10 +1591,7 @@ mod tests {
     #[test]
     fn flush_times_out_when_reader_never_acks() {
         let (tx, rx) = mpsc::channel::<FlushRequest>();
-        let handle = LsmFlushHandle {
-            thread_name: "test",
-            tx,
-        };
+        let handle = LsmFlushHandle::new("test", tx);
         let err = flush_all_readers(&[handle], Duration::from_millis(10)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         drop(rx);
@@ -1596,14 +1611,8 @@ mod tests {
             waited
         });
         let handles = [
-            LsmFlushHandle {
-                thread_name: "stuck",
-                tx: stuck_tx,
-            },
-            LsmFlushHandle {
-                thread_name: "slow",
-                tx: slow_tx,
-            },
+            LsmFlushHandle::new("stuck", stuck_tx),
+            LsmFlushHandle::new("slow", slow_tx),
         ];
         let err = flush_all_readers(&handles, Duration::from_millis(300)).unwrap_err();
         assert!(err.contains("stuck"), "{err}");
@@ -1622,10 +1631,7 @@ mod tests {
             let ack = rx.recv().unwrap().ack;
             ack.send(FlushAck::Drained).unwrap();
         });
-        let handle = LsmFlushHandle {
-            thread_name: "test",
-            tx,
-        };
+        let handle = LsmFlushHandle::new("test", tx);
         flush_all_readers(&[handle], Duration::from_secs(5)).unwrap();
         t.join().unwrap();
     }
@@ -1637,10 +1643,7 @@ mod tests {
             let ack = rx.recv().unwrap().ack;
             ack.send(FlushAck::Truncated { drained: 7 }).unwrap();
         });
-        let handle = LsmFlushHandle {
-            thread_name: "open",
-            tx,
-        };
+        let handle = LsmFlushHandle::new("open", tx);
         let err = flush_all_readers(&[handle], Duration::from_secs(5)).unwrap_err();
         assert!(
             err.contains("eBPF open reader flush stopped after 7 records"),
@@ -1728,16 +1731,26 @@ mod tests {
     #[test]
     fn flush_deadline_is_fixed_when_the_request_is_sent() {
         let (tx, rx) = mpsc::channel::<FlushRequest>();
-        let handle = LsmFlushHandle {
-            thread_name: "test",
-            tx,
-        };
+        let handle = LsmFlushHandle::new("test", tx);
         let sent = Instant::now();
         let _ack = handle.request().unwrap();
         std::thread::sleep(Duration::from_millis(20));
         let req = rx.recv().unwrap();
         assert!(req.deadline <= sent + FLUSH_DRAIN_BUDGET + Duration::from_millis(5));
         assert!(req.deadline > sent);
+    }
+
+    #[test]
+    fn request_raises_the_waiting_flag_after_queueing() {
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handle = LsmFlushHandle::new("test", tx);
+        assert!(!handle.waiting.load(Ordering::Acquire));
+        let _ack = handle.request().unwrap();
+        assert!(handle.waiting.load(Ordering::Acquire));
+        assert!(
+            rx.try_recv().is_ok(),
+            "the flag is set only once the request is queued"
+        );
     }
 
     /// #234 item 5: a request that arrives mid-batch ends the batch, so
