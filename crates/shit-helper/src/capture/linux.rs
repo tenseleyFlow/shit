@@ -724,6 +724,10 @@ impl LinuxCaptureRuntime {
             (ev_dev_userspace, ev.inode),
             DedupeEntry { invalidated: true },
         );
+        if ev.is_directory {
+            ws.acct.note_dir_removed((ev_dev_userspace, ev.inode));
+        }
+        let parent_id = (ev_dev_userspace, ev.parent_inode);
 
         // AR01.1.fix-path-via-parent-inode — resolve strictly through
         // the dir-inode map (populated by pre_open_tree recursion + by
@@ -754,8 +758,12 @@ impl LinuxCaptureRuntime {
                 basename = ev.basename,
                 "lsm unlink: parent_inode not in dir_paths; dropping event"
             );
-            ws.acct.note_missing(
+            // #248: keep the parent identity. If the parent turns out to
+            // be a directory this command created (its mkdir handled
+            // after this unlink), the entry was born in the command.
+            ws.acct.note_missing_in_dir(
                 (ev_dev_userspace, ev.inode),
+                parent_id,
                 false,
                 None,
                 format!(
@@ -1011,8 +1019,9 @@ impl LinuxCaptureRuntime {
             }
         }
         if !evidence {
-            ws.acct.note_missing(
+            ws.acct.note_missing_in_dir(
                 (ev_dev_userspace, ev.inode),
+                parent_id,
                 parent_walked,
                 Some(resolved_path.clone()),
                 if race_won {
@@ -1984,6 +1993,7 @@ impl LinuxCaptureRuntime {
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
         let moved = (ev_dev, ev.inode);
+        ws.acct.note_moved(moved);
         let to_resolved =
             resolve_via_parent(&ws.dir_paths, ev_dev, ev.new_parent_inode, ev.new_basename);
 
@@ -3655,6 +3665,31 @@ mod born_set_tests {
             self.rt().handle_lsm_create(&view);
         }
 
+        fn mkdir(&mut self, parent: Id, name: &str) {
+            let view = LsmMkdirView {
+                command: self.cmd,
+                pid: 1,
+                parent_dev: userspace_to_kernel_dev(parent.0),
+                parent_inode: parent.1,
+                mode: 0o040755,
+                basename: name,
+            };
+            self.rt().handle_lsm_mkdir(&view);
+        }
+
+        fn rmdir(&mut self, id: Id, parent: Id, name: &str) {
+            let view = LsmUnlinkView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                parent_inode: parent.1,
+                basename: name,
+                is_directory: true,
+            };
+            self.rt().handle_lsm_unlink(&view);
+        }
+
         fn setattr(&mut self, id: Id) {
             let view = LsmSetattrView {
                 command: self.cmd,
@@ -4209,6 +4244,76 @@ mod born_set_tests {
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
         assert!(obs[0].1.contains("rename"), "{obs:?}");
+    }
+
+    /// A tree past the walk's file cap, with the FMODE_CREATED probe
+    /// untrusted: neither absence nor the open bit proves birth.
+    fn capped_rig_without_probe() -> Rig {
+        let mut rig = Rig::new(|d| {
+            for i in 0..=PRE_OPEN_TREE_MAX_FILES {
+                std::fs::write(d.join(format!("f{i}")), b"x").unwrap();
+            }
+        });
+        rig.rt().set_fmode_created_trusted(false);
+        rig
+    }
+
+    #[test]
+    fn unlink_before_its_parents_mkdir_is_born() {
+        // #248: `mkdir d; touch d/t; rm d/t`, with the unlink handled
+        // before the mkdir (so its parent does not resolve) and the
+        // create handled last.
+        let mut rig = capped_rig_without_probe();
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let d_id = Rig::id(&d);
+        std::fs::write(d.join("t"), b"").unwrap();
+        let t_id = Rig::id(&d.join("t"));
+        std::fs::remove_file(d.join("t")).unwrap();
+        rig.unlink(t_id, d_id, "t");
+        rig.mkdir(root, "d");
+        rig.create(d_id, "t");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn file_moved_into_a_born_dir_then_removed_is_not_born() {
+        // `mkdir d; mv deep/x d/x; rm d/x`, x never walked. The unlink
+        // and rename are handled before the mkdir.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let d_id = Rig::id(&d);
+        let x_id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        std::fs::rename(deep.join("x"), d.join("x")).unwrap();
+        std::fs::remove_file(d.join("x")).unwrap();
+        rig.unlink(x_id, d_id, "x");
+        rig.rename(x_id, (deep_id, "x"), (d_id, "x"));
+        rig.mkdir(root, "d");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+    }
+
+    #[test]
+    fn removed_dir_reusing_an_inode_is_not_a_born_parent() {
+        // `rm -r old; mkdir new` where new reuses old's inode number.
+        // Simulated with one directory reported both removed and made.
+        let mut rig = capped_rig_without_probe();
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let d_id = Rig::id(&d);
+        std::fs::write(d.join("t"), b"").unwrap();
+        let t_id = Rig::id(&d.join("t"));
+        std::fs::remove_file(d.join("t")).unwrap();
+        rig.unlink(t_id, d_id, "t");
+        rig.rmdir(d_id, root, "d");
+        rig.mkdir(root, "d");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
     }
 
     #[test]

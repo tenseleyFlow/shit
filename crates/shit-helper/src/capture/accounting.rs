@@ -118,6 +118,14 @@ pub struct CloseAccounting {
     unkeyed: Vec<String>,
     /// `(label, value)` of a tier-wide loss counter when the watch began.
     kernel_mark: Option<(&'static str, u64)>,
+    /// Parent directories of the removals recorded in `missing`, per
+    /// identity. `None` once any loss of the identity came without a
+    /// parent, so the parent rule below never applies to it.
+    missing_parents: BTreeMap<Id, Option<BTreeSet<Id>>>,
+    /// Identities some rename in this command moved, resolved or not.
+    moved: BTreeSet<Id>,
+    /// Directories this command removed.
+    removed_dirs: BTreeSet<Id>,
 }
 
 impl CloseAccounting {
@@ -298,6 +306,77 @@ impl CloseAccounting {
         path: Option<String>,
         detail: impl Into<String>,
     ) {
+        if id != (0, 0) {
+            self.missing_parents.insert(id, None);
+        }
+        self.record_missing(id, parent_walked, path, detail);
+    }
+
+    /// [`Self::note_missing`] for the removal of `id` from directory
+    /// `parent`, whose path may not be resolvable yet (#248).
+    pub fn note_missing_in_dir(
+        &mut self,
+        id: Id,
+        parent: Id,
+        parent_walked: bool,
+        path: Option<String>,
+        detail: impl Into<String>,
+    ) {
+        if id != (0, 0) {
+            match self.missing_parents.entry(id) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(Some(BTreeSet::from([parent])));
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if let Some(set) = o.get_mut() {
+                        set.insert(parent);
+                    }
+                }
+            }
+        }
+        self.record_missing(id, parent_walked, path, detail);
+    }
+
+    /// A rename in this command moved `id`.
+    pub fn note_moved(&mut self, id: Id) {
+        self.moved.insert(id);
+    }
+
+    /// True when every recorded loss of `id` removed it from a directory
+    /// this command created, and no rename moved it (#248). Such a
+    /// directory held nothing when the command started, and the only
+    /// way a pre-existing file gets into it is a rename, so `id` was
+    /// created in the command (or is a hard link whose other names are
+    /// accounted for separately). This holds whatever order the mkdir,
+    /// create and unlink records were handled in.
+    ///
+    /// A directory this command also removed does not count: after
+    /// `rm -r old; mkdir new` the new directory can reuse the old one's
+    /// inode number, and files removed from `old` would look as if they
+    /// were removed from `new`.
+    fn removed_from_born_dir(&self, id: &Id) -> bool {
+        !self.moved.contains(id)
+            && matches!(
+                self.missing_parents.get(id),
+                Some(Some(parents)) if !parents.is_empty()
+                    && parents
+                        .iter()
+                        .all(|p| self.born.contains(p) && !self.removed_dirs.contains(p))
+            )
+    }
+
+    /// This command removed directory `id`.
+    pub fn note_dir_removed(&mut self, id: Id) {
+        self.removed_dirs.insert(id);
+    }
+
+    fn record_missing(
+        &mut self,
+        id: Id,
+        parent_walked: bool,
+        path: Option<String>,
+        detail: impl Into<String>,
+    ) {
         let order = self.next_order();
         let obs = Observation {
             path,
@@ -370,6 +449,7 @@ impl CloseAccounting {
                 Provenance::Baseline => lost.push(obs),
                 Provenance::Born | Provenance::Outside => {}
                 Provenance::Unlocated if self.born_at(obs.path.as_deref(), order) => {}
+                Provenance::Unlocated if self.removed_from_born_dir(&id) => {}
                 Provenance::Unlocated if self.outside_root(obs.path.as_deref()) => {}
                 Provenance::Unlocated => unlocated += 1,
             }
