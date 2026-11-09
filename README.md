@@ -84,14 +84,15 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `dir-rename-undo-linux`, `renameat-overwrite-undo-linux` |
 | Filesystem: content writes and editors | `dd-of-undo-linux`, `redirect-race-undo-linux`, `shell-append-undo-linux` |
 
-### FreeBSD (73 wired into CI)
+### FreeBSD (76 wired into CI)
 
-#### FreeBSD 14 VM on hosted ubuntu-24.04 (UFS and ZFS legs): 73 smokes
+#### FreeBSD 14 VM on hosted ubuntu-24.04 (UFS and ZFS legs): 76 smokes
 
 | Surface family | Smokes |
 |---|---|
 | Strict capture (opt-in loss-aware refusal) | `strict-git-lockfile-fbsd`, `strict-readiness-refuse-fbsd`, `strict-redirect-fbsd` |
 | Git operations | `git-branch-D-undo-fbsd`, `git-checkout-branch-undo-fbsd`, `git-checkout-file-undo-fbsd`, `git-clean-fd-undo-fbsd`, `git-commit-undo-fbsd`, `git-reset-hard-undo-fbsd`, `git-stash-drop-undo-fbsd` |
+| Shell state | `cd-undo-fish-fbsd`, `cd-undo-zsh-fbsd`, `set-e-undo-zsh-fbsd` |
 | Capture tier, sandbox and ZFS engine | `capsicum-default-on-fbsd`, `ln-hardlink-shim-fbsd`, `preload-shim-fbsd`, `setxattr-shim-fbsd`, `shim-default-on-fbsd`, `zfs-clone-engine-fbsd`, `zfs-clone-primitives-fbsd` |
 | Package managers | `pkg-install-undo-fbsd` |
 | Services, firewall, network and processes | `kill-proc-undo-fbsd`, `pfctl-add-undo-fbsd`, `pfctl-flush-undo-fbsd`, `service-restart-undo-fbsd` |
