@@ -148,6 +148,9 @@ struct WatchState {
     baseline_ran: bool,
     /// Capture responses that never reached the daemon.
     send_failures: u32,
+    /// Wall clock when the attach began, in ns since the epoch. An entry
+    /// whose birth time is later was created after the listing started.
+    attached_at_ns: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +177,8 @@ struct DirEntryBaseline {
     /// `Some(readlink_value)` if this entry was a symlink at scan
     /// time. `None` for regular files, dirs, FIFOs, sockets, etc.
     symlink_target: Option<String>,
+    /// The entry is a directory (not a symlink to one).
+    is_dir: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +248,7 @@ impl PumpState {
         command: CommandId,
         root_path: &Path,
     ) -> Result<(), CaptureAttachError> {
+        let attached_at_ns = now_unix_nanos();
         let subtree_result = match &self.slash_fd {
             Some(slash) => register_subtree_at(kq, slash.as_raw_fd(), root_path, DEFAULT_DEPTH),
             None => register_subtree(kq, root_path, DEFAULT_DEPTH),
@@ -275,11 +281,18 @@ impl PumpState {
         acct.note_walked();
         let mut listed_dirs: HashSet<RawFd> = HashSet::new();
         let mut dir_baselines: HashMap<RawFd, DirBaseline> = HashMap::new();
+        // Directories the walk tracks, and directories some listing
+        // holds. One listed but not tracked was skipped by
+        // `register_subtree` (past the depth limit, or its open failed),
+        // so nothing under it is in the baseline.
+        let mut tracked_ids: HashSet<(u64, u64)> = HashSet::new();
+        let mut listed_subdirs: Vec<(u64, u64)> = Vec::new();
         for raw in tracked_fds(&subtree) {
             let Some((dev, inode, ft)) = fstat_dev_inode_kind(raw) else {
                 continue;
             };
             acct.note_baseline_id((dev, inode));
+            tracked_ids.insert((dev, inode));
             if ft != FileType::Directory {
                 continue;
             }
@@ -300,6 +313,9 @@ impl PumpState {
             };
             for e in entries.values() {
                 acct.note_baseline_id((e.dev, e.inode));
+                if e.is_dir {
+                    listed_subdirs.push((e.dev, e.inode));
+                }
             }
             // W09.16.1 CI diag — dump baseline dir entries with
             // their symlink_target so we know if `config` is in
@@ -321,6 +337,11 @@ impl PumpState {
                     entries,
                 },
             );
+        }
+        for dir in listed_subdirs {
+            if !tracked_ids.contains(&dir) {
+                acct.note_unwalked_dir(dir);
+            }
         }
         // S29.3 — snapshot per-fd metadata so NOTE_ATTRIB events can
         // diff and emit MetadataChange with the original `before`
@@ -374,6 +395,7 @@ impl PumpState {
                 baselined,
                 baseline_ran,
                 send_failures: 0,
+                attached_at_ns,
             },
         );
         Ok(())
@@ -685,7 +707,7 @@ impl PumpState {
         // under dst because NOTE_WRITE never fires on dst (no watch).
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
         let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
-        let mut new_dirs_to_watch: Vec<std::path::PathBuf> = Vec::new();
+        let mut new_dirs_to_watch: Vec<(std::path::PathBuf, bool)> = Vec::new();
         // W09.16.1 CI diag — dump current entries pre-diff.
         for (name, e) in &current {
             tracing::info!(
@@ -762,8 +784,24 @@ impl PumpState {
             // through to Regular, and the dir-watching branch
             // below never fires for new dirs. W03.B.
             let kind = file_kind_at(fd, name);
-            if parent_listed {
-                ws.acct.note_born((cur_entry.dev, cur_entry.inode));
+            let id = (cur_entry.dev, cur_entry.inode);
+            // #234: an entry new to this directory was born only if its
+            // birth time says so, or, when the file system cannot say,
+            // if the directory's listing was complete (decided at
+            // close). An entry older than the attach that the walk never
+            // saw came from outside the walked tree: a rename or link
+            // the kqueue tier cannot see the source of.
+            let mut moved_in = false;
+            if !ws.acct.is_baseline(id) {
+                match birth_evidence(birth_ns_at(fd, name), ws.attached_at_ns) {
+                    Birth::After => ws.acct.note_born(id),
+                    Birth::Before if parent_listed => {
+                        moved_in = true;
+                        ws.acct.note_unresolved_rename();
+                    }
+                    Birth::Unknown if parent_listed => ws.acct.note_absent_from_listing(id),
+                    Birth::Before | Birth::Unknown => {}
+                }
             }
             events.push(shit_proto::TreeOpWire::Create {
                 dev: cur_entry.dev,
@@ -777,7 +815,10 @@ impl PumpState {
                     new_files_to_watch.push(child);
                 }
                 shit_proto::FileKindWire::Directory => {
-                    new_dirs_to_watch.push(child);
+                    // A directory moved in from outside the walk has
+                    // contents no listing saw; its empty seed baseline
+                    // is not a complete listing.
+                    new_dirs_to_watch.push((child, parent_listed && !moved_in));
                 }
                 _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
             }
@@ -869,11 +910,12 @@ impl PumpState {
         // — cp may have already populated it before our watch
         // installed). The queue iteration is what propagates the
         // walk deep into a `cp -r` tree.
-        for new_path in new_dirs_to_watch {
+        for (new_path, listed) in new_dirs_to_watch {
             if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
                 self.fd_to_command.insert(new_fd, command);
-                // Born, so its seeded empty baseline is complete.
-                if parent_listed {
+                // Created in the command, so its seeded empty baseline
+                // is complete.
+                if listed {
                     ws.listed_dirs.insert(new_fd);
                 }
                 // S29.3 — meta baseline for the dir too (chmod on a
@@ -1236,9 +1278,13 @@ fn path_to_string(p: &Path) -> String {
     String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
 }
 
-/// Test hook: make the attach-time listing of this directory fail.
 #[cfg(test)]
-static FAIL_LISTING_FOR_TEST: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// Test hook: make the attach-time listing of this directory fail.
+    /// Per thread, so tests that attach on their own thread do not race.
+    static FAIL_LISTING_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// The attach-time listing of a tracked directory.
 fn attach_listing(
@@ -1246,7 +1292,7 @@ fn attach_listing(
     #[allow(unused_variables)] dir_path: &Path,
 ) -> std::io::Result<BTreeMap<std::ffi::OsString, DirEntryBaseline>> {
     #[cfg(test)]
-    if FAIL_LISTING_FOR_TEST.lock().unwrap().as_deref() == Some(dir_path) {
+    if FAIL_LISTING_FOR_TEST.with(|f| f.borrow().as_deref() == Some(dir_path)) {
         return Err(std::io::Error::from_raw_os_error(libc::EACCES));
     }
     read_dir_entries(dir_fd)
@@ -1330,6 +1376,7 @@ fn read_dir_entries(
                 dev: st.st_dev as u64,
                 inode: st.st_ino,
                 symlink_target,
+                is_dir: (st.st_mode as libc::mode_t) & libc::S_IFMT == libc::S_IFDIR,
             },
         );
     }
@@ -1363,6 +1410,76 @@ fn readlink_at(dir_fd: RawFd, name: &std::ffi::CStr) -> Option<String> {
     }
     // readlinkat doesn't NUL-terminate; the n bytes are the target.
     Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// What an entry's birth time says about when it was created, relative
+/// to the attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Birth {
+    /// Created after the attach began: born in the command.
+    After,
+    /// Created well before the attach: pre-existing.
+    Before,
+    /// No birth time, or one too close to the attach to call. Kernel
+    /// timestamps may lag the wall clock by a tick (or a second with
+    /// `vfs.timestamp_precision=0`), so a file created just after the
+    /// attach can carry a time just before it.
+    Unknown,
+}
+
+/// Slack for [`Birth::Unknown`].
+const BIRTH_SLACK_NS: i128 = 1_000_000_000;
+
+fn birth_evidence(birth_ns: Option<i128>, attached_at_ns: i128) -> Birth {
+    match birth_ns {
+        Some(b) if b <= 0 => Birth::Unknown,
+        Some(b) if b >= attached_at_ns => Birth::After,
+        Some(b) if b < attached_at_ns - BIRTH_SLACK_NS => Birth::Before,
+        _ => Birth::Unknown,
+    }
+}
+
+/// Birth time of `name` in `dir_fd` in ns since the epoch, without
+/// following a symlink. `None` where the platform or file system has no
+/// birth time.
+fn birth_ns_at(dir_fd: RawFd, name: &std::ffi::OsStr) -> Option<i128> {
+    #[cfg(test)]
+    if BIRTH_UNKNOWN_FOR_TEST.with(|f| f.get()) {
+        return None;
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: dir_fd is alive per caller (held in TrackedSubtree);
+        // name_c is NUL-terminated; st is writable.
+        let rc =
+            unsafe { libc::fstatat(dir_fd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            return None;
+        }
+        Some((st.st_birthtime as i128) * 1_000_000_000 + st.st_birthtime_nsec as i128)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let _ = (dir_fd, name);
+        None
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: report no birth time, as a file system without one
+    /// would. The pump runs on its own thread, so tests that drive a
+    /// `PumpState` directly set this on their own thread.
+    static BIRTH_UNKNOWN_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn now_unix_nanos() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
 }
 
 /// Classify a directory child's `FileKind` for the wire via
@@ -1688,50 +1805,187 @@ fn pump(
 mod tests {
     use super::*;
 
+    /// A pump state driven by hand on the test thread, with the daemon
+    /// end of its connection.
+    fn hand_driven_state(dir: &Path) -> (PumpState, Arc<KqueueFd>, Conn) {
+        use std::os::fd::FromRawFd;
+        let (conn_a, conn_b) = crate::ipc::socketpair().expect("socketpair");
+        let kq = Arc::new(crate::kqueue::init().expect("kqueue init"));
+        let cpath = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_DIRECTORY | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(raw >= 0);
+        let staging_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let state = PumpState::new(staging_fd, Arc::new(conn_a), Arc::clone(&kq), None);
+        (state, kq, conn_b)
+    }
+
+    fn tracked_fd(state: &PumpState, cmd: CommandId, path: &Path) -> RawFd {
+        state.watches[&cmd]
+            .subtree
+            .iter_entries()
+            .find(|(_, p)| *p == path)
+            .map(|(fd, _)| fd)
+            .unwrap_or_else(|| panic!("{} is not tracked", path.display()))
+    }
+
+    /// Detach `cmd`, close the helper end, and return every
+    /// CaptureRefused detail the daemon end received.
+    fn refusals_at_detach(mut state: PumpState, cmd: CommandId, daemon: Conn) -> Vec<String> {
+        state.detach(cmd);
+        drop(state);
+        let mut details = Vec::new();
+        while let Ok((resp, _)) = daemon.recv_response_with_fd() {
+            if let HelperResponse::CaptureRefused { detail, .. } = resp {
+                details.push(detail);
+            }
+        }
+        details
+    }
+
+    fn command(n: u128) -> CommandId {
+        CommandId {
+            session: Uuid::from_u128(n),
+            seq: 1,
+        }
+    }
+
     /// R3 slice B review item 3. A directory whose attach-time listing
-    /// failed has an empty baseline, so a file found in it later cannot
-    /// be told apart from one the listing missed. Writing such a file
-    /// must leave strict mode a loss to report, not a birth.
+    /// failed has an empty baseline, so without a birth time a file
+    /// found in it later cannot be told apart from one the listing
+    /// missed. Writing such a file must leave strict mode a loss to
+    /// report, not a birth.
     #[test]
     fn file_under_a_failed_listing_is_not_born() {
+        BIRTH_UNKNOWN_FOR_TEST.with(|f| f.set(true));
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("old"), b"pre-existing").unwrap();
-        *FAIL_LISTING_FOR_TEST.lock().unwrap() = Some(sub.clone());
-        let (helper, daemon) = crate::ipc::socketpair().unwrap();
-        let (control, _pump) = spawn(Arc::new(helper), dir.path().join("staging"), None).unwrap();
-        let session = Uuid::from_u128(78);
-        control
-            .on_watch_tree(session, 1, std::process::id(), root.to_str().unwrap())
-            .unwrap();
-        loop {
-            match daemon.recv_response_with_fd().unwrap().0 {
-                HelperResponse::WatchTreeReady { .. } => break,
-                HelperResponse::WatchTreeFailed { reason, .. } => panic!("attach: {reason}"),
-                _ => {}
-            }
-        }
-        *FAIL_LISTING_FOR_TEST.lock().unwrap() = None;
-        // The dir diff adds `new` to the watch; then it is written.
+        let (mut state, kq, daemon) = hand_driven_state(dir.path());
+        let cmd = command(78);
+        FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = Some(sub.clone()));
+        state.attach(&kq, cmd, &root).unwrap();
+        FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = None);
         std::fs::write(sub.join("new"), b"").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &sub));
         std::fs::write(sub.join("new"), b"written").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        control.on_unwatch_tree(session, 1);
-        let mut details = Vec::new();
-        loop {
-            match daemon.recv_response_with_fd().unwrap().0 {
-                HelperResponse::UnwatchTreeFlushed { .. } => break,
-                HelperResponse::CaptureRefused { detail, .. } => details.push(detail),
-                _ => {}
-            }
-        }
+        let new_fd = tracked_fd(&state, cmd, &sub.join("new"));
+        state.handle_vnode(new_fd, VnodeEventKind::Write);
+        let details = refusals_at_detach(state, cmd, daemon);
+        BIRTH_UNKNOWN_FOR_TEST.with(|f| f.set(false));
         assert!(
             details.iter().any(|d| d.contains("not listed completely")),
             "a write under a failed listing was taken as a birth: {details:?}"
         );
+    }
+
+    /// With a birth time, a file created after the attach is born even
+    /// in a directory whose listing failed.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn file_born_after_the_attach_is_born_under_a_failed_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (mut state, kq, daemon) = hand_driven_state(dir.path());
+        let cmd = command(80);
+        FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = Some(sub.clone()));
+        state.attach(&kq, cmd, &root).unwrap();
+        FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = None);
+        std::fs::write(sub.join("new"), b"").unwrap();
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &sub));
+        std::fs::write(sub.join("new"), b"written").unwrap();
+        let new_fd = tracked_fd(&state, cmd, &sub.join("new"));
+        state.handle_vnode(new_fd, VnodeEventKind::Write);
+        let details = refusals_at_detach(state, cmd, daemon);
+        assert!(details.is_empty(), "{details:?}");
+    }
+
+    /// #234 item 2. A pre-existing file renamed in from outside the
+    /// watched tree shows up in a listed directory's diff. It was not
+    /// born, and writing it loses its old content.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn file_moved_in_from_outside_the_tree_is_not_born() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f"), b"old content").unwrap();
+        let (mut state, kq, daemon) = hand_driven_state(dir.path());
+        let cmd = command(81);
+        state.attach(&kq, cmd, &root).unwrap();
+        // The file predates the attach by more than the slack.
+        state.watches.get_mut(&cmd).unwrap().attached_at_ns += 2 * BIRTH_SLACK_NS;
+        std::fs::rename(outside.join("f"), root.join("f")).unwrap();
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
+        std::fs::write(root.join("f"), b"new content").unwrap();
+        let f_fd = tracked_fd(&state, cmd, &root.join("f"));
+        state.handle_vnode(f_fd, VnodeEventKind::Write);
+        let details = refusals_at_detach(state, cmd, daemon);
+        assert!(
+            details.iter().any(|d| d.contains("rename")),
+            "a file moved in from outside was taken as a birth: {details:?}"
+        );
+    }
+
+    /// #234 item 1. `register_subtree` stops at the depth limit, so a
+    /// directory below it is listed by its parent but never walked.
+    /// Absence from a listing then proves nothing: a file moved up from
+    /// below the limit into a listed directory was not born.
+    #[test]
+    fn directory_past_the_depth_limit_is_unwalked() {
+        BIRTH_UNKNOWN_FOR_TEST.with(|f| f.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let mut deep = root.clone();
+        for i in 1..=DEFAULT_DEPTH + 1 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f"), b"old content").unwrap();
+        let (mut state, kq, daemon) = hand_driven_state(dir.path());
+        let cmd = command(82);
+        state.attach(&kq, cmd, &root).unwrap();
+        assert!(!state.watches[&cmd].acct.listing_complete());
+        std::fs::rename(deep.join("f"), root.join("f")).unwrap();
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
+        std::fs::write(root.join("f"), b"new content").unwrap();
+        let f_fd = tracked_fd(&state, cmd, &root.join("f"));
+        state.handle_vnode(f_fd, VnodeEventKind::Write);
+        let details = refusals_at_detach(state, cmd, daemon);
+        BIRTH_UNKNOWN_FOR_TEST.with(|f| f.set(false));
+        assert!(
+            details.iter().any(|d| d.contains("not listed completely")),
+            "a file from below the depth limit was taken as a birth: {details:?}"
+        );
+    }
+
+    #[test]
+    fn birth_time_is_judged_against_the_attach_with_slack() {
+        let at = 100 * BIRTH_SLACK_NS;
+        assert_eq!(birth_evidence(Some(at), at), Birth::After);
+        assert_eq!(birth_evidence(Some(at + 1), at), Birth::After);
+        assert_eq!(birth_evidence(Some(at - 1), at), Birth::Unknown);
+        assert_eq!(
+            birth_evidence(Some(at - BIRTH_SLACK_NS), at),
+            Birth::Unknown
+        );
+        assert_eq!(
+            birth_evidence(Some(at - BIRTH_SLACK_NS - 1), at),
+            Birth::Before
+        );
+        assert_eq!(birth_evidence(None, at), Birth::Unknown);
+        assert_eq!(birth_evidence(Some(0), at), Birth::Unknown);
+        assert_eq!(birth_evidence(Some(-1), at), Birth::Unknown);
     }
 
     #[test]
