@@ -200,9 +200,37 @@ pub struct SetattrEvent {
     pub _pad3: u32,
     pub old_size: u64,
     pub new_size: u64,
+    pub chain: DentryChain,
 }
 
-const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 136);
+const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 272);
+
+/// Directories above an event's dentry, mirroring `struct
+/// shit_dentry_chain` in common.h (#233).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DentryChain {
+    /// The inode's link count at hook time.
+    pub nlink: u32,
+    /// Slots of `anc` filled, nearest ancestor first.
+    pub depth: u16,
+    /// 1 when the walk reached the superblock root: the last filled
+    /// slot (or the file itself, at depth 0) is that root.
+    pub top: u16,
+    pub anc: [u64; DENTRY_DEPTH],
+}
+
+/// Mirrors `SHIT_DENTRY_DEPTH` in common.h.
+pub const DENTRY_DEPTH: usize = 16;
+
+const _: () = assert!(std::mem::size_of::<DentryChain>() == 136);
+
+impl DentryChain {
+    /// The recorded ancestors, nearest first.
+    pub fn ancestors(&self) -> &[u64] {
+        &self.anc[..(self.depth as usize).min(DENTRY_DEPTH)]
+    }
+}
 
 /// `lsm/inode_mkdir` event — mirrors `struct shit_mkdir_event`.
 /// Captures the parent directory's (dev, inode), the basename of
@@ -313,9 +341,10 @@ pub struct OpenEvent {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    pub chain: DentryChain,
 }
 
-const _: () = assert!(std::mem::size_of::<OpenEvent>() == 96);
+const _: () = assert!(std::mem::size_of::<OpenEvent>() == 232);
 
 /// `lsm/file_release` event — same C-struct shape as
 /// [`OpenEvent`], discriminated by `kind::RELEASE`. Fires when the
@@ -332,9 +361,10 @@ pub struct ReleaseEvent {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    pub chain: DentryChain,
 }
 
-const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 96);
+const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 232);
 
 /// `lsm/inode_rename` event — mirrors `struct shit_rename_event`.
 /// Carries both ends of the rename. `dev`/`inode` are the target's
@@ -593,6 +623,7 @@ impl LsmEventSink for LinuxCaptureSink {
             inode: ev.inode,
             f_mode: ev.f_mode,
             f_flags: ev.f_flags,
+            chain: ev.chain,
         };
         self.runtime.lock().unwrap().handle_lsm_release(&view);
     }
@@ -625,6 +656,7 @@ impl LsmEventSink for LinuxCaptureSink {
             new_uid: ev.new_uid,
             new_gid: ev.new_gid,
             new_size: ev.new_size,
+            chain: ev.chain,
         };
         self.runtime.lock().unwrap().handle_lsm_setattr(&view);
     }
@@ -703,6 +735,7 @@ impl LsmEventSink for LinuxCaptureSink {
             inode: ev.inode,
             f_mode: ev.f_mode,
             f_flags: ev.f_flags,
+            chain: ev.chain,
         };
         self.runtime.lock().unwrap().handle_lsm_open(&view);
     }
@@ -1770,8 +1803,8 @@ mod tests {
     }
 
     #[test]
-    fn setattr_event_layout_is_136_bytes() {
-        assert_eq!(std::mem::size_of::<SetattrEvent>(), 136);
+    fn setattr_event_layout_is_272_bytes() {
+        assert_eq!(std::mem::size_of::<SetattrEvent>(), 272);
         assert_eq!(std::mem::align_of::<SetattrEvent>(), 8);
     }
 
@@ -1800,8 +1833,14 @@ mod tests {
             _pad3: 0,
             old_size: 1024,
             new_size: 0,
+            chain: DentryChain {
+                nlink: 1,
+                depth: 2,
+                top: 1,
+                anc: [9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
         };
-        let bytes: [u8; 136] = unsafe { std::mem::transmute(original) };
+        let bytes: [u8; 272] = unsafe { std::mem::transmute(original) };
         let decoded = decode_setattr(&bytes).expect("decode");
         assert_eq!(decoded.hdr.kind, kind::SETATTR);
         assert_eq!(decoded.attr_valid, attr::MODE);
@@ -1809,12 +1848,33 @@ mod tests {
         assert_eq!(decoded.new_mode, 0o100755);
         assert_eq!(decoded.dev, 0x802);
         assert_eq!(decoded.inode, 12345);
+        assert_eq!(decoded.chain.ancestors(), &[9, 2]);
+        assert_eq!(decoded.chain.top, 1);
+    }
+
+    #[test]
+    fn dentry_chain_decodes_from_the_wire_offsets() {
+        // common.h: open event header 72, dev 72, inode 80, f_mode 88,
+        // f_flags 92, then the chain: nlink 96, depth 100, top 102,
+        // anc[16] at 104.
+        let mut bytes = [0u8; 232];
+        bytes[0] = kind::OPEN;
+        bytes[96..100].copy_from_slice(&2u32.to_ne_bytes());
+        bytes[100..102].copy_from_slice(&3u16.to_ne_bytes());
+        bytes[102..104].copy_from_slice(&0u16.to_ne_bytes());
+        for (i, ino) in [40u64, 30, 20].iter().enumerate() {
+            bytes[104 + 8 * i..112 + 8 * i].copy_from_slice(&ino.to_ne_bytes());
+        }
+        let ev = decode_open(&bytes).expect("decode");
+        assert_eq!(ev.chain.nlink, 2);
+        assert_eq!(ev.chain.ancestors(), &[40, 30, 20]);
+        assert_eq!(ev.chain.top, 0);
     }
 
     #[test]
     fn ancestry_decodes_from_the_wire_offsets() {
         // common.h: parent_pid at 12, ancestors[8] at 40, header 72.
-        let mut bytes = [0u8; 136];
+        let mut bytes = [0u8; 272];
         bytes[0] = kind::SETATTR;
         bytes[4..8].copy_from_slice(&300u32.to_ne_bytes());
         bytes[8..12].copy_from_slice(&300u32.to_ne_bytes());

@@ -97,6 +97,7 @@ int BPF_PROG(shit_file_release, struct file *file)
 
     e->f_mode = (__u32)f_mode;
     e->f_flags = BPF_CORE_READ(file, f_flags);
+    shit_fill_dentry_chain(&e->chain, BPF_CORE_READ(file, f_path.dentry));
 
     bpf_ringbuf_submit(e, 0);
     return 0;

@@ -53,6 +53,7 @@ use shit_proto::HelperResponse;
 
 use crate::capture::accounting::{CloseAccounting, Id, send_observations};
 use crate::capture::streaming::{STREAM_COPY_CAP, StreamError, stream_copy_to_staging_path};
+use crate::ebpf::DentryChain;
 use crate::ipc::Conn;
 
 /// `FMODE_CREATED` from `include/linux/fs.h` (`1 << 20` since 4.19). A
@@ -503,6 +504,17 @@ impl LinuxCaptureRuntime {
         ws.acct.note_root(cwd);
         ws.acct.note_tree_dev(root_dev_inode.0);
         ws.acct.note_walked();
+        // #233: path-less events are placed by their dentry ancestry.
+        // A mount under the root breaks the dentry/path correspondence,
+        // so the rule stays off then (and when mountinfo is unreadable).
+        match std::fs::read_to_string("/proc/self/mountinfo") {
+            Ok(info) if !mount_under(cwd, &info) => {
+                let above = ancestors_on_dev(cwd, root_dev_inode.0);
+                ws.acct
+                    .note_root_ancestry(root_dev_inode.0, root_dev_inode.1, above);
+            }
+            _ => {}
+        }
 
         let mut opened = 0usize;
         let mut hit_cap = false;
@@ -1118,11 +1130,10 @@ impl LinuxCaptureRuntime {
                 (ev_dev_userspace, ev.inode),
                 DedupeEntry { invalidated: false },
             );
-            let path = resolve_inode_to_path(ws, ev_dev_userspace, ev.inode);
-            ws.acct.note_missing(
+            note_missing_without_snapshot(
+                ws,
                 (ev_dev_userspace, ev.inode),
-                false,
-                path.as_deref().map(path_to_string),
+                &ev.chain,
                 "attribute change had no pre-change snapshot",
             );
             return;
@@ -1688,11 +1699,10 @@ impl LinuxCaptureRuntime {
                 "lsm open: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
             );
             if !created_now {
-                let path = resolve_inode_to_path(ws, ev_dev, ev.inode);
-                ws.acct.note_missing(
+                note_missing_without_snapshot(
+                    ws,
                     (ev_dev, ev.inode),
-                    false,
-                    path.as_deref().map(path_to_string),
+                    &ev.chain,
                     "write-open had no pre-mutation snapshot",
                 );
             }
@@ -1841,11 +1851,10 @@ impl LinuxCaptureRuntime {
                 inode = ev.inode,
                 "lsm release: no pre-snapshot; dropping"
             );
-            let path = resolve_inode_to_path(ws, ev_dev, ev.inode);
-            ws.acct.note_missing(
+            note_missing_without_snapshot(
+                ws,
                 (ev_dev, ev.inode),
-                false,
-                path.as_deref().map(path_to_string),
+                &ev.chain,
                 "written file had no pre-mutation snapshot",
             );
             return;
@@ -2182,6 +2191,70 @@ impl LinuxCaptureRuntime {
 
 /// R3 slice B — a rename onto `to` replaced whatever was there, and no
 /// snapshot of it was sent. Loss if that was a pre-existing entry.
+/// True when `mountinfo` (the text of `/proc/self/mountinfo`) lists a
+/// mount point strictly below `root`.
+fn mount_under(root: &Path, mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        line.split(' ')
+            .nth(4)
+            .map(unescape_mountinfo)
+            .is_some_and(|mp| {
+                let mp = Path::new(&mp);
+                mp != root && mp.starts_with(root)
+            })
+    })
+}
+
+/// Undo mountinfo's octal escapes (`\040` for a space, and so on).
+fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
+/// Inode numbers of the directories above `root` that are on `dev`.
+fn ancestors_on_dev(root: &Path, dev: u64) -> std::collections::BTreeSet<u64> {
+    root.ancestors()
+        .skip(1)
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter(|m| m.dev() == dev)
+        .map(|m| m.ino())
+        .collect()
+}
+
+/// Record a change to `id`, which has no pre-command snapshot, as
+/// possibly lost. Path-less events (open, release, setattr) carry the
+/// dentry's ancestor chain, which can place the file outside the watch
+/// root when no path is known (#233).
+fn note_missing_without_snapshot(ws: &mut WatchState, id: Id, chain: &DentryChain, detail: &str) {
+    match resolve_inode_to_path(ws, id.0, id.1) {
+        Some(p) => ws
+            .acct
+            .note_missing(id, false, Some(path_to_string(&p)), detail),
+        None => {
+            let outside = ws
+                .acct
+                .dentry_outside_root(id, chain.nlink, chain.ancestors());
+            ws.acct.note_missing_by_dentry(id, outside, detail);
+        }
+    }
+}
+
 fn note_replaced_without_capture(ws: &mut WatchState, to: &Path, moved: Id) {
     let old = ws
         .path_to_inode
@@ -2485,6 +2558,8 @@ pub struct LsmSetattrView {
     pub new_uid: u32,
     pub new_gid: u32,
     pub new_size: u64,
+    /// Directories above the changed dentry (#233).
+    pub chain: DentryChain,
 }
 
 /// View into an `lsm/inode_mkdir` event. The new directory's own
@@ -2527,6 +2602,8 @@ pub struct LsmOpenView {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    /// Directories above the opened dentry (#233).
+    pub chain: DentryChain,
 }
 
 /// L04.2 — View into an `lsm/file_release` event. Fires at
@@ -2541,6 +2618,8 @@ pub struct LsmReleaseView {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    /// Directories above the released dentry (#233).
+    pub chain: DentryChain,
 }
 
 /// L04.1 — View into an `lsm/inode_rename` event. Carries both
@@ -3456,6 +3535,7 @@ mod tests {
             inode,
             f_mode: 0x2,    // FMODE_WRITE
             f_flags: 0o002, // O_RDWR
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3489,6 +3569,7 @@ mod tests {
             inode,
             f_mode: 0x2,
             f_flags: 0o002,
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3525,6 +3606,7 @@ mod tests {
             inode,
             f_mode: 0x2,
             f_flags: 0o002,
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3548,6 +3630,7 @@ mod tests {
             inode: 0xcafe_babe,
             f_mode: 0x2,
             f_flags: 0o002,
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3573,6 +3656,29 @@ mod born_set_tests {
         dir: tempfile::TempDir,
         _staging: tempfile::TempDir,
         cmd: CommandId,
+        /// Dentry chain the open, setattr and release helpers send.
+        chain: DentryChain,
+    }
+
+    /// The dentry chain BPF would record for `path`: the directories
+    /// above it on its filesystem, nearest first.
+    fn chain_of(path: &Path) -> DentryChain {
+        let dev = std::fs::symlink_metadata(path).unwrap().dev();
+        let nlink = std::fs::symlink_metadata(path).unwrap().nlink() as u32;
+        let mut c = DentryChain {
+            nlink,
+            ..Default::default()
+        };
+        for p in path.ancestors().skip(1) {
+            let m = std::fs::metadata(p).unwrap();
+            if m.dev() != dev || c.depth as usize == crate::ebpf::ringbuf_reader::DENTRY_DEPTH {
+                break;
+            }
+            c.anc[c.depth as usize] = m.ino();
+            c.depth += 1;
+        }
+        c.top = 1;
+        c
     }
 
     impl Rig {
@@ -3596,6 +3702,7 @@ mod born_set_tests {
                 dir,
                 _staging: staging,
                 cmd,
+                chain: DentryChain::default(),
             }
         }
 
@@ -3636,6 +3743,7 @@ mod born_set_tests {
                 inode: id.1,
                 f_mode: 0x2 | if created { FMODE_CREATED } else { 0 },
                 f_flags: 0o1,
+                chain: self.chain,
             };
             self.rt().handle_lsm_open(&view);
         }
@@ -3705,6 +3813,7 @@ mod born_set_tests {
                 new_uid: 0,
                 new_gid: 0,
                 new_size: 0,
+                chain: self.chain,
             };
             self.rt().handle_lsm_setattr(&view);
         }
@@ -3717,6 +3826,7 @@ mod born_set_tests {
                 inode: id.1,
                 f_mode: 0x2,
                 f_flags: 0o1,
+                chain: self.chain,
             };
             self.rt().handle_lsm_release(&view);
         }
@@ -4314,6 +4424,86 @@ mod born_set_tests {
         rig.mkdir(root, "d");
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
+    }
+
+    /// A file on the tree's filesystem but outside the root, like
+    /// `~/.bash_history` for a command run in `~/proj`.
+    fn sibling_file(rig: &Rig, body: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let outside = tempfile::tempdir_in(rig.dir.path().parent().unwrap()).unwrap();
+        let f = outside.path().join("history");
+        std::fs::write(&f, body).unwrap();
+        (outside, f)
+    }
+
+    #[test]
+    fn capped_walk_does_not_refuse_writes_outside_the_root() {
+        // #233: open, setattr and release carry no path. The dentry
+        // chain places the file outside the root.
+        let mut rig = capped_rig_without_probe();
+        let (_outside, f) = sibling_file(&rig, b"ls\n");
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        rig.open(id, false);
+        rig.setattr(id);
+        rig.release(id);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn capped_walk_still_refuses_an_unwalked_file_inside_the_root() {
+        let mut rig = capped_rig_without_probe();
+        let late = rig.dir.path().join("late");
+        std::fs::write(&late, b"not in the walk").unwrap();
+        let id = Rig::id(&late);
+        rig.chain = chain_of(&late);
+        rig.open(id, false);
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("could not be placed"), "{obs:?}");
+    }
+
+    #[test]
+    fn outside_name_of_a_hard_linked_file_proves_nothing() {
+        // The same inode may have a name inside the tree.
+        let mut rig = capped_rig_without_probe();
+        let (_outside, f) = sibling_file(&rig, b"x");
+        std::fs::hard_link(&f, rig.dir.path().join("inside")).unwrap();
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        assert_eq!(rig.chain.nlink, 2);
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn a_chain_that_never_meets_the_roots_line_proves_nothing() {
+        let mut rig = capped_rig_without_probe();
+        let (_outside, f) = sibling_file(&rig, b"x");
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        // Truncate to the file's own directory, which is neither the
+        // root nor above it.
+        rig.chain.depth = 1;
+        rig.chain.top = 0;
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn mount_under_the_root_is_detected() {
+        let info = "22 1 0:21 / /home/u rw - ext4 /dev/sda rw\n\
+                    40 22 0:40 / /home/u/proj/my\\040mnt rw - tmpfs tmpfs rw\n";
+        assert!(mount_under(Path::new("/home/u/proj"), info));
+        assert!(!mount_under(Path::new("/home/u/other"), info));
+        // The root itself being a mount point is fine.
+        assert!(!mount_under(
+            Path::new("/home/u"),
+            "22 1 0:21 / /home/u rw - ext4 x rw\n"
+        ));
+        assert_eq!(
+            unescape_mountinfo("/a\\040b"),
+            std::ffi::OsString::from("/a b")
+        );
     }
 
     #[test]

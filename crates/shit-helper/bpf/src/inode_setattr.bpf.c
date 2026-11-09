@@ -136,6 +136,7 @@ static __always_inline void __do_setattr(struct dentry *dentry, struct iattr *at
     e->new_gid = BPF_CORE_READ(attr, ia_gid.val);
     e->new_size = BPF_CORE_READ(attr, ia_size);
     e->_pad3 = 0;
+    shit_fill_dentry_chain(&e->chain, dentry);
 
     bpf_ringbuf_submit(e, 0);
 }
