@@ -82,18 +82,13 @@ pub struct MarkedDir {
 impl MarkedDir {
     /// Record `fd` (an open directory) as marked for a command.
     pub fn new(path: PathBuf, fd: std::os::fd::OwnedFd) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        // SAFETY: `fd` is a live descriptor we own; fstat writes `st`.
-        if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: fstat returned 0, so `st` is initialized.
-        let st = unsafe { st.assume_init() };
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::fs::File::from(fd);
+        let meta = dir.metadata()?;
         Ok(Self {
             path,
-            fd,
-            key: (st.st_dev, st.st_ino),
+            fd: dir.into(),
+            key: (meta.dev(), meta.ino()),
         })
     }
 }
