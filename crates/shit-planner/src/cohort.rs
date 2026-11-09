@@ -55,6 +55,52 @@ use crate::inverse::{InverseOp, PlanNode};
 enum TouchKey {
     Path(PathBuf),
     Inode(InodeRef),
+    /// The path and everything below it.
+    Subtree(PathBuf),
+}
+
+/// Touch keys already placed in one cohort.
+#[derive(Default)]
+struct CohortKeys {
+    keys: BTreeSet<TouchKey>,
+    /// Every `Path` and `Subtree` key's path, for prefix lookups.
+    paths: BTreeSet<PathBuf>,
+    subtrees: BTreeSet<PathBuf>,
+}
+
+impl CohortKeys {
+    fn insert(&mut self, k: TouchKey) {
+        match &k {
+            TouchKey::Path(p) => {
+                self.paths.insert(p.clone());
+            }
+            TouchKey::Subtree(p) => {
+                self.paths.insert(p.clone());
+                self.subtrees.insert(p.clone());
+            }
+            TouchKey::Inode(_) => {}
+        }
+        self.keys.insert(k);
+    }
+
+    fn conflicts(&self, k: &TouchKey) -> bool {
+        match k {
+            TouchKey::Inode(_) => self.keys.contains(k),
+            // A path conflicts with itself and with any subtree above it.
+            TouchKey::Path(p) => {
+                self.paths.contains(p) || p.ancestors().any(|a| self.subtrees.contains(a))
+            }
+            // A subtree conflicts with any path at or below it, and with
+            // any subtree above it. Paths below `p` sort right after it.
+            TouchKey::Subtree(p) => {
+                self.paths
+                    .range(p.clone()..)
+                    .next()
+                    .is_some_and(|q| q.starts_with(p))
+                    || p.ancestors().any(|a| self.subtrees.contains(a))
+            }
+        }
+    }
 }
 
 /// Collect every path/inode this op touches. For most ops this is
@@ -72,6 +118,18 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
         | InverseOp::RestoreFlags { path, inode, .. } => {
             out.push(TouchKey::Path(path.clone()));
             out.push(TouchKey::Inode(*inode));
+        }
+        // A directory op orders against everything under the
+        // directory: it must exist before a child is restored into it
+        // (#214) and may only go once the children are back out (#215).
+        InverseOp::RecreatePath {
+            path,
+            kind: crate::metadata::FileKind::Directory,
+            ..
+        }
+        | InverseOp::EnsureDir { path, .. }
+        | InverseOp::RemoveBornDir { path } => {
+            out.push(TouchKey::Subtree(path.clone()));
         }
         InverseOp::Unlink { path }
         | InverseOp::RecreatePath { path, .. }
@@ -119,9 +177,7 @@ fn touches(op: &InverseOp) -> Vec<TouchKey> {
 /// `nodes`' order. Callers that want to fold this into the existing
 /// `plan()` pipeline just append it after the per-event emission.
 pub fn assign_cohorts(nodes: &mut [PlanNode]) -> u32 {
-    // Per-cohort set of touch keys held by ops already assigned to
-    // it. Stored as a Vec<BTreeSet<TouchKey>>; index = cohort id.
-    let mut cohort_touches: Vec<BTreeSet<TouchKey>> = Vec::new();
+    let mut cohort_touches: Vec<CohortKeys> = Vec::new();
 
     for node in nodes.iter_mut() {
         let keys = touches(&node.op);
@@ -129,25 +185,21 @@ pub fn assign_cohorts(nodes: &mut [PlanNode]) -> u32 {
             // Informational op — always cohort 0.
             node.cohort = 0;
             if cohort_touches.is_empty() {
-                cohort_touches.push(BTreeSet::new());
+                cohort_touches.push(CohortKeys::default());
             }
             continue;
         }
-        // Find the lowest cohort with no key overlap.
-        let mut chosen: Option<usize> = None;
-        for (i, existing) in cohort_touches.iter().enumerate() {
-            if keys.iter().all(|k| !existing.contains(k)) {
-                chosen = Some(i);
-                break;
-            }
+        // The cohort after the last one holding a conflicting op, so a
+        // node never runs before an op emitted ahead of it that it
+        // conflicts with. The lowest free cohort could sit below that
+        // op's cohort.
+        let cohort_idx = cohort_touches
+            .iter()
+            .rposition(|existing| keys.iter().any(|k| existing.conflicts(k)))
+            .map_or(0, |i| i + 1);
+        if cohort_idx == cohort_touches.len() {
+            cohort_touches.push(CohortKeys::default());
         }
-        let cohort_idx = match chosen {
-            Some(i) => i,
-            None => {
-                cohort_touches.push(BTreeSet::new());
-                cohort_touches.len() - 1
-            }
-        };
         for k in keys {
             cohort_touches[cohort_idx].insert(k);
         }
@@ -331,5 +383,54 @@ mod tests {
         let count = assign_cohorts(&mut nodes);
         assert_eq!(count, 2);
         assert!(nodes[0].cohort < nodes[2].cohort);
+    }
+
+    fn dir_op(op: InverseOp) -> PlanNode {
+        PlanNode {
+            op,
+            cohort: 0,
+            conflict: None,
+        }
+    }
+
+    #[test]
+    fn directory_ops_order_against_everything_below_them() {
+        // #214/#215: a recreated directory runs before a child restore,
+        // and a born directory's removal after every op under it.
+        let mut nodes = vec![
+            dir_op(InverseOp::RecreatePath {
+                path: PathBuf::from("/w/d"),
+                kind: crate::metadata::FileKind::Directory,
+                mode: 0o040700,
+                device: None,
+            }),
+            restore_content("/w/d/f", 1, 10),
+            restore_content("/w/other", 1, 11),
+            dir_op(InverseOp::RemoveBornDir {
+                path: PathBuf::from("/w/d"),
+            }),
+        ];
+        assign_cohorts(&mut nodes);
+        let c: Vec<u32> = nodes.iter().map(|n| n.cohort).collect();
+        assert!(c[1] > c[0], "{c:?}");
+        assert_eq!(c[2], 0, "unrelated path stays in the first cohort");
+        assert!(c[3] > c[1], "{c:?}");
+    }
+
+    #[test]
+    fn a_node_never_lands_before_an_earlier_conflicting_node() {
+        // b touches x and y and comes before c, which touches y. The
+        // lowest cohort free of c's keys is 0, below b's.
+        let mut nodes = vec![
+            restore_content("/x", 1, 1),
+            dir_op(InverseOp::Rename {
+                from: PathBuf::from("/x"),
+                to: PathBuf::from("/y"),
+            }),
+            restore_content("/y", 1, 2),
+        ];
+        assign_cohorts(&mut nodes);
+        let c: Vec<u32> = nodes.iter().map(|n| n.cohort).collect();
+        assert_eq!(c, vec![0, 1, 2]);
     }
 }
