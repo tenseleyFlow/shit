@@ -208,7 +208,9 @@ async fn handle_one(
                 let _ = stream.write_all(&frame).await;
             }
             if let Some(command) = command {
-                journal_version_gap(&index, command, got);
+                journal_gap_once(&index, command, GapCause::OtherShimWire, || {
+                    other_wire_gap_detail(got)
+                });
             }
             return Ok(());
         }
@@ -249,14 +251,18 @@ async fn handle_one(
     // compares it with the command's PostExec: a note stamped earlier was
     // sent while the kernel tier watched, however late it is ingested.
     let ingest_ts = crate::server::next_ts();
-    let key_trusted = peer_is_daemon_user(&stream);
-    if note.command_key.is_some() && !key_trusted {
-        warn!(
-            pid = note.pid,
-            "shim note carries a command key from a peer of another uid; ignoring the key"
-        );
-    }
-    let resolution = resolve_command(&note, key_trusted, &active, &index);
+    let key = trusted_key(&note, &stream);
+    // R8 review, item 6: the key check reads SQLite and the pid walk
+    // reads /proc or libproc. Neither runs on a runtime worker.
+    let resolution = {
+        let (active, index, pid) = (Arc::clone(&active), Arc::clone(&index), note.pid);
+        tokio::task::spawn_blocking(move || resolve_command(pid, key, &active, &index))
+            .await
+            .unwrap_or_else(|e| {
+                warn!(err = %e, pid = note.pid, "shim note resolution task failed");
+                Resolution::Unattributed
+            })
+    };
 
     // Ack — never block the user's command on journaling. We're
     // fail-open by design: even if the journal write below errors,
@@ -272,23 +278,29 @@ async fn handle_one(
         debug!(err = %e, pid = note.pid, "shim ack write failed; ingesting anyway");
     }
 
-    let resolved = match resolution {
-        Resolution::Command(command) => Some(command),
+    match resolution {
         Resolution::Closed(command) => {
-            journal_late_note_gap(&index, command, &note);
-            return Ok(());
+            ingest_late_note(&note, command, ingest_ts, &index, &live_baseline);
         }
-        Resolution::Unattributed => None,
-    };
-    ingest_notification(
-        &note,
-        resolved,
-        ingest_ts,
-        unlink_stat,
-        &index,
-        &blob_store,
-        &live_baseline,
-    );
+        Resolution::Command(command) => ingest_notification(
+            &note,
+            Some(command),
+            ingest_ts,
+            unlink_stat,
+            &index,
+            &blob_store,
+            &live_baseline,
+        ),
+        Resolution::Unattributed => ingest_notification(
+            &note,
+            None,
+            ingest_ts,
+            unlink_stat,
+            &index,
+            &blob_store,
+            &live_baseline,
+        ),
+    }
     Ok(())
 }
 
@@ -297,54 +309,161 @@ async fn handle_one(
 pub(crate) enum Resolution {
     /// Journal the note under this command.
     Command(shit_planner::events::CommandId),
-    /// The note's key names this command, which had already closed when
-    /// the note arrived: its change cannot join the command's journal.
+    /// The note's key names this command, which had closed, or been
+    /// superseded by a newer command of its session, when the note
+    /// arrived. See [`ingest_late_note`].
     Closed(shit_planner::events::CommandId),
     /// Neither the key nor the pid ancestry names a command.
     Unattributed,
 }
 
-/// R8 (#210, #251): the command a shim note belongs to.
-///
-/// A note carrying a [`shit_proto::ShimCommandKey`] from a peer with
-/// the daemon's own uid (`key_trusted`) is attributed by that key and
-/// needs no live pid walk, so a sender that exits before the daemon
-/// reads its note is still attributed. The key counts only for a
-/// command the daemon knows: one in the active map, or one whose row
-/// exists and has not been finalized (its PostExec close barrier is
-/// still pending). A key for a finalized command is [`Resolution::Closed`].
-/// A key the daemon does not know (another daemon's session, a daemon
-/// restart) is treated as missing, and so is a key from a peer of
-/// another uid: those notes fall back to walking the sender's pid
-/// ancestry, which must still be alive.
-pub(crate) fn resolve_command(
+/// R8 review, item 4: how long after its command closed a keyed note
+/// may still name it. Past this the key is ignored and the note falls
+/// back to the pid walk. It is the kernel tier's closed-watch grace.
+const LATE_KEY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The note's command key, when the peer runs as the daemon's user.
+fn trusted_key(
     note: &ShimNotification,
-    key_trusted: bool,
+    stream: &UnixStream,
+) -> Option<shit_planner::events::CommandId> {
+    let key = note.command_key?;
+    if !peer_is_daemon_user(stream) {
+        warn!(
+            pid = note.pid,
+            "shim note carries a command key from a peer of another uid; ignoring the key"
+        );
+        return None;
+    }
+    Some(shit_planner::events::CommandId {
+        session: key.session,
+        seq: key.seq,
+    })
+}
+
+/// R8 (#210, #251): the command a shim note from `pid` belongs to.
+///
+/// `key` is the note's [`shit_proto::ShimCommandKey`], already dropped
+/// when the peer is not the daemon's user. A key needs no live sender,
+/// so a sender that exits before the daemon reads its note is still
+/// attributed. It is bounded (review item 4):
+///
+/// - It counts only for the most recent command of its session, while
+///   that command is open and its shell is alive (see [`judge_key`]).
+/// - A key for a command that closed, or that a newer command of its
+///   session superseded, less than [`LATE_KEY_WINDOW`] ago is
+///   [`Resolution::Closed`].
+/// - Any other key (unknown, too old, a dead shell's open command) is
+///   ignored and the note falls back to the pid walk.
+/// - A live sender whose ancestry reaches another session's shell
+///   (tmux started from a hooked shell, then used from another) goes to
+///   that shell's command: the walk wins over the key.
+pub(crate) fn resolve_command(
+    pid: u32,
+    key: Option<shit_planner::events::CommandId>,
     active: &ActiveCommands,
     index: &Index,
 ) -> Resolution {
-    if let Some(key) = note.command_key.filter(|_| key_trusted) {
-        let command = shit_planner::events::CommandId {
-            session: key.session,
-            seq: key.seq,
-        };
-        if active.contains(command) {
-            return Resolution::Command(command);
-        }
-        match <Index as shit_planner::PlannerStore>::command_by_id(index, command) {
-            Some(record) if record.ended_at.is_none() => return Resolution::Command(command),
-            Some(_) => return Resolution::Closed(command),
-            None => debug!(
-                pid = note.pid,
-                %command,
-                "shim note's command key is not a known command; walking pid ancestry"
-            ),
+    let walked = active.resolve_by_descendant(pid);
+    let by_walk = || walked.map_or(Resolution::Unattributed, Resolution::Command);
+    let Some(command) = key else {
+        return by_walk();
+    };
+    if let Some(w) = walked
+        && w.session != command.session
+    {
+        debug!(pid, %command, walked = %w, "shim note's sender runs under another session's shell");
+        return Resolution::Command(w);
+    }
+    // Review item 6: a command already given its late-note gap needs no
+    // lookup.
+    if gap_journaled(command, GapCause::LateNote) {
+        return Resolution::Closed(command);
+    }
+    match judge_key(command, active, index, std::time::SystemTime::now()) {
+        KeyState::Open => Resolution::Command(command),
+        KeyState::RecentlyClosed => Resolution::Closed(command),
+        KeyState::Unusable => {
+            debug!(pid, %command, "shim note's command key is not usable; walking pid ancestry");
+            by_walk()
         }
     }
-    match active.resolve_by_descendant(note.pid) {
-        Some(command) => Resolution::Command(command),
-        None => Resolution::Unattributed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyState {
+    /// The key's command is open: journal under it.
+    Open,
+    /// It closed, or was superseded, within [`LATE_KEY_WINDOW`].
+    RecentlyClosed,
+    /// Unknown, closed too long ago, or open on a shell that is gone.
+    Unusable,
+}
+
+/// What a trusted key for `command` is worth at `now`.
+fn judge_key(
+    command: shit_planner::events::CommandId,
+    active: &ActiveCommands,
+    index: &Index,
+    now: std::time::SystemTime,
+) -> KeyState {
+    use shit_planner::PlannerStore;
+    let Some(record) = index.command_by_id(command) else {
+        return KeyState::Unusable;
+    };
+    let closed_recently = |closed_unix_nanos: u64| {
+        let closed = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(closed_unix_nanos);
+        if now
+            .duration_since(closed)
+            .is_ok_and(|age| age > LATE_KEY_WINDOW)
+        {
+            KeyState::Unusable
+        } else {
+            KeyState::RecentlyClosed
+        }
+    };
+    if let Some(ended) = record.ended_at {
+        return closed_recently(ended.wallclock_unix_nanos);
     }
+    // An open row the session has moved past: a command that never got
+    // its PostExec (its shell exec'd or was killed mid-command).
+    if let Some(latest) = index.latest_command_for_session(command.session)
+        && latest.command.seq > command.seq
+    {
+        return closed_recently(latest.started_at.wallclock_unix_nanos);
+    }
+    // `exec` into another hooked shell: the same pid now runs another
+    // session's command.
+    if let Some(current) = active.foreground_of(record.pid)
+        && current != command
+    {
+        return index
+            .command_by_id(current)
+            .map_or(KeyState::RecentlyClosed, |c| {
+                closed_recently(c.started_at.wallclock_unix_nanos)
+            });
+    }
+    if pid_alive(record.pid) {
+        KeyState::Open
+    } else {
+        KeyState::Unusable
+    }
+}
+
+/// Whether `pid` names a process (signal 0 sends nothing; EPERM means
+/// it exists under another uid).
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 only checks that the target exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Whether the peer of a shim connection runs as the daemon's user.
@@ -356,47 +475,221 @@ fn peer_is_daemon_user(stream: &UnixStream) -> bool {
     stream.peer_cred().is_ok_and(|c| c.uid() == me)
 }
 
-/// R8 (D-35): a keyed shim note arrived after its command was
-/// finalized. Its change happened under that command but was not
-/// captured, so journal one capture-gap refusal per command; undo of
-/// that command then refuses instead of passing over the change.
-fn journal_late_note_gap(
+/// R8 (D-35): a keyed note whose command had closed, or been
+/// superseded, when it arrived. Its change cannot join the command's
+/// journal.
+///
+/// - A rename-family outcome goes to the command its pre-call note was
+///   journaled under, which was open then (review item 1).
+/// - A Create the on-time path would have left to the kernel tier (the
+///   path was under its watch) is left to it here too: the kernel record
+///   is the record, and no gap is journaled (review item 2).
+/// - Anything else had the shim as its only record. The command gets one
+///   capture-gap refusal, so its undo refuses instead of passing over the
+///   change.
+pub(crate) fn ingest_late_note(
+    note: &ShimNotification,
+    command: shit_planner::events::CommandId,
+    ingest_ts: shit_planner::time::TimePoint,
+    index: &Index,
+    live_baseline: &LiveBaseline,
+) {
+    if let Some(out) = note.outcome
+        && let Some(call_command) = rename_call_command(note.pid, note.call_id)
+    {
+        journal_rename_outcome(note, out, call_command, ingest_ts, index);
+        return;
+    }
+    if late_note_left_to_kernel(note, command, ingest_ts, live_baseline) {
+        debug!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            %command,
+            "late shim note: path was in the kernel tier's watch; no gap"
+        );
+        return;
+    }
+    let wrote = journal_gap_once(index, command, GapCause::LateNote, || {
+        format!(
+            "a process of this command reported {} on {} after the command finished; that \
+             change was not captured",
+            note.syscall, note.arg
+        )
+    });
+    // Review item 5: once per command.
+    if wrote {
+        warn!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            %command,
+            "shim note arrived after its command closed; journaled a capture gap"
+        );
+    }
+}
+
+/// The in-watch check of [`ingest_note`], for a late note: would the
+/// on-time path have left this note's Create to the kernel tier? Only
+/// Creates are left to it there, so every other note had the shim as its
+/// only record. The Linux command watch is judged at the note's own
+/// timestamp, so a note stamped after the watch closed is not covered.
+fn late_note_left_to_kernel(
+    note: &ShimNotification,
+    command: shit_planner::events::CommandId,
+    at: shit_planner::time::TimePoint,
+    live_baseline: &LiveBaseline,
+) -> bool {
+    if note.failure.is_some() {
+        return false;
+    }
+    let path = Path::new(&note.arg);
+    if !path.is_absolute() {
+        return false;
+    }
+    let create = matches!(note.syscall.as_str(), "open_create" | "mkdir" | "mkdirat");
+    let link = matches!(note.syscall.as_str(), "link" | "linkat");
+    if !create && !link {
+        return false;
+    }
+    let in_command_watch = cfg!(target_os = "linux")
+        && create
+        && live_baseline.defer_create_to_kernel(command, path, at);
+    in_command_watch || live_baseline.path_in_watched_subtree(path)
+}
+
+/// Why a command got a capture-gap refusal from this listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GapCause {
+    /// A keyed note arrived after its command closed.
+    LateNote,
+    /// A shim of another wire version wrote for the command.
+    OtherShimWire,
+}
+
+type GapSet = std::collections::HashSet<(shit_planner::events::CommandId, GapCause)>;
+
+/// The gaps journaled (or being journaled) so far. A poisoned lock is
+/// recovered: the set is only a dedupe.
+fn journaled_gaps() -> std::sync::MutexGuard<'static, GapSet> {
+    static GAPS: std::sync::OnceLock<std::sync::Mutex<GapSet>> = std::sync::OnceLock::new();
+    GAPS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn gap_journaled(command: shit_planner::events::CommandId, cause: GapCause) -> bool {
+    journaled_gaps().contains(&(command, cause))
+}
+
+/// Journal one capture-gap refusal per command and cause; returns
+/// whether this call wrote it.
+///
+/// Review items 7 and 8: the claim is made under the lock and the write
+/// happens outside it. A note racing this one sees the claim and writes
+/// nothing; a failed write drops the claim, so the next note retries it
+/// (review of #232 medium review, item 5).
+fn journal_gap_once(
     index: &Index,
     command: shit_planner::events::CommandId,
-    note: &ShimNotification,
-) {
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<shit_planner::events::CommandId>>> =
-        OnceLock::new();
-    warn!(
-        pid = note.pid,
-        syscall = %note.syscall,
-        arg = %note.arg,
-        %command,
-        "shim note arrived after its command closed; journaling a capture gap"
-    );
-    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
-    if seen.contains(&command) {
-        return;
+    cause: GapCause,
+    detail: impl FnOnce() -> String,
+) -> bool {
+    {
+        let mut gaps = journaled_gaps();
+        if gaps.contains(&(command, cause)) {
+            return false;
+        }
+        if gaps.len() >= 4096 {
+            gaps.clear();
+        }
+        gaps.insert((command, cause));
     }
     match crate::helper_link::journal_refusal(
         index,
         command,
         None,
         shit_planner::COMMAND_CAPTURE_GAP,
-        format!(
-            "a process of this command reported {} on {} after the command finished; that \
-             change was not captured",
-            note.syscall, note.arg
-        ),
+        detail(),
     ) {
-        Ok(()) => {
-            if seen.len() >= 4096 {
-                seen.clear();
-            }
-            seen.insert(command);
+        Ok(()) => true,
+        Err(e) => {
+            warn!(err = %e, %command, ?cause, "shim capture-gap journal failed");
+            journaled_gaps().remove(&(command, cause));
+            false
         }
-        Err(e) => warn!(err = %e, %command, "shim late-note gap journal failed"),
+    }
+}
+
+/// L5 (review of #232, item 4; #225): the refusal text for a command
+/// whose shell loaded a shim of wire version `got`.
+fn other_wire_gap_detail(got: u8) -> String {
+    format!(
+        "a shim from an older version (wire {got}, daemon expects {}) was loaded in this \
+         command's shell; none of its changes were captured. Restart the shell to load the \
+         current shim",
+        shit_proto::SHIM_WIRE_VERSION
+    )
+}
+
+/// Review item 5: a note with no command is logged at warn once per
+/// sender pid; repeats are counted and summarized at most once a minute.
+fn warn_unattributed(note: &ShimNotification) {
+    #[derive(Default)]
+    struct Log {
+        pids: std::collections::HashSet<u32>,
+        quiet: u64,
+        last_summary: Option<std::time::Instant>,
+    }
+    const SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+    static LOG: std::sync::OnceLock<std::sync::Mutex<Log>> = std::sync::OnceLock::new();
+    enum Say {
+        First,
+        Summary(u64),
+        Nothing,
+    }
+    let say = {
+        let mut log = LOG
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.pids.len() >= 4096 {
+            log.pids.clear();
+        }
+        if log.pids.insert(note.pid) {
+            log.last_summary.get_or_insert_with(std::time::Instant::now);
+            Say::First
+        } else {
+            log.quiet += 1;
+            if log
+                .last_summary
+                .is_none_or(|t| t.elapsed() >= SUMMARY_EVERY)
+            {
+                log.last_summary = Some(std::time::Instant::now());
+                Say::Summary(std::mem::take(&mut log.quiet))
+            } else {
+                Say::Nothing
+            }
+        }
+    };
+    match say {
+        Say::First => warn!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            has_key = note.command_key.is_some(),
+            "shim notify: no command for this note; dropping"
+        ),
+        Say::Summary(count) => warn!(
+            count,
+            "shim notify: more notes with no command were dropped since the last report"
+        ),
+        Say::Nothing => debug!(
+            pid = note.pid,
+            syscall = %note.syscall,
+            arg = %note.arg,
+            "shim notify: no command for this note; dropping"
+        ),
     }
 }
 
@@ -569,43 +862,6 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     None
 }
 
-/// L5 (review of #232, item 4; #225): a shim built for another wire
-/// version is writing for `command`, and none of its notifications can be
-/// read. Journal one capture-gap refusal per command, so undo says the
-/// command's changes were not captured instead of passing over them.
-fn journal_version_gap(index: &Index, command: shit_planner::events::CommandId, got: u8) {
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<std::collections::HashSet<shit_planner::events::CommandId>>> =
-        OnceLock::new();
-    // Held across the write, and marked only once it succeeded (review
-    // of #232 medium review, item 5), so a failed write is retried on the
-    // old shim's next note.
-    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
-    if seen.contains(&command) {
-        return;
-    }
-    match crate::helper_link::journal_refusal(
-        index,
-        command,
-        None,
-        shit_planner::COMMAND_CAPTURE_GAP,
-        format!(
-            "a shim from an older version (wire {got}, daemon expects {}) was loaded in this \
-             command's shell; none of its changes were captured. Restart the shell to load the \
-             current shim",
-            shit_proto::SHIM_WIRE_VERSION
-        ),
-    ) {
-        Ok(()) => {
-            if seen.len() >= 4096 {
-                seen.clear();
-            }
-            seen.insert(command);
-        }
-        Err(e) => warn!(err = %e, %command, "shim version-gap refusal journal failed"),
-    }
-}
-
 /// Convert a shim notification into a `CaptureEvent` and journal it,
 /// if the emitter's pid resolves to an active command. Errors are
 /// logged but never propagated — the shim path is best-effort.
@@ -763,13 +1019,7 @@ fn ingest_note(
         // R8 (D-35): not silent. A note reaching this point carried no
         // usable command key, so it came from outside a hooked shell or
         // from a shim older than wire 5.
-        warn!(
-            pid = note.pid,
-            syscall = %note.syscall,
-            arg = %note.arg,
-            has_key = note.command_key.is_some(),
-            "shim notify: no command for this note; dropping"
-        );
+        warn_unattributed(note);
         return;
     };
 
@@ -1612,8 +1862,44 @@ mod tests {
         Arc::new(BlobStore::open(tmp.join("blobs")).unwrap())
     }
 
-    /// R8: an index holding one command of a fresh session, plus the
-    /// command's id. `ended` finalizes it.
+    fn now_nanos() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    const MINUTE_NANOS: u64 = 60 * 1_000_000_000;
+
+    /// R8: write `command`'s row, run on `shell_pid`, started at wall
+    /// time `started`, and ended at `ended` when given.
+    fn put_keyed_command(
+        index: &Index,
+        command: shit_planner::events::CommandId,
+        shell_pid: u32,
+        started: u64,
+        ended: Option<u64>,
+    ) {
+        use shit_planner::events::CommandRecord;
+        use shit_planner::time::TimePoint;
+        index
+            .put_command(&CommandRecord {
+                command,
+                cmd_string: Some("make_fifo".into()),
+                cwd: PathBuf::from("/tmp"),
+                pid: shell_pid,
+                shell_kind: shit_proto::ShellKind::Bash,
+                started_at: TimePoint::new(command.seq, started),
+                ended_at: ended.map(|w| TimePoint::new(100 + command.seq, w)),
+                exit_code: ended.map(|_| 0),
+                event_ids: vec![],
+            })
+            .expect("put_command");
+    }
+
+    /// R8: an index holding one command (seq 3) of a fresh session, plus
+    /// the command's id. Its shell is pid 1, which is always alive.
+    /// `ended` finalizes it just now.
     fn keyed_fixture(
         ended: bool,
     ) -> (
@@ -1621,28 +1907,15 @@ mod tests {
         Arc<Index>,
         shit_planner::events::CommandId,
     ) {
-        use shit_planner::events::CommandRecord;
         use shit_planner::time::TimePoint;
         let tmp = tempfile::tempdir().unwrap();
         let index = Arc::new(Index::open(tmp.path().join("idx.sqlite")).unwrap());
         let session = uuid::Uuid::now_v7();
         index
-            .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .put_session(session, "bash", 1, None, TimePoint::new(0, 0))
             .expect("put_session");
         let command = shit_planner::events::CommandId { session, seq: 3 };
-        index
-            .put_command(&CommandRecord {
-                command,
-                cmd_string: Some("make_fifo".into()),
-                cwd: tmp.path().to_path_buf(),
-                pid: u32::MAX - 1,
-                shell_kind: shit_proto::ShellKind::Bash,
-                started_at: TimePoint::new(0, 0),
-                ended_at: ended.then(|| TimePoint::new(9, 0)),
-                exit_code: ended.then_some(0),
-                event_ids: vec![],
-            })
-            .expect("put_command");
+        put_keyed_command(&index, command, 1, now_nanos(), ended.then(now_nanos));
         (tmp, index, command)
     }
 
@@ -1662,10 +1935,14 @@ mod tests {
     }
 
     fn mkfifo_note(pid: u32, path: &str) -> ShimNotification {
+        note_of("mkfifo", pid, path)
+    }
+
+    fn note_of(syscall: &str, pid: u32, arg: &str) -> ShimNotification {
         ShimNotification {
             pid,
-            syscall: "mkfifo".into(),
-            arg: path.into(),
+            syscall: syscall.into(),
+            arg: arg.into(),
             ts_unix_nanos: 0,
             pre_image: None,
             extra_pre_images: Vec::new(),
@@ -1675,6 +1952,24 @@ mod tests {
             outcome: None,
             command_key: None,
         }
+    }
+
+    fn kinds_of(index: &Index, command: shit_planner::events::CommandId) -> Vec<CaptureEventKind> {
+        index
+            .events_for_command(command)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect()
+    }
+
+    fn has_gap(kinds: &[CaptureEventKind]) -> bool {
+        kinds.iter().any(|k| {
+            matches!(
+                k,
+                CaptureEventKind::CaptureRefused { class, .. }
+                    if class == shit_planner::COMMAND_CAPTURE_GAP
+            )
+        })
     }
 
     /// Send `note` over a real socket to `handle_one` and wait until the
@@ -1721,7 +2016,7 @@ mod tests {
     async fn keyed_note_from_an_exited_sender_joins_its_command() {
         let (tmp, index, command) = keyed_fixture(false);
         let active = Arc::new(ActiveCommands::new());
-        active.insert(u32::MAX - 1, command);
+        active.insert(1, command);
         let other = shit_planner::events::CommandId {
             session: uuid::Uuid::now_v7(),
             seq: 1,
@@ -1733,11 +2028,7 @@ mod tests {
 
         send_through_listener(note, Arc::clone(&index), active, tmp.path()).await;
 
-        let kinds: Vec<_> = index
-            .events_for_command(command)
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
+        let kinds = kinds_of(&index, command);
         assert!(
             kinds.iter().any(|k| matches!(
                 k,
@@ -1749,22 +2040,22 @@ mod tests {
 
     /// The same note with no key (a version-4 shim, or a sender outside
     /// a hooked shell) still depends on the pid walk, which cannot reach
-    /// a dead sender's shell. It is dropped with a warning.
+    /// a dead sender's shell.
     #[tokio::test]
     async fn unkeyed_note_from_an_exited_sender_is_unattributed() {
         let (tmp, index, command) = keyed_fixture(false);
         let active = Arc::new(ActiveCommands::new());
-        active.insert(u32::MAX - 1, command);
+        active.insert(1, command);
         let note = mkfifo_note(exited_pid(), tmp.path().join("f").to_str().unwrap());
         assert_eq!(
-            resolve_command(&note, true, &active, &index),
+            resolve_command(note.pid, None, &active, &index),
             Resolution::Unattributed
         );
         send_through_listener(note, Arc::clone(&index), active, tmp.path()).await;
         assert!(index.events_for_command(command).is_empty());
     }
 
-    /// D-35: a keyed note for a command that was already finalized does
+    /// D-35: a keyed mkfifo for a command that was already finalized does
     /// not join it, and the command gets a capture-gap refusal instead.
     #[tokio::test]
     async fn keyed_note_after_its_command_closed_journals_a_capture_gap() {
@@ -1774,25 +2065,14 @@ mod tests {
         let mut note = mkfifo_note(exited_pid(), fifo.to_str().unwrap());
         note.command_key = Some(key_of(command));
         assert_eq!(
-            resolve_command(&note, true, &active, &index),
+            resolve_command(note.pid, Some(command), &active, &index),
             Resolution::Closed(command)
         );
 
         send_through_listener(note, Arc::clone(&index), active, tmp.path()).await;
 
-        let kinds: Vec<_> = index
-            .events_for_command(command)
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        assert!(
-            kinds.iter().any(|k| matches!(
-                k,
-                CaptureEventKind::CaptureRefused { class, .. }
-                    if class == shit_planner::COMMAND_CAPTURE_GAP
-            )),
-            "{kinds:?}"
-        );
+        let kinds = kinds_of(&index, command);
+        assert!(has_gap(&kinds), "{kinds:?}");
         assert!(
             !kinds
                 .iter()
@@ -1807,43 +2087,277 @@ mod tests {
     #[test]
     fn keyed_note_joins_a_command_that_is_still_closing() {
         let (_tmp, index, command) = keyed_fixture(false);
-        let mut note = mkfifo_note(exited_pid(), "/tmp/x");
-        note.command_key = Some(key_of(command));
         assert_eq!(
-            resolve_command(&note, true, &ActiveCommands::new(), &index),
+            resolve_command(exited_pid(), Some(command), &ActiveCommands::new(), &index),
             Resolution::Command(command)
         );
     }
 
-    /// A key from a peer of another uid is ignored, and so is a key the
-    /// daemon does not know; both fall back to the pid walk.
+    /// A key the daemon does not know falls back to the pid walk.
     #[test]
-    fn untrusted_or_unknown_keys_fall_back_to_the_pid_walk() {
-        let (_tmp, index, command) = keyed_fixture(false);
+    fn unknown_keys_fall_back_to_the_pid_walk() {
+        let (_tmp, index, _command) = keyed_fixture(false);
         let active = ActiveCommands::new();
-        active.insert(u32::MAX - 1, command);
-        let mut note = mkfifo_note(exited_pid(), "/tmp/x");
-        note.command_key = Some(key_of(command));
-        assert_eq!(
-            resolve_command(&note, false, &active, &index),
-            Resolution::Unattributed
-        );
-
-        // Unknown key, live sender under a tracked shell: the walk wins.
         let walked = shit_planner::events::CommandId {
             session: uuid::Uuid::now_v7(),
             seq: 8,
         };
         active.insert(std::process::id(), walked);
-        let mut note = mkfifo_note(std::process::id(), "/tmp/x");
-        note.command_key = Some(shit_proto::ShimCommandKey {
+        let unknown = shit_planner::events::CommandId {
             session: uuid::Uuid::now_v7(),
             seq: 2,
-        });
+        };
         assert_eq!(
-            resolve_command(&note, true, &active, &index),
+            resolve_command(std::process::id(), Some(unknown), &active, &index),
             Resolution::Command(walked)
         );
+        assert_eq!(
+            resolve_command(exited_pid(), Some(unknown), &active, &index),
+            Resolution::Unattributed
+        );
+    }
+
+    /// R8 review, item 4 (tmux): a live sender whose ancestry reaches
+    /// another session's shell goes to that shell's command, though its
+    /// key names an open command of the session it inherited the key from.
+    #[test]
+    fn a_live_sender_under_another_sessions_shell_goes_to_that_shell() {
+        let (_tmp, index, command) = keyed_fixture(false);
+        let active = ActiveCommands::new();
+        active.insert(1, command);
+        let tmux_shell = shit_planner::events::CommandId {
+            session: uuid::Uuid::now_v7(),
+            seq: 1,
+        };
+        active.insert(std::process::id(), tmux_shell);
+        assert_eq!(
+            resolve_command(std::process::id(), Some(command), &active, &index),
+            Resolution::Command(tmux_shell)
+        );
+        // The same key from a sender that already exited: the key holds.
+        assert_eq!(
+            resolve_command(exited_pid(), Some(command), &active, &index),
+            Resolution::Command(command)
+        );
+    }
+
+    /// R8 review, item 4: a command that never got its PostExec. Killed:
+    /// its shell is gone, so its key is ignored. Exec'd into another
+    /// hooked shell, or followed by a newer command of its session: it is
+    /// treated as closed, and its notes are a capture gap.
+    #[test]
+    fn keys_of_commands_that_never_closed_are_bounded() {
+        let (_tmp, index, command) = keyed_fixture(false);
+        let now = now_nanos();
+
+        // Killed shell.
+        let killed = shit_planner::events::CommandId {
+            session: uuid::Uuid::now_v7(),
+            seq: 1,
+        };
+        put_keyed_command(&index, killed, exited_pid(), now, None);
+        assert_eq!(
+            resolve_command(exited_pid(), Some(killed), &ActiveCommands::new(), &index),
+            Resolution::Unattributed
+        );
+
+        // `exec bash`: the same pid now runs another session's command.
+        let active = ActiveCommands::new();
+        active.insert(1, command);
+        let next_shell = shit_planner::events::CommandId {
+            session: uuid::Uuid::now_v7(),
+            seq: 1,
+        };
+        put_keyed_command(&index, next_shell, 1, now, None);
+        active.insert(1, next_shell);
+        assert_eq!(
+            resolve_command(exited_pid(), Some(command), &active, &index),
+            Resolution::Closed(command)
+        );
+
+        // A newer PreExec of the same session.
+        let (_tmp2, index2, command2) = keyed_fixture(false);
+        put_keyed_command(
+            &index2,
+            shit_planner::events::CommandId {
+                seq: command2.seq + 1,
+                ..command2
+            },
+            1,
+            now,
+            None,
+        );
+        assert_eq!(
+            resolve_command(
+                exited_pid(),
+                Some(command2),
+                &ActiveCommands::new(),
+                &index2
+            ),
+            Resolution::Closed(command2)
+        );
+    }
+
+    /// R8 review, item 4: a key whose command closed, or was superseded,
+    /// longer ago than the window is stale. It is ignored and the note
+    /// falls back to the pid walk.
+    #[test]
+    fn stale_keys_fall_back_to_the_pid_walk() {
+        use shit_planner::time::TimePoint;
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
+        let session = uuid::Uuid::now_v7();
+        index
+            .put_session(session, "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        let long_ago = now_nanos() - 30 * MINUTE_NANOS;
+        let closed = shit_planner::events::CommandId { session, seq: 1 };
+        put_keyed_command(&index, closed, 1, long_ago, Some(long_ago));
+        let superseded = shit_planner::events::CommandId { session, seq: 2 };
+        put_keyed_command(&index, superseded, 1, long_ago, None);
+        put_keyed_command(
+            &index,
+            shit_planner::events::CommandId { session, seq: 3 },
+            1,
+            long_ago,
+            Some(long_ago),
+        );
+        let active = ActiveCommands::new();
+        for key in [closed, superseded] {
+            assert_eq!(
+                resolve_command(exited_pid(), Some(key), &active, &index),
+                Resolution::Unattributed,
+                "{key}"
+            );
+        }
+        // Within the window the same closed key is a late note.
+        let recent = shit_planner::events::CommandId { session, seq: 4 };
+        put_keyed_command(&index, recent, 1, now_nanos(), Some(now_nanos()));
+        assert_eq!(
+            resolve_command(exited_pid(), Some(recent), &active, &index),
+            Resolution::Closed(recent)
+        );
+    }
+
+    /// R8 review, item 1: a rename call's pre-call note is journaled
+    /// while its command is open; the command closes; the outcome note
+    /// arrives late. It joins the call's command and leaves no gap.
+    #[test]
+    fn a_rename_outcome_after_its_command_closed_joins_the_call() {
+        use shit_planner::time::TimePoint;
+        let (_tmp, index, blob_store, command) = ingest_fixture("mv a b");
+        let lb = LiveBaseline::new();
+        let mut pre = open_note_arg("rename", "/tmp/r8-late/a\t/tmp/r8-late/b", None);
+        pre.call_id = 0x5208;
+        ingest_notification(
+            &pre,
+            Some(command),
+            TimePoint::new(2, 0),
+            None,
+            &index,
+            &blob_store,
+            &lb,
+        );
+        let mut out = pre.clone();
+        out.outcome = Some(shit_proto::ShimRenameOutcome {
+            errno: 0,
+            source_dev: 8,
+            source_inode: 42,
+        });
+        ingest_late_note(&out, command, TimePoint::new(9, 0), &index, &lb);
+
+        let kinds = kinds_of(&index, command);
+        assert!(
+            kinds.iter().any(|k| matches!(
+                k,
+                CaptureEventKind::RenameOutcome {
+                    call_id: 0x5208,
+                    ..
+                }
+            )),
+            "{kinds:#?}"
+        );
+        assert!(!has_gap(&kinds), "{kinds:#?}");
+        assert!(
+            rename_call_command(pre.pid, pre.call_id).is_none(),
+            "the call's map entry is taken, not leaked"
+        );
+    }
+
+    /// R8 review, item 2: a late Create under a path the kernel tier
+    /// watched is left to the kernel record, and journals no gap. A late
+    /// Create outside any watch, and a late mkfifo (which the kernel tier
+    /// cannot see on every platform), each journal one.
+    #[test]
+    fn late_notes_rely_on_the_kernel_tier_only_where_it_watched() {
+        use shit_planner::time::TimePoint;
+        let watched = tempfile::tempdir().unwrap();
+        let watched_dir = watched.path().canonicalize().unwrap();
+        let lb = LiveBaseline::new();
+        lb.entry_for_cwd(&watched_dir);
+
+        let (_tmp, index, covered) = keyed_fixture(false);
+        let note = open_note_arg("open_create", watched_dir.join("x").to_str().unwrap(), None);
+        ingest_late_note(&note, covered, TimePoint::new(9, 0), &index, &lb);
+        assert!(kinds_of(&index, covered).is_empty(), "no gap in the watch");
+
+        let (_tmp, index, outside) = keyed_fixture(false);
+        let note = open_note_arg("open_create", "/r8-unwatched/y", None);
+        ingest_late_note(&note, outside, TimePoint::new(9, 0), &index, &lb);
+        assert!(has_gap(&kinds_of(&index, outside)));
+
+        let (_tmp, index, fifo) = keyed_fixture(false);
+        let note = note_of("mkfifo", 4242, watched_dir.join("p").to_str().unwrap());
+        ingest_late_note(&note, fifo, TimePoint::new(9, 0), &index, &lb);
+        ingest_late_note(&note, fifo, TimePoint::new(10, 0), &index, &lb);
+        let kinds = kinds_of(&index, fifo);
+        assert!(has_gap(&kinds));
+        assert_eq!(kinds.len(), 1, "one gap per command: {kinds:?}");
+    }
+
+    /// On Linux the command's own kernel watch decides too: a late Create
+    /// stamped while the watch was confirmed and open is covered; one
+    /// stamped after the watch closed is a gap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn late_creates_are_judged_by_the_command_watch_at_their_stamp() {
+        use shit_planner::time::TimePoint;
+        let lb = LiveBaseline::new();
+        let (_tmp, index, command) = keyed_fixture(false);
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        lb.record_command_watch(command, root.clone());
+        lb.confirm_command_watch(command, TimePoint::new(2, 0));
+        lb.close_command_watch(command, TimePoint::new(10, 0));
+        let note = open_note_arg("mkdir", root.join("v").to_str().unwrap(), None);
+        ingest_late_note(&note, command, TimePoint::new(9, 0), &index, &lb);
+        assert!(kinds_of(&index, command).is_empty());
+        ingest_late_note(&note, command, TimePoint::new(11, 0), &index, &lb);
+        assert!(has_gap(&kinds_of(&index, command)));
+    }
+
+    /// R8 review, item 8: a poisoned gap lock does not panic the next
+    /// note; the dedupe still works.
+    #[test]
+    fn a_poisoned_gap_lock_is_recovered() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = journaled_gaps();
+            panic!("poison the gap lock");
+        });
+        let (_tmp, index, command) = keyed_fixture(false);
+        assert!(journal_gap_once(
+            &index,
+            command,
+            GapCause::LateNote,
+            || "d".into()
+        ));
+        assert!(!journal_gap_once(
+            &index,
+            command,
+            GapCause::LateNote,
+            || "d".into()
+        ));
+        assert!(gap_journaled(command, GapCause::LateNote));
     }
 
     #[test]
@@ -2941,7 +3455,9 @@ mod tests {
         let index = Index::open(tmp.path().join("idx.sqlite")).unwrap();
         let session = uuid::Uuid::from_u128(0x5eed);
         let command = shit_planner::events::CommandId { session, seq: 1 };
-        journal_version_gap(&index, command, 1);
+        journal_gap_once(&index, command, GapCause::OtherShimWire, || {
+            other_wire_gap_detail(1)
+        });
         assert!(index.events_for_command(command).is_empty());
         index
             .put_session(session, "bash", 0, None, TimePoint::new(0, 0))
@@ -2959,8 +3475,12 @@ mod tests {
                 event_ids: vec![],
             })
             .unwrap();
-        journal_version_gap(&index, command, 1);
-        journal_version_gap(&index, command, 1);
+        journal_gap_once(&index, command, GapCause::OtherShimWire, || {
+            other_wire_gap_detail(1)
+        });
+        journal_gap_once(&index, command, GapCause::OtherShimWire, || {
+            other_wire_gap_detail(1)
+        });
         assert_eq!(index.events_for_command(command).len(), 1);
     }
 

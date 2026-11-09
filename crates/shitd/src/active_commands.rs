@@ -109,14 +109,11 @@ impl ActiveCommands {
         None
     }
 
-    /// Whether `command` is between its PreExec and PostExec on any
-    /// shell. R8 (#210): a shim note that names its command by key is
-    /// checked here, with no pid walk.
-    pub fn contains(&self, command: CommandId) -> bool {
-        self.inner
-            .lock()
-            .map(|g| g.values().any(|stack| stack.contains(&command)))
-            .unwrap_or(false)
+    /// The most recent active command on `shell_pid`, if any. R8 review,
+    /// item 4: a keyed note's command is superseded once its shell pid
+    /// runs another command (`exec` into another hooked shell).
+    pub fn foreground_of(&self, shell_pid: u32) -> Option<CommandId> {
+        self.inner.lock().ok()?.get(&shell_pid)?.last().copied()
     }
 
     /// Number of shell pids currently with an active command. For
@@ -225,15 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn contains_finds_a_command_on_any_shell_until_it_is_removed() {
+    fn foreground_of_is_the_shells_most_recent_command() {
         let a = ActiveCommands::new();
+        assert_eq!(a.foreground_of(10), None);
         a.insert(10, cmd(1));
-        a.insert(20, cmd(2));
-        assert!(a.contains(cmd(1)));
-        assert!(a.contains(cmd(2)));
-        assert!(!a.contains(cmd(3)));
+        a.insert(10, cmd(2));
+        assert_eq!(a.foreground_of(10), Some(cmd(2)));
+        a.remove(10, cmd(2));
+        assert_eq!(a.foreground_of(10), Some(cmd(1)));
         a.remove(10, cmd(1));
-        assert!(!a.contains(cmd(1)));
+        assert_eq!(a.foreground_of(10), None);
     }
 
     #[test]
