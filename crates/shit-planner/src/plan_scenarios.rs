@@ -1953,6 +1953,39 @@ fn dual_tier_moved_fifo_is_recreated_once() {
 }
 
 #[test]
+fn kqueue_order_dir_removal_before_its_children_restores_the_private_dir() {
+    // #214 on FreeBSD: kqueue can deliver a directory's NOTE_DELETE
+    // before its children's, so the directory's Unlink is journaled
+    // first and its RecreatePath lands after the child restores in
+    // the plan. EnsureDir puts the directory back, at its journaled
+    // 0700, ahead of them.
+    let mut sim = Sim::new();
+    sim.seed_dir("junk", 0o700);
+    sim.seed_file("junk/a", b"a\n", 0o600);
+    let before = sim.snapshot();
+    let dir = sim.p("junk");
+    let file = sim.p("junk/a");
+    let dm = std::fs::symlink_metadata(&dir).unwrap();
+    let fm = std::fs::symlink_metadata(&file).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(dm.dev(), dm.ino()),
+        path: dir.clone(),
+        kind: FileKind::Directory,
+        mode: dm.mode(),
+    }));
+    sim.pre_image(&file, FilePreImageSource::Other);
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(fm.dev(), fm.ino()),
+        path: file.clone(),
+        kind: FileKind::Regular,
+        mode: fm.mode(),
+    }));
+    std::fs::remove_file(&file).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+    assert_restored(&sim, &before);
+}
+
+#[test]
 fn file_moved_into_new_dir_then_rm_rf_leaves_no_stray_dir() {
     // #215: `mkdir d; mv existing/f d/; rm -rf d`. The file comes back
     // to existing/f and `d`, born in the command, is gone again.
