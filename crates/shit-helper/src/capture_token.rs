@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! L4b - capture tokens: the helper's own evidence for a privileged
-//! apply. Linux-only, like the device-node restore that uses them.
+//! apply. Linux-only, like the device-node and ownership (#227) restores
+//! that use them.
 //!
 //! Any local user can run the helper, and its peer (shitd) runs as that
 //! user, so every field of an apply request is attacker-controlled. The
@@ -26,8 +27,19 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Domain separation for the MAC input, versioned with its layout.
-const DOMAIN: &[u8] = b"shit-helper device-node capture v1\0";
+/// Domain separation for the MAC input, versioned with its layout. Each
+/// kind of evidence has its own, so a token for one kind never verifies
+/// as another.
+const DEVICE_DOMAIN: &[u8] = b"shit-helper device-node capture v1\0";
+const OWNER_DOMAIN: &[u8] = b"shit-helper owner capture v1\0";
+
+/// Captured facts a token can cover.
+pub trait Facts {
+    /// Domain-separation prefix for this kind of evidence.
+    fn domain(&self) -> &'static [u8];
+    /// Feed the facts into the MAC, in a fixed layout.
+    fn feed(&self, m: &mut HmacSha256);
+}
 
 /// The facts a device-node token covers. Built from the held fd's
 /// `fstat` at capture, and from the request at apply.
@@ -46,6 +58,56 @@ pub struct DeviceFacts<'a> {
     /// The command that removed it.
     pub session: Uuid,
     pub seq: u64,
+}
+
+impl Facts for DeviceFacts<'_> {
+    fn domain(&self) -> &'static [u8] {
+        DEVICE_DOMAIN
+    }
+    fn feed(&self, m: &mut HmacSha256) {
+        m.update(&(self.mode & 0o170000).to_le_bytes());
+        m.update(&self.rdev.to_le_bytes());
+        m.update(&self.mode.to_le_bytes());
+        m.update(&self.uid.to_le_bytes());
+        m.update(&self.gid.to_le_bytes());
+        m.update(&self.dev.to_le_bytes());
+        m.update(&self.ino.to_le_bytes());
+        m.update(&(self.path.len() as u64).to_le_bytes());
+        m.update(self.path.as_bytes());
+        m.update(self.session.as_bytes());
+        m.update(&self.seq.to_le_bytes());
+    }
+}
+
+/// #227 - the facts an ownership token covers: the file's identity
+/// (`st_dev`, `st_ino`, absolute path) and its owner at capture, which
+/// is the owner an `ApplyChown` may give back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerFacts<'a> {
+    pub uid: u32,
+    pub gid: u32,
+    pub dev: u64,
+    pub ino: u64,
+    pub path: &'a str,
+    /// The command that changed the owner.
+    pub session: Uuid,
+    pub seq: u64,
+}
+
+impl Facts for OwnerFacts<'_> {
+    fn domain(&self) -> &'static [u8] {
+        OWNER_DOMAIN
+    }
+    fn feed(&self, m: &mut HmacSha256) {
+        m.update(&self.uid.to_le_bytes());
+        m.update(&self.gid.to_le_bytes());
+        m.update(&self.dev.to_le_bytes());
+        m.update(&self.ino.to_le_bytes());
+        m.update(&(self.path.len() as u64).to_le_bytes());
+        m.update(self.path.as_bytes());
+        m.update(self.session.as_bytes());
+        m.update(&self.seq.to_le_bytes());
+    }
 }
 
 /// Why a token was not accepted.
@@ -87,25 +149,15 @@ impl TokenKey {
         Some(Self { id, key })
     }
 
-    fn mac(&self, f: &DeviceFacts<'_>) -> HmacSha256 {
+    fn mac(&self, f: &impl Facts) -> HmacSha256 {
         let mut m = HmacSha256::new_from_slice(&self.key).expect("HMAC takes any key length");
-        m.update(DOMAIN);
+        m.update(f.domain());
         m.update(&self.id);
-        m.update(&(f.mode & 0o170000).to_le_bytes());
-        m.update(&f.rdev.to_le_bytes());
-        m.update(&f.mode.to_le_bytes());
-        m.update(&f.uid.to_le_bytes());
-        m.update(&f.gid.to_le_bytes());
-        m.update(&f.dev.to_le_bytes());
-        m.update(&f.ino.to_le_bytes());
-        m.update(&(f.path.len() as u64).to_le_bytes());
-        m.update(f.path.as_bytes());
-        m.update(f.session.as_bytes());
-        m.update(&f.seq.to_le_bytes());
+        f.feed(&mut m);
         m
     }
 
-    pub fn issue(&self, f: &DeviceFacts<'_>) -> CaptureToken {
+    pub fn issue(&self, f: &impl Facts) -> CaptureToken {
         CaptureToken {
             helper: self.id,
             mac: self.mac(f).finalize().into_bytes().into(),
@@ -113,7 +165,7 @@ impl TokenKey {
     }
 
     /// Constant-time check of `token` against `f`.
-    pub fn verify(&self, f: &DeviceFacts<'_>, token: &CaptureToken) -> Result<(), TokenError> {
+    pub fn verify(&self, f: &impl Facts, token: &CaptureToken) -> Result<(), TokenError> {
         if token.helper != self.id {
             return Err(TokenError::OtherHelper);
         }
@@ -308,6 +360,66 @@ mod tests {
             Some(UntrustedSource::Unknown)
         );
         assert_eq!(untrusted_source(-1), Some(UntrustedSource::Unknown));
+    }
+
+    fn owner(path: &str) -> OwnerFacts<'_> {
+        OwnerFacts {
+            uid: 0,
+            gid: 0,
+            dev: 0x803,
+            ino: 42,
+            path,
+            session: Uuid::from_u128(7),
+            seq: 3,
+        }
+    }
+
+    /// #227: an ownership token binds owner, identity, path and command.
+    #[test]
+    fn owner_token_verifies_only_for_the_facts_it_was_issued_for() {
+        let k = TokenKey::generate().unwrap();
+        let f = owner("/etc/x");
+        let t = k.issue(&f);
+        assert_eq!(k.verify(&f, &t), Ok(()));
+        let variants = [
+            OwnerFacts { uid: 1000, ..f },
+            OwnerFacts { gid: 1000, ..f },
+            OwnerFacts { dev: 0x804, ..f },
+            OwnerFacts { ino: 43, ..f },
+            OwnerFacts {
+                path: "/etc/y",
+                ..f
+            },
+            OwnerFacts {
+                session: Uuid::from_u128(8),
+                ..f
+            },
+            OwnerFacts { seq: 4, ..f },
+        ];
+        for v in variants {
+            assert_eq!(k.verify(&v, &t), Err(TokenError::Mismatch), "{v:?}");
+        }
+        let other = TokenKey::generate().unwrap();
+        assert_eq!(other.verify(&f, &t), Err(TokenError::OtherHelper));
+    }
+
+    /// A device token never passes as an ownership token for the same
+    /// identity and owner, and the other way round.
+    #[test]
+    fn device_and_owner_tokens_do_not_cross_verify() {
+        let k = TokenKey::generate().unwrap();
+        let d = facts("/w/null");
+        let o = OwnerFacts {
+            uid: d.uid,
+            gid: d.gid,
+            dev: d.dev,
+            ino: d.ino,
+            path: d.path,
+            session: d.session,
+            seq: d.seq,
+        };
+        assert_eq!(k.verify(&o, &k.issue(&d)), Err(TokenError::Mismatch));
+        assert_eq!(k.verify(&d, &k.issue(&o)), Err(TokenError::Mismatch));
     }
 
     #[test]

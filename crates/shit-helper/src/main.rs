@@ -64,6 +64,8 @@ mod sandbox;
 mod seccomp_linux;
 mod self_verify;
 mod svc;
+#[cfg(target_os = "linux")]
+mod watch_scope;
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\ncommit: ",
@@ -911,7 +913,10 @@ fn run_probe_fanotify() -> anyhow::Result<()> {
     }
     let _guard = DirGuard(dir_path.clone());
 
-    fanotify::mark::mark_dir_for_capture(&fd, &dir_path)
+    let dir_fd: std::os::fd::OwnedFd = std::fs::File::open(&dir_path)
+        .map_err(|e| anyhow::anyhow!("open tempdir: {e}"))?
+        .into();
+    fanotify::mark::mark_dir_for_capture(&fd, std::os::fd::AsFd::as_fd(&dir_fd))
         .map_err(|e| anyhow::anyhow!("mark_dir_for_capture: {e}"))?;
 
     // Spawn a child that opens a probe file inside the marked dir.
@@ -1420,18 +1425,33 @@ struct LsmDispatch {
 #[cfg(target_os = "linux")]
 const LSM_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Load the eBPF-LSM unlink program, take its ringbuf, and spawn
-/// the userspace reader thread wired to dispatch into the linux
-/// capture runtime. Returns the long-lived state to keep alive.
+/// The eBPF-LSM programs, attached, with their ring buffers taken and
+/// no reader thread spawned yet. #226: the helper drops its startup
+/// capabilities between [`load_ebpf_lsm`] and [`spawn_lsm_readers`],
+/// because each thread copies its creator's capability sets.
+#[cfg(target_os = "linux")]
+struct LsmLoaded {
+    loader: ebpf::EbpfLoader,
+    unlink_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    setattr_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    mkdir_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    create_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    open_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    rename_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    symlink_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    link_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    rmdir_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    mknod_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    release_rb_opt: Option<aya::maps::RingBuf<aya::maps::MapData>>,
+}
+
+/// Load and attach the eBPF-LSM programs and take their ring buffers.
+/// Spawns no thread.
 ///
 /// Requires CAP_BPF + CAP_PERFMON on the calling process. Call
-/// BEFORE `sandbox::enter` — that's the last point where the helper
-/// has the caps needed for `bpf(2)`.
+/// BEFORE `priv_linux::finish_startup`, which drops them.
 #[cfg(target_os = "linux")]
-fn boot_ebpf_lsm(
-    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
-    excluded_pids: Vec<u32>,
-) -> anyhow::Result<LsmCaptureState> {
+fn load_ebpf_lsm() -> anyhow::Result<LsmLoaded> {
     let mut loader = ebpf::EbpfLoader::new();
     loader
         .load_lsm_unlink()
@@ -1524,6 +1544,46 @@ fn boot_ebpf_lsm(
         None
     };
 
+    Ok(LsmLoaded {
+        loader,
+        unlink_rb,
+        setattr_rb,
+        mkdir_rb,
+        create_rb,
+        open_rb,
+        rename_rb,
+        symlink_rb,
+        link_rb,
+        rmdir_rb,
+        mknod_rb,
+        release_rb_opt,
+    })
+}
+
+/// Spawn the userspace reader threads for loaded eBPF-LSM programs,
+/// wired to dispatch into the linux capture runtime. Returns the
+/// long-lived state to keep alive. Call after
+/// `priv_linux::finish_startup` so the readers hold no capability.
+#[cfg(target_os = "linux")]
+fn spawn_lsm_readers(
+    loaded: LsmLoaded,
+    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
+    excluded_pids: Vec<u32>,
+) -> LsmCaptureState {
+    let LsmLoaded {
+        mut loader,
+        unlink_rb,
+        setattr_rb,
+        mkdir_rb,
+        create_rb,
+        open_rb,
+        rename_rb,
+        symlink_rb,
+        link_rb,
+        rmdir_rb,
+        mknod_rb,
+        release_rb_opt,
+    } = loaded;
     let mut tree_map = fanotify::tree::TreeMap::new();
     tree_map.set_excluded(excluded_pids.iter().map(|&p| p as i32).collect());
     let tree = Arc::new(std::sync::Mutex::new(tree_map));
@@ -1657,7 +1717,7 @@ fn boot_ebpf_lsm(
             g.set_fmode_created_trusted(trusted);
         }
     }
-    Ok(LsmCaptureState {
+    LsmCaptureState {
         _readers: readers,
         _loader: loader,
         dispatch: LsmDispatch {
@@ -1665,7 +1725,7 @@ fn boot_ebpf_lsm(
             runtime,
             flush,
         },
-    })
+    }
 }
 
 /// Check that `file_open` reports `FMODE_CREATED` the way the born set
@@ -2000,22 +2060,34 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         // sandbox::enter). The returned state carries both the
         // tree map (for WatchTree dispatch) and the LsmReader join
         // handle (for graceful shutdown).
-        let (lsm_state, ebpf_load_error): (Option<LsmCaptureState>, Option<anyhow::Error>) =
+        let (lsm_loaded, ebpf_load_error): (Option<LsmLoaded>, Option<anyhow::Error>) =
             if matches!(setup_tier, CaptureTier::EbpfLsm) {
-                // Exclude the helper's own pid + the daemon's pid from
-                // LSM event dispatch. Both run as descendants of the
-                // smoke harness (or the user's shell), so their internal
-                // file ops would otherwise be journaled as user-visible
-                // mutations. Daemon's blob-staging rename was the
-                // load-bearing miss surfaced by L04.1.
-                let excluded = vec![std::process::id(), cli.daemon_pid];
-                match boot_ebpf_lsm(capture_rt.clone(), excluded) {
-                    Ok(state) => (Some(state), None),
+                match load_ebpf_lsm() {
+                    Ok(loaded) => (Some(loaded), None),
                     Err(e) => (None, Some(e)),
                 }
             } else {
                 (None, None)
             };
+
+        // #226: kernel-tier setup is over (programs attached, or the
+        // fanotify fd opened in privileged_setup). Drop the startup
+        // capabilities before any reader thread exists: each thread
+        // copies its creator's sets. A failure here is a privilege
+        // error and stops the helper; it is never treated as an eBPF
+        // load failure or a reason to fall back to fanotify.
+        priv_linux::finish_startup()
+            .map_err(|e| anyhow::anyhow!("privilege drop failed; refusing to start: {e}"))?;
+
+        // Exclude the helper's own pid + the daemon's pid from LSM event
+        // dispatch. Both run as descendants of the smoke harness (or the
+        // user's shell), so their internal file ops would otherwise be
+        // journaled as user-visible mutations. Daemon's blob-staging
+        // rename was the load-bearing miss surfaced by L04.1.
+        let lsm_state: Option<LsmCaptureState> = lsm_loaded.map(|loaded| {
+            let excluded = vec![std::process::id(), cli.daemon_pid];
+            spawn_lsm_readers(loaded, capture_rt.clone(), excluded)
+        });
 
         let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
         let active_tier = match resolve_linux_capture_startup(
@@ -2234,6 +2306,17 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         }
     };
 
+    // #230: path lookups and the ptrace check in the request loop run
+    // with the real user's filesystem ids (a no-op on a setcap install;
+    // on a setuid-root install it stops euid 0 from widening them).
+    #[cfg(target_os = "linux")]
+    priv_linux::act_as_real_user()
+        .map_err(|e| anyhow::anyhow!("privilege drop failed; refusing to start: {e}"))?;
+    // Built before the sandbox: it reads the helper's real and effective
+    // uids, and getuid is not on the seccomp allowlist.
+    #[cfg(target_os = "linux")]
+    let watch_scope = watch_scope::WatchScope::new(outcome.daemon_uid);
+
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
@@ -2282,6 +2365,8 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
+            #[cfg(target_os = "linux")]
+            watch_scope,
             #[cfg(target_os = "linux")]
             request_state,
             #[cfg(target_os = "linux")]
@@ -2376,17 +2461,43 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
 /// what `/proc/<pid>/cwd` would report. `/proc/<pid>/cwd` alone is racy
 /// for a short-lived root process (issue #22 family).
 #[cfg(target_os = "linux")]
-fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(raw);
-    if !path.is_absolute() {
+fn validated_linux_watch_cwd(raw: &str) -> Result<WatchCwd, String> {
+    if !std::path::Path::new(raw).is_absolute() {
         return Err(format!("watch cwd {raw:?} is not absolute"));
     }
-    let canonical = std::fs::canonicalize(&path)
-        .map_err(|e| format!("watch cwd {raw:?} is unavailable: {e}"))?;
-    if !canonical.is_dir() {
-        return Err(format!("watch cwd {raw:?} is not a directory"));
+    open_watch_dir(raw).map_err(|e| format!("watch cwd {raw:?} is unavailable: {e}"))
+}
+
+/// #230 - a Linux watch root, held open. `path` is what the held fd
+/// names (for pre-opens and logs); the fanotify mark is made on `fd`.
+#[cfg(target_os = "linux")]
+struct WatchCwd {
+    fd: std::os::fd::OwnedFd,
+    path: PathBuf,
+}
+
+/// Open `path` as a directory for reading with the helper's own
+/// credentials. After startup the helper has no effective capability
+/// (#226) and its euid is the peer's uid (checked by
+/// [`watch_scope::WatchScope`]), so this open succeeds only for a
+/// directory the peer could open itself. A deleted directory (no links
+/// left) is refused.
+#[cfg(target_os = "linux")]
+fn open_watch_dir(path: &str) -> Result<WatchCwd, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    if dir.metadata().map_err(|e| e.to_string())?.nlink() == 0 {
+        return Err("the directory was deleted".to_string());
     }
-    Ok(canonical)
+    let fd = std::os::fd::OwnedFd::from(dir);
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|e| format!("cannot name the opened directory: {e}"))?;
+    Ok(WatchCwd { fd, path })
 }
 
 /// Resolve the Linux watch root: the hook-reported cwd, or the root
@@ -2398,18 +2509,13 @@ fn validated_linux_watch_cwd(raw: &str) -> Result<PathBuf, String> {
 /// directory was renamed, does not resolve either. Canonicalizing the
 /// magic link gives real bytes, and fails for a deleted cwd.
 #[cfg(target_os = "linux")]
-fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<PathBuf, String> {
+fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<WatchCwd, String> {
     let reported = if raw.contains(char::REPLACEMENT_CHARACTER) {
         Err(format!("watch cwd {raw:?} is not valid UTF-8"))
     } else {
         validated_linux_watch_cwd(raw)
     };
-    reported.or_else(|reason| {
-        std::fs::canonicalize(format!("/proc/{root_pid}/cwd"))
-            .ok()
-            .filter(|cwd| cwd.is_dir())
-            .ok_or(reason)
-    })
+    reported.or_else(|reason| open_watch_dir(&format!("/proc/{root_pid}/cwd")).map_err(|_| reason))
 }
 
 /// Close-barrier marker for `UnwatchTree`. Sent on every path, degraded
@@ -2447,6 +2553,23 @@ fn begin_watch(
     false
 }
 
+/// #230 - a WatchTree the peer may not make: nothing is tracked or
+/// marked. The refusal is logged, reported as a capture observation
+/// (journaled in strict mode), and returned as the WatchTreeFailed
+/// reason.
+#[cfg(target_os = "linux")]
+fn refuse_watch(
+    conn: &ipc::Conn,
+    command: shit_planner::events::CommandId,
+    root_pid: u32,
+    reason: &str,
+) -> String {
+    tracing::warn!(%command, root_pid, %reason, "WatchTree refused");
+    let detail = format!("watch refused: {reason}");
+    capture::accounting::send_capture_observation(conn, command, None, detail.clone());
+    detail
+}
+
 /// Linux WatchTree attach. `Ok` means the tier is set up for this
 /// command, possibly with less than a full capture: no tier at all, or
 /// an LSM attach whose cwd is unusable. Those are reported as
@@ -2460,7 +2583,7 @@ fn linux_watch_tree(
     lsm_state: Option<&LsmDispatch>,
     command: shit_planner::events::CommandId,
     root_pid: u32,
-    cwd_path: &str,
+    cwd: Result<WatchCwd, String>,
 ) -> Result<(), String> {
     let (session, command_seq) = (command.session, command.seq);
     if let Some(state) = fanotify_state {
@@ -2473,7 +2596,6 @@ fn linux_watch_tree(
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
         // L01: explicit dedupe-state init for the command.
-        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
         if let Some(rt) = &state.capture_runtime
             && let Ok(mut g) = rt.lock()
         {
@@ -2484,21 +2606,26 @@ fn linux_watch_tree(
                 state.overflows.load(std::sync::atomic::Ordering::Acquire),
             );
             if let Ok(cwd) = &cwd {
-                g.note_direct_children_baseline(command, cwd);
+                g.note_direct_children_baseline(command, &cwd.path);
             }
         }
-        let cwd = cwd?;
+        let WatchCwd {
+            fd: cwd_fd,
+            path: cwd,
+        } = cwd?;
         // L01: narrow-scope fanotify mark on the watch cwd
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
         // the box). Stash the path so UnwatchTree can unmark it.
-        match fanotify::mark::mark_dir_for_capture(&state.fd, &cwd) {
+        match fanotify::mark::mark_dir_for_capture(&state.fd, std::os::fd::AsFd::as_fd(&cwd_fd)) {
             Ok(()) => {
-                state
-                    .marked_paths
-                    .lock()
-                    .unwrap()
-                    .insert(command, cwd.clone());
+                state.marked_paths.lock().unwrap().insert(
+                    command,
+                    fanotify::runtime::MarkedDir {
+                        path: cwd.clone(),
+                        fd: cwd_fd,
+                    },
+                );
                 tracing::info!(
                     %session,
                     command_seq,
@@ -2521,7 +2648,6 @@ fn linux_watch_tree(
             .lock()
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
-        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
         // L04 — pre-open every regular file under the cwd. The held
         // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
         // unlink handler can read the pre-image content even though
@@ -2536,7 +2662,7 @@ fn linux_watch_tree(
                 ebpf::ringbuf_losses_observed(),
             );
             if let Ok(cwd) = &cwd {
-                g.pre_open_tree(command, cwd);
+                g.pre_open_tree(command, &cwd.path);
             }
         }
         match &cwd {
@@ -2544,7 +2670,7 @@ fn linux_watch_tree(
                 %session,
                 command_seq,
                 root_pid,
-                cwd = %cwd.display(),
+                cwd = %cwd.path.display(),
                 tier = "ebpf-lsm",
                 "watch_tree registered + cwd pre-opened (LSM tier)"
             ),
@@ -2598,7 +2724,9 @@ mod linux_watch_tests {
     fn watch_root_prefers_the_reported_cwd() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_linux_watch_cwd(dir.path().to_str().unwrap(), std::process::id()).unwrap(),
+            resolve_linux_watch_cwd(dir.path().to_str().unwrap(), std::process::id())
+                .unwrap()
+                .path,
             std::fs::canonicalize(dir.path()).unwrap()
         );
     }
@@ -2607,7 +2735,9 @@ mod linux_watch_tests {
     fn watch_root_falls_back_when_the_report_does_not_resolve() {
         let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(
-            resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", std::process::id()).unwrap(),
+            resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", std::process::id())
+                .unwrap()
+                .path,
             own
         );
     }
@@ -2620,14 +2750,18 @@ mod linux_watch_tests {
         std::fs::create_dir(&lossy).unwrap();
         let own = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(
-            resolve_linux_watch_cwd(lossy.to_str().unwrap(), std::process::id()).unwrap(),
+            resolve_linux_watch_cwd(lossy.to_str().unwrap(), std::process::id())
+                .unwrap()
+                .path,
             own
         );
     }
 
     #[test]
     fn watch_root_reports_the_reason_when_neither_resolves() {
-        let err = resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", dead_pid()).unwrap_err();
+        let err = resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", dead_pid())
+            .err()
+            .unwrap();
         assert!(err.contains("shit-r3a-cwd"), "{err}");
     }
 
@@ -2641,9 +2775,58 @@ mod linux_watch_tests {
         assert!(validated_linux_watch_cwd(file.to_str().unwrap()).is_err());
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
         assert_eq!(
-            validated_linux_watch_cwd(dir.path().to_str().unwrap()).unwrap(),
+            validated_linux_watch_cwd(dir.path().to_str().unwrap())
+                .unwrap()
+                .path,
             canonical
         );
+    }
+
+    /// #230: a directory the peer cannot open (no read permission) is
+    /// not watched, though it exists and is reachable.
+    #[test]
+    fn watch_cwd_the_peer_cannot_open_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let err = validated_linux_watch_cwd(locked.to_str().unwrap())
+            .err()
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err.contains("Permission denied"), "{err}");
+    }
+
+    /// #230: the process fallback does not reach a cwd the peer may not
+    /// inspect (pid 1's cwd belongs to root).
+    #[test]
+    fn fallback_to_another_users_cwd_is_refused() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        assert!(resolve_linux_watch_cwd("/nonexistent/shit-230", 1).is_err());
+    }
+
+    /// A deleted directory is not a watch root.
+    #[test]
+    fn deleted_watch_cwd_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&gone)
+            .spawn()
+            .unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        let r = resolve_linux_watch_cwd("/nonexistent/shit-230", child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(r.is_err());
     }
 
     fn lsm_dispatch() -> LsmDispatch {
@@ -2670,7 +2853,7 @@ mod linux_watch_tests {
                 Some(&dispatch),
                 command,
                 root,
-                "/nonexistent/shit-r3a-cwd"
+                resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", root)
             )
             .is_ok()
         );
@@ -2705,7 +2888,14 @@ mod linux_watch_tests {
             };
             let state = fanotify_state_that_cannot_mark();
             let root = dead_pid();
-            let result = linux_watch_tree(&helper, Some(&state), None, command, root, cwd);
+            let result = linux_watch_tree(
+                &helper,
+                Some(&state),
+                None,
+                command,
+                root,
+                resolve_linux_watch_cwd(cwd, root),
+            );
             assert!(result.is_err(), "{cwd}");
             assert_eq!(
                 state.tree.lock().unwrap().is_tracked(root as i32),
@@ -2733,7 +2923,7 @@ mod linux_watch_tests {
                 Some(&dispatch),
                 command,
                 1,
-                dir.path().to_str().unwrap()
+                resolve_linux_watch_cwd(dir.path().to_str().unwrap(), 1)
             )
             .is_ok()
         );
@@ -2764,7 +2954,17 @@ mod linux_watch_tests {
             session: uuid::Uuid::from_u128(9),
             seq: 2,
         };
-        assert!(linux_watch_tree(&helper, None, None, command, 1, "/nonexistent").is_ok());
+        assert!(
+            linux_watch_tree(
+                &helper,
+                None,
+                None,
+                command,
+                1,
+                resolve_linux_watch_cwd("/nonexistent", 1)
+            )
+            .is_ok()
+        );
         assert!(matches!(
             daemon.recv_response().unwrap(),
             shit_proto::HelperResponse::CaptureRefused { seq: 2, path: None, detail, .. }
@@ -2792,6 +2992,7 @@ mod linux_watch_tests {
 /// disconnects or sends `Shutdown`.
 fn request_loop(
     conn: Arc<ipc::Conn>,
+    #[cfg(target_os = "linux")] mut watch_scope: watch_scope::WatchScope,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
     #[cfg(target_os = "linux")] lsm_state: Option<LsmDispatch>,
     #[cfg(any(
@@ -2848,14 +3049,26 @@ fn request_loop(
                     continue;
                 }
                 #[cfg(target_os = "linux")]
-                let attach = linux_watch_tree(
-                    &conn,
-                    fanotify_state.as_ref(),
-                    lsm_state.as_ref(),
-                    command,
-                    root_pid,
-                    &cwd_path,
-                );
+                let attach = match watch_scope.authorize(session, root_pid) {
+                    Ok(ident) => {
+                        // The watch root may come from /proc/<pid>/cwd, so
+                        // the pid must still be the authorized process
+                        // once it is open (review item 4).
+                        let cwd = resolve_linux_watch_cwd(&cwd_path, root_pid);
+                        match watch_scope::still_same(root_pid, ident.start) {
+                            Ok(()) => linux_watch_tree(
+                                &conn,
+                                fanotify_state.as_ref(),
+                                lsm_state.as_ref(),
+                                command,
+                                root_pid,
+                                cwd,
+                            ),
+                            Err(reason) => Err(refuse_watch(&conn, command, root_pid, &reason)),
+                        }
+                    }
+                    Err(reason) => Err(refuse_watch(&conn, command, root_pid, &reason)),
+                };
                 #[cfg(not(any(
                     target_os = "linux",
                     target_os = "freebsd",
@@ -3053,12 +3266,15 @@ fn request_loop(
                             Some(state.overflows.load(std::sync::atomic::Ordering::Acquire)),
                         );
                     }
-                    if let Some(path) = state.marked_paths.lock().unwrap().remove(&cmd)
-                        && let Err(e) = fanotify::mark::unmark_dir_for_capture(&state.fd, &path)
+                    if let Some(dir) = state.marked_paths.lock().unwrap().remove(&cmd)
+                        && let Err(e) = fanotify::mark::unmark_dir_for_capture(
+                            &state.fd,
+                            std::os::fd::AsFd::as_fd(&dir.fd),
+                        )
                     {
                         tracing::warn!(
                             err = %e,
-                            path = %path.display(),
+                            path = %dir.path.display(),
                             "unmark_dir_for_capture failed (continuing)"
                         );
                     }
@@ -3209,11 +3425,8 @@ fn request_loop(
             HelperRequest::Handshake { .. } => {
                 tracing::warn!("unexpected duplicate Handshake; ignoring");
             }
-            // AU28 / DR-15 stage-1 — chown is wired: helper actually
-            // calls libc::chown/lchown when the daemon's
-            // HelperLinkPrivilegedOpRouter routes a chown request
-            // here. Mknod stays stubbed; AU22 lands the libc::mkfifo /
-            // libc::mknod implementation for Fifo/Socket kinds.
+            // AU28 / DR-15 stage-1, scoped by #227: the helper changes an
+            // owner only with a capture token it issued for that file.
             HelperRequest::ApplyChown {
                 session,
                 command_seq,
@@ -3221,8 +3434,19 @@ fn request_loop(
                 uid,
                 gid,
                 no_dereference,
+                owner,
             } => {
-                let outcome = apply_chown(&path, uid, gid, no_dereference);
+                #[cfg(target_os = "linux")]
+                let outcome = apply_chown(
+                    &path,
+                    uid,
+                    gid,
+                    no_dereference,
+                    owner.as_ref(),
+                    capture_token::process_key(),
+                );
+                #[cfg(not(target_os = "linux"))]
+                let outcome = apply_chown(&path, uid, gid, no_dereference, owner.as_ref());
                 tracing::info!(
                     %session,
                     command_seq,
@@ -3267,23 +3491,76 @@ fn request_loop(
     }
 }
 
-/// AU28 — helper-side ApplyChown handler. The daemon's
-/// HelperLinkPrivilegedOpRouter dispatches a chown the daemon
-/// process can't perform itself (no CAP_CHOWN), routing it here
-/// where the helper holds CAP_CHOWN. `no_dereference == true` ->
-/// lchown(2) (used when the target is a symlink and the captured
-/// metadata is the symlink's own ownership, not its target's).
+/// AU28 / #227 - helper-side ApplyChown handler. Every field of the
+/// request is attacker-controlled (D-28), so the helper changes an owner
+/// only on its own evidence, in this order:
 ///
-/// Path validation: the helper trusts the daemon to send only
-/// paths the daemon's planner derived from journaled events. A
-/// daemon compromise could chown arbitrary paths via this surface;
-/// the equivalent threat already exists via every other privileged
-/// helper IPC (mknod, kill targets, etc.).
+/// 1. capture evidence is present and its token verifies under this
+///    process's key against the requested owner, the file's
+///    `(dev, ino)`, the path and the capturing command (another
+///    helper's token is refused as expired);
+/// 2. the parent is opened one component at a time without following
+///    symlinks;
+/// 3. the entry is opened `O_PATH|O_NOFOLLOW` under that dirfd and must
+///    still be the captured inode on the captured device (D-31: a
+///    different `st_dev` is a different file);
+/// 4. the owner is changed through that fd. The helper holds no
+///    `CAP_CHOWN` (the startup drop strips it from permitted), so the
+///    kernel allows only what the invoking user could do anyway.
+#[cfg(target_os = "linux")]
 fn apply_chown(
     path: &str,
     uid: u32,
     gid: u32,
     no_dereference: bool,
+    owner: Option<&shit_proto::OwnerEvidence>,
+    key: Option<&capture_token::TokenKey>,
+) -> shit_proto::PrivilegedOpOutcome {
+    use shit_proto::PrivilegedOpOutcome;
+    let refuse = |reason: String| PrivilegedOpOutcome::Refused { reason };
+    let Some(ev) = owner else {
+        return refuse("no capture evidence for this ownership change".to_string());
+    };
+    let Some(key) = key else {
+        return refuse("helper has no capture-token key (kernel RNG unavailable at start)".into());
+    };
+    let facts = capture_token::OwnerFacts {
+        uid,
+        gid,
+        dev: ev.dev,
+        ino: ev.inode,
+        path,
+        session: ev.session,
+        seq: ev.command_seq,
+    };
+    if let Err(e) = key.verify(&facts, &ev.token) {
+        return refuse(e.reason().to_string());
+    }
+    let (parent, name) = match dirfd::open_parent_nofollow(path) {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    dirfd::owner_at(
+        &parent,
+        &name,
+        (ev.dev, ev.inode),
+        uid,
+        gid,
+        !no_dereference,
+    )
+}
+
+/// AU28 - non-Linux ApplyChown, unchanged by #227: chown(2), or
+/// lchown(2) for `no_dereference`, on the path. The owner-evidence gate
+/// is Linux-only until the macOS and FreeBSD helpers issue capture
+/// tokens of their own; `owner` is ignored here.
+#[cfg(not(target_os = "linux"))]
+fn apply_chown(
+    path: &str,
+    uid: u32,
+    gid: u32,
+    no_dereference: bool,
+    _owner: Option<&shit_proto::OwnerEvidence>,
 ) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
     let c_path = match std::ffi::CString::new(path) {
@@ -3780,6 +4057,85 @@ mod dirfd {
         }
     }
 
+    /// #227 - give the entry `name` under `parent` the owner `uid:gid`,
+    /// only if it is still the inode `ident` (`(st_dev, st_ino)`). The
+    /// entry is opened without following a symlink and changed through
+    /// that fd; `follow` (a chown(2) rather than lchown(2) request) on a
+    /// symlink is refused.
+    pub(super) fn owner_at(
+        parent: &OwnedFd,
+        name: &CStr,
+        ident: (u64, u64),
+        uid: u32,
+        gid: u32,
+        follow: bool,
+    ) -> PrivilegedOpOutcome {
+        let node = match open_at(parent.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                return PrivilegedOpOutcome::NotFound;
+            }
+            Err(e) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("open entry: {e}"),
+                };
+            }
+        };
+        let st = match fstat_fd(&node) {
+            Ok(st) => st,
+            Err(e) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("fstat entry: {e}"),
+                };
+            }
+        };
+        if (st.st_dev, st.st_ino) != ident {
+            return PrivilegedOpOutcome::Conflict {
+                detail: format!(
+                    "the entry at the path is {:#x}:{}, not the captured file {:#x}:{}",
+                    st.st_dev, st.st_ino, ident.0, ident.1
+                ),
+            };
+        }
+        if follow && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return PrivilegedOpOutcome::Refused {
+                reason: "the captured file is a symlink and the request would follow it; \
+                         the helper does not follow symlinks"
+                    .to_string(),
+            };
+        }
+        if st.st_uid == uid && st.st_gid == gid {
+            return PrivilegedOpOutcome::Applied;
+        }
+        let rc = unsafe {
+            libc::fchownat(
+                node.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if rc != 0 {
+            let e = errno();
+            return match e.raw_os_error() {
+                Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+                _ => PrivilegedOpOutcome::Failed {
+                    err: format!("fchownat {uid}:{gid}: {e}"),
+                },
+            };
+        }
+        match fstat_fd(&node) {
+            Ok(st) if st.st_uid == uid && st.st_gid == gid => PrivilegedOpOutcome::Applied,
+            Ok(st) => PrivilegedOpOutcome::Failed {
+                err: format!("owner is {}:{} after the change", st.st_uid, st.st_gid),
+            },
+            Err(e) => PrivilegedOpOutcome::Failed {
+                err: format!("fstat after chown: {e}"),
+            },
+        }
+    }
+
     fn describe(st: &libc::stat) -> String {
         format!(
             "mode {:o}, rdev {:#x}, owner {}:{}",
@@ -3829,14 +4185,15 @@ mod dirfd {
         // Permission bits 0: the umask can only clear bits, so it needs no
         // change (a process-wide umask(0) would race with capture threads
         // creating staging files). The fchmod step below sets the mode.
-        let rc = unsafe {
+        // #226: CAP_MKNOD is effective for this one call, on this thread.
+        let rc = crate::priv_linux::with_cap(crate::priv_linux::CAP_MKNOD, || unsafe {
             libc::mknodat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
                 ifmt as libc::mode_t,
                 rdev as libc::dev_t,
             )
-        };
+        });
         if rc != 0 {
             let e = errno();
             return match e.raw_os_error() {
@@ -4339,47 +4696,273 @@ mod apply_chown_tests {
     use super::*;
     use shit_proto::PrivilegedOpOutcome;
 
+    /// #227: on Linux a chown with no capture evidence is refused,
+    /// before anything is touched.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn chown_to_self_uid_is_applied() {
+    fn chown_without_evidence_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("self_chown");
+        let p = dir.path().join("f");
         std::fs::write(&p, b"x").unwrap();
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
-        let outcome = apply_chown(p.to_str().unwrap(), uid, gid, false);
-        assert_eq!(
-            outcome,
-            PrivilegedOpOutcome::Applied,
-            "self-chown should succeed without CAP_CHOWN"
-        );
+        let key = capture_token::process_key();
+        let o = apply_chown(p.to_str().unwrap(), uid, gid, true, None, key);
+        assert!(matches!(o, PrivilegedOpOutcome::Refused { .. }), "{o:?}");
+        // Not even an arbitrary root path gets past the evidence check.
+        let o = apply_chown("/etc/shadow", uid, gid, false, None, key);
+        assert!(matches!(o, PrivilegedOpOutcome::Refused { .. }), "{o:?}");
     }
 
-    #[test]
-    fn chown_nonexistent_path_is_not_found() {
-        let outcome = apply_chown("/nonexistent/au28/does/not/exist", 0, 0, false);
-        assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
+    /// Off Linux the pre-#227 path-based chown is kept until those
+    /// helpers issue capture tokens.
+    #[cfg(not(target_os = "linux"))]
+    mod non_linux {
+        use super::*;
+
+        #[test]
+        fn chown_to_self_uid_is_applied() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("self_chown");
+            std::fs::write(&p, b"x").unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let outcome = apply_chown(p.to_str().unwrap(), uid, gid, false, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        }
+
+        #[test]
+        fn chown_nonexistent_path_is_not_found() {
+            let outcome = apply_chown("/nonexistent/au28/does/not/exist", 0, 0, false, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
+        }
+
+        #[test]
+        fn chown_path_with_nul_byte_fails() {
+            let outcome = apply_chown("/tmp/has\0nul", 0, 0, false, None);
+            assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
+        }
+
+        #[test]
+        fn lchown_branch_is_reachable() {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join("au28_link");
+            std::os::unix::fs::symlink("/nonexistent-target", &link).unwrap();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            let outcome = apply_chown(link.to_str().unwrap(), uid, gid, true, None);
+            assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        }
     }
 
-    #[test]
-    fn chown_path_with_nul_byte_fails() {
-        // CString construction rejects interior NUL, surfacing as
-        // Failed{err}; the helper never reaches the chown syscall.
-        let outcome = apply_chown("/tmp/has\0nul", 0, 0, false);
-        assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
-    }
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use std::os::unix::fs::MetadataExt;
 
-    #[test]
-    fn lchown_branch_is_reachable() {
-        // Differentiates from the dereferencing chown branch.
-        // We don't need the symlink to point at anything; lchown
-        // operates on the link itself.
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("au28_link");
-        std::os::unix::fs::symlink("/nonexistent-target", &link).unwrap();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        let outcome = apply_chown(link.to_str().unwrap(), uid, gid, true);
-        assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        fn this_helper() -> &'static capture_token::TokenKey {
+            capture_token::process_key().expect("kernel RNG")
+        }
+
+        fn me() -> (u32, u32) {
+            unsafe { (libc::geteuid(), libc::getegid()) }
+        }
+
+        /// Evidence `key` would issue for `path` as it is on disk now,
+        /// claiming `owner` as the captured owner.
+        fn evidence(
+            key: &capture_token::TokenKey,
+            path: &str,
+            owner: (u32, u32),
+        ) -> shit_proto::OwnerEvidence {
+            let m = std::fs::symlink_metadata(path).unwrap();
+            let session = uuid::Uuid::from_u128(0x227);
+            let token = key.issue(&capture_token::OwnerFacts {
+                uid: owner.0,
+                gid: owner.1,
+                dev: m.dev(),
+                ino: m.ino(),
+                path,
+                session,
+                seq: 9,
+            });
+            shit_proto::OwnerEvidence {
+                dev: m.dev(),
+                inode: m.ino(),
+                session,
+                command_seq: 9,
+                token,
+            }
+        }
+
+        fn chown(
+            path: &str,
+            owner: (u32, u32),
+            follow: bool,
+            ev: &shit_proto::OwnerEvidence,
+        ) -> PrivilegedOpOutcome {
+            apply_chown(
+                path,
+                owner.0,
+                owner.1,
+                !follow,
+                Some(ev),
+                Some(this_helper()),
+            )
+        }
+
+        fn refused(o: &PrivilegedOpOutcome, needle: &str) -> bool {
+            matches!(o, PrivilegedOpOutcome::Refused { reason } if reason.contains(needle))
+        }
+
+        #[test]
+        fn valid_evidence_for_the_current_owner_is_applied() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            assert_eq!(chown(ps, me(), false, &ev), PrivilegedOpOutcome::Applied);
+        }
+
+        /// A token with its MAC flipped, or for other fields than the
+        /// request, is refused and nothing changes.
+        #[test]
+        fn forged_or_mismatched_evidence_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            let mut bad = ev;
+            bad.token.mac[0] ^= 1;
+            assert!(refused(&chown(ps, me(), false, &bad), "does not match"));
+            // Same token, another owner (root): the classic escalation.
+            assert!(refused(&chown(ps, (0, 0), false, &ev), "does not match"));
+            // Same token, another path.
+            let q = dir.path().join("g");
+            std::fs::write(&q, b"y").unwrap();
+            assert!(refused(
+                &chown(q.to_str().unwrap(), me(), false, &ev),
+                "does not match"
+            ));
+            // Another inode or device claimed for the same token.
+            for v in [
+                shit_proto::OwnerEvidence {
+                    inode: ev.inode + 1,
+                    ..ev
+                },
+                shit_proto::OwnerEvidence {
+                    dev: ev.dev + 1,
+                    ..ev
+                },
+                shit_proto::OwnerEvidence {
+                    command_seq: 10,
+                    ..ev
+                },
+            ] {
+                assert!(refused(&chown(ps, me(), false, &v), "does not match"));
+            }
+            assert_eq!(std::fs::metadata(&p).unwrap().uid(), me().0);
+        }
+
+        #[test]
+        fn token_from_a_previous_helper_process_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let old = capture_token::TokenKey::generate().unwrap();
+            let ev = evidence(&old, ps, me());
+            assert!(refused(
+                &chown(ps, me(), false, &ev),
+                "capture evidence expired: helper restarted"
+            ));
+        }
+
+        /// The file at the path was replaced after capture: the token
+        /// names the old inode, so the new file is a conflict.
+        #[test]
+        fn replaced_file_is_a_conflict() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            let keep = dir.path().join("keep");
+            std::fs::rename(&p, &keep).unwrap();
+            std::fs::write(&p, b"new").unwrap();
+            assert!(matches!(
+                chown(ps, me(), false, &ev),
+                PrivilegedOpOutcome::Conflict { .. }
+            ));
+        }
+
+        /// A parent swapped to a symlink after capture is not followed,
+        /// even when the symlink leads to the captured file.
+        #[test]
+        fn parent_swapped_to_a_symlink_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::write(real.join("f"), b"x").unwrap();
+            let link = dir.path().join("d");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let ps = format!("{}/f", link.to_str().unwrap());
+            let ev = evidence(this_helper(), &ps, me());
+            assert!(refused(&chown(&ps, me(), false, &ev), "symlink"));
+        }
+
+        /// The entry is a symlink and the request asks for chown(2),
+        /// which would follow it: refused. lchown(2) of the link itself
+        /// is applied.
+        #[test]
+        fn following_a_symlink_entry_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("t");
+            std::fs::write(&target, b"x").unwrap();
+            let link = dir.path().join("l");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let ps = link.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            assert!(refused(&chown(ps, me(), true, &ev), "symlink"));
+            assert_eq!(chown(ps, me(), false, &ev), PrivilegedOpOutcome::Applied);
+        }
+
+        /// With a valid token for a foreign owner the helper still cannot
+        /// give it: it holds no CAP_CHOWN, so the kernel says no and the
+        /// file keeps its owner.
+        #[test]
+        fn valid_evidence_for_a_foreign_owner_is_denied_without_cap_chown() {
+            if me().0 == 0
+                || crate::priv_linux::capget().unwrap().permitted
+                    & (1 << crate::priv_linux::CAP_CHOWN)
+                    != 0
+            {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, (0, 0));
+            assert_eq!(
+                chown(ps, (0, 0), false, &ev),
+                PrivilegedOpOutcome::PermissionDenied
+            );
+            assert_eq!(std::fs::metadata(&p).unwrap().uid(), me().0);
+        }
+
+        #[test]
+        fn missing_file_is_not_found() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            std::fs::remove_file(&p).unwrap();
+            assert_eq!(chown(ps, me(), false, &ev), PrivilegedOpOutcome::NotFound);
+        }
     }
 }
 

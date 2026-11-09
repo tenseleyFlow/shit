@@ -15,7 +15,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -127,26 +127,42 @@ pub fn unmark_filesystem(fd: &FanotifyFd, path: &Path) -> Result<(), MarkError> 
 /// without it the mark only fires for opens of the directory inode
 /// itself. ONLYDIR keeps the mark from accidentally pinning a
 /// regular file passed in by mistake.
-pub fn mark_dir_for_capture(fd: &FanotifyFd, dir: &Path) -> Result<(), MarkError> {
+///
+/// #230: the directory is the held fd `dir`, not a path. With a NULL
+/// pathname the kernel marks `dir`'s own inode, so nothing is
+/// re-resolved between the scope check that opened it and the mark.
+pub fn mark_dir_for_capture(fd: &FanotifyFd, dir: BorrowedFd<'_>) -> Result<(), MarkError> {
     let mask = libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_EVENT_ON_CHILD;
-    mark(
-        fd,
-        MarkFlags::ADD | MarkFlags::ONLYDIR,
-        mask,
-        libc::AT_FDCWD,
-        dir,
-    )
+    mark_held(fd, MarkFlags::ADD | MarkFlags::ONLYDIR, mask, dir)
 }
 
-/// Remove a mark previously added by [`mark_dir_for_capture`]. Pair
-/// with UnwatchTree so per-command marks are cleaned up.
-pub fn unmark_dir_for_capture(fd: &FanotifyFd, dir: &Path) -> Result<(), MarkError> {
+/// Remove a mark previously added by [`mark_dir_for_capture`], on the
+/// same held fd. Pair with UnwatchTree so per-command marks are cleaned
+/// up.
+pub fn unmark_dir_for_capture(fd: &FanotifyFd, dir: BorrowedFd<'_>) -> Result<(), MarkError> {
     let mask = libc::FAN_OPEN_PERM | libc::FAN_ACCESS_PERM | libc::FAN_EVENT_ON_CHILD;
-    mark(
-        fd,
-        MarkFlags::REMOVE | MarkFlags::ONLYDIR,
-        mask,
-        libc::AT_FDCWD,
-        dir,
-    )
+    mark_held(fd, MarkFlags::REMOVE | MarkFlags::ONLYDIR, mask, dir)
+}
+
+/// `fanotify_mark(2)` on the inode `dir` holds (pathname NULL).
+fn mark_held(
+    fd: &FanotifyFd,
+    flags: MarkFlags,
+    event_mask: u64,
+    dir: BorrowedFd<'_>,
+) -> Result<(), MarkError> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_fanotify_mark,
+            fd.as_raw_fd(),
+            flags.bits() as libc::c_uint,
+            event_mask,
+            dir.as_raw_fd() as libc::c_int,
+            std::ptr::null::<libc::c_char>(),
+        )
+    };
+    if rc < 0 {
+        return Err(MarkError::Syscall(io::Error::last_os_error()));
+    }
+    Ok(())
 }

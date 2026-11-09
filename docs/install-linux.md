@@ -32,6 +32,8 @@ shit doctor                          # on a host with fanotify or eBPF-LSM the t
 
 If `shit doctor` reports a missing capability, run `sudo setcap cap_bpf,cap_perfmon,cap_sys_admin+ep /usr/bin/shit-helper`.
 
+The helper uses these capabilities only while it starts: `cap_sys_admin` to open its fanotify group, `cap_bpf` and `cap_perfmon` to load and attach the BPF-LSM programs. Before it starts any worker thread it removes them from its effective and permitted sets, so a running helper holds no effective capability. If `cap_mknod` is also granted, the helper keeps it permitted and raises it only for the `mknodat` call that restores a block or character device node. On a kernel older than 6.5 with `kernel.unprivileged_bpf_disabled` set, it also keeps `cap_bpf` permitted to read its ring-buffer loss counters.
+
 ## From the release tarball
 
 `shit-<version>-x86_64-unknown-linux-gnu.tar.zst` (and `aarch64`) holds the same tree under `bin/`, `lib/` and `share/shit/`. Extract it, copy the files into `/usr/local`, give the helper its capabilities, and let `shit service install` write the systemd user unit with the real binary path:
