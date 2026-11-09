@@ -187,6 +187,8 @@ impl CloseAccounting {
     /// A diff found `id` in a directory whose start-of-command listing
     /// did not hold it. That is birth only if the whole walk completed
     /// and nothing could have moved a pre-existing file in.
+    // Only the kqueue producer diffs listings.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn note_absent_from_listing(&mut self, id: Id) {
         if id != (0, 0) {
             self.absent.insert(id);
@@ -194,6 +196,7 @@ impl CloseAccounting {
     }
 
     /// True when the baseline walk saw `id`.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn is_baseline(&self, id: Id) -> bool {
         self.baseline.contains(&id)
     }
