@@ -106,7 +106,7 @@ pub struct HelperLink {
     pub helper_uid: u32,
     pub granted: HelperCaps,
     /// Capture-tier classifier the helper reported in the handshake
-    /// (DR-66). E.g. `"fanotify"`, `"bpf-lsm"`, `"endpoint-security"`,
+    /// (DR-66). E.g. `"fanotify"`, `"ebpf-lsm"`, `"endpoint-security"`,
     /// `"kqueue"`. Forwarded to `Stats::set_kernel_tier` after
     /// link-up so `shit metrics` and the structured log stream
     /// surface what's actually running.

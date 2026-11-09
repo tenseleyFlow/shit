@@ -96,6 +96,15 @@ if ! grep -q "lsm-setattr CapturedPreImage sent" "${SHIT_SMOKE_TMP}/shitd.log"; 
 fi
 smoke_log "LSM inode_setattr handler confirmed fired"
 
+# #235: the handshake must report the tier that is running. Before the
+# fix the Linux helper always said "fanotify".
+metrics_out="$("${SHIT_BIN}" metrics 2>&1)"
+if ! grep -q "kernel tier .* ebpf-lsm" <<<"${metrics_out}"; then
+    smoke_fail "expected 'kernel tier ... ebpf-lsm' in metrics; got:
+${metrics_out}"
+fi
+smoke_log "handshake kernel_tier = ebpf-lsm"
+
 "${SHIT_BIN}" undo --yes 2>&1 | tee "${SHIT_SMOKE_TMP}/undo.log" || {
     sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
     smoke_fail "shit undo --yes exited non-zero"

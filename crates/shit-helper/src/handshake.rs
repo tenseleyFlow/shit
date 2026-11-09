@@ -34,15 +34,13 @@ use crate::ipc::{Conn, ConnError};
 /// &'static str`; the new shape returns a tuple so the wire can
 /// carry both pieces in one pass over the probe (the ES probe is a
 /// few-µs syscall but still worth avoiding a duplicate).
+///
+/// Linux has no entry here (#235): its tier is chosen at runtime
+/// (eBPF-LSM, the fanotify-perm fallback, or degraded) and `main`
+/// passes that result to [`perform_helper_side`] through
+/// `linux_kernel_tier_report`.
+#[cfg(not(target_os = "linux"))]
 pub fn classify_kernel_tier() -> (&'static str, Option<String>) {
-    #[cfg(target_os = "linux")]
-    {
-        // DR-01..04 light up bpf-lsm; until then the helper falls
-        // back to fanotify-perm (DR-08). The string mirrors the
-        // expected production tier so the operator sees the right
-        // banner during Stage 1 even though the runtime is degraded.
-        ("fanotify", None)
-    }
     #[cfg(target_os = "macos")]
     {
         // M03.1.I.6: runtime probe of EndpointSecurity. The probe
@@ -138,11 +136,15 @@ pub struct HandshakeOutcome {
 /// the daemon-spawned helper was given. `local_caps` is what we *can*
 /// offer (computed by the caller from platform + privilege). We grant
 /// the intersection of what the daemon asks for and what we can do.
+/// `kernel_tier` is the `(tier, degraded_reason)` pair the ack
+/// reports; the caller computes it from the capture runtime it
+/// actually started.
 pub fn perform_helper_side(
     conn: &Conn,
     expected_daemon_pid: u32,
     expected_daemon_uid: u32,
     local_caps: HelperCaps,
+    kernel_tier: (&'static str, Option<String>),
 ) -> Result<HandshakeOutcome, HandshakeError> {
     let (peer_pid, peer_uid) = peer_cred(conn.as_raw_fd())?;
     if peer_pid != expected_daemon_pid {
@@ -193,7 +195,7 @@ pub fn perform_helper_side(
     }
 
     let granted = capability_request.intersect(local_caps);
-    let (tier, degraded_reason) = classify_kernel_tier();
+    let (tier, degraded_reason) = kernel_tier;
     let self_verify = self_verify_report();
     let ack = HelperResponse::HandshakeAck {
         helper_pid: std::process::id(),
@@ -388,7 +390,13 @@ mod tests {
         let expected_uid = current_uid();
 
         let server_thread = thread::spawn(move || {
-            perform_helper_side(&server, expected_pid, expected_uid, HelperCaps::full())
+            perform_helper_side(
+                &server,
+                expected_pid,
+                expected_uid,
+                HelperCaps::full(),
+                ("fanotify", None),
+            )
         });
 
         let outcome_daemon = perform_daemon_side(&client, HelperCaps::full()).unwrap();
@@ -411,7 +419,13 @@ mod tests {
         };
 
         let server_thread = thread::spawn(move || {
-            perform_helper_side(&server, expected_pid, expected_uid, helper_local)
+            perform_helper_side(
+                &server,
+                expected_pid,
+                expected_uid,
+                helper_local,
+                ("fanotify", None),
+            )
         });
         let outcome = perform_daemon_side(&client, HelperCaps::full()).unwrap();
         let helper_outcome = server_thread.join().unwrap().unwrap();
@@ -423,7 +437,56 @@ mod tests {
     fn handshake_refuses_wrong_pid() {
         let (_client, server) = socketpair().unwrap();
         let wrong_pid = std::process::id().wrapping_add(1);
-        let res = perform_helper_side(&server, wrong_pid, current_uid(), HelperCaps::full());
+        let res = perform_helper_side(
+            &server,
+            wrong_pid,
+            current_uid(),
+            HelperCaps::full(),
+            ("fanotify", None),
+        );
         assert!(matches!(res, Err(HandshakeError::PidMismatch { .. })));
+    }
+
+    /// #235: the ack carries the tier the caller reports, so a helper
+    /// running eBPF-LSM (or falling back from it) says so on the wire.
+    #[test]
+    fn handshake_ack_reports_the_runtime_tier() {
+        for report in [
+            ("ebpf-lsm", None),
+            ("fanotify", Some("ebpf-lsm load failed: attach".to_string())),
+        ] {
+            let (client, server) = socketpair().unwrap();
+            let expected_pid = std::process::id();
+            let expected_uid = current_uid();
+            let sent = report.clone();
+            let server_thread = thread::spawn(move || {
+                perform_helper_side(
+                    &server,
+                    expected_pid,
+                    expected_uid,
+                    HelperCaps::full(),
+                    sent,
+                )
+            });
+            client
+                .send_request(&HelperRequest::Handshake {
+                    daemon_pid: expected_pid,
+                    daemon_uid: expected_uid,
+                    protocol_version: HELPER_PROTOCOL_VERSION,
+                    capability_request: HelperCaps::full(),
+                })
+                .unwrap();
+            let HelperResponse::HandshakeAck {
+                kernel_tier,
+                degraded_reason,
+                ..
+            } = client.recv_response().unwrap()
+            else {
+                panic!("expected HandshakeAck");
+            };
+            server_thread.join().unwrap().unwrap();
+            assert_eq!(kernel_tier, report.0);
+            assert_eq!(degraded_reason, report.1);
+        }
     }
 }

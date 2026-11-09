@@ -1205,6 +1205,11 @@ struct PrivilegedSetup {
     /// the runtime path (DR-01..DR-04 will use it).
     #[allow(dead_code)]
     tier: CaptureTier,
+    /// Why the eBPF-LSM prerequisite probe said no, when it did.
+    /// Reported as the handshake's `degraded_reason` when the helper
+    /// runs fanotify instead (#235).
+    #[cfg(target_os = "linux")]
+    ebpf_unavailable: Option<String>,
 }
 
 /// Which kernel-tier capture path is in effect.
@@ -1274,12 +1279,13 @@ fn privileged_setup() -> PrivilegedSetup {
     #[cfg(target_os = "linux")]
     {
         let (caps, fanotify_fd) = linux_privileged_setup();
-        let tier = pick_linux_tier(fanotify_fd.is_some());
+        let (tier, ebpf_unavailable) = pick_linux_tier(fanotify_fd.is_some());
         tracing::info!(tier = tier.label(), "kernel capture tier picked");
         PrivilegedSetup {
             caps,
             fanotify_fd,
             tier,
+            ebpf_unavailable,
         }
     }
     #[cfg(any(
@@ -1787,12 +1793,13 @@ fn probe_fmode_created(staging: &std::path::Path, flush: &[ebpf::LsmFlushHandle]
 ///     ebpf-lsm prerequisites are met (regression test for the older
 ///     tier on capable kernels).
 #[cfg(target_os = "linux")]
-fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
+fn pick_linux_tier(have_fanotify_fd: bool) -> (CaptureTier, Option<String>) {
     let forced = std::env::var("SHIT_FORCE_TIER").ok();
 
     let loader = ebpf::EbpfLoader::new();
     let outcome = loader.probe();
     let ebpf_ok = outcome.should_attempt_load();
+    let unavailable = (!ebpf_ok).then(|| outcome.diagnose());
 
     match forced.as_deref() {
         Some("ebpf-lsm") => {
@@ -1801,19 +1808,19 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
                 forced = true,
                 "SHIT_FORCE_TIER=ebpf-lsm — picking EbpfLsm"
             );
-            return CaptureTier::EbpfLsm;
+            return (CaptureTier::EbpfLsm, None);
         }
         Some("fanotify-perm") => {
             if ebpf_ok && have_fanotify_fd {
                 tracing::info!(
                     "SHIT_FORCE_TIER=fanotify-perm — using Fanotify despite ebpf-lsm being available"
                 );
-                return CaptureTier::EbpfLsmAvailableButDeferred;
+                return (CaptureTier::EbpfLsmAvailableButDeferred, None);
             }
             if have_fanotify_fd {
-                return CaptureTier::Fanotify;
+                return (CaptureTier::Fanotify, unavailable);
             }
-            return CaptureTier::Degraded;
+            return (CaptureTier::Degraded, unavailable);
         }
         Some(other) => {
             tracing::warn!(
@@ -1831,7 +1838,7 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
             cap_perfmon = outcome.caps.cap_perfmon,
             "ebpf-lsm prerequisites met — picking EbpfLsm"
         );
-        return CaptureTier::EbpfLsm;
+        return (CaptureTier::EbpfLsm, None);
     }
 
     tracing::info!(
@@ -1839,9 +1846,9 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
         "ebpf-lsm not available; using fanotify if possible"
     );
     if have_fanotify_fd {
-        CaptureTier::Fanotify
+        (CaptureTier::Fanotify, unavailable)
     } else {
-        CaptureTier::Degraded
+        (CaptureTier::Degraded, unavailable)
     }
 }
 
@@ -1893,6 +1900,105 @@ fn resolve_linux_capture_startup(
         | CaptureTier::KqueueOnly
         | CaptureTier::KqueuePreloadShim
         | CaptureTier::ZfsSnapshot => Err(LinuxCaptureStartupError::InvalidPreferredTier),
+    }
+}
+
+/// The `(kernel_tier, degraded_reason)` pair the handshake ack
+/// reports on Linux (#235). `requested` is the tier privileged setup
+/// picked, `active` the one startup resolved after the real eBPF load
+/// attempt. `probe_reason` is the prerequisite probe's diagnosis when
+/// it said no; `load_error` the loader error when the attempt failed.
+#[cfg(any(target_os = "linux", test))]
+fn linux_kernel_tier_report(
+    requested: CaptureTier,
+    active: CaptureTier,
+    probe_reason: Option<&str>,
+    load_error: Option<&str>,
+) -> (&'static str, Option<String>) {
+    match active {
+        CaptureTier::EbpfLsm => ("ebpf-lsm", None),
+        CaptureTier::Fanotify => {
+            let reason = match (requested, load_error, probe_reason) {
+                (CaptureTier::EbpfLsm, Some(e), _) => Some(format!("ebpf-lsm load failed: {e}")),
+                (CaptureTier::EbpfLsmAvailableButDeferred, _, _) => {
+                    Some("ebpf-lsm available; SHIT_FORCE_TIER=fanotify-perm".to_string())
+                }
+                (_, _, Some(p)) => Some(format!("ebpf-lsm unavailable: {p}")),
+                _ => None,
+            };
+            ("fanotify", reason)
+        }
+        _ => {
+            let why = match (load_error, probe_reason) {
+                (Some(e), _) => format!("ebpf-lsm load failed: {e}"),
+                (None, Some(p)) => format!("ebpf-lsm unavailable: {p}"),
+                (None, None) if requested != CaptureTier::Degraded => {
+                    "capture runtime failed to initialize".to_string()
+                }
+                (None, None) => "no kernel capture tier available".to_string(),
+            };
+            ("degraded", Some(format!("{why}; no kernel capture")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod linux_kernel_tier_report_tests {
+    use super::{CaptureTier, linux_kernel_tier_report};
+
+    #[test]
+    fn ebpf_lsm_runtime_reports_ebpf_lsm() {
+        assert_eq!(
+            linux_kernel_tier_report(CaptureTier::EbpfLsm, CaptureTier::EbpfLsm, None, None),
+            ("ebpf-lsm", None)
+        );
+    }
+
+    #[test]
+    fn fallback_from_ebpf_names_the_load_error() {
+        let (tier, reason) = linux_kernel_tier_report(
+            CaptureTier::EbpfLsm,
+            CaptureTier::Fanotify,
+            None,
+            Some("attach lsm/inode_unlink: EPERM"),
+        );
+        assert_eq!(tier, "fanotify");
+        assert_eq!(
+            reason.as_deref(),
+            Some("ebpf-lsm load failed: attach lsm/inode_unlink: EPERM")
+        );
+    }
+
+    #[test]
+    fn fanotify_on_a_host_without_bpf_lsm_names_the_probe() {
+        let (tier, reason) = linux_kernel_tier_report(
+            CaptureTier::Fanotify,
+            CaptureTier::Fanotify,
+            Some("bpf not in /sys/kernel/security/lsm"),
+            None,
+        );
+        assert_eq!(tier, "fanotify");
+        assert!(reason.unwrap().contains("bpf not in"));
+    }
+
+    #[test]
+    fn forced_fanotify_says_so() {
+        let (tier, reason) = linux_kernel_tier_report(
+            CaptureTier::EbpfLsmAvailableButDeferred,
+            CaptureTier::Fanotify,
+            None,
+            None,
+        );
+        assert_eq!(tier, "fanotify");
+        assert!(reason.unwrap().contains("SHIT_FORCE_TIER"));
+    }
+
+    #[test]
+    fn degraded_runtime_reports_degraded_with_a_reason() {
+        let (tier, reason) =
+            linux_kernel_tier_report(CaptureTier::Fanotify, CaptureTier::Degraded, None, None);
+        assert_eq!(tier, "degraded");
+        assert!(reason.unwrap().contains("capture runtime failed"));
     }
 }
 
@@ -2043,7 +2149,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // unused fd from the other tier (the fanotify fd after a
     // successful eBPF boot) is dropped once startup is resolved.
     #[cfg(target_os = "linux")]
-    let (fanotify_state, lsm_state) = {
+    let (fanotify_state, lsm_state, kernel_tier_report) = {
         let staging_dir = cli.state_dir.join("helper-staging");
         // A runtime that fails to initialize degrades the helper (as trunk
         // did) instead of aborting it; the daemon keeps working without
@@ -2175,17 +2281,37 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             None
         };
 
-        (fanotify_state, lsm_state)
-    };
+        // #235: report the tier that actually started, not a constant.
+        let kernel_tier_report = linux_kernel_tier_report(
+            setup.tier,
+            active_tier,
+            setup.ebpf_unavailable.as_deref(),
+            ebpf_load_error.as_ref().map(ToString::to_string).as_deref(),
+        );
+        tracing::info!(
+            kernel_tier = kernel_tier_report.0,
+            degraded_reason = kernel_tier_report.1.as_deref().unwrap_or(""),
+            "kernel tier reported in handshake"
+        );
 
-    let outcome =
-        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, setup.caps) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(err = %e, "handshake failed; exiting");
-                return Err(anyhow::anyhow!("handshake failed: {e}"));
-            }
-        };
+        (fanotify_state, lsm_state, kernel_tier_report)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let kernel_tier_report = handshake::classify_kernel_tier();
+
+    let outcome = match handshake::perform_helper_side(
+        &conn,
+        cli.daemon_pid,
+        cli.daemon_uid,
+        setup.caps,
+        kernel_tier_report,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(err = %e, "handshake failed; exiting");
+            return Err(anyhow::anyhow!("handshake failed: {e}"));
+        }
+    };
     tracing::info!(
         daemon_pid = outcome.daemon_pid,
         daemon_uid = outcome.daemon_uid,
