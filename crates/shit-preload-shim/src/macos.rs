@@ -29,7 +29,8 @@
 
 use super::policy;
 use libc::{c_char, c_int, c_uint, c_void, mode_t};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 
 /// Materialize a NUL-terminated C string into an owned `String` for
 /// the policy notification. Returns empty on NULL or invalid UTF-8
@@ -45,61 +46,36 @@ fn cstr_to_string(path: *const c_char) -> String {
     bytes.to_string_lossy().into_owned()
 }
 
-/// Resolve a path-taking `*at` call's target against its dirfd.
+/// Resolve a path-taking `*at` create's target against its dirfd, before
+/// the syscall, through the shared `*at` resolver (M3, #231): the
+/// existing parent is canonicalized and the final name is appended
+/// lexically. Resolving the final name after success would introduce a
+/// race: another thread could replace it with a symlink before
+/// `canonicalize`, misattributing the Create.
 ///
-/// The destination is resolved before the syscall by canonicalizing its
-/// existing parent and appending the final basename lexically. Resolving the
-/// final name after success would introduce a race: another thread could
-/// replace it with a symlink before `canonicalize`, misattributing the Create.
-///
-/// For a relative path with a real dirfd, interpreting it relative to the
-/// shimmed process's cwd is wrong: `mkdirat(fd, "child", ...)` targets
-/// `<fd>/child`, regardless of cwd. `F_GETPATH` supplies that missing base.
-///
-/// Resolution failures preserve the best available path and attach AU10's
-/// structured failure marker. The daemon can then journal both the partial
-/// Create and a refusal instead of silently losing a successful mutation.
+/// A relative name under a real dirfd that `F_GETPATH` cannot resolve
+/// fails closed with AU10's marker, as does any other resolution failure:
+/// the daemon then journals the partial Create and a refusal instead of
+/// silently losing a successful mutation. A missing parent means the
+/// call should fail; if it succeeds anyway the parent appeared in
+/// between, and the Create is reported with the marker.
 fn resolve_created_path_at(dirfd: c_int, path: &str) -> (String, Option<shit_proto::ShimFailure>) {
-    let path = Path::new(path);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else if dirfd == libc::AT_FDCWD {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(error) => {
-                return create_path_base_failure(path, format!("getcwd failed: {error}"));
-            }
+    match policy::resolve_leaf_at_for_notify(dirfd, path, "path") {
+        policy::AtResolution::Resolved(abs) => (abs, None),
+        policy::AtResolution::Failed(raw, failure) => (raw, Some(failure)),
+        policy::AtResolution::Nothing => {
+            // Keep the dirfd base: the joined path, not the bare name.
+            let joined = policy::join_at_path(dirfd, path);
+            (
+                joined.clone(),
+                Some(shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg: "path".to_string(),
+                    attempted_path: joined,
+                    error_chain: "parent directory did not exist before the call".to_string(),
+                }),
+            )
         }
-    } else {
-        match fd_to_path(dirfd) {
-            Some(base) => PathBuf::from(base).join(path),
-            None => {
-                return create_path_base_failure(
-                    path,
-                    format!("F_GETPATH failed for dirfd {dirfd}"),
-                );
-            }
-        }
-    };
-
-    // Run AU10's canonical-parent + lexical-basename resolution before the
-    // syscall. If canonicalization fails, this returns the absolute candidate
-    // plus ShimFailure::CanonicalizeFailed rather than dropping the event.
-    let candidate = candidate.to_string_lossy().into_owned();
-    policy::canonicalize_or_raw(&candidate, "path")
-}
-
-fn create_path_base_failure(
-    path: &Path,
-    detail: String,
-) -> (String, Option<shit_proto::ShimFailure>) {
-    let attempted_path = path.to_string_lossy().into_owned();
-    let failure = shit_proto::ShimFailure::CanonicalizeFailed {
-        which_arg: "path".to_string(),
-        attempted_path: attempted_path.clone(),
-        error_chain: detail,
-    };
-    (attempted_path, Some(failure))
+    }
 }
 
 /// Run a create-like syscall, then notify only when it actually succeeded.
@@ -180,7 +156,7 @@ where
 /// Same contract as `libc::unlink` — `pathname` must point to a
 /// valid NUL-terminated C string for the duration of the call.
 unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
-    policy::notify_unlink_entry("unlink", &cstr_to_string(pathname));
+    policy::notify_plain_pre_mutation_with_content("unlink", &cstr_to_string(pathname));
     // SAFETY: caller upholds libc::unlink's contract on pathname.
     unsafe { libc::unlink(pathname) }
 }
@@ -195,24 +171,19 @@ unsafe extern "C" fn my_unlink(pathname: *const c_char) -> c_int {
 /// valid NUL-terminated C string; `dirfd` must be `AT_FDCWD` or
 /// an open dirfd; `flags` is `0` or `AT_REMOVEDIR`.
 unsafe extern "C" fn my_unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
-    // L5: `shutil.rmtree` passes names relative to a real dirfd. Keyed
-    // against the cwd they named the wrong files.
-    let joined = join_dirfd(dirfd, &cstr_to_string(pathname));
+    // L5 / M3: `shutil.rmtree` passes names relative to a real dirfd.
+    // The shared `*at` resolver keys them to that directory and fails
+    // closed when it cannot.
+    let name = cstr_to_string(pathname);
     // Review round 2, item 2: a directory removal is reported after it
     // succeeded, with the stat from before, like rmdir.
     if flags & libc::AT_REMOVEDIR != 0 {
-        let pending = match joined {
-            Ok(p) => policy::removal_begin("unlinkat_dir", &p),
-            Err((raw, failure)) => policy::removal_pending("unlinkat_dir", raw, Some(failure)),
-        };
+        let pending = policy::removal_begin_at("unlinkat_dir", dirfd, &name);
         let rc = unsafe { libc::unlinkat(dirfd, pathname, flags) };
         policy::removal_end(pending, rc);
         return rc;
     }
-    match joined {
-        Ok(p) => policy::notify_unlink_entry("unlinkat", &p),
-        Err((raw, failure)) => policy::notify_unresolved("unlinkat", &raw, failure),
-    }
+    policy::notify_pre_mutation_with_content_at("unlinkat", dirfd, &name);
     unsafe { libc::unlinkat(dirfd, pathname, flags) }
 }
 
@@ -261,46 +232,18 @@ unsafe extern "C" fn my_renameat(
     tofd: c_int,
     to: *const c_char,
 ) -> c_int {
-    // #222 / L5: a relative name under a real dirfd names an entry of
-    // that directory, not of the cwd. Join it with F_GETPATH first.
-    let pending = match (
-        join_dirfd(fromfd, &cstr_to_string(from)),
-        join_dirfd(tofd, &cstr_to_string(to)),
-    ) {
-        (Ok(f), Ok(t)) => policy::notify_rename_with_dst_preimage("renameat", &f, &t),
-        (Err((f, failure)), Ok(t) | Err((t, _))) | (Ok(f), Err((t, failure))) => {
-            policy::notify_unresolved("renameat", &format!("{f}\t{t}"), failure);
-            None
-        }
-    };
+    // #222 / L5 / M3: a relative name under a real dirfd names an entry of
+    // that directory, not of the cwd. The shared resolver joins it.
+    let pending = policy::notify_rename_at(
+        "renameat",
+        fromfd,
+        &cstr_to_string(from),
+        tofd,
+        &cstr_to_string(to),
+    );
     let rc = unsafe { libc::renameat(fromfd, from, tofd, to) };
     policy::rename_end(pending, rc);
     rc
-}
-
-/// `path` joined with `dirfd`'s directory when it is relative to a real
-/// dirfd. Absolute paths and `AT_FDCWD` pass through for the policy
-/// layer's canonicalize. When `F_GETPATH` fails the raw name comes back
-/// with an AU10 marker: resolving it against the cwd would key the event
-/// to the wrong file.
-fn join_dirfd(dirfd: c_int, path: &str) -> Result<String, (String, shit_proto::ShimFailure)> {
-    if path.starts_with('/') || dirfd == libc::AT_FDCWD {
-        return Ok(path.to_string());
-    }
-    match fd_to_path(dirfd) {
-        Some(base) => Ok(PathBuf::from(base)
-            .join(path)
-            .to_string_lossy()
-            .into_owned()),
-        None => Err((
-            path.to_string(),
-            shit_proto::ShimFailure::CanonicalizeFailed {
-                which_arg: "path".to_string(),
-                attempted_path: path.to_string(),
-                error_chain: format!("F_GETPATH failed for dirfd {dirfd}"),
-            },
-        )),
-    }
 }
 
 // Open/openat replacements live in the C trampoline (`macos_shim.c`)
@@ -372,21 +315,14 @@ unsafe extern "C" fn rust_shim_openat(
     flags: c_int,
     mode: c_uint,
 ) -> c_int {
-    // L5: keyed to the dirfd, then the shared write-open policy.
-    // (#231 tracks routing this through the dirfd target the other
-    // platforms use.)
-    let call = |f| unsafe { libc::openat(dirfd, path, f, mode as c_int) };
-    if !policy::open_may_mutate(flags) || policy::disabled() {
-        return call(flags);
-    }
-    match join_dirfd(dirfd, &cstr_to_string(path)) {
-        Ok(p) => policy::write_open("openat", flags, || policy::OpenTarget::Path(p), call),
-        Err((raw, failure)) => {
-            let rc = call(flags);
-            policy::write_open_unresolved("openat", &raw, failure, rc);
-            rc
-        }
-    }
+    // L5 / M3: the shared write-open policy, keyed to the dirfd by the
+    // shared `*at` resolver (#231).
+    policy::write_open(
+        "openat",
+        flags,
+        || policy::OpenTarget::At(dirfd, cstr_to_string(path)),
+        |f| unsafe { libc::openat(dirfd, path, f, mode as c_int) },
+    )
 }
 
 /// Replacement for `mkdir(2)`. Captures directory-create
@@ -516,7 +452,12 @@ unsafe extern "C" fn my_fchmodat(
     mode: mode_t,
     flags: c_int,
 ) -> c_int {
-    policy::notify_pre_mutation_with_content("fchmodat", &cstr_to_string(pathname));
+    policy::notify_metadata_at(
+        "fchmodat",
+        dirfd,
+        &cstr_to_string(pathname),
+        flags & libc::AT_SYMLINK_NOFOLLOW != 0,
+    );
     unsafe { libc::fchmodat(dirfd, pathname, mode, flags) }
 }
 
@@ -591,7 +532,12 @@ unsafe extern "C" fn my_fchownat(
     group: libc::gid_t,
     flags: c_int,
 ) -> c_int {
-    policy::notify_pre_mutation_with_content("fchownat", &cstr_to_string(pathname));
+    policy::notify_metadata_at(
+        "fchownat",
+        dirfd,
+        &cstr_to_string(pathname),
+        flags & libc::AT_SYMLINK_NOFOLLOW != 0,
+    );
     unsafe { libc::fchownat(dirfd, pathname, owner, group, flags) }
 }
 
@@ -643,7 +589,12 @@ unsafe extern "C" fn my_utimensat(
     times: *const libc::timespec,
     flag: c_int,
 ) -> c_int {
-    policy::notify_pre_mutation_with_content("utimensat", &cstr_to_string(pathname));
+    policy::notify_metadata_at(
+        "utimensat",
+        dirfd,
+        &cstr_to_string(pathname),
+        flag & libc::AT_SYMLINK_NOFOLLOW != 0,
+    );
     unsafe { libc::utimensat(dirfd, pathname, times, flag) }
 }
 
@@ -811,16 +762,7 @@ unsafe extern "C" fn my_fremovexattr(fd: c_int, name: *const c_char, flags: c_in
 /// or if the call fails. macOS-specific: `F_GETPATH` writes up
 /// to `MAXPATHLEN` (1024) bytes into the user buffer.
 fn fd_to_path(fd: c_int) -> Option<String> {
-    use libc::{F_GETPATH, MAXPATHLEN, fcntl};
-    let mut buf = [0u8; MAXPATHLEN as usize];
-    // SAFETY: buf is large enough for F_GETPATH; fcntl writes a
-    // NUL-terminated path into it on success.
-    let rc = unsafe { fcntl(fd, F_GETPATH, buf.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    let nul = buf.iter().position(|&b| b == 0)?;
-    std::str::from_utf8(&buf[..nul]).ok().map(str::to_string)
+    policy::dirfd_path(fd)
 }
 
 /// Replacement for `mkdirat(2)`. Dirfd-relative variant.
@@ -1770,5 +1712,194 @@ mod rename_wire_tests {
                 .is_some_and(|s| s.mode & 0o170000 == 0o040000)
         );
         assert!(!dir.join("d").exists());
+    }
+
+    /// M3 (#231): one case per macOS `*at` interposer. Each name is
+    /// relative to a real dirfd that is not the cwd, so a key built
+    /// against the cwd would name a different (absent) file.
+    fn dir_with(
+        name: &str,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::fs::File) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+        let dfd = std::fs::File::open(&dir).unwrap();
+        (tmp, dir, dfd)
+    }
+
+    #[test]
+    fn openat_create_with_real_dirfd_is_keyed_to_that_directory() {
+        let (_tmp, dir, dfd) = dir_with("other", b"x");
+        let name = CString::new("fresh").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let fd = unsafe {
+                rust_shim_openat(
+                    dfd.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT,
+                    0o644,
+                )
+            };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "open_create")
+            .expect("open_create");
+        assert_eq!(n.arg, dir.join("fresh").to_str().unwrap());
+        assert!(n.failure.is_none());
+    }
+
+    #[test]
+    fn openat_over_existing_file_with_real_dirfd_captures_its_bytes() {
+        let (_tmp, dir, dfd) = dir_with("f", b"old");
+        let name = CString::new("f").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let fd = unsafe {
+                rust_shim_openat(
+                    dfd.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY | libc::O_TRUNC,
+                    0,
+                )
+            };
+            assert!(fd >= 0);
+            unsafe { libc::close(fd) };
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "openat")
+            .expect("openat");
+        assert_eq!(n.arg, dir.join("f").to_str().unwrap());
+        assert_eq!(n.pre_image.as_ref().unwrap().bytes, b"old");
+    }
+
+    #[test]
+    fn fchmodat_with_real_dirfd_is_keyed_to_that_directory() {
+        let (_tmp, dir, dfd) = dir_with("f", b"bytes");
+        let name = CString::new("f").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(
+                unsafe { my_fchmodat(dfd.as_raw_fd(), name.as_ptr(), 0o600, 0) },
+                0
+            );
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "fchmodat")
+            .expect("fchmodat");
+        assert_eq!(n.arg, dir.join("f").to_str().unwrap());
+        assert!(n.failure.is_none());
+    }
+
+    #[test]
+    fn fchownat_with_real_dirfd_is_keyed_to_that_directory() {
+        let (_tmp, dir, dfd) = dir_with("f", b"bytes");
+        let name = CString::new("f").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            // (uid_t)-1 and (gid_t)-1 leave both unchanged.
+            assert_eq!(
+                unsafe { my_fchownat(dfd.as_raw_fd(), name.as_ptr(), u32::MAX, u32::MAX, 0) },
+                0
+            );
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "fchownat")
+            .expect("fchownat");
+        assert_eq!(n.arg, dir.join("f").to_str().unwrap());
+    }
+
+    #[test]
+    fn utimensat_with_real_dirfd_is_keyed_to_that_directory() {
+        let (_tmp, dir, dfd) = dir_with("f", b"bytes");
+        let name = CString::new("f").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(
+                unsafe { my_utimensat(dfd.as_raw_fd(), name.as_ptr(), std::ptr::null(), 0) },
+                0
+            );
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "utimensat")
+            .expect("utimensat");
+        assert_eq!(n.arg, dir.join("f").to_str().unwrap());
+    }
+
+    #[test]
+    fn mkdirat_with_real_dirfd_is_keyed_to_that_directory() {
+        let (_tmp, dir, dfd) = dir_with("other", b"x");
+        let name = CString::new("sub").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            assert_eq!(
+                unsafe { my_mkdirat(dfd.as_raw_fd(), name.as_ptr(), 0o755) },
+                0
+            );
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "mkdirat")
+            .expect("mkdirat");
+        assert_eq!(n.arg, dir.join("sub").to_str().unwrap());
+        assert!(n.failure.is_none());
+    }
+
+    /// A dirfd `F_GETPATH` cannot resolve fails closed through the shared
+    /// resolver: the raw name goes out with the AU10 marker, never keyed
+    /// to the cwd. EBADF on the real call means no create is sent, so
+    /// the resolver is checked directly.
+    #[test]
+    fn unresolvable_dirfd_fails_closed_for_creates() {
+        let (path, failure) = resolve_created_path_at(987_654, "child");
+        assert_eq!(path, "child");
+        assert!(matches!(
+            failure,
+            Some(shit_proto::ShimFailure::CanonicalizeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn unlinkat_with_an_unresolvable_dirfd_ships_the_marker_not_a_cwd_key() {
+        let name = CString::new("x").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let rc = unsafe { my_unlinkat(987_654, name.as_ptr(), 0) };
+            assert_eq!(rc, -1);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "unlinkat")
+            .expect("unlinkat");
+        assert_eq!(n.arg, "x");
+        assert!(n.failure.is_some(), "{n:#?}");
+        assert!(n.pre_image.is_none());
+    }
+
+    #[test]
+    fn renameat_with_an_unresolvable_dirfd_ships_the_marker() {
+        let from = CString::new("a").unwrap();
+        let to = CString::new("b").unwrap();
+        let notes = policy::test_capture::capture(|| {
+            let rc = unsafe { my_renameat(987_654, from.as_ptr(), 987_654, to.as_ptr()) };
+            assert_eq!(rc, -1);
+        });
+        let n = notes
+            .iter()
+            .find(|n| n.syscall == "renameat")
+            .expect("renameat");
+        assert_eq!(n.arg, "a\tb");
+        assert!(n.failure.is_some(), "{n:#?}");
+    }
+
+    #[test]
+    fn dirfd_path_resolves_a_directory_and_rejects_a_bad_fd() {
+        let (_tmp, dir, dfd) = dir_with("f", b"x");
+        assert_eq!(
+            policy::dirfd_path(dfd.as_raw_fd()).map(|p| std::fs::canonicalize(p).unwrap()),
+            Some(dir)
+        );
+        assert!(policy::dirfd_path(-1).is_none());
     }
 }
