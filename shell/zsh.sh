@@ -106,9 +106,13 @@ __shit_post() {
 # to parse `set -o` / `alias` output. This is faster AND more
 # robust against zsh's NO_-prefixed "off" rendering quirk.
 __shit_collect_shell_state() {
+    # Copy the caller's options first: inside `emulate -L zsh`,
+    # `$options` shows the emulation's values, not the user's.
+    local -A _shit_opts
+    _shit_opts=("${(@kv)options}")
     emulate -L zsh
     local name value
-    for name value in ${(kv)options}; do
+    for name value in ${(kv)_shit_opts}; do
         printf 'OPT\t%s\t%s\0' "$name" "$value"
     done
     for name value in ${(kv)aliases}; do
