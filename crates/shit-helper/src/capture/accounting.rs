@@ -24,8 +24,9 @@
 //! order in which per-hook ring readers deliver events. A file whose
 //! unlink is handled before its creating open is still born.
 
-// The kqueue producer uses a subset: it has no walk cap, unlisted
-// directories, renames or kernel loss counter.
+// The kqueue producer uses a subset: it has no walk cap or kernel loss
+// counter, and it counts an entry that arrived from outside the walk
+// (by its birth time) as an unresolved rename.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
