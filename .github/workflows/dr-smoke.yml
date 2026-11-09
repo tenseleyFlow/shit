@@ -2509,13 +2509,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: start FreeBSD 14.2 VM
         # Same pin as ci.yml's freebsd-14 job. Keep pinned; don't follow
-        # @v1. Without `run`, the VM stays up for the cpa.sh steps below;
-        # each of them is a fresh login in the VM.
+        # @v1. With no `run`, the VM stays up for the cpa.sh steps below;
+        # each of them is a fresh login in the VM. `shutdown_vm: false`
+        # says so explicitly instead of relying on the default.
         uses: cross-platform-actions/action@v1.7.0
         with:
           operating_system: freebsd
           version: '14.2'
           shell: sh
+          shutdown_vm: false
       - name: put the smoke user in a second group
         # The CI user (`runner`) is in its own group only, so
         # chown-undo-fbsd skipped its group case. Smoke files inherit
@@ -2542,9 +2544,8 @@ jobs:
           rustc -V
 
           echo "===== configure doas (permit the CI runner user directly) ====="
-          # The cross-platform-actions VM runs commands as a user
-          # that's NOT in `wheel`, so `permit nopass :wheel` doesn't
-          # apply. Grant the current user explicitly.
+          # Grant the CI user by name. It is in `wheel` only since the
+          # previous step, and doas should not depend on that.
           CI_USER="$(id -un)"
           echo "  user: ${CI_USER}"
           printf 'permit nopass %s\npermit nopass :wheel\n' "${CI_USER}" \

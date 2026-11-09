@@ -63,7 +63,7 @@ smoke_log "ShellStateDiff events journaled: ${N_SSD}"
 
 grep -q "DR-30" "${SHIT_SMOKE_TMP}/undo.log" \
     || smoke_fail "undo output for the fish session lacks the DR-30 marker"
-FISH_SNIPPET="$(grep -E "^cd '${WATCHED}'" "${SHIT_SMOKE_TMP}/undo.log" | head -1)"
+FISH_SNIPPET="$(grep -F "cd '${WATCHED}'" "${SHIT_SMOKE_TMP}/undo.log" | grep '^cd ' | head -1)"
 [ -n "${FISH_SNIPPET}" ] || smoke_fail "undo output lacks the fish snippet (cd '${WATCHED}')"
 
 QUEUE_DIR="${XDG_STATE_HOME}/shit/precmd-queue"
