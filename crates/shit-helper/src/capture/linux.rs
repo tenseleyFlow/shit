@@ -4408,6 +4408,49 @@ mod born_set_tests {
     }
 
     #[test]
+    fn dir_renamed_onto_a_made_name_is_not_a_born_parent() {
+        // `mkdir d; rmdir d; mv deep d; rm d/x`. The mkdir handler runs
+        // last and stats d, which is now the pre-existing deep.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        rig.rt().set_fmode_created_trusted(false);
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let _made = Rig::id(&d);
+        std::fs::remove_dir(&d).unwrap();
+        let deep_id = Rig::id(&deep);
+        let above = Rig::id(deep.parent().unwrap());
+        let x_id = Rig::id(&deep.join("x"));
+        std::fs::rename(&deep, &d).unwrap();
+        std::fs::remove_file(d.join("x")).unwrap();
+        // The rmdir of the made d is not sent: its own loss would hide x.
+        rig.unlink(x_id, deep_id, "x");
+        rig.rename(deep_id, (above, "d8"), (root, "d"));
+        rig.mkdir(root, "d");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "x was pre-existing: {obs:?}");
+    }
+
+    #[test]
+    fn file_moved_out_by_an_unresolved_rename_then_written_is_refused() {
+        // `mv deep/x ../out/x; echo >> ../out/x`: x existed in the tree,
+        // and its dentry chain now places it outside.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        rig.rt().set_fmode_created_trusted(false);
+        let out = tempfile::tempdir_in(rig.dir.path().parent().unwrap()).unwrap();
+        let out_id = Rig::id(out.path());
+        let x_id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        let moved = out.path().join("x");
+        std::fs::rename(deep.join("x"), &moved).unwrap();
+        rig.rename(x_id, (deep_id, "x"), (out_id, "x"));
+        rig.chain = chain_of(&moved);
+        rig.open(x_id, false);
+        let obs = rig.close(None);
+        assert!(!obs.is_empty(), "x was pre-existing: {obs:?}");
+    }
+
+    #[test]
     fn removed_dir_reusing_an_inode_is_not_a_born_parent() {
         // `rm -r old; mkdir new` where new reuses old's inode number.
         // Simulated with one directory reported both removed and made.

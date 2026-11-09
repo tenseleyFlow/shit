@@ -137,6 +137,8 @@ pub struct CloseAccounting {
     /// Per identity in `missing`: true while every loss of it came with
     /// a dentry chain that placed it outside the root.
     dentry_outside: BTreeMap<Id, bool>,
+    /// Set by [`Self::disable_dentry_rule`].
+    dentry_rule_off: bool,
 }
 
 impl CloseAccounting {
@@ -431,15 +433,42 @@ impl CloseAccounting {
     /// `rm -r old; mkdir new` the new directory can reuse the old one's
     /// inode number, and files removed from `old` would look as if they
     /// were removed from `new`.
+    ///
+    /// Neither does a directory the walk saw or a rename moved: the
+    /// mkdir handler stats its path late, so `born` can hold a
+    /// pre-existing directory renamed onto the new name (`mkdir d;
+    /// rmdir d; mv deep d; rm d/x`).
     fn removed_from_born_dir(&self, id: &Id) -> bool {
         !self.moved.contains(id)
             && matches!(
                 self.missing_parents.get(id),
                 Some(Some(parents)) if !parents.is_empty()
-                    && parents
-                        .iter()
-                        .all(|p| self.born.contains(p) && !self.removed_dirs.contains(p))
+                    && parents.iter().all(|p| {
+                        self.born.contains(p)
+                            && !self.removed_dirs.contains(p)
+                            && !self.baseline.contains(p)
+                            && !self.moved.contains(p)
+                    })
             )
+    }
+
+    /// True when the dentry chain of every loss of `id` placed it
+    /// outside the root, and nothing in the command could have moved a
+    /// pre-existing file out of the tree first: `id` was not renamed, no
+    /// rename went unresolved (an unresolved rename may have moved a
+    /// directory holding `id` out), and the rule was not turned off.
+    fn dentry_places_outside(&self, id: &Id) -> bool {
+        !self.dentry_rule_off
+            && self.renames_unresolved == 0
+            && !self.moved.contains(id)
+            && self.dentry_outside.get(id) == Some(&true)
+    }
+
+    /// Stop using dentry chains for this command: something (a mount,
+    /// another mount namespace) may have broken the match between the
+    /// dentry tree and paths under the root.
+    pub fn disable_dentry_rule(&mut self) {
+        self.dentry_rule_off = true;
     }
 
     /// This command removed directory `id`.
@@ -545,7 +574,7 @@ impl CloseAccounting {
                 Provenance::Born | Provenance::Outside => {}
                 Provenance::Unlocated if self.born_at(obs.path.as_deref(), order) => {}
                 Provenance::Unlocated if self.removed_from_born_dir(&id) => {}
-                Provenance::Unlocated if self.dentry_outside.get(&id) == Some(&true) => {}
+                Provenance::Unlocated if self.dentry_places_outside(&id) => {}
                 Provenance::Unlocated if self.outside_root(obs.path.as_deref()) => {}
                 Provenance::Unlocated => unlocated += 1,
             }
