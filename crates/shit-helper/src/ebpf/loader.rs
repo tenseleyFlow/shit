@@ -164,6 +164,21 @@ pub type RingbufLossCounter = aya::maps::Array<aya::maps::MapData, u64>;
 /// #229: the same losses per tgid (LRU hash), with ancestry.
 const RINGBUF_LOSS_BY_TGID: &str = "ringbuf_loss_by_tgid";
 
+/// Mirrors `struct shit_loss_key` in common.h: a process, told apart
+/// from a later one that reuses its pid by the leader's start time.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LossKey {
+    pub tgid: u32,
+    pub _pad: u32,
+    pub start_time: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<LossKey>() == 16);
+
+// SAFETY: LossKey is repr(C), Copy, and every bit pattern is valid.
+unsafe impl aya::Pod for LossKey {}
+
 /// Mirrors `struct shit_loss_rec` in common.h.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -180,7 +195,7 @@ const _: () = assert!(std::mem::size_of::<LossRec>() == 48);
 unsafe impl aya::Pod for LossRec {}
 
 /// Userspace handle for one object's per-tgid loss map.
-pub type RingbufLossByTgid = aya::maps::HashMap<aya::maps::MapData, u32, LossRec>;
+pub type RingbufLossByTgid = aya::maps::HashMap<aya::maps::MapData, LossKey, LossRec>;
 
 /// One object's loss maps. Either may be missing (an object built
 /// before the map existed, or a failed take); the reader then counts

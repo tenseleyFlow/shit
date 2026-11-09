@@ -48,7 +48,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::loader::{LossMaps, LossRec};
+use super::loader::{LossKey, LossMaps, LossRec};
 
 use aya::maps::{MapData, RingBuf};
 
@@ -1001,8 +1001,8 @@ struct LossTracker {
     last: u64,
     /// `last` at the most recent read of the per-tgid map.
     tgid_read_at: u64,
-    /// Per-tgid counts at that read.
-    tgid_last: std::collections::HashMap<u32, u64>,
+    /// Per-process counts at that read.
+    tgid_last: std::collections::HashMap<LossKey, u64>,
     unreadable_logged: bool,
 }
 
@@ -1066,16 +1066,16 @@ impl LossTracker {
         let Some(by_tgid) = &self.maps.by_tgid else {
             return;
         };
-        let entries: Vec<(u32, LossRec)> =
+        let entries: Vec<(LossKey, LossRec)> =
             Self::read_map(|| by_tgid.iter().filter_map(Result::ok).collect());
         let mut seen = std::collections::HashMap::with_capacity(entries.len());
         let mut out = Vec::new();
-        for (tgid, rec) in entries {
-            let prev = self.tgid_last.get(&tgid).copied().unwrap_or(0);
-            if let Some(loss) = tgid_increase(tgid, &rec, prev) {
+        for (key, rec) in entries {
+            let prev = self.tgid_last.get(&key).copied().unwrap_or(0);
+            if let Some(loss) = tgid_increase(key.tgid, &rec, prev) {
                 out.push(loss);
             }
-            seen.insert(tgid, rec.count);
+            seen.insert(key, rec.count);
         }
         self.tgid_last = seen;
         super::loss_ledger::queue(out);

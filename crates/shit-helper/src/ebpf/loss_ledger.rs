@@ -91,7 +91,9 @@ pub(crate) fn queue(losses: impl IntoIterator<Item = TgidLoss>) {
 }
 
 /// Attribute every queued drop through `tree`, then return `command`'s
-/// loss value. Call with the tree still watching `command`.
+/// loss value. Call with the tree still watching `command`. Classifying
+/// reads no `/proc` (see [`TreeMap::classify_loss`]), so holding the tree
+/// lock across this call costs only an in-memory scan.
 pub fn ringbuf_loss_value(tree: &TreeMap, command: CommandId) -> u64 {
     let pending = PENDING
         .lock()

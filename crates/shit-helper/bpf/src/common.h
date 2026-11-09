@@ -152,11 +152,16 @@ struct {
     __type(value, __u64);
 } ringbuf_loss_count SEC(".maps");
 
-/* #229: the same losses, keyed by the tgid whose event was dropped, with
- * that process's ancestry at the time of the drop. Userspace attributes
- * each tgid's increase to the command whose tree holds it, the same way
- * it attributes events, so an overflow caused by an unrelated process
+/* #229: the same losses, keyed by the process whose event was dropped,
+ * with that process's ancestry at its first drop. Userspace attributes
+ * each process's increase to the command whose tree holds it, the same
+ * way it attributes events, so an overflow caused by an unrelated process
  * does not count against every active command.
+ *
+ * The key is (tgid, start time of the thread-group leader), so a pid the
+ * kernel reuses for a new process gets a new entry and never inherits the
+ * dead process's ancestry. Entries are not removed when a process exits;
+ * the LRU retires them.
  *
  * LRU: under a storm of distinct tgids old entries are evicted and their
  * counts vanish. Userspace notices because the per-tgid increases then
@@ -164,6 +169,12 @@ struct {
  * active command, as before this map existed. The per-tgid update runs
  * before the total's, so a reader that reads the total first never sees
  * a total the per-tgid entries cannot cover yet. */
+struct shit_loss_key {
+    __u32 tgid;
+    __u32 _pad;
+    __u64 start_time;
+};
+
 struct shit_loss_rec {
     __u64 count;
     __u32 parent_pid;
@@ -174,19 +185,21 @@ struct shit_loss_rec {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 1024);
-    __type(key, __u32);
+    __type(key, struct shit_loss_key);
     __type(value, struct shit_loss_rec);
 } ringbuf_loss_by_tgid SEC(".maps");
 
 static __always_inline void shit_note_ringbuf_loss(void)
 {
-    __u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    struct shit_loss_rec *rec = bpf_map_lookup_elem(&ringbuf_loss_by_tgid, &tgid);
+    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+    struct shit_loss_key k = {};
+    k.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    k.start_time = BPF_CORE_READ(t, group_leader, start_time);
+    struct shit_loss_rec *rec = bpf_map_lookup_elem(&ringbuf_loss_by_tgid, &k);
     if (rec) {
         __sync_fetch_and_add(&rec->count, 1);
     } else {
         struct shit_event_hdr h = {};
-        struct task_struct *t = (struct task_struct *)bpf_get_current_task();
         shit_fill_ancestry(&h, BPF_CORE_READ(t, real_parent));
         struct shit_loss_rec fresh = {};
         fresh.count = 1;
@@ -195,9 +208,9 @@ static __always_inline void shit_note_ringbuf_loss(void)
         for (int i = 0; i < SHIT_ANCESTRY_DEPTH; i++) {
             fresh.ancestors[i] = h.ancestors[i];
         }
-        if (bpf_map_update_elem(&ringbuf_loss_by_tgid, &tgid, &fresh, BPF_NOEXIST) != 0) {
+        if (bpf_map_update_elem(&ringbuf_loss_by_tgid, &k, &fresh, BPF_NOEXIST) != 0) {
             /* Another CPU inserted it first. */
-            rec = bpf_map_lookup_elem(&ringbuf_loss_by_tgid, &tgid);
+            rec = bpf_map_lookup_elem(&ringbuf_loss_by_tgid, &k);
             if (rec) {
                 __sync_fetch_and_add(&rec->count, 1);
             }

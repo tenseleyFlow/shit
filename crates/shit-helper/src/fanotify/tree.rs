@@ -168,8 +168,10 @@ impl TreeMap {
     /// that cannot be placed must not be called someone else's: strict
     /// mode charges an [`LossOwner::Unknown`] drop to every active
     /// command. A chain the kernel recorded in full, with no tracked
-    /// root in it, belongs to no command. A truncated chain is followed
-    /// up `/proc`; a process that is gone there makes the drop Unknown.
+    /// root in it, belongs to no command. A truncated chain is Unknown:
+    /// following it up `/proc` could reach a reused pid and charge the
+    /// wrong command. This reads no `/proc`, so it is cheap to call with
+    /// the tree locked.
     pub fn classify_loss(&self, tgid: i32, ancestry: &[i32]) -> LossOwner {
         let end = ancestry.iter().position(|&a| a <= 0);
         let recorded = &ancestry[..end.unwrap_or(ancestry.len())];
@@ -181,28 +183,10 @@ impl TreeMap {
             return LossOwner::Command(s, seq);
         }
         if end.is_some() {
-            return LossOwner::Other;
+            LossOwner::Other
+        } else {
+            LossOwner::Unknown
         }
-        let Some(&top) = recorded.last() else {
-            return LossOwner::Unknown;
-        };
-        let mut current = top;
-        for _ in 0..64 {
-            match parent_pid(current) {
-                Some(0) | Some(1) => return LossOwner::Other,
-                None => return LossOwner::Unknown,
-                Some(ppid) => {
-                    if self.excluded.contains(&ppid) {
-                        return LossOwner::Other;
-                    }
-                    if let Some((s, seq)) = self.root_in([ppid]) {
-                        return LossOwner::Command(s, seq);
-                    }
-                    current = ppid;
-                }
-            }
-        }
-        LossOwner::Unknown
     }
 
     /// Walk `/proc/<pid>/stat` up the parent chain from `pid` looking
@@ -497,11 +481,14 @@ mod tests {
     }
 
     #[test]
-    fn truncated_loss_chain_with_a_gone_top_is_unknown() {
-        // Every slot filled and the topmost recorded process is gone, so
-        // nothing says whether a tracked root is above it.
-        let tm = TreeMap::new();
-        let full = [GONE_SH; 9];
-        assert_eq!(tm.classify_loss(GONE_CHILD, &full), LossOwner::Unknown);
+    fn truncated_loss_chain_is_unknown() {
+        // Every slot filled: nothing recorded says whether a tracked root
+        // is above it, and /proc may hold a reused pid there. The chain
+        // is this live process, so a /proc walk would find one.
+        let mut tm = TreeMap::new();
+        let (me, parent) = me_and_parent();
+        tm.watch(Uuid::from_u128(229), 5, parent_pid(parent).unwrap_or(1));
+        let full = [me; 9];
+        assert_eq!(tm.classify_loss(me, &full), LossOwner::Unknown);
     }
 }
