@@ -57,6 +57,10 @@ sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 
 N_SSD="$(smoke_journal_count "discriminant = 'ShellStateDiff'")"
 smoke_log "ShellStateDiff events journaled: ${N_SSD}"
+if [ "${N_SSD}" -lt 1 ]; then
+    smoke_log "zsh session output:"
+    tr -d '\033' < "${SHIT_SMOKE_TMP}/zsh.out" | sed 's/^/    /' >&2
+fi
 [ "${N_SSD}" -ge 1 ] || smoke_fail "the zsh hook journaled no ShellStateDiff for the cd"
 
 smoke_hook_queue_drained
