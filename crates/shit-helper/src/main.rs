@@ -3482,9 +3482,9 @@ fn request_loop(
 /// 3. the entry is opened `O_PATH|O_NOFOLLOW` under that dirfd and must
 ///    still be the captured inode on the captured device (D-31: a
 ///    different `st_dev` is a different file);
-/// 4. the owner is changed through that fd, with `CAP_CHOWN` raised for
-///    the one call if it is permitted (it is not granted today, so the
-///    kernel allows only what the invoking user could do anyway).
+/// 4. the owner is changed through that fd. The helper holds no
+///    `CAP_CHOWN` (the startup drop strips it from permitted), so the
+///    kernel allows only what the invoking user could do anyway.
 #[cfg(target_os = "linux")]
 fn apply_chown(
     path: &str,
@@ -4058,7 +4058,7 @@ mod dirfd {
         if st.st_uid == uid && st.st_gid == gid {
             return PrivilegedOpOutcome::Applied;
         }
-        let rc = crate::priv_linux::with_cap(crate::priv_linux::CAP_CHOWN, || unsafe {
+        let rc = unsafe {
             libc::fchownat(
                 node.as_raw_fd(),
                 c"".as_ptr(),
@@ -4066,7 +4066,7 @@ mod dirfd {
                 gid,
                 libc::AT_EMPTY_PATH,
             )
-        });
+        };
         if rc != 0 {
             let e = errno();
             return match e.raw_os_error() {

@@ -33,14 +33,17 @@
 //! the calling thread, for one syscall. Nothing else needs one:
 //! `fanotify_mark` on an inode, reading fanotify events and ring
 //! buffers, and fifo/socket restores all work without. `CAP_CHOWN` is
-//! not granted; `apply_chown` asks for it through [`with_cap`], which
-//! runs without it when it is not permitted.
+//! neither granted nor kept: the startup sets strip it from permitted,
+//! so `apply_chown` calls `fchownat` with no capability and the kernel
+//! allows only what the invoking user could do.
 //!
 //! One exception: on kernels before 6.5 with
 //! `kernel.unprivileged_bpf_disabled` set, every `bpf(2)` call needs
 //! `CAP_BPF`, including the ring-buffer loss counter reads. There,
 //! `CAP_BPF` stays permitted (never effective outside [`with_cap`]) so
-//! drops can still be counted. See [`runtime_bpf_needs_cap`].
+//! drops can still be counted. See [`runtime_bpf_needs_cap`]; the
+//! answer is computed once, in [`finish_startup`], and read through
+//! [`bpf_cap_kept`].
 
 use std::io;
 
@@ -56,6 +59,8 @@ pub enum PrivError {
 
 /// Numeric capability constants. Values are pinned by the kernel ABI
 /// (`include/uapi/linux/capability.h`); libc does not export them.
+/// Only tests name it: they check it is never permitted.
+#[cfg(test)]
 pub const CAP_CHOWN: u32 = 0;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_MKNOD: u32 = 27;
@@ -250,6 +255,15 @@ fn clear_ambient() -> Result<(), PrivError> {
 
 static STARTUP_FINISHED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
+/// Whether [`finish_startup`] kept `CAP_BPF` permitted for map reads.
+static BPF_CAP_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when `CAP_BPF` was kept permitted so map reads can raise it.
+/// Fixed once startup finishes; false before.
+pub fn bpf_cap_kept() -> bool {
+    BPF_CAP_KEPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// End of startup: drop to [`runtime_sets`] on this thread, then check
 /// that no thread of the process holds more. Call it on the main thread
 /// after the kernel tier is set up and before any worker thread starts.
@@ -270,6 +284,7 @@ pub fn finish_startup() -> Result<(), PrivError> {
         return Err(PrivError::ThreadsKeepCaps(bad.join("; ")));
     }
     *done = true;
+    BPF_CAP_KEPT.store(keep_bpf, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
         permitted = format!("{:#x}", next.permitted),
         keep_bpf,
