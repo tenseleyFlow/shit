@@ -32,7 +32,7 @@ else
   exit 1
 fi
 
-PKGS="sudo gmake python3 sqlite3 doas jq git vim gawk rsync curl ca_root_nss bash"
+PKGS="sudo gmake python3 sqlite3 doas jq git vim gawk rsync curl ca_root_nss bash zsh fish"
 if [ "${FBSD_VM_ARCH:-amd64}" = aarch64 ]; then
   PKGS="${PKGS} rust"
 fi
