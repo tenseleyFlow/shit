@@ -16,7 +16,8 @@
 # the registry. npm replaces the package directory; the pass condition
 # is that the v1 module is back byte-identical and still prints v1.
 # A loud refusal (non-zero exit naming a conflict) is accepted unless
-# SHIT_REQUIRE_OUTCOME_A=1.
+# SHIT_REQUIRE_OUTCOME_A=1. Undo exits 1 and leaves a temp symlink (#261);
+# the smoke gates on the module restore and logs the tree diff.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

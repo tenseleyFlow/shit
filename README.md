@@ -230,9 +230,10 @@ Gaps where coverage is plausible but not shipped, or shipped without CI evidence
 
 These should work in practice once the underlying mechanism is wired (no architectural blocker discovered), but they don't have a pinned smoke today:
 
-- **`helm install / uninstall`** — same shape as `docker compose`; descriptor candidate in AR08.2.
-- **`ufw allow / deny`, `firewall-cmd --add-port`** — both are thin wrappers over iptables/nft; descriptor candidates.
-- **`npm install -g`, `gem install`** — same LD_PRELOAD shim path as `pip install --user`. AR08.2.
+- **`helm install / uninstall`** and **`firewall-cmd`** are refused (classes `cluster-release` and `firewalld`), pinned by `refuse-helm-linux` and `refuse-firewall-cmd-linux`. Before the refusal, `shit undo` exited 0 having applied nothing.
+- **`ufw allow`** through the ufw wrapper is undone when ufw is enabled: `ufw-allow-undo-linux` checks that the rule is gone after undo.
+- **`npm install -g`** over an older version restores the old module (`npm-install-global-undo-linux`), but undo exits 1 with a phantom conflict and leaves npm's temp symlink in `bin/` (#261).
+- **`gem install`** over an older version restores every file (`gem-install-undo-linux`) and leaves the new gem's empty directory behind (#260).
 
 ## OS support matrix
 
