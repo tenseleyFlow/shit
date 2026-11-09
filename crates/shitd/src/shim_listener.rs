@@ -226,22 +226,19 @@ async fn handle_one(
     );
 
     // The shim notifies before the real unlink runs, so the path still
-    // exists here. Stat it first: on macOS and FreeBSD `resolve_by_descendant`
-    // below shells out to `ps` once per ancestor and can outlast the shim's 50 ms ack
+    // exists here. Stat it first: a slow `resolve_by_descendant` below
+    // (a deep chain on a loaded host) can outlast the shim's 50 ms ack
     // timeout, after which the syscall has run and the path is gone. By
     // ingest time only the wire's Regular default would be left.
     let unlink_stat = pre_syscall_unlink_stat(&note);
 
-    // Resolve `pid → CommandId` BEFORE acking. The shim returns to
-    // the calling process immediately after we ack, the real
-    // syscall fires, and the process (e.g. `install` invoked by
-    // `make`) often terminates within milliseconds. If we resolve
-    // after acking, `ancestor_chain` shells out to `ps -p <pid>`
-    // for an already-dead pid and returns None — the notification
-    // is then orphaned. Doing the resolution synchronously here
-    // costs ~10ms (one ps invocation per ancestor level); we have
-    // 40ms of headroom inside the shim's 50ms allow-on-timeout
-    // budget.
+    // Resolve the command BEFORE acking. The shim returns to the
+    // calling process immediately after we ack, the real syscall
+    // fires, and the process (e.g. `install` invoked by `make`) often
+    // terminates within milliseconds. A note with a command key does
+    // not need the sender alive (R8, #210). One without a key falls
+    // back to the pid walk, which needs every ancestor alive, so it
+    // runs here while the shim is still waiting for the ack.
     //
     // Reserve journal order before allowing the intercepted syscall to
     // run. Ingestion itself remains fail-open and happens after the ACK,

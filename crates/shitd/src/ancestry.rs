@@ -29,7 +29,8 @@
 //!   past the preload shim's 50 ms ack timeout. The shim then let the
 //!   syscall run, rsync exited, the walk hit a dead pid and the shim
 //!   listener dropped the notification (#202).
-//! - **macOS**: shells out to `ps -o ppid= -p <pid>` (~5 ms per hop).
+//! - **macOS**: `proc_pidinfo(PROC_PIDTBSDINFO)` and `pbi_ppid`. This
+//!   used to fork `ps -o ppid=` per hop (~5 ms each; #210, #251).
 //!
 //! ## Loop guard
 //!
@@ -132,21 +133,27 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 pub fn parent_pid(pid: u32) -> Option<u32> {
-    use std::process::{Command, Stdio};
-    let out = Command::new("ps")
-        .arg("-o")
-        .arg("ppid=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    // R8 (#210, #251): libproc in-process, as shit-helper's proc
+    // snapshot does. This used to fork `ps -o ppid=` per hop (~5 ms
+    // each), which let a short-lived shim sender exit mid-walk.
+    // SAFETY: proc_bsdinfo is plain old data; zeroed is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is writable for `size` bytes and PROC_PIDTBSDINFO
+    // fills exactly a proc_bsdinfo.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            libc::c_int::try_from(pid).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if rc < size {
         return None;
     }
-    let s = std::str::from_utf8(&out.stdout).ok()?.trim();
-    s.parse().ok()
+    Some(info.pbi_ppid)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
@@ -207,8 +214,8 @@ mod tests {
 
     #[test]
     fn ancestor_chain_for_self_terminates() {
-        // /proc/<pid>/status is real on Linux and ps -o ppid= works
-        // on macOS — the test platform either way produces a chain.
+        // /proc/<pid>/status on Linux, sysctl on FreeBSD and libproc
+        // on macOS: the test platform either way produces a chain.
         // We only assert it terminates within the depth limit and
         // includes our own pid as the first element.
         let pid = std::process::id();
