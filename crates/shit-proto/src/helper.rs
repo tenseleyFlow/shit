@@ -44,7 +44,10 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 /// **Version 6 (L4/L4b):** `CapturedPreImage` gained `rdev` and
 /// `device_token`; `ApplyMknod` carries `DeviceEvidence`;
 /// `PrivilegedOpOutcome` gained `Conflict` and `Refused`.
-pub const HELPER_PROTOCOL_VERSION: u16 = 6;
+///
+/// **Version 7 (L6, #227):** `ApplyChown` carries `OwnerEvidence`; the
+/// helper refuses a chown without a token it issued for that file.
+pub const HELPER_PROTOCOL_VERSION: u16 = 7;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -221,18 +224,26 @@ pub enum HelperRequest {
     /// DR-15 privileged-op routing: ask the helper to chown a path
     /// the daemon's unprivileged FileExecutor couldn't touch (target
     /// uid/gid differs from the daemon's effective uid, kernel
-    /// returned EPERM). Helper validates the path is under the
-    /// session's watched scope before applying.
+    /// returned EPERM).
+    ///
+    /// #227 / D-28: the helper acts only with `owner` evidence, a token
+    /// this helper process issued for the file at `path` with this
+    /// `(dev, inode)` and this `uid`/`gid` as its owner. It opens the
+    /// parent without following symlinks, requires the entry to still
+    /// be that inode on that device, and changes it through the held
+    /// fd. Anything else is refused.
     ApplyChown {
         session: Uuid,
         command_seq: u64,
         path: String,
         uid: u32,
         gid: u32,
-        /// `true` = call lchown(2) instead of chown(2). The executor
-        /// passes `true` when the target is a symlink — the captured
-        /// metadata is the symlink's, not the target's.
+        /// `true` = change the entry itself, not a symlink's target.
+        /// The helper never follows a symlink: with `false` and a
+        /// symlink at `path`, it refuses.
         no_dereference: bool,
+        /// #227 - the capture evidence for this ownership change.
+        owner: Option<OwnerEvidence>,
     },
     /// DR-15 privileged-op routing: mknod for character/block special
     /// files and FIFOs. Same audit shape as ApplyChown — helper
@@ -284,6 +295,19 @@ pub struct DeviceEvidence {
     pub uid: u32,
     pub gid: u32,
     /// `(st_dev, st_ino)` of the removed node.
+    pub dev: u64,
+    pub inode: u64,
+    pub session: Uuid,
+    pub command_seq: u64,
+    pub token: CaptureToken,
+}
+
+/// #227 - the captured identity of a file whose owner an `ApplyChown`
+/// gives back. The token covers `(dev, inode)`, the request's `path`,
+/// `uid` and `gid`, and the command that changed the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerEvidence {
+    /// `(st_dev, st_ino)` of the file at capture.
     pub dev: u64,
     pub inode: u64,
     pub session: Uuid,
@@ -986,7 +1010,8 @@ mod tests {
         //     `UnwatchTreeFlushed`.
         //   Version 6 (L4/L4b) added device rdev, capture tokens and
         //     the Conflict/Refused privileged-op outcomes.
-        assert_eq!(HELPER_PROTOCOL_VERSION, 6);
+        //   Version 7 (L6) added owner evidence to `ApplyChown`.
+        assert_eq!(HELPER_PROTOCOL_VERSION, 7);
     }
 
     #[test]

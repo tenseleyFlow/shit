@@ -2026,8 +2026,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         // privileged_setup). Drop the startup capabilities before the
         // fanotify reader thread exists. Done already when the eBPF tier
         // booted; this covers the fanotify and degraded paths.
-        priv_linux::finish_startup()
-            .map_err(|e| anyhow::anyhow!("capability drop failed: {e}"))?;
+        priv_linux::finish_startup().map_err(|e| anyhow::anyhow!("capability drop failed: {e}"))?;
 
         let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
         let active_tier = match resolve_linux_capture_startup(
@@ -3221,11 +3220,8 @@ fn request_loop(
             HelperRequest::Handshake { .. } => {
                 tracing::warn!("unexpected duplicate Handshake; ignoring");
             }
-            // AU28 / DR-15 stage-1 — chown is wired: helper actually
-            // calls libc::chown/lchown when the daemon's
-            // HelperLinkPrivilegedOpRouter routes a chown request
-            // here. Mknod stays stubbed; AU22 lands the libc::mkfifo /
-            // libc::mknod implementation for Fifo/Socket kinds.
+            // AU28 / DR-15 stage-1, scoped by #227: the helper changes an
+            // owner only with a capture token it issued for that file.
             HelperRequest::ApplyChown {
                 session,
                 command_seq,
@@ -3233,8 +3229,19 @@ fn request_loop(
                 uid,
                 gid,
                 no_dereference,
+                owner,
             } => {
-                let outcome = apply_chown(&path, uid, gid, no_dereference);
+                #[cfg(target_os = "linux")]
+                let outcome = apply_chown(
+                    &path,
+                    uid,
+                    gid,
+                    no_dereference,
+                    owner.as_ref(),
+                    capture_token::process_key(),
+                );
+                #[cfg(not(target_os = "linux"))]
+                let outcome = apply_chown(&path, uid, gid, no_dereference, owner.as_ref());
                 tracing::info!(
                     %session,
                     command_seq,
@@ -3279,53 +3286,79 @@ fn request_loop(
     }
 }
 
-/// AU28 — helper-side ApplyChown handler. The daemon's
-/// HelperLinkPrivilegedOpRouter dispatches a chown the daemon
-/// process can't perform itself (no CAP_CHOWN), routing it here
-/// where the helper holds CAP_CHOWN. `no_dereference == true` ->
-/// lchown(2) (used when the target is a symlink and the captured
-/// metadata is the symlink's own ownership, not its target's).
+/// AU28 / #227 - helper-side ApplyChown handler. Every field of the
+/// request is attacker-controlled (D-28), so the helper changes an owner
+/// only on its own evidence, in this order:
 ///
-/// Path validation: the helper trusts the daemon to send only
-/// paths the daemon's planner derived from journaled events. A
-/// daemon compromise could chown arbitrary paths via this surface;
-/// the equivalent threat already exists via every other privileged
-/// helper IPC (mknod, kill targets, etc.).
+/// 1. capture evidence is present and its token verifies under this
+///    process's key against the requested owner, the file's
+///    `(dev, ino)`, the path and the capturing command (another
+///    helper's token is refused as expired);
+/// 2. the parent is opened one component at a time without following
+///    symlinks;
+/// 3. the entry is opened `O_PATH|O_NOFOLLOW` under that dirfd and must
+///    still be the captured inode on the captured device (D-31: a
+///    different `st_dev` is a different file);
+/// 4. the owner is changed through that fd, with `CAP_CHOWN` raised for
+///    the one call if it is permitted (it is not granted today, so the
+///    kernel allows only what the invoking user could do anyway).
+#[cfg(target_os = "linux")]
 fn apply_chown(
     path: &str,
     uid: u32,
     gid: u32,
     no_dereference: bool,
+    owner: Option<&shit_proto::OwnerEvidence>,
+    key: Option<&capture_token::TokenKey>,
 ) -> shit_proto::PrivilegedOpOutcome {
     use shit_proto::PrivilegedOpOutcome;
-    let c_path = match std::ffi::CString::new(path) {
-        Ok(s) => s,
-        Err(e) => {
-            return PrivilegedOpOutcome::Failed {
-                err: format!("path contains NUL: {e}"),
-            };
-        }
+    let refuse = |reason: String| PrivilegedOpOutcome::Refused { reason };
+    let Some(ev) = owner else {
+        return refuse("no capture evidence for this ownership change".to_string());
     };
-    let rc = unsafe {
-        if no_dereference {
-            libc::lchown(c_path.as_ptr(), uid, gid)
-        } else {
-            libc::chown(c_path.as_ptr(), uid, gid)
-        }
+    let Some(key) = key else {
+        return refuse("helper has no capture-token key (kernel RNG unavailable at start)".into());
     };
-    if rc == 0 {
-        return PrivilegedOpOutcome::Applied;
+    let facts = capture_token::OwnerFacts {
+        uid,
+        gid,
+        dev: ev.dev,
+        ino: ev.inode,
+        path,
+        session: ev.session,
+        seq: ev.command_seq,
+    };
+    if let Err(e) = key.verify(&facts, &ev.token) {
+        return refuse(e.reason().to_string());
     }
-    let errno = std::io::Error::last_os_error();
-    match errno.raw_os_error() {
-        Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
-        Some(libc::ENOENT) => PrivilegedOpOutcome::NotFound,
-        _ => PrivilegedOpOutcome::Failed {
-            err: format!(
-                "{}: {errno}",
-                if no_dereference { "lchown" } else { "chown" }
-            ),
-        },
+    let (parent, name) = match dirfd::open_parent_nofollow(path) {
+        Ok(v) => v,
+        Err(o) => return o,
+    };
+    dirfd::owner_at(
+        &parent,
+        &name,
+        (ev.dev, ev.inode),
+        uid,
+        gid,
+        !no_dereference,
+    )
+}
+
+/// Non-Linux helpers issue no capture tokens, so they have no evidence
+/// to act on and refuse every ownership change (#227).
+#[cfg(not(target_os = "linux"))]
+fn apply_chown(
+    _path: &str,
+    _uid: u32,
+    _gid: u32,
+    _no_dereference: bool,
+    _owner: Option<&shit_proto::OwnerEvidence>,
+) -> shit_proto::PrivilegedOpOutcome {
+    shit_proto::PrivilegedOpOutcome::Refused {
+        reason: "ownership restore through the helper needs capture evidence, which only \
+                 the Linux helper issues"
+            .to_string(),
     }
 }
 
@@ -3789,6 +3822,85 @@ mod dirfd {
                     err: format!("chmod {perms:o}: {e}; node removed"),
                 }
             }
+        }
+    }
+
+    /// #227 - give the entry `name` under `parent` the owner `uid:gid`,
+    /// only if it is still the inode `ident` (`(st_dev, st_ino)`). The
+    /// entry is opened without following a symlink and changed through
+    /// that fd; `follow` (a chown(2) rather than lchown(2) request) on a
+    /// symlink is refused.
+    pub(super) fn owner_at(
+        parent: &OwnedFd,
+        name: &CStr,
+        ident: (u64, u64),
+        uid: u32,
+        gid: u32,
+        follow: bool,
+    ) -> PrivilegedOpOutcome {
+        let node = match open_at(parent.as_raw_fd(), name, libc::O_PATH | libc::O_NOFOLLOW) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                return PrivilegedOpOutcome::NotFound;
+            }
+            Err(e) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("open entry: {e}"),
+                };
+            }
+        };
+        let st = match fstat_fd(&node) {
+            Ok(st) => st,
+            Err(e) => {
+                return PrivilegedOpOutcome::Failed {
+                    err: format!("fstat entry: {e}"),
+                };
+            }
+        };
+        if (st.st_dev, st.st_ino) != ident {
+            return PrivilegedOpOutcome::Conflict {
+                detail: format!(
+                    "the entry at the path is {:#x}:{}, not the captured file {:#x}:{}",
+                    st.st_dev, st.st_ino, ident.0, ident.1
+                ),
+            };
+        }
+        if follow && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return PrivilegedOpOutcome::Refused {
+                reason: "the captured file is a symlink and the request would follow it; \
+                         the helper does not follow symlinks"
+                    .to_string(),
+            };
+        }
+        if st.st_uid == uid && st.st_gid == gid {
+            return PrivilegedOpOutcome::Applied;
+        }
+        let rc = crate::priv_linux::with_cap(crate::priv_linux::CAP_CHOWN, || unsafe {
+            libc::fchownat(
+                node.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
+        });
+        if rc != 0 {
+            let e = errno();
+            return match e.raw_os_error() {
+                Some(libc::EPERM) => PrivilegedOpOutcome::PermissionDenied,
+                _ => PrivilegedOpOutcome::Failed {
+                    err: format!("fchownat {uid}:{gid}: {e}"),
+                },
+            };
+        }
+        match fstat_fd(&node) {
+            Ok(st) if st.st_uid == uid && st.st_gid == gid => PrivilegedOpOutcome::Applied,
+            Ok(st) => PrivilegedOpOutcome::Failed {
+                err: format!("owner is {}:{} after the change", st.st_uid, st.st_gid),
+            },
+            Err(e) => PrivilegedOpOutcome::Failed {
+                err: format!("fstat after chown: {e}"),
+            },
         }
     }
 
@@ -4352,47 +4464,250 @@ mod apply_chown_tests {
     use super::*;
     use shit_proto::PrivilegedOpOutcome;
 
+    /// #227: a chown with no capture evidence is refused on every
+    /// platform, before anything is touched.
     #[test]
-    fn chown_to_self_uid_is_applied() {
+    fn chown_without_evidence_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("self_chown");
+        let p = dir.path().join("f");
         std::fs::write(&p, b"x").unwrap();
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
-        let outcome = apply_chown(p.to_str().unwrap(), uid, gid, false);
-        assert_eq!(
-            outcome,
-            PrivilegedOpOutcome::Applied,
-            "self-chown should succeed without CAP_CHOWN"
+        #[cfg(target_os = "linux")]
+        let o = apply_chown(
+            p.to_str().unwrap(),
+            uid,
+            gid,
+            true,
+            None,
+            capture_token::process_key(),
         );
+        #[cfg(not(target_os = "linux"))]
+        let o = apply_chown(p.to_str().unwrap(), uid, gid, true, None);
+        assert!(matches!(o, PrivilegedOpOutcome::Refused { .. }), "{o:?}");
+        // Not even an arbitrary root path gets past the evidence check.
+        #[cfg(target_os = "linux")]
+        let o = apply_chown(
+            "/etc/shadow",
+            uid,
+            gid,
+            false,
+            None,
+            capture_token::process_key(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let o = apply_chown("/etc/shadow", uid, gid, false, None);
+        assert!(matches!(o, PrivilegedOpOutcome::Refused { .. }), "{o:?}");
     }
 
-    #[test]
-    fn chown_nonexistent_path_is_not_found() {
-        let outcome = apply_chown("/nonexistent/au28/does/not/exist", 0, 0, false);
-        assert_eq!(outcome, PrivilegedOpOutcome::NotFound);
-    }
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+        use std::os::unix::fs::MetadataExt;
 
-    #[test]
-    fn chown_path_with_nul_byte_fails() {
-        // CString construction rejects interior NUL, surfacing as
-        // Failed{err}; the helper never reaches the chown syscall.
-        let outcome = apply_chown("/tmp/has\0nul", 0, 0, false);
-        assert!(matches!(outcome, PrivilegedOpOutcome::Failed { .. }));
-    }
+        fn this_helper() -> &'static capture_token::TokenKey {
+            capture_token::process_key().expect("kernel RNG")
+        }
 
-    #[test]
-    fn lchown_branch_is_reachable() {
-        // Differentiates from the dereferencing chown branch.
-        // We don't need the symlink to point at anything; lchown
-        // operates on the link itself.
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("au28_link");
-        std::os::unix::fs::symlink("/nonexistent-target", &link).unwrap();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        let outcome = apply_chown(link.to_str().unwrap(), uid, gid, true);
-        assert_eq!(outcome, PrivilegedOpOutcome::Applied);
+        fn me() -> (u32, u32) {
+            unsafe { (libc::geteuid(), libc::getegid()) }
+        }
+
+        /// Evidence `key` would issue for `path` as it is on disk now,
+        /// claiming `owner` as the captured owner.
+        fn evidence(
+            key: &capture_token::TokenKey,
+            path: &str,
+            owner: (u32, u32),
+        ) -> shit_proto::OwnerEvidence {
+            let m = std::fs::symlink_metadata(path).unwrap();
+            let session = uuid::Uuid::from_u128(0x227);
+            let token = key.issue(&capture_token::OwnerFacts {
+                uid: owner.0,
+                gid: owner.1,
+                dev: m.dev(),
+                ino: m.ino(),
+                path,
+                session,
+                seq: 9,
+            });
+            shit_proto::OwnerEvidence {
+                dev: m.dev(),
+                inode: m.ino(),
+                session,
+                command_seq: 9,
+                token,
+            }
+        }
+
+        fn chown(
+            path: &str,
+            owner: (u32, u32),
+            follow: bool,
+            ev: &shit_proto::OwnerEvidence,
+        ) -> PrivilegedOpOutcome {
+            apply_chown(
+                path,
+                owner.0,
+                owner.1,
+                !follow,
+                Some(ev),
+                Some(this_helper()),
+            )
+        }
+
+        fn refused(o: &PrivilegedOpOutcome, needle: &str) -> bool {
+            matches!(o, PrivilegedOpOutcome::Refused { reason } if reason.contains(needle))
+        }
+
+        #[test]
+        fn valid_evidence_for_the_current_owner_is_applied() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            assert_eq!(chown(ps, me(), false, &ev), PrivilegedOpOutcome::Applied);
+        }
+
+        /// A token with its MAC flipped, or for other fields than the
+        /// request, is refused and nothing changes.
+        #[test]
+        fn forged_or_mismatched_evidence_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            let mut bad = ev;
+            bad.token.mac[0] ^= 1;
+            assert!(refused(&chown(ps, me(), false, &bad), "does not match"));
+            // Same token, another owner (root): the classic escalation.
+            assert!(refused(&chown(ps, (0, 0), false, &ev), "does not match"));
+            // Same token, another path.
+            let q = dir.path().join("g");
+            std::fs::write(&q, b"y").unwrap();
+            assert!(refused(
+                &chown(q.to_str().unwrap(), me(), false, &ev),
+                "does not match"
+            ));
+            // Another inode or device claimed for the same token.
+            for v in [
+                shit_proto::OwnerEvidence {
+                    inode: ev.inode + 1,
+                    ..ev
+                },
+                shit_proto::OwnerEvidence {
+                    dev: ev.dev + 1,
+                    ..ev
+                },
+                shit_proto::OwnerEvidence {
+                    command_seq: 10,
+                    ..ev
+                },
+            ] {
+                assert!(refused(&chown(ps, me(), false, &v), "does not match"));
+            }
+            assert_eq!(std::fs::metadata(&p).unwrap().uid(), me().0);
+        }
+
+        #[test]
+        fn token_from_a_previous_helper_process_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let old = capture_token::TokenKey::generate().unwrap();
+            let ev = evidence(&old, ps, me());
+            assert!(refused(
+                &chown(ps, me(), false, &ev),
+                "capture evidence expired: helper restarted"
+            ));
+        }
+
+        /// The file at the path was replaced after capture: the token
+        /// names the old inode, so the new file is a conflict.
+        #[test]
+        fn replaced_file_is_a_conflict() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            let keep = dir.path().join("keep");
+            std::fs::rename(&p, &keep).unwrap();
+            std::fs::write(&p, b"new").unwrap();
+            assert!(matches!(
+                chown(ps, me(), false, &ev),
+                PrivilegedOpOutcome::Conflict { .. }
+            ));
+        }
+
+        /// A parent swapped to a symlink after capture is not followed,
+        /// even when the symlink leads to the captured file.
+        #[test]
+        fn parent_swapped_to_a_symlink_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::write(real.join("f"), b"x").unwrap();
+            let link = dir.path().join("d");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let ps = format!("{}/f", link.to_str().unwrap());
+            let ev = evidence(this_helper(), &ps, me());
+            assert!(refused(&chown(&ps, me(), false, &ev), "symlink"));
+        }
+
+        /// The entry is a symlink and the request asks for chown(2),
+        /// which would follow it: refused. lchown(2) of the link itself
+        /// is applied.
+        #[test]
+        fn following_a_symlink_entry_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("t");
+            std::fs::write(&target, b"x").unwrap();
+            let link = dir.path().join("l");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let ps = link.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            assert!(refused(&chown(ps, me(), true, &ev), "symlink"));
+            assert_eq!(chown(ps, me(), false, &ev), PrivilegedOpOutcome::Applied);
+        }
+
+        /// With a valid token for a foreign owner the helper still cannot
+        /// give it: it holds no CAP_CHOWN, so the kernel says no and the
+        /// file keeps its owner.
+        #[test]
+        fn valid_evidence_for_a_foreign_owner_is_denied_without_cap_chown() {
+            if me().0 == 0
+                || crate::priv_linux::capget().unwrap().permitted
+                    & (1 << crate::priv_linux::CAP_CHOWN)
+                    != 0
+            {
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, (0, 0));
+            assert_eq!(
+                chown(ps, (0, 0), false, &ev),
+                PrivilegedOpOutcome::PermissionDenied
+            );
+            assert_eq!(std::fs::metadata(&p).unwrap().uid(), me().0);
+        }
+
+        #[test]
+        fn missing_file_is_not_found() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"x").unwrap();
+            let ps = p.to_str().unwrap();
+            let ev = evidence(this_helper(), ps, me());
+            std::fs::remove_file(&p).unwrap();
+            assert_eq!(chown(ps, me(), false, &ev), PrivilegedOpOutcome::NotFound);
+        }
     }
 }
 

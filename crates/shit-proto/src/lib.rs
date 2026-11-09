@@ -115,8 +115,8 @@ mod tests {
 pub use helper::{
     AuthDecision, AuthEventKind, CaptureToken, DeviceEvidence, FileKindWire, FileMetadataWire,
     HELPER_PATH_HINT_MAX, HELPER_PROTOCOL_VERSION, HelperCaps, HelperProtoError, HelperRequest,
-    HelperResponse, MAX_HELPER_FRAME_SIZE, PrivilegedOpOutcome, SelfVerifyReport, SignatureKind,
-    TreeOpWire, UntrustedSource, validate_outgoing,
+    HelperResponse, MAX_HELPER_FRAME_SIZE, OwnerEvidence, PrivilegedOpOutcome, SelfVerifyReport,
+    SignatureKind, TreeOpWire, UntrustedSource, validate_outgoing,
 };
 pub use shim::{
     SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage,

@@ -143,13 +143,7 @@ pub fn capset(sets: &CapSets) -> io::Result<()> {
             inheritable: i1,
         },
     ];
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            &mut hdr as *mut CapHeader,
-            data.as_ptr(),
-        )
-    };
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr()) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -344,8 +338,8 @@ pub fn status_violation(status: &str, allowed: u64) -> Option<String> {
 /// not only map and program creation) with that sysctl set.
 pub fn runtime_bpf_needs_cap() -> bool {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-    let sysctl = std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled")
-        .unwrap_or_default();
+    let sysctl =
+        std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled").unwrap_or_default();
     bpf_needs_cap(&release, &sysctl)
 }
 
@@ -555,13 +549,29 @@ mod tests {
                   CapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
         assert_eq!(status_violation(ok, RUNTIME_CAPS), None);
         let eff = ok.replace("CapEff:\t0000000000000000", "CapEff:\t0000000008000000");
-        assert!(status_violation(&eff, RUNTIME_CAPS).unwrap().contains("CapEff"));
+        assert!(
+            status_violation(&eff, RUNTIME_CAPS)
+                .unwrap()
+                .contains("CapEff")
+        );
         let prm = ok.replace("CapPrm:\t0000000008000000", "CapPrm:\t0000000008200000");
-        assert!(status_violation(&prm, RUNTIME_CAPS).unwrap().contains("CapPrm"));
+        assert!(
+            status_violation(&prm, RUNTIME_CAPS)
+                .unwrap()
+                .contains("CapPrm")
+        );
         let inh = ok.replace("CapInh:\t0000000000000000", "CapInh:\t0000000000000001");
-        assert!(status_violation(&inh, RUNTIME_CAPS).unwrap().contains("CapInh"));
+        assert!(
+            status_violation(&inh, RUNTIME_CAPS)
+                .unwrap()
+                .contains("CapInh")
+        );
         let amb = ok.replace("CapAmb:\t0000000000000000", "CapAmb:\t0000000000200000");
-        assert!(status_violation(&amb, RUNTIME_CAPS).unwrap().contains("CapAmb"));
+        assert!(
+            status_violation(&amb, RUNTIME_CAPS)
+                .unwrap()
+                .contains("CapAmb")
+        );
         assert!(status_violation("Name:\tx\n", RUNTIME_CAPS).is_some());
     }
 
