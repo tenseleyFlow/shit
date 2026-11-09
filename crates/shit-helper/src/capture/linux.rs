@@ -182,6 +182,12 @@ struct WatchState {
     /// write returned Err) — NOT dedupe-skips or other intentional
     /// short-circuits.
     silent_send_failures: u32,
+    /// The watch root, set by `pre_open_tree`.
+    root: Option<PathBuf>,
+    /// `/proc/<root_pid>/mounts`, held from `check_mounts` to close. Any
+    /// mount change in that namespace meanwhile makes it pollable
+    /// (#233).
+    mounts_watch: Option<std::fs::File>,
     /// R3 slice B — baseline, born set and uncaptured mutations. Read
     /// at `on_unwatch_tree`, which sends one observation per loss.
     acct: CloseAccounting,
@@ -439,9 +445,51 @@ impl LinuxCaptureRuntime {
                 );
             }
         }
-        if let Some(ws) = self.watches.remove(&command) {
+        if let Some(mut ws) = self.watches.remove(&command) {
+            // #233: a mount anywhere in the command's namespace since
+            // WatchTree may have put a mount under the root, so the
+            // dentry chains no longer match paths there.
+            if ws.mounts_watch.as_ref().is_none_or(mounts_changed) {
+                ws.acct.disable_dentry_rule();
+            }
             let observations = ws.acct.close(ws.silent_send_failures, kernel_losses_now);
             send_observations(&self.conn, command, observations);
+        }
+    }
+
+    /// #233: turn on the dentry rule for `command` if its mount table
+    /// lets dentry chains stand for paths under the root. Call after
+    /// [`Self::pre_open_tree`], with the command's root process.
+    ///
+    /// The rule stays off when the root runs in another mount namespace
+    /// than the helper, when its mountinfo cannot be read or lists a
+    /// mount under the root, or when anything here fails. The held
+    /// `/proc/<root_pid>/mounts` fd is polled at close: a mount change
+    /// in that namespace during the command turns the rule off again.
+    pub fn check_mounts(&mut self, command: CommandId, root_pid: i32) {
+        let ws = self.watches.entry(command).or_default();
+        let proc_dir = PathBuf::from(format!("/proc/{root_pid}"));
+        let same_ns = match (
+            std::fs::metadata("/proc/self/ns/mnt"),
+            std::fs::metadata(proc_dir.join("ns/mnt")),
+        ) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        };
+        // Opened before mountinfo is read, so a change between the two
+        // still shows at close.
+        let watch = std::fs::File::open(proc_dir.join("mounts")).ok();
+        let clean = same_ns
+            && watch.is_some()
+            && ws.root.as_deref().is_some_and(|root| {
+                std::fs::read_to_string(proc_dir.join("mountinfo"))
+                    .is_ok_and(|info| !mount_under(root, &info))
+            });
+        ws.mounts_watch = watch;
+        if clean {
+            ws.acct.enable_dentry_rule();
+        } else {
+            ws.acct.disable_dentry_rule();
         }
     }
 
@@ -504,17 +552,12 @@ impl LinuxCaptureRuntime {
         ws.acct.note_root(cwd);
         ws.acct.note_tree_dev(root_dev_inode.0);
         ws.acct.note_walked();
-        // #233: path-less events are placed by their dentry ancestry.
-        // A mount under the root breaks the dentry/path correspondence,
-        // so the rule stays off then (and when mountinfo is unreadable).
-        match std::fs::read_to_string("/proc/self/mountinfo") {
-            Ok(info) if !mount_under(cwd, &info) => {
-                let above = ancestors_on_dev(cwd, root_dev_inode.0);
-                ws.acct
-                    .note_root_ancestry(root_dev_inode.0, root_dev_inode.1, above);
-            }
-            _ => {}
-        }
+        // #233: path-less events are placed by their dentry ancestry,
+        // once `check_mounts` has turned the rule on.
+        let above = ancestors_on_dev(cwd, root_dev_inode.0);
+        ws.acct
+            .note_root_ancestry(root_dev_inode.0, root_dev_inode.1, above);
+        ws.root = Some(cwd.to_path_buf());
 
         let mut opened = 0usize;
         let mut hit_cap = false;
@@ -2189,10 +2232,8 @@ impl LinuxCaptureRuntime {
     }
 }
 
-/// R3 slice B — a rename onto `to` replaced whatever was there, and no
-/// snapshot of it was sent. Loss if that was a pre-existing entry.
-/// True when `mountinfo` (the text of `/proc/self/mountinfo`) lists a
-/// mount point strictly below `root`.
+/// True when `mountinfo` (the text of a `/proc/<pid>/mountinfo`) lists
+/// a mount point strictly below `root`.
 fn mount_under(root: &Path, mountinfo: &str) -> bool {
     mountinfo.lines().any(|line| {
         line.split(' ')
@@ -2212,12 +2253,16 @@ fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Only `\000` to `\377` fit a byte; anything else is literal.
         if b[i] == b'\\'
             && i + 3 < b.len()
-            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+            && (b'0'..=b'3').contains(&b[i + 1])
+            && b[i + 2..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
         {
-            let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
-            out.push(v);
+            let v = u32::from(b[i + 1] - b'0') * 64
+                + u32::from(b[i + 2] - b'0') * 8
+                + u32::from(b[i + 3] - b'0');
+            out.push(v as u8);
             i += 4;
         } else {
             out.push(b[i]);
@@ -2225,6 +2270,19 @@ fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
         }
     }
     std::ffi::OsString::from_vec(out)
+}
+
+/// True when the mount table behind `f` (a `/proc/<pid>/mounts` fd)
+/// changed since it was opened, or when that cannot be told.
+fn mounts_changed(f: &std::fs::File) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: f.as_raw_fd(),
+        events: libc::POLLPRI,
+        revents: 0,
+    };
+    // SAFETY: pfd is one valid pollfd; a zero timeout does not block.
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    rc < 0 || pfd.revents & (libc::POLLPRI | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 /// Inode numbers of the directories above `root` that are on `dev`.
@@ -2255,6 +2313,8 @@ fn note_missing_without_snapshot(ws: &mut WatchState, id: Id, chain: &DentryChai
     }
 }
 
+/// R3 slice B — a rename onto `to` replaced whatever was there, and no
+/// snapshot of it was sent. Loss if that was a pre-existing entry.
 fn note_replaced_without_capture(ws: &mut WatchState, to: &Path, moved: Id) {
     let old = ws
         .path_to_inode
@@ -3696,6 +3756,7 @@ mod born_set_tests {
             };
             rt.on_watch_tree(cmd);
             rt.pre_open_tree(cmd, dir.path());
+            rt.check_mounts(cmd, std::process::id() as i32);
             Self {
                 rt: Some(rt),
                 daemon,
@@ -4547,6 +4608,76 @@ mod born_set_tests {
             unescape_mountinfo("/a\\040b"),
             std::ffi::OsString::from("/a b")
         );
+    }
+
+    #[test]
+    fn mountinfo_escapes_above_377_are_literal() {
+        assert_eq!(
+            unescape_mountinfo("/a\\777b"),
+            std::ffi::OsString::from("/a\\777b")
+        );
+        assert_eq!(
+            unescape_mountinfo("/a\\134b"),
+            std::ffi::OsString::from("/a\\b")
+        );
+    }
+
+    /// A child in its own user and mount namespace running `script`, or
+    /// None where unprivileged namespaces are not allowed.
+    fn unshared_child(script: &str) -> Option<std::process::Child> {
+        let ok = std::process::Command::new("unshare")
+            .args(["-Urm", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("skipping: unprivileged mount namespaces unavailable");
+            return None;
+        }
+        let child = std::process::Command::new("unshare")
+            .args(["-Urm", "sh", "-c", script])
+            .spawn()
+            .unwrap();
+        let mine = std::fs::metadata("/proc/self/ns/mnt").unwrap().ino();
+        let ns = format!("/proc/{}/ns/mnt", child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::metadata(&ns).map(|m| m.ino()).unwrap_or(mine) == mine {
+            assert!(std::time::Instant::now() < deadline, "child never unshared");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Some(child)
+    }
+
+    #[test]
+    fn root_in_another_mount_namespace_keeps_the_dentry_rule_off() {
+        let Some(mut child) = unshared_child("sleep 5") else {
+            return;
+        };
+        let mut rig = capped_rig_without_probe();
+        let cmd = rig.cmd;
+        rig.rt().check_mounts(cmd, child.id() as i32);
+        let (_outside, f) = sibling_file(&rig, b"ls\n");
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_mount_after_the_watch_shows_on_the_held_mounts_fd() {
+        let Some(mut child) = unshared_child("sleep 0.3; mount -t tmpfs none /mnt; sleep 5") else {
+            return;
+        };
+        let f = std::fs::File::open(format!("/proc/{}/mounts", child.id())).unwrap();
+        assert!(!mounts_changed(&f));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !mounts_changed(&f) {
+            assert!(std::time::Instant::now() < deadline, "mount never showed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

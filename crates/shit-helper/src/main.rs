@@ -2791,6 +2791,7 @@ fn linux_watch_tree(
             g.mark_kernel_losses(command, "the eBPF ring buffers", loss_start);
             if let Ok(cwd) = &cwd {
                 g.pre_open_tree(command, &cwd.path);
+                g.check_mounts(command, root_pid as i32);
             }
         }
         match &cwd {

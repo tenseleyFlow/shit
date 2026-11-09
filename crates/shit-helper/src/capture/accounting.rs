@@ -137,7 +137,9 @@ pub struct CloseAccounting {
     /// Per identity in `missing`: true while every loss of it came with
     /// a dentry chain that placed it outside the root.
     dentry_outside: BTreeMap<Id, bool>,
-    /// Set by [`Self::disable_dentry_rule`].
+    /// Set by [`Self::enable_dentry_rule`].
+    dentry_rule_on: bool,
+    /// Set by [`Self::disable_dentry_rule`]; overrides `dentry_rule_on`.
     dentry_rule_off: bool,
 }
 
@@ -456,9 +458,11 @@ impl CloseAccounting {
     /// outside the root, and nothing in the command could have moved a
     /// pre-existing file out of the tree first: `id` was not renamed, no
     /// rename went unresolved (an unresolved rename may have moved a
-    /// directory holding `id` out), and the rule was not turned off.
+    /// directory holding `id` out), and the rule is on: turned on by
+    /// [`Self::enable_dentry_rule`] and never turned off.
     fn dentry_places_outside(&self, id: &Id) -> bool {
-        !self.dentry_rule_off
+        self.dentry_rule_on
+            && !self.dentry_rule_off
             && self.renames_unresolved == 0
             && !self.moved.contains(id)
             && self.dentry_outside.get(id) == Some(&true)
@@ -469,6 +473,13 @@ impl CloseAccounting {
     /// dentry tree and paths under the root.
     pub fn disable_dentry_rule(&mut self) {
         self.dentry_rule_off = true;
+    }
+
+    /// Use dentry chains for this command: its mount table was checked
+    /// at WatchTree. The rule is off until this is called, and a later
+    /// [`Self::disable_dentry_rule`] wins.
+    pub fn enable_dentry_rule(&mut self) {
+        self.dentry_rule_on = true;
     }
 
     /// This command removed directory `id`.
