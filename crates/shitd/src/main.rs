@@ -68,9 +68,10 @@ struct Cli {
 }
 
 /// DR-66: per-OS classifier the daemon uses to prime
-/// `Stats::kernel_tier` at startup. Mirrors
-/// `shit_helper::handshake::classify_kernel_tier`; once the helper
-/// links up it overwrites this with its own runtime probe result.
+/// `Stats::kernel_tier` at startup. Once the helper links up it
+/// overwrites this with the tier it reported in the handshake (on
+/// Linux, the tier capture startup resolved: `ebpf-lsm`, `fanotify`
+/// or `degraded`).
 const fn daemon_kernel_tier_default() -> &'static str {
     #[cfg(target_os = "linux")]
     {
