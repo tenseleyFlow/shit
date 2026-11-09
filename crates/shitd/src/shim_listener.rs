@@ -288,6 +288,10 @@ pub(crate) struct UnlinkStat {
     inode: Option<InodeRef>,
     /// The link's target when the entry is a symlink (L4b).
     link_target: Option<String>,
+    /// #213: the kind and mode came from the daemon's own lstat, not the
+    /// shim's pre-call stat. That lstat can run after the syscall, so it
+    /// may describe a different entry, or none.
+    racy: bool,
 }
 
 /// L5 — removals the shim reports after they succeeded: `rmdir` and
@@ -324,12 +328,14 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
                 mode: s.mode,
                 inode: Some(InodeRef::new(s.dev, s.inode)),
                 link_target: None,
+                racy: false,
             })
         });
     }
     if !Path::new(&note.arg).is_absolute() {
         return None;
     }
+    let racy = note.pre_stat.is_none();
     let (dev, ino, mode, shim_target) = match &note.pre_stat {
         Some(st) => (st.dev, st.inode, st.mode, st.link_target.clone()),
         None => match std::fs::symlink_metadata(&note.arg) {
@@ -357,6 +363,7 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
             mode,
             inode: None,
             link_target: Some(target),
+            racy,
         });
     }
     if !matches!(
@@ -377,7 +384,37 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
         mode,
         inode,
         link_target: None,
+        racy,
     })
+}
+
+/// #213: why a shim `unlink`/`unlinkat` of an absolute path has no
+/// trustworthy kind, or `None` when the shim's pre-call stat supplied
+/// it. The shim lstats the target in process before every unlink and
+/// sends the result, so a note without one means the shim found nothing
+/// there. The daemon's lstat is then the only source, and it races the
+/// syscall: it can find nothing, or a different entry. Undo would then
+/// recreate a guessed kind (a regular file where a directory was, and
+/// every child restore fails ENOTDIR), so the removal is refused.
+fn racy_unlink_reason(note: &ShimNotification, stat: Option<&UnlinkStat>) -> Option<String> {
+    if !matches!(note.syscall.as_str(), "unlink" | "unlinkat")
+        || !Path::new(&note.arg).is_absolute()
+    {
+        return None;
+    }
+    match stat {
+        Some(s) if !s.racy => None,
+        Some(s) => Some(format!(
+            "{} {}: the shim sent no pre-call stat and the daemon's lstat, \
+             which races the syscall, found a {:?}; the removed entry's kind is not known",
+            note.syscall, note.arg, s.kind
+        )),
+        None => Some(format!(
+            "{} {}: the shim sent no pre-call stat and the daemon's lstat, \
+             which races the syscall, found nothing usable; the removed entry's kind is not known",
+            note.syscall, note.arg
+        )),
+    }
 }
 
 /// Overlay a pre-syscall lstat onto a classified shim Unlink. A removed
@@ -978,6 +1015,7 @@ fn ingest_note(
         warn!(err = %e, pid = note.pid, syscall = %note.syscall, "shim notify: unlink pre-image ingest failed");
     }
     // Fall through to journal the TreeOp::Unlink below.
+    let racy_unlink = racy_unlink_reason(note, unlink_stat.as_ref());
 
     let Some(kind) =
         classify_tree_op(&note.syscall, &note.arg).map(|k| apply_unlink_stat(k, unlink_stat))
@@ -1024,6 +1062,28 @@ fn ingest_note(
             if let Err(e) = put(index, ids, &event) {
                 warn!(err = %e, pid = note.pid, "shim notify: relative-path refusal journal failed");
             }
+        }
+        return;
+    }
+
+    // #213: never journal an Unlink whose kind only a racing daemon
+    // lstat supplied. A refusal takes its place, so undo says why the
+    // path is not recreated instead of guessing its kind (D-35).
+    if let Some(detail) = racy_unlink {
+        debug!(pid = note.pid, syscall = %note.syscall, arg = %note.arg, "shim unlink without a pre-call stat; refusing");
+        let event = CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: ingest_ts,
+            partial: false,
+            kind: CaptureEventKind::CaptureRefused {
+                class: "capture-incomplete".to_string(),
+                path: PathBuf::from(&note.arg),
+                detail,
+            },
+        };
+        if let Err(e) = put(index, ids, &event) {
+            warn!(err = %e, pid = note.pid, "shim notify: racy-unlink refusal journal failed");
         }
         return;
     }
@@ -1955,6 +2015,9 @@ mod tests {
         std::fs::write(&target, b"keep").unwrap();
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        // The shim's pre-call lstat, as every shim sends for an unlink.
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&link).unwrap();
         let note = ShimNotification {
             pid: 4242,
             syscall: "unlinkat".into(),
@@ -1963,7 +2026,12 @@ mod tests {
             pre_image: None,
             extra_pre_images: Vec::new(),
             failure: None,
-            pre_stat: None,
+            pre_stat: Some(shit_proto::ShimStat {
+                dev: m.dev(),
+                inode: m.ino(),
+                mode: m.mode(),
+                link_target: Some(target.to_str().unwrap().into()),
+            }),
             call_id: 0,
             outcome: None,
         };
@@ -2095,6 +2163,7 @@ mod tests {
                 mode: 0o040750,
                 inode: None,
                 link_target: None,
+                racy: false,
             }),
             &index,
             &blob_store,
@@ -2114,7 +2183,10 @@ mod tests {
             "{events:#?}"
         );
 
-        // Without a stat (lstat lost the race) the wire default stays.
+        // #213: without the shim's stat, and with the daemon's lstat lost
+        // to the race, the kind is unknown. The wire's Regular default
+        // used to be journaled here, so undo made a file where the
+        // directory was. Now the removal is refused instead.
         let (_tmp2, index2, blob_store2, command2) = ingest_fixture("rm -rf d");
         ingest_notification(
             &note,
@@ -2126,15 +2198,38 @@ mod tests {
             &LiveBaseline::new(),
         );
         let events = index2.events_for_command(command2);
+        assert_eq!(events.len(), 1, "{events:#?}");
         assert!(
             matches!(
                 &events[0].kind,
-                CaptureEventKind::TreeOp(TreeOp::Unlink {
-                    kind: FileKind::Regular,
-                    mode: 0o100644,
-                    ..
-                })
+                CaptureEventKind::CaptureRefused { class, path, .. }
+                    if class == "capture-incomplete" && path == Path::new("/tmp/shit-unlink-dir/d")
             ),
+            "{events:#?}"
+        );
+
+        // #213: a daemon lstat that did find something is still racy
+        // (it may have run after the syscall), so it is refused too.
+        let (_tmp3, index3, blob_store3, command3) = ingest_fixture("rm -rf d");
+        ingest_notification(
+            &note,
+            Some(command3),
+            TimePoint::new(8, 0),
+            Some(UnlinkStat {
+                kind: FileKind::Regular,
+                mode: 0o100644,
+                inode: None,
+                link_target: None,
+                racy: true,
+            }),
+            &index3,
+            &blob_store3,
+            &LiveBaseline::new(),
+        );
+        let events = index3.events_for_command(command3);
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(
+            matches!(&events[0].kind, CaptureEventKind::CaptureRefused { detail, .. } if detail.contains("races the syscall")),
             "{events:#?}"
         );
     }
@@ -2722,6 +2817,7 @@ mod tests {
                 mode: 0o040750,
                 inode: Some(InodeRef::new(1, 2)),
                 link_target: None,
+                racy: false,
             })
         );
     }
@@ -2798,6 +2894,7 @@ mod tests {
                     mode: 0o040700,
                     inode: None,
                     link_target: None,
+                    racy: false,
                 }),
                 0o040700,
             ),
