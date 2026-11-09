@@ -29,8 +29,10 @@
 //!   past the preload shim's 50 ms ack timeout. The shim then let the
 //!   syscall run, rsync exited, the walk hit a dead pid and the shim
 //!   listener dropped the notification (#202).
-//! - **macOS**: `proc_pidinfo(PROC_PIDTBSDINFO)` and `pbi_ppid`. This
-//!   used to fork `ps -o ppid=` per hop (~5 ms each; #210, #251).
+//! - **macOS**: `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)` and `pbsi_ppid`,
+//!   which reads processes of any uid (`PROC_PIDTBSDINFO` refuses other
+//!   users, so a walk through `sudo` stopped there). `ps -o ppid=` (~5 ms
+//!   per hop) is the fallback when libproc refuses (#210, #251).
 //!
 //! ## Loop guard
 //!
@@ -133,27 +135,74 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 pub fn parent_pid(pid: u32) -> Option<u32> {
-    // R8 (#210, #251): libproc in-process, as shit-helper's proc
-    // snapshot does. This used to fork `ps -o ppid=` per hop (~5 ms
-    // each), which let a short-lived shim sender exit mid-walk.
-    // SAFETY: proc_bsdinfo is plain old data; zeroed is a valid value.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is writable for `size` bytes and PROC_PIDTBSDINFO
-    // fills exactly a proc_bsdinfo.
+    parent_pid_libproc(pid).or_else(|| parent_pid_ps(pid))
+}
+
+/// `struct proc_bsdshortinfo` from `<sys/proc_info.h>`; the libc crate
+/// does not declare it.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pbsi_pid: u32,
+    pbsi_ppid: u32,
+    pbsi_pgid: u32,
+    pbsi_status: u32,
+    pbsi_comm: [libc::c_char; 16],
+    pbsi_flags: u32,
+    pbsi_uid: libc::uid_t,
+    pbsi_gid: libc::gid_t,
+    pbsi_ruid: libc::uid_t,
+    pbsi_rgid: libc::gid_t,
+    pbsi_svuid: libc::uid_t,
+    pbsi_svgid: libc::gid_t,
+    pbsi_rfu: u32,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
+
+/// `PROC_PIDT_SHORTBSDINFO` from `<sys/proc_info.h>`.
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+/// R8 (#210, #251): libproc in process. The short flavor has no
+/// same-user check, so the walk passes `sudo` and setuid ancestors.
+#[cfg(target_os = "macos")]
+fn parent_pid_libproc(pid: u32) -> Option<u32> {
+    // SAFETY: ProcBsdShortInfo is plain old data; zeroed is a valid value.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdShortInfo>() as libc::c_int;
+    // SAFETY: `info` is writable for `size` bytes, and this flavor fills
+    // exactly a proc_bsdshortinfo.
     let rc = unsafe {
         libc::proc_pidinfo(
             libc::c_int::try_from(pid).ok()?,
-            libc::PROC_PIDTBSDINFO,
+            PROC_PIDT_SHORTBSDINFO,
             0,
             (&raw mut info).cast(),
             size,
         )
     };
-    if rc < size {
+    (rc >= size).then_some(info.pbsi_ppid)
+}
+
+/// The fallback when libproc refuses: one `ps` fork per hop.
+#[cfg(target_os = "macos")]
+fn parent_pid_ps(pid: u32) -> Option<u32> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("ps")
+        .arg("-o")
+        .arg("ppid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
         return None;
     }
-    Some(info.pbi_ppid)
+    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
@@ -177,6 +226,24 @@ pub fn find_tracked_shell(start_pid: u32, tracked_shells: &HashSet<u32>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R8 review, item 3: the libproc flavor agrees with the kernel for
+    /// our own parent, and reads a process of another uid (launchd, pid 1,
+    /// is root's) where `PROC_PIDTBSDINFO` refuses. Hosted macOS runs
+    /// this as a non-root user.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn libproc_short_info_reads_parents_of_any_uid() {
+        // SAFETY: getppid and geteuid have no preconditions.
+        let (ppid, euid) = unsafe { (libc::getppid(), libc::geteuid()) };
+        assert_eq!(parent_pid_libproc(std::process::id()), Some(ppid as u32));
+        assert_eq!(parent_pid_ps(std::process::id()), Some(ppid as u32));
+        assert_eq!(
+            parent_pid_libproc(1),
+            Some(0),
+            "launchd's parent through libproc (euid {euid})"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
