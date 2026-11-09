@@ -142,6 +142,7 @@ pub fn parent_pid(pid: u32) -> Option<u32> {
 /// does not declare it.
 #[cfg(target_os = "macos")]
 #[repr(C)]
+#[allow(dead_code)] // Layout only; the walk reads pbsi_ppid.
 struct ProcBsdShortInfo {
     pbsi_pid: u32,
     pbsi_ppid: u32,
