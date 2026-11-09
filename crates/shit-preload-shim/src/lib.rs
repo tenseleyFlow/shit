@@ -600,24 +600,6 @@ mod policy {
         notify_inner(syscall, path, Some(path));
     }
 
-    /// Review of #232 round 2, item 6: `unlink` acts on the entry itself,
-    /// so the key is the canonical parent plus the final name, and a
-    /// symlink's removal is keyed to the link, never its target. A
-    /// regular file is captured as usual. (#223 gives Linux the same rule
-    /// as `resolve_leaf_at_for_notify`; the names are reconciled when it
-    /// lands.)
-    #[cfg(target_os = "macos")]
-    pub fn notify_unlink_entry(syscall: &'static str, path: &str) {
-        if idle(path) {
-            return;
-        }
-        let (abs, failure) = entry_or_raw(path, "path");
-        if should_skip_path(&abs) {
-            return;
-        }
-        notify_inner_with_failure(syscall, &abs, Some(&abs), failure, true);
-    }
-
     /// Plain-path (`unlink`, `open`) counterpart of
     /// [`notify_pre_mutation_with_content_at`]: the same resolver with
     /// `AT_FDCWD`, and the resolved path is what gets sent and captured
@@ -630,6 +612,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub fn notify_plain_pre_mutation_with_content(syscall: &'static str, path: &str) {
         if let Some(r) = plain_resolution(path) {
@@ -646,6 +629,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub(super) fn plain_resolution(path: &str) -> Option<AtResolution> {
         if disabled() || should_skip_path(path) || IN_NOTIFY.with(|f| f.get()) {
@@ -680,6 +664,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     #[derive(Debug)]
     pub enum AtResolution {
@@ -706,6 +691,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub fn resolve_at_for_notify(dirfd: libc::c_int, path: &str, which_arg: &str) -> AtResolution {
         resolve_at_with(dirfd, path, which_arg, canonical_path)
@@ -722,6 +708,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub fn resolve_leaf_at_for_notify(
         dirfd: libc::c_int,
@@ -737,6 +724,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     fn resolve_at_with(
         dirfd: libc::c_int,
@@ -784,6 +772,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub fn notify_pre_mutation_with_content_at(
         syscall: &'static str,
@@ -791,6 +780,28 @@ mod policy {
         path: &str,
     ) {
         notify_resolved(syscall, resolve_leaf_at_for_notify(dirfd, path, "path"));
+    }
+
+    /// M3 (#231): metadata `*at` calls (`fchmodat`, `fchownat`,
+    /// `utimensat`) key the name to its dirfd through the shared
+    /// resolver. They follow a final symlink unless `nofollow`
+    /// (`AT_SYMLINK_NOFOLLOW`), in which case the entry itself is keyed.
+    #[cfg(target_os = "macos")]
+    pub fn notify_metadata_at(
+        syscall: &'static str,
+        dirfd: libc::c_int,
+        path: &str,
+        nofollow: bool,
+    ) {
+        if idle(path) {
+            return;
+        }
+        let r = if nofollow {
+            resolve_leaf_at_for_notify(dirfd, path, "path")
+        } else {
+            resolve_at_for_notify(dirfd, path, "path")
+        };
+        notify_resolved(syscall, r);
     }
 
     /// Send one resolved single-path notification: a keyed path is the
@@ -802,6 +813,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     fn notify_resolved(syscall: &'static str, resolution: AtResolution) {
         match resolution {
@@ -835,6 +847,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub fn notify_rename_at(
         syscall: &'static str,
@@ -859,37 +872,6 @@ mod policy {
                 None
             }
         }
-    }
-
-    /// A mutation whose path could not be keyed: send the raw arg (for a
-    /// rename, `from\tto`) with the AU10 marker and no capture.
-    #[cfg(target_os = "macos")]
-    pub fn notify_unresolved(syscall: &'static str, arg: &str, failure: shit_proto::ShimFailure) {
-        // Review of #232 round 2, item 8: muted, re-entered or skipped
-        // paths send nothing here either.
-        if idle(arg) {
-            return;
-        }
-        notify_inner_with_failure(syscall, arg, None, Some(failure), false);
-    }
-
-    /// L5 (review of #232, item 7): a write-capable open whose target
-    /// could not be keyed (macOS: F_GETPATH failed on the dirfd). The
-    /// call runs first; only a successful open is reported, with the
-    /// marker and the raw name, and only when the shim is not muted,
-    /// re-entered, or looking at a skipped path. The daemon refuses the
-    /// relative name rather than journaling it.
-    #[cfg(target_os = "macos")]
-    pub fn write_open_unresolved(
-        syscall: &'static str,
-        raw: &str,
-        failure: shit_proto::ShimFailure,
-        rc: libc::c_int,
-    ) {
-        if rc < 0 || idle(raw) {
-            return;
-        }
-        with_saved_errno(|| notify_unresolved(syscall, raw, failure));
     }
 
     /// B09 — notify a chflags-family mutation with a metadata-only
@@ -1459,6 +1441,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub(super) fn removal_begin_at(
         syscall: &'static str,
@@ -1562,6 +1545,7 @@ mod policy {
             target_os = "openbsd",
             target_os = "dragonfly",
             target_os = "linux",
+            target_os = "macos",
         ))]
         At(libc::c_int, String),
     }
@@ -1616,6 +1600,7 @@ mod policy {
                 target_os = "openbsd",
                 target_os = "dragonfly",
                 target_os = "linux",
+                target_os = "macos",
             ))]
             OpenTarget::At(dirfd, p) => {
                 let r = if nofollow {
@@ -1825,6 +1810,21 @@ mod policy {
             || path.starts_with("/sys/")
     }
 
+    /// Resolve a directory fd to its path with `fcntl(F_GETPATH)`.
+    #[cfg(target_os = "macos")]
+    pub(super) fn dirfd_path(dirfd: libc::c_int) -> Option<String> {
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes a NUL-terminated path of at most
+        // MAXPATHLEN bytes into the buffer.
+        let rc = unsafe { libc::fcntl(dirfd, libc::F_GETPATH, buf.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let nul = buf.iter().position(|&b| b == 0)?;
+        let path = std::str::from_utf8(&buf[..nul]).ok()?.to_string();
+        path.starts_with('/').then_some(path)
+    }
+
     /// Resolve a directory fd to its path with `fcntl(F_KINFO)`.
     #[cfg(target_os = "freebsd")]
     pub(super) fn dirfd_path(dirfd: libc::c_int) -> Option<String> {
@@ -1862,6 +1862,7 @@ mod policy {
         target_os = "openbsd",
         target_os = "dragonfly",
         target_os = "linux",
+        target_os = "macos",
     ))]
     pub fn join_at_path(dirfd: libc::c_int, path: &str) -> String {
         if path.starts_with('/') || dirfd == libc::AT_FDCWD {
@@ -1875,7 +1876,7 @@ mod policy {
                 return s.to_string();
             }
         }
-        #[cfg(target_os = "freebsd")]
+        #[cfg(any(target_os = "freebsd", target_os = "macos"))]
         {
             return join_with_dir(dirfd_path(dirfd), path);
         }
@@ -1885,7 +1886,7 @@ mod policy {
 
     /// Join a resolved directory path with `path`; an unresolved
     /// directory leaves `path` raw (the caller then fails closed).
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     pub(super) fn join_with_dir(dir: Option<String>, path: &str) -> String {
         match dir {
             Some(d) => std::path::Path::new(&d)
