@@ -109,6 +109,16 @@ impl ActiveCommands {
         None
     }
 
+    /// Whether `command` is between its PreExec and PostExec on any
+    /// shell. R8 (#210): a shim note that names its command by key is
+    /// checked here, with no pid walk.
+    pub fn contains(&self, command: CommandId) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.values().any(|stack| stack.contains(&command)))
+            .unwrap_or(false)
+    }
+
     /// Number of shell pids currently with an active command. For
     /// metrics / debug only. Wired to `shit metrics` in a later DR.
     #[allow(dead_code)]
@@ -212,6 +222,18 @@ mod tests {
         assert!(a.remove(pid, cmd(2)));
         // Top of stack is still cmd(3).
         assert_eq!(a.resolve_by_descendant(pid), Some(cmd(3)));
+    }
+
+    #[test]
+    fn contains_finds_a_command_on_any_shell_until_it_is_removed() {
+        let a = ActiveCommands::new();
+        a.insert(10, cmd(1));
+        a.insert(20, cmd(2));
+        assert!(a.contains(cmd(1)));
+        assert!(a.contains(cmd(2)));
+        assert!(!a.contains(cmd(3)));
+        a.remove(10, cmd(1));
+        assert!(!a.contains(cmd(1)));
     }
 
     #[test]
