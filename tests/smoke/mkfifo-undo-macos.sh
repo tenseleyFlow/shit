@@ -98,8 +98,12 @@ cd "${WATCHED}"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
+# The shell hooks export _SHIT_SESSION and _SHIT_SEQ to every command;
+# the shim sends them as the note's command key, so the daemon does not
+# need make_fifo alive to attribute the note (#210, #251).
 smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} ${WATCHED}/make_fifo ${TARGET}"
-DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${WATCHED}/make_fifo" "${TARGET}" \
+_SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 \
+    DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${WATCHED}/make_fifo" "${TARGET}" \
     > "${SHIT_SMOKE_TMP}/mkfifo.log" 2>&1
 MKFIFO_RC=$?
 if [ "${MKFIFO_RC}" -ne 0 ]; then

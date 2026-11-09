@@ -222,6 +222,7 @@ async fn handle_one(
         syscall = %note.syscall,
         arg = %note.arg,
         has_pre_image = note.pre_image.is_some(),
+        command_key = ?note.command_key,
         "shim pre-mutation"
     );
 
