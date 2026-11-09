@@ -176,7 +176,7 @@ impl UnlinkEvent {
     /// reported `name_len == 0` (str_read failed).
     pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
         let len = (self.name_len as usize).min(NAME_BUF_LEN);
-        String::from_utf8_lossy(&self.name[..len])
+        name_str(&self.name[..len])
     }
 }
 
@@ -251,7 +251,7 @@ impl std::fmt::Debug for MkdirEvent {
 impl MkdirEvent {
     pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
         let len = (self.name_len as usize).min(NAME_BUF_LEN);
-        String::from_utf8_lossy(&self.name[..len])
+        name_str(&self.name[..len])
     }
 }
 
@@ -298,7 +298,7 @@ impl std::fmt::Debug for CreateEvent {
 impl CreateEvent {
     pub fn basename_str(&self) -> std::borrow::Cow<'_, str> {
         let len = (self.name_len as usize).min(NAME_BUF_LEN);
-        String::from_utf8_lossy(&self.name[..len])
+        name_str(&self.name[..len])
     }
 }
 
@@ -388,11 +388,11 @@ impl std::fmt::Debug for RenameEvent {
 impl RenameEvent {
     pub fn old_basename_str(&self) -> std::borrow::Cow<'_, str> {
         let len = (self.old_name_len as usize).min(NAME_BUF_LEN);
-        String::from_utf8_lossy(&self.old_name[..len])
+        name_str(&self.old_name[..len])
     }
     pub fn new_basename_str(&self) -> std::borrow::Cow<'_, str> {
         let len = (self.new_name_len as usize).min(NAME_BUF_LEN);
-        String::from_utf8_lossy(&self.new_name[..len])
+        name_str(&self.new_name[..len])
     }
 }
 
@@ -1507,6 +1507,20 @@ fn reader_thread(
         std::thread::sleep(idle_sleep);
     }
     tracing::info!(thread = thread_name, "lsm-rb reader exiting");
+}
+
+/// #211: a kernel-reported name as a string, byte for byte. A UTF-8
+/// name is borrowed as is; any other is in `shit_proto::wire_path` hex
+/// form, which the capture code turns back into bytes with
+/// `wire_path::decode` before joining it to a directory.
+fn name_str(b: &[u8]) -> std::borrow::Cow<'_, str> {
+    use std::os::unix::ffi::OsStrExt;
+    match std::str::from_utf8(b) {
+        Ok(s) if !s.starts_with('\0') => std::borrow::Cow::Borrowed(s),
+        _ => std::borrow::Cow::Owned(shit_proto::wire_path::encode(std::ffi::OsStr::from_bytes(
+            b,
+        ))),
+    }
 }
 
 #[cfg(test)]

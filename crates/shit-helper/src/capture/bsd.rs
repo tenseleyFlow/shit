@@ -1233,7 +1233,7 @@ fn baseline_shipped(shipped: HashSet<(u64, u64)>, complete_sent: bool) -> HashSe
 }
 
 fn path_to_string(p: &Path) -> String {
-    String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+    shit_proto::wire_path::encode(p)
 }
 
 /// Test hook: make the attach-time listing of this directory fail.

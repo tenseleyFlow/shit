@@ -18,9 +18,9 @@
 # Validate-the-gap: with the fallback removed the command journals no
 # FilePreImage at all, on both the LSM and fanotify tiers.
 #
-# This pins capture only. Undo restores into a sibling spelled with
-# U+FFFD on trunk as well, because captured paths are lossy strings too.
-# The assertion accepts either location until paths carry bytes.
+# #211: undo must restore the file in place, under the Latin-1 name.
+# Captured paths used to cross the helper wire as lossy strings, so undo
+# restored into a sibling spelled with U+FFFD.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -71,10 +71,10 @@ REFUSED="$(smoke_journal_count "discriminant = 'CaptureRefused'")"
 "${SHIT_BIN}" undo --yes 2>&1 | sed 's/^/    /' >&2
 cd "${SHIT_SMOKE_TMP}"
 
-# Accepts the lossy sibling; see the header.
-RESTORED="$(find "${SHIT_SMOKE_TMP}" -maxdepth 2 -type f -name victim -print -quit)"
-[ -n "${RESTORED}" ] || smoke_fail "undo restored no victim anywhere under the smoke root"
-[ "$(cat "${RESTORED}")" = "keep me" ] || smoke_fail "restored victim has the wrong content"
+[ -f "${WATCH}/victim" ] || smoke_fail "undo did not restore victim under the Latin-1 directory"
+[ "$(cat "${WATCH}/victim")" = "keep me" ] || smoke_fail "restored victim has the wrong content"
+LOSSY="${SHIT_SMOKE_TMP}/caf"$'\xef\xbf\xbd'
+[ ! -e "${LOSSY}" ] || smoke_fail "undo created the U+FFFD-spelled sibling ${LOSSY}"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
 smoke_log "PASS: non-utf8-cwd-capture-linux"

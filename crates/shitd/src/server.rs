@@ -447,7 +447,7 @@ fn handle(
                 // / fish equivalent) so the planner's refuse-list
                 // match has the command string to operate on.
                 cmd_string: cmd_string.clone(),
-                cwd: PathBuf::from(cwd_path),
+                cwd: shit_proto::wire_path::decode(cwd_path),
                 pid: *pid,
                 shell_kind: *shell_kind,
                 started_at: ts,
@@ -475,7 +475,7 @@ fn handle(
                 request_watch(
                     &close_ctx.live_baseline,
                     command,
-                    PathBuf::from(cwd_path),
+                    shit_proto::wire_path::decode(cwd_path),
                     || link.send_request(&req),
                 );
             }
