@@ -1271,15 +1271,77 @@ mod tests {
     /// A stand-in for the docker engine that answers `volume ls` with the
     /// given lines (or fails), so compose tests need no real docker.
     fn fake_engine(dir: &Path, volumes: Option<&str>) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("engine.sh");
         let body = match volumes {
             Some(v) => format!("#!/bin/sh\nprintf '%s' '{v}'\n"),
             None => "#!/bin/sh\necho engine down >&2\nexit 1\n".to_string(),
         };
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec_script(&path, &body);
         path.display().to_string()
+    }
+
+    /// Write an executable script that is safe to exec right away.
+    ///
+    /// Another test thread can fork while this thread holds the script
+    /// open for writing. The child keeps a copy of the write fd until it
+    /// reaches its own exec (the std `O_CLOEXEC` flag only closes it
+    /// there), and an exec of the script in that window fails with
+    /// ETXTBSY. The fd is closed in this thread by the time `write`
+    /// returns, so once the racing children have exec'd or exited no
+    /// writer is left. Exec the script until the kernel stops refusing
+    /// it; after that nothing can hold it for writing again.
+    fn write_exec_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match Command::new(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                // Exit status is irrelevant: the script may fail on purpose.
+                Ok(_) => return,
+                Err(e) if e.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => panic!("cannot exec {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// #242: a script written while other threads fork must still exec.
+    /// With a plain write-then-exec this fails with ETXTBSY within a few
+    /// hundred iterations, because a forked child holds the write fd
+    /// until its own exec.
+    #[test]
+    fn fresh_script_execs_while_other_threads_fork() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            let path = dir.path().join(format!("s{i}.sh"));
+            write_exec_script(&path, "#!/bin/sh\nexit 0\n");
+            let status = Command::new(&path).status().unwrap();
+            assert!(status.success());
+        }
+        stop.store(true, Ordering::Relaxed);
+        for f in forkers {
+            f.join().unwrap();
+        }
     }
 
     fn compose_dir() -> (tempfile::TempDir, PathBuf) {
@@ -1453,14 +1515,11 @@ mod tests {
         // A runtime that reports the object as absent yields no event.
         let dir = tempfile::tempdir().unwrap();
         let absent = {
-            use std::os::unix::fs::PermissionsExt;
             let path = dir.path().join("absent.sh");
-            std::fs::write(
+            write_exec_script(
                 &path,
                 "#!/bin/sh\necho 'Error: No such container: x' >&2\nexit 1\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
             path.display().to_string()
         };
         assert!(prepare_rm(&absent, vec!["c1".into(), "c2".into()], false).is_empty());

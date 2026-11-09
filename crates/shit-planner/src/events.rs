@@ -140,6 +140,13 @@ pub enum FilePreImageSource {
     /// marker: a gap is covered only by a pre-image some other tier
     /// captured.
     ShimPreMutation,
+    /// M3 (#216): the shim's record of an xattr mutation (`setxattr`,
+    /// `fsetxattr`, `removexattr`, `fremovexattr`) before the call ran.
+    /// It carries the file's stat fields and the one xattr's old value
+    /// in the metadata, and no file content: the blob is an empty
+    /// placeholder. The planner restores xattrs from it and never
+    /// restores bytes.
+    ShimXattrPreMutation,
 }
 
 /// L5: the `CaptureRefused` class for a refusal about a whole command
@@ -150,9 +157,12 @@ pub const COMMAND_CAPTURE_GAP: &str = "command-capture-gap";
 
 impl FilePreImageSource {
     /// False for records that reuse the FilePreImage wire without
-    /// carrying the file's content: a chflags snapshot.
+    /// carrying the file's content: a chflags or an xattr snapshot.
     pub fn has_content(&self) -> bool {
-        !matches!(self, FilePreImageSource::ShimFlagsPreMutation)
+        !matches!(
+            self,
+            FilePreImageSource::ShimFlagsPreMutation | FilePreImageSource::ShimXattrPreMutation
+        )
     }
 
     /// True for records the LD_PRELOAD shim captured.
@@ -162,6 +172,7 @@ impl FilePreImageSource {
             FilePreImageSource::ShimFlagsPreMutation
                 | FilePreImageSource::ShimRenameSubtree
                 | FilePreImageSource::ShimPreMutation
+                | FilePreImageSource::ShimXattrPreMutation
         )
     }
 
