@@ -85,14 +85,15 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `dir-rename-undo-linux`, `renameat-overwrite-undo-linux` |
 | Filesystem: content writes and editors | `dd-of-undo-linux`, `redirect-race-undo-linux`, `shell-append-undo-linux` |
 
-### FreeBSD (73 wired into CI)
+### FreeBSD (77 wired into CI)
 
-#### FreeBSD 14 VM on hosted ubuntu-24.04 (UFS and ZFS legs): 73 smokes
+#### FreeBSD 14 VM on hosted ubuntu-24.04 (UFS and ZFS legs): 77 smokes
 
 | Surface family | Smokes |
 |---|---|
-| Strict capture (opt-in loss-aware refusal) | `strict-git-lockfile-fbsd`, `strict-readiness-refuse-fbsd`, `strict-redirect-fbsd` |
+| Strict capture (opt-in loss-aware refusal) | `strict-extract-fbsd`, `strict-git-lockfile-fbsd`, `strict-readiness-refuse-fbsd`, `strict-redirect-fbsd` |
 | Git operations | `git-branch-D-undo-fbsd`, `git-checkout-branch-undo-fbsd`, `git-checkout-file-undo-fbsd`, `git-clean-fd-undo-fbsd`, `git-commit-undo-fbsd`, `git-reset-hard-undo-fbsd`, `git-stash-drop-undo-fbsd` |
+| Shell state | `cd-undo-fish-fbsd`, `cd-undo-zsh-fbsd`, `set-e-undo-zsh-fbsd` |
 | Capture tier, sandbox and ZFS engine | `capsicum-default-on-fbsd`, `ln-hardlink-shim-fbsd`, `preload-shim-fbsd`, `setxattr-shim-fbsd`, `shim-default-on-fbsd`, `zfs-clone-engine-fbsd`, `zfs-clone-primitives-fbsd` |
 | Package managers | `pkg-install-undo-fbsd` |
 | Services, firewall, network and processes | `kill-proc-undo-fbsd`, `pfctl-add-undo-fbsd`, `pfctl-flush-undo-fbsd`, `service-restart-undo-fbsd` |
@@ -163,10 +164,9 @@ Some items below are limits of pinned classes; the ones marked unpinned have no 
 
 - macOS: SIP-protected binaries (`/bin/rm`, `/bin/mv`, `/bin/cp` and the like) drop `DYLD_INSERT_LIBRARIES` on exec, so the default (non-EndpointSecurity) tier does not capture them. No smoke pins this behavior yet.
 - Static binaries and binaries that issue raw syscalls (Go programs, for example) bypass the DYLD interposer on macOS and the LD_PRELOAD shim on FreeBSD. No smoke pins this either.
-- FreeBSD `chown-undo-fbsd` skips its group case in CI because the CI user is in one group. Chown-to-group on FreeBSD is not pinned.
 - macOS `pip install --user --force-reinstall` reaches full restore on trunk, but `pip-install-user-undo-macos` does not yet gate on that outcome. It passes; it is not a gate.
 - Linux `pip install --user --force-reinstall` accepts two outcomes in its smoke: full restore through recursive pre-image, or a graceful fallback.
-- Strict capture (`SHIT_STRICT_CAPTURE`, opt-in) refuses an undo when capture was provably incomplete for the touched paths. It is off by default. The `strict-*` smokes run on Linux and FreeBSD only.
+- Strict capture (`SHIT_STRICT_CAPTURE`, opt-in) refuses an undo when capture was provably incomplete for the touched paths. It is off by default. The `strict-*` smokes run on Linux and FreeBSD only. On FreeBSD, strict mode compares file birth times with the wall clock at the start of the command, so a realtime clock step while a command runs can misclassify which files the command created.
 - `kubectl delete` restore is context-drift gated. `terraform apply` reverses through `terraform destroy`; `terraform destroy` reverses through state-push plus `terraform apply`.
 - `kill`, `pkill` and `killall` produce an informational note and a restart hint. Processes are not reanimated.
 - apt rollback delegates to `apt-get history-rollback` on apt 3.2 and later. Older apt synthesizes an inverse invocation (`refuse-without-native-delegate`).
@@ -214,7 +214,6 @@ Gaps where coverage is plausible but not shipped, or shipped without CI evidence
 ### FreeBSD
 
 - NetBSD, OpenBSD and DragonFly are post-v1 stretch goals. The helper compiles only on FreeBSD.
-- Chown-to-group is not pinned (see the known limits above).
 - Raw-syscall and static binaries bypass the shim, and no smoke pins that.
 - Containers and cloud tools are untested.
 
