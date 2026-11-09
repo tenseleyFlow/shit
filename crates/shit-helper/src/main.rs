@@ -1425,18 +1425,33 @@ struct LsmDispatch {
 #[cfg(target_os = "linux")]
 const LSM_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Load the eBPF-LSM unlink program, take its ringbuf, and spawn
-/// the userspace reader thread wired to dispatch into the linux
-/// capture runtime. Returns the long-lived state to keep alive.
+/// The eBPF-LSM programs, attached, with their ring buffers taken and
+/// no reader thread spawned yet. #226: the helper drops its startup
+/// capabilities between [`load_ebpf_lsm`] and [`spawn_lsm_readers`],
+/// because each thread copies its creator's capability sets.
+#[cfg(target_os = "linux")]
+struct LsmLoaded {
+    loader: ebpf::EbpfLoader,
+    unlink_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    setattr_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    mkdir_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    create_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    open_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    rename_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    symlink_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    link_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    rmdir_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    mknod_rb: aya::maps::RingBuf<aya::maps::MapData>,
+    release_rb_opt: Option<aya::maps::RingBuf<aya::maps::MapData>>,
+}
+
+/// Load and attach the eBPF-LSM programs and take their ring buffers.
+/// Spawns no thread.
 ///
 /// Requires CAP_BPF + CAP_PERFMON on the calling process. Call
-/// BEFORE `sandbox::enter` — that's the last point where the helper
-/// has the caps needed for `bpf(2)`.
+/// BEFORE `priv_linux::finish_startup`, which drops them.
 #[cfg(target_os = "linux")]
-fn boot_ebpf_lsm(
-    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
-    excluded_pids: Vec<u32>,
-) -> anyhow::Result<LsmCaptureState> {
+fn load_ebpf_lsm() -> anyhow::Result<LsmLoaded> {
     let mut loader = ebpf::EbpfLoader::new();
     loader
         .load_lsm_unlink()
@@ -1529,11 +1544,46 @@ fn boot_ebpf_lsm(
         None
     };
 
-    // #226: the programs are attached and the ring buffers taken. Drop
-    // the startup capabilities now, before the reader threads below are
-    // spawned: each thread copies its creator's capability sets.
-    priv_linux::finish_startup().map_err(|e| anyhow::anyhow!("capability drop failed: {e}"))?;
+    Ok(LsmLoaded {
+        loader,
+        unlink_rb,
+        setattr_rb,
+        mkdir_rb,
+        create_rb,
+        open_rb,
+        rename_rb,
+        symlink_rb,
+        link_rb,
+        rmdir_rb,
+        mknod_rb,
+        release_rb_opt,
+    })
+}
 
+/// Spawn the userspace reader threads for loaded eBPF-LSM programs,
+/// wired to dispatch into the linux capture runtime. Returns the
+/// long-lived state to keep alive. Call after
+/// `priv_linux::finish_startup` so the readers hold no capability.
+#[cfg(target_os = "linux")]
+fn spawn_lsm_readers(
+    loaded: LsmLoaded,
+    runtime: Option<Arc<std::sync::Mutex<capture::linux::LinuxCaptureRuntime>>>,
+    excluded_pids: Vec<u32>,
+) -> LsmCaptureState {
+    let LsmLoaded {
+        mut loader,
+        unlink_rb,
+        setattr_rb,
+        mkdir_rb,
+        create_rb,
+        open_rb,
+        rename_rb,
+        symlink_rb,
+        link_rb,
+        rmdir_rb,
+        mknod_rb,
+        release_rb_opt,
+    } = loaded;
     let mut tree_map = fanotify::tree::TreeMap::new();
     tree_map.set_excluded(excluded_pids.iter().map(|&p| p as i32).collect());
     let tree = Arc::new(std::sync::Mutex::new(tree_map));
@@ -1667,7 +1717,7 @@ fn boot_ebpf_lsm(
             g.set_fmode_created_trusted(trusted);
         }
     }
-    Ok(LsmCaptureState {
+    LsmCaptureState {
         _readers: readers,
         _loader: loader,
         dispatch: LsmDispatch {
@@ -1675,7 +1725,7 @@ fn boot_ebpf_lsm(
             runtime,
             flush,
         },
-    })
+    }
 }
 
 /// Check that `file_open` reports `FMODE_CREATED` the way the born set
@@ -2010,28 +2060,34 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         // sandbox::enter). The returned state carries both the
         // tree map (for WatchTree dispatch) and the LsmReader join
         // handle (for graceful shutdown).
-        let (lsm_state, ebpf_load_error): (Option<LsmCaptureState>, Option<anyhow::Error>) =
+        let (lsm_loaded, ebpf_load_error): (Option<LsmLoaded>, Option<anyhow::Error>) =
             if matches!(setup_tier, CaptureTier::EbpfLsm) {
-                // Exclude the helper's own pid + the daemon's pid from
-                // LSM event dispatch. Both run as descendants of the
-                // smoke harness (or the user's shell), so their internal
-                // file ops would otherwise be journaled as user-visible
-                // mutations. Daemon's blob-staging rename was the
-                // load-bearing miss surfaced by L04.1.
-                let excluded = vec![std::process::id(), cli.daemon_pid];
-                match boot_ebpf_lsm(capture_rt.clone(), excluded) {
-                    Ok(state) => (Some(state), None),
+                match load_ebpf_lsm() {
+                    Ok(loaded) => (Some(loaded), None),
                     Err(e) => (None, Some(e)),
                 }
             } else {
                 (None, None)
             };
 
-        // #226: kernel-tier setup is over (the fanotify fd was opened in
-        // privileged_setup). Drop the startup capabilities before the
-        // fanotify reader thread exists. Done already when the eBPF tier
-        // booted; this covers the fanotify and degraded paths.
-        priv_linux::finish_startup().map_err(|e| anyhow::anyhow!("capability drop failed: {e}"))?;
+        // #226: kernel-tier setup is over (programs attached, or the
+        // fanotify fd opened in privileged_setup). Drop the startup
+        // capabilities before any reader thread exists: each thread
+        // copies its creator's sets. A failure here is a privilege
+        // error and stops the helper; it is never treated as an eBPF
+        // load failure or a reason to fall back to fanotify.
+        priv_linux::finish_startup()
+            .map_err(|e| anyhow::anyhow!("privilege drop failed; refusing to start: {e}"))?;
+
+        // Exclude the helper's own pid + the daemon's pid from LSM event
+        // dispatch. Both run as descendants of the smoke harness (or the
+        // user's shell), so their internal file ops would otherwise be
+        // journaled as user-visible mutations. Daemon's blob-staging
+        // rename was the load-bearing miss surfaced by L04.1.
+        let lsm_state: Option<LsmCaptureState> = lsm_loaded.map(|loaded| {
+            let excluded = vec![std::process::id(), cli.daemon_pid];
+            spawn_lsm_readers(loaded, capture_rt.clone(), excluded)
+        });
 
         let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
         let active_tier = match resolve_linux_capture_startup(
