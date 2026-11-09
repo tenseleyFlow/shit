@@ -379,7 +379,9 @@ impl CloseAccounting {
     pub fn close(mut self, send_failures: u32, kernel_now: Option<u64>) -> Vec<Observation> {
         let mut out = Vec::new();
         let reason = self.incomplete_reason();
-        let mut lost = Vec::new();
+        // `(observation, identity known)`: a pre-existing file, or a
+        // change whose file could not be identified at all.
+        let mut lost: Vec<(Observation, bool)> = Vec::new();
         let mut unlocated = 0usize;
         let keyed = std::mem::take(&mut self.missing)
             .into_iter()
@@ -395,7 +397,7 @@ impl CloseAccounting {
                 if !self.born_at(obs.path.as_deref(), order)
                     && !self.outside_root(obs.path.as_deref())
                 {
-                    lost.push(obs);
+                    lost.push((obs, false));
                 }
                 continue;
             }
@@ -403,21 +405,30 @@ impl CloseAccounting {
                 continue;
             }
             match self.classify(id, absent) {
-                Provenance::Baseline => lost.push(obs),
+                Provenance::Baseline => lost.push((obs, true)),
                 Provenance::Born | Provenance::Outside => {}
                 Provenance::Unlocated if self.born_at(obs.path.as_deref(), order) => {}
                 Provenance::Unlocated if self.outside_root(obs.path.as_deref()) => {}
                 Provenance::Unlocated => unlocated += 1,
             }
         }
-        let hidden = lost.len().saturating_sub(MAX_PATH_OBSERVATIONS);
-        lost.truncate(MAX_PATH_OBSERVATIONS);
-        out.extend(lost);
-        if hidden > 0 {
+        let folded = lost.split_off(lost.len().min(MAX_PATH_OBSERVATIONS));
+        out.extend(lost.into_iter().map(|(obs, _)| obs));
+        let hidden_known = folded.iter().filter(|(_, known)| *known).count();
+        let hidden_unknown = folded.len() - hidden_known;
+        if hidden_known > 0 {
             out.push(Observation {
                 path: None,
                 detail: format!(
-                    "{hidden} more pre-existing file(s) changed without captured evidence"
+                    "{hidden_known} more pre-existing file(s) changed without captured evidence"
+                ),
+            });
+        }
+        if hidden_unknown > 0 {
+            out.push(Observation {
+                path: None,
+                detail: format!(
+                    "{hidden_unknown} more change(s) to file(s) whose identity could not be read, without captured evidence"
                 ),
             });
         }
@@ -750,6 +761,29 @@ mod tests {
         let obs = a.close(0, None);
         assert_eq!(obs.len(), MAX_PATH_OBSERVATIONS + 1);
         assert!(obs.last().unwrap().detail.starts_with("3 more"));
+    }
+
+    #[test]
+    fn folded_unknown_identity_losses_are_not_called_pre_existing() {
+        let mut a = CloseAccounting::default();
+        a.note_walked();
+        for i in 0..(MAX_PATH_OBSERVATIONS as u64 + 2) {
+            a.note_baseline_entry((1, 100 + i), Path::new("/w/x"));
+            a.note_missing((1, 100 + i), true, None, "no snapshot");
+        }
+        for _ in 0..3 {
+            a.note_missing((0, 0), false, None, "no identity");
+        }
+        let obs = a.close(0, None);
+        assert_eq!(obs.len(), MAX_PATH_OBSERVATIONS + 2, "{obs:?}");
+        assert!(
+            obs[MAX_PATH_OBSERVATIONS]
+                .detail
+                .starts_with("2 more pre-existing")
+        );
+        let last = &obs[MAX_PATH_OBSERVATIONS + 1].detail;
+        assert!(last.starts_with("3 more change(s)"), "{last}");
+        assert!(!last.contains("pre-existing"), "{last}");
     }
 
     #[test]
