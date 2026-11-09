@@ -179,6 +179,11 @@ struct DirEntryBaseline {
     symlink_target: Option<String>,
     /// The entry is a directory (not a symlink to one).
     is_dir: bool,
+    /// Birth time in ns since the epoch, from the same `fstatat` as the
+    /// identity. `None` where the platform or file system has none.
+    birth_ns: Option<i128>,
+    /// Modification time in ns since the epoch, from the same `fstatat`.
+    mtime_ns: i128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -548,10 +553,7 @@ impl PumpState {
                     return;
                 }
             };
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let now_nanos = now_unix_nanos() as u64;
         // Wire's `seq` field is the *command's* seq — that's the FK
         // the daemon uses to attach the event to the originating
         // PreExec'd command (the helper-local seq_counter we had here
@@ -707,7 +709,7 @@ impl PumpState {
         // under dst because NOTE_WRITE never fires on dst (no watch).
         let mut events: Vec<shit_proto::TreeOpWire> = Vec::new();
         let mut new_files_to_watch: Vec<std::path::PathBuf> = Vec::new();
-        let mut new_dirs_to_watch: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let mut new_dirs_to_watch: Vec<(std::path::PathBuf, Birth, (u64, u64))> = Vec::new();
         // W09.16.1 CI diag — dump current entries pre-diff.
         for (name, e) in &current {
             tracing::info!(
@@ -785,20 +787,21 @@ impl PumpState {
             // below never fires for new dirs. W03.B.
             let kind = file_kind_at(fd, name);
             let id = (cur_entry.dev, cur_entry.inode);
-            // #234: an entry new to this directory was born only if its
-            // birth time says so, or, when the file system cannot say,
-            // if the directory's listing was complete (decided at
-            // close). An entry older than the attach that the walk never
-            // saw came from outside the walked tree: a rename or link
+            // #234: an entry new to this directory was born if its birth
+            // time says so. Otherwise, when the time cannot say, absence
+            // from a complete listing decides at close. An entry whose
+            // birth time is well before the attach and differs from its
+            // mtime came from outside the walked tree: a rename or link
             // the kqueue tier cannot see the source of.
-            let mut moved_in = false;
+            let birth = if ws.acct.is_baseline(id) {
+                Birth::Unknown
+            } else {
+                birth_evidence(cur_entry.birth_ns, cur_entry.mtime_ns, ws.attached_at_ns)
+            };
             if !ws.acct.is_baseline(id) {
-                match birth_evidence(birth_ns_at(fd, name), ws.attached_at_ns) {
+                match birth {
                     Birth::After => ws.acct.note_born(id),
-                    Birth::Before if parent_listed => {
-                        moved_in = true;
-                        ws.acct.note_unresolved_rename();
-                    }
+                    Birth::Before if parent_listed => ws.acct.note_unresolved_rename(),
                     Birth::Unknown if parent_listed => ws.acct.note_absent_from_listing(id),
                     Birth::Before | Birth::Unknown => {}
                 }
@@ -815,10 +818,7 @@ impl PumpState {
                     new_files_to_watch.push(child);
                 }
                 shit_proto::FileKindWire::Directory => {
-                    // A directory moved in from outside the walk has
-                    // contents no listing saw; its empty seed baseline
-                    // is not a complete listing.
-                    new_dirs_to_watch.push((child, parent_listed && !moved_in));
+                    new_dirs_to_watch.push((child, birth, id));
                 }
                 _ => {} // symlinks/other tracked via S29.1's tree-op pairing path
             }
@@ -910,13 +910,18 @@ impl PumpState {
         // — cp may have already populated it before our watch
         // installed). The queue iteration is what propagates the
         // walk deep into a `cp -r` tree.
-        for (new_path, listed) in new_dirs_to_watch {
+        for (new_path, birth, id) in new_dirs_to_watch {
             if let Some(new_fd) = ws.subtree.add_path(&self.kq, &new_path) {
                 self.fd_to_command.insert(new_fd, command);
-                // Created in the command, so its seeded empty baseline
-                // is complete.
-                if listed {
+                // Only a directory proven created in the command has a
+                // complete (empty) seed listing. One that may have been
+                // moved in from outside the walk holds entries no listing
+                // saw, so it counts as unwalked. A baseline directory
+                // moved within the tree holds baseline entries.
+                if birth == Birth::After {
                     ws.listed_dirs.insert(new_fd);
+                } else if !ws.acct.is_baseline(id) {
+                    ws.acct.note_unwalked_dir(id);
                 }
                 // S29.3 — meta baseline for the dir too (chmod on a
                 // dir fires NOTE_ATTRIB on it).
@@ -947,10 +952,7 @@ impl PumpState {
             tracing::trace!(fd, "dir Write produced no entry-set delta");
             return;
         }
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let now_nanos = now_unix_nanos() as u64;
         let mut failed = 0u32;
         for op in events {
             let resp = shit_proto::HelperResponse::TreeMutation {
@@ -1029,10 +1031,7 @@ impl PumpState {
             return;
         }
         let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let now_nanos = now_unix_nanos() as u64;
         let resp = shit_proto::HelperResponse::CapturedMetadataChange {
             session: command.session,
             seq: command.seq,
@@ -1377,6 +1376,8 @@ fn read_dir_entries(
                 inode: st.st_ino,
                 symlink_target,
                 is_dir: (st.st_mode as libc::mode_t) & libc::S_IFMT == libc::S_IFDIR,
+                birth_ns: stat_birth_ns(&st),
+                mtime_ns: (st.st_mtime as i128) * 1_000_000_000 + st.st_mtime_nsec as i128,
             },
         );
     }
@@ -1420,49 +1421,44 @@ enum Birth {
     After,
     /// Created well before the attach: pre-existing.
     Before,
-    /// No birth time, or one too close to the attach to call. Kernel
-    /// timestamps may lag the wall clock by a tick (or a second with
-    /// `vfs.timestamp_precision=0`), so a file created just after the
-    /// attach can carry a time just before it.
+    /// No birth time, one too close to the attach to call, or one that
+    /// may have been backdated. Kernel timestamps may lag the wall clock
+    /// by a tick (or a second with `vfs.timestamp_precision=0`), so a
+    /// file created just after the attach can carry a time just before
+    /// it. And `utimes(2)` with an mtime older than the birth time moves
+    /// the birth time back to that mtime (FreeBSD `setutimes`), which is
+    /// what `tar x`, `cp -p`, `rsync -t` and `unzip` do to files they
+    /// create. A birth time equal to the mtime is therefore no evidence.
     Unknown,
 }
 
 /// Slack for [`Birth::Unknown`].
 const BIRTH_SLACK_NS: i128 = 1_000_000_000;
 
-fn birth_evidence(birth_ns: Option<i128>, attached_at_ns: i128) -> Birth {
+fn birth_evidence(birth_ns: Option<i128>, mtime_ns: i128, attached_at_ns: i128) -> Birth {
     match birth_ns {
         Some(b) if b <= 0 => Birth::Unknown,
         Some(b) if b >= attached_at_ns => Birth::After,
+        Some(b) if b == mtime_ns => Birth::Unknown,
         Some(b) if b < attached_at_ns - BIRTH_SLACK_NS => Birth::Before,
         _ => Birth::Unknown,
     }
 }
 
-/// Birth time of `name` in `dir_fd` in ns since the epoch, without
-/// following a symlink. `None` where the platform or file system has no
-/// birth time.
-fn birth_ns_at(dir_fd: RawFd, name: &std::ffi::OsStr) -> Option<i128> {
+/// Birth time from a `stat` in ns since the epoch. `None` where the
+/// platform or file system has none.
+fn stat_birth_ns(st: &libc::stat) -> Option<i128> {
     #[cfg(test)]
     if BIRTH_UNKNOWN_FOR_TEST.with(|f| f.get()) {
         return None;
     }
     #[cfg(target_os = "freebsd")]
     {
-        let name_c = std::ffi::CString::new(name.as_bytes()).ok()?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: dir_fd is alive per caller (held in TrackedSubtree);
-        // name_c is NUL-terminated; st is writable.
-        let rc =
-            unsafe { libc::fstatat(dir_fd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-        if rc != 0 {
-            return None;
-        }
         Some((st.st_birthtime as i128) * 1_000_000_000 + st.st_birthtime_nsec as i128)
     }
     #[cfg(not(target_os = "freebsd"))]
     {
-        let _ = (dir_fd, name);
+        let _ = st;
         None
     }
 }
@@ -1919,6 +1915,10 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f"), b"").unwrap();
+        // Written after its birth, so its birth time is not its mtime
+        // (which is what a utimes backdate would leave).
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::write(outside.join("f"), b"old content").unwrap();
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(81);
@@ -1969,23 +1969,103 @@ mod tests {
         );
     }
 
+    /// A directory that may have been moved in from outside the walk
+    /// (no birth evidence) is not a complete listing, even in a listed
+    /// parent: a pre-existing file inside it written in the command is
+    /// loss, not a birth.
+    #[test]
+    fn directory_moved_in_without_birth_evidence_is_not_listed() {
+        BIRTH_UNKNOWN_FOR_TEST.with(|f| f.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("d")).unwrap();
+        std::fs::write(outside.join("d/f"), b"old content").unwrap();
+        let (mut state, kq, daemon) = hand_driven_state(dir.path());
+        let cmd = command(83);
+        state.attach(&kq, cmd, &root).unwrap();
+        assert!(state.watches[&cmd].acct.listing_complete());
+        std::fs::rename(outside.join("d"), root.join("d")).unwrap();
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
+        let d_fd = tracked_fd(&state, cmd, &root.join("d"));
+        assert!(!state.watches[&cmd].listed_dirs.contains(&d_fd));
+        std::fs::write(root.join("d/f"), b"new content").unwrap();
+        let f_fd = tracked_fd(&state, cmd, &root.join("d/f"));
+        state.handle_vnode(f_fd, VnodeEventKind::Write);
+        let details = refusals_at_detach(state, cmd, daemon);
+        BIRTH_UNKNOWN_FOR_TEST.with(|f| f.set(false));
+        assert!(
+            details.iter().any(|d| d.contains("not listed completely")),
+            "a file inside a moved-in directory was taken as a birth: {details:?}"
+        );
+    }
+
+    /// A directory created in the command is a complete listing.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn directory_born_in_the_command_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut state, kq, _daemon) = hand_driven_state(dir.path());
+        let cmd = command(84);
+        state.attach(&kq, cmd, &root).unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
+        let d_fd = tracked_fd(&state, cmd, &root.join("d"));
+        assert!(state.watches[&cmd].listed_dirs.contains(&d_fd));
+        assert!(state.watches[&cmd].acct.listing_complete());
+    }
+
+    /// `tar x` and `cp -p` backdate the birth time of files they create
+    /// to the archived mtime. Such a file is not counted as arriving
+    /// from outside the walk, and absence from the complete listing
+    /// proves its birth.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn backdated_new_file_is_not_a_rename_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut state, kq, daemon) = hand_driven_state(dir.path());
+        let cmd = command(85);
+        state.attach(&kq, cmd, &root).unwrap();
+        let f = root.join("f");
+        std::fs::write(&f, b"extracted").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
+        // A later write with no evidence: born, so not loss.
+        std::fs::write(&f, b"appended").unwrap();
+        state.handle_vnode(tracked_fd(&state, cmd, &f), VnodeEventKind::Write);
+        let details = refusals_at_detach(state, cmd, daemon);
+        assert!(details.is_empty(), "{details:?}");
+    }
+
     #[test]
     fn birth_time_is_judged_against_the_attach_with_slack() {
         let at = 100 * BIRTH_SLACK_NS;
-        assert_eq!(birth_evidence(Some(at), at), Birth::After);
-        assert_eq!(birth_evidence(Some(at + 1), at), Birth::After);
-        assert_eq!(birth_evidence(Some(at - 1), at), Birth::Unknown);
+        let m = at + 5; // written after its birth
+        assert_eq!(birth_evidence(Some(at), m, at), Birth::After);
+        assert_eq!(birth_evidence(Some(at + 1), m, at), Birth::After);
+        assert_eq!(birth_evidence(Some(at - 1), m, at), Birth::Unknown);
         assert_eq!(
-            birth_evidence(Some(at - BIRTH_SLACK_NS), at),
+            birth_evidence(Some(at - BIRTH_SLACK_NS), m, at),
             Birth::Unknown
         );
-        assert_eq!(
-            birth_evidence(Some(at - BIRTH_SLACK_NS - 1), at),
-            Birth::Before
-        );
-        assert_eq!(birth_evidence(None, at), Birth::Unknown);
-        assert_eq!(birth_evidence(Some(0), at), Birth::Unknown);
-        assert_eq!(birth_evidence(Some(-1), at), Birth::Unknown);
+        let old = at - BIRTH_SLACK_NS - 1;
+        assert_eq!(birth_evidence(Some(old), m, at), Birth::Before);
+        // utimes backdates the birth to the mtime: no evidence either way.
+        assert_eq!(birth_evidence(Some(old), old, at), Birth::Unknown);
+        assert_eq!(birth_evidence(None, m, at), Birth::Unknown);
+        assert_eq!(birth_evidence(Some(0), m, at), Birth::Unknown);
+        assert_eq!(birth_evidence(Some(-1), m, at), Birth::Unknown);
     }
 
     #[test]
