@@ -393,6 +393,35 @@ pub fn with_cap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Set the filesystem uid and gid to the real ones, on this thread and
+/// every thread it later creates. On a setcap install they already are
+/// (euid is the invoking user). On a setuid-root install the euid is 0,
+/// and this makes path lookups, opens and the ptrace access check
+/// behave as the invoking user, so the WatchTree scope checks (#230)
+/// ask what the peer could do. Call on the main thread before the
+/// request loop starts.
+pub fn act_as_real_user() -> Result<(), PrivError> {
+    let (ruid, rgid) = unsafe { (libc::getuid(), libc::getgid()) };
+    unsafe {
+        libc::setfsgid(rgid);
+        libc::setfsuid(ruid);
+    }
+    // setfsuid/setfsgid report no error; an invalid id (-1) changes
+    // nothing and returns the current value, which is checked here.
+    let (fsuid, fsgid) = unsafe {
+        (
+            libc::setfsuid(libc::uid_t::MAX) as u32,
+            libc::setfsgid(libc::gid_t::MAX) as u32,
+        )
+    };
+    if (fsuid, fsgid) != (ruid, rgid) {
+        return Err(PrivError::Capset(format!(
+            "filesystem ids are {fsuid}:{fsgid}, not the real ids {ruid}:{rgid}"
+        )));
+    }
+    Ok(())
+}
+
 /// Best-effort detection of "full root inherited": UID 0 and an
 /// effective set with (essentially) every capability. The real test is
 /// "did the operator launch us via sudo without our file-cap install".
@@ -630,6 +659,13 @@ mod tests {
             };
             assert!(capset(&more).is_err());
         }
+    }
+
+    #[test]
+    fn act_as_real_user_sets_the_real_filesystem_ids() {
+        act_as_real_user().unwrap();
+        let fsuid = unsafe { libc::setfsuid(libc::uid_t::MAX) } as u32;
+        assert_eq!(fsuid, unsafe { libc::getuid() });
     }
 
     #[test]

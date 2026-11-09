@@ -2306,6 +2306,13 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
         }
     };
 
+    // #230: path lookups and the ptrace check in the request loop run
+    // with the real user's filesystem ids (a no-op on a setcap install;
+    // on a setuid-root install it stops euid 0 from widening them).
+    #[cfg(target_os = "linux")]
+    priv_linux::act_as_real_user()
+        .map_err(|e| anyhow::anyhow!("privilege drop failed; refusing to start: {e}"))?;
+
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
 
@@ -2475,25 +2482,17 @@ struct WatchCwd {
 /// left) is refused.
 #[cfg(target_os = "linux")]
 fn open_watch_dir(path: &str) -> Result<WatchCwd, String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let c = std::ffi::CString::new(path).map_err(|e| format!("path contains NUL: {e}"))?;
-    let raw = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    if st.st_nlink == 0 {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    if dir.metadata().map_err(|e| e.to_string())?.nlink() == 0 {
         return Err("the directory was deleted".to_string());
     }
+    let fd = std::os::fd::OwnedFd::from(dir);
     let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
         .map_err(|e| format!("cannot name the opened directory: {e}"))?;
     Ok(WatchCwd { fd, path })
@@ -2582,7 +2581,7 @@ fn linux_watch_tree(
     lsm_state: Option<&LsmDispatch>,
     command: shit_planner::events::CommandId,
     root_pid: u32,
-    cwd_path: &str,
+    cwd: Result<WatchCwd, String>,
 ) -> Result<(), String> {
     let (session, command_seq) = (command.session, command.seq);
     if let Some(state) = fanotify_state {
@@ -2595,7 +2594,6 @@ fn linux_watch_tree(
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
         // L01: explicit dedupe-state init for the command.
-        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
         if let Some(rt) = &state.capture_runtime
             && let Ok(mut g) = rt.lock()
         {
@@ -2648,7 +2646,6 @@ fn linux_watch_tree(
             .lock()
             .unwrap()
             .watch(session, command_seq, root_pid as i32);
-        let cwd = resolve_linux_watch_cwd(cwd_path, root_pid);
         // L04 — pre-open every regular file under the cwd. The held
         // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
         // unlink handler can read the pre-image content even though
@@ -2854,7 +2851,7 @@ mod linux_watch_tests {
                 Some(&dispatch),
                 command,
                 root,
-                "/nonexistent/shit-r3a-cwd"
+                resolve_linux_watch_cwd("/nonexistent/shit-r3a-cwd", root)
             )
             .is_ok()
         );
@@ -2889,7 +2886,14 @@ mod linux_watch_tests {
             };
             let state = fanotify_state_that_cannot_mark();
             let root = dead_pid();
-            let result = linux_watch_tree(&helper, Some(&state), None, command, root, cwd);
+            let result = linux_watch_tree(
+                &helper,
+                Some(&state),
+                None,
+                command,
+                root,
+                resolve_linux_watch_cwd(cwd, root),
+            );
             assert!(result.is_err(), "{cwd}");
             assert_eq!(
                 state.tree.lock().unwrap().is_tracked(root as i32),
@@ -2917,7 +2921,7 @@ mod linux_watch_tests {
                 Some(&dispatch),
                 command,
                 1,
-                dir.path().to_str().unwrap()
+                resolve_linux_watch_cwd(dir.path().to_str().unwrap(), 1)
             )
             .is_ok()
         );
@@ -2948,7 +2952,17 @@ mod linux_watch_tests {
             session: uuid::Uuid::from_u128(9),
             seq: 2,
         };
-        assert!(linux_watch_tree(&helper, None, None, command, 1, "/nonexistent").is_ok());
+        assert!(
+            linux_watch_tree(
+                &helper,
+                None,
+                None,
+                command,
+                1,
+                resolve_linux_watch_cwd("/nonexistent", 1)
+            )
+            .is_ok()
+        );
         assert!(matches!(
             daemon.recv_response().unwrap(),
             shit_proto::HelperResponse::CaptureRefused { seq: 2, path: None, detail, .. }
@@ -3037,14 +3051,23 @@ fn request_loop(
                 }
                 #[cfg(target_os = "linux")]
                 let attach = match watch_scope.authorize(session, root_pid) {
-                    Ok(()) => linux_watch_tree(
-                        &conn,
-                        fanotify_state.as_ref(),
-                        lsm_state.as_ref(),
-                        command,
-                        root_pid,
-                        &cwd_path,
-                    ),
+                    Ok(ident) => {
+                        // The watch root may come from /proc/<pid>/cwd, so
+                        // the pid must still be the authorized process
+                        // once it is open (review item 4).
+                        let cwd = resolve_linux_watch_cwd(&cwd_path, root_pid);
+                        match watch_scope::still_same(root_pid, ident.start) {
+                            Ok(()) => linux_watch_tree(
+                                &conn,
+                                fanotify_state.as_ref(),
+                                lsm_state.as_ref(),
+                                command,
+                                root_pid,
+                                cwd,
+                            ),
+                            Err(reason) => Err(refuse_watch(&conn, command, root_pid, &reason)),
+                        }
+                    }
                     Err(reason) => Err(refuse_watch(&conn, command, root_pid, &reason)),
                 };
                 #[cfg(not(any(
