@@ -2312,6 +2312,10 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     priv_linux::act_as_real_user()
         .map_err(|e| anyhow::anyhow!("privilege drop failed; refusing to start: {e}"))?;
+    // Built before the sandbox: it reads the helper's real and effective
+    // uids, and getuid is not on the seccomp allowlist.
+    #[cfg(target_os = "linux")]
+    let watch_scope = watch_scope::WatchScope::new(outcome.daemon_uid);
 
     // Sandbox entry — per-OS module decides what to do.
     sandbox::enter(&cli.state_dir)?;
@@ -2358,13 +2362,11 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     let request_macos_capture = macos_capture.clone();
     #[cfg(target_os = "macos")]
     let request_macos_es_capture = macos_es_capture.clone();
-    #[cfg(target_os = "linux")]
-    let peer_uid = outcome.daemon_uid;
     let request_handle = tokio::task::spawn_blocking(move || {
         request_loop(
             request_conn,
             #[cfg(target_os = "linux")]
-            peer_uid,
+            watch_scope,
             #[cfg(target_os = "linux")]
             request_state,
             #[cfg(target_os = "linux")]
@@ -2990,7 +2992,7 @@ mod linux_watch_tests {
 /// disconnects or sends `Shutdown`.
 fn request_loop(
     conn: Arc<ipc::Conn>,
-    #[cfg(target_os = "linux")] peer_uid: u32,
+    #[cfg(target_os = "linux")] mut watch_scope: watch_scope::WatchScope,
     #[cfg(target_os = "linux")] fanotify_state: Option<fanotify::runtime::FanotifyState>,
     #[cfg(target_os = "linux")] lsm_state: Option<LsmDispatch>,
     #[cfg(any(
@@ -3008,9 +3010,6 @@ fn request_loop(
     // Commands with a WatchTree and no UnwatchTree yet. A duplicate
     // WatchTree must not reset an active capture window.
     let mut active_watches = std::collections::BTreeSet::new();
-    // #230: which processes this peer may watch.
-    #[cfg(target_os = "linux")]
-    let mut watch_scope = watch_scope::WatchScope::new(peer_uid);
 
     loop {
         let req = match conn.recv_request() {
