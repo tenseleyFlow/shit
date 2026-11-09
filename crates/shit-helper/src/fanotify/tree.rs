@@ -163,6 +163,48 @@ impl TreeMap {
         None
     }
 
+    /// Who owns a ring-buffer drop recorded for `tgid` with the ancestry
+    /// BPF read at the time (#229). Unlike event attribution, a drop
+    /// that cannot be placed must not be called someone else's: strict
+    /// mode charges an [`LossOwner::Unknown`] drop to every active
+    /// command. A chain the kernel recorded in full, with no tracked
+    /// root in it, belongs to no command. A truncated chain is followed
+    /// up `/proc`; a process that is gone there makes the drop Unknown.
+    pub fn classify_loss(&self, tgid: i32, ancestry: &[i32]) -> LossOwner {
+        let end = ancestry.iter().position(|&a| a <= 0);
+        let recorded = &ancestry[..end.unwrap_or(ancestry.len())];
+        let chain = || std::iter::once(tgid).chain(recorded.iter().copied());
+        if chain().any(|p| self.excluded.contains(&p)) {
+            return LossOwner::Other;
+        }
+        if let Some((s, seq)) = self.root_in(chain()) {
+            return LossOwner::Command(s, seq);
+        }
+        if end.is_some() {
+            return LossOwner::Other;
+        }
+        let Some(&top) = recorded.last() else {
+            return LossOwner::Unknown;
+        };
+        let mut current = top;
+        for _ in 0..64 {
+            match parent_pid(current) {
+                Some(0) | Some(1) => return LossOwner::Other,
+                None => return LossOwner::Unknown,
+                Some(ppid) => {
+                    if self.excluded.contains(&ppid) {
+                        return LossOwner::Other;
+                    }
+                    if let Some((s, seq)) = self.root_in([ppid]) {
+                        return LossOwner::Command(s, seq);
+                    }
+                    current = ppid;
+                }
+            }
+        }
+        LossOwner::Unknown
+    }
+
     /// Walk `/proc/<pid>/stat` up the parent chain from `pid` looking
     /// for a tracked root. An excluded process on the way ends the walk
     /// untracked. Bounded depth so a malicious/cycling proc tree can't
@@ -185,6 +227,17 @@ impl TreeMap {
         }
         None
     }
+}
+
+/// The owner of a ring-buffer drop, from [`TreeMap::classify_loss`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossOwner {
+    /// The tracked command `(session, seq)`.
+    Command(Uuid, u64),
+    /// A process outside every tracked tree.
+    Other,
+    /// Could not be placed.
+    Unknown,
 }
 
 /// Read the parent PID from `/proc/<pid>/stat`. The field layout is
@@ -418,5 +471,37 @@ mod tests {
         // Pre-seed cache with a value that resolve() wouldn't produce.
         tm.pid_cache.insert(54321, Some((s, 99)));
         assert_eq!(tm.is_tracked(54321), Some((s, 99)));
+    }
+
+    #[test]
+    fn loss_owner_follows_the_recorded_ancestry() {
+        // #229: a drop by a gone grandchild of the root is the root's
+        // command; a drop by a process whose full chain holds no root is
+        // nobody's; a drop under the helper is nobody's.
+        let mut tm = TreeMap::new();
+        let s = Uuid::from_u128(229);
+        tm.watch(s, 4, ROOT);
+        tm.set_excluded(vec![HELPER]);
+        assert_eq!(
+            tm.classify_loss(GONE_CHILD, &chain(&[GONE_SH, ROOT, 1])),
+            LossOwner::Command(s, 4)
+        );
+        assert_eq!(
+            tm.classify_loss(GONE_CHILD, &chain(&[GONE_SH, 1])),
+            LossOwner::Other
+        );
+        assert_eq!(
+            tm.classify_loss(GONE_CHILD, &chain(&[HELPER, ROOT])),
+            LossOwner::Other
+        );
+    }
+
+    #[test]
+    fn truncated_loss_chain_with_a_gone_top_is_unknown() {
+        // Every slot filled and the topmost recorded process is gone, so
+        // nothing says whether a tracked root is above it.
+        let tm = TreeMap::new();
+        let full = [GONE_SH; 9];
+        assert_eq!(tm.classify_loss(GONE_CHILD, &full), LossOwner::Unknown);
     }
 }

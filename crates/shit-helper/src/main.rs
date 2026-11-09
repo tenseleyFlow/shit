@@ -1616,37 +1616,37 @@ fn spawn_lsm_readers(
         unlink_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("unlink"),
+        loader.take_loss_maps("unlink"),
     );
     let setattr_reader = ebpf::LsmReader::spawn_setattr(
         setattr_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("setattr"),
+        loader.take_loss_maps("setattr"),
     );
     let mkdir_reader = ebpf::LsmReader::spawn_mkdir(
         mkdir_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("mkdir"),
+        loader.take_loss_maps("mkdir"),
     );
     let create_reader = ebpf::LsmReader::spawn_create(
         create_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("create"),
+        loader.take_loss_maps("create"),
     );
     let open_reader = ebpf::LsmReader::spawn_open(
         open_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("open"),
+        loader.take_loss_maps("open"),
     );
     let rename_reader = ebpf::LsmReader::spawn_rename(
         rename_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("rename"),
+        loader.take_loss_maps("rename"),
     );
     // DR-CR-55: both new ringbufs carry shit_create_event records;
     // reuse spawn_create so they route through the on_create sink.
@@ -1654,13 +1654,13 @@ fn spawn_lsm_readers(
         symlink_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("symlink"),
+        loader.take_loss_maps("symlink"),
     );
     let link_reader = ebpf::LsmReader::spawn_create(
         link_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("link"),
+        loader.take_loss_maps("link"),
     );
     // G03: rmdir uses the same wire shape as unlink but routes via
     // on_rmdir → handle_lsm_unlink with is_directory=true.
@@ -1668,7 +1668,7 @@ fn spawn_lsm_readers(
         rmdir_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("rmdir"),
+        loader.take_loss_maps("rmdir"),
     );
     // AU29: mknod payload mirrors inode_create's; the dispatcher
     // routes through on_create. handle_lsm_create's mode-aware
@@ -1677,13 +1677,13 @@ fn spawn_lsm_readers(
         mknod_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("mknod"),
+        loader.take_loss_maps("mknod"),
     );
     // L04.2: file_release fires at last writable-fd close; the
     // handler diffs current content against the open-time
     // snapshot and emits a CapturedPreImage iff they differ.
     // Optional — only spawned on kernels where the hook loaded.
-    let release_loss = loader.take_loss_counter("release");
+    let release_loss = loader.take_loss_maps("release");
     let release_reader = release_rb_opt
         .map(|rb| ebpf::LsmReader::spawn_release(rb, Arc::clone(&sink), idle, release_loss));
 
@@ -2772,11 +2772,14 @@ fn linux_watch_tree(
         // untracked pids are dropped. The tree is tracked whatever the
         // cwd's state: `cd /tmp/x; rm -rf /tmp/x; rm ~/important` has no
         // usable cwd, and its descendants must stay attributed.
-        state
-            .tree
-            .lock()
-            .unwrap()
-            .watch(session, command_seq, root_pid as i32);
+        let loss_start = {
+            let mut tree = state.tree.lock().unwrap();
+            // #229: attribute the drops queued so far before this tree
+            // exists, so none of them is charged to this command.
+            ebpf::ringbuf_loss_value(&tree, command);
+            tree.watch(session, command_seq, root_pid as i32);
+            ebpf::ringbuf_loss_value(&tree, command)
+        };
         // L04 — pre-open every regular file under the cwd. The held
         // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
         // unlink handler can read the pre-image content even though
@@ -2785,11 +2788,7 @@ fn linux_watch_tree(
             && let Ok(mut g) = rt.lock()
         {
             g.on_watch_tree(command);
-            g.mark_kernel_losses(
-                command,
-                "the eBPF ring buffers",
-                ebpf::ringbuf_losses_observed(),
-            );
+            g.mark_kernel_losses(command, "the eBPF ring buffers", loss_start);
             if let Ok(cwd) = &cwd {
                 g.pre_open_tree(command, &cwd.path);
             }
@@ -3425,13 +3424,21 @@ fn request_loop(
                             format!("capture tail may be missing: {detail}"),
                         );
                     }
-                    state.tree.lock().unwrap().unwatch(session, command_seq);
+                    // #229: attribute the drops the flush polled while the
+                    // tree still holds this command, then stop watching.
+                    let loss_now = {
+                        let mut tree = state.tree.lock().unwrap();
+                        let v = ebpf::ringbuf_loss_value(&tree, command);
+                        tree.unwatch(session, command_seq);
+                        v
+                    };
                     let cmd = command;
                     if let Some(rt) = &state.runtime
                         && let Ok(mut g) = rt.lock()
                     {
-                        g.on_unwatch_tree_counting(cmd, Some(ebpf::ringbuf_losses_observed()));
+                        g.on_unwatch_tree_counting(cmd, Some(loss_now));
                     }
+                    ebpf::forget_ringbuf_losses(cmd);
                     tracing::info!(%session, command_seq, tier = "ebpf-lsm", "unwatch_tree");
                 }
                 #[cfg(any(

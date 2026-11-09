@@ -48,7 +48,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::loader::RingbufLossCounter;
+use super::loader::{LossMaps, LossRec};
 
 use aya::maps::{MapData, RingBuf};
 
@@ -995,34 +995,43 @@ pub fn ringbuf_losses_observed() -> u64 {
     RINGBUF_LOSSES_OBSERVED.load(Ordering::Relaxed)
 }
 
-/// Tracks one object's loss counter and reports increases.
+/// Tracks one object's loss maps and reports increases.
 struct LossTracker {
-    counter: Option<RingbufLossCounter>,
+    maps: LossMaps,
     last: u64,
+    /// `last` at the most recent read of the per-tgid map.
+    tgid_read_at: u64,
+    /// Per-tgid counts at that read.
+    tgid_last: std::collections::HashMap<u32, u64>,
     unreadable_logged: bool,
 }
 
 impl LossTracker {
-    fn new(counter: Option<RingbufLossCounter>) -> Self {
+    fn new(maps: LossMaps) -> Self {
         Self {
-            counter,
+            maps,
             last: 0,
+            tgid_read_at: 0,
+            tgid_last: std::collections::HashMap::new(),
             unreadable_logged: false,
         }
     }
 
+    /// Run `f` with CAP_BPF raised where the kernel needs it for map
+    /// reads (#226).
+    fn read_map<T>(f: impl FnOnce() -> T) -> T {
+        if crate::priv_linux::bpf_cap_kept() {
+            crate::priv_linux::with_cap(crate::priv_linux::CAP_BPF, f)
+        } else {
+            f()
+        }
+    }
+
     fn poll(&mut self, thread_name: &'static str) {
-        let Some(counter) = &self.counter else {
+        let Some(counter) = &self.maps.counter else {
             return;
         };
-        // #226: CAP_BPF is permitted only on kernels that need it for map
-        // reads; there with_cap raises it for this read on this thread.
-        let read = if crate::priv_linux::bpf_cap_kept() {
-            crate::priv_linux::with_cap(crate::priv_linux::CAP_BPF, || counter.get(&0, 0))
-        } else {
-            counter.get(&0, 0)
-        };
-        match read {
+        match Self::read_map(|| counter.get(&0, 0)) {
             Ok(value) => {
                 let delta = note_loss_value(&mut self.last, value);
                 if delta > 0 {
@@ -1044,9 +1053,56 @@ impl LossTracker {
                         "eBPF ring-buffer loss counter is unreadable; drops cannot be counted"
                     );
                 }
+                return;
             }
         }
+        // #229: the per-tgid entries are updated before the total, so
+        // once the total has moved, one read of the map sees every drop
+        // the total counts.
+        if self.last == self.tgid_read_at {
+            return;
+        }
+        self.tgid_read_at = self.last;
+        let Some(by_tgid) = &self.maps.by_tgid else {
+            return;
+        };
+        let entries: Vec<(u32, LossRec)> =
+            Self::read_map(|| by_tgid.iter().filter_map(Result::ok).collect());
+        let mut seen = std::collections::HashMap::with_capacity(entries.len());
+        let mut out = Vec::new();
+        for (tgid, rec) in entries {
+            let prev = self.tgid_last.get(&tgid).copied().unwrap_or(0);
+            if let Some(loss) = tgid_increase(tgid, &rec, prev) {
+                out.push(loss);
+            }
+            seen.insert(tgid, rec.count);
+        }
+        self.tgid_last = seen;
+        super::loss_ledger::queue(out);
     }
+}
+
+/// The increase of one tgid's entry since `prev`. A count below `prev`
+/// is an entry that was evicted and made again, so all of it is new.
+fn tgid_increase(tgid: u32, rec: &LossRec, prev: u64) -> Option<super::loss_ledger::TgidLoss> {
+    let count = if rec.count >= prev {
+        rec.count - prev
+    } else {
+        rec.count
+    };
+    if count == 0 {
+        return None;
+    }
+    let mut ancestry = [0i32; ANCESTRY_DEPTH + 1];
+    ancestry[0] = rec.parent_pid as i32;
+    for (slot, a) in ancestry[1..].iter_mut().zip(rec.ancestors) {
+        *slot = a as i32;
+    }
+    Some(super::loss_ledger::TgidLoss {
+        tgid,
+        ancestry,
+        count,
+    })
 }
 
 /// Advance `last` to `value` and return how many losses that is. The
@@ -1161,7 +1217,7 @@ impl LsmReader {
         unlink_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-unlink",
@@ -1191,7 +1247,7 @@ impl LsmReader {
         rmdir_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-rmdir",
@@ -1221,7 +1277,7 @@ impl LsmReader {
         release_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-release",
@@ -1249,7 +1305,7 @@ impl LsmReader {
         setattr_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-setattr",
@@ -1277,7 +1333,7 @@ impl LsmReader {
         mkdir_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-mkdir",
@@ -1305,7 +1361,7 @@ impl LsmReader {
         create_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-create",
@@ -1338,7 +1394,7 @@ impl LsmReader {
         mknod_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-mknod",
@@ -1366,7 +1422,7 @@ impl LsmReader {
         open_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-open",
@@ -1394,7 +1450,7 @@ impl LsmReader {
         rename_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-rename",
@@ -1425,7 +1481,7 @@ impl LsmReader {
         sink: Arc<dyn LsmEventSink>,
         handler: RecordHandler,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_t = Arc::clone(&alive);
@@ -1555,6 +1611,22 @@ mod tests {
         assert_eq!(note_loss_value(&mut last, 3), 0);
         last = u64::MAX;
         assert_eq!(note_loss_value(&mut last, 1), 2);
+    }
+
+    #[test]
+    fn tgid_increase_counts_new_drops_and_carries_ancestry() {
+        let rec = LossRec {
+            count: 5,
+            parent_pid: 40,
+            _pad: 0,
+            ancestors: [30, 1, 0, 0, 0, 0, 0, 0],
+        };
+        let l = tgid_increase(50, &rec, 2).unwrap();
+        assert_eq!((l.tgid, l.count), (50, 3));
+        assert_eq!(&l.ancestry[..3], &[40, 30, 1]);
+        assert!(tgid_increase(50, &rec, 5).is_none());
+        // Evicted and made again: the whole count is new.
+        assert_eq!(tgid_increase(50, &rec, 9).unwrap().count, 5);
     }
 
     #[test]
