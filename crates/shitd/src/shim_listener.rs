@@ -1878,7 +1878,10 @@ mod tests {
             assert_eq!(src, S::ShimXattrPreMutation, "{sc}");
             assert!(!src.has_content(), "{sc}");
         }
-        assert_eq!(metadata_pre_image_source("chflags"), S::ShimFlagsPreMutation);
+        assert_eq!(
+            metadata_pre_image_source("chflags"),
+            S::ShimFlagsPreMutation
+        );
         assert_eq!(metadata_pre_image_source("fchmod"), S::ShimPreMutation);
     }
 
