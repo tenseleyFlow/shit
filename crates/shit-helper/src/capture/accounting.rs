@@ -83,6 +83,10 @@ pub struct CloseAccounting {
     /// Command-scoped reason the tier does not see the whole tree.
     uncovered: Option<String>,
     born: BTreeSet<Id>,
+    /// Identities a producer found missing from a listing taken when the
+    /// command started (the kqueue dir diff). Absence proves birth only
+    /// under [`Self::absence_proves_birth`].
+    absent: BTreeSet<Id>,
     /// Identities with a pre-image or metadata capture on the wire.
     captured: BTreeSet<Id>,
     /// Identities whose bytes a delete capture read from a held fd.
@@ -178,6 +182,20 @@ impl CloseAccounting {
         if id != (0, 0) {
             self.born.insert(id);
         }
+    }
+
+    /// A diff found `id` in a directory whose start-of-command listing
+    /// did not hold it. That is birth only if the whole walk completed
+    /// and nothing could have moved a pre-existing file in.
+    pub fn note_absent_from_listing(&mut self, id: Id) {
+        if id != (0, 0) {
+            self.absent.insert(id);
+        }
+    }
+
+    /// True when the baseline walk saw `id`.
+    pub fn is_baseline(&self, id: Id) -> bool {
+        self.baseline.contains(&id)
     }
 
     pub fn note_captured(&mut self, id: Id) {
@@ -279,7 +297,10 @@ impl CloseAccounting {
         if self.born.contains(&id) {
             return Provenance::Born;
         }
-        if absent_from_walked_parent && id != (0, 0) && self.absence_proves_birth() {
+        if (absent_from_walked_parent || self.absent.contains(&id))
+            && id != (0, 0)
+            && self.absence_proves_birth()
+        {
             return Provenance::Born;
         }
         if id != (0, 0) && !self.tree_devs.is_empty() && !self.tree_devs.contains(&id.0) {
@@ -363,7 +384,18 @@ impl CloseAccounting {
             .into_iter()
             .map(|(obs, absent, order)| ((0, 0), obs, absent, order));
         for (id, obs, absent, order) in keyed.chain(unknown) {
-            if id != (0, 0) && self.has_evidence(&id) {
+            if id == (0, 0) {
+                // No identity: nothing places it outside the tree, and
+                // no evidence can be matched to it. Only a known path
+                // can excuse it.
+                if !self.born_at(obs.path.as_deref(), order)
+                    && !self.outside_root(obs.path.as_deref())
+                {
+                    lost.push(obs);
+                }
+                continue;
+            }
+            if self.has_evidence(&id) {
                 continue;
             }
             match self.classify(id, absent) {
@@ -614,8 +646,54 @@ mod tests {
         a.note_missing((0, 0), false, Some("/w/a".into()), "no identity");
         a.note_missing((0, 0), false, Some("/w/b".into()), "no identity");
         let obs = a.close(0, None);
+        assert_eq!(obs.len(), 2, "{obs:?}");
+        assert_eq!(obs[0].path.as_deref(), Some("/w/a"));
+        assert_eq!(obs[1].path.as_deref(), Some("/w/b"));
+    }
+
+    /// #234 item 4: a complete walk says nothing about an identity it
+    /// cannot look up, so an unknown identity is loss there too.
+    #[test]
+    fn unknown_identity_is_loss_after_a_complete_walk() {
+        let mut a = walked();
+        a.note_root(Path::new("/w"));
+        assert!(a.listing_complete());
+        a.note_missing((0, 0), false, Some("/w/a".into()), "no identity");
+        a.note_missing((0, 0), false, None, "no identity");
+        let obs = a.close(0, None);
+        assert_eq!(obs.len(), 2, "{obs:?}");
+
+        // A known path outside the root, or one an ENOENT create proved
+        // born, still excuses it.
+        let mut a = walked();
+        a.note_root(Path::new("/w"));
+        a.note_missing((0, 0), false, Some("/elsewhere/a".into()), "no identity");
+        a.note_born_path("/w/t".into());
+        a.note_missing((0, 0), false, Some("/w/t".into()), "no identity");
+        let obs = a.close(0, None);
+        assert!(obs.is_empty(), "{obs:?}");
+    }
+
+    #[test]
+    fn absence_from_a_listing_proves_birth_only_after_a_complete_walk() {
+        let mut a = walked();
+        a.note_absent_from_listing((1, 40));
+        a.note_missing((1, 40), false, Some("/w/n".into()), "no snapshot");
+        assert!(a.close(0, None).is_empty());
+
+        let mut a = walked();
+        a.note_unwalked_dir((1, 2));
+        a.note_absent_from_listing((1, 40));
+        a.note_missing((1, 40), false, Some("/w/n".into()), "no snapshot");
+        let obs = a.close(0, None);
         assert_eq!(obs.len(), 1, "{obs:?}");
-        assert!(obs[0].detail.starts_with("2 changed file(s)"), "{obs:?}");
+        assert!(obs[0].detail.contains("not listed completely"), "{obs:?}");
+
+        let mut a = walked();
+        a.note_unresolved_rename();
+        a.note_absent_from_listing((1, 40));
+        a.note_missing((1, 40), false, Some("/w/n".into()), "no snapshot");
+        assert_eq!(a.close(0, None).len(), 1);
     }
 
     #[test]
