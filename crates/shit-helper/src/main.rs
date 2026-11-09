@@ -1524,6 +1524,11 @@ fn boot_ebpf_lsm(
         None
     };
 
+    // #226: the programs are attached and the ring buffers taken. Drop
+    // the startup capabilities now, before the reader threads below are
+    // spawned: each thread copies its creator's capability sets.
+    priv_linux::finish_startup().map_err(|e| anyhow::anyhow!("capability drop failed: {e}"))?;
+
     let mut tree_map = fanotify::tree::TreeMap::new();
     tree_map.set_excluded(excluded_pids.iter().map(|&p| p as i32).collect());
     let tree = Arc::new(std::sync::Mutex::new(tree_map));
@@ -2016,6 +2021,13 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             } else {
                 (None, None)
             };
+
+        // #226: kernel-tier setup is over (the fanotify fd was opened in
+        // privileged_setup). Drop the startup capabilities before the
+        // fanotify reader thread exists. Done already when the eBPF tier
+        // booted; this covers the fanotify and degraded paths.
+        priv_linux::finish_startup()
+            .map_err(|e| anyhow::anyhow!("capability drop failed: {e}"))?;
 
         let forced_tier = std::env::var("SHIT_FORCE_TIER").ok();
         let active_tier = match resolve_linux_capture_startup(
@@ -3829,14 +3841,15 @@ mod dirfd {
         // Permission bits 0: the umask can only clear bits, so it needs no
         // change (a process-wide umask(0) would race with capture threads
         // creating staging files). The fchmod step below sets the mode.
-        let rc = unsafe {
+        // #226: CAP_MKNOD is effective for this one call, on this thread.
+        let rc = crate::priv_linux::with_cap(crate::priv_linux::CAP_MKNOD, || unsafe {
             libc::mknodat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
                 ifmt as libc::mode_t,
                 rdev as libc::dev_t,
             )
-        };
+        });
         if rc != 0 {
             let e = errno();
             return match e.raw_os_error() {

@@ -237,6 +237,11 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_tgkill,
     libc::SYS_exit_group,
     libc::SYS_prctl,
+    // #226: capabilities are raised and lowered around the one syscall
+    // that needs them (priv_linux::with_cap). capset can only move
+    // within the thread's permitted set.
+    libc::SYS_capget,
+    libc::SYS_capset,
     libc::SYS_seccomp,
     libc::SYS_getrandom, // SP-04: needed by libstd RNG seeding.
     // Tokio worker-thread runtime surface, surfaced by L01 chunk 5.

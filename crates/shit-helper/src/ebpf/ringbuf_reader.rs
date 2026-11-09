@@ -982,7 +982,9 @@ impl LossTracker {
         let Some(counter) = &self.counter else {
             return;
         };
-        match counter.get(&0, 0) {
+        // #226: CAP_BPF is permitted here only on kernels that need it
+        // for map reads; with_cap raises it for this read on this thread.
+        match crate::priv_linux::with_cap(crate::priv_linux::CAP_BPF, || counter.get(&0, 0)) {
             Ok(value) => {
                 let delta = note_loss_value(&mut self.last, value);
                 if delta > 0 {
