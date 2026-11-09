@@ -753,11 +753,7 @@ fn ingest_note(
             | "fchflags"
     ) {
         if let Some(pre) = &note.pre_image {
-            let source = if matches!(note.syscall.as_str(), "chflags" | "fchflags") {
-                shit_planner::FilePreImageSource::ShimFlagsPreMutation
-            } else {
-                shit_planner::FilePreImageSource::ShimPreMutation
-            };
+            let source = metadata_pre_image_source(note.syscall.as_str());
             if let Err(e) = ingest_pre_image_with_source(
                 command, pre, index, blob_store, source, ingest_ts, ids,
             ) {
@@ -1103,6 +1099,19 @@ fn relative_tree_path(kind: &CaptureEventKind) -> Option<PathBuf> {
         .into_iter()
         .find(|p| !p.is_absolute())
         .map(Path::to_path_buf)
+}
+
+/// Which `FilePreImageSource` a metadata-mutation syscall's pre-image is
+/// journaled under. chflags and xattr records carry no file content, so
+/// the planner must not restore bytes from them (#216).
+fn metadata_pre_image_source(syscall: &str) -> shit_planner::FilePreImageSource {
+    match syscall {
+        "chflags" | "fchflags" => shit_planner::FilePreImageSource::ShimFlagsPreMutation,
+        "setxattr" | "fsetxattr" | "removexattr" | "fremovexattr" => {
+            shit_planner::FilePreImageSource::ShimXattrPreMutation
+        }
+        _ => shit_planner::FilePreImageSource::ShimPreMutation,
+    }
 }
 
 /// W06.A.4 — write the shim's inline bytes into the BlobStore and
@@ -1859,6 +1868,18 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn xattr_syscalls_journal_without_content_source() {
+        use shit_planner::FilePreImageSource as S;
+        for sc in ["setxattr", "fsetxattr", "removexattr", "fremovexattr"] {
+            let src = metadata_pre_image_source(sc);
+            assert_eq!(src, S::ShimXattrPreMutation, "{sc}");
+            assert!(!src.has_content(), "{sc}");
+        }
+        assert_eq!(metadata_pre_image_source("chflags"), S::ShimFlagsPreMutation);
+        assert_eq!(metadata_pre_image_source("fchmod"), S::ShimPreMutation);
     }
 
     #[test]

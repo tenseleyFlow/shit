@@ -1193,6 +1193,22 @@ fn emit_for_event(
                 });
                 return;
             }
+            // M3 (#216): an xattr snapshot has no file content (its blob
+            // is an empty placeholder). Restore the metadata, which holds
+            // the xattr's old value, and never the bytes.
+            if matches!(source, FilePreImageSource::ShimXattrPreMutation) {
+                let restore_path = class.hardlink_dead_to_source.get(path).unwrap_or(path);
+                nodes.push(PlanNode {
+                    op: InverseOp::RestoreMetadata {
+                        inode: *inode,
+                        path: restore_path.clone(),
+                        target: meta.clone(),
+                    },
+                    cohort: 0,
+                    conflict: file_path_conflict(restore_path, *inode, probe),
+                });
+                return;
+            }
             // W09.20 — for the dead side of a hardlink pair, the
             // surviving alias has the right content already; the
             // CreateHardlink emitted from the Unlink branch will
@@ -2788,6 +2804,99 @@ mod tests {
             &n.op,
             InverseOp::Rename { from: f, to: t } if f == &to && t == &from
         )));
+    }
+
+    fn xattr_pre_image(inode: InodeRef, path: &str, logical: u64) -> CaptureEvent {
+        let mut captured = meta(0);
+        captured.xattrs.insert("user.k".into(), b"old".to_vec());
+        CaptureEvent {
+            id: EventId(logical),
+            command: dummy_command().command,
+            ts: TimePoint::new(logical, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: PathBuf::from(path),
+                blob: BlobHash::from_bytes([logical as u8; 32]),
+                meta: captured,
+                post_content_hash: None,
+                source: crate::FilePreImageSource::ShimXattrPreMutation,
+            },
+        }
+    }
+
+    #[test]
+    fn shim_xattr_preimage_restores_metadata_never_content() {
+        let inode = InodeRef::new(1, 20);
+        let path = PathBuf::from("/tmp/xattr-only");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(9),
+            },
+            None,
+        );
+        let p = plan(
+            dummy_command(),
+            &[xattr_pre_image(inode, path.to_str().unwrap(), 1)],
+            &probe,
+            &InMemoryStore::new(),
+        );
+        assert_eq!(p.nodes.len(), 1, "{:#?}", p.nodes);
+        assert!(matches!(
+            &p.nodes[0].op,
+            InverseOp::RestoreMetadata { target, .. } if target.xattrs.contains_key("user.k")
+        ));
+        assert_eq!(p.content_restore_count(), 0);
+        assert!(!p.has_blocking_conflicts(), "{:#?}", p.nodes);
+    }
+
+    #[test]
+    fn shim_xattr_preimage_does_not_count_as_a_content_pre_image() {
+        // #216: a moved file with only an xattr record has no pre-image,
+        // so the rename is reversed and no bytes are restored.
+        let inode = InodeRef::new(1, 21);
+        let from = PathBuf::from("/tmp/xattr-before-rename");
+        let to = PathBuf::from("/tmp/xattr-after-rename");
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            to.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(0),
+            },
+            None,
+        );
+        let rename = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(TreeOp::Rename {
+                from: from.clone(),
+                to: to.clone(),
+                inode,
+            }),
+        };
+        let xattr = xattr_pre_image(inode, to.to_str().unwrap(), 2);
+        let p = plan(
+            dummy_command(),
+            &[rename, xattr],
+            &probe,
+            &InMemoryStore::new(),
+        );
+        assert_eq!(p.content_restore_count(), 0, "{:#?}", p.nodes);
+        assert!(p.nodes.iter().any(|n| matches!(
+            &n.op,
+            InverseOp::Rename { from: f, to: t } if f == &to && t == &from
+        )));
+        assert!(
+            !p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RestoreContent { .. }))
+        );
     }
 
     #[test]
