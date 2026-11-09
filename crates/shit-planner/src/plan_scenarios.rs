@@ -650,14 +650,15 @@ fn pip_shape_with_partial_walk_keeps_reverse_rename() {
 }
 
 #[test]
-fn pip_shape_as_the_hosted_shim_sees_it_conflicts_with_the_old_tree_intact() {
-    // The journal pip produces on hosted Linux (degraded helper, shim
-    // only): no Create for the new tree, no unlink for the stash's top
-    // directory. The new `d` is in the way of the reverse rename, so undo
-    // stops with a loud conflict: the smoke's Outcome B. The old tree is
-    // back at the stash name. Sprint L5 tracks getting it back to `d`.
+fn pip_shape_with_an_unjournaled_stash_rmdir_refuses_without_guessing_a_mode() {
+    // pip on a shim without rmdir interposition: no Create for the new
+    // tree, no unlink for the stash's top directory. `d.old`'s mode was
+    // never journaled (the Rename carries none), so undo refuses the
+    // first restore under it instead of making it at the umask (#214).
+    // The shim interposes rmdir and unlinkat(AT_REMOVEDIR) since L5, so
+    // the hosted journal now carries that row.
     let mut sim = Sim::new();
-    sim.seed_dir("d", 0o755);
+    sim.seed_dir("d", 0o700);
     sim.seed_file("d/f", b"original\n", 0o640);
     sim.seed_dir("d/sub", 0o711);
     sim.seed_file("d/sub/g", b"g\n", 0o600);
@@ -668,23 +669,12 @@ fn pip_shape_as_the_hosted_shim_sees_it_conflicts_with_the_old_tree_intact() {
     sim.rmtree_top_unseen("d.old");
     let log = sim.undo();
     assert!(
-        log.iter()
-            .any(|l| l.starts_with("!! ") && l.contains("Rename")),
+        log.iter().any(|l| l.starts_with("!! ")
+            && l.contains("d.old is missing and its mode was not journaled")),
         "{}",
         log.join("\n")
     );
-    assert_eq!(
-        std::fs::read(sim.p("d.old/f")).unwrap(),
-        b"original\n",
-        "{}",
-        log.join("\n")
-    );
-    assert_eq!(
-        std::fs::read(sim.p("d.old/sub/g")).unwrap(),
-        b"g\n",
-        "{}",
-        log.join("\n")
-    );
+    assert!(!sim.p("d.old").exists(), "{}", log.join("\n"));
 }
 
 // Review of #205. All but the last failed against the first version of
@@ -1297,17 +1287,10 @@ fn dir_diff_pip_shape_restores_names_and_bytes() {
     let log = sim.undo();
     assert_no_failures(&log);
     let after = sim.snapshot();
-    // Bytes and names come back. `d/sub`'s mode does not: its unlink is
-    // classified transient alongside the dir-diff Create, on trunk too.
-    assert_eq!(after.len(), before.len(), "{}", log.join("\n"));
-    for rel in ["d/f", "d/sub/g"] {
-        assert_eq!(
-            after.get(Path::new(rel)),
-            before.get(Path::new(rel)),
-            "{}",
-            log.join("\n")
-        );
-    }
+    // #214: `d/sub` comes back with its journaled 0750 too. Its unlink
+    // is folded away with the dir-diff Create, and before EnsureDir it
+    // was made by `mkdir -p` at the umask.
+    assert_eq!(after, before, "{}", log.join("\n"));
 }
 
 #[test]
@@ -1970,10 +1953,9 @@ fn dual_tier_moved_fifo_is_recreated_once() {
 }
 
 #[test]
-fn file_moved_into_new_dir_then_rm_rf_comes_back_with_a_stray_dir() {
-    // `mkdir d; mv existing/f d/; rm -rf d`. The file comes back; `d` is
-    // scratch at the planner's level, but restoring and moving f out
-    // recreates it, so an empty `d` stays behind. No data is lost.
+fn file_moved_into_new_dir_then_rm_rf_leaves_no_stray_dir() {
+    // #215: `mkdir d; mv existing/f d/; rm -rf d`. The file comes back
+    // to existing/f and `d`, born in the command, is gone again.
     let mut sim = Sim::new();
     sim.seed_dir("existing", 0o755);
     sim.seed_file("existing/f", b"f\n", 0o644);
@@ -1981,18 +1963,7 @@ fn file_moved_into_new_dir_then_rm_rf_comes_back_with_a_stray_dir() {
     sim.mkdir("d");
     sim.mv("existing/f", "d/");
     sim.rm_rf("d");
-    let log = sim.undo();
-    assert_no_failures(&log);
-    let mut after = sim.snapshot();
-    assert_eq!(
-        after
-            .remove(Path::new("d"))
-            .map(|e| matches!(e, Entry::Dir { .. })),
-        Some(true),
-        "{}",
-        log.join("\n")
-    );
-    assert_eq!(after, before, "{}", log.join("\n"));
+    assert_restored(&sim, &before);
 }
 
 // L5: shapes that appear once the shim journals open64, mkdir and rmdir.

@@ -396,6 +396,9 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
             // signal — a true precondition violation, not a
             // recoverable gap).
             InverseOp::RestoreContent { .. } => None,
+            // #215: both executors check the path themselves; an
+            // existing directory and a missing one are each fine.
+            InverseOp::EnsureDir { .. } | InverseOp::RemoveBornDir { .. } => None,
             InverseOp::RestoreMetadata { path, .. }
             | InverseOp::Unlink { path }
             | InverseOp::FileExtend { path, .. } => {

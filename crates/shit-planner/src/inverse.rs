@@ -284,6 +284,19 @@ pub enum InverseOp {
         path: PathBuf,
         flags: u32,
     },
+    /// #214, #215: put back a directory the command removed, with the
+    /// mode its removal journaled, before an op lands under it. Covers a
+    /// directory with no inverse of its own: one the command created and
+    /// removed (scratch), or one whose removal was folded into a rename
+    /// shape. An existing directory is left as it is; anything else at
+    /// the path is a failure. A directory the command created is paired
+    /// with a [`InverseOp::RemoveBornDir`] that takes it away again.
+    EnsureDir { path: PathBuf, mode: u32 },
+    /// #215: remove a directory the command created, once the undo has
+    /// moved everything back out of it. Runs after every op under the
+    /// path, deepest first. Gone already is fine; a directory that still
+    /// holds something is left in place and reported.
+    RemoveBornDir { path: PathBuf },
 }
 
 /// C03: kubectl verb captured against a single resource (or a
@@ -560,7 +573,9 @@ impl InverseOp {
             | Self::Unlink { path, .. }
             | Self::RecreatePath { path, .. }
             | Self::CreateSymlink { path, .. }
-            | Self::FileExtend { path, .. } => Some(path),
+            | Self::FileExtend { path, .. }
+            | Self::EnsureDir { path, .. }
+            | Self::RemoveBornDir { path } => Some(path),
             Self::CreateHardlink { target, .. } => Some(target),
             Self::Rename { to, .. } => Some(to),
             Self::SetEnv { .. }
@@ -602,7 +617,9 @@ impl InverseOp {
             | Self::Rename { .. }
             | Self::CreateSymlink { .. }
             | Self::CreateHardlink { .. }
-            | Self::FileExtend { .. } => InverseTier::Files,
+            | Self::FileExtend { .. }
+            | Self::EnsureDir { .. }
+            | Self::RemoveBornDir { .. } => InverseTier::Files,
             Self::SetEnv { .. } | Self::UnsetEnv { .. } => InverseTier::Env,
             Self::PackageRollback { .. } => InverseTier::Packages,
             Self::NetworkRollback { .. } => InverseTier::Network,
