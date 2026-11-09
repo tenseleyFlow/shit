@@ -63,14 +63,18 @@ fn resolve_created_path_at(dirfd: c_int, path: &str) -> (String, Option<shit_pro
     match policy::resolve_leaf_at_for_notify(dirfd, path, "path") {
         policy::AtResolution::Resolved(abs) => (abs, None),
         policy::AtResolution::Failed(raw, failure) => (raw, Some(failure)),
-        policy::AtResolution::Nothing => (
-            path.to_string(),
-            Some(shit_proto::ShimFailure::CanonicalizeFailed {
-                which_arg: "path".to_string(),
-                attempted_path: path.to_string(),
-                error_chain: "parent directory did not exist before the call".to_string(),
-            }),
-        ),
+        policy::AtResolution::Nothing => {
+            // Keep the dirfd base: the joined path, not the bare name.
+            let joined = policy::join_at_path(dirfd, path);
+            (
+                joined.clone(),
+                Some(shit_proto::ShimFailure::CanonicalizeFailed {
+                    which_arg: "path".to_string(),
+                    attempted_path: joined,
+                    error_chain: "parent directory did not exist before the call".to_string(),
+                }),
+            )
+        }
     }
 }
 
@@ -758,16 +762,7 @@ unsafe extern "C" fn my_fremovexattr(fd: c_int, name: *const c_char, flags: c_in
 /// or if the call fails. macOS-specific: `F_GETPATH` writes up
 /// to `MAXPATHLEN` (1024) bytes into the user buffer.
 fn fd_to_path(fd: c_int) -> Option<String> {
-    use libc::{F_GETPATH, MAXPATHLEN, fcntl};
-    let mut buf = [0u8; MAXPATHLEN as usize];
-    // SAFETY: buf is large enough for F_GETPATH; fcntl writes a
-    // NUL-terminated path into it on success.
-    let rc = unsafe { fcntl(fd, F_GETPATH, buf.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    let nul = buf.iter().position(|&b| b == 0)?;
-    std::str::from_utf8(&buf[..nul]).ok().map(str::to_string)
+    policy::dirfd_path(fd)
 }
 
 /// Replacement for `mkdirat(2)`. Dirfd-relative variant.

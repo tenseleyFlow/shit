@@ -779,6 +779,9 @@ mod policy {
         dirfd: libc::c_int,
         path: &str,
     ) {
+        if idle(path) {
+            return;
+        }
         notify_resolved(syscall, resolve_leaf_at_for_notify(dirfd, path, "path"));
     }
 
@@ -856,6 +859,9 @@ mod policy {
         tofd: libc::c_int,
         to: &str,
     ) -> Option<PendingRename> {
+        if disabled() || IN_NOTIFY.with(|f| f.get()) {
+            return None;
+        }
         let f = resolve_leaf_at_for_notify(fromfd, from, "from");
         let t = resolve_leaf_at_for_notify(tofd, to, "to");
         match (f, t) {
@@ -1371,7 +1377,9 @@ mod policy {
             mtime_unix_nanos: mtime_nanos,
             bytes: Vec::new(),
             xattr: Some(xattr_pre),
-            flags: 0,
+            // The planner restores this record's metadata, flags
+            // included, so it must hold the file's real st_flags.
+            flags: read_st_flags(resolved, false).unwrap_or(0),
         }
     }
 
@@ -1686,6 +1694,17 @@ mod policy {
         let (abs, failure) = resolve_open_target(target, nofollow)?;
         if should_skip_path(&abs) {
             return None;
+        }
+        // A name that could not be keyed (a dirfd that does not resolve)
+        // is still relative to that dirfd. Stat'ing or capturing it here
+        // would read whatever the cwd holds under that name, so it is
+        // never touched: a successful call is reported with the marker
+        // and the raw name, whatever the target turns out to be.
+        if failure.is_some() && !abs.starts_with('/') {
+            return Some(PendingCreate {
+                path: abs,
+                gap: failure,
+            });
         }
         // One lstat; the target is stat'ed only through a symlink.
         let existing = match std::fs::symlink_metadata(&abs) {
@@ -3559,6 +3578,26 @@ mod xattr_record_tests {
             assert_eq!(x.value.as_deref(), Some(&b"old"[..]));
         }
     }
+
+    /// A file with UF_HIDDEN keeps it in the record, so undoing the
+    /// xattr change does not clear the flag.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn xattr_record_carries_the_real_st_flags() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::chflags(c.as_ptr(), libc::UF_HIDDEN) }, 0);
+        let pre = super::policy::xattr_shim_pre_image(
+            file.to_str().unwrap(),
+            shit_proto::XattrPreImage {
+                name: "user.k".into(),
+                value: None,
+            },
+        );
+        assert_eq!(pre.flags & libc::UF_HIDDEN, libc::UF_HIDDEN);
+    }
 }
 
 /// B09 — flags capture is metadata-only and therefore must not inherit
@@ -3653,3 +3692,75 @@ mod chflagsat_capture_tests {
     )
 ))]
 mod rename_wire_tests;
+
+/// M3 (#231): a `write_open` whose dirfd name cannot be keyed must not
+/// read the cwd. The call is reported with the marker and the raw name.
+#[cfg(all(
+    test,
+    any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+        target_os = "macos",
+    )
+))]
+mod unresolved_dirfd_open_tests {
+    use super::policy::{OpenTarget, test_capture, write_open};
+
+    /// A unique name in the cwd, removed on drop.
+    struct CwdEntry(std::path::PathBuf);
+    impl Drop for CwdEntry {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    fn run(name: &str, flags: libc::c_int) -> Vec<shit_proto::ShimNotification> {
+        test_capture::capture(|| {
+            // The fake call "succeeds" so the report path runs.
+            let rc = write_open(
+                "openat",
+                flags,
+                || OpenTarget::At(987_654, name.to_string()),
+                |_| 3,
+            );
+            assert_eq!(rc, 3);
+        })
+    }
+
+    #[test]
+    fn unresolved_dirfd_never_captures_an_unrelated_cwd_file() {
+        let name = format!("m3-unrelated-{}", std::process::id());
+        std::fs::write(&name, b"not the target").unwrap();
+        let _g = CwdEntry(std::path::PathBuf::from(&name));
+        let notes = run(&name, libc::O_WRONLY | libc::O_TRUNC);
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        let n = &notes[0];
+        assert_eq!(n.arg, name);
+        assert!(n.pre_image.is_none(), "cwd bytes shipped: {n:#?}");
+        assert!(n.failure.is_some(), "{n:#?}");
+    }
+
+    #[test]
+    fn unresolved_dirfd_reports_even_when_the_cwd_name_is_a_directory() {
+        let name = format!("m3-unrelated-dir-{}", std::process::id());
+        std::fs::create_dir(&name).unwrap();
+        let _g = CwdEntry(std::path::PathBuf::from(&name));
+        let notes = run(&name, libc::O_WRONLY | libc::O_TRUNC);
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert!(notes[0].failure.is_some());
+        assert!(notes[0].pre_image.is_none());
+    }
+
+    #[test]
+    fn unresolved_dirfd_create_reports_the_marker_not_a_create() {
+        let name = format!("m3-absent-{}", std::process::id());
+        let notes = run(&name, libc::O_WRONLY | libc::O_CREAT);
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_ne!(notes[0].syscall, "open_create");
+        assert!(notes[0].failure.is_some());
+    }
+}

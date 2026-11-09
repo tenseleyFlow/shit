@@ -284,8 +284,7 @@ fn is_flags_only_event(ev: &CaptureEvent) -> bool {
             // xattrs live on the inode too (#216).
             matches!(
                 source,
-                FilePreImageSource::ShimFlagsPreMutation
-                    | FilePreImageSource::ShimXattrPreMutation
+                FilePreImageSource::ShimFlagsPreMutation | FilePreImageSource::ShimXattrPreMutation
             )
         }
         CaptureEventKind::MetadataChange { before, after, .. } => before.only_flags_changed(after),
