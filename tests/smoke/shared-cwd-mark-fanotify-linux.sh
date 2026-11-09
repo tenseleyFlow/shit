@@ -59,7 +59,7 @@ cd "${SCRATCH}"
 # for `ls` run from a second shell in the same directory.
 sleep 120 >/dev/null 2>&1 &
 B_PID=$!
-trap 'kill "${B_PID}" 2>/dev/null || true; smoke_cleanup' EXIT
+trap 'rc=$?; kill "${B_PID}" 2>/dev/null || true; smoke_cleanup "${rc}"' EXIT
 
 SESSION_A="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 SESSION_B="$(python3 -c 'import uuid; print(uuid.uuid4())')"
