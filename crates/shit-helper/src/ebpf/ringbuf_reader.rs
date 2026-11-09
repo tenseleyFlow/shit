@@ -1126,10 +1126,6 @@ pub struct LsmFlushHandle {
     in_handler: Arc<AtomicBool>,
 }
 
-/// How long past a request's drain deadline the requester waits before
-/// it looks at whether the reader is stuck inside one handler (#249).
-const HANDLER_OVERRUN_GRACE: Duration = Duration::from_millis(100);
-
 /// One flush request: where the ack goes, and when the drain must stop.
 /// The deadline is fixed when the request is sent, so time the reader
 /// spends on records it was already handling counts against the budget.
@@ -1206,9 +1202,8 @@ impl LsmFlushHandle {
     }
 
     /// Ask the reader to dispatch every record already in its ring
-    /// buffer. Returns the channel its ack arrives on and the drain
-    /// deadline the request carries.
-    fn request(&self) -> Result<(mpsc::Receiver<FlushAck>, Instant), String> {
+    /// buffer. Returns the channel its ack arrives on.
+    fn request(&self) -> Result<mpsc::Receiver<FlushAck>, String> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
         let deadline = Instant::now() + FLUSH_DRAIN_BUDGET;
         self.tx
@@ -1218,33 +1213,27 @@ impl LsmFlushHandle {
             })
             .map_err(|_| format!("eBPF {} reader is not running", self.thread_name))?;
         self.waiting.store(true, Ordering::Release);
-        Ok((ack_rx, deadline))
+        Ok(ack_rx)
     }
 
-    /// Wait for the ack of a request whose drain deadline is
-    /// `drain_deadline`, giving up at `deadline`.
+    /// Wait for the ack of a request, giving up at `deadline`.
     ///
     /// #249: a reader cannot look at its flush request while one record
-    /// handler runs (a large pre-image copy, say). If the drain deadline
-    /// has passed and the reader is still inside a handler, its tail is
-    /// cut short exactly as a truncated drain is, so report that at once
-    /// instead of waiting out the whole timeout and calling it one.
-    fn await_ack(
-        &self,
-        ack: &mpsc::Receiver<FlushAck>,
-        drain_deadline: Instant,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let check_at = (drain_deadline + HANDLER_OVERRUN_GRACE).min(deadline);
-        let outcome = match ack.recv_timeout(check_at.saturating_duration_since(Instant::now())) {
+    /// handler runs (a large pre-image copy, say). A handler that ends
+    /// before `deadline` lets the drain finish normally, so its ack
+    /// decides. Only when `deadline` passes with the reader still inside
+    /// a handler is the tail reported as cut short by that handler, which
+    /// tells it apart from a reader that is not responding at all.
+    fn await_ack(&self, ack: &mpsc::Receiver<FlushAck>, deadline: Instant) -> Result<(), String> {
+        let outcome = match ack.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(a) => Ok(a),
             Err(_) if self.in_handler.load(Ordering::Acquire) => {
                 return Err(format!(
-                    "eBPF {} reader flush stopped: one record handler ran past the flush budget",
+                    "eBPF {} reader flush stopped: one record handler was still running at the flush timeout",
                     self.thread_name
                 ));
             }
-            Err(_) => ack.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            Err(e) => Err(e),
         };
         match outcome {
             Ok(FlushAck::Drained) => Ok(()),
@@ -1266,8 +1255,8 @@ pub fn flush_all_readers(handles: &[LsmFlushHandle], timeout: Duration) -> Resul
     let mut failures = Vec::new();
     for (handle, request) in handles.iter().zip(requests) {
         match request {
-            Ok((ack, drain_deadline)) => {
-                if let Err(e) = handle.await_ack(&ack, drain_deadline, deadline) {
+            Ok(ack) => {
+                if let Err(e) = handle.await_ack(&ack, deadline) {
                     failures.push(e);
                 }
             }
@@ -1780,26 +1769,56 @@ mod tests {
         drop(stuck_rx);
     }
 
+    /// A reader inside one handler for `busy`, which then takes the
+    /// request and acks `ack`.
+    fn busy_reader(
+        handle: &LsmFlushHandle,
+        rx: mpsc::Receiver<FlushRequest>,
+        busy: Duration,
+        ack: FlushAck,
+    ) -> std::thread::JoinHandle<()> {
+        let in_handler = Arc::clone(&handle.in_handler);
+        in_handler.store(true, Ordering::Release);
+        std::thread::spawn(move || {
+            std::thread::sleep(busy);
+            in_handler.store(false, Ordering::Release);
+            if let Ok(req) = rx.recv() {
+                let _ = req.ack.send(ack);
+            }
+        })
+    }
+
     #[test]
-    fn one_slow_handler_is_a_cut_short_tail_inside_the_timeout() {
-        // #249: the reader is inside a handler that sleeps past the
-        // budget on its first record. The flush must report the tail as
-        // cut short, before LSM_FLUSH_TIMEOUT, not as a timeout.
+    fn slow_handler_that_ends_inside_the_timeout_still_drains() {
+        // #249 review: a handler that runs past the drain budget but ends
+        // before LSM_FLUSH_TIMEOUT leaves a fully drained ring. That must
+        // stay Drained, or strict refuses a command it journaled whole.
         let (tx, rx) = mpsc::channel::<FlushRequest>();
         let handle = LsmFlushHandle::new("open", tx);
-        let in_handler = Arc::clone(&handle.in_handler);
-        let reader = std::thread::spawn(move || {
-            in_handler.store(true, Ordering::Release);
-            std::thread::sleep(crate::LSM_FLUSH_TIMEOUT + Duration::from_millis(500));
-            in_handler.store(false, Ordering::Release);
-            let req = rx.recv().unwrap();
-            let _ = req.ack.send(FlushAck::Truncated { drained: 0 });
-        });
+        let busy = FLUSH_DRAIN_BUDGET + Duration::from_millis(300);
+        assert!(busy < crate::LSM_FLUSH_TIMEOUT);
+        let reader = busy_reader(&handle, rx, busy, FlushAck::Drained);
+        flush_all_readers(&[handle], crate::LSM_FLUSH_TIMEOUT).unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn handler_still_running_at_the_timeout_is_a_cut_short_tail() {
+        // #249: one handler outlasts the whole wait. That is reported as
+        // a tail the handler cut short, not as an unresponsive reader.
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handle = LsmFlushHandle::new("open", tx);
+        let timeout = Duration::from_millis(400);
+        let reader = busy_reader(
+            &handle,
+            rx,
+            timeout + Duration::from_millis(300),
+            FlushAck::Truncated { drained: 0 },
+        );
         let started = Instant::now();
-        let err = flush_all_readers(&[handle], crate::LSM_FLUSH_TIMEOUT).unwrap_err();
-        let took = started.elapsed();
-        assert!(err.contains("ran past the flush budget"), "{err}");
-        assert!(took < crate::LSM_FLUSH_TIMEOUT, "took {took:?}");
+        let err = flush_all_readers(&[handle], timeout).unwrap_err();
+        assert!(started.elapsed() >= timeout);
+        assert!(err.contains("still running at the flush timeout"), "{err}");
         reader.join().unwrap();
     }
 
@@ -1807,7 +1826,7 @@ mod tests {
     fn idle_reader_that_never_acks_still_times_out() {
         let (tx, rx) = mpsc::channel::<FlushRequest>();
         let handle = LsmFlushHandle::new("stuck", tx);
-        let err = flush_all_readers(&[handle], Duration::from_millis(1300)).unwrap_err();
+        let err = flush_all_readers(&[handle], Duration::from_millis(300)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         drop(rx);
     }
