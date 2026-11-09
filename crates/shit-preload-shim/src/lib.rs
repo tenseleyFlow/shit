@@ -1337,7 +1337,6 @@ mod policy {
         path: &str,
         xattr_pre: shit_proto::XattrPreImage,
     ) {
-        use std::os::unix::fs::MetadataExt;
         if disabled() || should_skip_path(path) {
             return;
         }
@@ -1348,11 +1347,26 @@ mod policy {
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
             .unwrap_or_else(|| path.to_string());
+        let pre = xattr_shim_pre_image(&resolved, xattr_pre);
+        let _ = try_notify(syscall, &resolved, Some(pre), Vec::new(), None);
+        IN_NOTIFY.with(|f| f.set(false));
+    }
+
+    /// M3 (#216): the wire record for an xattr mutation. It carries the
+    /// file's stat identity and the one xattr's old value, and never
+    /// file bytes: `bytes` stays empty so nothing downstream can mistake
+    /// it for a content capture.
+    #[allow(dead_code)]
+    pub(super) fn xattr_shim_pre_image(
+        resolved: &str,
+        xattr_pre: shit_proto::XattrPreImage,
+    ) -> shit_proto::ShimPreImage {
+        use std::os::unix::fs::MetadataExt;
         // Stat for inode/dev keying. Falls through with zeroed
-        // identity on stat failure — the daemon can still match
+        // identity on stat failure; the daemon can still match
         // by path string.
         let (dev, inode, mode, uid, gid, size, mtime_nanos) =
-            match std::fs::symlink_metadata(&resolved) {
+            match std::fs::symlink_metadata(resolved) {
                 Ok(m) => (
                     m.dev(),
                     m.ino(),
@@ -1364,8 +1378,8 @@ mod policy {
                 ),
                 Err(_) => (0, 0, 0, 0, 0, 0, 0),
             };
-        let pre = shit_proto::ShimPreImage {
-            path: resolved.clone(),
+        shit_proto::ShimPreImage {
+            path: resolved.to_string(),
             dev,
             inode,
             mode,
@@ -1373,17 +1387,10 @@ mod policy {
             gid,
             size,
             mtime_unix_nanos: mtime_nanos,
-            // Empty file bytes — xattr ops don't change file content.
             bytes: Vec::new(),
             xattr: Some(xattr_pre),
-            // M03.x.SETATTR — xattr-mutation notifications don't
-            // probe st_flags (the syscall doesn't change them).
-            // Default to 0; the chflags-side path populates flags
-            // when relevant.
             flags: 0,
-        };
-        let _ = try_notify(syscall, &resolved, Some(pre), Vec::new(), None);
-        IN_NOTIFY.with(|f| f.set(false));
+        }
     }
 
     // macOS create-only wrappers use `notify_create_resolved` so they can
@@ -3524,6 +3531,32 @@ mod canonical_tests {
         let (got, failure) = super::policy::canonicalize_or_raw("/tmp", "path");
         assert!(failure.is_none(), "no failure on Ok path");
         assert!(got.starts_with('/'));
+    }
+}
+
+/// M3 (#216): an xattr mutation's wire record carries xattr data only.
+#[cfg(test)]
+mod xattr_record_tests {
+    #[test]
+    fn xattr_record_has_no_file_bytes_for_file_or_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("f");
+        std::fs::write(&file, b"content that must not travel").unwrap();
+        for path in [file.to_str().unwrap(), tmp.path().to_str().unwrap()] {
+            let pre = super::policy::xattr_shim_pre_image(
+                path,
+                shit_proto::XattrPreImage {
+                    name: "user.k".into(),
+                    value: Some(b"old".to_vec()),
+                },
+            );
+            assert!(pre.bytes.is_empty(), "{path}");
+            assert_eq!(pre.path, path);
+            assert_ne!(pre.inode, 0);
+            let x = pre.xattr.expect("xattr payload");
+            assert_eq!(x.name, "user.k");
+            assert_eq!(x.value.as_deref(), Some(&b"old"[..]));
+        }
     }
 }
 
