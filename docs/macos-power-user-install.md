@@ -8,7 +8,7 @@ This is the long-form guide to running `shit` in EndpointSecurity (ES) mode on a
 
 ## What you're trading
 
-ES mode requires three macOS security mitigations to be relaxed. Each one is independently meaningful — none of them should be touched casually.
+ES mode requires two macOS security mitigations to be relaxed. Each one is independently meaningful — none of them should be touched casually.
 
 ### 1. SIP (System Integrity Protection) — disabled
 
@@ -19,11 +19,13 @@ ES mode requires three macOS security mitigations to be relaxed. Each one is ind
 - Debuggers attach to system processes without restriction. Useful for kernel work; an attack surface for everyone else.
 - Loaded executables can be modified or replaced without triggering signature checks.
 
-### 2. Authenticated Root (`csrutil authenticated-root disable`) — disabled
+### 2. Authenticated Root: leave it enabled
+
+Authenticated Root is not required. ES delivered events to an ad-hoc signed helper with Authenticated Root still enabled (macOS 15.7.7 Tart guest, SIP disabled, AMFI boot-arg set). Earlier versions of this guide asked you to disable it.
 
 The system volume is normally sealed with a cryptographic snapshot — Apple verifies its integrity at boot. Disabling this lets you (or anyone with root) mount the system volume read-write.
 
-**What this weakens:**
+**What disabling it would weaken:**
 - The "your system files have been tampered with" guarantee is gone. A rootkit can persist in `/System` across reboots.
 - macOS auto-updates may refuse to install or may behave unpredictably.
 
@@ -96,19 +98,10 @@ csrutil status
 # expected: System Integrity Protection status: disabled.
 ```
 
-### Step 3 — disable Authenticated Root (Recovery boot, again)
+### Step 3 — Authenticated Root: nothing to do
 
-Same Recovery procedure as Step 2. From the Recovery terminal:
-```sh
-csrutil authenticated-root disable
-reboot
-```
-
-After reboot:
-```sh
-csrutil authenticated-root status
-# expected: Authenticated Root status: disabled
-```
+Leave Authenticated Root enabled. If you disabled it under an earlier
+version of this guide, see "Re-enable Authenticated Root" below.
 
 ### Step 4 — enable the AMFI bypass
 
