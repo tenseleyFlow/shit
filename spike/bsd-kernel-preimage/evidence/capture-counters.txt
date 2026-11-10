@@ -1,0 +1,15 @@
+untar, mode 1:
+summary: wall=0.305s events=20826 captured=0 bytes=0 hook_avg=0.3us hook_max=36.4us lag_avg=3.9us lag_max=322.6us
+per-op: open_w=6319 setmode=623 setowner=6942 setutimes=6942
+4.0K	stage
+checkout x5 round trips, mode 1:
+summary: wall=0.250s events=2165 captured=1061 bytes=15263651 hook_avg=0.5us hook_max=92.8us lag_avg=55.4us lag_max=2005.9us
+per-op: unlink=1045 rename_from=20 rename_to=20 open_w=1080
+ 17M	stage
+ls: stage: Permission denied
+       0
+security.mac.shitpre.hook_calls: 36259
+security.mac.shitpre.copy_ns: 92011
+security.mac.shitpre.copied_bytes: 213536
+security.mac.shitpre.pinned: 1060
+security.mac.shitpre.dropped: 0
