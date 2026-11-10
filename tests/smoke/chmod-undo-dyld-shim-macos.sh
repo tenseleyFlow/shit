@@ -105,6 +105,8 @@ smoke_log "shim metadata events journaled by daemon: ${SHIM_HITS}"
 
 N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 smoke_log "journal events: ${N_EVENTS}"
+smoke_journal_query "SELECT id, discriminant, path FROM events;" 2>/dev/null \
+    | sed 's/^/    journal: /' >&2 || true
 
 smoke_log "running: shit undo --yes"
 set +e
