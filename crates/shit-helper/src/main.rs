@@ -3171,7 +3171,15 @@ fn request_loop(
                 command_seq,
                 shell_kind: _,
                 cwd_path,
+                zfs_snapshot,
             } => {
+                #[cfg(not(any(
+                    target_os = "freebsd",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                    target_os = "dragonfly",
+                )))]
+                let _ = zfs_snapshot;
                 let command = shit_planner::events::CommandId {
                     session,
                     seq: command_seq,
@@ -3218,7 +3226,7 @@ fn request_loop(
                 {
                     let attach = match &bsd_capture {
                         Some(ctrl) => ctrl
-                            .on_watch_tree(session, command_seq, root_pid, &cwd_path)
+                            .on_watch_tree(session, command_seq, root_pid, &cwd_path, zfs_snapshot)
                             .map_err(|e| e.to_string()),
                         None => Err("BSD capture runtime unavailable".to_string()),
                     };
