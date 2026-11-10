@@ -169,14 +169,13 @@ pub fn plan(
 /// ancestors, since ops can land at either.
 fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut Vec<PlanNode>) {
     use crate::metadata::FileKind;
-    use std::collections::HashMap;
 
     // Chronological.
     let events: Vec<&CaptureEvent> = live.iter().rev().copied().collect();
     let mut removed: Vec<(PathBuf, u32)> = Vec::new();
     let mut born: Vec<PathBuf> = Vec::new();
-    let mut created_mode: std::collections::HashMap<PathBuf, u32> =
-        std::collections::HashMap::new();
+    let mut created_mode: std::collections::BTreeMap<PathBuf, u32> =
+        std::collections::BTreeMap::new();
     for (i, e) in events.iter().enumerate() {
         let (path, mode, is_create) = match &e.kind {
             CaptureEventKind::TreeOp(TreeOp::Unlink {
@@ -219,7 +218,7 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
         }
     }
     // The last journaled removal of a path wins.
-    let mut mode_of: HashMap<PathBuf, u32> = HashMap::new();
+    let mut mode_of: std::collections::BTreeMap<PathBuf, u32> = std::collections::BTreeMap::new();
     let mut order: Vec<PathBuf> = Vec::new();
     for (p, m) in removed {
         if mode_of.insert(p.clone(), m).is_none() {
@@ -232,7 +231,7 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
     // journaled. That mode is journaled too, and the scratch directory
     // is removed again at the end.
     for (p, m) in created_mode {
-        if let std::collections::hash_map::Entry::Vacant(v) = mode_of.entry(p.clone()) {
+        if let std::collections::btree_map::Entry::Vacant(v) = mode_of.entry(p.clone()) {
             v.insert(m);
             order.push(p);
         }

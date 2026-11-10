@@ -319,7 +319,8 @@ impl<'a, E: InverseOpExecutor, P: StateProbe> Orchestrator<'a, E, P> {
         };
         let outcome_kind = OutcomeKind::from_outcome(&outcome);
         let detail = match &outcome {
-            ExecutionOutcome::AppliedWithNote { note } => Some(note.clone()),
+            ExecutionOutcome::AppliedWithNote { note }
+            | ExecutionOutcome::WouldApplyWithNote { note } => Some(note.clone()),
             ExecutionOutcome::Skipped { reason } => Some(reason.clone()),
             ExecutionOutcome::Conflict { kind } => Some(format!("{kind:?}")),
             ExecutionOutcome::Failed { err } => Some(err.clone()),

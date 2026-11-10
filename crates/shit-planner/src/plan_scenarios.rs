@@ -650,15 +650,16 @@ fn pip_shape_with_partial_walk_keeps_reverse_rename() {
 }
 
 #[test]
-fn pip_shape_with_an_unjournaled_stash_rmdir_refuses_without_guessing_a_mode() {
-    // pip on a shim without rmdir interposition: no Create for the new
-    // tree, no unlink for the stash's top directory. `d.old`'s mode was
-    // never journaled (the Rename carries none), so undo refuses the
-    // first restore under it instead of making it at the umask (#214).
-    // The shim interposes rmdir and unlinkat(AT_REMOVEDIR) since L5, so
-    // the hosted journal now carries that row.
+fn pip_shape_as_the_hosted_shim_sees_it_restores_the_old_tree_into_a_private_stash() {
+    // The journal pip produces on a shim without rmdir interposition: no
+    // Create for the new tree, no unlink for the stash's top directory.
+    // The new `d` is in the way of the reverse rename, so undo stops
+    // with a loud conflict (the smoke's Outcome B), with the old tree
+    // back at the stash name. `d.old`'s mode was never journaled (the
+    // Rename carries none), so it is made 0700, not at the umask (#214).
+    use std::os::unix::fs::PermissionsExt;
     let mut sim = Sim::new();
-    sim.seed_dir("d", 0o700);
+    sim.seed_dir("d", 0o755);
     sim.seed_file("d/f", b"original\n", 0o640);
     sim.seed_dir("d/sub", 0o711);
     sim.seed_file("d/sub/g", b"g\n", 0o600);
@@ -669,12 +670,25 @@ fn pip_shape_with_an_unjournaled_stash_rmdir_refuses_without_guessing_a_mode() {
     sim.rmtree_top_unseen("d.old");
     let log = sim.undo();
     assert!(
-        log.iter().any(|l| l.starts_with("!! ")
-            && l.contains("d.old is missing and its mode was not journaled")),
+        log.iter()
+            .any(|l| l.starts_with("!! ") && l.contains("Rename")),
         "{}",
         log.join("\n")
     );
-    assert!(!sim.p("d.old").exists(), "{}", log.join("\n"));
+    assert!(
+        log.iter()
+            .any(|l| l.contains("d.old did not exist and its mode was not captured")),
+        "{}",
+        log.join("\n")
+    );
+    assert_eq!(std::fs::read(sim.p("d.old/f")).unwrap(), b"original\n");
+    assert_eq!(std::fs::read(sim.p("d.old/sub/g")).unwrap(), b"g\n");
+    let mode = std::fs::metadata(sim.p("d.old"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o700, "{}", log.join("\n"));
 }
 
 // Review of #205. All but the last failed against the first version of

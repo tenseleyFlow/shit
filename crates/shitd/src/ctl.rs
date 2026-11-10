@@ -1570,15 +1570,7 @@ fn handle_undo(
                     // undo --steps N` with N > 1) shows N refusal
                     // lines and the user can't tell which command
                     // triggered which.
-                    // #214: an executor refusal (a step skipped with a
-                    // reason, the rest of the undo applied) is counted and
-                    // rendered the same way, never as a silent skip.
-                    let executor_refusal = rec
-                        .detail
-                        .as_deref()
-                        .is_some_and(|d| d.starts_with("refused: "));
-                    if matches!(rec.op, shit_planner::InverseOp::Refuse { .. }) || executor_refusal
-                    {
+                    if matches!(rec.op, shit_planner::InverseOp::Refuse { .. }) {
                         ops_refused += 1;
                         if let Some(d) = rec.detail.as_deref() {
                             let cmd_str = cmd.cmd_string.as_deref().unwrap_or("<unknown command>");
