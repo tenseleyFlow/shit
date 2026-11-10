@@ -1,0 +1,15 @@
+*.o
+*.ko
+*.full
+*.debug
+.depend*
+opt_*.h
+vnode_if*.h
+machine
+x86
+i386
+export_syms
+/helper/shitpre_helper
+/helper/mut
+/audit/auditpipe_reader
+/jail/cap_probe
