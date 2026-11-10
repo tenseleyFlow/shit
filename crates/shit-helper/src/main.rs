@@ -1205,6 +1205,11 @@ struct PrivilegedSetup {
     /// the runtime path (DR-01..DR-04 will use it).
     #[allow(dead_code)]
     tier: CaptureTier,
+    /// Why the eBPF-LSM prerequisite probe said no, when it did.
+    /// Reported as the handshake's `degraded_reason` when the helper
+    /// runs fanotify instead (#235).
+    #[cfg(target_os = "linux")]
+    ebpf_unavailable: Option<String>,
 }
 
 /// Which kernel-tier capture path is in effect.
@@ -1274,12 +1279,13 @@ fn privileged_setup() -> PrivilegedSetup {
     #[cfg(target_os = "linux")]
     {
         let (caps, fanotify_fd) = linux_privileged_setup();
-        let tier = pick_linux_tier(fanotify_fd.is_some());
+        let (tier, ebpf_unavailable) = pick_linux_tier(fanotify_fd.is_some());
         tracing::info!(tier = tier.label(), "kernel capture tier picked");
         PrivilegedSetup {
             caps,
             fanotify_fd,
             tier,
+            ebpf_unavailable,
         }
     }
     #[cfg(any(
@@ -1610,37 +1616,37 @@ fn spawn_lsm_readers(
         unlink_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("unlink"),
+        loader.take_loss_maps("unlink"),
     );
     let setattr_reader = ebpf::LsmReader::spawn_setattr(
         setattr_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("setattr"),
+        loader.take_loss_maps("setattr"),
     );
     let mkdir_reader = ebpf::LsmReader::spawn_mkdir(
         mkdir_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("mkdir"),
+        loader.take_loss_maps("mkdir"),
     );
     let create_reader = ebpf::LsmReader::spawn_create(
         create_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("create"),
+        loader.take_loss_maps("create"),
     );
     let open_reader = ebpf::LsmReader::spawn_open(
         open_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("open"),
+        loader.take_loss_maps("open"),
     );
     let rename_reader = ebpf::LsmReader::spawn_rename(
         rename_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("rename"),
+        loader.take_loss_maps("rename"),
     );
     // DR-CR-55: both new ringbufs carry shit_create_event records;
     // reuse spawn_create so they route through the on_create sink.
@@ -1648,13 +1654,13 @@ fn spawn_lsm_readers(
         symlink_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("symlink"),
+        loader.take_loss_maps("symlink"),
     );
     let link_reader = ebpf::LsmReader::spawn_create(
         link_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("link"),
+        loader.take_loss_maps("link"),
     );
     // G03: rmdir uses the same wire shape as unlink but routes via
     // on_rmdir → handle_lsm_unlink with is_directory=true.
@@ -1662,7 +1668,7 @@ fn spawn_lsm_readers(
         rmdir_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("rmdir"),
+        loader.take_loss_maps("rmdir"),
     );
     // AU29: mknod payload mirrors inode_create's; the dispatcher
     // routes through on_create. handle_lsm_create's mode-aware
@@ -1671,13 +1677,13 @@ fn spawn_lsm_readers(
         mknod_rb,
         Arc::clone(&sink),
         idle,
-        loader.take_loss_counter("mknod"),
+        loader.take_loss_maps("mknod"),
     );
     // L04.2: file_release fires at last writable-fd close; the
     // handler diffs current content against the open-time
     // snapshot and emits a CapturedPreImage iff they differ.
     // Optional — only spawned on kernels where the hook loaded.
-    let release_loss = loader.take_loss_counter("release");
+    let release_loss = loader.take_loss_maps("release");
     let release_reader = release_rb_opt
         .map(|rb| ebpf::LsmReader::spawn_release(rb, Arc::clone(&sink), idle, release_loss));
 
@@ -1787,12 +1793,13 @@ fn probe_fmode_created(staging: &std::path::Path, flush: &[ebpf::LsmFlushHandle]
 ///     ebpf-lsm prerequisites are met (regression test for the older
 ///     tier on capable kernels).
 #[cfg(target_os = "linux")]
-fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
+fn pick_linux_tier(have_fanotify_fd: bool) -> (CaptureTier, Option<String>) {
     let forced = std::env::var("SHIT_FORCE_TIER").ok();
 
     let loader = ebpf::EbpfLoader::new();
     let outcome = loader.probe();
     let ebpf_ok = outcome.should_attempt_load();
+    let unavailable = (!ebpf_ok).then(|| outcome.diagnose());
 
     match forced.as_deref() {
         Some("ebpf-lsm") => {
@@ -1801,19 +1808,19 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
                 forced = true,
                 "SHIT_FORCE_TIER=ebpf-lsm — picking EbpfLsm"
             );
-            return CaptureTier::EbpfLsm;
+            return (CaptureTier::EbpfLsm, None);
         }
         Some("fanotify-perm") => {
             if ebpf_ok && have_fanotify_fd {
                 tracing::info!(
                     "SHIT_FORCE_TIER=fanotify-perm — using Fanotify despite ebpf-lsm being available"
                 );
-                return CaptureTier::EbpfLsmAvailableButDeferred;
+                return (CaptureTier::EbpfLsmAvailableButDeferred, None);
             }
             if have_fanotify_fd {
-                return CaptureTier::Fanotify;
+                return (CaptureTier::Fanotify, unavailable);
             }
-            return CaptureTier::Degraded;
+            return (CaptureTier::Degraded, unavailable);
         }
         Some(other) => {
             tracing::warn!(
@@ -1831,7 +1838,7 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
             cap_perfmon = outcome.caps.cap_perfmon,
             "ebpf-lsm prerequisites met — picking EbpfLsm"
         );
-        return CaptureTier::EbpfLsm;
+        return (CaptureTier::EbpfLsm, None);
     }
 
     tracing::info!(
@@ -1839,9 +1846,9 @@ fn pick_linux_tier(have_fanotify_fd: bool) -> CaptureTier {
         "ebpf-lsm not available; using fanotify if possible"
     );
     if have_fanotify_fd {
-        CaptureTier::Fanotify
+        (CaptureTier::Fanotify, unavailable)
     } else {
-        CaptureTier::Degraded
+        (CaptureTier::Degraded, unavailable)
     }
 }
 
@@ -1893,6 +1900,105 @@ fn resolve_linux_capture_startup(
         | CaptureTier::KqueueOnly
         | CaptureTier::KqueuePreloadShim
         | CaptureTier::ZfsSnapshot => Err(LinuxCaptureStartupError::InvalidPreferredTier),
+    }
+}
+
+/// The `(kernel_tier, degraded_reason)` pair the handshake ack
+/// reports on Linux (#235). `requested` is the tier privileged setup
+/// picked, `active` the one startup resolved after the real eBPF load
+/// attempt. `probe_reason` is the prerequisite probe's diagnosis when
+/// it said no; `load_error` the loader error when the attempt failed.
+#[cfg(any(target_os = "linux", test))]
+fn linux_kernel_tier_report(
+    requested: CaptureTier,
+    active: CaptureTier,
+    probe_reason: Option<&str>,
+    load_error: Option<&str>,
+) -> (&'static str, Option<String>) {
+    match active {
+        CaptureTier::EbpfLsm => ("ebpf-lsm", None),
+        CaptureTier::Fanotify => {
+            let reason = match (requested, load_error, probe_reason) {
+                (CaptureTier::EbpfLsm, Some(e), _) => Some(format!("ebpf-lsm load failed: {e}")),
+                (CaptureTier::EbpfLsmAvailableButDeferred, _, _) => {
+                    Some("ebpf-lsm available; SHIT_FORCE_TIER=fanotify-perm".to_string())
+                }
+                (_, _, Some(p)) => Some(format!("ebpf-lsm unavailable: {p}")),
+                _ => None,
+            };
+            ("fanotify", reason)
+        }
+        _ => {
+            let why = match (load_error, probe_reason) {
+                (Some(e), _) => format!("ebpf-lsm load failed: {e}"),
+                (None, Some(p)) => format!("ebpf-lsm unavailable: {p}"),
+                (None, None) if requested != CaptureTier::Degraded => {
+                    "capture runtime failed to initialize".to_string()
+                }
+                (None, None) => "no kernel capture tier available".to_string(),
+            };
+            ("degraded", Some(format!("{why}; no kernel capture")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod linux_kernel_tier_report_tests {
+    use super::{CaptureTier, linux_kernel_tier_report};
+
+    #[test]
+    fn ebpf_lsm_runtime_reports_ebpf_lsm() {
+        assert_eq!(
+            linux_kernel_tier_report(CaptureTier::EbpfLsm, CaptureTier::EbpfLsm, None, None),
+            ("ebpf-lsm", None)
+        );
+    }
+
+    #[test]
+    fn fallback_from_ebpf_names_the_load_error() {
+        let (tier, reason) = linux_kernel_tier_report(
+            CaptureTier::EbpfLsm,
+            CaptureTier::Fanotify,
+            None,
+            Some("attach lsm/inode_unlink: EPERM"),
+        );
+        assert_eq!(tier, "fanotify");
+        assert_eq!(
+            reason.as_deref(),
+            Some("ebpf-lsm load failed: attach lsm/inode_unlink: EPERM")
+        );
+    }
+
+    #[test]
+    fn fanotify_on_a_host_without_bpf_lsm_names_the_probe() {
+        let (tier, reason) = linux_kernel_tier_report(
+            CaptureTier::Fanotify,
+            CaptureTier::Fanotify,
+            Some("bpf not in /sys/kernel/security/lsm"),
+            None,
+        );
+        assert_eq!(tier, "fanotify");
+        assert!(reason.unwrap().contains("bpf not in"));
+    }
+
+    #[test]
+    fn forced_fanotify_says_so() {
+        let (tier, reason) = linux_kernel_tier_report(
+            CaptureTier::EbpfLsmAvailableButDeferred,
+            CaptureTier::Fanotify,
+            None,
+            None,
+        );
+        assert_eq!(tier, "fanotify");
+        assert!(reason.unwrap().contains("SHIT_FORCE_TIER"));
+    }
+
+    #[test]
+    fn degraded_runtime_reports_degraded_with_a_reason() {
+        let (tier, reason) =
+            linux_kernel_tier_report(CaptureTier::Fanotify, CaptureTier::Degraded, None, None);
+        assert_eq!(tier, "degraded");
+        assert!(reason.unwrap().contains("capture runtime failed"));
     }
 }
 
@@ -2043,7 +2149,7 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
     // unused fd from the other tier (the fanotify fd after a
     // successful eBPF boot) is dropped once startup is resolved.
     #[cfg(target_os = "linux")]
-    let (fanotify_state, lsm_state) = {
+    let (fanotify_state, lsm_state, kernel_tier_report) = {
         let staging_dir = cli.state_dir.join("helper-staging");
         // A runtime that fails to initialize degrades the helper (as trunk
         // did) instead of aborting it; the daemon keeps working without
@@ -2175,17 +2281,37 @@ async fn run(cli: SidecarConfig, setup: PrivilegedSetup) -> anyhow::Result<()> {
             None
         };
 
-        (fanotify_state, lsm_state)
-    };
+        // #235: report the tier that actually started, not a constant.
+        let kernel_tier_report = linux_kernel_tier_report(
+            setup.tier,
+            active_tier,
+            setup.ebpf_unavailable.as_deref(),
+            ebpf_load_error.as_ref().map(ToString::to_string).as_deref(),
+        );
+        tracing::info!(
+            kernel_tier = kernel_tier_report.0,
+            degraded_reason = kernel_tier_report.1.as_deref().unwrap_or(""),
+            "kernel tier reported in handshake"
+        );
 
-    let outcome =
-        match handshake::perform_helper_side(&conn, cli.daemon_pid, cli.daemon_uid, setup.caps) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(err = %e, "handshake failed; exiting");
-                return Err(anyhow::anyhow!("handshake failed: {e}"));
-            }
-        };
+        (fanotify_state, lsm_state, kernel_tier_report)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let kernel_tier_report = handshake::classify_kernel_tier();
+
+    let outcome = match handshake::perform_helper_side(
+        &conn,
+        cli.daemon_pid,
+        cli.daemon_uid,
+        setup.caps,
+        kernel_tier_report,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(err = %e, "handshake failed; exiting");
+            return Err(anyhow::anyhow!("handshake failed: {e}"));
+        }
+    };
     tracing::info!(
         daemon_pid = outcome.daemon_pid,
         daemon_uid = outcome.daemon_uid,
@@ -2619,15 +2745,18 @@ fn linux_watch_tree(
         // (FAN_EVENT_ON_CHILD, ONLYDIR). We deliberately do NOT use
         // FAN_MARK_FILESYSTEM here (HP-18: marking $HOME at boot wedged
         // the box). Stash the path so UnwatchTree can unmark it.
-        match fanotify::mark::mark_dir_for_capture(&state.fd, std::os::fd::AsFd::as_fd(&cwd_fd)) {
+        //
+        // #254: the table lock is held across mark and insert so a
+        // concurrent UnwatchTree of another command in the same cwd
+        // sees this command as a sharer before it decides to unmark.
+        let marked = fanotify::runtime::MarkedDir::new(cwd.clone(), cwd_fd)
+            .map_err(|e| format!("fstat {} failed: {e}", cwd.display()))?;
+        let mut marks = state.marked_paths.lock().unwrap();
+        match fanotify::mark::mark_dir_for_capture(&state.fd, std::os::fd::AsFd::as_fd(&marked.fd))
+        {
             Ok(()) => {
-                state.marked_paths.lock().unwrap().insert(
-                    command,
-                    fanotify::runtime::MarkedDir {
-                        path: cwd.clone(),
-                        fd: cwd_fd,
-                    },
-                );
+                marks.insert(command, marked);
+                drop(marks);
                 tracing::info!(
                     %session,
                     command_seq,
@@ -2645,11 +2774,14 @@ fn linux_watch_tree(
         // untracked pids are dropped. The tree is tracked whatever the
         // cwd's state: `cd /tmp/x; rm -rf /tmp/x; rm ~/important` has no
         // usable cwd, and its descendants must stay attributed.
-        state
-            .tree
-            .lock()
-            .unwrap()
-            .watch(session, command_seq, root_pid as i32);
+        let loss_start = {
+            let mut tree = state.tree.lock().unwrap();
+            // #229: attribute the drops queued so far before this tree
+            // exists, so none of them is charged to this command.
+            ebpf::ringbuf_loss_value(&tree, command);
+            tree.watch(session, command_seq, root_pid as i32);
+            ebpf::ringbuf_loss_value(&tree, command)
+        };
         // L04 — pre-open every regular file under the cwd. The held
         // OwnedFd keeps the inode alive after vfs_unlink, so the LSM
         // unlink handler can read the pre-image content even though
@@ -2658,13 +2790,10 @@ fn linux_watch_tree(
             && let Ok(mut g) = rt.lock()
         {
             g.on_watch_tree(command);
-            g.mark_kernel_losses(
-                command,
-                "the eBPF ring buffers",
-                ebpf::ringbuf_losses_observed(),
-            );
+            g.mark_kernel_losses(command, "the eBPF ring buffers", loss_start);
             if let Ok(cwd) = &cwd {
                 g.pre_open_tree(command, &cwd.path);
+                g.check_mounts(command, root_pid as i32);
             }
         }
         match &cwd {
@@ -3268,7 +3397,11 @@ fn request_loop(
                             Some(state.overflows.load(std::sync::atomic::Ordering::Acquire)),
                         );
                     }
-                    if let Some(dir) = state.marked_paths.lock().unwrap().remove(&cmd)
+                    // #254: another active command may share this cwd's
+                    // mark; only the last one removes it. The lock is held
+                    // through the unmark (see linux_watch_tree).
+                    let mut marks = state.marked_paths.lock().unwrap();
+                    if let Some(dir) = fanotify::runtime::release_marked_dir(&mut marks, cmd)
                         && let Err(e) = fanotify::mark::unmark_dir_for_capture(
                             &state.fd,
                             std::os::fd::AsFd::as_fd(&dir.fd),
@@ -3294,13 +3427,21 @@ fn request_loop(
                             format!("capture tail may be missing: {detail}"),
                         );
                     }
-                    state.tree.lock().unwrap().unwatch(session, command_seq);
+                    // #229: attribute the drops the flush polled while the
+                    // tree still holds this command, then stop watching.
+                    let loss_now = {
+                        let mut tree = state.tree.lock().unwrap();
+                        let v = ebpf::ringbuf_loss_value(&tree, command);
+                        tree.unwatch(session, command_seq);
+                        v
+                    };
                     let cmd = command;
                     if let Some(rt) = &state.runtime
                         && let Ok(mut g) = rt.lock()
                     {
-                        g.on_unwatch_tree_counting(cmd, Some(ebpf::ringbuf_losses_observed()));
+                        g.on_unwatch_tree_counting(cmd, Some(loss_now));
                     }
+                    ebpf::forget_ringbuf_losses(cmd);
                     tracing::info!(%session, command_seq, tier = "ebpf-lsm", "unwatch_tree");
                 }
                 #[cfg(any(

@@ -74,6 +74,40 @@ pub struct FanotifyState {
 pub struct MarkedDir {
     pub path: PathBuf,
     pub fd: std::os::fd::OwnedFd,
+    /// `(dev, ino)` of the marked directory. fanotify keeps one mark
+    /// per (group, inode), so commands that share a cwd share a mark.
+    pub key: (u64, u64),
+}
+
+impl MarkedDir {
+    /// Record `fd` (an open directory) as marked for a command.
+    pub fn new(path: PathBuf, fd: std::os::fd::OwnedFd) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::fs::File::from(fd);
+        let meta = dir.metadata()?;
+        Ok(Self {
+            path,
+            fd: dir.into(),
+            key: (meta.dev(), meta.ino()),
+        })
+    }
+}
+
+/// Drop `command`'s entry from the mark table. Returns it only when no
+/// other command still marks the same directory, so the caller removes
+/// the kernel mark only then (#254). The caller holds the table lock
+/// across this call and the unmark, and `WatchTree` holds it across
+/// mark and insert, so a concurrent watch of the same cwd cannot lose
+/// its mark between the check and the unmark.
+pub fn release_marked_dir(
+    marks: &mut HashMap<CommandId, MarkedDir>,
+    command: CommandId,
+) -> Option<MarkedDir> {
+    let dir = marks.remove(&command)?;
+    if marks.values().any(|other| other.key == dir.key) {
+        return None;
+    }
+    Some(dir)
 }
 
 impl FanotifyState {
@@ -256,5 +290,36 @@ mod tests {
         assert_eq!(s2.events_seen.load(Ordering::Relaxed), 7);
         s.shutdown();
         assert!(s2.shutdown.load(Ordering::Acquire));
+    }
+
+    fn open_dir(p: &std::path::Path) -> std::os::fd::OwnedFd {
+        std::fs::File::open(p).unwrap().into()
+    }
+
+    /// #254: two commands in one cwd share the fanotify mark. The first
+    /// UnwatchTree must leave it in place; the last one removes it.
+    #[test]
+    fn shared_cwd_mark_is_released_by_the_last_command_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let cmd = |seq| CommandId {
+            session: uuid::Uuid::from_u128(254),
+            seq,
+        };
+        let mut marks = HashMap::new();
+        for seq in [1, 2] {
+            let d = MarkedDir::new(dir.path().to_path_buf(), open_dir(dir.path())).unwrap();
+            marks.insert(cmd(seq), d);
+        }
+        let d = MarkedDir::new(other.path().to_path_buf(), open_dir(other.path())).unwrap();
+        marks.insert(cmd(3), d);
+
+        assert!(release_marked_dir(&mut marks, cmd(1)).is_none());
+        let unrelated = release_marked_dir(&mut marks, cmd(3)).expect("sole owner");
+        assert_eq!(unrelated.path, other.path());
+        let last = release_marked_dir(&mut marks, cmd(2)).expect("last owner");
+        assert_eq!(last.path, dir.path());
+        assert!(release_marked_dir(&mut marks, cmd(2)).is_none());
+        assert!(marks.is_empty());
     }
 }

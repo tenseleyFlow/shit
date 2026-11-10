@@ -152,13 +152,131 @@ struct {
     __type(value, __u64);
 } ringbuf_loss_count SEC(".maps");
 
+/* #229: the same losses, keyed by the process whose event was dropped,
+ * with that process's ancestry at its first drop. Userspace attributes
+ * each process's increase to the command whose tree holds it, the same
+ * way it attributes events, so an overflow caused by an unrelated process
+ * does not count against every active command.
+ *
+ * The key is (tgid, start time of the thread-group leader), so a pid the
+ * kernel reuses for a new process gets a new entry and never inherits the
+ * dead process's ancestry. Entries are not removed when a process exits;
+ * the LRU retires them.
+ *
+ * LRU: under a storm of distinct tgids old entries are evicted and their
+ * counts vanish. Userspace notices because the per-tgid increases then
+ * fall short of `ringbuf_loss_count`, and charges the shortfall to every
+ * active command, as before this map existed. The per-tgid update runs
+ * before the total's, so a reader that reads the total first never sees
+ * a total the per-tgid entries cannot cover yet. */
+struct shit_loss_key {
+    __u32 tgid;
+    __u32 _pad;
+    __u64 start_time;
+};
+
+struct shit_loss_rec {
+    __u64 count;
+    __u32 parent_pid;
+    __u32 _pad;
+    __u32 ancestors[SHIT_ANCESTRY_DEPTH];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct shit_loss_key);
+    __type(value, struct shit_loss_rec);
+} ringbuf_loss_by_tgid SEC(".maps");
+
 static __always_inline void shit_note_ringbuf_loss(void)
 {
+    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+    struct shit_loss_key k = {};
+    k.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    k.start_time = BPF_CORE_READ(t, group_leader, start_time);
+    struct shit_loss_rec *rec = bpf_map_lookup_elem(&ringbuf_loss_by_tgid, &k);
+    if (rec) {
+        __sync_fetch_and_add(&rec->count, 1);
+    } else {
+        struct shit_event_hdr h = {};
+        shit_fill_ancestry(&h, BPF_CORE_READ(t, real_parent));
+        struct shit_loss_rec fresh = {};
+        fresh.count = 1;
+        fresh.parent_pid = h.parent_pid;
+#pragma unroll
+        for (int i = 0; i < SHIT_ANCESTRY_DEPTH; i++) {
+            fresh.ancestors[i] = h.ancestors[i];
+        }
+        if (bpf_map_update_elem(&ringbuf_loss_by_tgid, &k, &fresh, BPF_NOEXIST) != 0) {
+            /* Another CPU inserted it first. */
+            rec = bpf_map_lookup_elem(&ringbuf_loss_by_tgid, &k);
+            if (rec) {
+                __sync_fetch_and_add(&rec->count, 1);
+            }
+        }
+    }
+
     __u32 key = 0;
     __u64 *count = bpf_map_lookup_elem(&ringbuf_loss_count, &key);
     if (count) {
         __sync_fetch_and_add(count, 1);
     }
+}
+
+/* #233: inode numbers of the directories above a file's dentry, nearest
+ * first, so userspace can tell a file outside the watched tree from one
+ * in an unwalked part of it when the event carries no path. The walk
+ * follows d_parent within the superblock and stops at its root
+ * (d_parent == self); `dentry_depth` is the number of slots filled, and
+ * `dentry_top` is 1 when the walk reached the superblock root. `nlink`
+ * is the inode's link count: a file with more than one name may also
+ * live inside the tree under another name, so userspace ignores the
+ * walk for it. */
+#define SHIT_DENTRY_DEPTH 16
+
+struct shit_dentry_chain {
+    __u32 nlink;
+    __u16 dentry_depth;
+    __u16 dentry_top;
+    __u64 dentry_anc[SHIT_DENTRY_DEPTH];
+};
+
+static __always_inline void shit_fill_dentry_chain(struct shit_dentry_chain *c,
+                                                   struct dentry *d)
+{
+    struct inode *ino = BPF_CORE_READ(d, d_inode);
+    c->nlink = BPF_CORE_READ(ino, __i_nlink);
+    __u16 depth = 0;
+    __u16 top = 0;
+#pragma unroll
+    for (int i = 0; i < SHIT_DENTRY_DEPTH; i++) {
+        struct dentry *p = 0;
+        if (!top && d) {
+            p = BPF_CORE_READ(d, d_parent);
+            if (!p || p == d) {
+                top = 1;
+                p = 0;
+            }
+        }
+        if (p) {
+            c->dentry_anc[i] = BPF_CORE_READ(p, d_inode, i_ino);
+            depth++;
+        } else {
+            c->dentry_anc[i] = 0;
+        }
+        d = p;
+    }
+    /* The loop may stop on the last slot without having looked one level
+     * higher: check whether that ancestor is the root. */
+    if (!top && d) {
+        struct dentry *p = BPF_CORE_READ(d, d_parent);
+        if (!p || p == d) {
+            top = 1;
+        }
+    }
+    c->dentry_depth = depth;
+    c->dentry_top = top;
 }
 
 /* lsm/inode_unlink — `rm`-style deletes. dev/inode identify the
@@ -220,6 +338,7 @@ struct shit_setattr_event {
     __u32 _pad3;
     __u64 old_size;
     __u64 new_size;
+    struct shit_dentry_chain chain;
 };
 
 /* lsm/inode_mkdir — `mkdir(2)` / `mkdirat(2)`. The LSM hook fires
@@ -269,6 +388,7 @@ struct shit_open_event {
     __u64 inode;
     __u32 f_mode;
     __u32 f_flags;
+    struct shit_dentry_chain chain;
 };
 
 /* lsm/file_release — last-fd-close (incl. final mmap unmap).
@@ -283,6 +403,7 @@ struct shit_release_event {
     __u64 inode;
     __u32 f_mode;
     __u32 f_flags;
+    struct shit_dentry_chain chain;
 };
 
 /* lsm/inode_rename — `rename(2)` / `renameat2(2)`. Captures

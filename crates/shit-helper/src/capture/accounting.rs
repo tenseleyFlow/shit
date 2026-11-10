@@ -123,6 +123,24 @@ pub struct CloseAccounting {
     unkeyed: Vec<String>,
     /// `(label, value)` of a tier-wide loss counter when the watch began.
     kernel_mark: Option<(&'static str, u64)>,
+    /// Parent directories of the removals recorded in `missing`, per
+    /// identity. `None` once any loss of the identity came without a
+    /// parent, so the parent rule below never applies to it.
+    missing_parents: BTreeMap<Id, Option<BTreeSet<Id>>>,
+    /// Identities some rename in this command moved, resolved or not.
+    moved: BTreeSet<Id>,
+    /// Directories this command removed.
+    removed_dirs: BTreeSet<Id>,
+    /// `(dev, root inode, inodes above the root)`, when no mount lies
+    /// under the root (#233).
+    root_ancestry: Option<(u64, u64, BTreeSet<u64>)>,
+    /// Per identity in `missing`: true while every loss of it came with
+    /// a dentry chain that placed it outside the root.
+    dentry_outside: BTreeMap<Id, bool>,
+    /// Set by [`Self::enable_dentry_rule`].
+    dentry_rule_on: bool,
+    /// Set by [`Self::disable_dentry_rule`]; overrides `dentry_rule_on`.
+    dentry_rule_off: bool,
 }
 
 impl CloseAccounting {
@@ -323,6 +341,160 @@ impl CloseAccounting {
         path: Option<String>,
         detail: impl Into<String>,
     ) {
+        if id != (0, 0) {
+            self.missing_parents.insert(id, None);
+        }
+        self.record_missing(id, parent_walked, false, path, detail);
+    }
+
+    /// [`Self::note_missing`] for a change to `id` whose event carries
+    /// no path. `outside` is [`Self::dentry_outside_root`] for the
+    /// event's dentry chain (#233).
+    pub fn note_missing_by_dentry(&mut self, id: Id, outside: bool, detail: impl Into<String>) {
+        if id != (0, 0) {
+            self.missing_parents.insert(id, None);
+        }
+        self.record_missing(id, false, outside, None, detail);
+    }
+
+    /// Record the watch root's place in its filesystem: its inode and
+    /// the inodes of the directories above it on the same filesystem.
+    /// Only call this when no mount lies under the root, since a file
+    /// reached through such a mount has ancestors outside the root
+    /// while its path is inside it.
+    pub fn note_root_ancestry(&mut self, dev: u64, root_ino: u64, above: BTreeSet<u64>) {
+        self.root_ancestry = Some((dev, root_ino, above));
+    }
+
+    /// True when the dentry chain proves `id` lives outside the watch
+    /// root (#233). `ancestors` are the inode numbers of the directories
+    /// above the file's dentry, nearest first. Walking up, the first
+    /// directory that is either the root or one of the root's own
+    /// ancestors decides: the root means inside, an ancestor of the root
+    /// means the file's path left the root's line below that ancestor.
+    /// A chain that meets neither proves nothing. A file with more than
+    /// one link may have another name inside the tree, so it never
+    /// counts as outside.
+    pub fn dentry_outside_root(&self, id: Id, nlink: u32, ancestors: &[u64]) -> bool {
+        let Some((dev, root_ino, above)) = &self.root_ancestry else {
+            return false;
+        };
+        if nlink != 1 || id.0 != *dev || id == (0, 0) {
+            return false;
+        }
+        for a in ancestors {
+            if a == root_ino {
+                return false;
+            }
+            if above.contains(a) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`Self::note_missing`] for the removal of `id` from directory
+    /// `parent`, whose path may not be resolvable yet (#248).
+    pub fn note_missing_in_dir(
+        &mut self,
+        id: Id,
+        parent: Id,
+        parent_walked: bool,
+        path: Option<String>,
+        detail: impl Into<String>,
+    ) {
+        if id != (0, 0) {
+            match self.missing_parents.entry(id) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(Some(BTreeSet::from([parent])));
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if let Some(set) = o.get_mut() {
+                        set.insert(parent);
+                    }
+                }
+            }
+        }
+        self.record_missing(id, parent_walked, false, path, detail);
+    }
+
+    /// A rename in this command moved `id`.
+    pub fn note_moved(&mut self, id: Id) {
+        self.moved.insert(id);
+    }
+
+    /// True when every recorded loss of `id` removed it from a directory
+    /// this command created, and no rename moved it (#248). Such a
+    /// directory held nothing when the command started, and the only
+    /// way a pre-existing file gets into it is a rename, so `id` was
+    /// created in the command (or is a hard link whose other names are
+    /// accounted for separately). This holds whatever order the mkdir,
+    /// create and unlink records were handled in.
+    ///
+    /// A directory this command also removed does not count: after
+    /// `rm -r old; mkdir new` the new directory can reuse the old one's
+    /// inode number, and files removed from `old` would look as if they
+    /// were removed from `new`.
+    ///
+    /// Neither does a directory the walk saw or a rename moved: the
+    /// mkdir handler stats its path late, so `born` can hold a
+    /// pre-existing directory renamed onto the new name (`mkdir d;
+    /// rmdir d; mv deep d; rm d/x`).
+    fn removed_from_born_dir(&self, id: &Id) -> bool {
+        !self.moved.contains(id)
+            && matches!(
+                self.missing_parents.get(id),
+                Some(Some(parents)) if !parents.is_empty()
+                    && parents.iter().all(|p| {
+                        self.born.contains(p)
+                            && !self.removed_dirs.contains(p)
+                            && !self.baseline.contains(p)
+                            && !self.moved.contains(p)
+                    })
+            )
+    }
+
+    /// True when the dentry chain of every loss of `id` placed it
+    /// outside the root, and nothing in the command could have moved a
+    /// pre-existing file out of the tree first: `id` was not renamed, no
+    /// rename went unresolved (an unresolved rename may have moved a
+    /// directory holding `id` out), and the rule is on: turned on by
+    /// [`Self::enable_dentry_rule`] and never turned off.
+    fn dentry_places_outside(&self, id: &Id) -> bool {
+        self.dentry_rule_on
+            && !self.dentry_rule_off
+            && self.renames_unresolved == 0
+            && !self.moved.contains(id)
+            && self.dentry_outside.get(id) == Some(&true)
+    }
+
+    /// Stop using dentry chains for this command: something (a mount,
+    /// another mount namespace) may have broken the match between the
+    /// dentry tree and paths under the root.
+    pub fn disable_dentry_rule(&mut self) {
+        self.dentry_rule_off = true;
+    }
+
+    /// Use dentry chains for this command: its mount table was checked
+    /// at WatchTree. The rule is off until this is called, and a later
+    /// [`Self::disable_dentry_rule`] wins.
+    pub fn enable_dentry_rule(&mut self) {
+        self.dentry_rule_on = true;
+    }
+
+    /// This command removed directory `id`.
+    pub fn note_dir_removed(&mut self, id: Id) {
+        self.removed_dirs.insert(id);
+    }
+
+    fn record_missing(
+        &mut self,
+        id: Id,
+        parent_walked: bool,
+        outside: bool,
+        path: Option<String>,
+        detail: impl Into<String>,
+    ) {
         let order = self.next_order();
         let obs = Observation {
             path,
@@ -332,6 +504,10 @@ impl CloseAccounting {
             self.missing_unknown.push((obs, parent_walked, order));
             return;
         }
+        self.dentry_outside
+            .entry(id)
+            .and_modify(|o| *o &= outside)
+            .or_insert(outside);
         self.missing
             .entry(id)
             .and_modify(|(_, absent, _)| *absent |= parent_walked)
@@ -408,6 +584,8 @@ impl CloseAccounting {
                 Provenance::Baseline => lost.push((obs, true)),
                 Provenance::Born | Provenance::Outside => {}
                 Provenance::Unlocated if self.born_at(obs.path.as_deref(), order) => {}
+                Provenance::Unlocated if self.removed_from_born_dir(&id) => {}
+                Provenance::Unlocated if self.dentry_places_outside(&id) => {}
                 Provenance::Unlocated if self.outside_root(obs.path.as_deref()) => {}
                 Provenance::Unlocated => unlocated += 1,
             }

@@ -48,7 +48,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::loader::RingbufLossCounter;
+use super::loader::{LossKey, LossMaps, LossRec};
 
 use aya::maps::{MapData, RingBuf};
 
@@ -200,9 +200,37 @@ pub struct SetattrEvent {
     pub _pad3: u32,
     pub old_size: u64,
     pub new_size: u64,
+    pub chain: DentryChain,
 }
 
-const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 136);
+const _: () = assert!(std::mem::size_of::<SetattrEvent>() == 272);
+
+/// Directories above an event's dentry, mirroring `struct
+/// shit_dentry_chain` in common.h (#233).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DentryChain {
+    /// The inode's link count at hook time.
+    pub nlink: u32,
+    /// Slots of `anc` filled, nearest ancestor first.
+    pub depth: u16,
+    /// 1 when the walk reached the superblock root: the last filled
+    /// slot (or the file itself, at depth 0) is that root.
+    pub top: u16,
+    pub anc: [u64; DENTRY_DEPTH],
+}
+
+/// Mirrors `SHIT_DENTRY_DEPTH` in common.h.
+pub const DENTRY_DEPTH: usize = 16;
+
+const _: () = assert!(std::mem::size_of::<DentryChain>() == 136);
+
+impl DentryChain {
+    /// The recorded ancestors, nearest first.
+    pub fn ancestors(&self) -> &[u64] {
+        &self.anc[..(self.depth as usize).min(DENTRY_DEPTH)]
+    }
+}
 
 /// `lsm/inode_mkdir` event — mirrors `struct shit_mkdir_event`.
 /// Captures the parent directory's (dev, inode), the basename of
@@ -313,9 +341,10 @@ pub struct OpenEvent {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    pub chain: DentryChain,
 }
 
-const _: () = assert!(std::mem::size_of::<OpenEvent>() == 96);
+const _: () = assert!(std::mem::size_of::<OpenEvent>() == 232);
 
 /// `lsm/file_release` event — same C-struct shape as
 /// [`OpenEvent`], discriminated by `kind::RELEASE`. Fires when the
@@ -332,9 +361,10 @@ pub struct ReleaseEvent {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    pub chain: DentryChain,
 }
 
-const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 96);
+const _: () = assert!(std::mem::size_of::<ReleaseEvent>() == 232);
 
 /// `lsm/inode_rename` event — mirrors `struct shit_rename_event`.
 /// Carries both ends of the rename. `dev`/`inode` are the target's
@@ -593,6 +623,7 @@ impl LsmEventSink for LinuxCaptureSink {
             inode: ev.inode,
             f_mode: ev.f_mode,
             f_flags: ev.f_flags,
+            chain: ev.chain,
         };
         self.runtime.lock().unwrap().handle_lsm_release(&view);
     }
@@ -625,6 +656,7 @@ impl LsmEventSink for LinuxCaptureSink {
             new_uid: ev.new_uid,
             new_gid: ev.new_gid,
             new_size: ev.new_size,
+            chain: ev.chain,
         };
         self.runtime.lock().unwrap().handle_lsm_setattr(&view);
     }
@@ -703,6 +735,7 @@ impl LsmEventSink for LinuxCaptureSink {
             inode: ev.inode,
             f_mode: ev.f_mode,
             f_flags: ev.f_flags,
+            chain: ev.chain,
         };
         self.runtime.lock().unwrap().handle_lsm_open(&view);
     }
@@ -962,34 +995,43 @@ pub fn ringbuf_losses_observed() -> u64 {
     RINGBUF_LOSSES_OBSERVED.load(Ordering::Relaxed)
 }
 
-/// Tracks one object's loss counter and reports increases.
+/// Tracks one object's loss maps and reports increases.
 struct LossTracker {
-    counter: Option<RingbufLossCounter>,
+    maps: LossMaps,
     last: u64,
+    /// `last` at the most recent read of the per-tgid map.
+    tgid_read_at: u64,
+    /// Per-process counts at that read.
+    tgid_last: std::collections::HashMap<LossKey, u64>,
     unreadable_logged: bool,
 }
 
 impl LossTracker {
-    fn new(counter: Option<RingbufLossCounter>) -> Self {
+    fn new(maps: LossMaps) -> Self {
         Self {
-            counter,
+            maps,
             last: 0,
+            tgid_read_at: 0,
+            tgid_last: std::collections::HashMap::new(),
             unreadable_logged: false,
         }
     }
 
+    /// Run `f` with CAP_BPF raised where the kernel needs it for map
+    /// reads (#226).
+    fn read_map<T>(f: impl FnOnce() -> T) -> T {
+        if crate::priv_linux::bpf_cap_kept() {
+            crate::priv_linux::with_cap(crate::priv_linux::CAP_BPF, f)
+        } else {
+            f()
+        }
+    }
+
     fn poll(&mut self, thread_name: &'static str) {
-        let Some(counter) = &self.counter else {
+        let Some(counter) = &self.maps.counter else {
             return;
         };
-        // #226: CAP_BPF is permitted only on kernels that need it for map
-        // reads; there with_cap raises it for this read on this thread.
-        let read = if crate::priv_linux::bpf_cap_kept() {
-            crate::priv_linux::with_cap(crate::priv_linux::CAP_BPF, || counter.get(&0, 0))
-        } else {
-            counter.get(&0, 0)
-        };
-        match read {
+        match Self::read_map(|| counter.get(&0, 0)) {
             Ok(value) => {
                 let delta = note_loss_value(&mut self.last, value);
                 if delta > 0 {
@@ -1011,9 +1053,56 @@ impl LossTracker {
                         "eBPF ring-buffer loss counter is unreadable; drops cannot be counted"
                     );
                 }
+                return;
             }
         }
+        // #229: the per-tgid entries are updated before the total, so
+        // once the total has moved, one read of the map sees every drop
+        // the total counts.
+        if self.last == self.tgid_read_at {
+            return;
+        }
+        self.tgid_read_at = self.last;
+        let Some(by_tgid) = &self.maps.by_tgid else {
+            return;
+        };
+        let entries: Vec<(LossKey, LossRec)> =
+            Self::read_map(|| by_tgid.iter().filter_map(Result::ok).collect());
+        let mut seen = std::collections::HashMap::with_capacity(entries.len());
+        let mut out = Vec::new();
+        for (key, rec) in entries {
+            let prev = self.tgid_last.get(&key).copied().unwrap_or(0);
+            if let Some(loss) = tgid_increase(key.tgid, &rec, prev) {
+                out.push(loss);
+            }
+            seen.insert(key, rec.count);
+        }
+        self.tgid_last = seen;
+        super::loss_ledger::queue(out);
     }
+}
+
+/// The increase of one tgid's entry since `prev`. A count below `prev`
+/// is an entry that was evicted and made again, so all of it is new.
+fn tgid_increase(tgid: u32, rec: &LossRec, prev: u64) -> Option<super::loss_ledger::TgidLoss> {
+    let count = if rec.count >= prev {
+        rec.count - prev
+    } else {
+        rec.count
+    };
+    if count == 0 {
+        return None;
+    }
+    let mut ancestry = [0i32; ANCESTRY_DEPTH + 1];
+    ancestry[0] = rec.parent_pid as i32;
+    for (slot, a) in ancestry[1..].iter_mut().zip(rec.ancestors) {
+        *slot = a as i32;
+    }
+    Some(super::loss_ledger::TgidLoss {
+        tgid,
+        ancestry,
+        count,
+    })
 }
 
 /// Advance `last` to `value` and return how many losses that is. The
@@ -1033,6 +1122,8 @@ pub struct LsmFlushHandle {
     /// Set after a request is sent. The reader checks this flag between
     /// records instead of polling the channel.
     waiting: Arc<AtomicBool>,
+    /// True while the reader is inside one record handler (#249).
+    in_handler: Arc<AtomicBool>,
 }
 
 /// One flush request: where the ack goes, and when the drain must stop.
@@ -1106,6 +1197,7 @@ impl LsmFlushHandle {
             thread_name,
             tx,
             waiting: Arc::new(AtomicBool::new(false)),
+            in_handler: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1113,14 +1205,44 @@ impl LsmFlushHandle {
     /// buffer. Returns the channel its ack arrives on.
     fn request(&self) -> Result<mpsc::Receiver<FlushAck>, String> {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + FLUSH_DRAIN_BUDGET;
         self.tx
             .send(FlushRequest {
                 ack: ack_tx,
-                deadline: Instant::now() + FLUSH_DRAIN_BUDGET,
+                deadline,
             })
             .map_err(|_| format!("eBPF {} reader is not running", self.thread_name))?;
         self.waiting.store(true, Ordering::Release);
         Ok(ack_rx)
+    }
+
+    /// Wait for the ack of a request, giving up at `deadline`.
+    ///
+    /// #249: a reader cannot look at its flush request while one record
+    /// handler runs (a large pre-image copy, say). A handler that ends
+    /// before `deadline` lets the drain finish normally, so its ack
+    /// decides. Only when `deadline` passes with the reader still inside
+    /// a handler is the tail reported as cut short by that handler, which
+    /// tells it apart from a reader that is not responding at all.
+    fn await_ack(&self, ack: &mpsc::Receiver<FlushAck>, deadline: Instant) -> Result<(), String> {
+        let outcome = match ack.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(a) => Ok(a),
+            Err(_) if self.in_handler.load(Ordering::Acquire) => {
+                return Err(format!(
+                    "eBPF {} reader flush stopped: one record handler was still running at the flush timeout",
+                    self.thread_name
+                ));
+            }
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(FlushAck::Drained) => Ok(()),
+            Ok(FlushAck::Truncated { drained }) => Err(format!(
+                "eBPF {} reader flush stopped after {drained} records with more queued",
+                self.thread_name
+            )),
+            Err(_) => Err(format!("eBPF {} reader flush timed out", self.thread_name)),
+        }
     }
 }
 
@@ -1134,17 +1256,8 @@ pub fn flush_all_readers(handles: &[LsmFlushHandle], timeout: Duration) -> Resul
     for (handle, request) in handles.iter().zip(requests) {
         match request {
             Ok(ack) => {
-                let wait = deadline.saturating_duration_since(Instant::now());
-                match ack.recv_timeout(wait) {
-                    Ok(FlushAck::Drained) => {}
-                    Ok(FlushAck::Truncated { drained }) => failures.push(format!(
-                        "eBPF {} reader flush stopped after {drained} records with more queued",
-                        handle.thread_name
-                    )),
-                    Err(_) => failures.push(format!(
-                        "eBPF {} reader flush timed out",
-                        handle.thread_name
-                    )),
+                if let Err(e) = handle.await_ack(&ack, deadline) {
+                    failures.push(e);
                 }
             }
             Err(e) => failures.push(e),
@@ -1174,7 +1287,7 @@ impl LsmReader {
         unlink_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-unlink",
@@ -1204,7 +1317,7 @@ impl LsmReader {
         rmdir_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-rmdir",
@@ -1234,7 +1347,7 @@ impl LsmReader {
         release_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-release",
@@ -1262,7 +1375,7 @@ impl LsmReader {
         setattr_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-setattr",
@@ -1290,7 +1403,7 @@ impl LsmReader {
         mkdir_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-mkdir",
@@ -1318,7 +1431,7 @@ impl LsmReader {
         create_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-create",
@@ -1351,7 +1464,7 @@ impl LsmReader {
         mknod_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-mknod",
@@ -1379,7 +1492,7 @@ impl LsmReader {
         open_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-open",
@@ -1407,7 +1520,7 @@ impl LsmReader {
         rename_rb: RingBuf<MapData>,
         sink: Arc<dyn LsmEventSink>,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         Self::spawn_with_handler(
             "shit-lsm-rename",
@@ -1438,13 +1551,14 @@ impl LsmReader {
         sink: Arc<dyn LsmEventSink>,
         handler: RecordHandler,
         idle_sleep: Duration,
-        loss_counter: Option<RingbufLossCounter>,
+        loss_counter: LossMaps,
     ) -> Self {
         let alive = Arc::new(AtomicBool::new(true));
         let alive_t = Arc::clone(&alive);
         let (flush_tx, flush_rx) = mpsc::channel();
         let flush = LsmFlushHandle::new(thread_name, flush_tx);
         let waiting = Arc::clone(&flush.waiting);
+        let in_handler = Arc::clone(&flush.in_handler);
         let handle = std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
@@ -1458,6 +1572,7 @@ impl LsmReader {
                     LossTracker::new(loss_counter),
                     flush_rx,
                     waiting,
+                    in_handler,
                 );
             })
             .expect("spawn lsm reader");
@@ -1509,16 +1624,24 @@ fn reader_thread(
     mut loss: LossTracker,
     flush_rx: mpsc::Receiver<FlushRequest>,
     waiting: Arc<AtomicBool>,
+    in_handler: Arc<AtomicBool>,
 ) {
     let mut last_loss_poll = Instant::now();
     let mut pending: Vec<FlushRequest> = Vec::new();
+    // #249: the requester reads `in_handler` to tell one slow handler
+    // from a reader that is not responding.
+    let handle = |rec: &[u8]| {
+        in_handler.store(true, Ordering::Release);
+        handler(rec, sink.as_ref());
+        in_handler.store(false, Ordering::Release);
+    };
     while alive.load(Ordering::Acquire) {
         dispatch_batch(
             || {
                 let Some(rec) = rb.next() else {
                     return false;
                 };
-                handler(&rec[..], sink.as_ref());
+                handle(&rec[..]);
                 true
             },
             // One atomic load per record. The flag is set after the
@@ -1537,9 +1660,8 @@ fn reader_thread(
         // request is already in the ring, so draining until empty
         // dispatches the command's whole tail before the ack. The
         // budget runs from when the request was sent. A single handler
-        // still runs to completion, so one that outlasts the requester's
-        // wait shows up there as a timeout, which the close reports the
-        // same way.
+        // still runs to completion; the requester sees `in_handler` and
+        // reports that as a cut-short tail (#249).
         for FlushRequest { ack, deadline } in pending.drain(..) {
             let outcome = drain_for_flush(
                 || Instant::now() >= deadline,
@@ -1547,7 +1669,7 @@ fn reader_thread(
                     let Some(rec) = rb.next() else {
                         return false;
                     };
-                    handler(&rec[..], sink.as_ref());
+                    handle(&rec[..]);
                     true
                 },
             );
@@ -1601,6 +1723,22 @@ mod tests {
     }
 
     #[test]
+    fn tgid_increase_counts_new_drops_and_carries_ancestry() {
+        let rec = LossRec {
+            count: 5,
+            parent_pid: 40,
+            _pad: 0,
+            ancestors: [30, 1, 0, 0, 0, 0, 0, 0],
+        };
+        let l = tgid_increase(50, &rec, 2).unwrap();
+        assert_eq!((l.tgid, l.count), (50, 3));
+        assert_eq!(&l.ancestry[..3], &[40, 30, 1]);
+        assert!(tgid_increase(50, &rec, 5).is_none());
+        // Evicted and made again: the whole count is new.
+        assert_eq!(tgid_increase(50, &rec, 9).unwrap().count, 5);
+    }
+
+    #[test]
     fn flush_reports_stopped_reader() {
         let (tx, rx) = mpsc::channel();
         drop(rx);
@@ -1643,6 +1781,68 @@ mod tests {
             "the second reader was asked only after the first gave up"
         );
         drop(stuck_rx);
+    }
+
+    /// A reader inside one handler for `busy`, which then takes the
+    /// request and acks `ack`.
+    fn busy_reader(
+        handle: &LsmFlushHandle,
+        rx: mpsc::Receiver<FlushRequest>,
+        busy: Duration,
+        ack: FlushAck,
+    ) -> std::thread::JoinHandle<()> {
+        let in_handler = Arc::clone(&handle.in_handler);
+        in_handler.store(true, Ordering::Release);
+        std::thread::spawn(move || {
+            std::thread::sleep(busy);
+            in_handler.store(false, Ordering::Release);
+            if let Ok(req) = rx.recv() {
+                let _ = req.ack.send(ack);
+            }
+        })
+    }
+
+    #[test]
+    fn slow_handler_that_ends_inside_the_timeout_still_drains() {
+        // #249 review: a handler that runs past the drain budget but ends
+        // before LSM_FLUSH_TIMEOUT leaves a fully drained ring. That must
+        // stay Drained, or strict refuses a command it journaled whole.
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handle = LsmFlushHandle::new("open", tx);
+        let busy = FLUSH_DRAIN_BUDGET + Duration::from_millis(300);
+        assert!(busy < crate::LSM_FLUSH_TIMEOUT);
+        let reader = busy_reader(&handle, rx, busy, FlushAck::Drained);
+        flush_all_readers(&[handle], crate::LSM_FLUSH_TIMEOUT).unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn handler_still_running_at_the_timeout_is_a_cut_short_tail() {
+        // #249: one handler outlasts the whole wait. That is reported as
+        // a tail the handler cut short, not as an unresponsive reader.
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handle = LsmFlushHandle::new("open", tx);
+        let timeout = Duration::from_millis(400);
+        let reader = busy_reader(
+            &handle,
+            rx,
+            timeout + Duration::from_millis(300),
+            FlushAck::Truncated { drained: 0 },
+        );
+        let started = Instant::now();
+        let err = flush_all_readers(&[handle], timeout).unwrap_err();
+        assert!(started.elapsed() >= timeout);
+        assert!(err.contains("still running at the flush timeout"), "{err}");
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn idle_reader_that_never_acks_still_times_out() {
+        let (tx, rx) = mpsc::channel::<FlushRequest>();
+        let handle = LsmFlushHandle::new("stuck", tx);
+        let err = flush_all_readers(&[handle], Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        drop(rx);
     }
 
     #[test]
@@ -1915,8 +2115,8 @@ mod tests {
     }
 
     #[test]
-    fn setattr_event_layout_is_136_bytes() {
-        assert_eq!(std::mem::size_of::<SetattrEvent>(), 136);
+    fn setattr_event_layout_is_272_bytes() {
+        assert_eq!(std::mem::size_of::<SetattrEvent>(), 272);
         assert_eq!(std::mem::align_of::<SetattrEvent>(), 8);
     }
 
@@ -1945,8 +2145,14 @@ mod tests {
             _pad3: 0,
             old_size: 1024,
             new_size: 0,
+            chain: DentryChain {
+                nlink: 1,
+                depth: 2,
+                top: 1,
+                anc: [9, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
         };
-        let bytes: [u8; 136] = unsafe { std::mem::transmute(original) };
+        let bytes: [u8; 272] = unsafe { std::mem::transmute(original) };
         let decoded = decode_setattr(&bytes).expect("decode");
         assert_eq!(decoded.hdr.kind, kind::SETATTR);
         assert_eq!(decoded.attr_valid, attr::MODE);
@@ -1954,12 +2160,33 @@ mod tests {
         assert_eq!(decoded.new_mode, 0o100755);
         assert_eq!(decoded.dev, 0x802);
         assert_eq!(decoded.inode, 12345);
+        assert_eq!(decoded.chain.ancestors(), &[9, 2]);
+        assert_eq!(decoded.chain.top, 1);
+    }
+
+    #[test]
+    fn dentry_chain_decodes_from_the_wire_offsets() {
+        // common.h: open event header 72, dev 72, inode 80, f_mode 88,
+        // f_flags 92, then the chain: nlink 96, depth 100, top 102,
+        // anc[16] at 104.
+        let mut bytes = [0u8; 232];
+        bytes[0] = kind::OPEN;
+        bytes[96..100].copy_from_slice(&2u32.to_ne_bytes());
+        bytes[100..102].copy_from_slice(&3u16.to_ne_bytes());
+        bytes[102..104].copy_from_slice(&0u16.to_ne_bytes());
+        for (i, ino) in [40u64, 30, 20].iter().enumerate() {
+            bytes[104 + 8 * i..112 + 8 * i].copy_from_slice(&ino.to_ne_bytes());
+        }
+        let ev = decode_open(&bytes).expect("decode");
+        assert_eq!(ev.chain.nlink, 2);
+        assert_eq!(ev.chain.ancestors(), &[40, 30, 20]);
+        assert_eq!(ev.chain.top, 0);
     }
 
     #[test]
     fn ancestry_decodes_from_the_wire_offsets() {
         // common.h: parent_pid at 12, ancestors[8] at 40, header 72.
-        let mut bytes = [0u8; 136];
+        let mut bytes = [0u8; 272];
         bytes[0] = kind::SETATTR;
         bytes[4..8].copy_from_slice(&300u32.to_ne_bytes());
         bytes[8..12].copy_from_slice(&300u32.to_ne_bytes());

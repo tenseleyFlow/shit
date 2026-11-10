@@ -33,11 +33,13 @@
 
 pub mod error;
 pub mod loader;
+pub mod loss_ledger;
 pub mod ringbuf_reader;
 
 pub use error::EbpfError;
-pub use loader::{EbpfLoader, ProbeOutcome, RingbufLossCounter};
+pub use loader::{EbpfLoader, ProbeOutcome, RingbufLossByTgid, RingbufLossCounter};
+pub use loss_ledger::{forget_ringbuf_losses, ringbuf_loss_value};
 pub use ringbuf_reader::{
-    EventHeader, LoggingSink, LsmEventSink, LsmFlushHandle, LsmReader, UnlinkEvent, decode_unlink,
-    flush_all_readers, kind, ringbuf_losses_observed,
+    ANCESTRY_DEPTH, DentryChain, EventHeader, LoggingSink, LsmEventSink, LsmFlushHandle, LsmReader,
+    UnlinkEvent, decode_unlink, flush_all_readers, kind, ringbuf_losses_observed,
 };

@@ -1100,7 +1100,7 @@ pub struct MetricsSnapshot {
     pub last_gc_duration_ms: u64,
     pub last_gc_bytes_reclaimed: u64,
     pub last_gc_at_unix_secs: u64,
-    /// Kernel-tier classifier (Linux: "fanotify"/"bpf-lsm"; macOS:
+    /// Kernel-tier classifier (Linux: "fanotify"/"ebpf-lsm"; macOS:
     /// "endpoint-security"; FreeBSD: "kqueue"). Empty when capture
     /// tier not yet initialized.
     pub kernel_tier: String,

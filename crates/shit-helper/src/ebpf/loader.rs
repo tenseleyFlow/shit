@@ -161,6 +161,51 @@ const RINGBUF_LOSS_COUNT: &str = "ringbuf_loss_count";
 /// Userspace handle for one object's monotonic ring-buffer loss counter.
 pub type RingbufLossCounter = aya::maps::Array<aya::maps::MapData, u64>;
 
+/// #229: the same losses per tgid (LRU hash), with ancestry.
+const RINGBUF_LOSS_BY_TGID: &str = "ringbuf_loss_by_tgid";
+
+/// Mirrors `struct shit_loss_key` in common.h: a process, told apart
+/// from a later one that reuses its pid by the leader's start time.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LossKey {
+    pub tgid: u32,
+    pub _pad: u32,
+    pub start_time: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<LossKey>() == 16);
+
+// SAFETY: LossKey is repr(C), Copy, and every bit pattern is valid.
+unsafe impl aya::Pod for LossKey {}
+
+/// Mirrors `struct shit_loss_rec` in common.h.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LossRec {
+    pub count: u64,
+    pub parent_pid: u32,
+    pub _pad: u32,
+    pub ancestors: [u32; super::ringbuf_reader::ANCESTRY_DEPTH],
+}
+
+const _: () = assert!(std::mem::size_of::<LossRec>() == 48);
+
+// SAFETY: LossRec is repr(C), Copy, and every bit pattern is valid.
+unsafe impl aya::Pod for LossRec {}
+
+/// Userspace handle for one object's per-tgid loss map.
+pub type RingbufLossByTgid = aya::maps::HashMap<aya::maps::MapData, LossKey, LossRec>;
+
+/// One object's loss maps. Either may be missing (an object built
+/// before the map existed, or a failed take); the reader then counts
+/// what it can.
+#[derive(Default)]
+pub struct LossMaps {
+    pub counter: Option<RingbufLossCounter>,
+    pub by_tgid: Option<RingbufLossByTgid>,
+}
+
 /// Result of `EbpfLoader::probe` — combined kernel feature + capability
 /// view. `should_attempt_load` is the call-site predicate that tells
 /// the helper whether it's worth invoking `load`.
@@ -1032,7 +1077,27 @@ impl EbpfLoader {
     /// is not loaded, the map was already taken, or the object predates
     /// the counter.
     pub fn take_loss_counter(&mut self, object: &str) -> Option<RingbufLossCounter> {
-        let bpf = match object {
+        let map = self.object_mut(object)?.take_map(RINGBUF_LOSS_COUNT)?;
+        aya::maps::Array::try_from(map).ok()
+    }
+
+    /// Both loss maps of one object, for its reader.
+    pub fn take_loss_maps(&mut self, object: &str) -> LossMaps {
+        LossMaps {
+            counter: self.take_loss_counter(object),
+            by_tgid: self.take_loss_by_tgid(object),
+        }
+    }
+
+    /// Take the per-tgid loss map of one loaded LSM object (#229). Same
+    /// `object` names as [`Self::take_loss_counter`].
+    pub fn take_loss_by_tgid(&mut self, object: &str) -> Option<RingbufLossByTgid> {
+        let map = self.object_mut(object)?.take_map(RINGBUF_LOSS_BY_TGID)?;
+        aya::maps::HashMap::try_from(map).ok()
+    }
+
+    fn object_mut(&mut self, object: &str) -> Option<&mut aya::Ebpf> {
+        match object {
             "unlink" => self.bpf.as_mut(),
             "setattr" => self.setattr_bpf.as_mut(),
             "mkdir" => self.mkdir_bpf.as_mut(),
@@ -1045,9 +1110,7 @@ impl EbpfLoader {
             "release" => self.release_bpf.as_mut(),
             "mknod" => self.mknod_bpf.as_mut(),
             _ => None,
-        }?;
-        let map = bpf.take_map(RINGBUF_LOSS_COUNT)?;
-        aya::maps::Array::try_from(map).ok()
+        }
     }
 
     /// L04 — Take the `unlink_events` ringbuf for the userspace

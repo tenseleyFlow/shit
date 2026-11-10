@@ -129,7 +129,7 @@ fn spawn_helper_and_complete_handshake() {
             assert!(matches!(
                 kernel_tier.as_str(),
                 "fanotify"
-                    | "bpf-lsm"
+                    | "ebpf-lsm"
                     | "endpoint-security"
                     | "fsevents-degraded"
                     | "kqueue"

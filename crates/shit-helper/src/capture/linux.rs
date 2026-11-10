@@ -53,6 +53,7 @@ use shit_proto::HelperResponse;
 
 use crate::capture::accounting::{CloseAccounting, Id, send_observations};
 use crate::capture::streaming::{STREAM_COPY_CAP, StreamError, stream_copy_to_staging_path};
+use crate::ebpf::DentryChain;
 use crate::ipc::Conn;
 
 /// `FMODE_CREATED` from `include/linux/fs.h` (`1 << 20` since 4.19). A
@@ -181,6 +182,12 @@ struct WatchState {
     /// write returned Err) — NOT dedupe-skips or other intentional
     /// short-circuits.
     silent_send_failures: u32,
+    /// The watch root, set by `pre_open_tree`.
+    root: Option<PathBuf>,
+    /// `/proc/<root_pid>/mounts`, held from `check_mounts` to close. Any
+    /// mount change in that namespace meanwhile makes it pollable
+    /// (#233).
+    mounts_watch: Option<MountsWatch>,
     /// R3 slice B — baseline, born set and uncaptured mutations. Read
     /// at `on_unwatch_tree`, which sends one observation per loss.
     acct: CloseAccounting,
@@ -438,9 +445,64 @@ impl LinuxCaptureRuntime {
                 );
             }
         }
-        if let Some(ws) = self.watches.remove(&command) {
+        if let Some(mut ws) = self.watches.remove(&command) {
+            // #233: a mount anywhere in the command's namespace since
+            // WatchTree may have put a mount under the root, so the
+            // dentry chains no longer match paths there.
+            if ws.mounts_watch.as_ref().is_none_or(MountsWatch::changed) {
+                ws.acct.disable_dentry_rule();
+            }
             let observations = ws.acct.close(ws.silent_send_failures, kernel_losses_now);
             send_observations(&self.conn, command, observations);
+        }
+    }
+
+    /// #233: turn on the dentry rule for `command` if its mount table
+    /// lets dentry chains stand for paths under the root. Call after
+    /// [`Self::pre_open_tree`], with the command's root process.
+    ///
+    /// The rule stays off when the root runs in another mount namespace
+    /// than the helper, when its mountinfo cannot be read or lists a
+    /// mount under the root, or when anything here fails. The held
+    /// `/proc/<root_pid>/mounts` fd is polled at close: a mount change
+    /// in that namespace during the command turns the rule off again.
+    ///
+    /// Dentry chains are judged in the helper's mount namespace. A
+    /// descendant that unshares its own namespace and mounts inside it
+    /// is not seen here: the watch covers the root's namespace only.
+    pub fn check_mounts(&mut self, command: CommandId, root_pid: i32) {
+        let ws = self.watches.entry(command).or_default();
+        let proc_dir = PathBuf::from(format!("/proc/{root_pid}"));
+        let same_ns = match (
+            std::fs::metadata("/proc/self/ns/mnt"),
+            std::fs::metadata(proc_dir.join("ns/mnt")),
+        ) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        };
+        // Opened before mountinfo is read, so a change between the two
+        // still shows at close.
+        let watch = MountsWatch::open(root_pid);
+        let clean = same_ns
+            && watch.is_some()
+            && ws.root.as_deref().is_some_and(|root| {
+                std::fs::read_to_string(proc_dir.join("mountinfo"))
+                    .is_ok_and(|info| !mount_under(root, &info))
+            });
+        tracing::info!(
+            session = %command.session,
+            seq = command.seq,
+            root_pid,
+            same_ns,
+            watching = watch.is_some(),
+            dentry_rule = clean,
+            "check_mounts"
+        );
+        ws.mounts_watch = watch;
+        if clean {
+            ws.acct.enable_dentry_rule();
+        } else {
+            ws.acct.disable_dentry_rule();
         }
     }
 
@@ -503,6 +565,12 @@ impl LinuxCaptureRuntime {
         ws.acct.note_root(cwd);
         ws.acct.note_tree_dev(root_dev_inode.0);
         ws.acct.note_walked();
+        // #233: path-less events are placed by their dentry ancestry,
+        // once `check_mounts` has turned the rule on.
+        let above = ancestors_on_dev(cwd, root_dev_inode.0);
+        ws.acct
+            .note_root_ancestry(root_dev_inode.0, root_dev_inode.1, above);
+        ws.root = Some(cwd.to_path_buf());
 
         let mut opened = 0usize;
         let mut hit_cap = false;
@@ -724,6 +792,10 @@ impl LinuxCaptureRuntime {
             (ev_dev_userspace, ev.inode),
             DedupeEntry { invalidated: true },
         );
+        if ev.is_directory {
+            ws.acct.note_dir_removed((ev_dev_userspace, ev.inode));
+        }
+        let parent_id = (ev_dev_userspace, ev.parent_inode);
 
         // AR01.1.fix-path-via-parent-inode — resolve strictly through
         // the dir-inode map (populated by pre_open_tree recursion + by
@@ -754,8 +826,12 @@ impl LinuxCaptureRuntime {
                 basename = ev.basename,
                 "lsm unlink: parent_inode not in dir_paths; dropping event"
             );
-            ws.acct.note_missing(
+            // #248: keep the parent identity. If the parent turns out to
+            // be a directory this command created (its mkdir handled
+            // after this unlink), the entry was born in the command.
+            ws.acct.note_missing_in_dir(
                 (ev_dev_userspace, ev.inode),
+                parent_id,
                 false,
                 None,
                 format!(
@@ -1011,8 +1087,9 @@ impl LinuxCaptureRuntime {
             }
         }
         if !evidence {
-            ws.acct.note_missing(
+            ws.acct.note_missing_in_dir(
                 (ev_dev_userspace, ev.inode),
+                parent_id,
                 parent_walked,
                 Some(resolved_path.clone()),
                 if race_won {
@@ -1109,11 +1186,10 @@ impl LinuxCaptureRuntime {
                 (ev_dev_userspace, ev.inode),
                 DedupeEntry { invalidated: false },
             );
-            let path = resolve_inode_to_path(ws, ev_dev_userspace, ev.inode);
-            ws.acct.note_missing(
+            note_missing_without_snapshot(
+                ws,
                 (ev_dev_userspace, ev.inode),
-                false,
-                path.as_deref().map(path_to_string),
+                &ev.chain,
                 "attribute change had no pre-change snapshot",
             );
             return;
@@ -1679,11 +1755,10 @@ impl LinuxCaptureRuntime {
                 "lsm open: no pre-snapshot; dropping (file not in WatchTree's cwd or too large)"
             );
             if !created_now {
-                let path = resolve_inode_to_path(ws, ev_dev, ev.inode);
-                ws.acct.note_missing(
+                note_missing_without_snapshot(
+                    ws,
                     (ev_dev, ev.inode),
-                    false,
-                    path.as_deref().map(path_to_string),
+                    &ev.chain,
                     "write-open had no pre-mutation snapshot",
                 );
             }
@@ -1832,11 +1907,10 @@ impl LinuxCaptureRuntime {
                 inode = ev.inode,
                 "lsm release: no pre-snapshot; dropping"
             );
-            let path = resolve_inode_to_path(ws, ev_dev, ev.inode);
-            ws.acct.note_missing(
+            note_missing_without_snapshot(
+                ws,
                 (ev_dev, ev.inode),
-                false,
-                path.as_deref().map(path_to_string),
+                &ev.chain,
                 "written file had no pre-mutation snapshot",
             );
             return;
@@ -1984,6 +2058,7 @@ impl LinuxCaptureRuntime {
 
         let ev_dev = kernel_dev_to_userspace(ev.dev);
         let moved = (ev_dev, ev.inode);
+        ws.acct.note_moved(moved);
         let to_resolved =
             resolve_via_parent(&ws.dir_paths, ev_dev, ev.new_parent_inode, ev.new_basename);
 
@@ -2167,6 +2242,127 @@ impl LinuxCaptureRuntime {
             to = %to_path,
             "lsm-rename TreeMutation sent",
         );
+    }
+}
+
+/// True when `mountinfo` (the text of a `/proc/<pid>/mountinfo`) lists
+/// a mount point strictly below `root`.
+fn mount_under(root: &Path, mountinfo: &str) -> bool {
+    mountinfo.lines().any(|line| {
+        line.split(' ')
+            .nth(4)
+            .map(unescape_mountinfo)
+            .is_some_and(|mp| {
+                let mp = Path::new(&mp);
+                mp != root && mp.starts_with(root)
+            })
+    })
+}
+
+/// Undo mountinfo's octal escapes (`\040` for a space, and so on).
+fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        // Only `\000` to `\377` fit a byte; anything else is literal.
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && (b'0'..=b'3').contains(&b[i + 1])
+            && b[i + 2..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            let v = u32::from(b[i + 1] - b'0') * 64
+                + u32::from(b[i + 2] - b'0') * 8
+                + u32::from(b[i + 3] - b'0');
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
+/// Watches one mount namespace for mount changes (#233).
+///
+/// Opening `/proc/<pid>/mounts` records the namespace's event count;
+/// the file polls readable with `EPOLLPRI` once the count moves, and
+/// each poll resets it. So the epoll set is made when the watch starts:
+/// adding the file polls it once with nothing changed yet, a later mount
+/// wakes the set, and the one poll at [`Self::changed`] reports it.
+/// epoll, unlike `poll`, is on the helper's seccomp allow list.
+#[derive(Debug)]
+struct MountsWatch {
+    _mounts: std::fs::File,
+    ep: OwnedFd,
+}
+
+impl MountsWatch {
+    fn open(pid: i32) -> Option<Self> {
+        let mounts = std::fs::File::open(format!("/proc/{pid}/mounts")).ok()?;
+        // SAFETY: plain syscall; a negative return is an error.
+        let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if ep < 0 {
+            return None;
+        }
+        // SAFETY: `ep` is the fd just returned; we own it.
+        let ep = unsafe { OwnedFd::from_raw_fd(ep) };
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLPRI | libc::EPOLLERR) as u32,
+            u64: 0,
+        };
+        // SAFETY: both fds are open; `ev` is a valid epoll_event.
+        let rc = unsafe {
+            libc::epoll_ctl(
+                ep.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                mounts.as_raw_fd(),
+                &mut ev,
+            )
+        };
+        (rc == 0).then_some(Self {
+            _mounts: mounts,
+            ep,
+        })
+    }
+
+    /// True when the namespace's mount table changed since [`Self::open`],
+    /// or when that cannot be told.
+    fn changed(&self) -> bool {
+        let mut out = libc::epoll_event { events: 0, u64: 0 };
+        // SAFETY: `out` has room for one event; zero timeout; no sigmask.
+        let n = unsafe { libc::epoll_pwait(self.ep.as_raw_fd(), &mut out, 1, 0, std::ptr::null()) };
+        n != 0
+    }
+}
+
+/// Inode numbers of the directories above `root` that are on `dev`.
+fn ancestors_on_dev(root: &Path, dev: u64) -> std::collections::BTreeSet<u64> {
+    root.ancestors()
+        .skip(1)
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter(|m| m.dev() == dev)
+        .map(|m| m.ino())
+        .collect()
+}
+
+/// Record a change to `id`, which has no pre-command snapshot, as
+/// possibly lost. Path-less events (open, release, setattr) carry the
+/// dentry's ancestor chain, which can place the file outside the watch
+/// root when no path is known (#233).
+fn note_missing_without_snapshot(ws: &mut WatchState, id: Id, chain: &DentryChain, detail: &str) {
+    match resolve_inode_to_path(ws, id.0, id.1) {
+        Some(p) => ws
+            .acct
+            .note_missing(id, false, Some(path_to_string(&p)), detail),
+        None => {
+            let outside = ws
+                .acct
+                .dentry_outside_root(id, chain.nlink, chain.ancestors());
+            ws.acct.note_missing_by_dentry(id, outside, detail);
+        }
     }
 }
 
@@ -2477,6 +2673,8 @@ pub struct LsmSetattrView {
     pub new_uid: u32,
     pub new_gid: u32,
     pub new_size: u64,
+    /// Directories above the changed dentry (#233).
+    pub chain: DentryChain,
 }
 
 /// View into an `lsm/inode_mkdir` event. The new directory's own
@@ -2519,6 +2717,8 @@ pub struct LsmOpenView {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    /// Directories above the opened dentry (#233).
+    pub chain: DentryChain,
 }
 
 /// L04.2 — View into an `lsm/file_release` event. Fires at
@@ -2533,6 +2733,8 @@ pub struct LsmReleaseView {
     pub inode: u64,
     pub f_mode: u32,
     pub f_flags: u32,
+    /// Directories above the released dentry (#233).
+    pub chain: DentryChain,
 }
 
 /// L04.1 — View into an `lsm/inode_rename` event. Carries both
@@ -3476,6 +3678,7 @@ mod tests {
             inode,
             f_mode: 0x2,    // FMODE_WRITE
             f_flags: 0o002, // O_RDWR
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3509,6 +3712,7 @@ mod tests {
             inode,
             f_mode: 0x2,
             f_flags: 0o002,
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3545,6 +3749,7 @@ mod tests {
             inode,
             f_mode: 0x2,
             f_flags: 0o002,
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3568,6 +3773,7 @@ mod tests {
             inode: 0xcafe_babe,
             f_mode: 0x2,
             f_flags: 0o002,
+            chain: DentryChain::default(),
         };
         rt.handle_lsm_release(&view);
 
@@ -3593,6 +3799,29 @@ mod born_set_tests {
         dir: tempfile::TempDir,
         _staging: tempfile::TempDir,
         cmd: CommandId,
+        /// Dentry chain the open, setattr and release helpers send.
+        chain: DentryChain,
+    }
+
+    /// The dentry chain BPF would record for `path`: the directories
+    /// above it on its filesystem, nearest first.
+    fn chain_of(path: &Path) -> DentryChain {
+        let dev = std::fs::symlink_metadata(path).unwrap().dev();
+        let nlink = std::fs::symlink_metadata(path).unwrap().nlink() as u32;
+        let mut c = DentryChain {
+            nlink,
+            ..Default::default()
+        };
+        for p in path.ancestors().skip(1) {
+            let m = std::fs::metadata(p).unwrap();
+            if m.dev() != dev || c.depth as usize == crate::ebpf::ringbuf_reader::DENTRY_DEPTH {
+                break;
+            }
+            c.anc[c.depth as usize] = m.ino();
+            c.depth += 1;
+        }
+        c.top = 1;
+        c
     }
 
     impl Rig {
@@ -3610,12 +3839,14 @@ mod born_set_tests {
             };
             rt.on_watch_tree(cmd);
             rt.pre_open_tree(cmd, dir.path());
+            rt.check_mounts(cmd, std::process::id() as i32);
             Self {
                 rt: Some(rt),
                 daemon,
                 dir,
                 _staging: staging,
                 cmd,
+                chain: DentryChain::default(),
             }
         }
 
@@ -3656,6 +3887,7 @@ mod born_set_tests {
                 inode: id.1,
                 f_mode: 0x2 | if created { FMODE_CREATED } else { 0 },
                 f_flags: 0o1,
+                chain: self.chain,
             };
             self.rt().handle_lsm_open(&view);
         }
@@ -3685,6 +3917,31 @@ mod born_set_tests {
             self.rt().handle_lsm_create(&view);
         }
 
+        fn mkdir(&mut self, parent: Id, name: &str) {
+            let view = LsmMkdirView {
+                command: self.cmd,
+                pid: 1,
+                parent_dev: userspace_to_kernel_dev(parent.0),
+                parent_inode: parent.1,
+                mode: 0o040755,
+                basename: name,
+            };
+            self.rt().handle_lsm_mkdir(&view);
+        }
+
+        fn rmdir(&mut self, id: Id, parent: Id, name: &str) {
+            let view = LsmUnlinkView {
+                command: self.cmd,
+                pid: 1,
+                dev: userspace_to_kernel_dev(id.0),
+                inode: id.1,
+                parent_inode: parent.1,
+                basename: name,
+                is_directory: true,
+            };
+            self.rt().handle_lsm_unlink(&view);
+        }
+
         fn setattr(&mut self, id: Id) {
             let view = LsmSetattrView {
                 command: self.cmd,
@@ -3700,6 +3957,7 @@ mod born_set_tests {
                 new_uid: 0,
                 new_gid: 0,
                 new_size: 0,
+                chain: self.chain,
             };
             self.rt().handle_lsm_setattr(&view);
         }
@@ -3712,6 +3970,7 @@ mod born_set_tests {
                 inode: id.1,
                 f_mode: 0x2,
                 f_flags: 0o1,
+                chain: self.chain,
             };
             self.rt().handle_lsm_release(&view);
         }
@@ -4239,6 +4498,275 @@ mod born_set_tests {
         let obs = rig.close(None);
         assert_eq!(obs.len(), 1, "{obs:?}");
         assert!(obs[0].1.contains("rename"), "{obs:?}");
+    }
+
+    /// A tree past the walk's file cap, with the FMODE_CREATED probe
+    /// untrusted: neither absence nor the open bit proves birth.
+    fn capped_rig_without_probe() -> Rig {
+        let mut rig = Rig::new(|d| {
+            for i in 0..=PRE_OPEN_TREE_MAX_FILES {
+                std::fs::write(d.join(format!("f{i}")), b"x").unwrap();
+            }
+        });
+        rig.rt().set_fmode_created_trusted(false);
+        rig
+    }
+
+    #[test]
+    fn unlink_before_its_parents_mkdir_is_born() {
+        // #248: `mkdir d; touch d/t; rm d/t`, with the unlink handled
+        // before the mkdir (so its parent does not resolve) and the
+        // create handled last.
+        let mut rig = capped_rig_without_probe();
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let d_id = Rig::id(&d);
+        std::fs::write(d.join("t"), b"").unwrap();
+        let t_id = Rig::id(&d.join("t"));
+        std::fs::remove_file(d.join("t")).unwrap();
+        rig.unlink(t_id, d_id, "t");
+        rig.mkdir(root, "d");
+        rig.create(d_id, "t");
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn file_moved_into_a_born_dir_then_removed_is_not_born() {
+        // `mkdir d; mv deep/x d/x; rm d/x`, x never walked. The unlink
+        // and rename are handled before the mkdir.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let d_id = Rig::id(&d);
+        let x_id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        std::fs::rename(deep.join("x"), d.join("x")).unwrap();
+        std::fs::remove_file(d.join("x")).unwrap();
+        rig.unlink(x_id, d_id, "x");
+        rig.rename(x_id, (deep_id, "x"), (d_id, "x"));
+        rig.mkdir(root, "d");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+    }
+
+    #[test]
+    fn dir_renamed_onto_a_made_name_is_not_a_born_parent() {
+        // `mkdir d; rmdir d; mv deep d; rm d/x`. The mkdir handler runs
+        // last and stats d, which is now the pre-existing deep.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        rig.rt().set_fmode_created_trusted(false);
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let _made = Rig::id(&d);
+        std::fs::remove_dir(&d).unwrap();
+        let deep_id = Rig::id(&deep);
+        let above = Rig::id(deep.parent().unwrap());
+        let x_id = Rig::id(&deep.join("x"));
+        std::fs::rename(&deep, &d).unwrap();
+        std::fs::remove_file(d.join("x")).unwrap();
+        // The rmdir of the made d is not sent: its own loss would hide x.
+        rig.unlink(x_id, deep_id, "x");
+        rig.rename(deep_id, (above, "d8"), (root, "d"));
+        rig.mkdir(root, "d");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "x was pre-existing: {obs:?}");
+    }
+
+    #[test]
+    fn file_moved_out_by_an_unresolved_rename_then_written_is_refused() {
+        // `mv deep/x ../out/x; echo >> ../out/x`: x existed in the tree,
+        // and its dentry chain now places it outside.
+        let (mut rig, deep) = rig_with_unwalked_file();
+        rig.rt().set_fmode_created_trusted(false);
+        let out = tempfile::tempdir_in(rig.dir.path().parent().unwrap()).unwrap();
+        let out_id = Rig::id(out.path());
+        let x_id = Rig::id(&deep.join("x"));
+        let deep_id = Rig::id(&deep);
+        let moved = out.path().join("x");
+        std::fs::rename(deep.join("x"), &moved).unwrap();
+        rig.rename(x_id, (deep_id, "x"), (out_id, "x"));
+        rig.chain = chain_of(&moved);
+        rig.open(x_id, false);
+        let obs = rig.close(None);
+        assert!(!obs.is_empty(), "x was pre-existing: {obs:?}");
+    }
+
+    #[test]
+    fn removed_dir_reusing_an_inode_is_not_a_born_parent() {
+        // `rm -r old; mkdir new` where new reuses old's inode number.
+        // Simulated with one directory reported both removed and made.
+        let mut rig = capped_rig_without_probe();
+        let root = rig.root();
+        let d = rig.dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let d_id = Rig::id(&d);
+        std::fs::write(d.join("t"), b"").unwrap();
+        let t_id = Rig::id(&d.join("t"));
+        std::fs::remove_file(d.join("t")).unwrap();
+        rig.unlink(t_id, d_id, "t");
+        rig.rmdir(d_id, root, "d");
+        rig.mkdir(root, "d");
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+    }
+
+    /// A file on the tree's filesystem but outside the root, like
+    /// `~/.bash_history` for a command run in `~/proj`.
+    fn sibling_file(rig: &Rig, body: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let outside = tempfile::tempdir_in(rig.dir.path().parent().unwrap()).unwrap();
+        let f = outside.path().join("history");
+        std::fs::write(&f, body).unwrap();
+        (outside, f)
+    }
+
+    #[test]
+    fn capped_walk_does_not_refuse_writes_outside_the_root() {
+        // #233: open, setattr and release carry no path. The dentry
+        // chain places the file outside the root.
+        let mut rig = capped_rig_without_probe();
+        let (_outside, f) = sibling_file(&rig, b"ls\n");
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        rig.open(id, false);
+        rig.setattr(id);
+        rig.release(id);
+        assert_eq!(rig.close(None), vec![]);
+    }
+
+    #[test]
+    fn capped_walk_still_refuses_an_unwalked_file_inside_the_root() {
+        let mut rig = capped_rig_without_probe();
+        let late = rig.dir.path().join("late");
+        std::fs::write(&late, b"not in the walk").unwrap();
+        let id = Rig::id(&late);
+        rig.chain = chain_of(&late);
+        rig.open(id, false);
+        let obs = rig.close(None);
+        assert_eq!(obs.len(), 1, "{obs:?}");
+        assert!(obs[0].1.contains("could not be placed"), "{obs:?}");
+    }
+
+    #[test]
+    fn outside_name_of_a_hard_linked_file_proves_nothing() {
+        // The same inode may have a name inside the tree.
+        let mut rig = capped_rig_without_probe();
+        let (_outside, f) = sibling_file(&rig, b"x");
+        std::fs::hard_link(&f, rig.dir.path().join("inside")).unwrap();
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        assert_eq!(rig.chain.nlink, 2);
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn a_chain_that_never_meets_the_roots_line_proves_nothing() {
+        let mut rig = capped_rig_without_probe();
+        let (_outside, f) = sibling_file(&rig, b"x");
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        // Truncate to the file's own directory, which is neither the
+        // root nor above it.
+        rig.chain.depth = 1;
+        rig.chain.top = 0;
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+    }
+
+    #[test]
+    fn mount_under_the_root_is_detected() {
+        let info = "22 1 0:21 / /home/u rw - ext4 /dev/sda rw\n\
+                    40 22 0:40 / /home/u/proj/my\\040mnt rw - tmpfs tmpfs rw\n";
+        assert!(mount_under(Path::new("/home/u/proj"), info));
+        assert!(!mount_under(Path::new("/home/u/other"), info));
+        // The root itself being a mount point is fine.
+        assert!(!mount_under(
+            Path::new("/home/u"),
+            "22 1 0:21 / /home/u rw - ext4 x rw\n"
+        ));
+        assert_eq!(
+            unescape_mountinfo("/a\\040b"),
+            std::ffi::OsString::from("/a b")
+        );
+    }
+
+    #[test]
+    fn mountinfo_escapes_above_377_are_literal() {
+        assert_eq!(
+            unescape_mountinfo("/a\\777b"),
+            std::ffi::OsString::from("/a\\777b")
+        );
+        assert_eq!(
+            unescape_mountinfo("/a\\134b"),
+            std::ffi::OsString::from("/a\\b")
+        );
+    }
+
+    /// A child in its own user and mount namespace running `script`, or
+    /// None where unprivileged namespaces are not allowed. With
+    /// `SHIT_REQUIRE_USERNS=1` (set in CI) that is a failure instead, so
+    /// the namespace tests cannot pass by skipping.
+    fn unshared_child(script: &str) -> Option<std::process::Child> {
+        let ok = std::process::Command::new("unshare")
+            .args(["-Urm", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            assert!(
+                std::env::var("SHIT_REQUIRE_USERNS").as_deref() != Ok("1"),
+                "SHIT_REQUIRE_USERNS=1 but `unshare -Urm` failed"
+            );
+            eprintln!("skipping: unprivileged mount namespaces unavailable");
+            return None;
+        }
+        let child = std::process::Command::new("unshare")
+            .args(["-Urm", "sh", "-c", script])
+            .spawn()
+            .unwrap();
+        let mine = std::fs::metadata("/proc/self/ns/mnt").unwrap().ino();
+        let ns = format!("/proc/{}/ns/mnt", child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::metadata(&ns).map(|m| m.ino()).unwrap_or(mine) == mine {
+            assert!(std::time::Instant::now() < deadline, "child never unshared");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Some(child)
+    }
+
+    #[test]
+    fn root_in_another_mount_namespace_keeps_the_dentry_rule_off() {
+        let Some(mut child) = unshared_child("sleep 5") else {
+            return;
+        };
+        let mut rig = capped_rig_without_probe();
+        let cmd = rig.cmd;
+        rig.rt().check_mounts(cmd, child.id() as i32);
+        let (_outside, f) = sibling_file(&rig, b"ls\n");
+        let id = Rig::id(&f);
+        rig.chain = chain_of(&f);
+        rig.open(id, false);
+        assert_eq!(rig.close(None).len(), 1);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_mount_after_the_watch_shows_on_the_held_mounts_fd() {
+        let Some(mut child) = unshared_child("sleep 0.3; mount -t tmpfs none /mnt; sleep 5") else {
+            return;
+        };
+        let w = MountsWatch::open(child.id() as i32).unwrap();
+        assert!(!w.changed());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !w.changed() {
+            assert!(std::time::Instant::now() < deadline, "mount never showed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
