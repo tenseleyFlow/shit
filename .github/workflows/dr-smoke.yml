@@ -849,23 +849,28 @@ jobs:
         run: brew install coreutils
       - name: build binaries + shim
         run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
-      - name: run smoke 15 times
+      - name: run smoke with gchmod and /bin/chmod
         run: |
           set +e
           pass=0; fail=0; lost=0
-          for i in $(seq 1 15); do
-            bash tests/smoke/chmod-undo-dyld-shim-macos.sh > "run-$i.log" 2>&1
+          run() {
+            local tag="$1" bin="$2" i="$3" log="run-$1-$3.log" rc out post hits rows
+            SHIT_SMOKE_CHMOD_BIN="$bin" bash tests/smoke/chmod-undo-dyld-shim-macos.sh > "$log" 2>&1
             rc=$?
-            out="$(grep -oE 'OUTCOME [ABC]' "run-$i.log" | head -1)"
-            post="$(grep -oE 'post-undo: .* mode=[A-Z0-9]+' "run-$i.log" | sed 's/.*mode=//')"
-            hits="$(grep -oE 'shim metadata events journaled by daemon: [0-9]+' "run-$i.log" | awk '{print $NF}')"
-            rows="$(grep 'journal: ' "run-$i.log" | sed 's/.*journal: //' | tr '\n' ';')"
-            echo "run $i: rc=$rc ${out:-no-outcome} post-undo=$post shim-hits=$hits rows=[$rows]"
-            if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
-            [ "$post" = "MISSING" ] && lost=$((lost+1))
-          done
-          echo "total=15 pass=$pass fail=$fail file-removed=$lost"
-          for i in $(seq 1 15); do echo "===== run $i"; cat "run-$i.log"; done
+            out="$(grep -oE 'OUTCOME [ABC]' "$log" | head -1)"
+            post="$(grep -oE 'post-undo: .* mode=[A-Z0-9]+' "$log" | sed 's/.*mode=//')"
+            hits="$(grep -oE 'shim metadata events journaled by daemon: [0-9]+' "$log" | awk '{print $NF}')"
+            rows="$(grep 'journal: ' "$log" | sed 's/.*journal: [0-9]*|//; s/|.*//' | tr '\n' ' ')"
+            echo "$tag run $i: rc=$rc ${out:-no-outcome} post-undo=$post shim-hits=$hits rows=[$rows]"
+            if [ "$post" = "MISSING" ]; then lost=$((lost+1)); fi
+            if [ "$tag" = gchmod ]; then
+              if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+            fi
+          }
+          for i in $(seq 1 12); do run gchmod "$(command -v gchmod)" "$i"; done
+          for i in $(seq 1 10); do run binchmod /bin/chmod "$i"; done
+          echo "gchmod: pass=$pass fail=$fail; file removed by undo (all runs): $lost"
+          for f in run-*.log; do echo "===== $f"; cat "$f"; done
           [ "$lost" -eq 0 ] && [ "$fail" -eq 0 ]
 
   pip-install-user-undo-macos:
