@@ -665,6 +665,11 @@ impl LinuxCaptureRuntime {
 
         let bytes = match read_pre_image(ev.fd) {
             Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(fd = ev.fd, pid = ev.pid, error = %e, "pre-image refused");
+                note_missing(ws, e.to_string());
+                return;
+            }
             Err(e) => {
                 tracing::warn!(fd = ev.fd, error = %e, "pre-image read failed");
                 note_missing(ws, format!("pre-image read failed: {e}"));
@@ -2911,8 +2916,21 @@ fn resolve_inode_to_path(ws: &WatchState, dev: u64, inode: u64) -> Option<PathBu
 /// the dup back to 0 before reading — the share-the-offset semantic
 /// of dup means this resets the original fd's offset too, which is
 /// what we want for repeated reads.
+///
+/// #253: the bytes are read only when the invoking user could read the
+/// file ([`user_may_read`]). A fanotify event fd is opened with the
+/// helper's rights, so a setuid descendant of a watched shell (sudo,
+/// passwd) could otherwise put a root-only pre-image in the user's
+/// journal. A refusal is a [`std::io::ErrorKind::PermissionDenied`]
+/// error carrying [`PRE_IMAGE_REFUSED`]; callers record it as loss.
 fn read_pre_image(fd: RawFd) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
+    if !user_may_read(fd)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            PRE_IMAGE_REFUSED,
+        ));
+    }
     // Stat to size-cap; refuse to capture huge files (the kernel
     // budget cliff is 50ms — reading 4GB at ~1GB/s overshoots).
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -2946,6 +2964,42 @@ fn read_pre_image(fd: RawFd) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(size.min(MAX_PRE_IMAGE_BYTES));
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Why a pre-image was not read for a file the user cannot read.
+pub(crate) const PRE_IMAGE_REFUSED: &str =
+    "pre-image refused: the invoking user cannot read this file";
+
+/// True when the invoking user may read the file open on `fd`.
+///
+/// `faccessat` without `AT_EACCESS` checks with the real uid and gid
+/// as the filesystem ids, and with no effective capability unless the
+/// real uid is 0. The helper's real uid is the invoking user on both
+/// install shapes (file capabilities and setuid root), so this asks
+/// the kernel what that user could do, ACLs and LSMs included, without
+/// depending on the calling thread's effective or filesystem ids. The
+/// `/proc/self/fd` link resolves for the helper's own fds whatever
+/// their owner, and access(2) opens nothing, so no fanotify event is
+/// raised.
+fn user_may_read(fd: RawFd) -> std::io::Result<bool> {
+    let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}"))
+        .expect("a formatted fd path has no NUL");
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::R_OK,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EACCES) | Some(libc::EPERM) => Ok(false),
+        _ => Err(err),
+    }
 }
 
 /// blake3 the bytes — same hasher the daemon side verifies against.
@@ -3046,6 +3100,87 @@ mod tests {
         let f = std::fs::File::open(&path).unwrap();
         let got = read_pre_image(f.as_raw_fd()).expect("pre-image read");
         assert_eq!(got, expected);
+    }
+
+    /// Root reads every file, so the refusal tests mean nothing as root.
+    fn running_as_root() -> bool {
+        unsafe { libc::getuid() == 0 }
+    }
+
+    /// #253: an fd the helper holds on a file the invoking user cannot
+    /// read (a fanotify event fd is opened with the helper's rights) is
+    /// not read. Here the fd is opened first and the mode dropped after.
+    #[test]
+    fn read_pre_image_refuses_a_file_the_user_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipping: root can read a mode 000 file");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, b"root-only bytes").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = read_pre_image(f.as_raw_fd()).expect_err("read a file the user cannot read");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(err.to_string(), PRE_IMAGE_REFUSED);
+    }
+
+    /// #253 on the fanotify path: the event for a file the user cannot
+    /// read sends no pre-image and leaves a refusal as loss, which the
+    /// close reports as `CaptureRefused`.
+    #[test]
+    fn fanotify_event_on_unreadable_file_is_refused_as_loss() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipping: root can read a mode 000 file");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shadow");
+        std::fs::write(&path, b"root-only bytes").unwrap();
+        let (helper, daemon) = crate::ipc::socketpair().expect("socketpair");
+        let mut rt =
+            LinuxCaptureRuntime::new(staging.path().to_path_buf(), Arc::new(helper)).unwrap();
+        let cmd = CommandId {
+            session: Uuid::from_u128(253),
+            seq: 1,
+        };
+        rt.on_watch_tree(cmd);
+        rt.note_direct_children_baseline(cmd, dir.path());
+        let f = std::fs::File::open(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        rt.handle_event(&FanotifyEventView {
+            command: cmd,
+            fd: f.as_raw_fd(),
+            pid: std::process::id() as i32,
+            kind: FanotifyCaptureKind::OpenWrite,
+            _life: std::marker::PhantomData,
+        });
+        rt.on_unwatch_tree_counting(cmd, None);
+        drop(rt);
+        let mut refused = Vec::new();
+        while let Ok((resp, _fd)) = daemon.recv_response_with_fd() {
+            match resp {
+                HelperResponse::CapturedPreImage { .. } => {
+                    panic!("sent a pre-image of an unreadable file")
+                }
+                HelperResponse::CaptureRefused { path, detail, .. } => refused.push((path, detail)),
+                _ => {}
+            }
+        }
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].0.as_deref().unwrap().ends_with("/shadow"),
+            "{refused:?}"
+        );
+        assert!(refused[0].1.contains(PRE_IMAGE_REFUSED), "{refused:?}");
+        assert!(
+            std::fs::read_dir(staging.path()).unwrap().next().is_none(),
+            "staged the bytes of an unreadable file"
+        );
     }
 
     #[test]
