@@ -134,6 +134,7 @@ pub fn plan(
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
     }
     bracket_born_dirs(&live, probe, &mut nodes);
+    refuse_unproven_removals(&live, &mut nodes);
 
     // DR-14: partition nodes into cohorts so the orchestrator's
     // `run_parallel` only runs commuting ops concurrently. Without
@@ -296,6 +297,75 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
         cohort: 0,
         conflict: None,
     }));
+}
+
+/// Refusal class for a removal the journal does not back (#269).
+pub const UNPROVEN_REMOVAL: &str = "unproven-removal";
+
+/// #269: an inverse that removes a path is planned only when the
+/// command journaled creating that path: a `Create`, a hard link's
+/// target or a symlink at that path. A created directory also covers
+/// the names `bracket_born_dirs` maps it back to through earlier
+/// renames. Any other removal means the capture missed
+/// something, so it becomes a refusal and the path is left alone.
+///
+/// Every removal the per-event pass emits today comes from such an
+/// event. This pass holds that line for whatever emits one next.
+fn refuse_unproven_removals(live: &[&CaptureEvent], nodes: &mut [PlanNode]) {
+    // Chronological.
+    let events: Vec<&CaptureEvent> = live.iter().rev().copied().collect();
+    let mut created: HashSet<PathBuf> = HashSet::new();
+    for (i, e) in events.iter().enumerate() {
+        let (path, is_dir) = match &e.kind {
+            CaptureEventKind::TreeOp(TreeOp::Create { path, kind, .. }) => {
+                (path, *kind == crate::metadata::FileKind::Directory)
+            }
+            CaptureEventKind::TreeOp(TreeOp::Symlink { path, .. })
+            | CaptureEventKind::TreeOp(TreeOp::Link { target: path, .. }) => (path, false),
+            _ => continue,
+        };
+        created.insert(path.clone());
+        if !is_dir {
+            continue;
+        }
+        // A created directory's earlier names, as `bracket_born_dirs`
+        // maps them for its RemoveBornDir.
+        let mut back = path.clone();
+        for earlier in events[..i].iter().rev() {
+            if let CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) = &earlier.kind
+                && let Ok(rest) = back.strip_prefix(to)
+            {
+                back = if rest.as_os_str().is_empty() {
+                    from.clone()
+                } else {
+                    from.join(rest)
+                };
+                created.insert(back.clone());
+            }
+        }
+    }
+    for node in nodes.iter_mut() {
+        let path = match &node.op {
+            InverseOp::Unlink { path } | InverseOp::RemoveBornDir { path } => path,
+            _ => continue,
+        };
+        if created.contains(path) {
+            continue;
+        }
+        node.op = InverseOp::Refuse {
+            class: UNPROVEN_REMOVAL.to_string(),
+            reason: format!(
+                "undo would remove {}, but no creation of it by this command was captured, \
+                 so it is left in place",
+                path.display()
+            ),
+            remediation: Some(
+                "check whether the command created this path and remove it by hand if it did"
+                    .to_string(),
+            ),
+        };
+        node.conflict = None;
+    }
 }
 
 /// L5 (review of #232, item 2): a shim capture-gap marker for `P` says
@@ -2497,6 +2567,152 @@ mod tests {
             exit_code: Some(0),
             event_ids: vec![EventId(1)],
         }
+    }
+
+    fn tree_event(id: u64, op: TreeOp) -> CaptureEvent {
+        CaptureEvent {
+            id: EventId(id),
+            command: dummy_command().command,
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(op),
+        }
+    }
+
+    fn unlink_node(path: &str) -> PlanNode {
+        PlanNode {
+            op: InverseOp::Unlink {
+                path: PathBuf::from(path),
+            },
+            cohort: 0,
+            conflict: None,
+        }
+    }
+
+    /// #269: a removal with no journaled create of its path is refused;
+    /// one backed by a Create, a link, a symlink or a renamed create
+    /// stands.
+    #[test]
+    fn removals_need_a_journaled_create() {
+        use crate::metadata::FileKind;
+        let create = |id, p: &str| {
+            tree_event(
+                id,
+                TreeOp::Create {
+                    inode: InodeRef::new(1, id),
+                    path: PathBuf::from(p),
+                    kind: FileKind::Regular,
+                    mode: 0o100644,
+                },
+            )
+        };
+        let events = [
+            create(1, "/w/made"),
+            create(2, "/w/dir"),
+            tree_event(
+                3,
+                TreeOp::Rename {
+                    from: PathBuf::from("/w/dir"),
+                    to: PathBuf::from("/w/moved"),
+                    inode: InodeRef::new(1, 2),
+                },
+            ),
+            tree_event(
+                4,
+                TreeOp::Symlink {
+                    target: "made".into(),
+                    path: PathBuf::from("/w/link"),
+                },
+            ),
+            tree_event(
+                5,
+                TreeOp::Link {
+                    source: InodeRef::new(1, 1),
+                    target: PathBuf::from("/w/hard"),
+                },
+            ),
+        ];
+        let mut live: Vec<&CaptureEvent> = events.iter().collect();
+        live.reverse();
+        let mut nodes = vec![
+            unlink_node("/w/made"),
+            unlink_node("/w/link"),
+            unlink_node("/w/hard"),
+            PlanNode {
+                op: InverseOp::RemoveBornDir {
+                    path: PathBuf::from("/w/dir"),
+                },
+                cohort: 0,
+                conflict: None,
+            },
+            unlink_node("/w/file.txt"),
+            PlanNode {
+                op: InverseOp::RemoveBornDir {
+                    path: PathBuf::from("/w/old"),
+                },
+                cohort: 0,
+                conflict: None,
+            },
+        ];
+        refuse_unproven_removals(&live, &mut nodes);
+        for n in &nodes[..4] {
+            assert!(
+                matches!(
+                    n.op,
+                    InverseOp::Unlink { .. } | InverseOp::RemoveBornDir { .. }
+                ),
+                "{n:#?}"
+            );
+        }
+        for n in &nodes[4..] {
+            assert!(
+                matches!(&n.op, InverseOp::Refuse { class, .. } if class == UNPROVEN_REMOVAL),
+                "{n:#?}"
+            );
+        }
+    }
+
+    /// #269 at plan level: a chmod whose only journaled event is a
+    /// metadata pre-image plans no removal.
+    #[test]
+    fn a_chmod_alone_never_plans_a_removal() {
+        let path = PathBuf::from("/w/file.txt");
+        let mut m = meta(19);
+        m.mode = 0o100600;
+        let ev = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode: InodeRef::new(1, 7),
+                path: path.clone(),
+                blob: BlobHash::from_bytes([0u8; 32]),
+                meta: m,
+                post_content_hash: None,
+                source: crate::FilePreImageSource::ShimPreMutation,
+            },
+        };
+        let mut probe = InMemoryProbe::new();
+        let mut now = meta(19);
+        now.mode = 0o100644;
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode: InodeRef::new(1, 7),
+                meta: now,
+            },
+            Some(BlobHash::from_bytes([0u8; 32])),
+        );
+        let p = plan(dummy_command(), &[ev], &probe, &InMemoryStore::new());
+        assert!(
+            !p.nodes.iter().any(|n| matches!(
+                n.op,
+                InverseOp::Unlink { .. } | InverseOp::RemoveBornDir { .. }
+            )),
+            "{:#?}",
+            p.nodes
+        );
     }
 
     #[test]
