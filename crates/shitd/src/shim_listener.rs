@@ -375,27 +375,81 @@ pub(crate) fn resolve_command(
         debug!(pid, %command, walked = %w, "shim note's sender runs under another session's shell");
         return Resolution::Command(w);
     }
-    // Review item 6: a command already given its late-note gap needs no
-    // lookup.
-    if gap_journaled(command, GapCause::LateNote) {
-        return Resolution::Closed(command);
+    let now = std::time::SystemTime::now();
+    let unusable = || {
+        debug!(pid, %command, "shim note's command key is not usable; walking pid ancestry");
+        by_walk()
+    };
+    // Review item 6: a command already judged late needs no lookup while
+    // its key is inside the window. Past the window its key is stale like
+    // any other (re-review of #259: a gap does not make it late forever).
+    match closed_key_cached(command, now) {
+        Some(true) => return Resolution::Closed(command),
+        Some(false) => return unusable(),
+        None => {}
     }
-    match judge_key(command, active, index, std::time::SystemTime::now()) {
+    match judge_key(command, active, index, now) {
         KeyState::Open => Resolution::Command(command),
-        KeyState::RecentlyClosed => Resolution::Closed(command),
-        KeyState::Unusable => {
-            debug!(pid, %command, "shim note's command key is not usable; walking pid ancestry");
-            by_walk()
+        KeyState::RecentlyClosed(closed) => {
+            if let Some(closed) = closed {
+                cache_closed_key(command, closed);
+            }
+            Resolution::Closed(command)
         }
+        KeyState::Unusable => unusable(),
     }
+}
+
+type ClosedKeys = std::collections::HashMap<shit_planner::events::CommandId, u64>;
+
+/// When each command judged late closed (wall clock, Unix nanos). A
+/// closed or superseded command does not reopen, so the time is final.
+fn closed_keys() -> std::sync::MutexGuard<'static, ClosedKeys> {
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<ClosedKeys>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn cache_closed_key(command: shit_planner::events::CommandId, closed_unix_nanos: u64) {
+    let mut keys = closed_keys();
+    if keys.len() >= 4096 {
+        keys.clear();
+    }
+    keys.insert(command, closed_unix_nanos);
+}
+
+/// `Some(true)`: `command` is cached as closed inside the window at
+/// `now`. `Some(false)`: cached but past the window; the entry is
+/// dropped. `None`: not cached.
+fn closed_key_cached(
+    command: shit_planner::events::CommandId,
+    now: std::time::SystemTime,
+) -> Option<bool> {
+    let mut keys = closed_keys();
+    let closed = *keys.get(&command)?;
+    let inside = within_late_window(closed, now);
+    if !inside {
+        keys.remove(&command);
+    }
+    Some(inside)
+}
+
+/// Whether a close at `closed_unix_nanos` is less than
+/// [`LATE_KEY_WINDOW`] before `now`.
+fn within_late_window(closed_unix_nanos: u64, now: std::time::SystemTime) -> bool {
+    let closed = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(closed_unix_nanos);
+    !now.duration_since(closed)
+        .is_ok_and(|age| age > LATE_KEY_WINDOW)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyState {
     /// The key's command is open: journal under it.
     Open,
-    /// It closed, or was superseded, within [`LATE_KEY_WINDOW`].
-    RecentlyClosed,
+    /// It closed, or was superseded, within [`LATE_KEY_WINDOW`], at
+    /// this wall time when known.
+    RecentlyClosed(Option<u64>),
     /// Unknown, closed too long ago, or open on a shell that is gone.
     Unusable,
 }
@@ -412,14 +466,10 @@ fn judge_key(
         return KeyState::Unusable;
     };
     let closed_recently = |closed_unix_nanos: u64| {
-        let closed = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(closed_unix_nanos);
-        if now
-            .duration_since(closed)
-            .is_ok_and(|age| age > LATE_KEY_WINDOW)
-        {
-            KeyState::Unusable
+        if within_late_window(closed_unix_nanos, now) {
+            KeyState::RecentlyClosed(Some(closed_unix_nanos))
         } else {
-            KeyState::RecentlyClosed
+            KeyState::Unusable
         }
     };
     if let Some(ended) = record.ended_at {
@@ -439,7 +489,7 @@ fn judge_key(
     {
         return index
             .command_by_id(current)
-            .map_or(KeyState::RecentlyClosed, |c| {
+            .map_or(KeyState::RecentlyClosed(None), |c| {
                 closed_recently(c.started_at.wallclock_unix_nanos)
             });
     }
@@ -576,10 +626,6 @@ fn journaled_gaps() -> std::sync::MutexGuard<'static, GapSet> {
     GAPS.get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn gap_journaled(command: shit_planner::events::CommandId, cause: GapCause) -> bool {
-    journaled_gaps().contains(&(command, cause))
 }
 
 /// Journal one capture-gap refusal per command and cause; returns
@@ -2239,6 +2285,32 @@ mod tests {
         );
     }
 
+    /// Re-review of #259: a command that already has its late-note gap
+    /// and is cached as closed, whose key is now past the window. The key
+    /// is stale: the note goes to the pid walk, which cannot reach a dead
+    /// sender's shell.
+    #[test]
+    fn a_gapped_commands_key_past_the_window_goes_to_the_pid_walk() {
+        let (_tmp, index, command) = keyed_fixture(true);
+        let active = ActiveCommands::new();
+        assert_eq!(
+            resolve_command(exited_pid(), Some(command), &active, &index),
+            Resolution::Closed(command)
+        );
+        assert!(journal_gap_once(
+            &index,
+            command,
+            GapCause::LateNote,
+            || { "late".into() }
+        ));
+        // The close is now long past.
+        cache_closed_key(command, now_nanos() - 30 * MINUTE_NANOS);
+        assert_eq!(
+            resolve_command(exited_pid(), Some(command), &active, &index),
+            Resolution::Unattributed
+        );
+    }
+
     /// R8 review, item 1: a rename call's pre-call note is journaled
     /// while its command is open; the command closes; the outcome note
     /// arrives late. It joins the call's command and leaves no gap.
@@ -2357,7 +2429,6 @@ mod tests {
             GapCause::LateNote,
             || "d".into()
         ));
-        assert!(gap_journaled(command, GapCause::LateNote));
     }
 
     #[test]
