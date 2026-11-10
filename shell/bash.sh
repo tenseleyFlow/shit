@@ -30,11 +30,15 @@ export _SHIT_SESSION
 export _SHIT_SEQ=0
 
 __shit_send_open() {
+    # `tty` exits non-zero without a controlling tty, and some
+    # implementations still print "not a tty". Send an empty name then.
+    local _shit_tty
+    _shit_tty="$(tty 2>/dev/null)" || _shit_tty=""
     "$_SHIT_BIN" hook-send session-open \
         --session "$_SHIT_SESSION" \
         --pid "$$" \
         --shell bash \
-        --tty "$(tty 2>/dev/null || echo unknown)" \
+        --tty "$_shit_tty" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
 }

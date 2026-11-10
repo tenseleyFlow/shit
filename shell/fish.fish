@@ -97,12 +97,13 @@ function __shit_close --on-event fish_exit
         >/dev/null 2>&1
 end
 
-# macOS BSD `tty` prints "not a tty" on stdout (rather than just
-# erroring) when stdin isn't a TTY; without `string collect`, fish
-# word-splits on the newline and the trailing `or echo unknown`
-# leaks a second positional arg into `--tty`. Collect into one var.
-set -l _shit_tty (tty 2>/dev/null | string collect)
-test -z "$_shit_tty"; and set _shit_tty unknown
+# Send an empty --tty when stdin is not a terminal. BSD `tty` prints
+# "not a tty" on stdout in that case, so check its exit status instead
+# of its output.
+set -l _shit_tty ""
+if tty >/dev/null 2>&1
+    set _shit_tty (tty 2>/dev/null | string collect)
+end
 $_SHIT_BIN hook-send session-open \
     --session $_SHIT_SESSION \
     --pid $fish_pid \

@@ -20,20 +20,26 @@ export _SHIT_SESSION
 typeset -gi _SHIT_SEQ=0
 
 __shit_send_open() {
+    # `tty` exits non-zero without a controlling tty, and some
+    # implementations still print "not a tty". Send an empty name then.
+    local _shit_tty
+    _shit_tty="$(tty 2>/dev/null)" || _shit_tty=""
     "$_SHIT_BIN" hook-send session-open \
         --session "$_SHIT_SESSION" \
         --pid "$$" \
         --shell zsh \
-        --tty "$(tty 2>/dev/null || echo unknown)" \
+        --tty "$_shit_tty" \
         --sock "$_SHIT_SOCK" \
         >/dev/null 2>&1 || true
 }
 
 __shit_pre() {
     [[ -n "${SHIT_DISABLE:-}" ]] && return
-    # ZSH_EVAL_CONTEXT contains "file" for sourced scripts, "loadautofunc" etc.
+    # zsh runs preexec hooks with ZSH_EVAL_CONTEXT=shfunc (5.9 on Linux
+    # and FreeBSD, tty or not). A nested context ("file" for a sourced
+    # script, "loadautofunc", ...) is not a command line the user typed.
     case "$ZSH_EVAL_CONTEXT" in
-        toplevel*) ;;
+        shfunc|toplevel*) ;;
         *) return ;;
     esac
     _SHIT_SEQ=$(( _SHIT_SEQ + 1 ))
@@ -104,9 +110,13 @@ __shit_post() {
 # to parse `set -o` / `alias` output. This is faster AND more
 # robust against zsh's NO_-prefixed "off" rendering quirk.
 __shit_collect_shell_state() {
+    # Copy the caller's options first: inside `emulate -L zsh`,
+    # `$options` shows the emulation's values, not the user's.
+    local -A _shit_opts
+    _shit_opts=("${(@kv)options}")
     emulate -L zsh
     local name value
-    for name value in ${(kv)options}; do
+    for name value in ${(kv)_shit_opts}; do
         printf 'OPT\t%s\t%s\0' "$name" "$value"
     done
     for name value in ${(kv)aliases}; do
