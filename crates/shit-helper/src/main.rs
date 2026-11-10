@@ -2610,20 +2610,49 @@ struct WatchCwd {
 /// left) is refused.
 #[cfg(target_os = "linux")]
 fn open_watch_dir(path: &str) -> Result<WatchCwd, String> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
         .map_err(|e| e.to_string())?;
-    if dir.metadata().map_err(|e| e.to_string())?.nlink() == 0 {
-        return Err("the directory was deleted".to_string());
-    }
     let fd = std::os::fd::OwnedFd::from(dir);
+    let path = name_open_dir(&fd)?;
+    Ok(WatchCwd { fd, path })
+}
+
+/// The path that names the open directory `fd` now. #257: the kernel
+/// renders a removed directory's `/proc/self/fd` link as
+/// `"<path> (deleted)"`, and a directory renamed after the readlink is
+/// no longer at the returned path. The path is used only when `fd`
+/// still has links after the readlink and a stat of the path finds the
+/// same `(dev, ino)` as `fd`.
+#[cfg(target_os = "linux")]
+fn name_open_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let held = |when: &str| -> Result<(u64, u64), String> {
+        let meta = std::fs::File::from(fd.try_clone().map_err(|e| e.to_string())?)
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        if meta.nlink() == 0 {
+            return Err(format!("the directory was deleted {when}"));
+        }
+        Ok((meta.dev(), meta.ino()))
+    };
+    let id = held("before it could be named")?;
     let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
         .map_err(|e| format!("cannot name the opened directory: {e}"))?;
-    Ok(WatchCwd { fd, path })
+    held("while it was being named")?;
+    let named = std::fs::metadata(&path)
+        .map_err(|e| format!("{} does not name the opened directory: {e}", path.display()))?;
+    if (named.dev(), named.ino()) != id {
+        return Err(format!(
+            "{} is not the opened directory (it was moved or deleted)",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 /// Resolve the Linux watch root: the hook-reported cwd, or the root
@@ -2958,6 +2987,54 @@ mod linux_watch_tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(r.is_err());
+    }
+
+    fn open_dir_fd(p: &std::path::Path) -> std::os::fd::OwnedFd {
+        std::fs::File::open(p).unwrap().into()
+    }
+
+    /// #257: a directory removed after it was opened (the window between
+    /// the open and the readlink) is refused, not named
+    /// `"<path> (deleted)"`.
+    #[test]
+    fn directory_removed_before_naming_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let fd = open_dir_fd(&gone);
+        std::fs::remove_dir(&gone).unwrap();
+        let r = name_open_dir(&fd);
+        assert!(r.is_err(), "named a removed directory: {r:?}");
+    }
+
+    /// #257: a suffix check is not enough. With a directory literally
+    /// named `"gone (deleted)"` beside it, the readlink of the removed
+    /// directory names that other directory, and only the identity
+    /// check refuses it.
+    #[test]
+    fn readlink_naming_another_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::create_dir(dir.path().join("gone (deleted)")).unwrap();
+        let fd = open_dir_fd(&gone);
+        std::fs::remove_dir(&gone).unwrap();
+        let r = name_open_dir(&fd);
+        assert!(r.is_err(), "named a decoy directory: {r:?}");
+    }
+
+    /// #257: a directory moved after it was opened is named by its new
+    /// path, which is the same directory.
+    #[test]
+    fn moved_directory_is_named_by_its_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = dir.path().join("before");
+        let after = dir.path().join("after");
+        std::fs::create_dir(&before).unwrap();
+        let fd = open_dir_fd(&before);
+        std::fs::rename(&before, &after).unwrap();
+        let named = name_open_dir(&fd).unwrap();
+        assert_eq!(named, std::fs::canonicalize(&after).unwrap());
     }
 
     fn lsm_dispatch() -> LsmDispatch {
