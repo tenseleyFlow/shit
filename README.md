@@ -104,7 +104,7 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `hardlink-rm-undo-fbsd`, `ln-hardlink-undo-fbsd`, `ln-symlink-undo-fbsd`, `mkdir-p-undo-fbsd`, `mkdir-undo-fbsd`, `mkfifo-undo-fbsd`, `mv-across-dirs-undo-fbsd`, `mv-dir-undo-fbsd`, `mv-noop-undo-fbsd`, `non-ascii-filename-undo-fbsd`, `rm-undo-fbsd`, `symlink-replace-undo-fbsd` |
 | Filesystem: content writes and editors | `awk-inplace-undo-fbsd`, `backup-and-modify-undo-fbsd`, `cp-recursive-undo-fbsd`, `cpio-extract-undo-fbsd`, `dd-large-file-undo-fbsd`, `dd-notrunc-undo-fbsd`, `gzip-undo-fbsd`, `large-file-overwrite-undo-fbsd`, `patch-apply-undo-fbsd`, `rotate-and-touch-undo-fbsd`, `rsync-incremental-undo-fbsd`, `sed-inline-undo-fbsd`, `shell-append-undo-fbsd`, `shell-redirect-undo-fbsd`, `sort-inplace-undo-fbsd`, `split-undo-fbsd`, `tar-extract-undo-fbsd`, `tee-undo-fbsd`, `touch-edit-undo-fbsd`, `vim-edit-undo-fbsd` |
 
-### macOS (28 wired into CI, 2 excluded)
+### macOS (28 wired into CI, 3 excluded)
 
 #### hosted macos-15: 19 smokes
 
@@ -128,6 +128,7 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 
 | Smoke | Excluded by |
 |---|---|
+| `es-chflags-undo-macos` | `issue-269` |
 | `es-rename-undo-macos` | `issue-279` |
 | `mkdir-out-of-watch-undo-macos` | `M03.x.CREATE-mkdir-planner-coord-pending` |
 
