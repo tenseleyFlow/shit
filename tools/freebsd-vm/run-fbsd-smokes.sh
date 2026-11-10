@@ -26,8 +26,9 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 SMOKE_TMPDIR="${SMOKE_TMPDIR:-/tmp}"
+REQUIRE_SNAPSHOT=0
 case "${SMOKE_TMPDIR}" in
-  /tmp/zfs*) DEFAULT_TAG=zfs ;;
+  /tmp/zfs*) DEFAULT_TAG=zfs REQUIRE_SNAPSHOT=1 ;;
   *) DEFAULT_TAG=ufs ;;
 esac
 SMOKE_TAG="${SMOKE_TAG:-${DEFAULT_TAG}}"
@@ -40,9 +41,10 @@ bash "${FBSD_VM_SCRIPT_DIR}/sync.sh" >/dev/null
 
 set +e
 ssh "${SSH_OPTS[@]}" freebsd@127.0.0.1 \
-  "SMOKE_TMPDIR=${SMOKE_TMPDIR} SMOKE_TAG=${SMOKE_TAG} SMOKE_ONLY='$*' sh -s" <<'REMOTE_SCRIPT'
+  "SMOKE_TMPDIR=${SMOKE_TMPDIR} SMOKE_TAG=${SMOKE_TAG} SMOKE_ONLY='$*' SHIT_SMOKE_REQUIRE_ZFS_SNAPSHOT=${REQUIRE_SNAPSHOT} sh -s" <<'REMOTE_SCRIPT'
 set -eu
 export PATH="${HOME}/.cargo/bin:/usr/local/bin:${PATH}"
+export SHIT_SMOKE_REQUIRE_ZFS_SNAPSHOT
 cd ~/shit
 RESULTS="${HOME}/smoke-results.tsv"
 rm -f "${RESULTS}"

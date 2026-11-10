@@ -75,6 +75,8 @@ if [ -c /dev/vtbd1 ]; then
     ${SUDO} zfs create -o mountpoint=/tmp/zfs shitzfs/tmp
   fi
   ${SUDO} chmod 1777 /tmp/zfs
+  # B6: delegate snapshots to the login user, as the CI zfs leg does.
+  ${SUDO} zfs allow -u "$(id -un)" snapshot,destroy,mount shitzfs/tmp
   say "zfs: $(zfs list -H -o name,mountpoint shitzfs/tmp | tr '\t' ' ')"
 fi
 
