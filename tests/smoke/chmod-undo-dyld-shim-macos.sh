@@ -82,9 +82,13 @@ cd "${WATCHED}"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
-smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} ${CHMOD_BIN} 0644 ${TARGET}"
+# SHIT_SMOKE_NO_SHIM=1 leaves the shim out, so FSEvents is the only
+# capture: the shape of #269, where the shim's note was lost.
+INSERT=(env "DYLD_INSERT_LIBRARIES=${SHIM_LIB}")
+[ -n "${SHIT_SMOKE_NO_SHIM:-}" ] && INSERT=(env)
+smoke_log "${INSERT[*]} ${CHMOD_BIN} 0644 ${TARGET}"
 set +e
-DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${CHMOD_BIN}" 0644 "${TARGET}" \
+"${INSERT[@]}" "${CHMOD_BIN}" 0644 "${TARGET}" \
     >"${SHIT_SMOKE_TMP}/chmod.log" 2>&1
 CHMOD_RC=$?
 set -e
