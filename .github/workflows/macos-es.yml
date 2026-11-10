@@ -1,0 +1,89 @@
+name: macos-es
+
+# EndpointSecurity smokes on the self-hosted `macos-es` runner (lane
+# M2). The runner is a Mac host that drives a SIP-disabled Tart guest
+# through tools/macos-tart-vm/. Jobs run on that host with the owner's
+# user account, so this workflow must never run untrusted code:
+#
+#   - no pull_request or pull_request_target trigger, so fork code
+#     never reaches the runner;
+#   - push runs only on trunk, and only once the repo variable
+#     MACOS_ES_ENABLED is "true" (set it after the runner is
+#     registered, so trunk pushes do not queue jobs with no runner);
+#   - workflow_dispatch can be run by anyone with write access.
+#
+# Smokes run one at a time because they share one guest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: 'one smoke path (tests/smoke/<name>.sh); empty runs all'
+        required: false
+        default: ''
+  push:
+    branches: [trunk]
+
+concurrency:
+  group: macos-es
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SHIT_TART_VM: shit-m03
+
+jobs:
+  es-smoke:
+    name: es-smoke (${{ matrix.smoke }})
+    if: >-
+      github.repository == 'tenseleyFlow/shit' &&
+      (github.event_name == 'workflow_dispatch' || vars.MACOS_ES_ENABLED == 'true')
+    runs-on: [self-hosted, macos-es]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        smoke:
+          - tests/smoke/es-doctor-prereqs-macos.sh
+          - tests/smoke/es-unlink-undo-macos.sh
+          - tests/smoke/es-rename-undo-macos.sh
+          - tests/smoke/es-truncate-undo-macos.sh
+          - tests/smoke/es-open-write-undo-macos.sh
+          - tests/smoke/es-chmod-metadata-macos.sh
+          - tests/smoke/es-xattr-roundtrip-macos.sh
+          - tests/smoke/fsevents-fallback-macos.sh
+    steps:
+      - name: skip smokes not selected by dispatch input
+        id: pick
+        env:
+          WANT: ${{ github.event.inputs.smoke }}
+          THIS: ${{ matrix.smoke }}
+        run: |
+          # Keep the VM key outside the checkout so actions/checkout's
+          # clean does not delete it; the guest trusts this key.
+          echo "SHIT_TART_WORK_DIR=${HOME}/.shit-tart-vm" >>"${GITHUB_ENV}"
+          echo "/opt/homebrew/bin" >>"${GITHUB_PATH}"
+          if [ -z "${WANT}" ] || [ "${WANT}" = "${THIS}" ]; then
+            echo "run=1" >>"${GITHUB_OUTPUT}"
+          else
+            echo "run=0" >>"${GITHUB_OUTPUT}"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.pick.outputs.run == '1'
+      - name: boot guest
+        if: steps.pick.outputs.run == '1'
+        run: |
+          tools/macos-tart-vm/boot.sh
+      - name: doctor
+        if: steps.pick.outputs.run == '1'
+        run: |
+          tools/macos-tart-vm/doctor.sh
+      - name: run smoke in guest
+        if: steps.pick.outputs.run == '1'
+        env:
+          SMOKE: ${{ matrix.smoke }}
+        run: |
+          tools/macos-tart-vm/run-es-smoke.sh "${SMOKE}"
