@@ -109,6 +109,13 @@ impl ActiveCommands {
         None
     }
 
+    /// The most recent active command on `shell_pid`, if any. R8 review,
+    /// item 4: a keyed note's command is superseded once its shell pid
+    /// runs another command (`exec` into another hooked shell).
+    pub fn foreground_of(&self, shell_pid: u32) -> Option<CommandId> {
+        self.inner.lock().ok()?.get(&shell_pid)?.last().copied()
+    }
+
     /// Number of shell pids currently with an active command. For
     /// metrics / debug only. Wired to `shit metrics` in a later DR.
     #[allow(dead_code)]
@@ -212,6 +219,19 @@ mod tests {
         assert!(a.remove(pid, cmd(2)));
         // Top of stack is still cmd(3).
         assert_eq!(a.resolve_by_descendant(pid), Some(cmd(3)));
+    }
+
+    #[test]
+    fn foreground_of_is_the_shells_most_recent_command() {
+        let a = ActiveCommands::new();
+        assert_eq!(a.foreground_of(10), None);
+        a.insert(10, cmd(1));
+        a.insert(10, cmd(2));
+        assert_eq!(a.foreground_of(10), Some(cmd(2)));
+        a.remove(10, cmd(2));
+        assert_eq!(a.foreground_of(10), Some(cmd(1)));
+        a.remove(10, cmd(1));
+        assert_eq!(a.foreground_of(10), None);
     }
 
     #[test]

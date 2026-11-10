@@ -65,8 +65,9 @@ cd "${WATCHED}"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
+# As the shell hooks do: export the command key the shim sends (#210).
 smoke_log "LD_PRELOAD=${SHIM_LIB} mkfifo ${FIFO}"
-LD_PRELOAD="${SHIM_LIB}" "${MKFIFO_BIN}" "${FIFO}"
+_SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 LD_PRELOAD="${SHIM_LIB}" "${MKFIFO_BIN}" "${FIFO}"
 
 # The FIFO must exist after the syscall and be of fifo type.
 [ -p "${FIFO}" ] || smoke_fail "mkfifo didn't produce a FIFO at ${FIFO}"

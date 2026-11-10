@@ -2802,6 +2802,7 @@ mod tests_dispatch {
                 pre_stat: None,
                 call_id: 0,
                 outcome: None,
+                command_key: None,
             };
             crate::shim_listener::ingest_notification(
                 &gap,

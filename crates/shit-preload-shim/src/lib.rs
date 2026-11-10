@@ -2387,6 +2387,7 @@ mod policy {
                 pre_stat,
                 call_id,
                 outcome,
+                command_key: None,
             });
             return Ok(());
         }
@@ -2440,6 +2441,9 @@ mod policy {
             pre_stat,
             call_id,
             outcome,
+            // R8 (#210): lets the daemon attribute this note after the
+            // process has exited.
+            command_key: crate::runtime::command_key(),
         };
         // L5: shim frames carry their own version byte
         // (`SHIM_WIRE_VERSION`) and the large cap. An encode failure is

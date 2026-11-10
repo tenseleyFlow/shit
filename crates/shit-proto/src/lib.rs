@@ -120,8 +120,8 @@ pub use helper::{
     SignatureKind, TreeOpWire, UntrustedSource, validate_outgoing,
 };
 pub use shim::{
-    SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimFailure, ShimNotification, ShimPreImage,
-    ShimRenameOutcome, ShimStat, XattrPreImage,
+    SHIM_INLINE_PREIMAGE_CAP, ShimAck, ShimCommandKey, ShimFailure, ShimNotification, ShimPreImage,
+    ShimRenameOutcome, ShimStat, XattrPreImage, decode_shim_notification,
 };
 
 /// One IPC message sent from a shell hook (or the CLI on its behalf) to `shitd`.

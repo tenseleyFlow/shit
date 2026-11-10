@@ -17,7 +17,8 @@ else
     _SHIT_SESSION="$("$_SHIT_BIN" internal new-uuid 2>/dev/null || echo 00000000-0000-0000-0000-000000000000)"
 fi
 export _SHIT_SESSION
-typeset -gi _SHIT_SEQ=0
+# Exported so the preload shim can name the running command (#210).
+typeset -gxi _SHIT_SEQ=0
 
 __shit_send_open() {
     # `tty` exits non-zero without a controlling tty, and some
