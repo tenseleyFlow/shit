@@ -187,7 +187,7 @@ struct WatchState {
     /// `/proc/<root_pid>/mounts`, held from `check_mounts` to close. Any
     /// mount change in that namespace meanwhile makes it pollable
     /// (#233).
-    mounts_watch: Option<std::fs::File>,
+    mounts_watch: Option<MountsWatch>,
     /// R3 slice B — baseline, born set and uncaptured mutations. Read
     /// at `on_unwatch_tree`, which sends one observation per loss.
     acct: CloseAccounting,
@@ -449,7 +449,7 @@ impl LinuxCaptureRuntime {
             // #233: a mount anywhere in the command's namespace since
             // WatchTree may have put a mount under the root, so the
             // dentry chains no longer match paths there.
-            if ws.mounts_watch.as_ref().is_none_or(mounts_changed) {
+            if ws.mounts_watch.as_ref().is_none_or(MountsWatch::changed) {
                 ws.acct.disable_dentry_rule();
             }
             let observations = ws.acct.close(ws.silent_send_failures, kernel_losses_now);
@@ -478,13 +478,22 @@ impl LinuxCaptureRuntime {
         };
         // Opened before mountinfo is read, so a change between the two
         // still shows at close.
-        let watch = std::fs::File::open(proc_dir.join("mounts")).ok();
+        let watch = MountsWatch::open(root_pid);
         let clean = same_ns
             && watch.is_some()
             && ws.root.as_deref().is_some_and(|root| {
                 std::fs::read_to_string(proc_dir.join("mountinfo"))
                     .is_ok_and(|info| !mount_under(root, &info))
             });
+        tracing::info!(
+            session = %command.session,
+            seq = command.seq,
+            root_pid,
+            same_ns,
+            watching = watch.is_some(),
+            dentry_rule = clean,
+            "check_mounts"
+        );
         ws.mounts_watch = watch;
         if clean {
             ws.acct.enable_dentry_rule();
@@ -2272,17 +2281,57 @@ fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
     std::ffi::OsString::from_vec(out)
 }
 
-/// True when the mount table behind `f` (a `/proc/<pid>/mounts` fd)
-/// changed since it was opened, or when that cannot be told.
-fn mounts_changed(f: &std::fs::File) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: f.as_raw_fd(),
-        events: libc::POLLPRI,
-        revents: 0,
-    };
-    // SAFETY: pfd is one valid pollfd; a zero timeout does not block.
-    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-    rc < 0 || pfd.revents & (libc::POLLPRI | libc::POLLERR | libc::POLLNVAL) != 0
+/// Watches one mount namespace for mount changes (#233).
+///
+/// Opening `/proc/<pid>/mounts` records the namespace's event count;
+/// the file polls readable with `EPOLLPRI` once the count moves, and
+/// each poll resets it. So the epoll set is made when the watch starts:
+/// adding the file polls it once with nothing changed yet, a later mount
+/// wakes the set, and the one poll at [`Self::changed`] reports it.
+/// epoll, unlike `poll`, is on the helper's seccomp allow list.
+#[derive(Debug)]
+struct MountsWatch {
+    _mounts: std::fs::File,
+    ep: OwnedFd,
+}
+
+impl MountsWatch {
+    fn open(pid: i32) -> Option<Self> {
+        let mounts = std::fs::File::open(format!("/proc/{pid}/mounts")).ok()?;
+        // SAFETY: plain syscall; a negative return is an error.
+        let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if ep < 0 {
+            return None;
+        }
+        // SAFETY: `ep` is the fd just returned; we own it.
+        let ep = unsafe { OwnedFd::from_raw_fd(ep) };
+        let mut ev = libc::epoll_event {
+            events: (libc::EPOLLPRI | libc::EPOLLERR) as u32,
+            u64: 0,
+        };
+        // SAFETY: both fds are open; `ev` is a valid epoll_event.
+        let rc = unsafe {
+            libc::epoll_ctl(
+                ep.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                mounts.as_raw_fd(),
+                &mut ev,
+            )
+        };
+        (rc == 0).then_some(Self {
+            _mounts: mounts,
+            ep,
+        })
+    }
+
+    /// True when the namespace's mount table changed since [`Self::open`],
+    /// or when that cannot be told.
+    fn changed(&self) -> bool {
+        let mut out = libc::epoll_event { events: 0, u64: 0 };
+        // SAFETY: `out` has room for one event; zero timeout; no sigmask.
+        let n = unsafe { libc::epoll_pwait(self.ep.as_raw_fd(), &mut out, 1, 0, std::ptr::null()) };
+        n != 0
+    }
 }
 
 /// Inode numbers of the directories above `root` that are on `dev`.
@@ -4669,10 +4718,10 @@ mod born_set_tests {
         let Some(mut child) = unshared_child("sleep 0.3; mount -t tmpfs none /mnt; sleep 5") else {
             return;
         };
-        let f = std::fs::File::open(format!("/proc/{}/mounts", child.id())).unwrap();
-        assert!(!mounts_changed(&f));
+        let w = MountsWatch::open(child.id() as i32).unwrap();
+        assert!(!w.changed());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !mounts_changed(&f) {
+        while !w.changed() {
             assert!(std::time::Instant::now() < deadline, "mount never showed");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
