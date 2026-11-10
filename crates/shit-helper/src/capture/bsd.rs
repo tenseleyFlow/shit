@@ -2023,6 +2023,67 @@ mod tests {
         );
     }
 
+    /// B6: a write to a file the command's ZFS snapshot holds (same
+    /// device, there at attach) is answered with `SnapshotPreImage`
+    /// carrying the post-write hash, and no capture gap; a snapshot of
+    /// another device leaves the read-time path in charge.
+    #[test]
+    fn write_to_a_snapshotted_file_sends_a_snapshot_pre_image() {
+        use std::os::unix::fs::MetadataExt;
+        for same_dev in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let f = root.join("f");
+            std::fs::write(&f, b"before").unwrap();
+            let dev = std::fs::metadata(&root).unwrap().dev();
+            let (mut state, kq, daemon) = hand_driven_state(dir.path());
+            let cmd = command(90);
+            let snap = shit_proto::ZfsSnapshotRef {
+                dataset: "pool/w".into(),
+                name: "shitd-x".into(),
+                mountpoint: path_to_string(dir.path()),
+                dev: if same_dev { dev } else { dev ^ 1 },
+            };
+            state.attach(&kq, cmd, &root, Some(snap)).unwrap();
+            std::fs::write(&f, b"after").unwrap();
+            state.handle_vnode(tracked_fd(&state, cmd, &f), VnodeEventKind::Write);
+            state.detach(cmd);
+            drop(state);
+            let mut snapshot_pre = Vec::new();
+            let mut fd_pre = 0;
+            let mut refusals = Vec::new();
+            while let Ok((resp, _)) = daemon.recv_response_with_fd() {
+                match resp {
+                    HelperResponse::SnapshotPreImage {
+                        path,
+                        post_content_hash,
+                        is_delete,
+                        ..
+                    } => snapshot_pre.push((path, post_content_hash, is_delete)),
+                    HelperResponse::CapturedPreImage { .. } => fd_pre += 1,
+                    HelperResponse::CaptureRefused { detail, .. } => refusals.push(detail),
+                    _ => {}
+                }
+            }
+            if same_dev {
+                assert_eq!(
+                    snapshot_pre,
+                    vec![(
+                        path_to_string(&f),
+                        Some(*blake3::hash(b"after").as_bytes()),
+                        false
+                    )]
+                );
+                assert_eq!(fd_pre, 0);
+                assert!(refusals.is_empty(), "{refusals:?}");
+            } else {
+                assert!(snapshot_pre.is_empty(), "{snapshot_pre:?}");
+                assert_eq!(fd_pre, 1);
+            }
+        }
+    }
+
     /// With a birth time, a file created after the attach is born even
     /// in a directory whose listing failed.
     #[cfg(target_os = "freebsd")]
