@@ -4,9 +4,9 @@
 # (`sip-*-undo-macos.sh`). Each smoke sources `lib.sh` first and this
 # file next. The command runs the way a hooked shell runs it: between
 # PreExec and PostExec, with the command key exported and
-# DYLD_INSERT_LIBRARIES set. The shim does not capture SIP binaries:
-# dyld either ignores the variable or, on Apple Silicon, aborts the
-# arm64e binary because the shim is arm64 only.
+# DYLD_INSERT_LIBRARIES set. With SIP on, dyld ignores the variable
+# for SIP binaries, so they run uncaptured. Hosted runners have SIP
+# off, and there dyld aborts arm64e system binaries instead (#274).
 
 SIP_DYLD_ABORT=0
 
@@ -48,10 +48,10 @@ sip_run_hooked() {
         > "${SHIT_SMOKE_TMP}/cmd.log" 2>&1
     rc=$?
     set -e
-    # On Apple Silicon the system binaries are arm64e. dyld tries the
-    # arm64 shim and aborts the command before it runs (exit 134), so
-    # nothing changed. Record that, then run the binary the way it runs
-    # with the shim out of reach, to check what undo says about it.
+    # #274: with SIP off (hosted runners) dyld tries the arm64 shim in
+    # the arm64e binary and aborts it before it runs (exit 134), so
+    # nothing changed. Record that, then run the binary without the
+    # shim, which is how it runs on a default install with SIP on.
     if [ "${rc}" -ne 0 ] && grep -q "incompatible architecture" "${SHIT_SMOKE_TMP}/cmd.log"; then
         SIP_DYLD_ABORT=1
         smoke_log "dyld aborted $1 with the shim inserted (exit ${rc}): $(grep -m1 -o "have '[a-z0-9]*', need '[a-z0-9]*'" "${SHIT_SMOKE_TMP}/cmd.log")"
