@@ -104,9 +104,9 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `hardlink-rm-undo-fbsd`, `ln-hardlink-undo-fbsd`, `ln-symlink-undo-fbsd`, `mkdir-p-undo-fbsd`, `mkdir-undo-fbsd`, `mkfifo-undo-fbsd`, `mv-across-dirs-undo-fbsd`, `mv-dir-undo-fbsd`, `mv-noop-undo-fbsd`, `non-ascii-filename-undo-fbsd`, `rm-undo-fbsd`, `symlink-replace-undo-fbsd` |
 | Filesystem: content writes and editors | `awk-inplace-undo-fbsd`, `backup-and-modify-undo-fbsd`, `cp-recursive-undo-fbsd`, `cpio-extract-undo-fbsd`, `dd-large-file-undo-fbsd`, `dd-notrunc-undo-fbsd`, `gzip-undo-fbsd`, `large-file-overwrite-undo-fbsd`, `patch-apply-undo-fbsd`, `rotate-and-touch-undo-fbsd`, `rsync-incremental-undo-fbsd`, `sed-inline-undo-fbsd`, `shell-append-undo-fbsd`, `shell-redirect-undo-fbsd`, `sort-inplace-undo-fbsd`, `split-undo-fbsd`, `tar-extract-undo-fbsd`, `tee-undo-fbsd`, `touch-edit-undo-fbsd`, `vim-edit-undo-fbsd` |
 
-### macOS (19 wired into CI, 9 excluded)
+### macOS (21 wired into CI, 9 excluded)
 
-#### hosted macos-15: 19 smokes
+#### hosted macos-15: 21 smokes
 
 | Surface family | Smokes |
 |---|---|
@@ -115,7 +115,7 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Services, firewall, network and processes | `kill-proc-libproc-macos`, `launchctl-bootstrap-undo-macos`, `networksetup-dns-undo-macos`, `networksetup-location-undo-macos`, `pfctl-undo-macos`, `route-add-undo-macos` |
 | Build and install | `cargo-install-force-undo-macos`, `make-install-overwrite-undo-macos`, `make-install-undo-macos`, `pip-install-user-undo-macos` |
 | Filesystem: metadata and attributes | `chflags-undo-macos`, `chmod-undo-dyld-shim-macos`, `xattr-mutate-undo-macos` |
-| Filesystem: remove, rename, link, create | `link-undo-macos`, `mkfifo-undo-macos` |
+| Filesystem: remove, rename, link, create | `link-undo-macos`, `mkfifo-undo-macos`, `sip-mv-undo-macos`, `sip-rm-undo-macos` |
 | Filesystem: content writes and editors | `cp-clone-overwrite-undo-macos`, `mmap-write-undo-macos` |
 
 #### Excluded from CI, so not evidence of coverage

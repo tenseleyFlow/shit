@@ -43,7 +43,7 @@ USAGE
 # Skipped files (libraries, not smokes).
 is_library() {
     case "$(basename "$1")" in
-        lib.sh|lib-git.sh|lib-env-oversize.sh|lib-hooks.sh) return 0 ;;
+        lib.sh|lib-git.sh|lib-env-oversize.sh|lib-hooks.sh|lib-sip.sh) return 0 ;;
         *) return 1 ;;
     esac
 }

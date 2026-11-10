@@ -50,7 +50,7 @@ FAMILIES = [
     ("Filesystem: metadata and attributes",
      r"^(chmod-|chown-|chflags-|xattr-|setxattr-)"),
     ("Filesystem: remove, rename, link, create",
-     r"^(rm-|rmdir-|mv-|dir-rename-|renameat-|ln-|link-|hardlink-|symlink-|mkdir-|mkfifo-|mknod-|"
+     r"^(rm-|rmdir-|mv-|sip-|dir-rename-|renameat-|ln-|link-|hardlink-|symlink-|mkdir-|mkfifo-|mknod-|"
      r"large-file-rm-|non-ascii-|non-utf8-|canonicalize-|restore-fidelity-)"),
     ("Filesystem: content writes and editors",
      r"^(edit-|touch-edit-|vim-|sed-|awk-|sort-|tee-|dd-|shell-|redirect-|write-in-place-|mmap-|cp-|"
