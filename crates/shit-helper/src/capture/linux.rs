@@ -466,6 +466,10 @@ impl LinuxCaptureRuntime {
     /// mount under the root, or when anything here fails. The held
     /// `/proc/<root_pid>/mounts` fd is polled at close: a mount change
     /// in that namespace during the command turns the rule off again.
+    ///
+    /// Dentry chains are judged in the helper's mount namespace. A
+    /// descendant that unshares its own namespace and mounts inside it
+    /// is not seen here: the watch covers the root's namespace only.
     pub fn check_mounts(&mut self, command: CommandId, root_pid: i32) {
         let ws = self.watches.entry(command).or_default();
         let proc_dir = PathBuf::from(format!("/proc/{root_pid}"));
@@ -4702,13 +4706,19 @@ mod born_set_tests {
     }
 
     /// A child in its own user and mount namespace running `script`, or
-    /// None where unprivileged namespaces are not allowed.
+    /// None where unprivileged namespaces are not allowed. With
+    /// `SHIT_REQUIRE_USERNS=1` (set in CI) that is a failure instead, so
+    /// the namespace tests cannot pass by skipping.
     fn unshared_child(script: &str) -> Option<std::process::Child> {
         let ok = std::process::Command::new("unshare")
             .args(["-Urm", "true"])
             .status()
             .is_ok_and(|s| s.success());
         if !ok {
+            assert!(
+                std::env::var("SHIT_REQUIRE_USERNS").as_deref() != Ok("1"),
+                "SHIT_REQUIRE_USERNS=1 but `unshare -Urm` failed"
+            );
             eprintln!("skipping: unprivileged mount namespaces unavailable");
             return None;
         }

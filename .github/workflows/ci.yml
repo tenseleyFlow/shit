@@ -37,7 +37,19 @@ jobs:
         run: cargo run --quiet --package xtask -- license-check
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # The helper's mount-namespace tests (#233) need unprivileged user
+      # namespaces, which Ubuntu 24.04's AppArmor blocks by default.
+      - name: allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          key=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$key" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: test
+        env:
+          # Fail, rather than skip, a test that needs a user namespace.
+          SHIT_REQUIRE_USERNS: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo test --workspace
       - name: build (release)
         run: cargo build --workspace --release
