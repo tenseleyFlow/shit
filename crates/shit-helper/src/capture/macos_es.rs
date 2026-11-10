@@ -279,6 +279,7 @@ extern "C" fn producer_invoke(
     } else if event_type == sys::es_event_type_t::AUTH_OPEN {
         handle_auth_open(pump, client, message, &msg);
     } else if event_type == sys::es_event_type_t::AUTH_SETMODE
+        || event_type == sys::es_event_type_t::AUTH_SETFLAGS
         || event_type == sys::es_event_type_t::AUTH_SETOWNER
         || event_type == sys::es_event_type_t::AUTH_UTIMES
     {
@@ -745,7 +746,7 @@ fn handle_auth_truncate(
 }
 
 /// Metadata-mutation handler (M03.1.I.D). Catches AUTH_SETMODE,
-/// AUTH_SETOWNER, AUTH_UTIMES. Each event carries the new value(s)
+/// AUTH_SETFLAGS, AUTH_SETOWNER, AUTH_UTIMES. Each event carries the new value(s)
 /// + a target file whose kernel-attached stat captures the BEFORE
 ///   snapshot. We assemble `before` + `after` `FileMetadataWire`
 ///   values + queue a MetadataChange record; no clonefile, no staging.
@@ -778,6 +779,16 @@ fn handle_auth_metadata(
     let (target_ptr, after_delta) = if event_type == sys::es_event_type_t::AUTH_SETMODE {
         match msg.as_setmode() {
             Some(e) => (e.target, MetaDelta::Mode(e.mode as u32)),
+            None => {
+                respond_allow(client, message);
+                return;
+            }
+        }
+    } else if event_type == sys::es_event_type_t::AUTH_SETFLAGS {
+        // SIP binaries (/usr/bin/chflags) never load the shim's
+        // chflags interposer, so this is their only capture path.
+        match msg.as_setflags() {
+            Some(e) => (e.target, MetaDelta::Flags(e.flags)),
             None => {
                 respond_allow(client, message);
                 return;
@@ -857,17 +868,29 @@ fn handle_auth_metadata(
     enqueue_capture_record(pump, client, message, record, None);
 }
 
+/// The producer's ES subscription set. NOTIFY_EXEC/FORK/EXIT are for
+/// tree tracking; they must be subscribed even though we never respond
+/// to them, or the kernel never delivers them.
+const PRODUCER_EVENTS: [sys::es_event_type_t; 11] = [
+    sys::es_event_type_t::AUTH_OPEN,
+    sys::es_event_type_t::AUTH_UNLINK,
+    sys::es_event_type_t::AUTH_RENAME,
+    sys::es_event_type_t::AUTH_TRUNCATE,
+    sys::es_event_type_t::AUTH_SETMODE,
+    sys::es_event_type_t::AUTH_SETFLAGS,
+    sys::es_event_type_t::AUTH_SETOWNER,
+    sys::es_event_type_t::AUTH_UTIMES,
+    sys::es_event_type_t::NOTIFY_EXEC,
+    sys::es_event_type_t::NOTIFY_FORK,
+    sys::es_event_type_t::NOTIFY_EXIT,
+];
+
 /// What field(s) of FileMetadataWire to update for `after`.
 enum MetaDelta {
     Mode(u32),
     Owner(u32, u32),
     Mtime(i128),
-    /// M03.x.SETATTR — chflags delta (new st_flags value). Reserved
-    /// for the future AUTH_SETFLAGS ES handler; the chflags path on
-    /// stock macOS goes through the M07 shim's chflags interposer
-    /// (not ES). Allow-dead until AUTH_SETFLAGS lands in the
-    /// subscription set.
-    #[allow(dead_code)]
+    /// chflags delta (new st_flags value) from AUTH_SETFLAGS.
     Flags(u32),
 }
 
@@ -1410,28 +1433,11 @@ impl PumpState {
             );
         }
 
-        // Subscribe with the producer handler. AUTH_UNLINK is the
-        // only AUTH event for I.3 (I.4 adds AUTH_RENAME +
-        // AUTH_TRUNCATE + AUTH_WRITE). NOTIFY_EXEC/FORK/EXIT are
-        // for tree tracking — they MUST be in the subscription set
-        // even though we never respond to them, otherwise the kernel
-        // never delivers them.
-        let events = [
-            sys::es_event_type_t::AUTH_OPEN,
-            sys::es_event_type_t::AUTH_UNLINK,
-            sys::es_event_type_t::AUTH_RENAME,
-            sys::es_event_type_t::AUTH_TRUNCATE,
-            sys::es_event_type_t::AUTH_SETMODE,
-            sys::es_event_type_t::AUTH_SETOWNER,
-            sys::es_event_type_t::AUTH_UTIMES,
-            sys::es_event_type_t::NOTIFY_EXEC,
-            sys::es_event_type_t::NOTIFY_FORK,
-            sys::es_event_type_t::NOTIFY_EXIT,
-        ];
+        // Subscribe with the producer handler; see PRODUCER_EVENTS.
         let client = unsafe {
             crate::es::client::EsClient::new_with_handler(
                 &PRODUCER_HANDLER as *const _ as *const c_void,
-                &events,
+                &PRODUCER_EVENTS,
             )?
         };
 
@@ -1776,6 +1782,14 @@ fn pump(conn: Arc<Conn>, staging_dir: PathBuf, ctrl_rx: Receiver<ControlMsg>) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn producer_subscribes_to_auth_setflags() {
+        // /usr/bin/chflags is SIP-protected; without this subscription
+        // its flag changes are never captured.
+        assert_eq!(sys::es_event_type_t::AUTH_SETFLAGS.0, 47);
+        assert!(PRODUCER_EVENTS.contains(&sys::es_event_type_t::AUTH_SETFLAGS));
+    }
 
     #[test]
     fn path_to_string_short_path_round_trips() {

@@ -76,6 +76,9 @@ impl es_event_type_t {
     /// Metadata-mutation events (M03.1.I.D). Each fires AUTH-style;
     /// the producer emits a `CapturedMetadataChange` event with a
     /// stat-snapshot taken BEFORE the syscall commits.
+    /// chflags(2) / fchflags(2). Comes right before AUTH_SETMODE in
+    /// `es_event_type_t` (ESTypes.h).
+    pub const AUTH_SETFLAGS: Self = Self(47);
     pub const AUTH_SETMODE: Self = Self(48);
     pub const AUTH_SETOWNER: Self = Self(49);
     pub const AUTH_UTIMES: Self = Self(60);
