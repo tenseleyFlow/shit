@@ -38,12 +38,14 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 0
 fi
 
-CHMOD_BIN="$(command -v gchmod 2>/dev/null || true)"
+# SHIT_SMOKE_CHMOD_BIN=/bin/chmod runs a SIP binary the shim cannot
+# see, which leaves FSEvents as the only capture (#269 repeat job).
+CHMOD_BIN="${SHIT_SMOKE_CHMOD_BIN:-$(command -v gchmod 2>/dev/null || true)}"
 if [ -z "${CHMOD_BIN}" ]; then
     smoke_log "SKIP: gchmod (non-SIP) required; brew install coreutils"
     exit 0
 fi
-smoke_log "chmod: ${CHMOD_BIN} (non-SIP, DYLD survives)"
+smoke_log "chmod: ${CHMOD_BIN}"
 
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
@@ -84,7 +86,7 @@ sleep 0.7
 # the shim sends them as the note's command key. Without it the daemon
 # attributes by pid ancestry, which loses the note when gchmod exits
 # before the walk ends (#269: the note was dropped that way).
-smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} gchmod 0644 ${TARGET}"
+smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} ${CHMOD_BIN} 0644 ${TARGET}"
 set +e
 _SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 \
     DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${CHMOD_BIN}" 0644 "${TARGET}" \
