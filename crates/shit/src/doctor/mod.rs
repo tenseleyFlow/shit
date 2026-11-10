@@ -18,6 +18,8 @@
 pub mod coverage_snapshot;
 pub mod json;
 pub mod probes;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod shim_reach;
 pub mod snippet;
 pub mod visibility;
 
@@ -607,6 +609,8 @@ fn collect_macos() -> Option<json::MacReport> {
     // individual probes have run. Pure function; the inputs are
     // the already-populated SipReport + EndpointSecurityReport.
     let (es_capable, es_blockers) = macos::compose_es_capable(&sip, &es);
+    // M4: only a confirmed-off SIP lets dyld honor DYLD_* in /bin etc.
+    let sip_enforced = sip.state != "disabled";
 
     Some(json::MacReport {
         runtime_capture,
@@ -619,6 +623,8 @@ fn collect_macos() -> Option<json::MacReport> {
         es_capable,
         es_blockers,
         dyld_shim: macos::probe_dyld_shim(),
+        shim_reach: shim_reach::probe(&std::env::var("PATH").unwrap_or_default(), sip_enforced),
+        uncaptured: shim_reach::UNCAPTURED_SUMMARY.to_string(),
     })
 }
 
@@ -1065,7 +1071,30 @@ fn print_macos_tier(mac: &json::MacReport) {
         }
     );
     print_helper_handshake(&mac.helper_handshake);
+    print_shim_reach(mac);
     println!();
+}
+
+/// M4: the shell's resolved path for common commands and whether the
+/// DYLD shim can see them.
+#[cfg(target_os = "macos")]
+fn print_shim_reach(mac: &json::MacReport) {
+    println!("shim reach (first match on $PATH; aliases and functions not followed):");
+    for e in &mac.shim_reach {
+        let path = match (&e.resolved, &e.target) {
+            (Some(r), Some(t)) => format!("{r} -> {t}"),
+            (Some(r), None) => r.clone(),
+            (None, _) => "-".to_string(),
+        };
+        println!("  {:<6} {:<34} {}", e.command, path, e.reason);
+    }
+    if !mac.dyld_shim.shim_dylib_present {
+        println!(
+            "          the shim dylib is not installed, so no command is captured; \
+             see `shit dyld-hooks install`"
+        );
+    }
+    println!("          {}", mac.uncaptured);
 }
 
 #[cfg(target_os = "macos")]

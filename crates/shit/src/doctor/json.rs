@@ -317,6 +317,13 @@ pub struct MacReport {
     /// cleanly.
     #[serde(default)]
     pub dyld_shim: DyldShimReport,
+    /// M4: the shell's resolved path for `rm`, `mv`, `cp` and `chmod`
+    /// and whether the DYLD shim can load into each.
+    #[serde(default)]
+    pub shim_reach: Vec<crate::doctor::shim_reach::ShimReachEntry>,
+    /// M4: which binaries a default install does not capture.
+    #[serde(default)]
+    pub uncaptured: String,
 }
 
 /// M07-doctor — dyld-shim install-state probe. Mirrors the
@@ -709,6 +716,14 @@ mod tests {
             es_capable: false,
             es_blockers: vec![],
             dyld_shim: DyldShimReport::default(),
+            shim_reach: vec![crate::doctor::shim_reach::ShimReachEntry {
+                command: "rm".into(),
+                resolved: Some("/bin/rm".into()),
+                target: None,
+                shim_sees: false,
+                reason: "NOT captured: SIP-protected".into(),
+            }],
+            uncaptured: crate::doctor::shim_reach::UNCAPTURED_SUMMARY.into(),
         });
         let s = serde_json::to_string(&r).expect("serialize");
         assert!(s.contains("\"runtime_capture\":\"fsevents-degraded\""));
@@ -721,6 +736,9 @@ mod tests {
         assert_eq!(mac.fsevents.latency_probe_ms, 47);
         assert!(mac.sandbox.profile_loaded);
         assert!(!mac.sandbox.write_allowed_outside_state_dir);
+        assert_eq!(mac.shim_reach[0].resolved.as_deref(), Some("/bin/rm"));
+        assert!(!mac.shim_reach[0].shim_sees);
+        assert!(mac.uncaptured.contains("/bin"));
     }
 
     #[test]
