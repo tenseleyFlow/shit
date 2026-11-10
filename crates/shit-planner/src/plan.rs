@@ -560,6 +560,8 @@ struct EventClassification {
     /// Unlinks of moved data that undo cannot prove it can restore;
     /// each becomes a Refuse node with this reason.
     refused_unlinks: std::collections::HashMap<crate::events::EventId, String>,
+    /// Paths with a content pre-image in this command (any source).
+    content_pre_images: HashSet<PathBuf>,
 }
 
 fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> EventClassification {
@@ -979,6 +981,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
         paired_flags_shims: HashSet::new(),
         dropped_events,
         refused_unlinks: provenance.refused_unlinks,
+        content_pre_images: pre_images,
     }
 }
 
@@ -2401,6 +2404,33 @@ fn emit_for_tree_op(
                 });
                 return;
             }
+            // M4: a regular file's bytes come back only from a content
+            // pre-image. Without one, RecreatePath would make an empty
+            // file and count it applied; a post-hoc tier (FSEvents on a
+            // SIP binary's rm) journals exactly that. Refuse instead, as
+            // the shim's racy unlink does (#213).
+            if *kind == crate::metadata::FileKind::Regular
+                && !class.content_pre_images.contains(path)
+            {
+                nodes.push(PlanNode {
+                    op: InverseOp::Refuse {
+                        class: "capture-gap".to_string(),
+                        reason: format!(
+                            "{} was removed, but its bytes were not captured, so it is not \
+                             recreated",
+                            path.display()
+                        ),
+                        remediation: Some(
+                            "the program that removed it was not captured (on macOS, a \
+                             SIP-protected or static binary); restore it from a backup"
+                                .to_string(),
+                        ),
+                    },
+                    cohort: 0,
+                    conflict: None,
+                });
+                return;
+            }
             // G02: use the helper-captured kind + mode (LSM tier's
             // fstat-on-held-fd before unlink commits) so a deleted
             // directory restores as a directory with its original
@@ -2567,6 +2597,72 @@ mod tests {
             exit_code: Some(0),
             event_ids: vec![EventId(1)],
         }
+    }
+
+    /// A content pre-image of `path` (shim or kernel tier).
+    fn content_pre_image(id: u64, inode: InodeRef, path: &std::path::Path) -> CaptureEvent {
+        CaptureEvent {
+            id: EventId(id),
+            command: dummy_command().command,
+            ts: TimePoint::new(id, 0),
+            partial: false,
+            kind: CaptureEventKind::FilePreImage {
+                inode,
+                path: path.to_path_buf(),
+                blob: BlobHash::from_bytes([7u8; 32]),
+                meta: meta(5),
+                post_content_hash: None,
+                source: crate::FilePreImageSource::Other,
+            },
+        }
+    }
+
+    /// M4: a regular file removed with no content pre-image (FSEvents
+    /// saw a SIP binary's rm) is a capture-gap refusal. An empty
+    /// RecreatePath would count as applied and exit 0.
+    #[test]
+    fn uncaptured_regular_unlink_is_a_capture_gap() {
+        use crate::metadata::FileKind;
+        let path = PathBuf::from("/w/victim.txt");
+        let unlink = |kind| {
+            tree_event(
+                1,
+                TreeOp::Unlink {
+                    inode: InodeRef::new(0, 0),
+                    path: path.clone(),
+                    kind,
+                    mode: 0o644,
+                },
+            )
+        };
+        let p = plan(
+            dummy_command(),
+            &[unlink(FileKind::Regular)],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        let [node] = p.nodes.as_slice() else {
+            panic!("{:#?}", p.nodes);
+        };
+        assert!(
+            matches!(&node.op, InverseOp::Refuse { class, reason, .. }
+                if class == "capture-gap" && reason.contains("not captured")),
+            "{node:#?}"
+        );
+        // A directory has no bytes: its RecreatePath stands.
+        let p = plan(
+            dummy_command(),
+            &[unlink(FileKind::Directory)],
+            &InMemoryProbe::new(),
+            &InMemoryStore::new(),
+        );
+        assert!(
+            p.nodes
+                .iter()
+                .any(|n| matches!(n.op, InverseOp::RecreatePath { .. })),
+            "{:#?}",
+            p.nodes
+        );
     }
 
     fn tree_event(id: u64, op: TreeOp) -> CaptureEvent {
@@ -3678,17 +3774,27 @@ mod tests {
                 mode: 0o100644,
             }),
         };
-        let events = vec![flags_pre_image(inode, path.to_str().unwrap(), 0, 1), unlink];
+        // M4: the unlinked file's bytes were captured too; without them
+        // the Unlink is a capture-gap refusal.
+        let events = vec![
+            flags_pre_image(inode, path.to_str().unwrap(), 0, 1),
+            content_pre_image(3, inode, &path),
+            unlink,
+        ];
         let p = plan(
             dummy_command(),
             &events,
             &InMemoryProbe::new(),
             &InMemoryStore::new(),
         );
-        assert!(matches!(
-            p.nodes.first().map(|n| &n.op),
-            Some(InverseOp::RecreatePath { path: p, .. }) if p == &path
-        ));
+        assert!(
+            p.nodes.iter().any(|n| matches!(
+                &n.op,
+                InverseOp::RestoreContent { path: p, .. } if p == &path
+            )),
+            "{:#?}",
+            p.nodes
+        );
         assert!(p.nodes.iter().any(|n| matches!(
             &n.op,
             InverseOp::RestoreFlags {
@@ -4006,53 +4112,6 @@ mod tests {
                     *emitted_mode & 0o7777,
                     0o0700,
                     "RecreatePath mode should preserve captured perm bits (0o700)"
-                );
-            }
-            other => panic!("expected RecreatePath, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn regular_file_unlink_emits_recreate_with_captured_mode() {
-        // G02 — same shape as the dir test but for a regular file.
-        // Verifies the captured mode survives through the planner
-        // (was hard-coded 0o100644 pre-G02).
-        let probe = InMemoryProbe::new();
-        let store = InMemoryStore::new();
-        let inode = InodeRef::new(1, 43);
-        let path = PathBuf::from("/scratch/script.sh");
-        let unlink_exec = CaptureEvent {
-            id: EventId(1),
-            command: CommandId {
-                session: Uuid::nil(),
-                seq: 1,
-            },
-            ts: TimePoint::new(1, 0),
-            partial: false,
-            kind: CaptureEventKind::TreeOp(TreeOp::Unlink {
-                inode,
-                path: path.clone(),
-                kind: crate::metadata::FileKind::Regular,
-                mode: 0o100755,
-            }),
-        };
-        let p = plan(dummy_command(), &[unlink_exec], &probe, &store);
-        let node = p
-            .nodes
-            .iter()
-            .find(|n| matches!(&n.op, InverseOp::RecreatePath { path: pp, .. } if pp == &path))
-            .expect("expected RecreatePath for the unlinked file");
-        match &node.op {
-            InverseOp::RecreatePath {
-                kind: emitted_kind,
-                mode: emitted_mode,
-                ..
-            } => {
-                assert_eq!(*emitted_kind, crate::metadata::FileKind::Regular);
-                assert_eq!(
-                    *emitted_mode & 0o7777,
-                    0o0755,
-                    "RecreatePath mode should preserve executable bit"
                 );
             }
             other => panic!("expected RecreatePath, got {other:?}"),
