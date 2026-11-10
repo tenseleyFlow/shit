@@ -299,6 +299,49 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
     }));
 }
 
+/// #269: Creates of a path the command had already snapshotted as
+/// existing. A `MetadataChange` (its `before` is the file's state) or a
+/// pre-mutation `FilePreImage` (shim, EndpointSecurity, baseline) of
+/// `P` says `P` existed before that mutation. A later Create of `P`
+/// with no journaled removal of `P` in between is a capture artifact,
+/// typically FSEvents carrying ItemCreated over from an older create
+/// (seen with ES AUTH_SETFLAGS plus FSEvents on `chflags`). Its Unlink
+/// inverse would delete the file the snapshot restores, so the Create
+/// is dropped.
+///
+/// `chrono` is in journal order. Generic post-hoc pre-images do not
+/// count: a kqueue capture can be journaled before the dir-diff Create
+/// of a file the command made.
+fn creates_of_snapshotted_paths(chrono: &[&CaptureEvent]) -> Vec<crate::events::EventId> {
+    let mut existed: HashSet<&Path> = HashSet::new();
+    let mut out = Vec::new();
+    for e in chrono {
+        match &e.kind {
+            CaptureEventKind::MetadataChange { path, .. } => {
+                existed.insert(path);
+            }
+            CaptureEventKind::FilePreImage { path, source, .. }
+                if source.is_shim() || source.is_trusted_pre_mutation() =>
+            {
+                existed.insert(path);
+            }
+            CaptureEventKind::TreeOp(TreeOp::Unlink { path, .. }) => {
+                existed.remove(path.as_path());
+            }
+            CaptureEventKind::TreeOp(TreeOp::Rename { from, .. }) => {
+                existed.remove(from.as_path());
+            }
+            CaptureEventKind::TreeOp(TreeOp::Create { path, .. })
+                if existed.contains(path.as_path()) =>
+            {
+                out.push(e.id);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Refusal class for a removal the journal does not back (#269).
 pub const UNPROVEN_REMOVAL: &str = "unproven-removal";
 
@@ -970,6 +1013,7 @@ fn classify_replace_paths(events: &[&CaptureEvent], probe: &dyn StateProbe) -> E
     dropped_events.extend(disproved);
     dropped_events.extend(duplicate_device_unlinks);
     dropped_events.extend(symlink_removal_markers(&chrono));
+    dropped_events.extend(creates_of_snapshotted_paths(&chrono));
     EventClassification {
         atomic_replace_paths: atomic,
         transient_paths: transient,
@@ -2673,6 +2717,95 @@ mod tests {
             partial: false,
             kind: CaptureEventKind::TreeOp(op),
         }
+    }
+
+    /// #269 on ES + FSEvents (lane M2): `chflags` of an existing file
+    /// journals a MetadataChange, then FSEvents adds a Create of the
+    /// same path. The Create must not plan an Unlink.
+    #[test]
+    fn create_after_a_snapshot_of_the_path_is_dropped() {
+        use crate::metadata::FileKind;
+        let path = PathBuf::from("/w/flagged.txt");
+        let inode = InodeRef::new(1, 9);
+        let mut before = meta(5);
+        before.flags = 0;
+        let mut after = meta(5);
+        after.flags = 0x8040;
+        let change = CaptureEvent {
+            id: EventId(1),
+            command: dummy_command().command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: CaptureEventKind::MetadataChange {
+                inode,
+                path: path.clone(),
+                before,
+                after,
+            },
+        };
+        let create = |id| {
+            tree_event(
+                id,
+                TreeOp::Create {
+                    inode,
+                    path: path.clone(),
+                    kind: FileKind::Regular,
+                    mode: 0o100644,
+                },
+            )
+        };
+        let mut probe = InMemoryProbe::new();
+        probe.insert(
+            path.clone(),
+            ProbeStat {
+                inode,
+                meta: meta(5),
+            },
+            None,
+        );
+        let unlinks = |events: &[CaptureEvent]| {
+            plan(dummy_command(), events, &probe, &InMemoryStore::new())
+                .nodes
+                .iter()
+                .filter(|n| matches!(n.op, InverseOp::Unlink { .. }))
+                .count()
+        };
+        assert_eq!(unlinks(&[change.clone(), create(2)]), 0);
+        // The shim's pre-mutation snapshot counts the same way.
+        assert_eq!(
+            unlinks(&[
+                content_pre_image_from(1, inode, &path, crate::FilePreImageSource::ShimPreMutation),
+                create(2)
+            ]),
+            0
+        );
+        // A removal in between makes the Create a real re-creation.
+        let rm = tree_event(
+            2,
+            TreeOp::Unlink {
+                inode,
+                path: path.clone(),
+                kind: FileKind::Regular,
+                mode: 0o100644,
+            },
+        );
+        let created = creates_of_snapshotted_paths(&[&change, &rm, &create(3)]);
+        assert!(created.is_empty(), "{created:?}");
+        // A Create before any snapshot stands.
+        assert_eq!(unlinks(&[create(1)]), 1);
+    }
+
+    fn content_pre_image_from(
+        id: u64,
+        inode: InodeRef,
+        path: &std::path::Path,
+        source: crate::FilePreImageSource,
+    ) -> CaptureEvent {
+        let mut e = content_pre_image(id, inode, path);
+        if let CaptureEventKind::FilePreImage { source: s, .. } = &mut e.kind {
+            *s = source;
+        }
+        e
     }
 
     fn unlink_node(path: &str) -> PlanNode {
