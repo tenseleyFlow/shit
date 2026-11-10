@@ -2048,6 +2048,132 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  refuse-helm:
+    # L8 -- helm refuse class.
+    name: refuse-helm smoke (L8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/refuse-helm-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refuse-helm-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  refuse-firewall-cmd:
+    # L8 -- firewall-cmd refuse class.
+    name: refuse-firewall-cmd smoke (L8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 python3
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        run: bash tests/smoke/refuse-firewall-cmd-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refuse-firewall-cmd-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  ufw-allow-undo:
+    # L8 -- ufw allow through the wrapper, then undo.
+    name: ufw-allow-undo smoke (L8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 ufw
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper
+      - name: run smoke
+        env:
+          SHIT_REQUIRE_OUTCOME_A: "1"
+        run: bash tests/smoke/ufw-allow-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ufw-allow-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  npm-install-global-undo:
+    # L8 -- npm install -g overwrite undo via the shim.
+    name: npm-install-global-undo smoke (L8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 nodejs npm
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        env:
+          SHIT_REQUIRE_OUTCOME_A: "1"
+        run: bash tests/smoke/npm-install-global-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-install-global-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
+  gem-install-undo:
+    # L8 -- gem install overwrite undo via the shim.
+    name: gem-install-undo smoke (L8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y python3 sqlite3 ruby
+      - name: build binaries
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke
+        env:
+          SHIT_REQUIRE_OUTCOME_A: "1"
+        run: bash tests/smoke/gem-install-undo-linux.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gem-install-undo-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   iptables-net:
     # AR08.2 -- iptables wrapper bracket-fires the daemon; a
     # NetworkOp event lands in the journal. Closes AR08.1 smoke

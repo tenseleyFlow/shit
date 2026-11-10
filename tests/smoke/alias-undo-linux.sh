@@ -5,109 +5,64 @@
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: ubuntu-24.04
 # SMOKE_TIMEOUT_SEC: 300
-# EXCLUDED_BY: 
-# EXCLUDED_REASON: 
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
-# AR06.3 smoke — `alias ll='ls -la'` adds a new alias; `shit
-# undo --apply-shell-state` queues `unalias ll …` into the per-
-# session precmd-queue so the next prompt cycle drops it.
-#
-# Exercises aliases-only diff (pwd held constant). End-to-end
-# shape mirrors cd-undo-linux.sh / set-e-undo-linux.sh.
+# The bash hook installed by `shit hooks install --shell bash` runs in an
+# interactive bash on a pty. Each state change is a line of its own: the
+# bash hook numbers every simple command, so a second command on the line
+# would move the post-state snapshot to a command whose pre-state already
+# had the change. The shell defines an alias, then `shit undo
+# --apply-shell-state`. The hook's alias snapshot records the new alias,
+# the undo queues `unalias`, and the hook's PROMPT_COMMAND sources it,
+# so the alias is gone in the same shell.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export SHIT_REPO_ROOT
 # shellcheck source=lib.sh
 source "${SHIT_REPO_ROOT}/tests/smoke/lib.sh"
+# shellcheck source=lib-hooks.sh
+source "${SHIT_REPO_ROOT}/tests/smoke/lib-hooks.sh"
 
 if [ "$(uname -s)" != "Linux" ]; then
     smoke_log "SKIP: alias-undo-linux is Linux-only (uname=$(uname -s))"
     exit 0
 fi
 
-HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
-[ -x "${HELPER_BIN}" ] || smoke_fail "shit-helper missing"
-[ -x "${SHIT_BIN}" ]   || smoke_fail "shit missing"
-export SHIT_HELPER_BIN="${HELPER_BIN}"
-
-export XDG_STATE_HOME="${SHIT_SMOKE_TMP}/state"
-mkdir -p "${XDG_STATE_HOME}"
+[ -x "${SHIT_SMOKE_BIN_DIR}/shit-helper" ] || smoke_fail "shit-helper missing"
+[ -x "${SHIT_BIN}" ] || smoke_fail "shit missing"
+export SHIT_HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 
 WATCHED="${SHIT_SMOKE_TMP}/watched"
-mkdir -p "${WATCHED}"
+DIFFERENT="${SHIT_SMOKE_TMP}/different"
+mkdir -p "${WATCHED}" "${DIFFERENT}"
 
+smoke_install_hook bash
 smoke_start_shitd
 
-SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-PID="$$"
-
-cd "${WATCHED}"
-smoke_log "pre-state: PWD=$(pwd) aliases={}"
-
-"${SHIT_BIN}" hook-send session-open \
-    --session "${SESSION}" --pid "${PID}" --shell bash \
-    --tty "$(tty 2>/dev/null || echo /dev/null)" \
-    --sock "${SHIT_HOOK_SOCK}"
-
-"${SHIT_BIN}" hook-send pre-exec \
-    --session "${SESSION}" --seq 1 --pid "${PID}" \
-    --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
-
-# Pre-state: no aliases (empty stdin still drives --from-stdin path).
-printf '' | "${SHIT_BIN}" hook-send pre-exec-shell-state \
-    --session "${SESSION}" --seq 1 --pwd "${WATCHED}" \
-    --sock "${SHIT_HOOK_SOCK}" --from-stdin
-sleep 0.3
-
-# THE workload — `alias ll='ls -la'`.
+INPUT="${SHIT_SMOKE_TMP}/bash-input"
+cat > "${INPUT}" <<EOF
 alias ll='ls -la'
+'${SHIT_BIN}' undo --yes --apply-shell-state > '${SHIT_SMOKE_TMP}/undo.log' 2>&1
+if alias ll >/dev/null 2>&1; then echo present; else echo absent; fi > '${SHIT_SMOKE_TMP}/after'
+exit
+EOF
 
-"${SHIT_BIN}" hook-send post-exec \
-    --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
-
-# Post-state: one new alias `ll`. Same pwd.
-printf 'ALIAS\tll\tls -la\0' | "${SHIT_BIN}" hook-send post-exec-shell-state \
-    --session "${SESSION}" --seq 1 --pwd "${WATCHED}" \
-    --sock "${SHIT_HOOK_SOCK}" --from-stdin
-sleep 0.5
-
-N_SSD="$(smoke_journal_count "discriminant = 'ShellStateDiff'" 2>/dev/null || echo 0)"
-smoke_log "ShellStateDiff events journaled: ${N_SSD}"
-if [ "${N_SSD}" -lt 1 ]; then
-    smoke_fail "expected >= 1 ShellStateDiff event; daemon didn't journal the alias add"
-fi
-
-smoke_log "running: shit undo --yes --apply-shell-state"
-set +e
-"${SHIT_BIN}" undo --yes --apply-shell-state > "${SHIT_SMOKE_TMP}/undo.log" 2>&1
-UNDO_RC=$?
-set -e
-smoke_log "shit undo --yes --apply-shell-state exit=${UNDO_RC}"
+smoke_log "running an interactive bash with the installed hook on a pty"
+smoke_run_hooked_shell "${WATCHED}" "${INPUT}" bash -i
+smoke_log "shit undo output:"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 
-"${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
+N_SSD="$(smoke_journal_count "discriminant = 'ShellStateDiff'")"
+smoke_log "ShellStateDiff events journaled: ${N_SSD}"
+[ "${N_SSD}" -ge 1 ] || smoke_fail "the bash hook journaled no ShellStateDiff for the alias"
 
-QUEUE_FILE="${XDG_STATE_HOME}/shit/precmd-queue/${SESSION}"
-if [ ! -f "${QUEUE_FILE}" ]; then
-    smoke_log "precmd-queue dir contents:"
-    ls -la "${XDG_STATE_HOME}/shit/precmd-queue/" 2>&1 | sed 's/^/    /' >&2 || true
-    smoke_fail "precmd-queue file missing at ${QUEUE_FILE}"
-fi
-QUEUE_BODY="$(cat "${QUEUE_FILE}")"
-smoke_log "precmd-queue body:"
-printf '%s\n' "${QUEUE_BODY}" | sed 's/^/    /' >&2
+smoke_hook_queue_drained
 
-if ! printf '%s' "${QUEUE_BODY}" | grep -qE '^unalias ll'; then
-    smoke_fail "precmd-queue file doesn't contain 'unalias ll'"
-fi
+AFTER="$(cat "${SHIT_SMOKE_TMP}/after" 2>/dev/null || true)"
+[ "${AFTER}" = absent ] \
+    || smoke_fail "the bash hook did not apply the undo: alias ll is '${AFTER}' after undo, expected absent"
 
-# Final verdict: source the snippet in a fresh subshell that has
-# `ll` defined; confirm it's gone after.
-RESULT="$(alias ll='ls -la'; source "${QUEUE_FILE}" 2>/dev/null; if alias ll >/dev/null 2>&1; then echo present; else echo absent; fi)"
-if [ "${RESULT}" != "absent" ]; then
-    smoke_fail "sourcing precmd-queue snippet didn't unalias ll: got ${RESULT}, expected absent"
-fi
-
-smoke_log "PASS: alias-undo-linux (alias ll added → snippet unaliases)"
+smoke_log "PASS: alias-undo-linux (the installed bash hook journaled the alias and drained unalias)"
