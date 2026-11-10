@@ -160,8 +160,9 @@ pub fn plan(
 /// - one whose Create and Unlink a rename shape folded away (BSD's
 ///   dir-diff Creates under a renamed tree).
 ///
-/// For each such directory with a journaled removal, an `EnsureDir`
-/// with that mode goes right before the first op under it. A directory
+/// For each such directory with a journaled mode (its removal's, else
+/// for a directory the command made, its mkdir's), an `EnsureDir` with
+/// that mode goes right before the first op under it. A directory
 /// the command created also gets a `RemoveBornDir` after every op,
 /// deepest first. A removal is looked up at the path it was journaled
 /// at and at that path mapped back through earlier renames of its
@@ -174,6 +175,8 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
     let events: Vec<&CaptureEvent> = live.iter().rev().copied().collect();
     let mut removed: Vec<(PathBuf, u32)> = Vec::new();
     let mut born: Vec<PathBuf> = Vec::new();
+    let mut created_mode: std::collections::HashMap<PathBuf, u32> =
+        std::collections::HashMap::new();
     for (i, e) in events.iter().enumerate() {
         let (path, mode, is_create) = match &e.kind {
             CaptureEventKind::TreeOp(TreeOp::Unlink {
@@ -185,8 +188,9 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
             CaptureEventKind::TreeOp(TreeOp::Create {
                 path,
                 kind: FileKind::Directory,
+                mode,
                 ..
-            }) => (path, 0, true),
+            }) => (path, *mode, true),
             _ => continue,
         };
         let mut names = vec![path.clone()];
@@ -206,8 +210,9 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
         for n in names {
             if is_create {
                 if !born.contains(&n) {
-                    born.push(n);
+                    born.push(n.clone());
                 }
+                created_mode.insert(n, mode);
             } else {
                 removed.push((n, mode));
             }
@@ -218,6 +223,17 @@ fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut
     let mut order: Vec<PathBuf> = Vec::new();
     for (p, m) in removed {
         if mode_of.insert(p.clone(), m).is_none() {
+            order.push(p);
+        }
+    }
+    // A born directory whose removal came without a kind or mode (the
+    // LSM tier holds no fd on a directory made mid-command, so its
+    // rmdir races and is journaled as a marker) uses the mode its mkdir
+    // journaled. That mode is journaled too, and the scratch directory
+    // is removed again at the end.
+    for (p, m) in created_mode {
+        if let std::collections::hash_map::Entry::Vacant(v) = mode_of.entry(p.clone()) {
+            v.insert(m);
             order.push(p);
         }
     }

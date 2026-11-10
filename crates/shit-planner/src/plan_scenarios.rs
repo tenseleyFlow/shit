@@ -1986,6 +1986,40 @@ fn kqueue_order_dir_removal_before_its_children_restores_the_private_dir() {
 }
 
 #[test]
+fn file_moved_into_new_dir_then_rm_rf_with_a_marker_rmdir_leaves_no_stray_dir() {
+    // #215 as the LSM tier journals it: the helper holds no fd on a
+    // directory made mid-command, so its rmdir races and arrives as a
+    // marker with the wire's Regular default. The born directory's mode
+    // comes from its mkdir instead.
+    let mut sim = Sim::new();
+    sim.seed_dir("existing", 0o755);
+    sim.seed_file("existing/f", b"f\n", 0o644);
+    let before = sim.snapshot();
+    sim.mkdir("d");
+    sim.mv("existing/f", "d/");
+    let d = sim.p("d");
+    let f = sim.p("d/f");
+    let fm = std::fs::symlink_metadata(&f).unwrap();
+    let dm = std::fs::symlink_metadata(&d).unwrap();
+    sim.pre_image(&f, FilePreImageSource::Other);
+    std::fs::remove_file(&f).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(fm.dev(), fm.ino()),
+        path: f,
+        kind: FileKind::Regular,
+        mode: fm.mode(),
+    }));
+    std::fs::remove_dir(&d).unwrap();
+    sim.emit(CaptureEventKind::TreeOp(TreeOp::Unlink {
+        inode: InodeRef::new(dm.dev(), dm.ino()),
+        path: d,
+        kind: FileKind::Regular,
+        mode: 0o100644,
+    }));
+    assert_restored(&sim, &before);
+}
+
+#[test]
 fn file_moved_into_new_dir_then_rm_rf_leaves_no_stray_dir() {
     // #215: `mkdir d; mv existing/f d/; rm -rf d`. The file comes back
     // to existing/f and `d`, born in the command, is gone again.
