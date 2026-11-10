@@ -390,12 +390,13 @@ fn pre_syscall_unlink_stat(note: &ShimNotification) -> Option<UnlinkStat> {
 
 /// #213: why a shim `unlink`/`unlinkat` of an absolute path has no
 /// trustworthy kind, or `None` when the shim's pre-call stat supplied
-/// it. The shim lstats the target in process before every unlink and
-/// sends the result, so a note without one means the shim found nothing
-/// there. The daemon's lstat is then the only source, and it races the
-/// syscall: it can find nothing, or a different entry. Undo would then
-/// recreate a guessed kind (a regular file where a directory was, and
-/// every child restore fails ENOTDIR), so the removal is refused.
+/// it. The shim lstats the target in process before every unlink. When
+/// nothing is there it sends no note at all (the call removes nothing);
+/// when lstat fails any other way it sends the note without a stat. The
+/// daemon's lstat is then the only source, and it races the syscall: it
+/// can find nothing, or a different entry. Undo would then recreate a
+/// guessed kind (a regular file where a directory was, and every child
+/// restore fails ENOTDIR), so the removal is refused.
 fn racy_unlink_reason(note: &ShimNotification, stat: Option<&UnlinkStat>) -> Option<String> {
     if !matches!(note.syscall.as_str(), "unlink" | "unlinkat")
         || !Path::new(&note.arg).is_absolute()

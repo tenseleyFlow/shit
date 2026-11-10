@@ -383,3 +383,23 @@ fn unkeyed_removal_carries_no_stat_and_honors_the_mute() {
     });
     assert!(muted.is_none());
 }
+
+/// #213 (review of #262, item 2): unlinking a path that does not exist
+/// removes nothing, so the shim sends nothing. A note without a pre-call
+/// stat would make the daemon refuse the path, a false refusal at undo.
+#[test]
+fn unlink_of_a_missing_path_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let gone = CString::new(dir.join("never-there").to_str().unwrap()).unwrap();
+    let dfd = std::fs::File::open(&dir).unwrap();
+    let name = CString::new("never-there").unwrap();
+    let notes = capture_pre(|| {
+        assert_eq!(unsafe { super::interposers::unlink(gone.as_ptr()) }, -1);
+        assert_eq!(
+            unsafe { super::interposers::unlinkat(dfd.as_raw_fd(), name.as_ptr(), 0) },
+            -1
+        );
+    });
+    assert!(notes.is_empty(), "{notes:#?}");
+}
