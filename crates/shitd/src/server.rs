@@ -407,7 +407,7 @@ fn handle(
                 session,
                 shell_kind.as_str(),
                 *parent_pid,
-                Some(tty.as_str()),
+                tty_or_none(tty),
                 ts,
             ) {
                 warn!(err = %e, "put_session failed");
@@ -447,7 +447,7 @@ fn handle(
                 // / fish equivalent) so the planner's refuse-list
                 // match has the command string to operate on.
                 cmd_string: cmd_string.clone(),
-                cwd: PathBuf::from(cwd_path),
+                cwd: shit_proto::wire_path::decode(cwd_path),
                 pid: *pid,
                 shell_kind: *shell_kind,
                 started_at: ts,
@@ -475,7 +475,7 @@ fn handle(
                 request_watch(
                     &close_ctx.live_baseline,
                     command,
-                    PathBuf::from(cwd_path),
+                    shit_proto::wire_path::decode(cwd_path),
                     || link.send_request(&req),
                 );
             }
@@ -626,11 +626,23 @@ fn handle(
     debug!(?msg, "decoded frame");
 }
 
+/// The shell hooks send an empty `--tty` when stdin is not a terminal;
+/// store that as NULL rather than an empty string.
+fn tty_or_none(tty: &str) -> Option<&str> {
+    if tty.is_empty() { None } else { Some(tty) }
+}
+
 #[cfg(test)]
 mod close_barrier_tests {
     use super::*;
     use crate::watch_ready::WatchReadyMap;
     use uuid::Uuid;
+
+    #[test]
+    fn empty_tty_is_stored_as_null() {
+        assert_eq!(tty_or_none(""), None);
+        assert_eq!(tty_or_none("/dev/pts/3"), Some("/dev/pts/3"));
+    }
 
     /// Review of #232, item 1: the helper answers WatchTree with a
     /// failure before `send_request` returns. The command must not stay

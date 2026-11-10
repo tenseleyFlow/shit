@@ -24,6 +24,7 @@ pub mod metadata;
 pub mod network;
 pub mod network_diff;
 pub mod orchestrator;
+pub mod path_bytes;
 pub mod plan;
 pub mod plan_forward;
 #[cfg(test)]

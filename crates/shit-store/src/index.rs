@@ -142,7 +142,7 @@ impl Index {
                 cmd.command.session.as_bytes().as_slice(),
                 cmd.command.seq as i64,
                 cmd.cmd_string.as_deref(),
-                cmd.cwd.to_string_lossy(),
+                shit_proto::wire_path::encode(&cmd.cwd),
                 cmd.pid as i64,
                 cmd.shell_kind.as_str(),
                 cmd.started_at.logical as i64,
@@ -521,7 +521,7 @@ impl Index {
                     seq: seq as u64,
                 },
                 cmd_string,
-                cwd: PathBuf::from(cwd),
+                cwd: shit_proto::wire_path::decode(&cwd),
                 pid: pid as u32,
                 shell_kind: shell_kind.parse().unwrap_or(shit_proto::ShellKind::Unknown),
                 started_at: TimePoint::new(started_logical as u64, started_wall as u64),
@@ -560,7 +560,7 @@ fn update_path_history_with_conn(
                  VALUES (?1, ?2, ?3, ?4, NULL)
                  ON CONFLICT(path, valid_from_logical) DO NOTHING",
                 params![
-                    path.to_string_lossy(),
+                    shit_proto::wire_path::encode(path),
                     inode.dev as i64,
                     inode.inode as i64,
                     ts.logical as i64,
@@ -574,21 +574,21 @@ fn update_path_history_with_conn(
             conn.execute(
                 "UPDATE paths SET valid_to_logical = ?2
                  WHERE path = ?1 AND valid_to_logical IS NULL",
-                params![path.to_string_lossy(), ts.logical as i64],
+                params![shit_proto::wire_path::encode(path), ts.logical as i64],
             )?;
         }
         T::Rename { from, to, inode } => {
             conn.execute(
                 "UPDATE paths SET valid_to_logical = ?2
                  WHERE path = ?1 AND valid_to_logical IS NULL",
-                params![from.to_string_lossy(), ts.logical as i64],
+                params![shit_proto::wire_path::encode(from), ts.logical as i64],
             )?;
             conn.execute(
                 "INSERT INTO paths (path, dev, inode, valid_from_logical, valid_to_logical)
                  VALUES (?1, ?2, ?3, ?4, NULL)
                  ON CONFLICT(path, valid_from_logical) DO NOTHING",
                 params![
-                    to.to_string_lossy(),
+                    shit_proto::wire_path::encode(to),
                     inode.dev as i64,
                     inode.inode as i64,
                     ts.logical as i64,
@@ -601,7 +601,7 @@ fn update_path_history_with_conn(
                  VALUES (?1, ?2, ?3, ?4, NULL)
                  ON CONFLICT(path, valid_from_logical) DO NOTHING",
                 params![
-                    target.to_string_lossy(),
+                    shit_proto::wire_path::encode(target),
                     source.dev as i64,
                     source.inode as i64,
                     ts.logical as i64,
@@ -616,7 +616,7 @@ fn update_path_history_with_conn(
                 "INSERT INTO paths (path, dev, inode, valid_from_logical, valid_to_logical)
                  VALUES (?1, 0, 0, ?2, NULL)
                  ON CONFLICT(path, valid_from_logical) DO NOTHING",
-                params![path.to_string_lossy(), ts.logical as i64],
+                params![shit_proto::wire_path::encode(path), ts.logical as i64],
             )?;
         }
         T::SymlinkRemoved { path, .. } => {
@@ -626,7 +626,7 @@ fn update_path_history_with_conn(
             conn.execute(
                 "UPDATE paths SET valid_to_logical = ?2
                  WHERE path = ?1 AND valid_to_logical IS NULL",
-                params![path.to_string_lossy(), ts.logical as i64],
+                params![shit_proto::wire_path::encode(path), ts.logical as i64],
             )?;
         }
     }
@@ -643,7 +643,7 @@ fn resolve_path_at(conn: &Connection, path: &Path, at: TimePoint) -> Option<Inod
            AND (valid_to_logical IS NULL OR valid_to_logical > ?2)
          ORDER BY valid_from_logical DESC
          LIMIT 1",
-        params![path.to_string_lossy(), at.logical as i64],
+        params![shit_proto::wire_path::encode(path), at.logical as i64],
         |row| {
             let dev: i64 = row.get(0)?;
             let inode: i64 = row.get(1)?;
@@ -678,7 +678,7 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             discriminant: "FilePreImage",
             dev: Some(inode.dev as i64),
             inode: Some(inode.inode as i64),
-            path: Some(path.to_string_lossy().into_owned()),
+            path: Some(shit_proto::wire_path::encode(path)),
             blob_hash: Some(blob),
             post_content_hash: post_content_hash.as_ref(),
         },
@@ -686,7 +686,7 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             discriminant: "MetadataChange",
             dev: Some(inode.dev as i64),
             inode: Some(inode.inode as i64),
-            path: Some(path.to_string_lossy().into_owned()),
+            path: Some(shit_proto::wire_path::encode(path)),
             blob_hash: None,
             post_content_hash: None,
         },
@@ -699,7 +699,7 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             discriminant: "FileAppendPreStash",
             dev: Some(inode.dev as i64),
             inode: Some(inode.inode as i64),
-            path: Some(path.to_string_lossy().into_owned()),
+            path: Some(shit_proto::wire_path::encode(path)),
             blob_hash: None,
             post_content_hash: None,
         },
@@ -708,43 +708,43 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
                 T::Create { inode, path, .. } => (
                     Some(inode.dev as i64),
                     Some(inode.inode as i64),
-                    Some(path.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(path)),
                     "TreeOpCreate",
                 ),
                 T::Unlink { inode, path, .. } => (
                     Some(inode.dev as i64),
                     Some(inode.inode as i64),
-                    Some(path.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(path)),
                     "TreeOpUnlink",
                 ),
                 T::Rename { inode, to, .. } => (
                     Some(inode.dev as i64),
                     Some(inode.inode as i64),
-                    Some(to.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(to)),
                     "TreeOpRename",
                 ),
                 T::Link { source, target } => (
                     Some(source.dev as i64),
                     Some(source.inode as i64),
-                    Some(target.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(target)),
                     "TreeOpLink",
                 ),
                 T::Symlink { path, .. } => (
                     None,
                     None,
-                    Some(path.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(path)),
                     "TreeOpSymlink",
                 ),
                 T::SymlinkRemoved { path, .. } => (
                     None,
                     None,
-                    Some(path.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(path)),
                     "TreeOpSymlinkRemoved",
                 ),
                 T::DeviceNodeMeta { inode, path, .. } => (
                     Some(inode.dev as i64),
                     Some(inode.inode as i64),
-                    Some(path.to_string_lossy().into_owned()),
+                    Some(shit_proto::wire_path::encode(path)),
                     "TreeOpDeviceNodeMeta",
                 ),
             };
@@ -856,7 +856,7 @@ fn denormalize(kind: &CaptureEventKind) -> Denormalized<'_> {
             discriminant: "CaptureRefused",
             dev: None,
             inode: None,
-            path: Some(path.to_string_lossy().into_owned()),
+            path: Some(shit_proto::wire_path::encode(path)),
             blob_hash: None,
             post_content_hash: None,
         },
@@ -926,7 +926,7 @@ impl Index {
             params![
                 command.session.as_bytes().as_slice(),
                 command.seq as i64,
-                path.to_string_lossy()
+                shit_proto::wire_path::encode(path)
             ],
         )
     }
@@ -1003,7 +1003,7 @@ impl PlannerStore for Index {
         // referred to at `at`. If found, query unifies literal-path and
         // inode-resolved events; otherwise we fall back to literal-only.
         let inode_at = resolve_path_at(&conn, path, at);
-        let path_str = path.to_string_lossy();
+        let path_str = shit_proto::wire_path::encode(path);
 
         match inode_at {
             Some(i) => collect_events(
@@ -1062,7 +1062,7 @@ impl PlannerStore for Index {
                 Ok(CommandRecord {
                     command: id,
                     cmd_string,
-                    cwd: PathBuf::from(cwd),
+                    cwd: shit_proto::wire_path::decode(&cwd),
                     pid: pid as u32,
                     shell_kind: shell_kind.parse().unwrap_or(shit_proto::ShellKind::Unknown),
                     started_at: TimePoint::new(started_logical as u64, started_wall as u64),
@@ -1247,6 +1247,48 @@ mod tests {
             }
             _ => panic!("kind mismatch"),
         }
+    }
+
+    #[test]
+    fn non_utf8_paths_are_stored_byte_exact() {
+        // #211: a Latin-1 directory name. Default serde refused to encode
+        // it, and the lossy TEXT columns stored U+FFFD.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 0, None, TimePoint::new(0, 0))
+            .unwrap();
+        let mut cmd = sample_command(session, 1);
+        cmd.cwd = PathBuf::from(OsString::from_vec(b"/tmp/caf\xe9".to_vec()));
+        idx.put_command(&cmd).unwrap();
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/caf\xe9/victim".to_vec()));
+        let ev = CaptureEvent {
+            id: EventId(0),
+            command: CommandId { session, seq: 1 },
+            ts: TimePoint::new(1, 1000),
+            partial: false,
+            kind: CaptureEventKind::TreeOp(shit_planner::TreeOp::Unlink {
+                inode: InodeRef::new(1, 42),
+                path: path.clone(),
+                kind: shit_planner::FileKind::Regular,
+                mode: 0o100600,
+            }),
+        };
+        idx.put_event(&ev).unwrap();
+        let fetched = idx.events_for_command(CommandId { session, seq: 1 });
+        match &fetched[0].kind {
+            CaptureEventKind::TreeOp(shit_planner::TreeOp::Unlink { path: p, .. }) => {
+                assert_eq!(p.as_os_str().as_bytes(), b"/tmp/caf\xe9/victim")
+            }
+            other => panic!("{other:?}"),
+        }
+        let at_path = idx.events_for_command_at_path(CommandId { session, seq: 1 }, &path);
+        assert_eq!(at_path.len(), 1);
+        let back = idx
+            .command_by_id(CommandId { session, seq: 1 })
+            .expect("command row");
+        assert_eq!(back.cwd.as_os_str().as_bytes(), b"/tmp/caf\xe9");
     }
 
     #[test]

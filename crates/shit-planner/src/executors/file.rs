@@ -75,9 +75,56 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
                 err: format!("FileExecutor cannot execute op of tier {:?}", op.tier()),
             };
         }
-        if dry_run {
-            return ExecutionOutcome::WouldApply;
+        // #214: a parent directory that is missing and whose mode no
+        // journaled op restores is made 0700, which cannot widen access,
+        // and the step says so. The umask default could turn a 0700
+        // directory into 0755. Checked before the dry-run return so a
+        // dry run shows the same note.
+        let missing = match op {
+            InverseOp::RestoreContent { path, .. }
+            | InverseOp::RecreatePath { path, .. }
+            | InverseOp::EnsureDir { path, .. } => path.parent().map(missing_ancestors),
+            _ => None,
         }
+        .unwrap_or_default();
+        let note = missing.first().map(|top| {
+            format!(
+                "{} did not exist and its mode was not captured; recreated it 0700",
+                top.display()
+            )
+        });
+        if dry_run {
+            // A dry run applies nothing, so an earlier step that would
+            // recreate the parent has not run; say both.
+            return match missing.first() {
+                Some(top) => ExecutionOutcome::WouldApplyWithNote {
+                    note: format!(
+                        "{} is missing now; unless an earlier step recreates it, \
+                         undo makes it 0700 because its mode was not captured",
+                        top.display()
+                    ),
+                },
+                None => ExecutionOutcome::WouldApply,
+            };
+        }
+        if let Err(err) = make_private_dirs(&missing) {
+            return ExecutionOutcome::Failed { err };
+        }
+        let outcome = self.dispatch(op);
+        match (note, outcome) {
+            (Some(note), ExecutionOutcome::Applied) => ExecutionOutcome::AppliedWithNote { note },
+            (Some(note), ExecutionOutcome::AppliedWithNote { note: more }) => {
+                ExecutionOutcome::AppliedWithNote {
+                    note: format!("{note}; {more}"),
+                }
+            }
+            (_, outcome) => outcome,
+        }
+    }
+}
+
+impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
+    fn dispatch(&self, op: &InverseOp) -> ExecutionOutcome {
         match op {
             InverseOp::RestoreContent { .. } => self.apply_restore_content(op),
             InverseOp::RestoreMetadata { .. } => self.apply_restore_metadata(op),
@@ -88,6 +135,8 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
             InverseOp::CreateSymlink { .. } => self.apply_create_symlink(op),
             InverseOp::CreateHardlink { .. } => self.apply_create_hardlink(op),
             InverseOp::FileExtend { .. } => self.apply_file_extend(op),
+            InverseOp::EnsureDir { path, mode } => outcome(ensure_dir(path, *mode)),
+            InverseOp::RemoveBornDir { path } => remove_born_dir(path),
             other => ExecutionOutcome::Failed {
                 err: format!(
                     "FileExecutor: unexpected variant {other:?} after supports() said yes — bug?"
@@ -126,16 +175,9 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             .parent()
             .ok_or_else(|| format!("path {path:?} has no parent dir; cannot place tmpfile"))?;
 
-        // G01.5 — if the parent dir was removed alongside this file
-        // (e.g. `git clean -fd` rmdirs untracked directories after
-        // unlinking their contents), recreate the ancestor chain
-        // with default mode (0o755). Untracked dirs typically have
-        // default mode anyway; if a future use case needs the
-        // ORIGINAL mode we'd need to plumb kind+mode through the
-        // wire (deferred — see G01 plan).
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir -p {parent:?}: {e}"))?;
-        }
+        // #214: a missing parent was made 0700 by `execute` already; a
+        // journaled one came back with its own mode ahead of this op.
+        require_parent(parent)?;
 
         // Tmpfile name: ".shit-tmp-<pid>-<ns>" alongside target so rename(2)
         // is atomic on the same filesystem. If the rename later fails
@@ -293,16 +335,11 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
             };
         }
         if is_device || matches!(kind, FileKind::Fifo | FileKind::Socket) {
-            // G01.5 — same parent-tree guarantee as the regular path
-            // (recreate_path_inner does this for us; we mirror it
-            // here for the mknod branch).
+            // #214 — `execute` made any missing parent already.
             if let Some(parent) = path.parent()
-                && !parent.exists()
-                && let Err(e) = fs::create_dir_all(parent)
+                && let Err(err) = require_parent(parent)
             {
-                return ExecutionOutcome::Failed {
-                    err: format!("mkdir -p {parent:?}: {e}"),
-                };
+                return ExecutionOutcome::Failed { err };
             }
             // mode wire carries perm bits + S_IF* kind. The router
             // dispatches into the helper which calls libc::mknod
@@ -690,6 +727,104 @@ fn unlink_inner(path: &Path) -> Result<(), String> {
     }
 }
 
+fn outcome(r: Result<(), String>) -> ExecutionOutcome {
+    match r {
+        Ok(()) => ExecutionOutcome::Applied,
+        Err(err) => ExecutionOutcome::Failed { err },
+    }
+}
+
+/// #214: a guard for the inner functions. The executor's entry has
+/// already made any missing parent (see `execute`), so this only fails
+/// when one vanished in between.
+fn require_parent(parent: &Path) -> Result<(), String> {
+    if parent.as_os_str().is_empty() || fs::symlink_metadata(parent).is_ok() {
+        return Ok(());
+    }
+    Err(format!("{} is missing", parent.display()))
+}
+
+/// The missing directories from the topmost one down to `dir`. Empty
+/// when `dir` exists.
+fn missing_ancestors(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = dir
+        .ancestors()
+        .take_while(|a| !a.as_os_str().is_empty() && fs::symlink_metadata(a).is_err())
+        .map(Path::to_path_buf)
+        .collect();
+    out.reverse();
+    out
+}
+
+/// #214: make each directory 0700, top down. 0700 is set after mkdir so
+/// no umask can change it.
+fn make_private_dirs(dirs: &[PathBuf]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    for d in dirs {
+        match fs::create_dir(d) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("mkdir {d:?}: {e}")),
+        }
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod {d:?} -> 700: {e}"))?;
+    }
+    Ok(())
+}
+
+/// #215: recreate a directory the command created and removed, with
+/// its journaled mode. An existing directory is left untouched.
+fn ensure_dir(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => return Ok(()),
+        Ok(_) => return Err(format!("{path:?} exists and is not a directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("lstat {path:?}: {e}")),
+    }
+    if let Some(parent) = path.parent() {
+        require_parent(parent)?;
+    }
+    let perm_bits = mode & 0o7777;
+    fs::create_dir(path).map_err(|e| format!("mkdir {path:?}: {e}"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(perm_bits))
+        .map_err(|e| format!("chmod {path:?} -> {perm_bits:o}: {e}"))
+}
+
+/// #215: rmdir a directory born in the command once the undo has moved
+/// everything back out. Not there is fine. Still holding something
+/// (for example a file created after the command) means it stays, with
+/// a note.
+fn remove_born_dir(path: &Path) -> ExecutionOutcome {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ExecutionOutcome::Applied,
+        Ok(m) if !m.is_dir() => {
+            return ExecutionOutcome::AppliedWithNote {
+                note: format!(
+                    "{} was created by the command and is now not a directory; left in place",
+                    path.display()
+                ),
+            };
+        }
+        _ => {}
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => ExecutionOutcome::Applied,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExecutionOutcome::Applied,
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            ExecutionOutcome::AppliedWithNote {
+                note: format!(
+                    "{} was created by the command but is not empty after undo; left in place",
+                    path.display()
+                ),
+            }
+        }
+        Err(e) => ExecutionOutcome::Failed {
+            err: format!("rmdir {path:?}: {e}"),
+        },
+    }
+}
+
 /// Recreate a path the original command unlinked. Handles regular
 /// files and directories. Fifo, Socket, BlockDevice and CharDevice
 /// are NOT routed here; the executor dispatches those through
@@ -704,18 +839,10 @@ fn recreate_path_inner(
     use std::os::unix::fs::PermissionsExt;
 
     let perm_bits = mode & 0o7777;
-    // G01.5 — mkdir -p the parent if it's gone. Same rationale as
-    // restore_content_inner: a recursive `rm -rf` (or `git clean -fd`)
-    // leaves nested files orphaned from their dir tree at undo time.
-    // Untracked / build-cache dirs typically had default mode; if the
-    // user needs the original mode of an intermediate, a future wire
-    // change to TreeOpWire::Unlink carrying kind+mode would let the
-    // planner emit dedicated dir RecreatePath ops first (deferred,
-    // see G01 plan).
-    if let Some(parent) = path.parent()
-        && !parent.exists()
-    {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir -p {parent:?}: {e}"))?;
+    // #214 — never `mkdir -p` a missing parent at the umask; `execute`
+    // made it 0700 already.
+    if let Some(parent) = path.parent() {
+        require_parent(parent)?;
     }
     match kind {
         FileKind::Regular => {
@@ -1051,11 +1178,12 @@ mod tests {
     }
 
     #[test]
-    fn recreate_path_creates_missing_parent_dirs() {
-        // A nested `rm -rf` unlinks children before parents, so undo
-        // can reach a child's RecreatePath while its parent is still
-        // missing. The executor must build the chain instead of
-        // failing, for directories and regular files alike.
+    fn recreate_path_makes_an_unjournaled_parent_0700_with_a_note() {
+        // #214: a nested `rm -rf` journals each directory's removal, and
+        // the planner orders that RecreatePath ahead of the children. A
+        // parent missing here had no journaled removal, so its mode is
+        // unknown: it is made 0700, which cannot widen access, never at
+        // the umask, and the step says so.
         use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let dir = tmpdir.path().join("a").join("b").join("empty");
@@ -1063,9 +1191,9 @@ mod tests {
 
         let r = InMemoryBlobReader::new();
         let e = FileExecutor::new(&r);
-        for (path, kind, mode) in [
-            (&dir, crate::metadata::FileKind::Directory, 0o040711),
-            (&file, crate::metadata::FileKind::Regular, 0o100600),
+        for (path, kind, mode, top) in [
+            (&dir, crate::metadata::FileKind::Directory, 0o040711, "a"),
+            (&file, crate::metadata::FileKind::Regular, 0o100600, "c"),
         ] {
             let op = InverseOp::RecreatePath {
                 path: path.clone(),
@@ -1073,16 +1201,127 @@ mod tests {
                 mode,
                 device: None,
             };
-            assert_eq!(
-                e.execute(&op, false, ConflictPolicy::default()),
-                ExecutionOutcome::Applied,
-                "{path:?}"
-            );
+            match e.execute(&op, false, ConflictPolicy::default()) {
+                ExecutionOutcome::AppliedWithNote { note } => {
+                    assert!(note.contains("mode was not captured"), "{note}");
+                    assert!(note.contains(top), "{note}");
+                }
+                other => panic!("expected AppliedWithNote, got {other:?}"),
+            }
             let m = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
             assert_eq!(m, mode & 0o7777, "{path:?}");
+            for p in path.parent().unwrap().ancestors().take(2) {
+                let pm = std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(pm, 0o700, "{p:?}");
+            }
         }
-        assert!(dir.is_dir());
-        assert!(file.is_file());
+    }
+
+    #[test]
+    fn dry_run_reports_the_parent_it_would_make() {
+        // Review of #262, item 3: a dry run shows the same note the
+        // real run gives, and creates nothing.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("gone").join("f");
+        let blob_hash = BlobHash::from_bytes([2; 32]);
+        let mut reader = InMemoryBlobReader::new();
+        reader.insert(blob_hash, b"x".to_vec());
+        let e = FileExecutor::new(&reader);
+        let op = InverseOp::RestoreContent {
+            inode: InodeRef::new(1, 1),
+            path: target.clone(),
+            blob: blob_hash,
+        };
+        match e.execute(&op, true, ConflictPolicy::default()) {
+            ExecutionOutcome::WouldApplyWithNote { note } => {
+                assert!(note.contains("0700"), "{note}")
+            }
+            other => panic!("expected WouldApplyWithNote, got {other:?}"),
+        }
+        assert!(!tmpdir.path().join("gone").exists());
+    }
+
+    #[test]
+    fn ensure_dir_makes_the_journaled_mode_past_the_umask() {
+        // #214/#215: EnsureDir creates with the exact journaled mode
+        // (0700 survives a 022 umask, 0777 is not shaved to 0755) and
+        // leaves an existing directory alone.
+        use std::os::unix::fs::PermissionsExt;
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        for (name, mode) in [("private", 0o040700), ("open", 0o040777)] {
+            let p = tmpdir.path().join(name);
+            let op = InverseOp::EnsureDir {
+                path: p.clone(),
+                mode,
+            };
+            assert_eq!(
+                e.execute(&op, false, ConflictPolicy::default()),
+                ExecutionOutcome::Applied
+            );
+            let m = std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(m, mode & 0o7777, "{p:?}");
+        }
+        let existing = tmpdir.path().join("private");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let op = InverseOp::EnsureDir {
+            path: existing.clone(),
+            mode: 0o040700,
+        };
+        assert_eq!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        let m = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m, 0o750);
+        // Missing grandparent: made 0700 like any other unjournaled
+        // parent; the directory itself gets its journaled mode.
+        let deep = tmpdir.path().join("gone").join("x");
+        let op = InverseOp::EnsureDir {
+            path: deep.clone(),
+            mode: 0o040755,
+        };
+        assert!(matches!(
+            e.execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::AppliedWithNote { .. }
+        ));
+        let m = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(m(&deep), 0o755);
+        assert_eq!(m(&tmpdir.path().join("gone")), 0o700);
+    }
+
+    #[test]
+    fn remove_born_dir_takes_an_empty_dir_and_keeps_a_full_one() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let r = InMemoryBlobReader::new();
+        let e = FileExecutor::new(&r);
+        let empty = tmpdir.path().join("empty");
+        let full = tmpdir.path().join("full");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("later"), b"x").unwrap();
+        let run = |p: &Path| {
+            e.execute(
+                &InverseOp::RemoveBornDir {
+                    path: p.to_path_buf(),
+                },
+                false,
+                ConflictPolicy::default(),
+            )
+        };
+        assert_eq!(run(&empty), ExecutionOutcome::Applied);
+        assert!(!empty.exists());
+        assert_eq!(
+            run(&empty),
+            ExecutionOutcome::Applied,
+            "gone already is fine"
+        );
+        assert!(matches!(
+            run(&full),
+            ExecutionOutcome::AppliedWithNote { .. }
+        ));
+        assert!(full.join("later").exists());
     }
 
     #[test]
@@ -1496,13 +1735,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_content_recreates_missing_parent_dir() {
-        // G01.5: when the parent dir is gone (e.g. `git clean -fd`
-        // rmdir'd it after unlinking contents), RestoreContent
-        // should `mkdir -p` the chain and complete successfully.
-        // Pre-G01.5 this test asserted Failed; the new behavior is
-        // Applied because the executor recreates missing ancestors
-        // with default mode (0o755).
+    fn restore_content_makes_a_missing_parent_0700_not_at_the_umask() {
+        // #214: G01.5 used to `mkdir -p` the chain at the umask, so a
+        // 0700 directory removed without a journal row came back 0755.
+        // The data still comes back; the unjournaled parents are 0700.
+        use std::os::unix::fs::PermissionsExt;
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let nonexistent_parent = tmpdir.path().join("nested-a").join("nested-b");
         let target = nonexistent_parent.join("file");
@@ -1518,13 +1755,16 @@ mod tests {
             blob: blob_hash,
         };
         match executor.execute(&op, false, ConflictPolicy::default()) {
-            ExecutionOutcome::Applied => {}
-            other => panic!("expected Applied, got {other:?}"),
+            ExecutionOutcome::AppliedWithNote { note } => {
+                assert!(note.contains("nested-a did not exist"), "{note}")
+            }
+            other => panic!("expected AppliedWithNote, got {other:?}"),
         }
-        // File now exists with the expected content; parents were
-        // created.
-        let body = std::fs::read(&target).expect("read restored file");
-        assert_eq!(body, b"hello");
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+        for d in [&nonexistent_parent, &tmpdir.path().join("nested-a")] {
+            let m = std::fs::metadata(d).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(m, 0o700, "{d:?}");
+        }
     }
 
     fn device_op(

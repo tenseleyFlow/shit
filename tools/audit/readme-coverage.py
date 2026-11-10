@@ -41,9 +41,9 @@ FAMILIES = [
     ("Containers", r"^(docker-|podman-)"),
     ("Cloud and IaC", r"^(terraform-|kubectl-|gh-)"),
     ("Services, firewall, network and processes",
-     r"^(systemctl-|service-|launchctl-|nft-|iptables-|pfctl-|networksetup-|route-|kill-)"),
+     r"^(systemctl-|service-|launchctl-|nft-|iptables-|ufw-|pfctl-|networksetup-|route-|kill-)"),
     ("Databases", r"^sqlite3-"),
-    ("Build and install", r"^(make-install-|cargo-|pip-install-|python-venv-)"),
+    ("Build and install", r"^(make-install-|cargo-|pip-install-|npm-install-|gem-install-|python-venv-)"),
     ("Post-hash drift detection", r"^post-hash-"),
     ("Command shapes (pipelines, wrappers, read-only)",
      r"^(find-exec-|xargs-|and-chain-|bash-c-|background-job-|read-only-cmd-|ssh-keygen-)"),
@@ -51,7 +51,7 @@ FAMILIES = [
      r"^(chmod-|chown-|chflags-|xattr-|setxattr-)"),
     ("Filesystem: remove, rename, link, create",
      r"^(rm-|rmdir-|mv-|dir-rename-|renameat-|ln-|link-|hardlink-|symlink-|mkdir-|mkfifo-|mknod-|"
-     r"large-file-rm-|non-ascii-|non-utf8-|canonicalize-)"),
+     r"large-file-rm-|non-ascii-|non-utf8-|canonicalize-|restore-fidelity-)"),
     ("Filesystem: content writes and editors",
      r"^(edit-|touch-edit-|vim-|sed-|awk-|sort-|tee-|dd-|shell-|redirect-|write-in-place-|mmap-|cp-|"
      r"large-file-overwrite-|patch-|split-|rotate-|backup-and-modify-|gzip-|tar-|cpio-|rsync-)"),

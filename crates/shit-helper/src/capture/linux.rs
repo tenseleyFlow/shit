@@ -860,7 +860,7 @@ impl LinuxCaptureRuntime {
                 // path used for the journal entry (Issue #22).
                 // Review item 6 (L4b): the race-to-open fallback holds
                 // the entry without opening a fifo or device for reading.
-                match open_held_nofollow(&resolved_path) {
+                match open_held_nofollow(shit_proto::wire_path::decode(&resolved_path)) {
                     Ok(fd) => (Some(fd), "race"),
                     Err(_) => (None, "miss"),
                 }
@@ -1335,7 +1335,7 @@ impl LinuxCaptureRuntime {
             );
             return;
         };
-        let resolved_dir = PathBuf::from(&resolved_dir_str);
+        let resolved_dir = shit_proto::wire_path::decode(&resolved_dir_str);
 
         // Stat to grab the (dev, inode) of the freshly-created dir.
         //
@@ -1436,7 +1436,7 @@ impl LinuxCaptureRuntime {
         // resolve_via_parent attempt (now guaranteed to hit) and
         // takes the standard process_lsm_create_resolved path.
         for pc in drained {
-            let resolved_child = resolved_dir.join(&pc.basename);
+            let resolved_child = resolved_dir.join(shit_proto::wire_path::decode(&pc.basename));
             self.process_lsm_create_resolved(pc.command, pc.pid, resolved_child, pc.mode);
         }
     }
@@ -1501,7 +1501,7 @@ impl LinuxCaptureRuntime {
                 return;
             }
         };
-        let resolved_path = PathBuf::from(&resolved_path_str);
+        let resolved_path = shit_proto::wire_path::decode(&resolved_path_str);
 
         // Note: the `ws` borrow from above goes out of scope at the
         // call below -- process_lsm_create_resolved re-borrows.
@@ -2077,7 +2077,7 @@ impl LinuxCaptureRuntime {
             ws.acct.note_unresolved_rename();
             if let Some(to) = to_resolved.as_deref() {
                 ws.acct.note_rename_target(to.to_string());
-                note_replaced_without_capture(ws, Path::new(to), moved);
+                note_replaced_without_capture(ws, &shit_proto::wire_path::decode(to), moved);
             }
             return;
         };
@@ -2114,7 +2114,7 @@ impl LinuxCaptureRuntime {
         // path_to_inode; that's the correct behavior -- nothing to
         // capture.
         ws.acct.note_rename_target(to_path.clone());
-        let to_path_buf = PathBuf::from(&to_path);
+        let to_path_buf = shit_proto::wire_path::decode(&to_path);
         let mut dest_handled = false;
         if let Some(&(old_dev, old_inode)) = ws.path_to_inode.get(&to_path_buf)
             && let Some(snap) = ws.pre_snapshots.get(&(old_dev, old_inode)).cloned()
@@ -2187,7 +2187,7 @@ impl LinuxCaptureRuntime {
         // R3 slice B — the name now holds the moved entry. Without this a
         // later rename onto `from` (an editor's `mv f f~; mv tmp f`)
         // would take the moved file for the one being replaced.
-        let from_path_buf = PathBuf::from(&from_path);
+        let from_path_buf = shit_proto::wire_path::decode(&from_path);
         ws.path_to_inode.remove(&from_path_buf);
         ws.path_to_inode.insert(to_path_buf.clone(), moved);
         ws.acct.note_renamed(&from_path_buf, &to_path_buf, moved);
@@ -2626,7 +2626,9 @@ fn resolve_via_parent(
     basename: &str,
 ) -> Option<String> {
     let parent = ws_dir_paths.get(&(parent_dev, parent_inode))?;
-    Some(path_to_string(&parent.join(basename)))
+    Some(path_to_string(
+        &parent.join(shit_proto::wire_path::decode(basename)),
+    ))
 }
 
 /// View into an `lsm/inode_unlink` event as the BPF ringbuf reader
@@ -2979,9 +2981,11 @@ fn write_to_staging(dir: &Path, bytes: &[u8]) -> std::io::Result<OwnedFd> {
     Ok(f.into())
 }
 
+/// #211: the wire form of `p`, byte for byte (see
+/// [`shit_proto::wire_path`]). Strings this module builds with it are
+/// turned back into paths with `wire_path::decode`, never `PathBuf::from`.
 fn path_to_string(p: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+    shit_proto::wire_path::encode(p)
 }
 
 fn now_unix_nanos() -> u64 {
@@ -3483,6 +3487,32 @@ mod tests {
         let mut got = String::new();
         std::fs::File::from(fd).read_to_string(&mut got).unwrap();
         assert_eq!(got, "bytes");
+    }
+
+    #[test]
+    fn resolve_via_parent_keeps_non_utf8_bytes() {
+        // #211: a Latin-1 directory used to come out with U+FFFD, and
+        // undo restored into a sibling spelled that way.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut dir_paths: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+        dir_paths.insert(
+            (64, 100),
+            PathBuf::from(OsString::from_vec(b"/tmp/caf\xe9".to_vec())),
+        );
+        let wire = resolve_via_parent(&dir_paths, 64, 100, "victim").unwrap();
+        assert!(!wire.contains('\u{fffd}'), "{wire:?}");
+        assert_eq!(
+            shit_proto::wire_path::decode(&wire).as_os_str().as_bytes(),
+            b"/tmp/caf\xe9/victim"
+        );
+        // A non-UTF-8 basename, as the ring-buffer reader now passes it.
+        let name = shit_proto::wire_path::encode(std::ffi::OsStr::from_bytes(b"na\xefve"));
+        let wire = resolve_via_parent(&dir_paths, 64, 100, &name).unwrap();
+        assert_eq!(
+            shit_proto::wire_path::decode(&wire).as_os_str().as_bytes(),
+            b"/tmp/caf\xe9/na\xefve"
+        );
     }
 
     #[test]

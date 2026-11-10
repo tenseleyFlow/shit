@@ -56,6 +56,12 @@ smoke_install_hook() {
         | cmp -s - "${hook}"; then
         smoke_fail "installed ${shell} hook differs from ${template} with its placeholders filled in"
     fi
+    if [ "${shell}" = zsh ]; then
+        # Skip /etc/zsh/zshrc: on Ubuntu it runs compinit, which asks a
+        # question about insecure directories on the CI runner and eats
+        # the typed lines.
+        printf 'unsetopt global_rcs\n' > "${SMOKE_HOOK_HOME}/.zshenv"
+    fi
     if [ "${shell}" != fish ]; then
         grep -qF "source ${hook}" "${SMOKE_HOOK_HOME}/.${shell}rc" \
             || smoke_fail "~/.${shell}rc does not source ${hook}"

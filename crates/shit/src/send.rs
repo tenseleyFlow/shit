@@ -277,7 +277,7 @@ pub fn run(kind: HookSendKind) -> Result<()> {
             wait_ready_ms,
         } => {
             let (cwd_dev, cwd_inode) = stat_cwd(&cwd).unwrap_or((0, 0));
-            let cwd_path = cwd.to_string_lossy().into_owned();
+            let cwd_path = shit_proto::wire_path::encode(&cwd);
             // Task #105 — derive ctl_sock from hook sock's parent
             // dir when not explicitly given. Convention:
             // `<runtime>/shit.sock` -> `<runtime>/shit-ctl.sock`.

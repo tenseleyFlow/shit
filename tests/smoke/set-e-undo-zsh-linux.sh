@@ -5,109 +5,69 @@
 # SMOKE_TIER_REQUIRED: any
 # SMOKE_RUNNER_HINT: ubuntu-24.04
 # SMOKE_TIMEOUT_SEC: 300
-# EXCLUDED_BY: 
-# EXCLUDED_REASON: 
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
-# AR06.6 smoke — zsh parity for set-e-undo. zsh's option-restore
-# snippet uses `setopt` / `unsetopt`, not bash's `set ±o`. We
-# verify both the journal path AND that the rendered body
-# actually flips the option when sourced under zsh.
+# set-e-undo-zsh: the Linux smoke drives the real
+# zsh hook (see cd-undo-zsh-linux). An interactive zsh runs `setopt
+# errexit`, then `shit undo --apply-shell-state`. The hook's option
+# snapshot records errexit going on, the undo queues `unsetopt
+# errexit`, and the hook's precmd sources it, so the option is off
+# again in the same shell.
 
 # shellcheck disable=SC2154
 SHIT_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 export SHIT_REPO_ROOT
 # shellcheck source=lib.sh
 source "${SHIT_REPO_ROOT}/tests/smoke/lib.sh"
+# shellcheck source=lib-hooks.sh
+source "${SHIT_REPO_ROOT}/tests/smoke/lib-hooks.sh"
 
 if [ "$(uname -s)" != "Linux" ]; then
     smoke_log "SKIP: set-e-undo-zsh-linux is Linux-only (uname=$(uname -s))"
     exit 0
 fi
-if ! command -v zsh >/dev/null 2>&1; then
-    smoke_log "SKIP: zsh not installed"
-    exit 0
-fi
+command -v zsh >/dev/null 2>&1 || smoke_fail "zsh not installed"
 
-HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
-[ -x "${HELPER_BIN}" ] || smoke_fail "shit-helper missing"
-[ -x "${SHIT_BIN}" ]   || smoke_fail "shit missing"
-export SHIT_HELPER_BIN="${HELPER_BIN}"
-
-export XDG_STATE_HOME="${SHIT_SMOKE_TMP}/state"
-mkdir -p "${XDG_STATE_HOME}"
+[ -x "${SHIT_SMOKE_BIN_DIR}/shit-helper" ] || smoke_fail "shit-helper missing"
+[ -x "${SHIT_BIN}" ] || smoke_fail "shit missing"
+export SHIT_HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 
 WATCHED="${SHIT_SMOKE_TMP}/watched"
 mkdir -p "${WATCHED}"
 
+smoke_install_hook zsh
 smoke_start_shitd
 
-SESSION="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-PID="$$"
+# Each line is one command line, so one preexec/precmd pair. The
+# errexit probe shares the setopt line so it is not a command of its
+# own for the undo to pick. `|| true` keeps errexit from ending the
+# shell if the undo fails; the result file then shows it.
+INPUT="${SHIT_SMOKE_TMP}/zsh-input"
+cat > "${INPUT}" <<EOF
+setopt errexit; [[ -o errexit ]] && echo on > '${SHIT_SMOKE_TMP}/before'
+'${SHIT_BIN}' undo --yes --apply-shell-state > '${SHIT_SMOKE_TMP}/undo.log' 2>&1 || true
+if [[ -o errexit ]]; then echo on; else echo off; fi > '${SHIT_SMOKE_TMP}/after'
+exit
+EOF
 
-cd "${WATCHED}"
-
-"${SHIT_BIN}" hook-send session-open \
-    --session "${SESSION}" --pid "${PID}" --shell zsh \
-    --tty "$(tty 2>/dev/null || echo /dev/null)" \
-    --sock "${SHIT_HOOK_SOCK}"
-
-"${SHIT_BIN}" hook-send pre-exec \
-    --session "${SESSION}" --seq 1 --pid "${PID}" \
-    --cwd "${WATCHED}" --shell zsh --sock "${SHIT_HOOK_SOCK}"
-
-# Pre-state: errexit=on.
-printf 'OPT\terrexit\ton\0' | "${SHIT_BIN}" hook-send pre-exec-shell-state \
-    --session "${SESSION}" --seq 1 --pwd "${WATCHED}" \
-    --sock "${SHIT_HOOK_SOCK}" --from-stdin
-sleep 0.3
-
-"${SHIT_BIN}" hook-send post-exec \
-    --session "${SESSION}" --seq 1 --exit-code 0 --sock "${SHIT_HOOK_SOCK}"
-
-# Post-state: errexit=off.
-printf 'OPT\terrexit\toff\0' | "${SHIT_BIN}" hook-send post-exec-shell-state \
-    --session "${SESSION}" --seq 1 --pwd "${WATCHED}" \
-    --sock "${SHIT_HOOK_SOCK}" --from-stdin
-sleep 0.5
-
-N_SSD="$(smoke_journal_count "discriminant = 'ShellStateDiff'" 2>/dev/null || echo 0)"
-smoke_log "ShellStateDiff events journaled: ${N_SSD}"
-if [ "${N_SSD}" -lt 1 ]; then
-    smoke_fail "expected >= 1 ShellStateDiff event"
-fi
-
-smoke_log "running: shit undo --yes --apply-shell-state"
-set +e
-"${SHIT_BIN}" undo --yes --apply-shell-state > "${SHIT_SMOKE_TMP}/undo.log" 2>&1
-UNDO_RC=$?
-set -e
-smoke_log "shit undo --yes --apply-shell-state exit=${UNDO_RC}"
+smoke_log "running an interactive zsh with the installed hook on a pty"
+smoke_run_hooked_shell "${WATCHED}" "${INPUT}" zsh -i
+smoke_log "shit undo output:"
 sed 's/^/    /' "${SHIT_SMOKE_TMP}/undo.log" >&2
 
-"${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
+[ "$(cat "${SHIT_SMOKE_TMP}/before" 2>/dev/null)" = on ] \
+    || smoke_fail "setopt errexit did not take effect in the hooked zsh"
 
-QUEUE_FILE="${XDG_STATE_HOME}/shit/precmd-queue/${SESSION}"
-if [ ! -f "${QUEUE_FILE}" ]; then
-    smoke_fail "precmd-queue file missing at ${QUEUE_FILE}"
-fi
-QUEUE_BODY="$(cat "${QUEUE_FILE}")"
-smoke_log "precmd-queue body:"
-printf '%s\n' "${QUEUE_BODY}" | sed 's/^/    /' >&2
+N_SSD="$(smoke_journal_count "discriminant = 'ShellStateDiff'")"
+smoke_log "ShellStateDiff events journaled: ${N_SSD}"
+[ "${N_SSD}" -ge 1 ] || smoke_fail "the zsh hook journaled no ShellStateDiff for setopt errexit"
 
-# zsh-flavored: must contain `setopt errexit`, not `set -o errexit`.
-if ! printf '%s' "${QUEUE_BODY}" | grep -qE '^setopt errexit$'; then
-    smoke_fail "precmd-queue file doesn't contain 'setopt errexit' (zsh syntax)"
-fi
-if printf '%s' "${QUEUE_BODY}" | grep -qE '^set -o errexit$'; then
-    smoke_fail "precmd-queue file contains bash 'set -o errexit' for a zsh session"
-fi
+smoke_hook_queue_drained
 
-# Source under zsh, starting with errexit OFF, and confirm it
-# flips back ON.
-RESULT="$(zsh -c "unsetopt errexit; source ${QUEUE_FILE}; setopt | grep -qE '^errexit\$' && echo on || echo off")"
-if [ "${RESULT}" != "on" ]; then
-    smoke_fail "zsh sourcing precmd-queue snippet didn't restore errexit: got ${RESULT}, expected on"
-fi
+AFTER="$(cat "${SHIT_SMOKE_TMP}/after" 2>/dev/null || true)"
+[ "${AFTER}" = off ] \
+    || smoke_fail "the zsh hook did not apply the undo: errexit is '${AFTER}' after undo, expected off"
 
-smoke_log "PASS: set-e-undo-zsh-linux (zsh restores errexit via setopt)"
+smoke_log "PASS: set-e-undo-zsh-linux (the installed zsh hook journaled setopt errexit and drained unsetopt errexit)"

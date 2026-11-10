@@ -2636,7 +2636,9 @@ fn open_watch_dir(path: &str) -> Result<WatchCwd, String> {
 /// magic link gives real bytes, and fails for a deleted cwd.
 #[cfg(target_os = "linux")]
 fn resolve_linux_watch_cwd(raw: &str, root_pid: u32) -> Result<WatchCwd, String> {
-    let reported = if raw.contains(char::REPLACEMENT_CHARACTER) {
+    // #211: a non-UTF-8 cwd now arrives in `wire_path` hex form, which
+    // starts with NUL; an older hook sends U+FFFD. Neither opens.
+    let reported = if raw.contains(char::REPLACEMENT_CHARACTER) || raw.starts_with('\0') {
         Err(format!("watch cwd {raw:?} is not valid UTF-8"))
     } else {
         validated_linux_watch_cwd(raw)

@@ -77,7 +77,7 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
         let req = HelperRequest::ApplyChown {
             session: self.session,
             command_seq: seq,
-            path: path.to_string_lossy().into_owned(),
+            path: shit_proto::wire_path::encode(path),
             uid,
             gid,
             no_dereference,
@@ -128,7 +128,7 @@ impl PrivilegedOpRouter for HelperLinkPrivilegedOpRouter {
         let req = HelperRequest::ApplyMknod {
             session: self.session,
             command_seq: seq,
-            path: path.to_string_lossy().into_owned(),
+            path: shit_proto::wire_path::encode(path),
             mode,
             dev,
             device,
