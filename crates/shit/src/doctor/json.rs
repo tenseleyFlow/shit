@@ -584,7 +584,10 @@ mod tests {
             reason: Some("/home/u is not on ZFS".into()),
         });
         let s = serde_json::to_string(&r).unwrap();
-        assert!(s.contains("\"pre_image_source\":{\"source\":\"read-time\""), "{s}");
+        assert!(
+            s.contains("\"pre_image_source\":{\"source\":\"read-time\""),
+            "{s}"
+        );
         let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
         v["bsd"].as_object_mut().unwrap().remove("pre_image_source");
         let parsed: DoctorReport = serde_json::from_value(v).unwrap();
