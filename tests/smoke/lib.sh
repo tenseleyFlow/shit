@@ -278,6 +278,26 @@ smoke_stop_shitd() {
     return "${zombie}"
 }
 
+# B6 - the ZFS snapshots this smoke's daemon took. They back undo
+# until the command is pruned, so a stopped daemon leaves them; the
+# smoke's state dir (and so their owner) goes away with the smoke.
+smoke_zfs_snapshots() {
+    local owner_file="${XDG_STATE_HOME}/shit/zfs-snapshot-owner" owner
+    [ -x /sbin/zfs ] && [ -f "${owner_file}" ] || return 0
+    owner="$(tr -d '[:space:]' < "${owner_file}")"
+    [ -n "${owner}" ] || return 0
+    /sbin/zfs list -H -t snapshot -o name 2>/dev/null \
+        | grep -F "@shitd-${owner}-" || true
+}
+
+smoke_release_zfs_snapshots() {
+    local snap
+    for snap in $(smoke_zfs_snapshots); do
+        /sbin/zfs destroy "${snap}" 2>/dev/null \
+            || printf '[cleanup %s] could not destroy %s\n' "$(date -u +%H:%M:%S)" "${snap}" >&2
+    done
+}
+
 smoke_cleanup() {
     local prior_rc=$?
     local rc="${1:-${prior_rc}}"
@@ -286,6 +306,7 @@ smoke_cleanup() {
     # cleanup we always continue (the original exit code drives the
     # smoke's final disposition, not the cleanup's).
     smoke_stop_shitd || true
+    smoke_release_zfs_snapshots
     printf '[cleanup %s] smoke_stop_shitd returned; iterating SHIT_SMOKE_PIDS\n' "$(date -u +%H:%M:%S)" >&2
     # Iterate guarded: precondition-skip paths exit before populating
     # the array, and `set -u` would explode on `"${arr[@]}"` then.
