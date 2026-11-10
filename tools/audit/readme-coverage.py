@@ -59,6 +59,8 @@ FAMILIES = [
 PLATFORMS = [("Linux", "linux"), ("FreeBSD", "freebsd"), ("macOS", "macos"), ("Any OS", "any")]
 LSM_RUNNER = "self-hosted LSM runner (runs only when that runner is online)"
 BSD_RUNNER = "FreeBSD 14 VM on hosted ubuntu-24.04 (UFS and ZFS legs)"
+ES_RUNNER = ("self-hosted macos-es runner, SIP-disabled Tart guest "
+             "(macos-es.yml; runs only when that runner is online)")
 
 
 def die(msg):
@@ -112,6 +114,8 @@ def location(rec, wf):
         return LSM_RUNNER
     if rec["runner"] == "freebsd-vm":
         return BSD_RUNNER
+    if rec["runner"] == "macos-es":
+        return ES_RUNNER
     labels = wf.get(rec["name"])
     if not labels:
         die("smoke %r is not referenced by any dr-smoke.yml job" % rec["name"])

@@ -165,9 +165,10 @@ print(sum(1 for r in data if r["excluded_by"]))')"
 }
 
 # Verify every runnable smoke is referenced by some job in dr-smoke.yml.
-# - Smokes whose runner is self-hosted-lsm or freebsd-vm are covered by
-#   bucket-driven aggregate jobs (linux-kernel-capture, freebsd-smoke);
-#   the driver bucket call itself is the wiring, so they're auto-covered.
+# - Smokes whose runner is self-hosted-lsm, freebsd-vm or macos-es are
+#   covered by bucket-driven jobs (linux-kernel-capture, freebsd-smoke,
+#   and macos-es.yml's es-smoke matrix); the driver bucket call itself
+#   is the wiring, so they're auto-covered.
 # - All other runners (ubuntu-24.04, macos-14) use 1-job-per-smoke
 #   standalone jobs; the workflow must reference tests/smoke/<name>.sh
 #   directly.
@@ -185,7 +186,7 @@ do_verify_coverage() {
     unwired="$(echo "${matrix}" | python3 -c "
 import json, re, sys
 workflow_text = open(sys.argv[1]).read()
-bucket_runners = {'self-hosted-lsm', 'freebsd-vm'}
+bucket_runners = {'self-hosted-lsm', 'freebsd-vm', 'macos-es'}
 unwired = []
 for r in json.load(sys.stdin):
     if r['excluded_by']:
