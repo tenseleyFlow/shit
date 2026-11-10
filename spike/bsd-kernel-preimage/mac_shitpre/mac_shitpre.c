@@ -614,6 +614,13 @@ sp_open(struct cdev *dev, int oflags, int devtype, struct thread *td)
 {
 	int error;
 
+	/*
+	 * The device node is 0600 root, but a jail that shares the host's
+	 * devfs (or one whose ruleset unhides it) would otherwise let jailed
+	 * root become the consumer and read every host pre-image.
+	 */
+	if (jailed(td->td_ucred))
+		return (EPERM);
 	error = 0;
 	mtx_lock(&sp_mtx);
 	if (sp_consumer_pid != 0)
