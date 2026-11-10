@@ -81,7 +81,7 @@ done
 
 # 5. Wait for sshd. Default Cirrus base images come with sshd enabled
 # + admin/admin login. We don't add the SSH key on first boot —
-# that's the user's job (see audit doc setup steps). After they've
+# that's the user's job (see README.md, One-time setup). After they've
 # added it, subsequent boots get passwordless.
 echo -n "[boot] waiting for sshd at ${ip} "
 for i in $(seq 1 120); do
@@ -106,9 +106,7 @@ echo "  IP:   ${ip}"
 echo "  SSH:  tools/macos-tart-vm/ssh.sh    # wrapped"
 echo "  key:  ${SSH_KEY}.pub  (add to admin@${ip} ~/.ssh/authorized_keys)"
 echo
-echo "next steps:"
-echo "  1. ssh-copy-id -i ${SSH_KEY}.pub -p 22 admin@${ip}"
-echo "     (password: admin; only needed once per VM)"
-echo "  2. tools/macos-tart-vm/sync.sh"
-echo "  3. tools/macos-tart-vm/ssh.sh 'csrutil status'"
-echo "     (expect: 'disabled' — see audit doc for one-time setup)"
+echo "next steps (see tools/macos-tart-vm/README.md):"
+echo "  1. install ${SSH_KEY}.pub in the guest (tart exec or ssh-copy-id, password admin)"
+echo "  2. tools/macos-tart-vm/doctor.sh"
+echo "  3. tools/macos-tart-vm/sync.sh"

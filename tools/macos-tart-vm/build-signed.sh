@@ -3,11 +3,11 @@
 #
 # Build shit-helper on the tart VM AND ad-hoc-sign it with the
 # EndpointSecurity entitlement embedded. The VM has AMFI bypassed
-# (boot-arg amfi_get_out_of_my_way=0x1 + auth-root disabled), which
+# (boot-arg amfi_get_out_of_my_way=1, SIP disabled), which
 # lets the kernel accept the entitlement claim from an ad-hoc
 # signature. Without the codesign step the binary has NO entitlements
 # at all, and `es_new_client` returns NotEntitled regardless of AMFI
-# state — see `.docs/audits/macos-tart-vm-setup.md`.
+# state; see tools/macos-tart-vm/README.md.
 #
 # Usage:
 #   tools/macos-tart-vm/build-signed.sh             # signs bin/shit-helper

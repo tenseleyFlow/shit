@@ -18,8 +18,11 @@ The reference host is `nomad` (Apple Silicon, macOS 26). The guest
 image is `ghcr.io/cirruslabs/macos-sequoia-base:latest` (macOS 15,
 25.4 GB compressed, 50 GB disk). The guest must be the same macOS
 version as the host or older. The `-base` image is the smallest Cirrus
-image; it ships Homebrew and an `admin`/`admin` account with sshd on,
-and no Rust toolchain.
+image. It ships Homebrew, the Command Line Tools, the Tart guest agent
+and an `admin`/`admin` account with sshd on and passwordless sudo. It
+has no Rust toolchain. Cirrus builds it with SIP disabled and the boot
+policy in Permissive mode, so `csrutil status` already reads
+"disabled" on a fresh clone.
 
 ## Disk budget
 
@@ -54,9 +57,14 @@ df -h /
 # Clone and start the guest headless. Prints the guest IP.
 tools/macos-tart-vm/boot.sh
 
-# Install the per-VM key in the guest (password: admin).
-ssh-copy-id -i "$SHIT_TART_WORK_DIR/id_ed25519.pub" admin@"$(tart ip shit-m03)"
+# Install the per-VM key in the guest through the guest agent.
+K="$(cat "$SHIT_TART_WORK_DIR/id_ed25519.pub")"
+tart exec shit-m03 /bin/sh -c \
+  "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$K' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
 ```
+
+`ssh-copy-id -i "$SHIT_TART_WORK_DIR/id_ed25519.pub" admin@"$(tart ip shit-m03)"`
+with the password `admin` does the same.
 
 ### Guest provisioning
 
@@ -67,30 +75,48 @@ tools/macos-tart-vm/ssh.sh \
   'curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88'
 ```
 
-### Disabling SIP in the guest
+### SIP and AMFI in the guest
 
-This step needs the guest's Recovery console, which only opens as a
-window on the host's screen. It cannot be done over SSH. Do it at the
-host's keyboard (or over Screen Sharing), in Terminal:
+ES accepts an ad-hoc signed client only when SIP is disabled and AMFI
+is relaxed with the boot-arg `amfi_get_out_of_my_way=1`. On the
+sequoia-base image SIP is already off, so the boot-arg can be set over
+SSH:
+
+```sh
+tools/macos-tart-vm/ssh.sh 'sudo nvram boot-args="amfi_get_out_of_my_way=1"'
+# Shut down from inside the guest. `tart stop` does not keep NVRAM
+# writes made in the running guest.
+tools/macos-tart-vm/ssh.sh 'sudo shutdown -h now'
+# Wait until `tart list` shows the VM stopped, then:
+rm -f "$SHIT_TART_WORK_DIR/vm.ip"
+tools/macos-tart-vm/boot.sh
+tools/macos-tart-vm/ssh.sh 'sysctl kern.bootargs; csrutil status'
+```
+
+`doctor.sh` checks both. Leave the host's SIP, boot-args and nvram
+alone; all of this runs inside the guest.
+
+### Recovery fallback
+
+If a guest image ships with SIP enabled, `csrutil` and `nvram
+boot-args` can only be changed from the guest's Recovery console. It
+opens as a window on the host's screen and cannot be driven over SSH.
+At the host's keyboard (or over Screen Sharing), in Terminal:
 
 1. Stop the guest: `tart stop shit-m03`.
 2. Start it in Recovery: `tart run --recovery shit-m03`. A window opens
-   showing the Recovery startup screen.
+   on the Recovery startup screen.
 3. Click Options, then Continue. If Recovery asks for a user, pick
    `admin` and enter the password `admin`.
 4. In the menu bar, choose Utilities, then Terminal.
 5. Run `csrutil disable`. Answer `y`, then give `admin` / `admin`
    when it asks for an administrator.
-6. Run `csrutil authenticated-root disable` and answer the same way.
-7. Run `nvram boot-args="amfi_get_out_of_my_way=1"`. With this AMFI
-   accepts the ES entitlement on an ad-hoc signature.
-8. Run `shutdown -h now`. The window closes when the guest stops.
-9. Back on the host: `tools/macos-tart-vm/boot.sh`, then
-   `tools/macos-tart-vm/doctor.sh`. It should print "SIP disabled" and
-   "guest boot-args has amfi_get_out_of_my_way=1".
-
-Leave the host's SIP, boot-args and nvram alone. All of the above runs
-inside the guest.
+6. Run `nvram boot-args="amfi_get_out_of_my_way=1"`.
+7. Run `shutdown -h now`. The window closes when the guest stops.
+8. Back on the host: `rm -f "$SHIT_TART_WORK_DIR/vm.ip"`, then
+   `tools/macos-tart-vm/boot.sh` and `tools/macos-tart-vm/doctor.sh`.
+   It should print "SIP disabled" and "guest boot-args has
+   amfi_get_out_of_my_way=1".
 
 ## Running the ES smokes
 
