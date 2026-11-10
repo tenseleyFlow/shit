@@ -88,8 +88,16 @@ main(int argc, char **argv)
 		err(1, "SET_PRESELECT_NAFLAGS");
 	if (ioctl(fd, AUDITPIPE_GET_QLIMIT_MAX, &qlen) == 0)
 		(void)ioctl(fd, AUDITPIPE_SET_QLIMIT, &qlen);
-	signal(SIGINT, onint);
-	signal(SIGTERM, onint);
+	{
+		/* No SA_RESTART: read(2) on an idle pipe must return EINTR. */
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = onint;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGINT, &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+	}
 	fprintf(stderr, "auditpipe_reader: classes %s\n", classes);
 
 	while (!stop) {
