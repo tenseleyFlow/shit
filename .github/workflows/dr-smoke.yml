@@ -834,6 +834,74 @@ jobs:
             /tmp/shit-smoke.*/shitd.log
             /tmp/shit-smoke.*/state/shit/log/
 
+  chmod-undo-repeat-macos:
+    # #269: the chmod smoke run many times in one job, on dispatch only,
+    # to count how often capture misses and what undo does then.
+    name: chmod-undo repeat (#269 macOS)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: install non-SIP coreutils (brew)
+        run: brew install coreutils
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run smoke with and without the shim
+        run: |
+          set +e
+          pass=0; fail=0; lost=0
+          run() {
+            local tag="$1" bin="$2" i="$3" log="run-$1-$3.log" rc out post hits rows
+            SHIT_SMOKE_CHMOD_BIN="$bin" SHIT_SMOKE_NO_SHIM="$4" \
+              bash tests/smoke/chmod-undo-dyld-shim-macos.sh > "$log" 2>&1
+            rc=$?
+            out="$(grep -oE 'OUTCOME [ABC]' "$log" | head -1)"
+            post="$(grep -oE 'post-undo: .* mode=[A-Z0-9]+' "$log" | sed 's/.*mode=//')"
+            hits="$(grep -oE 'shim metadata events journaled by daemon: [0-9]+' "$log" | awk '{print $NF}')"
+            rows="$(grep 'journal: ' "$log" | sed 's/.*journal: [0-9]*|//; s/|.*//' | tr '\n' ' ')"
+            echo "$tag run $i: rc=$rc ${out:-no-outcome} post-undo=$post shim-hits=$hits rows=[$rows]"
+            if [ "$post" = "MISSING" ]; then lost=$((lost+1)); fi
+            if [ "$tag" = gchmod ]; then
+              if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); fi
+            fi
+          }
+          for i in $(seq 1 12); do run gchmod "$(command -v gchmod)" "$i"; done
+          # No shim: FSEvents alone, as when the shim's note was lost (#269).
+          for i in $(seq 1 10); do run noshim "$(command -v gchmod)" "$i" 1; done
+          echo "gchmod: pass=$pass fail=$fail; file removed by undo (all runs): $lost"
+          for f in run-*.log; do echo "===== $f"; cat "$f"; done
+          [ "$lost" -eq 0 ] && [ "$fail" -eq 0 ]
+
+  sip-binaries-undo-macos:
+    # M4: /bin/rm and /bin/mv are SIP-protected, so the DYLD shim never
+    # loads. Undo must refuse or restore exactly; exit 0 with nothing
+    # captured fails.
+    name: SIP binaries undo smoke (M4 macOS)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build binaries + shim
+        run: cargo build --release -p shitd -p shit -p shit-helper -p shit-preload-shim
+      - name: run /bin/rm smoke
+        run: bash tests/smoke/sip-rm-undo-macos.sh
+      - name: run /bin/mv smoke
+        if: success() || failure()
+        run: bash tests/smoke/sip-mv-undo-macos.sh
+      - name: upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sip-binaries-undo-macos-logs
+          path: |
+            /tmp/shit-smoke.*/shitd.log
+            /tmp/shit-smoke.*/state/shit/log/
+
   pip-install-user-undo-macos:
     # M07.A.5 — pip install --force-reinstall overwrite undo via
     # DYLD shim. Requires Homebrew python3 (Apple's /usr/bin/python3

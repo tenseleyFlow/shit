@@ -104,9 +104,9 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `hardlink-rm-undo-fbsd`, `ln-hardlink-undo-fbsd`, `ln-symlink-undo-fbsd`, `mkdir-p-undo-fbsd`, `mkdir-undo-fbsd`, `mkfifo-undo-fbsd`, `mv-across-dirs-undo-fbsd`, `mv-dir-undo-fbsd`, `mv-noop-undo-fbsd`, `non-ascii-filename-undo-fbsd`, `rm-undo-fbsd`, `symlink-replace-undo-fbsd` |
 | Filesystem: content writes and editors | `awk-inplace-undo-fbsd`, `backup-and-modify-undo-fbsd`, `cp-recursive-undo-fbsd`, `cpio-extract-undo-fbsd`, `dd-large-file-undo-fbsd`, `dd-notrunc-undo-fbsd`, `gzip-undo-fbsd`, `large-file-overwrite-undo-fbsd`, `patch-apply-undo-fbsd`, `rotate-and-touch-undo-fbsd`, `rsync-incremental-undo-fbsd`, `sed-inline-undo-fbsd`, `shell-append-undo-fbsd`, `shell-redirect-undo-fbsd`, `sort-inplace-undo-fbsd`, `split-undo-fbsd`, `tar-extract-undo-fbsd`, `tee-undo-fbsd`, `touch-edit-undo-fbsd`, `vim-edit-undo-fbsd` |
 
-### macOS (19 wired into CI, 9 excluded)
+### macOS (21 wired into CI, 9 excluded)
 
-#### hosted macos-15: 19 smokes
+#### hosted macos-15: 21 smokes
 
 | Surface family | Smokes |
 |---|---|
@@ -115,7 +115,7 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Services, firewall, network and processes | `kill-proc-libproc-macos`, `launchctl-bootstrap-undo-macos`, `networksetup-dns-undo-macos`, `networksetup-location-undo-macos`, `pfctl-undo-macos`, `route-add-undo-macos` |
 | Build and install | `cargo-install-force-undo-macos`, `make-install-overwrite-undo-macos`, `make-install-undo-macos`, `pip-install-user-undo-macos` |
 | Filesystem: metadata and attributes | `chflags-undo-macos`, `chmod-undo-dyld-shim-macos`, `xattr-mutate-undo-macos` |
-| Filesystem: remove, rename, link, create | `link-undo-macos`, `mkfifo-undo-macos` |
+| Filesystem: remove, rename, link, create | `link-undo-macos`, `mkfifo-undo-macos`, `sip-mv-undo-macos`, `sip-rm-undo-macos` |
 | Filesystem: content writes and editors | `cp-clone-overwrite-undo-macos`, `mmap-write-undo-macos` |
 
 #### Excluded from CI, so not evidence of coverage
@@ -162,8 +162,9 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 
 Some items below are limits of pinned classes; the ones marked unpinned have no smoke at all.
 
-- macOS: SIP-protected binaries (`/bin/rm`, `/bin/mv`, `/bin/cp` and the like) drop `DYLD_INSERT_LIBRARIES` on exec, so the default (non-EndpointSecurity) tier does not capture them. No smoke pins this behavior yet.
-- Static binaries and binaries that issue raw syscalls (Go programs, for example) bypass the DYLD interposer on macOS and the LD_PRELOAD shim on FreeBSD. No smoke pins this either.
+- macOS without EndpointSecurity does not capture SIP-protected binaries (everything in `/bin`, `/sbin`, `/usr` outside `/usr/local`, and `/System`, which includes the stock `rm`, `mv`, `cp` and `chmod`), setuid or setgid binaries, or statically linked binaries. With SIP on, dyld ignores `DYLD_INSERT_LIBRARIES` for the first two, so they run without the shim; a static binary never runs dyld. FSEvents still sees the change. Undo then refuses with "its bytes were not captured" and exits non-zero, rather than recreating an empty file or reporting success. `sip-rm-undo-macos` and `sip-mv-undo-macos` pin this for `/bin/rm` and for a `/bin/mv` that replaces an existing file. A metadata-only change (`/bin/chmod`) journals nothing in the default mode, so its undo applies nothing. Homebrew's GNU coreutils (`grm`, `gmv`, `gcp`, `gchmod`) are not SIP-protected and are captured.
+- `shit doctor` on macOS prints the path your shell resolves for `rm`, `mv`, `cp` and `chmod` (first match on `$PATH`; aliases and functions are not followed) and whether the shim can load into each.
+- Binaries that issue raw syscalls (Go programs, for example) bypass the DYLD interposer on macOS and the LD_PRELOAD shim on FreeBSD. No smoke pins this.
 - macOS `pip install --user --force-reinstall` reaches full restore on trunk, but `pip-install-user-undo-macos` does not yet gate on that outcome. It passes; it is not a gate.
 - Linux `pip install --user --force-reinstall` accepts two outcomes in its smoke: full restore through recursive pre-image, or a graceful fallback.
 - Strict capture (`SHIT_STRICT_CAPTURE`, opt-in) refuses an undo when capture was provably incomplete for the touched paths. It is off by default. The `strict-*` smokes run on Linux and FreeBSD only. On FreeBSD, strict mode compares file birth times with the wall clock at the start of the command, so a realtime clock step while a command runs can misclassify which files the command created.
@@ -220,7 +221,7 @@ Gaps where coverage is plausible but not shipped, or shipped without CI evidence
 ### macOS
 
 - EndpointSecurity has no CI evidence until a Tart host runs the `es-*` smokes (#190).
-- SIP-protected system binaries are not captured by the default tier, and raw-syscall binaries bypass the interposer. Neither is pinned by a smoke.
+- SIP-protected, setuid and static binaries are not captured by the default tier; undo refuses their removals and replacing moves (see [Known limits](#known-limits)). Raw-syscall binaries bypass the interposer, and no smoke pins that.
 - Notarized helper distribution is not built. The entitled-ES path needs a self-built helper with a developer-signed entitlement. The daemon refuses helpers whose code signature does not validate. A signed and notarized release pipeline is the remaining work.
 - DYLD interposer auto-install is not built. `shit dyld-hooks install` writes the shim to `/usr/local/lib/libshit_preload_shim.dylib` by hand; no package manager does it on first run.
 - Containers, cloud tools and shell hooks are untested.

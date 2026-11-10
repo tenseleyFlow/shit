@@ -23,7 +23,7 @@
 //!
 //! | FSEvents flag       | Wire emit |
 //! |---------------------|-----------|
-//! | `is_created`        | `TreeOpWire::Create { dev, inode, path, kind, mode }` |
+//! | `is_created`        | `TreeOpWire::Create { dev, inode, path, kind, mode }`, unless the file was born before the watch attached (#269) |
 //! | `is_removed`        | `TreeOpWire::Unlink { dev: 0, inode: 0, path }` — inode lost when the file was removed before our stat |
 //! | `is_renamed` (paired) | `TreeOpWire::Rename { from, to, dev, inode }` |
 //! | `is_renamed` (timeout) | `TreeOpWire::Unlink { path }` for unmatched halves |
@@ -78,6 +78,9 @@ enum ControlMsg {
     Attach {
         command: CommandId,
         root_path: PathBuf,
+        /// When the request loop received the WatchTree, before the
+        /// stream for it starts. See [`create_predates_watch`].
+        attached_at: SystemTime,
     },
     Detach {
         command: CommandId,
@@ -129,6 +132,7 @@ impl CaptureControl {
         if let Err(e) = self.tx.try_send(ControlMsg::Attach {
             command,
             root_path: path,
+            attached_at: SystemTime::now(),
         }) {
             tracing::warn!(
                 %session,
@@ -203,6 +207,9 @@ struct PumpState {
     /// Active tracked subtrees. Ordered for deterministic
     /// longest-prefix iteration.
     watches: BTreeMap<CommandId, PathBuf>,
+    /// When each watch attached. A Create for a file born earlier is
+    /// a flag FSEvents carried over from an older create (#269).
+    attached_at: BTreeMap<CommandId, SystemTime>,
     /// Active FSEvents stream + its event channel. `None` when no
     /// watches are registered. Recreated on every attach/detach
     /// because FSEvents has no add-path API.
@@ -216,12 +223,13 @@ impl PumpState {
         Self {
             conn,
             watches: BTreeMap::new(),
+            attached_at: BTreeMap::new(),
             stream: None,
             pending_rename: None,
         }
     }
 
-    fn attach(&mut self, command: CommandId, root_path: PathBuf) {
+    fn attach(&mut self, command: CommandId, root_path: PathBuf, attached_at: SystemTime) {
         // Canonicalize so subsequent path-prefix comparisons match
         // FSEvents-reported paths (which arrive realpath-resolved).
         let canonical = match std::fs::canonicalize(&root_path) {
@@ -244,6 +252,7 @@ impl PumpState {
             "fsevents watch attached"
         );
         self.watches.insert(command, canonical);
+        self.attached_at.insert(command, attached_at);
         self.rebuild_stream();
     }
 
@@ -267,6 +276,7 @@ impl PumpState {
     }
 
     fn detach(&mut self, command: CommandId) {
+        self.attached_at.remove(&command);
         if self.watches.remove(&command).is_some() {
             tracing::info!(
                 %command.session,
@@ -417,28 +427,16 @@ impl PumpState {
         let Ok(meta) = std::fs::symlink_metadata(&record.path) else {
             return;
         };
-        let kind = if meta.is_symlink() {
-            FileKindWire::Symlink
-        } else if meta.is_dir() {
-            FileKindWire::Directory
-        } else if meta.is_file() {
-            FileKindWire::Regular
-        } else {
-            // FIFO / socket / block / char — record as Regular for
-            // wire-shape purposes; the daemon's executor will handle
-            // unlinking by path regardless.
-            FileKindWire::Regular
-        };
-        self.emit_tree_mutation(
-            command,
-            TreeOpWire::Create {
-                dev: meta.dev(),
-                inode: meta.ino(),
-                path: record.path.to_string_lossy().into_owned(),
-                kind,
-                mode: meta.mode(),
-            },
-        );
+        match create_wire(&record.path, &meta, self.attached_at.get(&command).copied()) {
+            Some(op) => self.emit_tree_mutation(command, op),
+            None => tracing::debug!(
+                %command.session,
+                seq = command.seq,
+                path = %record.path.display(),
+                flags = format_args!("{:#x}", record.flags),
+                "fsevents Create for a file born before the watch; not a create by this command"
+            ),
+        }
     }
 
     fn emit_unlink(&self, command: CommandId, path: &Path) {
@@ -486,6 +484,54 @@ impl PumpState {
     }
 }
 
+/// The Create to journal for an FSEvents ItemCreated record at `path`,
+/// or `None` when the file predates the watch attached at `attached`.
+///
+/// #269: FSEvents keeps a path's flags across events, so a chmod of a
+/// file created shortly before the command arrives with ItemCreated
+/// still set. Journaling that as a Create made undo unlink a file the
+/// command never made.
+fn create_wire(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    attached: Option<SystemTime>,
+) -> Option<TreeOpWire> {
+    if create_predates_watch(meta.created().ok(), attached) {
+        return None;
+    }
+    let kind = if meta.is_symlink() {
+        FileKindWire::Symlink
+    } else if meta.is_dir() {
+        FileKindWire::Directory
+    } else {
+        // FIFO / socket / block / char are recorded as Regular for
+        // wire-shape purposes; the daemon's executor unlinks by path
+        // regardless.
+        FileKindWire::Regular
+    };
+    Some(TreeOpWire::Create {
+        dev: meta.dev(),
+        inode: meta.ino(),
+        path: path.to_string_lossy().into_owned(),
+        kind,
+        mode: meta.mode(),
+    })
+}
+
+/// #269: whether a file with birth time `birth` existed before the
+/// watch attached at `attached`, so an FSEvents ItemCreated flag on it
+/// is left over from an earlier create. Genuine creates come from the
+/// stream, which starts after `attached`, so they are born later.
+///
+/// Unknown birth or attach time keeps the Create. A tool that sets an
+/// mtime older than the birth time (`tar x`, `cp -p`) also moves the
+/// birth time back on APFS; such a create is then not journaled, which
+/// leaves the file in place on undo rather than removing a file the
+/// command did not make.
+fn create_predates_watch(birth: Option<SystemTime>, attached: Option<SystemTime>) -> bool {
+    matches!((birth, attached), (Some(b), Some(a)) if b < a)
+}
+
 /// Free-function form so the pure-logic edge cases are unit-testable
 /// without constructing an `Arc<Conn>`.
 fn find_owning_command(
@@ -511,8 +557,12 @@ fn pump(conn: Arc<Conn>, ctrl_rx: Receiver<ControlMsg>) {
     loop {
         // 1. Control first (low-latency attach/detach).
         match ctrl_rx.try_recv() {
-            Ok(ControlMsg::Attach { command, root_path }) => {
-                state.attach(command, root_path);
+            Ok(ControlMsg::Attach {
+                command,
+                root_path,
+                attached_at,
+            }) => {
+                state.attach(command, root_path, attached_at);
                 continue;
             }
             Ok(ControlMsg::Detach { command, flush }) => {
@@ -612,6 +662,38 @@ mod tests {
     fn find_owning_command_empty_watches_returns_none() {
         let watches: BTreeMap<CommandId, PathBuf> = BTreeMap::new();
         assert!(find_owning_command(&watches, Path::new("/anywhere")).is_none());
+    }
+
+    /// #269: a chmod of a file that existed before the watch arrives
+    /// with ItemCreated still set. It must not journal a Create, or
+    /// undo unlinks the file.
+    #[test]
+    fn create_of_a_file_born_before_the_watch_is_not_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.txt");
+        std::fs::write(&old, b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let attached = Some(SystemTime::now());
+        std::thread::sleep(Duration::from_millis(20));
+        let new = dir.path().join("new.txt");
+        std::fs::write(&new, b"y").unwrap();
+        let meta = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+        assert_eq!(create_wire(&old, &meta(&old), attached), None);
+        assert!(matches!(
+            create_wire(&new, &meta(&new), attached),
+            Some(TreeOpWire::Create {
+                kind: FileKindWire::Regular,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn create_with_unknown_times_is_kept() {
+        let t = SystemTime::now();
+        assert!(!create_predates_watch(None, Some(t)));
+        assert!(!create_predates_watch(Some(t), None));
+        assert!(!create_predates_watch(Some(t), Some(t)));
     }
 
     #[test]

@@ -38,12 +38,14 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 0
 fi
 
-CHMOD_BIN="$(command -v gchmod 2>/dev/null || true)"
+# SHIT_SMOKE_CHMOD_BIN=/bin/chmod runs a SIP binary the shim cannot
+# see, which leaves FSEvents as the only capture (#269 repeat job).
+CHMOD_BIN="${SHIT_SMOKE_CHMOD_BIN:-$(command -v gchmod 2>/dev/null || true)}"
 if [ -z "${CHMOD_BIN}" ]; then
     smoke_log "SKIP: gchmod (non-SIP) required; brew install coreutils"
     exit 0
 fi
-smoke_log "chmod: ${CHMOD_BIN} (non-SIP, DYLD survives)"
+smoke_log "chmod: ${CHMOD_BIN}"
 
 HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
 SHIT_BIN="${SHIT_SMOKE_BIN_DIR}/shit"
@@ -80,9 +82,18 @@ cd "${WATCHED}"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
-smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} gchmod 0644 ${TARGET}"
+# The shell hook exports _SHIT_SESSION / _SHIT_SEQ to the command;
+# the shim sends them as the note's command key. Without it the daemon
+# attributes by pid ancestry, which loses the note when gchmod exits
+# before the walk ends (#269: the note was dropped that way).
+# SHIT_SMOKE_NO_SHIM=1 leaves the shim out, so FSEvents is the only
+# capture: the shape of #269, where the shim's note was lost.
+INSERT=(env "DYLD_INSERT_LIBRARIES=${SHIM_LIB}")
+[ -n "${SHIT_SMOKE_NO_SHIM:-}" ] && INSERT=(env)
+smoke_log "${INSERT[*]} ${CHMOD_BIN} 0644 ${TARGET}"
 set +e
-DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${CHMOD_BIN}" 0644 "${TARGET}" \
+_SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 \
+    "${INSERT[@]}" "${CHMOD_BIN}" 0644 "${TARGET}" \
     >"${SHIT_SMOKE_TMP}/chmod.log" 2>&1
 CHMOD_RC=$?
 set -e
@@ -105,6 +116,8 @@ smoke_log "shim metadata events journaled by daemon: ${SHIM_HITS}"
 
 N_EVENTS="$(smoke_journal_count "1=1" 2>/dev/null || echo 0)"
 smoke_log "journal events: ${N_EVENTS}"
+smoke_journal_query "SELECT id, discriminant, path FROM events;" 2>/dev/null \
+    | sed 's/^/    journal: /' >&2 || true
 
 smoke_log "running: shit undo --yes"
 set +e
@@ -118,6 +131,11 @@ FINAL_MODE="$(stat -f %p "${TARGET}" 2>/dev/null | tail -c 4 || echo MISSING)"
 smoke_log "post-undo: ${TARGET} mode=${FINAL_MODE}"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
+
+# #269: an undo of a chmod must never remove the file.
+if [ "${FINAL_MODE}" = "MISSING" ]; then
+    smoke_fail "#269: undo of a chmod removed ${TARGET} (undo exit ${UNDO_RC})"
+fi
 
 # Outcome A — full undo (mode restored)
 if [ "${FINAL_MODE}" = "${PRE_MODE}" ]; then
