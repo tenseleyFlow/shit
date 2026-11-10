@@ -513,6 +513,7 @@ fn collect_bsd() -> Option<json::BsdReport> {
         zfs_datasets: bsd::zfs_datasets(),
         helper_handshake: probe_helper_handshake(),
         preload_shim_installed: bsd::preload_shim_installed(),
+        pre_image_source: Some(bsd::pre_image_source()),
     })
 }
 
@@ -940,6 +941,15 @@ fn print_bsd_tier(bsd: &json::BsdReport) {
             bsd.zfs_datasets.len(),
             bsd.zfs_datasets.join(", ")
         );
+    }
+    if let Some(src) = &bsd.pre_image_source {
+        match (src.source.as_str(), &src.dataset, &src.reason) {
+            ("zfs-snapshot", Some(ds), _) => {
+                println!("pre-image: zfs snapshot of {ds} per command ({})", src.cwd)
+            }
+            (_, _, Some(why)) => println!("pre-image: read-time ({}): {why}", src.cwd),
+            _ => println!("pre-image: {} ({})", src.source, src.cwd),
+        }
     }
     if bsd.preload_shim_installed {
         println!("preload:  installed at /usr/local/lib/shit/libshit_preload_shim.so");

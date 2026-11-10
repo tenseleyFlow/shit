@@ -189,6 +189,29 @@ pub fn zfs_datasets() -> Vec<String> {
     }
 }
 
+/// B6 - where a command run in the current directory would get its
+/// pre-images: a per-command ZFS snapshot when the directory is on a
+/// dataset this user may snapshot and destroy, read-time otherwise.
+/// Probes with a real snapshot, destroyed at once.
+pub fn pre_image_source() -> crate::doctor::json::PreImageSourceReport {
+    use shit_capture::zfs_snapshot::{PreImageSource, SystemZfs, probe_source};
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new("/").to_path_buf());
+    let (source, dataset, reason) = if std::env::var("SHIT_ZFS_SNAPSHOTS").as_deref() == Ok("0") {
+        ("read-time", None, Some("SHIT_ZFS_SNAPSHOTS=0".to_string()))
+    } else {
+        match probe_source(&SystemZfs, &cwd) {
+            PreImageSource::Snapshot(t) => ("zfs-snapshot", Some(t.id.dataset), None),
+            PreImageSource::ReadTime(why) => ("read-time", None, Some(why)),
+        }
+    };
+    crate::doctor::json::PreImageSourceReport {
+        source: source.to_string(),
+        cwd: cwd.display().to_string(),
+        dataset,
+        reason,
+    }
+}
+
 /// True iff the LD_PRELOAD shim is installed.
 ///
 /// AU07 — canonical install path is
