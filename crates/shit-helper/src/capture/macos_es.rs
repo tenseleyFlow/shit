@@ -560,7 +560,7 @@ fn hash_via_pread(fd: RawFd, size: u64) -> std::io::Result<([u8; 32], u64)> {
 }
 
 fn path_to_string(p: &Path) -> Option<String> {
-    let s = String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string();
+    let s = shit_proto::wire_path::encode(p);
     if s.len() > HELPER_PATH_HINT_MAX {
         // Send None rather than a truncated path that could mislead
         // the daemon's restore logic. Daemon falls back to dev+inode

@@ -26,6 +26,7 @@ pub mod fault_inject;
 pub mod frame;
 pub mod helper;
 pub mod shim;
+pub mod wire_path;
 
 pub use ctl::{
     BookmarkRequest, BookmarkSummary, CONTAINER_CAPTURE_FAILED_EXTRA, CloudEventReq,

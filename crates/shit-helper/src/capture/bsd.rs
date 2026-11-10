@@ -473,6 +473,10 @@ impl PumpState {
             }
         };
         if file_type == FileType::Directory {
+            if is_delete {
+                self.emit_dir_removed(command, fd, dev, inode);
+                return;
+            }
             // S29.1: NOTE_WRITE on a tracked dir indicates child
             // entries changed. Diff against the baseline to detect
             // create/unlink/rename and emit TreeMutation events.
@@ -658,6 +662,50 @@ impl PumpState {
         let mut to_scan: Vec<RawFd> = vec![fd];
         while let Some(fd) = to_scan.pop() {
             self.scan_dir_emit_and_watch_children(command, fd, &mut to_scan);
+        }
+    }
+
+    /// #214: a watched directory was removed (NOTE_DELETE on its own
+    /// fd). Journal its Unlink with the kind and mode fstat reads from
+    /// the held fd, so undo recreates it with its own mode. Without this
+    /// row the directory's mode was never journaled, and undo either
+    /// made it at the umask or (since #214) refuses to make it at all.
+    /// kqueue can deliver this before its children's deletes; the
+    /// planner orders the recreate ahead of them (`EnsureDir`).
+    fn emit_dir_removed(&mut self, command: CommandId, fd: RawFd, dev: u64, inode: u64) {
+        let Some(ws) = self.watches.get_mut(&command) else {
+            return;
+        };
+        let Some(baseline) = ws.dir_baselines.get(&fd) else {
+            tracing::trace!(fd, "dir Delete on dir without baseline; skipping");
+            return;
+        };
+        let path = path_to_string(&baseline.path);
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fd is held open by the watch; st is writable.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            ws.acct
+                .note_unkeyed("a removed directory's fd could not be stat'ed");
+            return;
+        }
+        let resp = shit_proto::HelperResponse::TreeMutation {
+            session: command.session,
+            seq: command.seq,
+            op: shit_proto::TreeOpWire::Unlink {
+                dev,
+                inode,
+                path,
+                kind: shit_proto::FileKindWire::Directory,
+                mode: st.st_mode as u32,
+            },
+            ts_unix_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        };
+        if let Err(e) = self.conn.send_response(&resp) {
+            tracing::warn!(error = %e, "send TreeMutation (dir removed) failed");
+            ws.send_failures = ws.send_failures.saturating_add(1);
         }
     }
 
@@ -1274,7 +1322,7 @@ fn baseline_shipped(shipped: HashSet<(u64, u64)>, complete_sent: bool) -> HashSe
 }
 
 fn path_to_string(p: &Path) -> String {
-    String::from_utf8_lossy(p.as_os_str().as_bytes()).to_string()
+    shit_proto::wire_path::encode(p)
 }
 
 #[cfg(test)]

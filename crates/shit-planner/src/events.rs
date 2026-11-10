@@ -230,6 +230,7 @@ pub enum CaptureEventKind {
     /// pre-command state). See [`FilePreImageSource`].
     FilePreImage {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         blob: BlobHash,
         meta: FileMetadata,
@@ -242,6 +243,7 @@ pub enum CaptureEventKind {
     /// bloat for metadata-only ops.
     MetadataChange {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         before: FileMetadata,
         after: FileMetadata,
@@ -264,6 +266,7 @@ pub enum CaptureEventKind {
         /// rotated / replaced and truncating would clobber the
         /// wrong file → emit `Conflict::Hard`.
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         pre_size: u64,
     },
@@ -291,7 +294,9 @@ pub enum CaptureEventKind {
     /// reverse: new events fed to an old planner just lose the
     /// extra diff fields.
     ShellStateDiff {
+        #[serde(with = "crate::path_bytes")]
         pwd_before: PathBuf,
+        #[serde(with = "crate::path_bytes")]
         pwd_after: PathBuf,
         /// AR06.2 — `set -o` option diffs. Each entry is a
         /// `(name, pre, post)` triple; "on"/"off" for booleans,
@@ -337,6 +342,7 @@ pub enum CaptureEventKind {
         kind: ProcessOpKind,
         pid: u32,
         argv: Vec<String>,
+        #[serde(with = "crate::path_bytes")]
         cwd: PathBuf,
         env_summary: BTreeMap<String, String>,
         parent_pid: u32,
@@ -388,6 +394,7 @@ pub enum CaptureEventKind {
     /// `runtime` distinguishes which tool (Terraform initially;
     /// kubectl / gh / aws land in AR04.3 / .4 / .5).
     TerraformOp {
+        #[serde(with = "crate::path_bytes")]
         workdir: std::path::PathBuf,
         op: crate::inverse::TerraformOp,
         /// Pre-mutation `terraform state pull` output, captured by
@@ -434,6 +441,7 @@ pub enum CaptureEventKind {
     /// human-readable string.
     CaptureRefused {
         class: String,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         detail: String,
     },
@@ -506,12 +514,14 @@ fn default_unlink_mode_event() -> u32 {
 pub enum TreeOp {
     Create {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         kind: FileKind,
         mode: u32,
     },
     Unlink {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         /// G02 — kind + mode of the entry at unlink time. Used by
         /// `emit_for_tree_op` to drive `InverseOp::RecreatePath`
@@ -524,17 +534,21 @@ pub enum TreeOp {
         mode: u32,
     },
     Rename {
+        #[serde(with = "crate::path_bytes")]
         from: PathBuf,
+        #[serde(with = "crate::path_bytes")]
         to: PathBuf,
         inode: InodeRef,
     },
     Link {
         source: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         target: PathBuf,
     },
     Symlink {
         target: String, // symlink contents (string the kernel returns)
-        path: PathBuf,  // location of the symlink itself
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf, // location of the symlink itself
     },
     /// W09.16.1 — a pre-existing symlink was atomically replaced.
     /// Carries the OLD target so undo can restore it. The planner
@@ -543,7 +557,8 @@ pub enum TreeOp {
     /// event) runs first, then this restores the original target.
     SymlinkRemoved {
         target: String, // the OLD symlink's target
-        path: PathBuf,  // path of the symlink that was replaced
+        #[serde(with = "crate::path_bytes")]
+        path: PathBuf, // path of the symlink that was replaced
     },
     /// L4 - device number, mode and owner of a block/char node that
     /// was unlinked, journaled right after its `Unlink`, with the
@@ -556,6 +571,7 @@ pub enum TreeOp {
     /// sees it and cannot restore the node (it refuses).
     DeviceNodeMeta {
         inode: InodeRef,
+        #[serde(with = "crate::path_bytes")]
         path: PathBuf,
         rdev: u64,
         mode: u32,
@@ -662,6 +678,7 @@ pub enum ProcessOpKind {
 pub struct CommandRecord {
     pub command: CommandId,
     pub cmd_string: Option<String>,
+    #[serde(with = "crate::path_bytes")]
     pub cwd: PathBuf,
     pub pid: u32,
     pub shell_kind: shit_proto::ShellKind,

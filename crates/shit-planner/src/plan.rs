@@ -133,6 +133,7 @@ pub fn plan(
     for ev in &live {
         emit_unless_skipped(ev, probe, store, &class, &mut nodes, &mut warnings);
     }
+    bracket_born_dirs(&live, probe, &mut nodes);
 
     // DR-14: partition nodes into cohorts so the orchestrator's
     // `run_parallel` only runs commuting ops concurrently. Without
@@ -145,6 +146,156 @@ pub fn plan(
         nodes,
         warnings,
     }
+}
+
+/// #214, #215: directories undo has to pass through but no op recreates.
+///
+/// The executor never makes a missing parent at the umask (#214). A
+/// directory whose removal the command journaled gets its RecreatePath
+/// from the per-event pass, but some have no inverse of their own:
+///
+/// - one the command created and removed is scratch, yet undo can pass
+///   through it: `mkdir d; mv existing/f d/; rm -rf d` restores `d/f`
+///   and moves it back to `existing/f` (#215);
+/// - one whose Create and Unlink a rename shape folded away (BSD's
+///   dir-diff Creates under a renamed tree).
+///
+/// For each such directory with a journaled mode (its removal's, else
+/// for a directory the command made, its mkdir's), an `EnsureDir` with
+/// that mode goes right before the first op under it. A directory
+/// the command created also gets a `RemoveBornDir` after every op,
+/// deepest first. A removal is looked up at the path it was journaled
+/// at and at that path mapped back through earlier renames of its
+/// ancestors, since ops can land at either.
+fn bracket_born_dirs(live: &[&CaptureEvent], probe: &dyn StateProbe, nodes: &mut Vec<PlanNode>) {
+    use crate::metadata::FileKind;
+
+    // Chronological.
+    let events: Vec<&CaptureEvent> = live.iter().rev().copied().collect();
+    let mut removed: Vec<(PathBuf, u32)> = Vec::new();
+    let mut born: Vec<PathBuf> = Vec::new();
+    let mut created_mode: std::collections::BTreeMap<PathBuf, u32> =
+        std::collections::BTreeMap::new();
+    for (i, e) in events.iter().enumerate() {
+        let (path, mode, is_create) = match &e.kind {
+            CaptureEventKind::TreeOp(TreeOp::Unlink {
+                path,
+                kind: FileKind::Directory,
+                mode,
+                ..
+            }) => (path, *mode, false),
+            CaptureEventKind::TreeOp(TreeOp::Create {
+                path,
+                kind: FileKind::Directory,
+                mode,
+                ..
+            }) => (path, *mode, true),
+            _ => continue,
+        };
+        let mut names = vec![path.clone()];
+        let mut back = path.clone();
+        for earlier in events[..i].iter().rev() {
+            if let CaptureEventKind::TreeOp(TreeOp::Rename { from, to, .. }) = &earlier.kind
+                && let Ok(rest) = back.strip_prefix(to)
+            {
+                back = if rest.as_os_str().is_empty() {
+                    from.clone()
+                } else {
+                    from.join(rest)
+                };
+                names.push(back.clone());
+            }
+        }
+        for n in names {
+            if is_create {
+                if !born.contains(&n) {
+                    born.push(n.clone());
+                }
+                created_mode.insert(n, mode);
+            } else {
+                removed.push((n, mode));
+            }
+        }
+    }
+    // The last journaled removal of a path wins.
+    let mut mode_of: std::collections::BTreeMap<PathBuf, u32> = std::collections::BTreeMap::new();
+    let mut order: Vec<PathBuf> = Vec::new();
+    for (p, m) in removed {
+        if mode_of.insert(p.clone(), m).is_none() {
+            order.push(p);
+        }
+    }
+    // A born directory whose removal came without a kind or mode (the
+    // LSM tier holds no fd on a directory made mid-command, so its
+    // rmdir races and is journaled as a marker) uses the mode its mkdir
+    // journaled. That mode is journaled too, and the scratch directory
+    // is removed again at the end.
+    for (p, m) in created_mode {
+        if let std::collections::btree_map::Entry::Vacant(v) = mode_of.entry(p.clone()) {
+            v.insert(m);
+            order.push(p);
+        }
+    }
+    // Shallow first, so a parent's EnsureDir is placed before its child's.
+    order.sort_by_key(|d| d.components().count());
+
+    let strictly_under = |op: &InverseOp, dir: &Path| -> bool {
+        let under = |p: &Path| p != dir && p.starts_with(dir);
+        match op {
+            InverseOp::Rename { from, to } => under(from) || under(to),
+            InverseOp::CreateHardlink { source, target } => under(source) || under(target),
+            other => other.primary_path().is_some_and(under),
+        }
+    };
+    let names = |op: &InverseOp, dir: &Path| -> bool {
+        match op {
+            InverseOp::Rename { from, to } => from == dir || to == dir,
+            InverseOp::EnsureDir { .. } => false,
+            other => other.primary_path() == Some(dir),
+        }
+    };
+    let mut removals = Vec::new();
+    for dir in &order {
+        let Some(first) = nodes.iter().position(|n| strictly_under(&n.op, dir)) else {
+            continue;
+        };
+        let earlier = &nodes[..first];
+        if earlier.iter().any(|n| {
+            matches!(
+                &n.op,
+                InverseOp::RecreatePath { path, .. } | InverseOp::EnsureDir { path, .. }
+                    if path == dir
+            ) || matches!(&n.op, InverseOp::Rename { to, .. } if to == dir)
+        }) {
+            continue;
+        }
+        // Present now and untouched by any op ahead of the first one
+        // under it: nothing to put back.
+        if probe.exists(dir) && !earlier.iter().any(|n| names(&n.op, dir)) {
+            continue;
+        }
+        nodes.insert(
+            first,
+            PlanNode {
+                op: InverseOp::EnsureDir {
+                    path: dir.clone(),
+                    mode: mode_of[dir],
+                },
+                cohort: 0,
+                conflict: None,
+            },
+        );
+        if born.contains(dir) && !nodes.iter().any(|n| names(&n.op, dir)) {
+            removals.push(dir.clone());
+        }
+    }
+    // Deepest first, so a born parent goes after its born children.
+    removals.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    nodes.extend(removals.into_iter().map(|d| PlanNode {
+        op: InverseOp::RemoveBornDir { path: d },
+        cohort: 0,
+        conflict: None,
+    }));
 }
 
 /// L5 (review of #232, item 2): a shim capture-gap marker for `P` says

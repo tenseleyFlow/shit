@@ -902,7 +902,8 @@ fn dispatch_response(
                 if stored_bytes == 0 && is_delete {
                     let command = CommandId { session, seq };
                     let inode_ref = InodeRef::new(dev, inode);
-                    let path_buf: PathBuf = path.unwrap_or_default().into();
+                    let path_buf: PathBuf =
+                        shit_proto::wire_path::decode(path.as_deref().unwrap_or_default());
                     let ts = crate::server::next_ts();
                     // G02: derive kind from mode bits (S_IFMT). The
                     // marker-only path is the canonical route for
@@ -1063,15 +1064,20 @@ fn dispatch_response(
         } => {
             let Some(staging) = fd else {
                 tracing::error!(%session, dev, inode, "BaselineCaptured missing SCM_RIGHTS fd");
-                live_baseline.mark_ingest_failed(session, Path::new(&cwd), dev, inode);
+                live_baseline.mark_ingest_failed(
+                    session,
+                    &shit_proto::wire_path::decode(&cwd),
+                    dev,
+                    inode,
+                );
                 return;
             };
             let ingested = handle_baseline_captured(
                 session,
-                std::path::PathBuf::from(&cwd),
+                shit_proto::wire_path::decode(&cwd),
                 dev,
                 inode,
-                std::path::PathBuf::from(&path),
+                shit_proto::wire_path::decode(&path),
                 blob_hash,
                 stored_bytes,
                 staging,
@@ -1080,10 +1086,20 @@ fn dispatch_response(
                 live_baseline,
             );
             match ingested {
-                Ok(_) => live_baseline.clear_ingest_inode(session, Path::new(&cwd), dev, inode),
+                Ok(_) => live_baseline.clear_ingest_inode(
+                    session,
+                    &shit_proto::wire_path::decode(&cwd),
+                    dev,
+                    inode,
+                ),
                 Err(e) => {
                     tracing::error!(error = %e, %session, dev, inode, %path, "failed to ingest BaselineCaptured");
-                    live_baseline.mark_ingest_failed(session, Path::new(&cwd), dev, inode);
+                    live_baseline.mark_ingest_failed(
+                        session,
+                        &shit_proto::wire_path::decode(&cwd),
+                        dev,
+                        inode,
+                    );
                 }
             }
         }
@@ -1093,7 +1109,7 @@ fn dispatch_response(
             file_count,
             partial,
         } => {
-            let cwd_path = std::path::PathBuf::from(&cwd);
+            let cwd_path = shit_proto::wire_path::decode(&cwd);
             // W09.12: empty-cwd case — the walk completed but no
             // entries arrived (cwd is empty pre-exec). Without an
             // entry in the LiveBaseline by-cwd map, the
@@ -1220,7 +1236,12 @@ fn dispatch_response(
             }
             if strict_capture {
                 tracing::warn!(%session, seq, ?path, %detail, "helper capture refusal (strict; journaling)");
-                journal_capture_refused_or_log(index, cmd, path.map(PathBuf::from), detail);
+                journal_capture_refused_or_log(
+                    index,
+                    cmd,
+                    path.as_deref().map(shit_proto::wire_path::decode),
+                    detail,
+                );
             } else {
                 tracing::info!(%session, seq, ?path, %detail, "helper capture observation (best-effort mode; not journaled)");
             }
@@ -1385,7 +1406,7 @@ fn handle_tree_mutation(
             CommandId { session, seq },
             ts,
             InodeRef::new(*dev, *inode),
-            std::path::PathBuf::from(path),
+            shit_proto::wire_path::decode(path),
             convert_kind(*kind),
             *mode,
         );
@@ -1400,7 +1421,7 @@ fn handle_tree_mutation(
             mode,
         } => TreeOp::Create {
             inode: InodeRef::new(dev, inode),
-            path: std::path::PathBuf::from(path),
+            path: shit_proto::wire_path::decode(&path),
             kind: convert_kind(kind),
             mode,
         },
@@ -1411,8 +1432,8 @@ fn handle_tree_mutation(
             dev,
             inode,
         } => TreeOp::Rename {
-            from: std::path::PathBuf::from(from),
-            to: std::path::PathBuf::from(to),
+            from: shit_proto::wire_path::decode(&from),
+            to: shit_proto::wire_path::decode(&to),
             inode: InodeRef::new(dev, inode),
         },
         TreeOpWire::Link {
@@ -1421,15 +1442,15 @@ fn handle_tree_mutation(
             target,
         } => TreeOp::Link {
             source: InodeRef::new(source_dev, source_inode),
-            target: std::path::PathBuf::from(target),
+            target: shit_proto::wire_path::decode(&target),
         },
         TreeOpWire::Symlink { target, path } => TreeOp::Symlink {
             target,
-            path: std::path::PathBuf::from(path),
+            path: shit_proto::wire_path::decode(&path),
         },
         TreeOpWire::SymlinkRemoved { target, path } => TreeOp::SymlinkRemoved {
             target,
-            path: std::path::PathBuf::from(path),
+            path: shit_proto::wire_path::decode(&path),
         },
     };
 
@@ -1498,7 +1519,8 @@ fn handle_metadata_change(
         }
     }
     let inode_ref = InodeRef::new(dev, inode);
-    let path_buf: std::path::PathBuf = path.unwrap_or_default().into();
+    let path_buf: std::path::PathBuf =
+        shit_proto::wire_path::decode(path.as_deref().unwrap_or_default());
     let ts = crate::server::next_ts();
     let event = CaptureEvent {
         id: EventId(0),
@@ -1554,7 +1576,7 @@ fn handle_captured_pre_image(
         acl: None,
         flags: args.flags,
     };
-    let path_buf: PathBuf = args.path.clone().unwrap_or_default().into();
+    let path_buf: PathBuf = shit_proto::wire_path::decode(args.path.as_deref().unwrap_or_default());
 
     // M03.x.OPEN-UNDO follow-up — tag the FilePreImage's source so
     // the planner can tell pre-mutation captures (macOS ES) from
@@ -1925,7 +1947,7 @@ fn handle_baseline_promoted_pre_image(
         acl: None,
         flags,
     };
-    let path_buf: PathBuf = path.clone().unwrap_or_default().into();
+    let path_buf: PathBuf = shit_proto::wire_path::decode(path.as_deref().unwrap_or_default());
     let ts = crate::server::next_ts();
 
     let pre_image = CaptureEvent {

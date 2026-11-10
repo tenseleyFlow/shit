@@ -43,6 +43,9 @@ pub enum ExecutionOutcome {
     AppliedWithNote { note: String },
     /// Dry-run: op *would* have applied. No mutation occurred.
     WouldApply,
+    /// Dry-run: op would apply, with a note on how (the real run would
+    /// return `AppliedWithNote` with the same note).
+    WouldApplyWithNote { note: String },
     /// Op was deliberately skipped (e.g. `--on-conflict=skip` hit a
     /// soft conflict, or partial-undo filter excluded the path).
     Skipped { reason: String },
@@ -62,14 +65,17 @@ impl ExecutionOutcome {
     pub fn is_inert(&self) -> bool {
         matches!(
             self,
-            Self::WouldApply | Self::Skipped { .. } | Self::Conflict { .. }
+            Self::WouldApply
+                | Self::WouldApplyWithNote { .. }
+                | Self::Skipped { .. }
+                | Self::Conflict { .. }
         )
     }
 
     pub fn verb_past_tense(&self) -> &'static str {
         match self {
             Self::Applied | Self::AppliedWithNote { .. } => "applied",
-            Self::WouldApply => "would apply",
+            Self::WouldApply | Self::WouldApplyWithNote { .. } => "would apply",
             Self::Skipped { .. } => "skipped",
             Self::Conflict { .. } => "conflict",
             Self::Failed { .. } => "failed",
@@ -114,7 +120,9 @@ impl OutcomeKind {
     pub fn from_outcome(o: &ExecutionOutcome) -> Self {
         match o {
             ExecutionOutcome::Applied | ExecutionOutcome::AppliedWithNote { .. } => Self::Applied,
-            ExecutionOutcome::WouldApply => Self::WouldApply,
+            ExecutionOutcome::WouldApply | ExecutionOutcome::WouldApplyWithNote { .. } => {
+                Self::WouldApply
+            }
             ExecutionOutcome::Skipped { .. } => Self::Skipped,
             ExecutionOutcome::Conflict { kind } => match kind {
                 Conflict::Soft { .. } => Self::ConflictSoft,
@@ -169,6 +177,7 @@ impl ExecutionReport {
 pub struct PlanSummary {
     pub command_id: crate::events::CommandId,
     pub cmd_string: Option<String>,
+    #[serde(with = "crate::path_bytes")]
     pub cwd: PathBuf,
     pub node_count: usize,
 }

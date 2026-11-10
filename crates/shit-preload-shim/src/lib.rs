@@ -827,9 +827,17 @@ mod policy {
                 // L4b - the removed entry's identity, read before the
                 // call, so the daemon can pair this report with the
                 // kernel tier's report of the same removal.
-                let pre_stat = matches!(syscall, "unlink" | "unlinkat")
-                    .then(|| lstat_identity(&abs))
-                    .flatten();
+                let is_unlink = matches!(syscall, "unlink" | "unlinkat");
+                // #213 (review of #262, item 2): nothing at the path
+                // means the call fails ENOENT and removes nothing
+                // (`rm -f`, cleanup code). Send no note: without a
+                // pre-call stat the daemon would refuse the path. Any
+                // other lstat error still sends the note without one,
+                // and the daemon refuses it.
+                if is_unlink && unlink_target_absent(&abs) {
+                    return;
+                }
+                let pre_stat = is_unlink.then(|| lstat_identity(&abs)).flatten();
                 notify_inner_stat(syscall, &abs, Some(&abs), None, true, pre_stat);
             }
             AtResolution::Failed(raw, failure) => {
@@ -1190,6 +1198,14 @@ mod policy {
     }
 
     /// lstat `path` into the wire's identity, with a symlink's target.
+    /// True when lstat says nothing is at `path` (ENOENT or ENOTDIR).
+    pub(super) fn unlink_target_absent(path: &str) -> bool {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => false,
+            Err(e) => matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR)),
+        }
+    }
+
     pub(super) fn lstat_identity(path: &str) -> Option<shit_proto::ShimStat> {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path)
