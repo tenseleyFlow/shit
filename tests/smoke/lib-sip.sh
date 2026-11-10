@@ -4,7 +4,11 @@
 # (`sip-*-undo-macos.sh`). Each smoke sources `lib.sh` first and this
 # file next. The command runs the way a hooked shell runs it: between
 # PreExec and PostExec, with the command key exported and
-# DYLD_INSERT_LIBRARIES set, which dyld drops for SIP binaries.
+# DYLD_INSERT_LIBRARIES set. The shim does not capture SIP binaries:
+# dyld either ignores the variable or, on Apple Silicon, aborts the
+# arm64e binary because the shim is arm64 only.
+
+SIP_DYLD_ABORT=0
 
 sip_setup() {
     HELPER_BIN="${SHIT_SMOKE_BIN_DIR}/shit-helper"
@@ -35,6 +39,8 @@ sip_run_hooked() {
         --session "${SESSION}" --seq 1 --pid "$$" \
         --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
     sleep 0.7
+    smoke_log "SIP: $(csrutil status 2>&1 | head -1)"
+    smoke_log "$1: $(file -b "$1" | head -1)"
     smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} $*"
     local rc
     set +e
@@ -42,6 +48,18 @@ sip_run_hooked() {
         > "${SHIT_SMOKE_TMP}/cmd.log" 2>&1
     rc=$?
     set -e
+    # On Apple Silicon the system binaries are arm64e. dyld tries the
+    # arm64 shim and aborts the command before it runs (exit 134), so
+    # nothing changed. Record that, then run the binary the way it runs
+    # with the shim out of reach, to check what undo says about it.
+    if [ "${rc}" -ne 0 ] && grep -q "incompatible architecture" "${SHIT_SMOKE_TMP}/cmd.log"; then
+        SIP_DYLD_ABORT=1
+        smoke_log "dyld aborted $1 with the shim inserted (exit ${rc}): $(grep -m1 -o "have '[a-z0-9]*', need '[a-z0-9]*'" "${SHIT_SMOKE_TMP}/cmd.log")"
+        set +e
+        _SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 "$@" > "${SHIT_SMOKE_TMP}/cmd.log" 2>&1
+        rc=$?
+        set -e
+    fi
     [ "${rc}" -eq 0 ] || smoke_fail "$* exited ${rc}: $(cat "${SHIT_SMOKE_TMP}/cmd.log")"
     sleep 0.5
     "${SHIT_BIN}" hook-send post-exec \
@@ -50,7 +68,7 @@ sip_run_hooked() {
     local hits
     hits="$(cat "${SHIT_SMOKE_TMP}"/state/shit/log/daemon.jsonl.* 2>/dev/null \
         | grep -c 'shim pre-mutation' || true)"
-    smoke_log "shim notes from $1: ${hits:-0} (0 expected: SIP strips DYLD_INSERT_LIBRARIES)"
+    smoke_log "shim notes from $1: ${hits:-0} (0 expected; dyld abort seen: ${SIP_DYLD_ABORT})"
     smoke_log "journal:"
     smoke_journal_query "SELECT id, discriminant, path FROM events;" 2>/dev/null \
         | sed 's/^/    /' >&2 || true

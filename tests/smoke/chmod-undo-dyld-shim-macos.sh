@@ -86,10 +86,14 @@ sleep 0.7
 # the shim sends them as the note's command key. Without it the daemon
 # attributes by pid ancestry, which loses the note when gchmod exits
 # before the walk ends (#269: the note was dropped that way).
-smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} ${CHMOD_BIN} 0644 ${TARGET}"
+# SHIT_SMOKE_NO_SHIM=1 leaves the shim out, so FSEvents is the only
+# capture: the shape of #269, where the shim's note was lost.
+INSERT=(env "DYLD_INSERT_LIBRARIES=${SHIM_LIB}")
+[ -n "${SHIT_SMOKE_NO_SHIM:-}" ] && INSERT=(env)
+smoke_log "${INSERT[*]} ${CHMOD_BIN} 0644 ${TARGET}"
 set +e
 _SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 \
-    DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${CHMOD_BIN}" 0644 "${TARGET}" \
+    "${INSERT[@]}" "${CHMOD_BIN}" 0644 "${TARGET}" \
     >"${SHIT_SMOKE_TMP}/chmod.log" 2>&1
 CHMOD_RC=$?
 set -e
