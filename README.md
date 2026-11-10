@@ -8,7 +8,7 @@ You ran a command and want its effects undone: an edit, a botched `mv`, an `rm` 
 
 Pre-1.0. APIs, wire formats, and on-disk layouts are unstable. "Arbitrary command undo" holds only for the classes pinned by a green CI smoke today. See [Coverage today](#coverage-today) and [What doesn't work yet](#what-doesnt-work-yet).
 
-Linux and FreeBSD run their smoke suites in CI. On macOS, CI runs the DYLD-interposer and wrapper smokes on hosted runners. The EndpointSecurity smokes are built but excluded from CI (see [macOS](#macos)). Windows is not supported.
+Linux and FreeBSD run their smoke suites in CI. On macOS, CI runs the DYLD-interposer and wrapper smokes on hosted runners. The EndpointSecurity smokes run on a self-hosted Apple Silicon host inside a SIP-disabled Tart guest (see [macOS](#macos)). Windows is not supported.
 
 ## Install
 
@@ -104,7 +104,7 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `hardlink-rm-undo-fbsd`, `ln-hardlink-undo-fbsd`, `ln-symlink-undo-fbsd`, `mkdir-p-undo-fbsd`, `mkdir-undo-fbsd`, `mkfifo-undo-fbsd`, `mv-across-dirs-undo-fbsd`, `mv-dir-undo-fbsd`, `mv-noop-undo-fbsd`, `non-ascii-filename-undo-fbsd`, `rm-undo-fbsd`, `symlink-replace-undo-fbsd` |
 | Filesystem: content writes and editors | `awk-inplace-undo-fbsd`, `backup-and-modify-undo-fbsd`, `cp-recursive-undo-fbsd`, `cpio-extract-undo-fbsd`, `dd-large-file-undo-fbsd`, `dd-notrunc-undo-fbsd`, `gzip-undo-fbsd`, `large-file-overwrite-undo-fbsd`, `patch-apply-undo-fbsd`, `rotate-and-touch-undo-fbsd`, `rsync-incremental-undo-fbsd`, `sed-inline-undo-fbsd`, `shell-append-undo-fbsd`, `shell-redirect-undo-fbsd`, `sort-inplace-undo-fbsd`, `split-undo-fbsd`, `tar-extract-undo-fbsd`, `tee-undo-fbsd`, `touch-edit-undo-fbsd`, `vim-edit-undo-fbsd` |
 
-### macOS (19 wired into CI, 9 excluded)
+### macOS (28 wired into CI, 2 excluded)
 
 #### hosted macos-15: 19 smokes
 
@@ -118,18 +118,17 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 | Filesystem: remove, rename, link, create | `link-undo-macos`, `mkfifo-undo-macos` |
 | Filesystem: content writes and editors | `cp-clone-overwrite-undo-macos`, `mmap-write-undo-macos` |
 
+#### self-hosted macos-es runner, SIP-disabled Tart guest (macos-es.yml; runs only when that runner is online): 9 smokes
+
+| Surface family | Smokes |
+|---|---|
+| Capture tier, sandbox and ZFS engine | `es-bin-mv-undo-macos`, `es-bin-rm-undo-macos`, `es-chmod-metadata-macos`, `es-doctor-prereqs-macos`, `es-open-write-undo-macos`, `es-truncate-undo-macos`, `es-unlink-undo-macos`, `es-xattr-roundtrip-macos`, `fsevents-fallback-macos` |
+
 #### Excluded from CI, so not evidence of coverage
 
 | Smoke | Excluded by |
 |---|---|
-| `es-chmod-metadata-macos` | `M03-vm-runner` |
-| `es-doctor-prereqs-macos` | `M03-vm-runner` |
-| `es-open-write-undo-macos` | `M03-vm-runner` |
-| `es-rename-undo-macos` | `M03-vm-runner` |
-| `es-truncate-undo-macos` | `M03-vm-runner` |
-| `es-unlink-undo-macos` | `M03-vm-runner` |
-| `es-xattr-roundtrip-macos` | `M03-vm-runner` |
-| `fsevents-fallback-macos` | `M03-vm-runner` |
+| `es-rename-undo-macos` | `issue-279` |
 | `mkdir-out-of-watch-undo-macos` | `M03.x.CREATE-mkdir-planner-coord-pending` |
 
 ### Any OS (12 wired into CI)
@@ -162,7 +161,7 @@ Smokes marked platform "any" branch on the runtime OS inside the script, but eac
 
 Some items below are limits of pinned classes; the ones marked unpinned have no smoke at all.
 
-- macOS: SIP-protected binaries (`/bin/rm`, `/bin/mv`, `/bin/cp` and the like) drop `DYLD_INSERT_LIBRARIES` on exec, so the default (non-EndpointSecurity) tier does not capture them. No smoke pins this behavior yet.
+- macOS: SIP-protected binaries (`/bin/rm`, `/bin/mv`, `/bin/cp` and the like) drop `DYLD_INSERT_LIBRARIES` on exec, so the default (non-EndpointSecurity) tier does not capture them. Under EndpointSecurity, `es-bin-rm-undo-macos` and `es-bin-mv-undo-macos` pin undo of `/bin/rm` and `/bin/mv`. Undo of `/bin/rm -r` on a tree (#280) and of `mv` over an existing file (#279) does not work yet.
 - Static binaries and binaries that issue raw syscalls (Go programs, for example) bypass the DYLD interposer on macOS and the LD_PRELOAD shim on FreeBSD. No smoke pins this either.
 - macOS `pip install --user --force-reinstall` reaches full restore on trunk, but `pip-install-user-undo-macos` does not yet gate on that outcome. It passes; it is not a gate.
 - Linux `pip install --user --force-reinstall` accepts two outcomes in its smoke: full restore through recursive pre-image, or a graceful fallback.
@@ -177,7 +176,7 @@ Some items below are limits of pinned classes; the ones marked unpinned have no 
 
 Two capture paths exist. EndpointSecurity needs a signed, entitled helper. The default path is the DYLD interposer, with FSEvents for readiness and diagnostics. `shit doctor` reports the active tier.
 
-The seven `es-*` smokes (including `es-doctor-prereqs-macos`), `fsevents-fallback-macos` and `mkdir-out-of-watch-undo-macos` carry `EXCLUDED_BY` and do not run in CI. The ES smokes need an Apple Silicon Tart host, which does not exist yet (#190). The EndpointSecurity path is built, not CI-gated. Everything in the macOS table above runs on hosted `macos-15` without ES.
+The EndpointSecurity smokes run in `macos-es.yml` on a self-hosted runner labelled `macos-es`. The runner drives a SIP-disabled Tart guest, and each smoke runs there as root against an ad-hoc signed helper. The workflow runs on `workflow_dispatch` and on trunk pushes, never on pull requests, so fork code never reaches the host. `es-rename-undo-macos` (#279) and `mkdir-out-of-watch-undo-macos` stay excluded. Everything else in the macOS table runs on hosted `macos-15` without ES.
 
 ## Refuse-list: what we explicitly won't undo
 
@@ -219,8 +218,8 @@ Gaps where coverage is plausible but not shipped, or shipped without CI evidence
 
 ### macOS
 
-- EndpointSecurity has no CI evidence until a Tart host runs the `es-*` smokes (#190).
-- SIP-protected system binaries are not captured by the default tier, and raw-syscall binaries bypass the interposer. Neither is pinned by a smoke.
+- EndpointSecurity CI evidence comes from one self-hosted runner. When it is offline, nothing gates the ES path.
+- SIP-protected system binaries are not captured by the default tier, only under EndpointSecurity. Raw-syscall binaries bypass the interposer, and no smoke pins that.
 - Notarized helper distribution is not built. The entitled-ES path needs a self-built helper with a developer-signed entitlement. The daemon refuses helpers whose code signature does not validate. A signed and notarized release pipeline is the remaining work.
 - DYLD interposer auto-install is not built. `shit dyld-hooks install` writes the shim to `/usr/local/lib/libshit_preload_shim.dylib` by hand; no package manager does it on first run.
 - Containers, cloud tools and shell hooks are untested.
