@@ -205,6 +205,12 @@ fn build_filter_with_action(mismatch_action: SeccompAction) -> Result<SeccompFil
 const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_read,
     libc::SYS_write,
+    // #252: the fanotify reader thread writes its permission responses
+    // with writev and waits with poll. It starts before the sandbox and
+    // was not filtered until TSYNC; aarch64 glibc implements poll with
+    // ppoll, and the bare poll syscall is x86_64-only (below).
+    libc::SYS_writev,
+    libc::SYS_ppoll,
     libc::SYS_recvmsg,
     libc::SYS_sendmsg,
     // L01 chunk 5: tokio-rt-worker also issues recvfrom/sendto on its
@@ -325,6 +331,7 @@ const ALLOWED_SYSCALLS: &[i64] = &[
 const ALLOWED_SYSCALLS_ARCH: &[i64] = &[
     libc::SYS_readlink,
     libc::SYS_epoll_wait,
+    libc::SYS_poll,
     libc::SYS_chown,
     libc::SYS_lchown,
     libc::SYS_mknod,
@@ -459,15 +466,49 @@ mod tests {
             let rc = unsafe { libc::syscall(libc::SYS_getppid) };
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             res_tx.send((rc, errno)).unwrap();
+            // What the fanotify reader does once filtered: poll its fd,
+            // writev the responses.
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            let mut pfd = libc::pollfd {
+                fd: fds[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let polled = unsafe { libc::poll(&mut pfd, 1, 0) };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            res_tx.send((polled as i64, errno)).unwrap();
+            let byte = [1u8];
+            let iov = libc::iovec {
+                iov_base: byte.as_ptr() as *mut libc::c_void,
+                iov_len: 1,
+            };
+            let wrote = unsafe { libc::writev(fds[1], &iov, 1) };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            res_tx.send((wrote as i64, errno)).unwrap();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
         });
         install_filter().expect("install filter");
         go_tx.send(()).unwrap();
         let (rc, errno) = res_rx.recv().unwrap();
+        let (polled, poll_errno) = res_rx.recv().unwrap();
+        let (wrote, writev_errno) = res_rx.recv().unwrap();
         early.join().unwrap();
         assert_eq!(
             (rc, errno),
             (-1, libc::EPERM),
             "getppid from a thread spawned before install was not filtered"
+        );
+        assert_eq!(
+            polled, 0,
+            "poll refused under the filter (errno {poll_errno})"
+        );
+        assert_eq!(
+            wrote, 1,
+            "writev refused under the filter (errno {writev_errno})"
         );
         println!("tsync child: ok");
     }
