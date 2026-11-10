@@ -80,9 +80,14 @@ cd "${WATCHED}"
     --cwd "${WATCHED}" --shell bash --sock "${SHIT_HOOK_SOCK}"
 sleep 0.7
 
+# The shell hook exports _SHIT_SESSION / _SHIT_SEQ to the command;
+# the shim sends them as the note's command key. Without it the daemon
+# attributes by pid ancestry, which loses the note when gchmod exits
+# before the walk ends (#269: the note was dropped that way).
 smoke_log "DYLD_INSERT_LIBRARIES=${SHIM_LIB} gchmod 0644 ${TARGET}"
 set +e
-DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${CHMOD_BIN}" 0644 "${TARGET}" \
+_SHIT_SESSION="${SESSION}" _SHIT_SEQ=1 \
+    DYLD_INSERT_LIBRARIES="${SHIM_LIB}" "${CHMOD_BIN}" 0644 "${TARGET}" \
     >"${SHIT_SMOKE_TMP}/chmod.log" 2>&1
 CHMOD_RC=$?
 set -e
@@ -120,6 +125,11 @@ FINAL_MODE="$(stat -f %p "${TARGET}" 2>/dev/null | tail -c 4 || echo MISSING)"
 smoke_log "post-undo: ${TARGET} mode=${FINAL_MODE}"
 
 "${SHIT_BIN}" hook-send session-close --session "${SESSION}" --sock "${SHIT_HOOK_SOCK}"
+
+# #269: an undo of a chmod must never remove the file.
+if [ "${FINAL_MODE}" = "MISSING" ]; then
+    smoke_fail "#269: undo of a chmod removed ${TARGET} (undo exit ${UNDO_RC})"
+fi
 
 # Outcome A — full undo (mode restored)
 if [ "${FINAL_MODE}" = "${PRE_MODE}" ]; then
