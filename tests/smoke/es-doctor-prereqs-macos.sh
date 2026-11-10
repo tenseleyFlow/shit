@@ -16,8 +16,10 @@
 #
 #   1. `shit doctor --json` reports `es_capable: true`
 #   2. Each individual prereq probe is green
-#      (`sip.state="disabled"|"custom"`, `sip.authenticated_root="disabled"`,
-#      `sip.amfi_bypass=true`, `endpoint_security.helper_has_es_entitlement=true`)
+#      (`sip.state="disabled"|"custom"`, `sip.amfi_bypass=true`,
+#      `endpoint_security.helper_has_es_entitlement=true`).
+#      `sip.authenticated_root` is reported but not required: ES works
+#      with it enabled (lane M2, macOS 15 Tart guest).
 #   3. `es_blockers` array is empty
 #   4. `shit setup-es-mode --check` exits 0 and prints all-pass
 #   5. `shit setup-es-mode --print` short-circuits to "nothing to do"
@@ -81,8 +83,8 @@ expect(m.get("es_blockers") == [], f"macos.es_blockers should be []; got {m.get(
 sip = m.get("sip") or {}
 expect(sip.get("state") in ("disabled", "custom"),
        f"macos.sip.state should be disabled|custom; got {sip.get('state')!r}")
-expect(sip.get("authenticated_root") == "disabled",
-       f"macos.sip.authenticated_root should be disabled; got {sip.get('authenticated_root')!r}")
+expect(sip.get("authenticated_root") in ("enabled", "disabled"),
+       f"macos.sip.authenticated_root should be reported; got {sip.get('authenticated_root')!r}")
 expect(sip.get("amfi_bypass") is True,
        f"macos.sip.amfi_bypass should be true; got {sip.get('amfi_bypass')!r}")
 
@@ -97,7 +99,7 @@ if fails:
 print("all doctor JSON assertions green")
 PY
 
-smoke_log "doctor JSON: es_capable=true + all 4 prereq fields green ✓"
+smoke_log "doctor JSON: es_capable=true + all 3 prereq fields green ✓"
 
 # ─────────────────────────────────────────────────────────────────────
 # Part 2 — `shit setup-es-mode --check` exits 0 with all-pass output
@@ -110,17 +112,17 @@ if [ "${SETUP_CHECK_RC}" -ne 0 ]; then
     sed 's/^/    /' "${SETUP_CHECK_OUT}" >&2
     smoke_fail "setup-es-mode --check exited ${SETUP_CHECK_RC} (expected 0)"
 fi
-# All four prereq lines should show ✓ pass.
+# All three prereq lines should show ✓ pass.
 PASS_COUNT="$(grep -cE '\[✓ pass\]' "${SETUP_CHECK_OUT}" || true)"
-if [ "${PASS_COUNT}" -ne 4 ]; then
+if [ "${PASS_COUNT}" -ne 3 ]; then
     sed 's/^/    /' "${SETUP_CHECK_OUT}" >&2
-    smoke_fail "setup-es-mode --check should show 4 ✓ pass lines; got ${PASS_COUNT}"
+    smoke_fail "setup-es-mode --check should show 3 ✓ pass lines; got ${PASS_COUNT}"
 fi
 if ! grep -q "es_capable = TRUE" "${SETUP_CHECK_OUT}"; then
     sed 's/^/    /' "${SETUP_CHECK_OUT}" >&2
     smoke_fail "setup-es-mode --check missing 'es_capable = TRUE' summary"
 fi
-smoke_log "setup-es-mode --check: exit 0, 4/4 prereqs pass, es_capable=TRUE ✓"
+smoke_log "setup-es-mode --check: exit 0, 3/3 prereqs pass, es_capable=TRUE ✓"
 
 # ─────────────────────────────────────────────────────────────────────
 # Part 3 — `shit setup-es-mode --print` short-circuits when capable

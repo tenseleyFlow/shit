@@ -6,7 +6,7 @@
 //! Apple denied the EndpointSecurity entitlement for general
 //! distribution (see `.docs/audits/apple-entitlement.md`), so the
 //! only way to get ES-tier pre-image capture on a stock Mac is for
-//! the user to explicitly disable SIP + AuthRoot, set the AMFI
+//! the user to explicitly disable SIP, set the AMFI
 //! bypass boot-arg, and codesign the helper with the entitlement
 //! plist embedded. This subcommand turns the doctor's structured
 //! `es_blockers` list into a user-facing setup flow:
@@ -108,7 +108,6 @@ fn run_check(capable: bool, blockers: &[EsBlocker]) -> Result<(), CliError> {
     println!();
     for (component, label) in &[
         ("sip", "SIP disabled                "),
-        ("authenticated_root", "AuthRoot disabled           "),
         ("amfi_bypass", "AMFI bypass boot-arg set    "),
         ("helper_entitlement", "Helper carries ES entitlement"),
     ] {
@@ -173,9 +172,10 @@ fn run_print(capable: bool, blockers: &[EsBlocker]) -> Result<(), CliError> {
     println!("# 3. Verify:");
     println!("    shit setup-es-mode --check");
     println!();
-    println!("# To REVERT later (restore SIP + AuthRoot + remove the AMFI bypass):");
+    println!("# To REVERT later (restore SIP + remove the AMFI bypass):");
     println!("#   - Boot into Recovery again, run:");
     println!("        csrutil enable");
+    println!("#     If an older version of this guide had you disable AuthRoot, also run:");
     println!("        csrutil authenticated-root enable");
     println!("#   - Back in macOS:");
     println!("        sudo nvram -d boot-args");
@@ -187,8 +187,8 @@ fn print_warnings_header() {
     println!("# ╔══════════════════════════════════════════════════════════════════╗");
     println!("# ║                  ⚠  YOU ARE ABOUT TO WEAKEN macOS SECURITY  ⚠       ║");
     println!("# ╠══════════════════════════════════════════════════════════════════╣");
-    println!("# ║  These steps disable System Integrity Protection, the Apple        ║");
-    println!("# ║  Silicon System volume seal, and the AMFI entitlement-check.       ║");
+    println!("# ║  These steps disable System Integrity Protection and the AMFI      ║");
+    println!("# ║  entitlement check.                                                ║");
     println!("# ║  After running them:                                                ║");
     println!("# ║    • Gatekeeper signature verification is weakened                 ║");
     println!("# ║    • Kernel extension loading is less restricted                   ║");

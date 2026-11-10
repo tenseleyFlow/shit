@@ -423,9 +423,14 @@ pub fn probe_helper_has_es_entitlement(helper_path: Option<&Path>) -> bool {
 ///   off for the filesystem-protection bit even with kext-signing on,
 ///   which is enough for our purposes; if it's still blocking we'd
 ///   see the next probe report blockers anyway)
-/// - `sip.authenticated_root == "disabled"`
 /// - `sip.amfi_bypass == true`
 /// - `endpoint_security.helper_has_es_entitlement == true`
+///
+/// `sip.authenticated_root` is reported but is not a prereq. An
+/// ad-hoc signed helper got ES events with Authenticated Root still
+/// enabled (macOS 15.7.7 Tart guest, SIP disabled, AMFI boot-arg set;
+/// lane M2). The sealed system volume does not take part in AMFI's
+/// entitlement check.
 ///
 /// When any prereq fails, the returned `Vec<EsBlocker>` enumerates
 /// each missing piece with a remediation command.
@@ -440,21 +445,6 @@ pub fn compose_es_capable(sip: &SipReport, es: &EndpointSecurityReport) -> (bool
                 sip.state
             ),
             fix_command: Some("csrutil disable".into()),
-            recovery_mode: true,
-        });
-    }
-    if sip.authenticated_root != "disabled" {
-        blockers.push(EsBlocker {
-            component: "authenticated_root".into(),
-            reason: format!(
-                "Authenticated Root is {}; required to be disabled on Apple Silicon for AMFI bypass to take effect",
-                if sip.authenticated_root.is_empty() {
-                    "unknown"
-                } else {
-                    sip.authenticated_root.as_str()
-                }
-            ),
-            fix_command: Some("csrutil authenticated-root disable".into()),
             recovery_mode: true,
         });
     }
@@ -1352,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_es_capable_stock_mac_lists_all_four_blockers() {
+    fn compose_es_capable_stock_mac_lists_all_three_blockers() {
         let sip = SipReport {
             state: "enabled".into(),
             authenticated_root: "enabled".into(),
@@ -1366,16 +1356,36 @@ mod tests {
         assert!(!capable);
         let names: Vec<&str> = blockers.iter().map(|b| b.component.as_str()).collect();
         assert!(names.contains(&"sip"));
-        assert!(names.contains(&"authenticated_root"));
+        assert!(!names.contains(&"authenticated_root"));
         assert!(names.contains(&"amfi_bypass"));
         assert!(names.contains(&"helper_entitlement"));
-        // Recovery-mode flags set correctly on the SIP/auth-root blockers.
+        assert_eq!(blockers.len(), 3);
+        // Only the SIP blocker needs Recovery.
         for b in &blockers {
             match b.component.as_str() {
-                "sip" | "authenticated_root" => assert!(b.recovery_mode),
+                "sip" => assert!(b.recovery_mode),
                 _ => assert!(!b.recovery_mode),
             }
         }
+    }
+
+    #[test]
+    fn compose_es_capable_ignores_authenticated_root() {
+        // Lane M2 evidence: ES delivered AUTH events to an ad-hoc
+        // signed helper on a guest with SIP off, the AMFI boot-arg
+        // set and Authenticated Root still enabled.
+        let sip = SipReport {
+            state: "disabled".into(),
+            authenticated_root: "enabled".into(),
+            amfi_bypass: true,
+        };
+        let es = EndpointSecurityReport {
+            helper_has_es_entitlement: true,
+            ..Default::default()
+        };
+        let (capable, blockers) = compose_es_capable(&sip, &es);
+        assert!(capable, "auth-root must not block: blockers={blockers:?}");
+        assert!(blockers.is_empty());
     }
 
     #[test]
