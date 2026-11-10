@@ -8,12 +8,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
+WORK_DIR="${SHIT_TART_WORK_DIR:-${SCRIPT_DIR}/work}"
 mkdir -p "${WORK_DIR}"
 
 : "${SHIT_TART_VM:=shit-m03}"
-: "${SHIT_TART_BASE:=ghcr.io/cirruslabs/macos-sonoma-base:latest}"
-: "${SHIT_TART_DISK_GB:=80}"
+: "${SHIT_TART_BASE:=ghcr.io/cirruslabs/macos-sequoia-base:latest}"
+# Leave unset to keep the image's own disk size (50 GB for the Cirrus
+# -base images). Every GB the guest writes is a GB of host disk, so
+# only grow it when the host has room.
+: "${SHIT_TART_DISK_GB:=}"
 
 if ! command -v tart >/dev/null 2>&1; then
     echo "tart not installed; run:  brew install cirruslabs/cli/tart" >&2
@@ -29,7 +32,9 @@ fi
 if ! tart list | awk '{print $2}' | grep -qxF "${SHIT_TART_VM}"; then
     echo "[boot] cloning ${SHIT_TART_BASE} -> ${SHIT_TART_VM}"
     tart clone "${SHIT_TART_BASE}" "${SHIT_TART_VM}"
-    tart set "${SHIT_TART_VM}" --disk-size "${SHIT_TART_DISK_GB}"
+    if [ -n "${SHIT_TART_DISK_GB}" ]; then
+        tart set "${SHIT_TART_VM}" --disk-size "${SHIT_TART_DISK_GB}"
+    fi
 else
     echo "[boot] ${SHIT_TART_VM} already exists; skipping clone"
 fi
