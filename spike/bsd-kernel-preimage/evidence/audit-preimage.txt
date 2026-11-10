@@ -1,0 +1,8 @@
+auditpipe_reader: classes fw,fd,fm,fc
+unlink records: 20, path still present at receipt: 0
+open-trunc records: 20, file still 3893 B at receipt: 0
+AUE_OPENAT_WTC lag=14.685ms exists=no size=-1 /home/freebsd/b5/work-audit/u1
+AUE_OPENAT_WTC lag=12.685ms exists=yes size=4 /home/freebsd/b5/work-audit/t1
+AUE_UNLINK lag=10.685ms exists=no size=-1 /home/freebsd/b5/work-audit/u1
+AUE_OPENAT_WT lag=10.685ms exists=yes size=4 /home/freebsd/b5/work-audit/t1
+summary: records=711 with_path=81 path_exists=41 path_gone=40 lag_avg=50.704ms lag_max=100.199ms drops=0

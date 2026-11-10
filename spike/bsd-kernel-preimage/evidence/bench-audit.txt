@@ -1,0 +1,60 @@
+plain untar 0.46
+plain checkout 0.38
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.58
+plain-audit checkout 0.31
+plain untar 0.50
+plain checkout 0.38
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.65
+plain-audit checkout 0.43
+plain untar 0.48
+plain checkout 0.34
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.63
+plain-audit checkout 0.40
+plain untar 0.44
+plain checkout 0.36
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.64
+plain-audit checkout 0.41
+plain untar 0.52
+plain checkout 0.38
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.57
+plain-audit checkout 0.41
+plain untar 0.42
+plain checkout 0.32
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.43
+plain-audit checkout 0.38
+plain untar 0.26
+plain checkout 0.25
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.40
+plain-audit checkout 0.27
+plain untar 0.29
+plain checkout 0.22
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.33
+plain-audit checkout 0.27
+plain untar 0.22
+plain checkout 0.20
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.35
+plain-audit checkout 0.22
+plain untar 0.22
+plain checkout 0.19
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.34
+plain-audit checkout 0.25
+plain untar 0.22
+plain checkout 0.18
+auditpipe_reader: classes fw,fd,fm,fc
+plain-audit untar 0.28
+plain-audit checkout 0.24
+--- medians over 11 rounds
+plain checkout median=0.32 all:0.38 0.38 0.34 0.36 0.38 0.32 0.25 0.22 0.20 0.19 0.18
+plain untar median=0.42 all:0.46 0.50 0.48 0.44 0.52 0.42 0.26 0.29 0.22 0.22 0.22
+plain-audit checkout median=0.31 all:0.31 0.43 0.40 0.41 0.41 0.38 0.27 0.27 0.22 0.25 0.24
+plain-audit untar median=0.43 all:0.58 0.65 0.63 0.64 0.57 0.43 0.40 0.33 0.35 0.34 0.28

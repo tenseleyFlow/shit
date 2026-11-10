@@ -1,0 +1,25 @@
+== stop_test.d -x switchrate=1000hz "/home/freebsd/b5/spike/dtrace/copier.sh"
+unlink trials: copier saw file present: 0/10
+trunc  trials: copier saw full size (3893 B): 0/10
+trunc  trials: copier saw size 0: 10/10
+17002 unlink absent victim=T /home/freebsd/b5/work-dtrace/u1
+17009 openat present size=0 victim=T /home/freebsd/b5/work-dtrace/t1
+17020 unlink absent victim=T /home/freebsd/b5/work-dtrace/u2
+17027 openat present size=0 victim=T /home/freebsd/b5/work-dtrace/t2
+copier ran after the mutator exited: 0
+== chill_test.d -x switchrate=1000hz "/home/freebsd/b5/spike/dtrace/copier.sh" 200000000
+unlink trials: copier saw file present: 0/10
+trunc  trials: copier saw full size (3893 B): 0/10
+trunc  trials: copier saw size 0: 0/10
+17292 unlink absent victim=exited /home/freebsd/b5/work-dtrace/u1
+17297 openat present size=4 victim=exited /home/freebsd/b5/work-dtrace/t1
+17310 unlink absent victim=exited /home/freebsd/b5/work-dtrace/u2
+17313 openat present size=4 victim=exited /home/freebsd/b5/work-dtrace/t2
+copier ran after the mutator exited: 20
+== chill_test.d -x switchrate=1000hz "/home/freebsd/b5/spike/dtrace/copier.sh" 450000000
+unlink trials: copier saw file present: 0/10
+trunc  trials: copier saw full size (3893 B): 0/10
+trunc  trials: copier saw size 0: 0/10
+17903 unlink absent victim=exited /home/freebsd/b5/work-dtrace/u1
+17908 openat present size=4 victim=exited /home/freebsd/b5/work-dtrace/t1
+17923 unlink absent victim=exited /home/freebsd/b5/work-dtrace/u2

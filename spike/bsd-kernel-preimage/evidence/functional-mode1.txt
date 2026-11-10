@@ -1,0 +1,17 @@
+1 unlink      pid=1066 jid=0 comm=mut size=14000 mode=644 nlink=1 flags=0x1 hook=2.4us lag=675.8us bytes=14000 /home/freebsd/b5/work-func/t/unlinked
+2 open_w      pid=1067 jid=0 comm=mut size=30000 mode=644 nlink=1 flags=0x2 hook=19.1us lag=439.8us bytes=30000 /home/freebsd/b5/work-func/t/truncated
+3 open_w      pid=1068 jid=0 comm=mut size=39000 mode=644 nlink=1 flags=0x2 hook=36.1us lag=974.0us bytes=39000 /home/freebsd/b5/work-func/t/inplace
+4 rename_from pid=1069 jid=0 comm=mut size=0 mode=0 nlink=0 flags=0x80 hook=1.4us lag=718.6us bytes=0 /home/freebsd/b5/work-func/t/src
+5 rename_to   pid=1069 jid=0 comm=mut size=48000 mode=644 nlink=1 flags=0x1 hook=0.5us lag=721.4us bytes=48000 /home/freebsd/b5/work-func/t/target
+6 open_w      pid=1070 jid=0 comm=mut size=65000 mode=644 nlink=1 flags=0x2 hook=30.0us lag=371.6us bytes=65000 /home/freebsd/b5/work-func/t/mmapped
+7 mmap_w      pid=1070 jid=0 comm=mut size=65000 mode=644 nlink=1 flags=0x8 hook=0.5us lag=2233.5us bytes=0 /home/freebsd/b5/work-func/t/mmapped
+8 setmode     pid=1071 jid=0 comm=mut size=84000 mode=644 nlink=1 flags=0x0 hook=0.9us lag=457.4us bytes=0 /home/freebsd/b5/work-func/t/chmodded
+summary: wall=0.007s events=8 captured=5 bytes=196000 hook_avg=11.4us hook_max=36.1us lag_avg=824.0us lag_max=2233.5us
+per-op: unlink=1 rename_from=1 rename_to=1 open_w=3 mmap_w=1 setmode=1
+--- verification (sha256 of originals found among staged blobs)
+ok   unlinked pre-image captured
+ok   truncated pre-image captured
+ok   inplace pre-image captured
+ok   target pre-image captured
+ok   mmapped pre-image captured
+ok   chmodded old mode 644 reported
