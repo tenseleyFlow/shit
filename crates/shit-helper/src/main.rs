@@ -2630,6 +2630,18 @@ fn open_watch_dir(path: &str) -> Result<WatchCwd, String> {
 #[cfg(target_os = "linux")]
 fn name_open_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, String> {
     use std::os::fd::AsRawFd;
+    name_open_dir_with(fd, || {
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+    })
+}
+
+/// [`name_open_dir`] with the readlink passed in, so a test can remove
+/// or move the directory inside the window the check closes.
+#[cfg(target_os = "linux")]
+fn name_open_dir_with(
+    fd: &std::os::fd::OwnedFd,
+    readlink: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt;
     let held = |when: &str| -> Result<(u64, u64), String> {
         let meta = std::fs::File::from(fd.try_clone().map_err(|e| e.to_string())?)
@@ -2641,8 +2653,7 @@ fn name_open_dir(fd: &std::os::fd::OwnedFd) -> Result<PathBuf, String> {
         Ok((meta.dev(), meta.ino()))
     };
     let id = held("before it could be named")?;
-    let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        .map_err(|e| format!("cannot name the opened directory: {e}"))?;
+    let path = readlink().map_err(|e| format!("cannot name the opened directory: {e}"))?;
     held("while it was being named")?;
     let named = std::fs::metadata(&path)
         .map_err(|e| format!("{} does not name the opened directory: {e}", path.display()))?;
@@ -2993,34 +3004,62 @@ mod linux_watch_tests {
         std::fs::File::open(p).unwrap().into()
     }
 
-    /// #257: a directory removed after it was opened (the window between
-    /// the open and the readlink) is refused, not named
-    /// `"<path> (deleted)"`.
+    /// Name `fd` through the real `/proc/self/fd` readlink, after
+    /// running `between` (the window after the open-time checks).
+    fn name_after(fd: &std::os::fd::OwnedFd, between: impl FnOnce()) -> Result<PathBuf, String> {
+        use std::os::fd::AsRawFd;
+        name_open_dir_with(fd, || {
+            between();
+            std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        })
+    }
+
+    /// #257: a directory removed between the open and the readlink is
+    /// refused, not named `"<path> (deleted)"`.
     #[test]
     fn directory_removed_before_naming_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("gone");
         std::fs::create_dir(&gone).unwrap();
         let fd = open_dir_fd(&gone);
-        std::fs::remove_dir(&gone).unwrap();
-        let r = name_open_dir(&fd);
+        let r = name_after(&fd, || std::fs::remove_dir(&gone).unwrap());
         assert!(r.is_err(), "named a removed directory: {r:?}");
     }
 
-    /// #257: a suffix check is not enough. With a directory literally
-    /// named `"gone (deleted)"` beside it, the readlink of the removed
-    /// directory names that other directory, and only the identity
-    /// check refuses it.
+    /// #257: a suffix check is not enough. A directory literally named
+    /// `"gone (deleted)"` is a real path. A readlink that names it while
+    /// `gone` still has links is refused by the identity check alone;
+    /// once `gone` is removed, the nlink recheck refuses it as well.
     #[test]
     fn readlink_naming_another_directory_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("gone");
+        let decoy = dir.path().join("gone (deleted)");
         std::fs::create_dir(&gone).unwrap();
-        std::fs::create_dir(dir.path().join("gone (deleted)")).unwrap();
+        std::fs::create_dir(&decoy).unwrap();
         let fd = open_dir_fd(&gone);
-        std::fs::remove_dir(&gone).unwrap();
-        let r = name_open_dir(&fd);
+        let r = name_open_dir_with(&fd, || Ok(decoy.clone()));
         assert!(r.is_err(), "named a decoy directory: {r:?}");
+        let r = name_after(&fd, || std::fs::remove_dir(&gone).unwrap());
+        assert!(r.is_err(), "named a removed directory: {r:?}");
+    }
+
+    /// #257: a directory moved between the readlink and the stat is
+    /// refused when another directory took its old name.
+    #[test]
+    fn directory_replaced_after_naming_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        std::fs::create_dir(&here).unwrap();
+        let fd = open_dir_fd(&here);
+        let r = name_open_dir_with(&fd, || {
+            use std::os::fd::AsRawFd;
+            let p = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+            std::fs::rename(&here, dir.path().join("moved")).unwrap();
+            std::fs::create_dir(&here).unwrap();
+            p
+        });
+        assert!(r.is_err(), "named a replacement directory: {r:?}");
     }
 
     /// #257: a directory moved after it was opened is named by its new
@@ -3032,8 +3071,7 @@ mod linux_watch_tests {
         let after = dir.path().join("after");
         std::fs::create_dir(&before).unwrap();
         let fd = open_dir_fd(&before);
-        std::fs::rename(&before, &after).unwrap();
-        let named = name_open_dir(&fd).unwrap();
+        let named = name_after(&fd, || std::fs::rename(&before, &after).unwrap()).unwrap();
         assert_eq!(named, std::fs::canonicalize(&after).unwrap());
     }
 
