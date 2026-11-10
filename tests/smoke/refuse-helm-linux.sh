@@ -40,5 +40,7 @@ cd "${SHIT_SMOKE_TMP}/scratch"
 smoke_refuse_assert "cluster-release" "helm install au-l8 ./chart"
 smoke_refuse_assert "cluster-release" "helm upgrade --install au-l8 ./chart"
 smoke_refuse_assert "cluster-release" "helm uninstall au-l8"
+smoke_refuse_assert "cluster-release" "sudo helm install au-l8 ./chart"
+smoke_refuse_assert "cluster-release" "helm -n prod upgrade au-l8 ./chart"
 
 smoke_log "PASS: refuse-helm-linux (cluster-release class pinned)"

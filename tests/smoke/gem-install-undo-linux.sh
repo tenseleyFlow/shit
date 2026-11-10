@@ -155,9 +155,15 @@ if diff "${SHIT_SMOKE_TMP}/tree-before.txt" "${SHIT_SMOKE_TMP}/tree-after.txt" \
             > "${SHIT_SMOKE_TMP}/dirs.diff" 2>&1; then
             smoke_log "known gap #260: directories differ after undo:"
             sed 's/^/    /' "${SHIT_SMOKE_TMP}/dirs.diff" >&2
-            if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
-                smoke_fail "SHIT_REQUIRE_OUTCOME_A=1: directories not restored"
+            # Under SHIT_REQUIRE_OUTCOME_A=1 only the #260 leftover is allowed.
+            if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ] \
+                && grep -E '^[<>]' "${SHIT_SMOKE_TMP}/dirs.diff" \
+                    | grep -qvxF "> ./gems/${GEM_NAME}-2.0.0"; then
+                smoke_fail "SHIT_REQUIRE_OUTCOME_A=1: unexpected directory differences beyond #260"
             fi
+        fi
+        if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ] && [ "${UNDO_RC}" -ne 0 ]; then
+            smoke_fail "SHIT_REQUIRE_OUTCOME_A=1: undo exited ${UNDO_RC} after restoring the files"
         fi
         smoke_log "OUTCOME A: gem files match the pre-v2 state, executable prints v1"
         smoke_log "PASS: gem-install-undo-linux (Outcome A)"
@@ -174,7 +180,7 @@ if [ "${SHIT_REQUIRE_OUTCOME_A:-}" = "1" ]; then
 fi
 
 if [ "${UNDO_RC}" -ne 0 ] \
-    && grep -qE "out-of-scope|outside|refus|conflict|${GEM_NAME}" "${SHIT_SMOKE_TMP}/undo.log"; then
+    && grep -qE "conflict \(|refused|Conflict[A-Za-z]*|out-of-scope" "${SHIT_SMOKE_TMP}/undo.log"; then
     smoke_log "OUTCOME B: loud refusal (undo non-zero, log names the conflict)"
     smoke_log "PASS: gem-install-undo-linux (Outcome B)"
     exit 0

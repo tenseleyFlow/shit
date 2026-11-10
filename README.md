@@ -192,8 +192,8 @@ The planner short-circuits these classes at plan-build time with a one-line reas
 | **sandbox-escape** | `chroot`, `unshare`, `nsenter` | namespace / chroot transitions move execution into a context our capture tier no longer observes |
 | **opaque-shell-mutation** | `source script.sh`, `. script.sh` | sourcing mutates the parent shell in arbitrary ways we don't introspect |
 | **system-identity** | `useradd`, `userdel`, `usermod`, `groupadd`, `groupdel`, `passwd` | PAM + shadow-file mutations touch state we won't trust ourselves to roll back without per-OS policy |
-| **cluster-release** | `helm install`, `helm upgrade`, `helm uninstall`, `helm delete`, `helm rollback` | release state lives in the cluster and is not captured; undo would report success and change nothing |
-| **firewalld** | `firewall-cmd` | runtime and permanent zone state is not captured; undo would report success and change nothing |
+| **cluster-release** | `helm install`, `helm upgrade`, `helm uninstall`, `helm delete`, `helm rollback` (also behind `sudo` or global flags such as `-n prod`); `helm list`, `status`, `get`, `template` and `show` are not refused | release state lives in the cluster and is not captured; undo would report success and change nothing |
+| **firewalld** | `firewall-cmd` options that change state (`--add-*`, `--remove-*`, `--reload`, ...); `--state`, `--list-*` and `--get-*` are not refused | runtime and permanent zone state is not captured; undo would report success and change nothing |
 
 ## What doesn't work yet
 

@@ -38,5 +38,6 @@ cd "${SHIT_SMOKE_TMP}/scratch"
 
 smoke_refuse_assert "firewalld" "firewall-cmd --add-port=8080/tcp"
 smoke_refuse_assert "firewalld" "firewall-cmd --permanent --add-service=http"
+smoke_refuse_assert "firewalld" "sudo firewall-cmd --add-port=8080/tcp"
 
 smoke_log "PASS: refuse-firewall-cmd-linux (firewalld class pinned)"

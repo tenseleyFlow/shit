@@ -41,17 +41,32 @@ if ! sudo -n true 2>/dev/null; then
 fi
 
 PORT=54321
+# Host safety. Enabling ufw can cut an SSH session and a stray rule
+# changes the host's firewall, so outside CI the smoke runs only when ufw
+# is already active.
 UFW_WAS_ACTIVE=0
 if sudo ufw status | grep -q '^Status: active'; then
     UFW_WAS_ACTIVE=1
 fi
+if [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ] && [ "${UFW_WAS_ACTIVE}" = "0" ]; then
+    smoke_log "SKIP: ufw is inactive and this is not CI; not enabling a firewall on a personal host"
+    exit 0
+fi
+# Never touch a rule that is not ours.
+if sudo ufw show added 2>/dev/null | grep -q "${PORT}/tcp"; then
+    smoke_fail "a ${PORT}/tcp rule already exists on this host; refusing to touch it"
+fi
+UFW_RULE_ADDED=0
 cleanup_ufw() {
-    sudo ufw --force delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
+    if [ "${UFW_RULE_ADDED}" = "1" ]; then
+        sudo ufw --force delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
+    fi
     if [ "${UFW_WAS_ACTIVE}" = "0" ]; then
         sudo ufw --force disable >/dev/null 2>&1 || true
     fi
 }
-trap cleanup_ufw EXIT
+# Keep lib.sh's cleanup (it stops shitd) and run ours first.
+trap 'cleanup_ufw; smoke_cleanup' EXIT
 
 smoke_start_shitd
 
@@ -66,10 +81,6 @@ WRAPPER_LINK="${SHIT_SMOKE_TMP}/ufw"
 ln -sf "${WRAPPER}" "${WRAPPER_LINK}"
 
 sudo ufw --force enable >/dev/null
-sudo ufw --force delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
-if sudo ufw status | grep -q "${PORT}/tcp"; then
-    smoke_fail "pre-state already has a ${PORT}/tcp rule"
-fi
 
 chmod 0666 "${SHIT_CTL_SOCK}" 2>/dev/null || true
 
@@ -82,6 +93,7 @@ PID="$$"
     --session "${SESSION}" --seq 1 --pid "${PID}" \
     --cwd "$(pwd)" --shell bash --sock "${SHIT_HOOK_SOCK}"
 
+UFW_RULE_ADDED=1
 smoke_log "sudo ufw allow ${PORT}/tcp (via wrapper)"
 sudo env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "SHIT_HELPER=${HELPER}" "PATH=${SHIT_SMOKE_TMP}:${PATH}" \
     "${WRAPPER_LINK}" allow "${PORT}/tcp"

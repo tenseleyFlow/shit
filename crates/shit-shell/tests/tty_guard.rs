@@ -50,6 +50,8 @@ fn session_open_args(shell: ShellKind, interp: &str, dir: &Path) -> String {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env_remove("SHIT_DISABLE")
+        .env_remove("_SHIT_BASH_LOADED")
+        .env_remove("_SHIT_ZSH_LOADED")
         .status()
         .unwrap();
     assert!(status.success());
@@ -82,4 +84,9 @@ fn bash_hook_sends_empty_tty_without_a_tty() {
 #[test]
 fn zsh_hook_sends_empty_tty_without_a_tty() {
     check(ShellKind::Zsh, "zsh");
+}
+
+#[test]
+fn fish_hook_sends_empty_tty_without_a_tty() {
+    check(ShellKind::Fish, "fish");
 }
