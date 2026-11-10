@@ -83,13 +83,19 @@ impl SeccompMode {
     }
 }
 
-/// Install the seccomp filter for the current thread / process.
+/// Install the seccomp filter on every thread of the process.
 ///
 /// **One-way (in `Kill` mode):** after this returns Ok, the kernel
 /// kills the process on the first disallowed syscall. Run *after*
 /// every privileged setup; any code path that needs new syscalls
 /// must update the allowlist (and `seccomp-policy.md`) in the same
 /// PR.
+///
+/// #252: the capture reader threads start before sandbox entry. The
+/// filter is installed with `SECCOMP_FILTER_FLAG_TSYNC`, so the kernel
+/// applies it to every thread at once or to none. A TSYNC failure is
+/// an error, and so is any thread in `/proc/self/task` that does not
+/// report filter mode afterwards.
 pub fn install_filter() -> Result<(), SeccompError> {
     let mode = SeccompMode::from_env();
     if mode == SeccompMode::Off {
@@ -103,7 +109,16 @@ pub fn install_filter() -> Result<(), SeccompError> {
     let program: BpfProgram = filter
         .try_into()
         .map_err(|e: seccompiler::BackendError| SeccompError::Compiler(e.to_string()))?;
-    seccompiler::apply_filter(&program).map_err(|e| SeccompError::Apply(e.to_string()))?;
+    seccompiler::apply_filter_all_threads(&program)
+        .map_err(|e| SeccompError::Apply(e.to_string()))?;
+    let unfiltered = unfiltered_threads()
+        .map_err(|e| SeccompError::Apply(format!("read /proc/self/task: {e}")))?;
+    if !unfiltered.is_empty() {
+        return Err(SeccompError::Apply(format!(
+            "threads without the filter: {}",
+            unfiltered.join("; ")
+        )));
+    }
     match mode {
         SeccompMode::Kill => tracing::info!("seccomp filter installed (mode=kill)"),
         SeccompMode::Log => tracing::warn!(
@@ -117,6 +132,39 @@ pub fn install_filter() -> Result<(), SeccompError> {
         SeccompMode::Off => unreachable!(), // returned early
     }
     Ok(())
+}
+
+/// Every thread of this process whose `/proc/self/task/<tid>/status`
+/// does not show `Seccomp: 2` (filter mode), as `tid: reason` strings.
+pub fn unfiltered_threads() -> std::io::Result<Vec<String>> {
+    let mut bad = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/task")? {
+        let entry = entry?;
+        let tid = entry.file_name().to_string_lossy().into_owned();
+        let status = match std::fs::read_to_string(entry.path().join("status")) {
+            Ok(s) => s,
+            // The thread exited between readdir and open.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if let Some(reason) = seccomp_status_violation(&status) {
+            bad.push(format!("{tid}: {reason}"));
+        }
+    }
+    Ok(bad)
+}
+
+/// Why a `/proc/<pid>/status` text shows a thread outside filter mode,
+/// or `None`.
+fn seccomp_status_violation(status: &str) -> Option<String> {
+    let mode = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:").map(str::trim));
+    match mode {
+        Some("2") => None,
+        Some(m) => Some(format!("Seccomp {m}")),
+        None => Some("no Seccomp field".to_string()),
+    }
 }
 
 /// Build the filter with the production default (`KillProcess`).
@@ -177,6 +225,9 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     // favor of readlinkat. Always allow readlinkat; conditionally
     // allow readlink below.
     libc::SYS_readlinkat,
+    // #253: capture/linux::user_may_read asks whether the invoking user
+    // could read a file before its pre-image is read.
+    libc::SYS_faccessat,
     libc::SYS_lseek,     // File reads sometimes seek
     libc::SYS_ftruncate, // staging file ops
     libc::SYS_fsync,     // staging file durability (we removed but be defensive)
@@ -236,6 +287,9 @@ const ALLOWED_SYSCALLS: &[i64] = &[
     libc::SYS_rt_sigreturn,
     libc::SYS_tgkill,
     libc::SYS_exit_group,
+    // #252: a thread's own exit. With TSYNC the reader threads started
+    // before the sandbox are filtered too, and they exit at shutdown.
+    libc::SYS_exit,
     libc::SYS_prctl,
     // #226: capabilities are raised and lowered around the one syscall
     // that needs them (priv_linux::with_cap). capset can only move
@@ -332,6 +386,90 @@ mod tests {
                 std::env::remove_var("SHIT_HELPER_SECCOMP_MODE");
             }
         }
+    }
+
+    #[test]
+    fn status_without_filter_mode_is_a_violation() {
+        assert_eq!(seccomp_status_violation("Name:\tx\nSeccomp:\t2\n"), None);
+        assert_eq!(
+            seccomp_status_violation("Seccomp:\t0\n").as_deref(),
+            Some("Seccomp 0")
+        );
+        assert!(seccomp_status_violation("Name:\tx\n").is_some());
+    }
+
+    const TSYNC_CHILD_ENV: &str = "SHIT_TEST_SECCOMP_TSYNC_CHILD";
+
+    /// #252: a thread spawned before `install_filter` runs under the
+    /// filter too. The work happens in a re-executed copy of this test
+    /// binary, since the filter cannot be removed once installed. The
+    /// child uses errno mode, so a denied syscall returns EPERM instead
+    /// of killing the process.
+    #[test]
+    fn filter_covers_threads_spawned_before_install() {
+        if std::env::var_os(TSYNC_CHILD_ENV).is_some() {
+            tsync_child();
+            return;
+        }
+        let out_file = tempfile::NamedTempFile::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "seccomp_linux::tests::filter_covers_threads_spawned_before_install",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(TSYNC_CHILD_ENV, "1")
+            .env("SHIT_HELPER_SECCOMP_MODE", "errno")
+            .stdin(std::process::Stdio::null())
+            .stdout(out_file.reopen().unwrap())
+            .stderr(out_file.reopen().unwrap())
+            .spawn()
+            .expect("re-exec test binary");
+        // A syscall the filter refuses in a loop (a thread's exit did,
+        // before SYS_exit was allowed) would hang the child; bound it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let text = std::fs::read_to_string(out_file.path()).unwrap_or_default();
+        let status = status.unwrap_or_else(|| panic!("child timed out:\n{text}"));
+        assert!(status.success(), "child failed:\n{text}");
+        assert!(
+            text.contains("tsync child: ok"),
+            "child did not run:\n{text}"
+        );
+    }
+
+    fn tsync_child() {
+        use std::sync::mpsc;
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (res_tx, res_rx) = mpsc::channel::<(i64, i32)>();
+        let early = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            // getppid is not on the allowlist.
+            let rc = unsafe { libc::syscall(libc::SYS_getppid) };
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            res_tx.send((rc, errno)).unwrap();
+        });
+        install_filter().expect("install filter");
+        go_tx.send(()).unwrap();
+        let (rc, errno) = res_rx.recv().unwrap();
+        early.join().unwrap();
+        assert_eq!(
+            (rc, errno),
+            (-1, libc::EPERM),
+            "getppid from a thread spawned before install was not filtered"
+        );
+        println!("tsync child: ok");
     }
 
     /// Building with each non-Off action produces a valid BPF program.

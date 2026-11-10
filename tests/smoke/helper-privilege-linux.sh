@@ -16,6 +16,9 @@
 # cap_bpf on a kernel before 6.5 with unprivileged_bpf_disabled set).
 # no_new_privs is set.
 #
+# #252: every helper thread, the readers started before the sandbox
+# among them, reports seccomp filter mode.
+#
 # #230: a WatchTree for a process the peer does not own is refused,
 # and the refusal is logged. pid 1 is always refused; with passwordless
 # sudo a root-owned sleep is refused for its owner.
@@ -100,11 +103,16 @@ for task in /proc/"${HELPER_PID}"/task/*; do
     [ -z "${amb}" ] || [ $((16#${amb})) -eq 0 ] || smoke_fail "thread ${tid}: CapAmb ${amb} (want 0)"
     [ $(( 16#${prm} & ~ALLOWED )) -eq 0 ] \
         || smoke_fail "thread ${tid}: CapPrm ${prm} holds more than $(printf '%x' "${ALLOWED}")"
+    # #252: the reader threads start before the sandbox; TSYNC must
+    # have put them under the filter too.
+    sec="$(field Seccomp "${st}")"
+    [ "${sec}" = "2" ] || smoke_fail "thread ${tid}: Seccomp ${sec} (want 2, filter mode)"
 done
 [ "${THREADS}" -gt 1 ] || smoke_fail "read ${THREADS} helper thread(s); expected the reader threads too"
 NNP="$(field NoNewPrivs /proc/"${HELPER_PID}"/status)"
 [ "${NNP}" = "1" ] || smoke_fail "helper NoNewPrivs=${NNP} (want 1)"
 smoke_log "#226: ${THREADS} helper threads, none with an effective capability; permitted within $(printf '%x' "${ALLOWED}")"
+smoke_log "#252: all ${THREADS} helper threads in seccomp filter mode"
 
 # ---- #230: a process the peer does not own is not watched ----
 # refuse_watch <seq> <pid> <reason substring>
