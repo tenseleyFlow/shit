@@ -166,11 +166,6 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
     /// limitation; the hardlink path lands in stage 2 (gated on
     /// integration with the live state probe — S11.6/11.7).
     fn restore_content_inner(&self, path: &Path, blob: &BlobHash) -> Result<(), String> {
-        let bytes = self
-            .blob_reader
-            .read(blob)
-            .map_err(|e| format!("blob read for {path:?}: {e}"))?;
-
         let parent = path
             .parent()
             .ok_or_else(|| format!("path {path:?} has no parent dir; cannot place tmpfile"))?;
@@ -187,16 +182,20 @@ impl<R: BlobReader, P: PrivilegedOpRouter> FileExecutor<'_, R, P> {
         let tmp_path: PathBuf = parent.join(tmp_name);
 
         // Write + fsync the tmpfile.
-        let write_result = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            Ok(())
+        let write_result = (|| -> Result<(), String> {
+            let mut f = fs::File::create(&tmp_path)
+                .map_err(|e| format!("tmpfile write {tmp_path:?}: {e}"))?;
+            self.blob_reader
+                .copy_to(blob, &mut f)
+                .map_err(|e| format!("blob read for {path:?}: {e}"))?;
+            f.flush()
+                .and_then(|()| f.sync_all())
+                .map_err(|e| format!("tmpfile write {tmp_path:?}: {e}"))
         })();
         if let Err(e) = write_result {
             // Best-effort cleanup of partial tmpfile.
             let _ = fs::remove_file(&tmp_path);
-            return Err(format!("tmpfile write {tmp_path:?}: {e}"));
+            return Err(e);
         }
 
         // Atomic rename. On the same filesystem this overwrites the
@@ -949,6 +948,56 @@ mod tests {
             e.execute(&op, true, ConflictPolicy::default()),
             ExecutionOutcome::WouldApply
         );
+    }
+
+    /// B6: a reader that only streams (a pre-image kept in a ZFS
+    /// snapshot) restores through `copy_to`; a failed stream leaves no
+    /// tmpfile and the target untouched.
+    #[test]
+    fn restore_content_streams_through_copy_to() {
+        struct StreamOnly(&'static [u8]);
+        impl BlobReader for StreamOnly {
+            fn read(&self, _: &BlobHash) -> Result<Vec<u8>, crate::executor::BlobReadError> {
+                panic!("restore must stream, not read the blob whole");
+            }
+            fn copy_to(
+                &self,
+                _: &BlobHash,
+                out: &mut dyn std::io::Write,
+            ) -> Result<(), crate::executor::BlobReadError> {
+                if self.0.is_empty() {
+                    out.write_all(b"partial")?;
+                    return Err(crate::executor::BlobReadError::NotFound("gone".into()));
+                }
+                out.write_all(self.0)?;
+                Ok(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        std::fs::write(&path, b"after").unwrap();
+        let op = InverseOp::RestoreContent {
+            inode: InodeRef::new(1, 1),
+            path: path.clone(),
+            blob: BlobHash::from_bytes([1; 32]),
+        };
+        let r = StreamOnly(b"before");
+        assert_eq!(
+            FileExecutor::new(&r).execute(&op, false, ConflictPolicy::default()),
+            ExecutionOutcome::Applied
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+
+        std::fs::write(&path, b"after").unwrap();
+        let r = StreamOnly(b"");
+        let out = FileExecutor::new(&r).execute(&op, false, ConflictPolicy::default());
+        assert!(
+            matches!(&out, ExecutionOutcome::Failed { err } if err.contains("gone")),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "tmpfile left behind");
     }
 
     #[test]

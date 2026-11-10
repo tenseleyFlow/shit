@@ -216,6 +216,14 @@ pub enum ConflictPolicy {
 /// A streaming variant for large blobs lands in a follow-up sprint.
 pub trait BlobReader {
     fn read(&self, hash: &BlobHash) -> Result<Vec<u8>, BlobReadError>;
+
+    /// Write the blob's bytes to `out`. The default reads the whole
+    /// blob into memory; a reader with large blobs (B6: a pre-image
+    /// kept in a ZFS snapshot) streams instead.
+    fn copy_to(&self, hash: &BlobHash, out: &mut dyn std::io::Write) -> Result<(), BlobReadError> {
+        out.write_all(&self.read(hash)?)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
