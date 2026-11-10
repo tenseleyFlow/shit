@@ -31,6 +31,7 @@ vergen-gitcl = { workspace = true }
 shit-proto = { workspace = true }
 shit-store = { workspace = true }
 shit-planner = { workspace = true }
+shit-capture = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
@@ -52,3 +53,4 @@ tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+blake3 = { workspace = true }

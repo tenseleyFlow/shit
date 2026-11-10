@@ -646,16 +646,36 @@ fn handle_cloud_event(
     CtlResponse::CloudEventAck
 }
 
-/// Adapt `BlobStore::get` into the planner's `BlobReader` trait.
+/// Adapt `BlobStore::get` into the planner's `BlobReader` trait. B6: a
+/// pre-image kept only in a ZFS snapshot is streamed from there.
 struct BlobReaderShim<'a> {
     blob_store: &'a BlobStore,
+    snapshots: crate::zfs_snap::SnapshotBlobs,
 }
 
 impl shit_planner::BlobReader for BlobReaderShim<'_> {
     fn read(&self, hash: &shit_planner::BlobHash) -> Result<Vec<u8>, shit_planner::BlobReadError> {
-        self.blob_store
-            .get(*hash)
-            .map_err(|e| shit_planner::BlobReadError::NotFound(format!("{hash:?}: {e}")))
+        match self.blob_store.get(*hash) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                let mut out = Vec::new();
+                self.snapshots
+                    .copy_to(hash, &mut out)
+                    .map_err(|_| shit_planner::BlobReadError::NotFound(format!("{hash:?}: {e}")))?;
+                Ok(out)
+            }
+        }
+    }
+
+    fn copy_to(
+        &self,
+        hash: &shit_planner::BlobHash,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), shit_planner::BlobReadError> {
+        match self.blob_store.get(*hash) {
+            Ok(bytes) => Ok(out.write_all(&bytes)?),
+            Err(_) => self.snapshots.copy_to(hash, out),
+        }
     }
 }
 
@@ -1480,7 +1500,10 @@ fn handle_undo(
     }
 
     let probe = LiveStateProbe::new();
-    let reader = BlobReaderShim { blob_store };
+    let reader = BlobReaderShim {
+        blob_store,
+        snapshots: Default::default(),
+    };
 
     let mut commands_attempted = 0u32;
     let mut ops_applied = 0u32;
@@ -1495,6 +1518,7 @@ fn handle_undo(
     for cmd in commands {
         commands_attempted += 1;
         let events = index.events_for_command(cmd.command);
+        reader.snapshots.note_events(&events);
         let undo_plan = plan(cmd.clone(), &events, &probe, index);
         // AR06.1: per-command executor so the shell-state runner
         // can be wired with the session-specific precmd-queue

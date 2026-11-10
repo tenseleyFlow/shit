@@ -33,6 +33,7 @@ mod telemetry;
 mod tracing_ring_layer;
 mod watch_ready;
 mod xattr;
+mod zfs_snap;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -188,6 +189,10 @@ async fn run(cfg: config::ResolvedConfig) -> anyhow::Result<()> {
     let blobs_path = cfg.state_dir.join("blobs");
     let blob_store = Arc::new(shit_store::BlobStore::open(&blobs_path)?);
     tracing::info!(path = %blobs_path.display(), "blob store opened");
+
+    // B6: release ZFS snapshots of commands no longer in the journal
+    // (pruned, or a crash before the command was journaled).
+    zfs_snap::init(&cfg.state_dir, &index);
 
     // W02.B.live-baseline — per-cwd content snapshot held in memory.
     // Populated by the helper's BaselineCaptured stream at session

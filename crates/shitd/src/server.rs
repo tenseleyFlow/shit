@@ -471,6 +471,13 @@ fn handle(
                     command_seq: command.seq,
                     shell_kind: *shell_kind,
                     cwd_path: cwd_path.clone(),
+                    // B6: taken after put_command, so a crash right
+                    // after leaves a snapshot whose command is journaled
+                    // (released on prune) or none at all.
+                    zfs_snapshot: crate::zfs_snap::take(
+                        command,
+                        &shit_proto::wire_path::decode(cwd_path),
+                    ),
                 };
                 request_watch(
                     &close_ctx.live_baseline,

@@ -867,6 +867,69 @@ fn dispatch_response(
     strict_capture: bool,
 ) {
     match resp {
+        HelperResponse::SnapshotPreImage {
+            session,
+            seq,
+            dev,
+            inode,
+            path,
+            post_content_hash,
+            xattrs,
+            is_delete,
+        } => {
+            let command = CommandId { session, seq };
+            let path_buf: PathBuf = shit_proto::wire_path::decode(&path);
+            let ev = crate::zfs_snap::SnapshotPreImage {
+                command,
+                dev,
+                inode,
+                path: path_buf.clone(),
+                post_content_hash,
+                xattrs,
+            };
+            // The helper sends these only for regular files.
+            let mut mode = 0o100644;
+            match crate::zfs_snap::journal_pre_image(&ev, index, blob_store) {
+                Ok(m) => mode = m,
+                Err(why) => {
+                    tracing::warn!(%session, seq, %why, "zfs snapshot pre-image unavailable");
+                    // The helper read nothing itself: without the snapshot's
+                    // bytes this change has no pre-image at all.
+                    let detail = format!(
+                        "the pre-image of {} could not be read from the command's zfs snapshot: {why}",
+                        path_buf.display()
+                    );
+                    if let Err(e) = journal_refusal(
+                        index,
+                        command,
+                        Some(path_buf.clone()),
+                        "capture-incomplete",
+                        detail,
+                    ) {
+                        tracing::error!(error = %e, %session, seq, "snapshot pre-image refusal journal failed");
+                    }
+                }
+            }
+            if is_delete {
+                if let Err(e) = journal_unlink_idempotent(
+                    index,
+                    command,
+                    crate::server::next_ts(),
+                    InodeRef::new(dev, inode),
+                    path_buf,
+                    kind_from_mode_bits(mode),
+                    mode,
+                ) {
+                    tracing::error!(error = %e, %session, seq, "snapshot delete Unlink journal failed");
+                    note_ingest_failure(
+                        strict_capture,
+                        index,
+                        command,
+                        format!("a deletion could not be journaled: {e}"),
+                    );
+                }
+            }
+        }
         HelperResponse::CapturedPreImage {
             session,
             seq,

@@ -153,6 +153,13 @@ pub async fn run_loop(
 
         match report {
             Ok(Ok(r)) => {
+                if r.commands_dropped > 0 {
+                    let index = Arc::clone(&index);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::zfs_snap::after_prune(&index);
+                    })
+                    .await;
+                }
                 tracing::info!(
                     commands_dropped = r.commands_dropped,
                     blobs_swept = r.blobs_swept,
