@@ -3,10 +3,13 @@
 //! M4: which common commands the macOS DYLD shim can load into.
 //!
 //! On a default macOS install (no EndpointSecurity) the shim is the
-//! only capture that takes a pre-image. dyld drops
-//! `DYLD_INSERT_LIBRARIES` for SIP-protected binaries (`/bin`, `/sbin`,
-//! `/usr` outside `/usr/local`, `/System`) and for setuid or setgid
-//! binaries, and a statically linked binary never runs dyld at all.
+//! only capture that takes a pre-image. It does not run in
+//! SIP-protected binaries (`/bin`, `/sbin`, `/usr` outside
+//! `/usr/local`, `/System`): dyld ignores `DYLD_INSERT_LIBRARIES` for
+//! them, and on Apple Silicon, where they are arm64e, dyld instead
+//! aborts the command because the shim is built arm64 only (seen on
+//! hosted macos-15). dyld also ignores the variable for setuid or
+//! setgid binaries, and a statically linked binary never runs dyld.
 //! Changes made by those binaries are not captured, so undo cannot
 //! reverse them. `shit doctor` resolves each probed command the way
 //! the shell would (first match on `$PATH`) and says which side of
@@ -72,7 +75,7 @@ pub fn classify(
     if sip_enforced && sip_protected(binary) {
         return (
             false,
-            "NOT captured: SIP-protected, dyld drops DYLD_INSERT_LIBRARIES".to_string(),
+            "NOT captured: SIP-protected system binary, the shim does not run in it".to_string(),
         );
     }
     if setid {
