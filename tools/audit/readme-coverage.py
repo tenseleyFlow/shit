@@ -34,7 +34,7 @@ FAMILIES = [
     ("Shell state", r"^(cd|set-e|alias)-"),
     ("Capture tier, sandbox and ZFS engine",
      r"^(capsicum-|shim-default-|preload-shim-|zfs-|es-|fsevents-|ln-hardlink-shim-|setxattr-shim-|"
-     r"helper-privilege-|shared-cwd-mark-)"),
+     r"helper-privilege-|shared-cwd-mark-|setuid-preimage-)"),
     ("Daemon, doctor and harness",
      r"^(daemon-boot|doctor-|hook-ipc$|shitd-|show-detail-|visibility-|env-oversize-|pkg-install-doctor-)"),
     ("Package managers", r"^(apt-|dnf-|pkg-install-undo|brew-)"),
