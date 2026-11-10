@@ -135,7 +135,48 @@ guest's `admin` user.
 runner labelled `macos-es`. The runner executes jobs on the host as the
 owner's user, so the workflow has no `pull_request` trigger: fork code
 never runs there. It runs on `workflow_dispatch`, and on pushes to
-`trunk` once the repo variable `MACOS_ES_ENABLED` is `true`.
+`trunk` once the repo variable `MACOS_ES_ENABLED` is `true`. The
+smoke list is `tools/audit/smoke-driver.sh bucket macos-es`: every
+smoke with `SMOKE_RUNNER_HINT: macos-es` and no `EXCLUDED_BY`. A smoke
+that logs SKIP fails there, because this host meets every ES
+precondition.
+
+### Installing the runner
+
+On the host, as the user that owns `~/.tart` and `~/.shit-tart-vm`:
+
+```sh
+mkdir -p ~/actions-runner-shit && cd ~/actions-runner-shit
+curl -sSfLO https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-osx-arm64-2.338.2.tar.gz
+shasum -a 256 actions-runner-osx-arm64-2.338.2.tar.gz
+# compare with the SHA in the release notes, then:
+tar xzf actions-runner-osx-arm64-2.338.2.tar.gz
+# token: gh api -X POST repos/tenseleyFlow/shit/actions/runners/registration-token --jq .token
+./config.sh --unattended --url https://github.com/tenseleyFlow/shit \
+  --token <token> --name nomad-macos-es --labels macos-es --work _work
+./svc.sh install    # writes a launchd user agent in ~/Library/LaunchAgents
+./svc.sh start
+./svc.sh status
+```
+
+Once the runner shows Idle under Settings, Actions, Runners, set the
+repo variable `MACOS_ES_ENABLED` to `true`
+(`gh variable set MACOS_ES_ENABLED --body true --repo tenseleyFlow/shit`).
+
+### Stopping and removing the runner
+
+```sh
+cd ~/actions-runner-shit
+./svc.sh stop        # stop it; ./svc.sh start brings it back
+./svc.sh uninstall   # remove the launchd agent
+# token: gh api -X POST repos/tenseleyFlow/shit/actions/runners/remove-token --jq .token
+./config.sh remove --token <token>
+gh variable delete MACOS_ES_ENABLED --repo tenseleyFlow/shit
+```
+
+Then delete `~/actions-runner-shit`. Stopping the runner leaves the
+guest running; `tart stop shit-m03` stops it, and
+`tools/macos-tart-vm/teardown.sh` deletes it.
 
 ## Scripts
 
