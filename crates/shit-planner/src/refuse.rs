@@ -292,6 +292,9 @@ fn strip_wrappers<'a, 'b>(tokens: &'b [&'a str]) -> &'b [&'a str] {
         "--command-timeout",
         "--other-user",
     ];
+    // env options that take a separate value. `-S STRING` splits its value
+    // into the command line; that form is not parsed here.
+    const ENV_VALUE_OPTS: &[&str] = &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"];
     let mut i = 0;
     while i < tokens.len() {
         let t = tokens[i];
@@ -310,7 +313,11 @@ fn strip_wrappers<'a, 'b>(tokens: &'b [&'a str]) -> &'b [&'a str] {
         } else if t == "env" {
             i += 1;
             while i < tokens.len() && (tokens[i].starts_with('-') || is_assignment(tokens[i])) {
+                let takes = ENV_VALUE_OPTS.contains(&tokens[i]);
                 i += 1;
+                if takes {
+                    i += 1;
+                }
             }
         } else if is_assignment(t) {
             i += 1;
@@ -605,6 +612,24 @@ mod tests {
             "remote-push"
         );
         assert!(match_command("sudo").is_none());
+    }
+
+    #[test]
+    fn env_options_with_values_are_skipped() {
+        assert_eq!(
+            match_command("env -u FOO git push").unwrap().class,
+            "remote-push"
+        );
+        assert_eq!(
+            match_command("env -C /x helm install rel ./c")
+                .unwrap()
+                .class,
+            "cluster-release"
+        );
+        assert_eq!(
+            match_command("env -i FOO=1 git push").unwrap().class,
+            "remote-push"
+        );
     }
 
     #[test]
