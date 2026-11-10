@@ -148,6 +148,8 @@ async fn handle_one(
     // connection, sends a partial frame, then idles — without this
     // bound, `read_exact` would park the daemon task indefinitely.
     let read_deadline = std::time::Duration::from_secs(10);
+    // R8: the peer's uid, read before the frame (see `peer_uid`).
+    let peer_uid = peer_uid(&stream);
     let mut len_buf = [0u8; 4];
     match tokio::time::timeout(read_deadline, stream.read_exact(&mut len_buf)).await {
         Ok(Ok(_)) => {}
@@ -251,7 +253,7 @@ async fn handle_one(
     // compares it with the command's PostExec: a note stamped earlier was
     // sent while the kernel tier watched, however late it is ingested.
     let ingest_ts = crate::server::next_ts();
-    let key = trusted_key(&note, &stream);
+    let key = trusted_key(&note, peer_uid);
     // R8 review, item 6: the key check reads SQLite and the pid walk
     // reads /proc or libproc. Neither runs on a runtime worker.
     let resolution = {
@@ -322,16 +324,18 @@ pub(crate) enum Resolution {
 /// back to the pid walk. It is the kernel tier's closed-watch grace.
 const LATE_KEY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// The note's command key, when the peer runs as the daemon's user.
+/// The note's command key, when the peer (uid read at accept) runs as
+/// the daemon's user.
 fn trusted_key(
     note: &ShimNotification,
-    stream: &UnixStream,
+    peer_uid: Option<u32>,
 ) -> Option<shit_planner::events::CommandId> {
     let key = note.command_key?;
-    if !peer_is_daemon_user(stream) {
+    if !is_daemon_user(peer_uid) {
         warn!(
             pid = note.pid,
-            "shim note carries a command key from a peer of another uid; ignoring the key"
+            ?peer_uid,
+            "shim note's command key is not from the daemon's user; ignoring the key"
         );
         return None;
     }
@@ -516,13 +520,39 @@ fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Whether the peer of a shim connection runs as the daemon's user.
-/// The socket is 0600, so only that user or root can connect; a root
-/// peer's key is not trusted.
-fn peer_is_daemon_user(stream: &UnixStream) -> bool {
+/// The effective uid of a shim connection's peer, or `None` when it
+/// cannot be read.
+///
+/// R8 (#251): it must still work after the peer hung up, since the
+/// emitters this is for exit right after their syscall. Linux's
+/// `SO_PEERCRED` and `getpeereid` on macOS and FreeBSD read the
+/// credentials stored at connect. tokio's `peer_cred` cannot be used on
+/// macOS: it also asks for the peer's pid (`LOCAL_PEEREPID`), which fails
+/// with ENOTCONN once the peer closed, so every key from an exited
+/// sender was dropped there.
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        stream.peer_cred().ok().map(|c| c.uid())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: the fd is the stream's open socket, and uid and gid are
+        // valid for writes.
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        (rc == 0).then_some(uid)
+    }
+}
+
+/// Whether a peer uid is the daemon's. The socket is 0600, so only that
+/// user or root can connect; a root peer's key is not trusted.
+fn is_daemon_user(peer_uid: Option<u32>) -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let me = unsafe { libc::geteuid() };
-    stream.peer_cred().is_ok_and(|c| c.uid() == me)
+    peer_uid == Some(me)
 }
 
 /// R8 (D-35): a keyed note whose command had closed, or been
@@ -2052,6 +2082,26 @@ mod tests {
         .await
         .unwrap();
         server.await.unwrap();
+    }
+
+    /// R8 (#251): the peer's uid is readable after the peer hung up, as a
+    /// short-lived emitter does. On macOS tokio's `peer_cred` fails here
+    /// (it asks for the peer's pid), and every key from such a sender was
+    /// dropped.
+    #[tokio::test]
+    async fn peer_uid_survives_the_peer_hanging_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("p.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        drop(StdUnixStream::connect(&sock).unwrap());
+        let (stream, _) = listener.accept().await.unwrap();
+        // Let the hang-up land before the uid is read.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let uid = peer_uid(&stream);
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(uid, Some(unsafe { libc::geteuid() }));
+        assert!(is_daemon_user(uid));
+        assert!(!is_daemon_user(None));
     }
 
     /// R8 (#210, #251, D-35): a note from a process that has already
