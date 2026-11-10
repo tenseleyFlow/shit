@@ -78,6 +78,20 @@ impl<R: BlobReader, P: PrivilegedOpRouter> InverseOpExecutor for FileExecutor<'_
         if dry_run {
             return ExecutionOutcome::WouldApply;
         }
+        // #214: an op whose parent directory is missing, with no
+        // journaled mode to recreate it at, is refused: skipped with
+        // the reason, and the rest of the undo goes on. Making the
+        // parent at the umask could widen a private directory.
+        if let InverseOp::RestoreContent { path, .. }
+        | InverseOp::RecreatePath { path, .. }
+        | InverseOp::EnsureDir { path, .. } = op
+            && let Some(parent) = path.parent()
+            && let Err(reason) = require_parent(parent)
+        {
+            return ExecutionOutcome::Skipped {
+                reason: format!("refused: {reason}"),
+            };
+        }
         match op {
             InverseOp::RestoreContent { .. } => self.apply_restore_content(op),
             InverseOp::RestoreMetadata { .. } => self.apply_restore_metadata(op),
@@ -1134,10 +1148,10 @@ mod tests {
                 device: None,
             };
             match e.execute(&op, false, ConflictPolicy::default()) {
-                ExecutionOutcome::Failed { err } => {
-                    assert!(err.contains("mode was not journaled"), "{err}")
+                ExecutionOutcome::Skipped { reason } => {
+                    assert!(reason.contains("mode was not journaled"), "{reason}")
                 }
-                other => panic!("expected Failed, got {other:?}"),
+                other => panic!("expected a refusal, got {other:?}"),
             }
             assert!(!path.parent().unwrap().exists(), "{path:?}");
         }
@@ -1185,7 +1199,7 @@ mod tests {
         };
         assert!(matches!(
             e.execute(&op, false, ConflictPolicy::default()),
-            ExecutionOutcome::Failed { .. }
+            ExecutionOutcome::Skipped { .. }
         ));
         assert!(!deep.exists());
     }
@@ -1654,10 +1668,10 @@ mod tests {
             blob: blob_hash,
         };
         match executor.execute(&op, false, ConflictPolicy::default()) {
-            ExecutionOutcome::Failed { err } => {
-                assert!(err.contains("nested-b is missing"), "{err}")
+            ExecutionOutcome::Skipped { reason } => {
+                assert!(reason.contains("nested-b is missing"), "{reason}")
             }
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
         assert!(!tmpdir.path().join("nested-a").exists());
     }
