@@ -7,7 +7,7 @@
 | Mode                            | What you get                                                                 | Security tradeoff                                                                                  | Who it's for                                                                  |
 |---------------------------------|------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
 | **Default (FSEvents-degraded)** | Reliable undo for most file edits. Post-mutation capture only.               | **None.** Stock macOS. SIP stays on.                                                               | Most users. The recommended path.                                             |
-| **Power-user (EndpointSecurity)** | Full pre-mutation undo on every syscall family. Trusted byte-for-byte restore. | **Significant.** SIP + AuthRoot disabled, AMFI bypassed. You boot into Recovery to enable this. | Developers who want maximum coverage and have read the tradeoffs in full.    |
+| **Power-user (EndpointSecurity)** | Full pre-mutation undo on every syscall family. Trusted byte-for-byte restore. | **Significant.** SIP disabled, AMFI bypassed. You boot into Recovery to enable this. | Developers who want maximum coverage and have read the tradeoffs in full.    |
 
 ## Default install
 
@@ -38,7 +38,7 @@ That's it. `shit doctor` will report `kernel_tier: fsevents-degraded`, which is 
 Read [`macos-power-user-install.md`](./macos-power-user-install.md) **in full** before continuing. It walks through:
 
 1. The exact security tradeoffs you're accepting (and what each toggle weakens).
-2. The Recovery-mode steps to disable SIP and AuthRoot — these cannot be scripted, you do them manually.
+2. The Recovery-mode step to disable SIP. It cannot be scripted; you do it by hand.
 3. The `shit setup-es-mode --apply` step that codesigns the local helper with the EndpointSecurity entitlement.
 4. How to verify the install with `shit doctor`.
 5. How to reverse the install if you change your mind.

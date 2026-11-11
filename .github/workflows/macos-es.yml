@@ -1,0 +1,93 @@
+name: macos-es
+
+# EndpointSecurity smokes on the self-hosted `macos-es` runner (lane
+# M2). The runner is a Mac host that drives a SIP-disabled Tart guest
+# through tools/macos-tart-vm/. Jobs run on that host with the owner's
+# user account, so this workflow must never run untrusted code:
+#
+#   - no pull_request or pull_request_target trigger, so fork code
+#     never reaches the runner;
+#   - push runs only on trunk, and only once the repo variable
+#     MACOS_ES_ENABLED is "true" (set it after the runner is
+#     registered, so trunk pushes do not queue jobs with no runner);
+#   - workflow_dispatch can be run by anyone with write access.
+#
+# Smokes run one at a time because they share one guest. A smoke that
+# logs SKIP fails here (run-es-smoke.sh), since this host meets every
+# ES precondition.
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: 'one smoke path (tests/smoke/<name>.sh); empty runs all'
+        required: false
+        default: ''
+  push:
+    branches: [trunk]
+
+concurrency:
+  group: macos-es
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SHIT_TART_VM: shit-m03
+
+jobs:
+  # The smoke list is the driver's macos-es bucket: every smoke with
+  # SMOKE_RUNNER_HINT macos-es and no EXCLUDED_BY. Computed on a hosted
+  # runner so the self-hosted host only ever runs the smokes.
+  plan:
+    if: >-
+      github.repository == 'tenseleyFlow/shit' &&
+      (github.event_name == 'workflow_dispatch' || vars.MACOS_ES_ENABLED == 'true')
+    runs-on: ubuntu-24.04
+    outputs:
+      smokes: ${{ steps.bucket.outputs.smokes }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: bucket
+        env:
+          WANT: ${{ github.event.inputs.smoke }}
+        run: |
+          smokes="$(bash tools/audit/smoke-driver.sh bucket macos-es \
+            | python3 -c 'import json,os,sys; w=os.environ.get("WANT",""); print(json.dumps([l.strip() for l in sys.stdin if l.strip() and (not w or l.strip()==w)]))')"
+          echo "smokes=${smokes}" >>"${GITHUB_OUTPUT}"
+          echo "${smokes}"
+          [ "${smokes}" != "[]" ] || { echo "no macos-es smoke selected" >&2; exit 1; }
+
+  es-smoke:
+    name: es-smoke (${{ matrix.smoke }})
+    needs: plan
+    runs-on: [self-hosted, macos-es]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        smoke: ${{ fromJSON(needs.plan.outputs.smokes) }}
+    steps:
+      - name: environment
+        run: |
+          # Keep the VM key outside the checkout so actions/checkout's
+          # clean does not delete it; the guest trusts this key.
+          echo "SHIT_TART_WORK_DIR=${HOME}/.shit-tart-vm" >>"${GITHUB_ENV}"
+          echo "/opt/homebrew/bin" >>"${GITHUB_PATH}"
+      - uses: actions/checkout@v4
+      - name: boot guest
+        run: tools/macos-tart-vm/boot.sh
+      - name: doctor
+        run: tools/macos-tart-vm/doctor.sh
+      - name: run smoke in guest
+        env:
+          SMOKE: ${{ matrix.smoke }}
+        run: |
+          # fsevents-fallback checks the non-root tier, so it runs as
+          # the guest's admin user. Every other smoke runs as root.
+          case "${SMOKE}" in
+            */fsevents-fallback-macos.sh) tools/macos-tart-vm/run-es-smoke.sh --user "${SMOKE}" ;;
+            *) tools/macos-tart-vm/run-es-smoke.sh "${SMOKE}" ;;
+          esac

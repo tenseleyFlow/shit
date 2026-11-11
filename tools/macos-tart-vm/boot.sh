@@ -8,12 +8,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
+WORK_DIR="${SHIT_TART_WORK_DIR:-${SCRIPT_DIR}/work}"
 mkdir -p "${WORK_DIR}"
 
 : "${SHIT_TART_VM:=shit-m03}"
-: "${SHIT_TART_BASE:=ghcr.io/cirruslabs/macos-sonoma-base:latest}"
-: "${SHIT_TART_DISK_GB:=80}"
+: "${SHIT_TART_BASE:=ghcr.io/cirruslabs/macos-sequoia-base:latest}"
+# Leave unset to keep the image's own disk size (50 GB for the Cirrus
+# -base images). Every GB the guest writes is a GB of host disk, so
+# only grow it when the host has room.
+: "${SHIT_TART_DISK_GB:=}"
 
 if ! command -v tart >/dev/null 2>&1; then
     echo "tart not installed; run:  brew install cirruslabs/cli/tart" >&2
@@ -29,7 +32,9 @@ fi
 if ! tart list | awk '{print $2}' | grep -qxF "${SHIT_TART_VM}"; then
     echo "[boot] cloning ${SHIT_TART_BASE} -> ${SHIT_TART_VM}"
     tart clone "${SHIT_TART_BASE}" "${SHIT_TART_VM}"
-    tart set "${SHIT_TART_VM}" --disk-size "${SHIT_TART_DISK_GB}"
+    if [ -n "${SHIT_TART_DISK_GB}" ]; then
+        tart set "${SHIT_TART_VM}" --disk-size "${SHIT_TART_DISK_GB}"
+    fi
 else
     echo "[boot] ${SHIT_TART_VM} already exists; skipping clone"
 fi
@@ -76,7 +81,7 @@ done
 
 # 5. Wait for sshd. Default Cirrus base images come with sshd enabled
 # + admin/admin login. We don't add the SSH key on first boot —
-# that's the user's job (see audit doc setup steps). After they've
+# that's the user's job (see README.md, One-time setup). After they've
 # added it, subsequent boots get passwordless.
 echo -n "[boot] waiting for sshd at ${ip} "
 for i in $(seq 1 120); do
@@ -101,9 +106,7 @@ echo "  IP:   ${ip}"
 echo "  SSH:  tools/macos-tart-vm/ssh.sh    # wrapped"
 echo "  key:  ${SSH_KEY}.pub  (add to admin@${ip} ~/.ssh/authorized_keys)"
 echo
-echo "next steps:"
-echo "  1. ssh-copy-id -i ${SSH_KEY}.pub -p 22 admin@${ip}"
-echo "     (password: admin; only needed once per VM)"
-echo "  2. tools/macos-tart-vm/sync.sh"
-echo "  3. tools/macos-tart-vm/ssh.sh 'csrutil status'"
-echo "     (expect: 'disabled' — see audit doc for one-time setup)"
+echo "next steps (see tools/macos-tart-vm/README.md):"
+echo "  1. install ${SSH_KEY}.pub in the guest (tart exec or ssh-copy-id, password admin)"
+echo "  2. tools/macos-tart-vm/doctor.sh"
+echo "  3. tools/macos-tart-vm/sync.sh"

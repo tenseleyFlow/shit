@@ -264,6 +264,16 @@ pub struct es_event_setmode_t {
     pub _reserved: [u8; 64],
 }
 
+/// `es_event_setflags_t` from ESMessage.h. `flags` is the new
+/// st_flags value; `target.stat` carries the BEFORE flags.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct es_event_setflags_t {
+    pub flags: u32,
+    pub target: *const es_file_t,
+    pub _reserved: [u8; 64],
+}
+
 /// `es_event_setowner_t` from ESMessage.h. `uid`/`gid` are the new
 /// owners; `target.stat` carries the BEFORE owners.
 #[repr(C)]
@@ -301,6 +311,7 @@ pub union es_events_t {
     pub truncate: std::mem::ManuallyDrop<es_event_truncate_t>,
     pub open: std::mem::ManuallyDrop<es_event_open_t>,
     pub setmode: std::mem::ManuallyDrop<es_event_setmode_t>,
+    pub setflags: std::mem::ManuallyDrop<es_event_setflags_t>,
     pub setowner: std::mem::ManuallyDrop<es_event_setowner_t>,
     pub utimes: std::mem::ManuallyDrop<es_event_utimes_t>,
     pub fork: std::mem::ManuallyDrop<es_event_fork_t>,
@@ -518,6 +529,14 @@ impl<'a> EsMessage<'a> {
         unsafe { Some(&*(&(*self.raw).event.setmode as *const _ as *const es_event_setmode_t)) }
     }
 
+    pub fn as_setflags(&self) -> Option<&'a es_event_setflags_t> {
+        if self.event_type() != super::sys::es_event_type_t::AUTH_SETFLAGS {
+            return None;
+        }
+        // SAFETY: discriminant guarantees the union variant.
+        unsafe { Some(&*(&(*self.raw).event.setflags as *const _ as *const es_event_setflags_t)) }
+    }
+
     pub fn as_setowner(&self) -> Option<&'a es_event_setowner_t> {
         if self.event_type() != super::sys::es_event_type_t::AUTH_SETOWNER {
             return None;
@@ -704,6 +723,14 @@ mod tests {
         // whole process.
         let p = unsafe { tok.as_path() };
         assert_eq!(p, Path::new("/tmp/test/file.txt"));
+    }
+
+    #[test]
+    fn setflags_layout_matches_esmessage_h() {
+        // { uint32_t flags; es_file_t *target; uint8_t reserved[64]; }
+        assert_eq!(std::mem::offset_of!(es_event_setflags_t, flags), 0);
+        assert_eq!(std::mem::offset_of!(es_event_setflags_t, target), 8);
+        assert_eq!(std::mem::size_of::<es_event_setflags_t>(), 80);
     }
 
     #[test]

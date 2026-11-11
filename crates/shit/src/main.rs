@@ -212,7 +212,7 @@ enum Cmd {
         visibility: Option<std::path::PathBuf>,
     },
     /// macOS power-user EndpointSecurity setup helper. Documents +
-    /// applies the SIP-disable + AuthRoot-disable + AMFI-bypass +
+    /// applies the SIP-disable + AMFI-bypass +
     /// helper-codesign steps required to run shit's ES-tier
     /// capture on a stock Mac (M03.x.POWER-USER post-entitlement-
     /// denial pivot). Use `--check` to inspect prereqs, `--print`

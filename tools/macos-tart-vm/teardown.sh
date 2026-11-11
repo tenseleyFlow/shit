@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
+WORK_DIR="${SHIT_TART_WORK_DIR:-${SCRIPT_DIR}/work}"
 
 : "${SHIT_TART_VM:=shit-m03}"
 

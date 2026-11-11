@@ -6,10 +6,17 @@
 #     (without this the binary returns NotEntitled on AMFI-bypass VMs)
 #   - build shit + shitd plain (no entitlement needed)
 #   - run the smoke as root (ES requires it)
+#   - fail if the smoke logged a SKIP: on this host every ES
+#     precondition holds, so a skip means the setup broke
 #
 # Usage:
-#   tools/macos-tart-vm/run-es-smoke.sh              # default smoke
-#   tools/macos-tart-vm/run-es-smoke.sh <smoke-rel>  # specific smoke
+#   tools/macos-tart-vm/run-es-smoke.sh                     # default smoke
+#   tools/macos-tart-vm/run-es-smoke.sh <smoke-rel>         # specific smoke
+#   tools/macos-tart-vm/run-es-smoke.sh --user <smoke-rel>  # as the guest's
+#                                                           # admin user, no sudo
+#
+# --user is for smokes that check the non-root fallback tier
+# (fsevents-fallback-macos). Set SHIT_ES_ALLOW_SKIP=1 to accept a SKIP.
 #
 # Default smoke is tests/smoke/es-unlink-undo-macos.sh.
 
@@ -18,6 +25,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+AS_USER=0
+if [ "${1:-}" = "--user" ]; then
+    AS_USER=1
+    shift
+fi
 SMOKE="${1:-tests/smoke/es-unlink-undo-macos.sh}"
 
 if [ ! -f "${REPO_ROOT}/${SMOKE}" ]; then
@@ -47,5 +59,23 @@ echo "[run-es-smoke] verifying helper entitlement"
         || { echo "helper missing ES entitlement" >&2; exit 1; }
 '
 
-echo "[run-es-smoke] running ${SMOKE} (as root)"
-"${SCRIPT_DIR}/ssh.sh" "cd shit && sudo SHIT_SMOKE_BIN_DIR=\$(pwd)/target/release ${SMOKE}"
+LOG="$(mktemp -t run-es-smoke)"
+trap 'rm -f "${LOG}"' EXIT
+if [ "${AS_USER}" -eq 1 ]; then
+    echo "[run-es-smoke] running ${SMOKE} (as admin)"
+    REMOTE="cd shit && SHIT_SMOKE_BIN_DIR=\$(pwd)/target/release ${SMOKE}"
+else
+    echo "[run-es-smoke] running ${SMOKE} (as root)"
+    REMOTE="cd shit && sudo SHIT_SMOKE_BIN_DIR=\$(pwd)/target/release ${SMOKE}"
+fi
+set +e
+"${SCRIPT_DIR}/ssh.sh" "${REMOTE}" 2>&1 | tee "${LOG}"
+rc="${PIPESTATUS[0]}"
+set -e
+if [ "${rc}" -ne 0 ]; then
+    exit "${rc}"
+fi
+if grep -q '\] SKIP:' "${LOG}" && [ "${SHIT_ES_ALLOW_SKIP:-0}" != "1" ]; then
+    echo "[run-es-smoke] ${SMOKE} skipped on the ES host; treating as failure" >&2
+    exit 1
+fi

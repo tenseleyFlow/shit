@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
+WORK_DIR="${SHIT_TART_WORK_DIR:-${SCRIPT_DIR}/work}"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SSH_KEY="${WORK_DIR}/id_ed25519"
 KNOWN_HOSTS="${WORK_DIR}/known_hosts"

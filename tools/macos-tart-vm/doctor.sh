@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK_DIR="${SCRIPT_DIR}/work"
+WORK_DIR="${SHIT_TART_WORK_DIR:-${SCRIPT_DIR}/work}"
 
 : "${SHIT_TART_VM:=shit-m03}"
 
@@ -51,14 +51,33 @@ else
     exit 1
 fi
 
-# 5. SIP state?
+# 5. SIP state? Match the overall status line only: a custom
+# configuration prints "enabled (Custom Configuration)" followed by
+# per-feature lines, some of which say "disabled".
 sip="$("${SCRIPT_DIR}/ssh.sh" 'csrutil status 2>&1' 2>/dev/null || echo 'query failed')"
-if printf '%s' "${sip}" | grep -qi 'disabled'; then
-    ok "SIP disabled (required for ES dev without entitlement)"
-elif printf '%s' "${sip}" | grep -qi 'enabled'; then
-    warn "SIP enabled — ES dev will get NOT_ENTITLED; see audit doc for Recovery-boot steps"
+if printf '%s' "${sip}" | grep -qi 'status: disabled'; then
+    ok "SIP disabled (required for an ad-hoc signed ES client)"
+elif printf '%s' "${sip}" | grep -qi 'status: enabled'; then
+    warn "SIP enabled: ES will return NOT_ENTITLED; see README, Disabling SIP in the guest"
 else
     warn "SIP state unknown: ${sip}"
+fi
+
+# 5b. AMFI boot-arg? Needed for the kernel to honour the ES
+# entitlement on an ad-hoc signature.
+bootargs="$("${SCRIPT_DIR}/ssh.sh" 'nvram boot-args 2>/dev/null' 2>/dev/null || true)"
+if printf '%s' "${bootargs}" | grep -q 'amfi_get_out_of_my_way=1'; then
+    ok "guest boot-args has amfi_get_out_of_my_way=1"
+else
+    warn "guest boot-args lacks amfi_get_out_of_my_way=1 (got: ${bootargs:-none})"
+fi
+
+# 5c. Rust toolchain in the guest? The -base images ship Homebrew
+# but no Rust.
+if "${SCRIPT_DIR}/ssh.sh" 'test -x $HOME/.cargo/bin/cargo' 2>/dev/null; then
+    ok "cargo present in guest"
+else
+    warn "cargo missing in guest; see README, Guest provisioning"
 fi
 
 # 6. Repo synced?

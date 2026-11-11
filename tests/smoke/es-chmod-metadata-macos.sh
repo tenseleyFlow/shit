@@ -3,10 +3,10 @@
 # SMOKE_NAME: es-chmod-metadata-macos
 # SMOKE_PLATFORM: macos
 # SMOKE_TIER_REQUIRED: mocked-es
-# SMOKE_RUNNER_HINT: macos-14
+# SMOKE_RUNNER_HINT: macos-es
 # SMOKE_TIMEOUT_SEC: 300
-# EXCLUDED_BY: M03-vm-runner
-# EXCLUDED_REASON: macOS smokes need a signed binary on a Tart VM; GH-hosted macos-14 runner cannot satisfy the EndpointSecurity entitlement 
+# EXCLUDED_BY:
+# EXCLUDED_REASON:
 #
 # M03.1.I.D end-to-end smoke — macOS ES metadata-mutation capture.
 #
