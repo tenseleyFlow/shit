@@ -1,0 +1,11 @@
+round 1: summary: records=7814 with_path=4395 path_exists=1745 path_gone=2650 lag_avg=20.573ms lag_max=129.948ms drops=34365
+round 2: summary: records=8109 with_path=4979 path_exists=1980 path_gone=2999 lag_avg=24.827ms lag_max=145.789ms drops=33347
+round 3: summary: records=6760 with_path=3462 path_exists=1743 path_gone=1719 lag_avg=33.872ms lag_max=146.115ms drops=35014
+round 4: summary: records=7488 with_path=5508 path_exists=1359 path_gone=4149 lag_avg=14.788ms lag_max=128.453ms drops=31864
+round 5: summary: records=10102 with_path=7567 path_exists=1552 path_gone=6015 lag_avg=9.098ms lag_max=114.264ms drops=30865
+round 6: summary: records=4690 with_path=2906 path_exists=1518 path_gone=1388 lag_avg=36.785ms lag_max=157.618ms drops=37868
+round 7: summary: records=8049 with_path=5122 path_exists=1700 path_gone=3422 lag_avg=12.275ms lag_max=86.397ms drops=33644
+round 8: summary: records=4084 with_path=1902 path_exists=1708 path_gone=194 lag_avg=20.672ms lag_max=86.199ms drops=37404
+round 9: summary: records=3415 with_path=1676 path_exists=1497 path_gone=179 lag_avg=46.765ms lag_max=112.282ms drops=39461
+round 10: summary: records=4539 with_path=2740 path_exists=1465 path_gone=1275 lag_avg=15.258ms lag_max=69.541ms drops=35869
+round 11: summary: records=6275 with_path=3690 path_exists=1511 path_gone=2179 lag_avg=10.847ms lag_max=59.671ms drops=35259

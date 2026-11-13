@@ -1,0 +1,60 @@
+plain untar 0.30
+plain checkout 0.23
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.33
+plain-dtrace checkout 0.27
+plain untar 0.35
+plain checkout 0.60
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.31
+plain-dtrace checkout 0.24
+plain untar 0.29
+plain checkout 0.26
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.32
+plain-dtrace checkout 0.24
+plain untar 0.29
+plain checkout 0.23
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.32
+plain-dtrace checkout 0.25
+plain untar 0.27
+plain checkout 0.28
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.33
+plain-dtrace checkout 0.24
+plain untar 0.28
+plain checkout 0.25
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.30
+plain-dtrace checkout 0.24
+plain untar 0.28
+plain checkout 0.23
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.32
+plain-dtrace checkout 0.23
+plain untar 0.29
+plain checkout 0.22
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.34
+plain-dtrace checkout 0.25
+plain untar 0.32
+plain checkout 0.25
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.33
+plain-dtrace checkout 0.24
+plain untar 0.27
+plain checkout 0.27
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.29
+plain-dtrace checkout 0.24
+plain untar 0.28
+plain checkout 0.23
+dtrace: buffer size lowered to 4m
+plain-dtrace untar 0.28
+plain-dtrace checkout 0.25
+--- medians over 11 rounds
+plain checkout median=0.25 all:0.23 0.60 0.26 0.23 0.28 0.25 0.23 0.22 0.25 0.27 0.23
+plain untar median=0.29 all:0.30 0.35 0.29 0.29 0.27 0.28 0.28 0.29 0.32 0.27 0.28
+plain-dtrace checkout median=0.24 all:0.27 0.24 0.24 0.25 0.24 0.24 0.23 0.25 0.24 0.24 0.25
+plain-dtrace untar median=0.32 all:0.33 0.31 0.32 0.32 0.33 0.30 0.32 0.34 0.33 0.29 0.28

@@ -1,0 +1,21 @@
+== 1. host helper, jailed mutator
+1 unlink      pid=42162 jid=5 comm=mut size=3500 mode=644 nlink=1 flags=0x1 hook=1.7us lag=39.4us bytes=3500 /home/freebsd/b5/work-jail/t/victim
+2 open_w      pid=42161 jid=5 comm=mut size=3000 mode=644 nlink=1 flags=0x2 hook=4.1us lag=22.7us bytes=3000 /home/freebsd/b5/work-jail/t/trunc
+summary: wall=0.008s events=2 captured=2 bytes=6500 hook_avg=2.9us hook_max=4.1us lag_avg=31.1us lag_max=39.4us
+per-op: unlink=1 open_w=1
+ok   pre-image of orig captured from inside the jail
+ok   pre-image of orig-trunc captured from inside the jail
+== 2. device access from inside a jail (root in jail)
+jail: open /dev/shitpre: denied
+jail: open /dev/auditpipe: allowed
+jail: open /dev/dtrace/dtrace: denied
+jail: dtrace BEGIN: failed
+auditpipe_reader: classes fw,fd,fm,fc
+jail: auditpipe_reader: running
+== 3. capability mode
+before: open /dev/auditpipe                      ok
+after: fhopen(dir handle)                        Not permitted in capability mode
+after: open /dev/shitpre                         Not permitted in capability mode
+after: open /dev/auditpipe                       Not permitted in capability mode
+after: open /dev/dtrace/dtrace                   Not permitted in capability mode
+after: ioctl on auditpipe fd opened before       ok

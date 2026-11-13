@@ -1,0 +1,10 @@
+  wait 817 unlink /home/freebsd/b5/work-wait/t/unlinked: copier BLOCKED before ack (open took 200.4 ms, finished 0.3 ms after ack), result No such file or directory, 0 bytes
+  wait 818 open_w /home/freebsd/b5/work-wait/t/truncated: copier BLOCKED before ack (open took 1037.6 ms, finished 837.5 ms after ack), result ok, 4 bytes
+  wait 821 open_w /home/freebsd/b5/work-wait/t/inplace: copier BLOCKED before ack (open took 619.6 ms, finished 419.7 ms after ack), result ok, 26000 bytes
+  wait 823 rename_from /home/freebsd/b5/work-wait/t/src: copier BLOCKED before ack (open took 619.5 ms, finished 419.4 ms after ack), result No such file or directory, 0 bytes
+  wait 825 setmode /home/freebsd/b5/work-wait/t/chmodded: copier BLOCKED before ack (open took 200.0 ms, finished 0.4 ms after ack), result ok, 28000 bytes
+summary: wall=2.690s events=5 captured=0 bytes=0 hook_avg=3.3us hook_max=11.6us lag_avg=38.5us lag_max=65.1us
+per-op: unlink=1 rename_from=1 open_w=2 setmode=1
+mode2: waited=5 copier_blocked_until_ack=5 copier_ok_before_ack=0
+security.mac.shitpre.waits: 9
+security.mac.shitpre.wait_timeouts: 4
