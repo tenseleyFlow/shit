@@ -1830,6 +1830,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1969,6 +1970,7 @@ name = "shitd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "hdrhistogram",
  "libc",
@@ -1978,6 +1980,7 @@ dependencies = [
  "opentelemetry_sdk",
  "serde",
  "serde_json",
+ "shit-capture",
  "shit-planner",
  "shit-proto",
  "shit-store",

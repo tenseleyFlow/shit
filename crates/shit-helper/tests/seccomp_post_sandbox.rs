@@ -122,6 +122,8 @@ fn helper_survives_post_sandbox_requests() {
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_default(),
+
+        zfs_snapshot: None,
     };
     send_frame(&conn_fd, &encode_frame(&watch).unwrap());
 

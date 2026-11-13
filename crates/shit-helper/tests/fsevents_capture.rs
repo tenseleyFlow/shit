@@ -116,6 +116,8 @@ fn fsevents_capture_create_and_unlink_through_helper() {
         command_seq,
         shell_kind: ShellKind::Bash,
         cwd_path: watch_root.to_string_lossy().into_owned(),
+
+        zfs_snapshot: None,
     };
     send_frame(&conn_fd, &encode_frame(&watch_req).unwrap());
 

@@ -133,6 +133,23 @@ pub struct BsdReport {
     /// path (`/usr/local/lib/shit/libshit_preload_shim.so`), or at
     /// the path pointed to by `SHIT_PRELOAD_SHIM_PATH` if set.
     pub preload_shim_installed: bool,
+    /// B6 - where a command run in doctor's cwd gets its pre-images.
+    /// `None` from a doctor that predates the field.
+    #[serde(default)]
+    pub pre_image_source: Option<PreImageSourceReport>,
+}
+
+/// B6 - the pre-image source for commands in one directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreImageSourceReport {
+    /// `"zfs-snapshot"` or `"read-time"`.
+    pub source: String,
+    /// The directory probed.
+    pub cwd: String,
+    /// The ZFS dataset snapshotted, for `zfs-snapshot`.
+    pub dataset: Option<String>,
+    /// Why capture stays read-time, for `read-time`.
+    pub reason: Option<String>,
 }
 
 /// Result of spawning `shit-helper handshake-probe --daemon-sock
@@ -515,6 +532,7 @@ mod tests {
                     degraded_reason: None,
                 },
                 preload_shim_installed: false,
+                pre_image_source: None,
             }),
             linux: None,
             macos: None,
@@ -552,6 +570,28 @@ mod tests {
         assert!(r2.bsd.is_some());
         assert!(r2.linux.is_none());
         assert!(r2.macos.is_none());
+    }
+
+    /// B6: the pre-image source is reported, and a report written
+    /// before the field existed still parses.
+    #[test]
+    fn pre_image_source_is_reported_and_optional() {
+        let mut r = empty_report();
+        r.bsd.as_mut().unwrap().pre_image_source = Some(PreImageSourceReport {
+            source: "read-time".into(),
+            cwd: "/home/u".into(),
+            dataset: None,
+            reason: Some("/home/u is not on ZFS".into()),
+        });
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(
+            s.contains("\"pre_image_source\":{\"source\":\"read-time\""),
+            "{s}"
+        );
+        let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v["bsd"].as_object_mut().unwrap().remove("pre_image_source");
+        let parsed: DoctorReport = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.bsd.unwrap().pre_image_source, None);
     }
 
     #[test]

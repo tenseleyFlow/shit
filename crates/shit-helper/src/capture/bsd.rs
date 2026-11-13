@@ -70,6 +70,8 @@ enum ControlMsg {
     Attach {
         command: CommandId,
         root_path: PathBuf,
+        /// B6 - the daemon's snapshot of the root's dataset, if any.
+        snapshot: Option<shit_proto::ZfsSnapshotRef>,
     },
     Detach {
         command: CommandId,
@@ -151,6 +153,9 @@ struct WatchState {
     /// Wall clock when the attach began, in ns since the epoch. An entry
     /// whose birth time is later was created after the listing started.
     attached_at_ns: i128,
+    /// B6 - the ZFS snapshot the daemon took before the command ran.
+    /// A file it holds gets its pre-image from there.
+    snapshot: Option<shit_proto::ZfsSnapshotRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +257,7 @@ impl PumpState {
         kq: &KqueueFd,
         command: CommandId,
         root_path: &Path,
+        snapshot: Option<shit_proto::ZfsSnapshotRef>,
     ) -> Result<(), CaptureAttachError> {
         let attached_at_ns = now_unix_nanos();
         let subtree_result = match &self.slash_fd {
@@ -401,6 +407,7 @@ impl PumpState {
                 baseline_ran,
                 send_failures: 0,
                 attached_at_ns,
+                snapshot,
             },
         );
         Ok(())
@@ -502,6 +509,61 @@ impl PumpState {
             return;
         }
         let path = ws.subtree.path_for_fd(fd).map(|p| p.to_path_buf());
+        // B6 - a file that was there when the daemon took the command's
+        // ZFS snapshot: the snapshot holds its pre-command bytes, so
+        // nothing is read here but the post-write hash.
+        if let Some(snap) = &ws.snapshot
+            && snap.dev == dev
+            && ws.acct.is_baseline((dev, inode))
+            && let Some(p) = path.as_deref()
+        {
+            let post_content_hash = if is_delete {
+                None
+            } else {
+                match hash_fd(fd) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(fd, error = %e, "post-write hash failed");
+                        None
+                    }
+                }
+            };
+            let xattrs = fstat_meta(fd).map(|m| m.xattrs).unwrap_or_default();
+            let resp = HelperResponse::SnapshotPreImage {
+                session: command.session,
+                seq: command.seq,
+                dev,
+                inode,
+                path: path_to_string(p),
+                post_content_hash,
+                xattrs,
+                is_delete,
+            };
+            if !is_delete {
+                ws.acct.note_written((dev, inode));
+            }
+            if let Err(e) = self.conn.send_response(&resp) {
+                tracing::warn!(error = %e, "SnapshotPreImage send failed");
+                ws.send_failures = ws.send_failures.saturating_add(1);
+                return;
+            }
+            ws.acct.note_captured((dev, inode));
+            ws.dedupe.insert(
+                (dev, inode),
+                DedupeEntry {
+                    invalidated: is_delete,
+                },
+            );
+            tracing::info!(
+                %command.session,
+                seq = command.seq,
+                dev,
+                inode,
+                ?kind,
+                "SnapshotPreImage sent",
+            );
+            return;
+        }
         // R3 slice B — kqueue fires after the write, so a pre-existing
         // file's only pre-write content is its live-baseline pre-image.
         // A tracked file absent from the attach listing was born.
@@ -1321,6 +1383,32 @@ fn baseline_shipped(shipped: HashSet<(u64, u64)>, complete_sent: bool) -> HashSe
     }
 }
 
+/// blake3 of the whole file behind `fd`, read with `pread` so the
+/// fd's offset is left alone.
+fn hash_fd(fd: RawFd) -> std::io::Result<[u8; 32]> {
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut off: libc::off_t = 0;
+    loop {
+        // SAFETY: `buf` is valid for `buf.len()` bytes; `fd` is a
+        // tracked fd the pump owns.
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), off) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n as usize]);
+        off += n as libc::off_t;
+    }
+    Ok(*h.finalize().as_bytes())
+}
+
 fn path_to_string(p: &Path) -> String {
     shit_proto::wire_path::encode(p)
 }
@@ -1575,6 +1663,7 @@ impl CaptureControl {
         command_seq: u64,
         root_pid: u32,
         cwd_path: &str,
+        snapshot: Option<shit_proto::ZfsSnapshotRef>,
     ) -> Result<(), CaptureAttachError> {
         let path = if !cwd_path.is_empty() {
             PathBuf::from(cwd_path)
@@ -1592,6 +1681,7 @@ impl CaptureControl {
                 seq: command_seq,
             },
             root_path: path,
+            snapshot,
         };
         // Enqueue only. The pump performs registration and the baseline
         // walk and then sends WatchTreeReady or WatchTreeFailed itself, so
@@ -1746,8 +1836,12 @@ fn pump(
     loop {
         // Try a control command first (low latency for watch/unwatch).
         match ctrl_rx.try_recv() {
-            Ok(ControlMsg::Attach { command, root_path }) => {
-                let result = state.attach(&kq, command, &root_path);
+            Ok(ControlMsg::Attach {
+                command,
+                root_path,
+                snapshot,
+            }) => {
+                let result = state.attach(&kq, command, &root_path, snapshot);
                 if let Err(e) = &result {
                     // Release anything a partial attach left behind
                     // before reporting failure (no-op when nothing was
@@ -1914,7 +2008,7 @@ mod tests {
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(78);
         FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = Some(sub.clone()));
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = None);
         std::fs::write(sub.join("new"), b"").unwrap();
         state.handle_dir_change(cmd, tracked_fd(&state, cmd, &sub));
@@ -1929,6 +2023,67 @@ mod tests {
         );
     }
 
+    /// B6: a write to a file the command's ZFS snapshot holds (same
+    /// device, there at attach) is answered with `SnapshotPreImage`
+    /// carrying the post-write hash, and no capture gap; a snapshot of
+    /// another device leaves the read-time path in charge.
+    #[test]
+    fn write_to_a_snapshotted_file_sends_a_snapshot_pre_image() {
+        use std::os::unix::fs::MetadataExt;
+        for same_dev in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let f = root.join("f");
+            std::fs::write(&f, b"before").unwrap();
+            let dev = std::fs::metadata(&root).unwrap().dev();
+            let (mut state, kq, daemon) = hand_driven_state(dir.path());
+            let cmd = command(90);
+            let snap = shit_proto::ZfsSnapshotRef {
+                dataset: "pool/w".into(),
+                name: "shitd-x".into(),
+                mountpoint: path_to_string(dir.path()),
+                dev: if same_dev { dev } else { dev ^ 1 },
+            };
+            state.attach(&kq, cmd, &root, Some(snap)).unwrap();
+            std::fs::write(&f, b"after").unwrap();
+            state.handle_vnode(tracked_fd(&state, cmd, &f), VnodeEventKind::Write);
+            state.detach(cmd);
+            drop(state);
+            let mut snapshot_pre = Vec::new();
+            let mut fd_pre = 0;
+            let mut refusals = Vec::new();
+            while let Ok((resp, _)) = daemon.recv_response_with_fd() {
+                match resp {
+                    HelperResponse::SnapshotPreImage {
+                        path,
+                        post_content_hash,
+                        is_delete,
+                        ..
+                    } => snapshot_pre.push((path, post_content_hash, is_delete)),
+                    HelperResponse::CapturedPreImage { .. } => fd_pre += 1,
+                    HelperResponse::CaptureRefused { detail, .. } => refusals.push(detail),
+                    _ => {}
+                }
+            }
+            if same_dev {
+                assert_eq!(
+                    snapshot_pre,
+                    vec![(
+                        path_to_string(&f),
+                        Some(*blake3::hash(b"after").as_bytes()),
+                        false
+                    )]
+                );
+                assert_eq!(fd_pre, 0);
+                assert!(refusals.is_empty(), "{refusals:?}");
+            } else {
+                assert!(snapshot_pre.is_empty(), "{snapshot_pre:?}");
+                assert_eq!(fd_pre, 1);
+            }
+        }
+    }
+
     /// With a birth time, a file created after the attach is born even
     /// in a directory whose listing failed.
     #[cfg(target_os = "freebsd")]
@@ -1941,7 +2096,7 @@ mod tests {
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(80);
         FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = Some(sub.clone()));
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         FAIL_LISTING_FOR_TEST.with(|f| *f.borrow_mut() = None);
         std::fs::write(sub.join("new"), b"").unwrap();
         state.handle_dir_change(cmd, tracked_fd(&state, cmd, &sub));
@@ -1970,7 +2125,7 @@ mod tests {
         std::fs::write(outside.join("f"), b"old content").unwrap();
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(81);
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         // The file predates the attach by more than the slack.
         state.watches.get_mut(&cmd).unwrap().attached_at_ns += 2 * BIRTH_SLACK_NS;
         std::fs::rename(outside.join("f"), root.join("f")).unwrap();
@@ -2002,7 +2157,7 @@ mod tests {
         std::fs::write(deep.join("f"), b"old content").unwrap();
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(82);
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         assert!(!state.watches[&cmd].acct.listing_complete());
         std::fs::rename(deep.join("f"), root.join("f")).unwrap();
         state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
@@ -2032,7 +2187,7 @@ mod tests {
         std::fs::write(outside.join("d/f"), b"old content").unwrap();
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(83);
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         assert!(state.watches[&cmd].acct.listing_complete());
         std::fs::rename(outside.join("d"), root.join("d")).unwrap();
         state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
@@ -2058,7 +2213,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let (mut state, kq, _daemon) = hand_driven_state(dir.path());
         let cmd = command(84);
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         std::fs::create_dir(root.join("d")).unwrap();
         state.handle_dir_change(cmd, tracked_fd(&state, cmd, &root));
         let d_fd = tracked_fd(&state, cmd, &root.join("d"));
@@ -2078,7 +2233,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let (mut state, kq, daemon) = hand_driven_state(dir.path());
         let cmd = command(85);
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         let f = root.join("f");
         std::fs::write(&f, b"extracted").unwrap();
         let old = std::time::SystemTime::now() - Duration::from_secs(86_400);
@@ -2175,7 +2330,7 @@ mod tests {
         let (control, _pump) = spawn(Arc::new(helper), dir.path().join("staging"), None).unwrap();
         let session = Uuid::from_u128(77);
         control
-            .on_watch_tree(session, 1, std::process::id(), root.to_str().unwrap())
+            .on_watch_tree(session, 1, std::process::id(), root.to_str().unwrap(), None)
             .unwrap();
         // The attach streams baseline responses ahead of its outcome.
         loop {
@@ -2218,10 +2373,12 @@ mod tests {
 
         // Returns immediately even though nothing has consumed the Attach.
         control
-            .on_watch_tree(session, 17, 4242, "/tmp/capture-root")
+            .on_watch_tree(session, 17, 4242, "/tmp/capture-root", None)
             .expect("enqueue should not wait for the pump");
 
-        let ControlMsg::Attach { command, root_path } = rx
+        let ControlMsg::Attach {
+            command, root_path, ..
+        } = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("capture pump should receive attach")
         else {
@@ -2237,9 +2394,9 @@ mod tests {
         let (tx, _rx) = sync_channel::<ControlMsg>(1);
         let control = CaptureControl { tx };
         control
-            .on_watch_tree(Uuid::nil(), 1, 1, "/tmp/a")
+            .on_watch_tree(Uuid::nil(), 1, 1, "/tmp/a", None)
             .expect("first enqueue");
-        let second = control.on_watch_tree(Uuid::nil(), 2, 1, "/tmp/b");
+        let second = control.on_watch_tree(Uuid::nil(), 2, 1, "/tmp/b", None);
         assert!(matches!(
             second,
             Err(CaptureAttachError::ControlChannelFull)
@@ -2291,7 +2448,7 @@ mod tests {
         drop(rx);
         let control = CaptureControl { tx };
 
-        let result = control.on_watch_tree(Uuid::nil(), 29, 6262, "/tmp/capture-root");
+        let result = control.on_watch_tree(Uuid::nil(), 29, 6262, "/tmp/capture-root", None);
         assert!(matches!(
             result,
             Err(CaptureAttachError::ControlChannelClosed)
@@ -2405,7 +2562,7 @@ mod tests {
             session: Uuid::from_u128(79),
             seq: 1,
         };
-        state.attach(&kq, cmd, &root).unwrap();
+        state.attach(&kq, cmd, &root, None).unwrap();
         drop(conn_b);
         std::fs::write(root.join("new"), b"").unwrap();
         let root_fd = *state.watches[&cmd].dir_baselines.keys().next().unwrap();

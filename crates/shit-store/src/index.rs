@@ -1684,6 +1684,57 @@ mod tests {
         assert_eq!(got[1].kind, CaptureEventKind::TreeOp(meta));
     }
 
+    /// B6, D-13: `FilePreImageSource::ZfsSnapshot` is appended, so no
+    /// earlier source changes its encoding and no column or migration
+    /// is needed. A pre-image from a snapshot reads back with its source.
+    #[test]
+    fn zfs_snapshot_source_is_appended_and_round_trips() {
+        use shit_planner::FilePreImageSource as S;
+        use shit_planner::metadata::FileMetadata;
+        let enc = |s: S| postcard::to_allocvec(&s).unwrap();
+        assert_eq!(enc(S::BaselineCachePromote), vec![0]);
+        assert_eq!(enc(S::Other), vec![2]);
+        assert_eq!(enc(S::ShimXattrPreMutation), vec![6]);
+        assert_eq!(enc(S::ZfsSnapshot), vec![7]);
+        assert!(S::ZfsSnapshot.is_trusted_pre_mutation());
+        assert!(S::ZfsSnapshot.has_content());
+
+        let (_dir, idx) = open_index();
+        let session = Uuid::nil();
+        idx.put_session(session, "bash", 1, None, TimePoint::new(0, 0))
+            .unwrap();
+        idx.put_command(&sample_command(session, 1)).unwrap();
+        let command = CommandId { session, seq: 1 };
+        let kind = CaptureEventKind::FilePreImage {
+            inode: InodeRef::new(9, 70),
+            path: PathBuf::from("/tmp/zfs/w/big"),
+            blob: BlobHash::from_bytes([5; 32]),
+            meta: FileMetadata {
+                mode: 0o100644,
+                uid: 1001,
+                gid: 1001,
+                size: 1 << 30,
+                mtime_unix_nanos: 1,
+                xattrs: Default::default(),
+                acl: None,
+                flags: 0,
+            },
+            post_content_hash: Some(BlobHash::from_bytes([6; 32])),
+            source: S::ZfsSnapshot,
+        };
+        idx.put_event(&CaptureEvent {
+            id: EventId(0),
+            command,
+            ts: TimePoint::new(1, 0),
+            partial: false,
+            kind: kind.clone(),
+        })
+        .unwrap();
+        let got = idx.events_for_command(command);
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(got[0].kind, kind);
+    }
+
     /// L5 (PR B), D-13: the call-id rows are new variants appended to
     /// the event enum. They add no column and no migration, the existing
     /// variants keep their encoding (so rows written before them decode;

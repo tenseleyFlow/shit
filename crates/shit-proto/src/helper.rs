@@ -47,7 +47,11 @@ pub const HELPER_PATH_HINT_MAX: usize = 4000;
 ///
 /// **Version 7 (L6, #227):** `ApplyChown` carries `OwnerEvidence`; the
 /// Linux helper refuses a chown without a token it issued for that file.
-pub const HELPER_PROTOCOL_VERSION: u16 = 7;
+///
+/// **Version 8 (B6):** `WatchTree` carries `zfs_snapshot`, the snapshot
+/// the daemon took for the command; the BSD helper answers writes and
+/// deletes of files that snapshot holds with `SnapshotPreImage`.
+pub const HELPER_PROTOCOL_VERSION: u16 = 8;
 
 /// Capabilities the daemon expects the helper to expose. Helper replies
 /// with the subset it can actually provide given the current platform
@@ -201,6 +205,10 @@ pub enum HelperRequest {
         /// from `root_pid` via sysctl (KERN_PROC_CWD isn't whitelisted),
         /// so the path arrives pre-resolved.
         cwd_path: String,
+        /// B6 - the ZFS snapshot the daemon took of the cwd's dataset
+        /// before this command ran. `None` when the cwd is not on ZFS
+        /// or the daemon may not snapshot it.
+        zfs_snapshot: Option<ZfsSnapshotRef>,
     },
     UnwatchTree {
         session: Uuid,
@@ -615,6 +623,39 @@ pub enum HelperResponse {
         session: Uuid,
         command_seq: u64,
     },
+    /// B6 - a write or delete of a file that the command's ZFS snapshot
+    /// holds (see `WatchTree::zfs_snapshot`). The helper sends no bytes:
+    /// the daemon reads the pre-image from the snapshot, which predates
+    /// the command, and checks that the snapshot's file is this inode.
+    SnapshotPreImage {
+        session: Uuid,
+        seq: u64,
+        dev: u64,
+        inode: u64,
+        /// The file's path at the event. Bounded by
+        /// [`HELPER_PATH_HINT_MAX`].
+        path: String,
+        /// Hash of the file's content after the write, read from the
+        /// held fd. `None` for a delete.
+        post_content_hash: Option<[u8; 32]>,
+        /// User-namespace xattrs at the event.
+        xattrs: std::collections::BTreeMap<String, Vec<u8>>,
+        is_delete: bool,
+    },
+}
+
+/// B6 - a snapshot of one ZFS dataset, taken by the daemon at PreExec.
+/// Files on the dataset (`st_dev == dev`) that existed when the command
+/// started are in it, under `mountpoint`/.zfs/snapshot/`name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZfsSnapshotRef {
+    pub dataset: String,
+    /// Snapshot name, the part after `@`.
+    pub name: String,
+    /// The dataset's mountpoint, in wire form.
+    pub mountpoint: String,
+    /// `st_dev` of files on the dataset.
+    pub dev: u64,
 }
 
 /// DR-15 helper-applied result for a privileged-op request.
@@ -798,6 +839,14 @@ pub fn validate_outgoing(resp: &HelperResponse) -> Result<(), HelperProtoError> 
             {
                 return Err(HelperProtoError::PathHintTooLong {
                     got: p.len(),
+                    max: HELPER_PATH_HINT_MAX,
+                });
+            }
+        }
+        HelperResponse::SnapshotPreImage { path, .. } => {
+            if path.len() > HELPER_PATH_HINT_MAX {
+                return Err(HelperProtoError::PathHintTooLong {
+                    got: path.len(),
                     max: HELPER_PATH_HINT_MAX,
                 });
             }
@@ -1013,7 +1062,9 @@ mod tests {
         //   Version 6 (L4/L4b) added device rdev, capture tokens and
         //     the Conflict/Refused privileged-op outcomes.
         //   Version 7 (L6) added owner evidence to `ApplyChown`.
-        assert_eq!(HELPER_PROTOCOL_VERSION, 7);
+        //   Version 8 (B6) added the ZFS snapshot to `WatchTree` and
+        //     `SnapshotPreImage`.
+        assert_eq!(HELPER_PROTOCOL_VERSION, 8);
     }
 
     #[test]

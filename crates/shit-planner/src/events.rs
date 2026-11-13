@@ -147,6 +147,13 @@ pub enum FilePreImageSource {
     /// placeholder. The planner restores xattrs from it and never
     /// restores bytes.
     ShimXattrPreMutation,
+    /// B6: the bytes were read from a ZFS snapshot the daemon took at
+    /// PreExec, before the command ran, so they are the file's
+    /// pre-command state however late the kernel event arrived. Large
+    /// files are not copied into the blob store; undo reads them back
+    /// from the snapshot, which the daemon keeps until the command is
+    /// pruned.
+    ZfsSnapshot,
 }
 
 /// L5: the `CaptureRefused` class for a refusal about a whole command
@@ -186,7 +193,9 @@ impl FilePreImageSource {
     pub fn is_trusted_pre_mutation(&self) -> bool {
         matches!(
             self,
-            FilePreImageSource::BaselineCachePromote | FilePreImageSource::EsAuthPreMutation
+            FilePreImageSource::BaselineCachePromote
+                | FilePreImageSource::EsAuthPreMutation
+                | FilePreImageSource::ZfsSnapshot
         )
     }
 }

@@ -2716,7 +2716,11 @@ jobs:
           sudo zpool create -f shitzfs "/dev/${ZFS_MD}"
           sudo zfs create -o mountpoint=/tmp/zfs shitzfs/tmp
           sudo chmod 1777 /tmp/zfs
+          # B6: let the runner snapshot the dataset, so the zfs leg
+          # takes pre-images from per-command snapshots.
+          sudo zfs allow -u "$(id -un)" snapshot,destroy,mount shitzfs/tmp
           echo "  zpool: shitzfs on /dev/${ZFS_MD} ($(zfs list -H -o name,mountpoint shitzfs/tmp | tr '\t' ' '))"
+          zfs allow shitzfs/tmp | sed 's/^/  /'
 
           echo "===== doctor JSON pre-flight ====="
           export SHIT_HELPER_BIN="$(pwd)/target/release/shit-helper"
@@ -2851,6 +2855,10 @@ jobs:
           echo "===== ${leg} leg: $((FAIL_COUNT - leg_fail_start)) of $SMOKE_COUNT failed ====="
           }
           run_bucket ufs /tmp
+          # B6: on the zfs leg snapshot pre-images are required, not
+          # optional (zfs-snapshot-preimage-fbsd fails instead of
+          # skipping without them).
+          export SHIT_SMOKE_REQUIRE_ZFS_SNAPSHOT=1
           run_bucket zfs /tmp/zfs
 
           if [ "$FAIL_COUNT" -gt 0 ]; then
